@@ -12,6 +12,14 @@ You @ the bot in a Feishu thread. It runs on your machine — reading your real 
 
 ---
 
+## 💬 Join the community (Feishu)
+
+See Larkway in action and talk through how to set it up for your team — scan to join the **Larkway 交流群** (QR never expires):
+
+<img src="https://raw.githubusercontent.com/chuckwu0/larkway/main/assets/larkway-feishu-qr.jpg" width="260" alt="Larkway Feishu group QR" />
+
+---
+
 ## Why
 
 The engineers on your team know how a feature is actually implemented. Everyone else has to ask them. That friction compounds: a data analyst wondering whether a metric counts deleted records, a PM asking which API endpoint powers a chart, a QA engineer trying to reproduce a bug without context.

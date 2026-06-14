@@ -12,6 +12,14 @@
 
 ---
 
+## 💬 交流群（飞书）
+
+想看实际效果、聊聊怎么给你的团队搭 agent？扫码加入 **Larkway 交流群**（二维码永久有效）：
+
+<img src="https://raw.githubusercontent.com/chuckwu0/larkway/main/assets/larkway-feishu-qr.jpg" width="260" alt="Larkway 交流群 飞书二维码" />
+
+---
+
 ## 背景
 
 工程师知道某个功能是怎么实现的，其他人不知道，只能问。这个摩擦不断叠加：数据分析师想弄清楚某个指标有没有过滤已删除的记录，PM 想知道某个图表背后调的是哪个 API，QA 工程师在没有上下文的情况下试图复现一个 bug。
