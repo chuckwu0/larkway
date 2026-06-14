@@ -2,7 +2,7 @@
 
 > Turn your Claude Code or Codex subscription into a Feishu (Lark) agent your whole team can @-mention.
 
-[中文版](README.zh.md)
+🌐 [larkway.dev](https://larkway.dev) · [中文版](README.zh.md)
 
 ---
 

@@ -2,7 +2,7 @@
 
 > 把你的 Claude Code 或 Codex 订阅变成全团队都能 @ 的飞书 Agent。
 
-[English](README.md)
+🌐 [larkway.dev](https://larkway.dev) · [English](README.md)
 
 ---
 
