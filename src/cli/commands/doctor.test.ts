@@ -434,6 +434,65 @@ describe("doctor --lint --json", () => {
 });
 
 // ---------------------------------------------------------------------------
+// --json WITHOUT --lint (P1: --json alone must trigger structured output)
+// ---------------------------------------------------------------------------
+
+describe("doctor --json (without --lint)", () => {
+  it("emits valid one-line JSON and is NOT silently ignored", async () => {
+    await withFakeHome(async () => {
+      await writeBotYaml("test-bot", validBotYaml("test-bot"));
+      await writeEnvFile({ TEST_APP_SECRET: "secret123" });
+      await writeFakeClaude();
+
+      const output: unknown[] = [];
+      const ctx = buildCtx({ json: true, nonInteractive: true }, { captureJson: output });
+      // Note: NO --lint flag, only the global --json (via flags.json).
+      const code = await run(ctx, []);
+
+      expect(code).toBe(0);
+      // Exactly one structured JSON value (not human text).
+      expect(output).toHaveLength(1);
+      const result = output[0] as { ok: boolean; exitCode: number; checks: unknown[] };
+      expect(result.ok).toBe(true);
+      expect(result.exitCode).toBe(0);
+      expect(Array.isArray(result.checks)).toBe(true);
+    });
+  });
+
+  it("preserves exit code 2 (error) in --json mode on bad yaml", async () => {
+    await withFakeHome(async () => {
+      await writeBotYaml("bad-bot", "id: bad-bot\nname: Bad\n# missing required fields");
+      await writeEnvFile({ SOME_SECRET: "x" });
+      await writeFakeClaude();
+
+      const output: unknown[] = [];
+      const ctx = buildCtx({ json: true, nonInteractive: true }, { captureJson: output });
+      const code = await run(ctx, []);
+
+      expect(code).toBe(2);
+      const result = output[0] as { ok: boolean; exitCode: number };
+      expect(result.ok).toBe(false);
+      expect(result.exitCode).toBe(2);
+    });
+  });
+
+  it("--lint --json still behaves identically (exit 0 on clean)", async () => {
+    await withFakeHome(async () => {
+      await writeBotYaml("test-bot", validBotYaml("test-bot"));
+      await writeEnvFile({ TEST_APP_SECRET: "secret123" });
+      await writeFakeClaude();
+
+      const output: unknown[] = [];
+      const ctx = buildCtx({ json: true, nonInteractive: true }, { captureJson: output });
+      const code = await run(ctx, ["--lint"]);
+
+      expect(code).toBe(0);
+      expect(output).toHaveLength(1);
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Human output mode smoke tests
 // ---------------------------------------------------------------------------
 

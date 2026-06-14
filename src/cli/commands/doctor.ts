@@ -640,8 +640,12 @@ export async function run(ctx: CliContext, args: string[]): Promise<number> {
   const { fix, force, lint } = parseDoctorFlags(args);
   const { ui, flags } = ctx;
 
-  // --lint --json mode: read-only, structured output, exit code CI gate
-  if (lint && flags.json) {
+  // Structured JSON mode: read-only, one-line JSON, exit code CI gate.
+  // `--json` ALONE is sufficient to trigger this path (it's advertised as a
+  // global flag); `--lint --json` behaves identically. The `lint` flag still
+  // controls the WS-probe failure downgrade (network/timeout → warn not error,
+  // so CI doesn't go flaky) — that semantic is unchanged.
+  if (flags.json) {
     const results = await runAllChecks(ctx, { lint });
     const code = exitCodeFromResults(results);
     ui.emitJson({

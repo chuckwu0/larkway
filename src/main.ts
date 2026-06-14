@@ -1,6 +1,7 @@
 import { execSync } from "node:child_process";
 import { mkdirSync } from "node:fs";
 import path from "node:path";
+import { resolveLarkwayVersion } from "./version.js";
 import { Client as LarkSdkClient } from "@larksuiteoapi/node-sdk";
 import { loadConfig, loadConfigJson } from "./config.js";
 import type { Config, ConfigJsonType } from "./config.js";
@@ -34,7 +35,8 @@ import { checkWorkspacePermissionGrant } from "./agent/permissionGate.js";
 /** How often the bridge rewrites each bot's status.json liveness heartbeat. */
 const STATUS_WRITE_INTERVAL_MS = 30_000;
 
-const VERSION = "0.1.0";
+/** Larkway 版本号 —— 读最近的 package.json(单一源,不再硬编码,避免 banner 撒谎)。 */
+const VERSION: string = resolveLarkwayVersion(import.meta.url);
 
 // ---------------------------------------------------------------------------
 // CLI probe (kept from D1 — startup validation)

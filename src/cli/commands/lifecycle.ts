@@ -29,7 +29,9 @@ import {
   startBridge,
   stopBridge,
   bridgeLogPath,
+  tailBridgeLog,
 } from "../bridgeControl.js";
+import { loadBots } from "../../config/botLoader.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -95,10 +97,61 @@ async function deepProbe(status: BridgeStatusDeep, logPath: string): Promise<Bri
 // Sub-command: start
 // ---------------------------------------------------------------------------
 
-async function cmdStart(ctx: CliContext): Promise<number> {
+/**
+ * Injectable seams for cmdStart — defaults wire the real primitives; tests pass
+ * fakes so the no-bots pre-check and the liveness poll can be exercised WITHOUT
+ * spawning a real bridge process (honoring the no-subprocess test rule).
+ */
+export interface CmdStartDeps {
+  loadBots: typeof loadBots;
+  startBridge: typeof startBridge;
+  detectBridgeStatus: typeof detectBridgeStatus;
+  tailBridgeLog: typeof tailBridgeLog;
+  /** Sleep helper — tests inject a no-op to skip real waiting. */
+  sleep: (ms: number) => Promise<void>;
+}
+
+const defaultStartDeps: CmdStartDeps = {
+  loadBots,
+  startBridge,
+  detectBridgeStatus,
+  tailBridgeLog,
+  sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
+};
+
+// Liveness poll window after spawn: ~3s total in a few ticks. The bridge exits
+// almost immediately on the no-bots / config-error path, so a short poll is
+// enough to catch a process that died on startup.
+const LIVENESS_POLL_TICK_MS = 400;
+const LIVENESS_POLL_TICKS = 7; // 7 × 400ms ≈ 2.8s
+
+export async function cmdStart(ctx: CliContext, deps: CmdStartDeps = defaultStartDeps): Promise<number> {
   const { ui, paths } = ctx;
 
-  const result = await startBridge(paths.larkwayDir);
+  // (a) PRE-CHECK: no point spawning a bridge that will immediately exit cleanly
+  // because there are no bots to serve. Reuse the bridge's own bots-dir
+  // resolution (LARKWAY_BOTS_DIR override, else <home>/bots) + loadBots loader.
+  const botsDir = process.env["LARKWAY_BOTS_DIR"]
+    ? path.resolve(process.env["LARKWAY_BOTS_DIR"])
+    : paths.botsDir;
+  let bots;
+  try {
+    bots = await deps.loadBots(botsDir);
+  } catch (e) {
+    ui.failure(`无法读取 bot 配置 (${botsDir}): ${e instanceof Error ? e.message : String(e)}`);
+    ui.print(ui.dim("修复 bot yaml 后重试,或运行 `larkway doctor` 诊断。"));
+    return 1;
+  }
+  if (bots.length === 0) {
+    ui.failure("还没有配置任何 bot — bridge 无事可做,已取消启动。");
+    ui.print(`在 ${botsDir} 没有找到 bots/*.yaml。`);
+    ui.print("先添加一个 bot 再启动:");
+    ui.print(ui.dim("  larkway init        # 引导式初始化首个 bot"));
+    ui.print(ui.dim("  larkway             # 打开 Web 管理面板添加 bot"));
+    return 1;
+  }
+
+  const result = await deps.startBridge(paths.larkwayDir);
 
   if (!result.ok) {
     ui.failure(result.message);
@@ -121,6 +174,36 @@ async function cmdStart(ctx: CliContext): Promise<number> {
   // mac / other
   ui.print("正在后台启动 larkway bridge…");
   ui.print(ui.dim(`日志: ${bridgeLogPath(paths.larkwayDir)}`));
+
+  // (b) POST-SPAWN LIVENESS CHECK: the supervisor may spawn but the bridge can
+  // die on startup (config error, etc.) and exit non-zero or be reaped. Poll a
+  // short window to confirm it's actually still alive before claiming success.
+  let alive = false;
+  for (let i = 0; i < LIVENESS_POLL_TICKS; i++) {
+    await deps.sleep(LIVENESS_POLL_TICK_MS);
+    const status = await deps.detectBridgeStatus(paths.larkwayDir);
+    if (status.running) {
+      alive = true;
+      break;
+    }
+  }
+
+  if (!alive) {
+    // The bridge died during the poll window — surface the REAL reason from the
+    // log instead of a misleading ✓.
+    ui.failure("Bridge 启动后随即退出 —— 未能保持运行。");
+    const { lines, path: logPath } = await deps.tailBridgeLog(paths.larkwayDir, 15);
+    if (lines.length > 0) {
+      ui.print(ui.dim("── bridge.log 末尾 ──────────────────────────"));
+      for (const line of lines) ui.printErr(ui.dim(line));
+    } else {
+      ui.print(ui.dim(`(日志为空或不存在: ${logPath})`));
+    }
+    ui.print(ui.dim("排查:运行 `larkway doctor` 检查配置,或 `larkway logs` 查看完整日志。"));
+    return 1;
+  }
+
+  // (c) Only now is success real.
   ui.success(result.message);
   ui.print(ui.dim(`查看日志: larkway logs --follow`));
   return 0;

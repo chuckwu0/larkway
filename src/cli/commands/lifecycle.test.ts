@@ -387,6 +387,125 @@ describe("stop — process-group SIGTERM", () => {
 });
 
 // ---------------------------------------------------------------------------
+// Tests: start — no-bots pre-check + post-spawn liveness (P1 false-success fix)
+//
+// These exercise cmdStart with INJECTED deps so no real bridge is spawned.
+// ---------------------------------------------------------------------------
+
+import type { CmdStartDeps } from "./lifecycle.js";
+import type { BridgePlatform } from "../bridgeControl.js";
+
+/** Build CmdStartDeps with sensible alive defaults; override per test. */
+function makeStartDeps(over: Partial<CmdStartDeps> = {}): CmdStartDeps {
+  return {
+    // Default: one bot configured (so pre-check passes).
+    loadBots: (async () => [{ id: "b1" }]) as unknown as CmdStartDeps["loadBots"],
+    // Default: spawn succeeds, mac platform, not already running.
+    startBridge: (async () => ({
+      ok: true,
+      pid: 4242,
+      alreadyRunning: false,
+      platform: "mac" as BridgePlatform,
+      message: "Bridge 启动中 (supervisor pid 4242)",
+    })) as unknown as CmdStartDeps["startBridge"],
+    // Default: alive.
+    detectBridgeStatus: (async () => ({
+      running: true,
+      pid: 4242,
+      platform: "mac" as BridgePlatform,
+      mode: "local" as const,
+    })) as unknown as CmdStartDeps["detectBridgeStatus"],
+    tailBridgeLog: (async () => ({ lines: [], path: "/tmp/bridge.log" })) as unknown as CmdStartDeps["tailBridgeLog"],
+    sleep: async () => { /* no real waiting in tests */ },
+    ...over,
+  };
+}
+
+describe("start — no-bots pre-check", () => {
+  it("does NOT spawn and returns non-zero when no bots are configured", async () => {
+    const { cmdStart } = await getLifecycle();
+    const ctx = makeCtx();
+
+    let spawned = false;
+    const deps = makeStartDeps({
+      loadBots: (async () => []) as unknown as CmdStartDeps["loadBots"],
+      startBridge: (async () => {
+        spawned = true;
+        throw new Error("startBridge must not be called when no bots");
+      }) as unknown as CmdStartDeps["startBridge"],
+    });
+
+    const code = await cmdStart(ctx, deps);
+    expect(code).toBe(1);
+    expect(spawned).toBe(false);
+  });
+
+  it("mentions larkway init when no bots", async () => {
+    const out: string[] = [];
+    vi.spyOn(process.stdout, "write").mockImplementation((c) => { out.push(String(c)); return true; });
+    vi.spyOn(process.stderr, "write").mockImplementation((c) => { out.push(String(c)); return true; });
+
+    const { cmdStart } = await getLifecycle();
+    const ctx = makeCtx();
+    const deps = makeStartDeps({ loadBots: (async () => []) as unknown as CmdStartDeps["loadBots"] });
+
+    await cmdStart(ctx, deps);
+    expect(out.join("")).toContain("larkway init");
+  });
+});
+
+describe("start — post-spawn liveness", () => {
+  it("returns non-zero (no false ✓) when bridge dies right after spawn", async () => {
+    const out: string[] = [];
+    vi.spyOn(process.stdout, "write").mockImplementation((c) => { out.push(String(c)); return true; });
+    vi.spyOn(process.stderr, "write").mockImplementation((c) => { out.push(String(c)); return true; });
+
+    const { cmdStart } = await getLifecycle();
+    const ctx = makeCtx();
+
+    let successPrinted = false;
+    const customUi = {
+      ...ui,
+      success: (msg: string) => { successPrinted = true; void msg; },
+    };
+    const ctxWithUi = { ...ctx, ui: customUi } as typeof ctx;
+
+    const deps = makeStartDeps({
+      // Bridge never becomes alive.
+      detectBridgeStatus: (async () => ({
+        running: false,
+        pid: null,
+        platform: "mac" as BridgePlatform,
+        mode: "local" as const,
+      })) as unknown as CmdStartDeps["detectBridgeStatus"],
+      tailBridgeLog: (async () => ({
+        lines: ["[larkway] no bots/*.yaml found — nothing to serve — exiting cleanly."],
+        path: "/tmp/bridge.log",
+      })) as unknown as CmdStartDeps["tailBridgeLog"],
+    });
+
+    const code = await cmdStart(ctxWithUi, deps);
+    expect(code).toBe(1);
+    expect(successPrinted).toBe(false);
+    // The real reason from the log tail should be surfaced.
+    expect(out.join("")).toContain("nothing to serve");
+  });
+
+  it("returns 0 and prints success when bridge stays alive", async () => {
+    const { cmdStart } = await getLifecycle();
+    const ctx = makeCtx();
+
+    let successPrinted = false;
+    const customUi = { ...ui, success: () => { successPrinted = true; } };
+    const ctxWithUi = { ...ctx, ui: customUi } as typeof ctx;
+
+    const code = await cmdStart(ctxWithUi, makeStartDeps());
+    expect(code).toBe(0);
+    expect(successPrinted).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Tests: unknown sub-command
 // ---------------------------------------------------------------------------
 

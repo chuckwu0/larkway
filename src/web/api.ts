@@ -41,8 +41,7 @@ import {
 } from "../agent/workspaceStore.js";
 import { permissionItemsFromCapabilities } from "../agent/permissionPlan.js";
 import { resolveAgentWorkspacePathFromHome } from "../config/paths.js";
-import { readFileSync } from "node:fs";
-import { fileURLToPath } from "node:url";
+import { resolveLarkwayVersion } from "../version.js";
 import {
   readStatusFile,
   classifyStatus,
@@ -78,32 +77,10 @@ export function _setEventNameResolverExecForTest(fn?: EventExecFile): void {
 }
 
 /**
- * Larkway 版本号 —— 读 package.json(单一源,避免和 main.ts 的硬编码 VERSION 漂移)。
- * 模块加载时读一次;失败回退 "0.0.0"。
- *
- * Path probing: import.meta.url points to THIS file's location, which varies:
- *   tsc multi-file: dist/web/api.js      → up 2 = package root ✓
- *   CLI bundle:     dist/cli/index.js    → up 2 = package root ✓
- *   main bundle:    dist/main.js         → up 2 = parent of root ✗ → probe up 1
- * We check up-1 first (for main bundle), then up-2 (for web/cli bundles).
+ * Larkway 版本号 —— 读 package.json(单一源,和 main.ts 共用 resolveLarkwayVersion,
+ * 避免版本号漂移)。模块加载时读一次;失败回退 "0.0.0"。
  */
-const LARKWAY_VERSION: string = (() => {
-  const here = path.dirname(fileURLToPath(import.meta.url));
-  const candidates = [
-    path.join(here, "..", "package.json"),
-    path.join(here, "..", "..", "package.json"),
-  ];
-  for (const pkgPath of candidates) {
-    try {
-      const pkg = JSON.parse(readFileSync(pkgPath, "utf-8")) as { version?: unknown; name?: unknown };
-      // Verify it's the larkway package (not some other package.json in a parent dir).
-      if (pkg.name === "larkway" && typeof pkg.version === "string") return pkg.version;
-    } catch {
-      // file missing or invalid JSON — try next candidate
-    }
-  }
-  return "0.0.0";
-})();
+const LARKWAY_VERSION: string = resolveLarkwayVersion(import.meta.url, "0.0.0");
 
 // ---------------------------------------------------------------------------
 // ManagementContext — the local / central abstraction
