@@ -72,13 +72,11 @@ This boundary is intentional. Workflow changes go into your repository's agent g
 
 ## Quick start
 
-> **Note:** npm publish is pending. Until then, install straight from the GitHub repo (the `prepack` build runs on install):
+> Install globally with npm:
 >
 > ```bash
-> npm i -g github:chuckwu0/larkway
+> npm i -g larkway
 > ```
->
-> Once published: `npm i -g larkway`
 
 ```bash
 # 1. Check your environment

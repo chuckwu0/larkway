@@ -72,13 +72,11 @@ lark.card              ◄──  agent 读仓库、跑 bash、改代码、
 
 ## 快速上手
 
-> **注意：** npm 包尚未发布。现阶段直接从 GitHub 仓库安装（`prepack` 会在安装时自动构建）：
+> 全局安装：
 >
 > ```bash
-> npm i -g github:chuckwu0/larkway
+> npm i -g larkway
 > ```
->
-> 发布后可直接：`npm i -g larkway`
 
 ```bash
 # 1. 检查环境
