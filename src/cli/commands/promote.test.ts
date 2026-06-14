@@ -138,6 +138,10 @@ async function gitCmd(args: string[], cwd: string): Promise<string> {
 async function initBareRepo(bareDir: string): Promise<string> {
   await mkdir(bareDir, { recursive: true });
   await execFileAsync("git", ["init", "--bare", bareDir]);
+  // Pin the bare repo's default branch to 'main' so a plain `git clone` checks
+  // it out, regardless of the host's init.defaultBranch (CI runners default to
+  // 'master', leaving HEAD dangling since we only ever push a 'main' branch).
+  await execFileAsync("git", ["-C", bareDir, "symbolic-ref", "HEAD", "refs/heads/main"]);
 
   // Use a temp work tree to seed the bare repo with an initial commit
   const workDir = `${bareDir}-init-work`;

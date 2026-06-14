@@ -71,6 +71,10 @@ async function setupCentralRepo(
   };
 
   await execFileAsync("git", ["init", "--bare", bareDir]);
+  // Pin the bare repo's default branch to 'main' so clones start on 'main'
+  // regardless of the host's init.defaultBranch (CI runners default to 'master',
+  // which would make `git push origin main` fail — no local 'main' branch).
+  await execFileAsync("git", ["-C", bareDir, "symbolic-ref", "HEAD", "refs/heads/main"]);
   await execFileAsync("git", ["clone", bareDir, workDir], { env });
   await execFileAsync("git", ["config", "user.email", "test@example.com"], { cwd: workDir, env });
   await execFileAsync("git", ["config", "user.name", "Test Author"], { cwd: workDir, env });
