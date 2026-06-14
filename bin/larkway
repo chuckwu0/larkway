@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# larkway CLI shim — resolves the package root from this script's own location
+# so it works whether invoked via `bin/larkway`, an absolute path, or a symlink
+# on PATH (e.g. after `npm i -g`).
+#
+# Startup priority:
+#   1. dist/cli/index.js exists  → `node dist/cli/index.js` (installed package / post-build)
+#   2. otherwise                 → `npx tsx src/cli/index.ts` (fresh clone dev mode, no build)
+set -euo pipefail
+SOURCE="${BASH_SOURCE[0]}"
+while [ -h "$SOURCE" ]; do
+  DIR="$(cd -P "$(dirname "$SOURCE")" >/dev/null 2>&1 && pwd)"
+  SOURCE="$(readlink "$SOURCE")"
+  [[ $SOURCE != /* ]] && SOURCE="$DIR/$SOURCE"
+done
+REPO_ROOT="$(cd -P "$(dirname "$SOURCE")/.." >/dev/null 2>&1 && pwd)"
+
+DIST_ENTRY="$REPO_ROOT/dist/cli/index.js"
+
+if [ -f "$DIST_ENTRY" ]; then
+  exec node "$DIST_ENTRY" "$@"
+else
+  # Dev fallback: run TypeScript source directly via tsx.
+  exec npx tsx "$REPO_ROOT/src/cli/index.ts" "$@"
+fi

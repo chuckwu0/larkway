@@ -1,0 +1,60 @@
+{
+  "name": "larkway",
+  "version": "0.3.6",
+  "description": "Thin bridge: Feishu thread to local Claude Code CLI",
+  "license": "MIT",
+  "author": "Chuck Wu (chuckwu0)",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/chuckwu0/larkway.git"
+  },
+  "homepage": "https://github.com/chuckwu0/larkway#readme",
+  "bugs": {
+    "url": "https://github.com/chuckwu0/larkway/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "type": "module",
+  "bin": {
+    "larkway": "bin/larkway"
+  },
+  "scripts": {
+    "start": "tsx src/main.ts",
+    "cli": "tsx src/cli/index.ts",
+    "start:supervised": "bin/start-bridge.sh",
+    "dev": "tsx watch src/main.ts",
+    "build": "node scripts/build.mjs",
+    "prepack": "node scripts/build.mjs",
+    "typecheck": "tsc --noEmit",
+    "check:links": "bash bin/check-doc-links.sh",
+    "test": "vitest run",
+    "test:v0.3": "bash bin/v0.3-local-acceptance.sh"
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "@types/js-yaml": "^4.0.9",
+    "@types/node": "^20.0.0",
+    "@types/qrcode": "^1.5.6",
+    "@vitest/coverage-v8": "^4.1.7",
+    "esbuild": "^0.28.0",
+    "tsx": "^4.7.0",
+    "typescript": "^5.4.0",
+    "vitest": "^4.1.7",
+    "@larksuiteoapi/node-sdk": "file:vendor/larksuiteoapi-node-sdk",
+    "dotenv": "^16.4.0",
+    "js-yaml": "^4.1.1",
+    "qrcode": "^1.5.4",
+    "qrcode-terminal": "^0.12.0",
+    "zod": "^3.22.0"
+  },
+  "packageManager": "pnpm@9.0.0",
+  "engines": {
+    "node": ">=20"
+  },
+  "files": [
+    "dist/",
+    "bin/larkway",
+    "README.md"
+  ]
+}

@@ -1,0 +1,146 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Larkway 看板</title>
+    <!-- 浏览器标签页图标:Larkway arc 品牌标(indigo 徽章 + 白弧) -->
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <link rel="stylesheet" href="/style.css" />
+    <script>
+      // Token injected by the server when it renders index.html.
+      // If the placeholder survives (file served raw), app.js falls back to ?token=.
+      window.__LARKWAY_TOKEN__ = "__LARKWAY_TOKEN__";
+    </script>
+  </head>
+  <body class="lk-root">
+    <!-- ───────────────────────── 顶栏(HeaderCentered · 方案 B) ───────────────────────── -->
+    <header class="topbar">
+      <!-- 左:Arc 品牌标记(indigo)+ Larkway + 看板 + 版本药丸 -->
+      <div class="brand">
+        <span class="brand-mark" aria-hidden="true">
+          <svg viewBox="0 0 24 24" width="22" height="22">
+            <path d="M5 18 C 8 11, 13 8, 19 6" fill="none" stroke="#4f46e5" stroke-width="2.2" stroke-linecap="round" />
+            <circle cx="19" cy="6" r="2.5" fill="#4f46e5" />
+            <circle cx="5" cy="18" r="2.1" fill="none" stroke="#334155" stroke-width="1.9" />
+          </svg>
+        </span>
+        <span class="brand-word">Larkway</span>
+        <span class="brand-sub">看板</span>
+        <span class="brand-ver" id="brand-ver" title="Larkway 版本"></span>
+      </div>
+
+      <!-- 中:绝对居中分段控件(本机 可改 / 公司中心库 只读) -->
+      <nav class="context-switch" id="context-switch" aria-label="上下文切换">
+        <button class="ctx-btn is-active" data-mode="local" id="ctx-local" type="button">
+          本机 <span class="ctx-hint">可改</span>
+        </button>
+        <button class="ctx-btn" data-mode="central" id="ctx-central" type="button" disabled>
+          公司中心库 <span class="ctx-hint">只读</span>
+        </button>
+      </nav>
+
+      <!-- 右:本机服务指示器(LkServiceIndicator,renderServiceIndicator 注入)
+           —— 它统一承担顶栏的服务/状态呈现;旧的整机 status-pill 已并入此处。 -->
+      <div class="bridge-indicator" id="bridge-indicator" title="本机服务状态"></div>
+    </header>
+
+    <!-- 来源条:连接中心库后,在主体上方显示「来自 <仓库>@<分支> · 最近同步 N 分钟前」+ 同步入口。
+         由 app.js renderCentralSourceBar() 注入内容;仅 central 已连接态显示。 -->
+    <div class="central-source-bar" id="central-source-bar" hidden></div>
+
+    <!-- ───────────────────────── 主体:300px 名册侧栏 + 1fr 详情 ───────────────────────── -->
+    <main class="layout">
+      <!-- 左:助手名册 -->
+      <aside class="sidebar" id="sidebar">
+        <div class="sidebar-head">
+          <div class="roster-eyebrow">助手名册</div>
+          <div class="roster-count" id="roster-count">
+            <button class="roster-refresh" id="btn-refresh" type="button" title="刷新列表" aria-label="刷新列表">
+              <svg class="icon icon-sm" viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M3 12a9 9 0 0 1 15-6.7L21 8" />
+                <path d="M21 3v5h-5" />
+                <path d="M21 12a9 9 0 0 1-15 6.7L3 16" />
+                <path d="M3 21v-5h5" />
+              </svg>
+            </button>
+            <span id="roster-count-text">助手列表</span>
+          </div>
+          <!-- BL-18: 重启中/超时 名册头部状态行(by JS) -->
+          <div id="roster-restart-status" hidden></div>
+        </div>
+
+        <ul class="bot-list" id="bot-list">
+          <li class="empty" id="bot-list-empty">
+            <span class="list-loading"><span class="spinner"></span> 正在加载助手…</span>
+          </li>
+        </ul>
+
+        <!-- 底部:添加新助手(indigo)+ 从公司中心库拉取(中心可用时由 app.js 显示) -->
+        <div class="sidebar-actions" id="sidebar-actions">
+          <button class="btn btn-add" id="btn-add" type="button">
+            <svg class="icon icon-sm" viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M12 5v14M5 12h14" />
+            </svg>
+            添加新助手
+          </button>
+          <button class="btn btn-block" id="btn-sync" type="button">
+            <svg class="icon icon-sm" viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M12 3v12" />
+              <path d="m8 11 4 4 4-4" />
+              <path d="M4 21h16" />
+            </svg>
+            从公司中心库拉取
+          </button>
+        </div>
+      </aside>
+
+      <!-- 右:详情 / 编辑区 -->
+      <section class="detail" id="detail">
+        <!-- 空态(名册有助手但未选中):内容由 app.js renderDetailPlaceholder() 按 mode 填充 -->
+        <div class="detail-placeholder" id="detail-placeholder"></div>
+        <!-- detail content injected by app.js renderBotDetail() -->
+      </section>
+    </main>
+
+    <!-- toast -->
+    <div class="toast" id="toast" hidden></div>
+
+    <!-- 添加新助手 modal(扫码优先 · Block A) -->
+    <div class="modal-backdrop" id="onboard-backdrop" hidden>
+      <div
+        class="modal onboard-modal"
+        id="onboard-modal"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="onboard-modal-title"
+      >
+        <!-- 整张卡内容由 app.js renderOnboardScan/renderOnboardNameForm/etc 注入 -->
+      </div>
+    </div>
+
+    <!-- 连接公司中心库 modal(form → connecting → connected/failed) -->
+    <div class="modal-backdrop" id="connect-backdrop" hidden>
+      <div
+        class="modal connect-modal"
+        id="connect-modal"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="connect-header"
+      >
+        <!-- 整张卡内容由 app.js renderConnectFlow() 注入(各 phase 自带 header/footer) -->
+      </div>
+    </div>
+
+    <!-- 同步预览 modal -->
+    <div class="modal-backdrop" id="modal-backdrop" hidden>
+      <div class="modal" id="modal" role="dialog" aria-modal="true" aria-labelledby="modal-header">
+        <div class="modal-header" id="modal-header">同步预览</div>
+        <div class="modal-body" id="modal-body"></div>
+        <div class="modal-footer" id="modal-footer"></div>
+      </div>
+    </div>
+
+    <script type="module" src="/app.js"></script>
+  </body>
+</html>

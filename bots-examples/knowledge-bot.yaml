@@ -1,0 +1,82 @@
+# ============================================================
+# Example bot: READ-ONLY knowledge / Q&A bot
+#
+# V0.3 key fields:
+#   runtime: agent_workspace  — V0.3 layout; bridge passes a long-lived
+#                               workspace and per-topic session dir; agent
+#                               decides how to clone/read the repo.
+#   backend: claude           — uses local Claude Code subprocess.
+#   read_only: true           — skip per-thread worktree + node_modules;
+#                               agent works from a shared read-only repo
+#                               cache (scratch dir, no separate branch).
+#
+# Copy to  ~/.larkway/bots/<your-id>.yaml  and fill in real values.
+# All sensitive values (secrets, tokens) go in .env — never in yaml.
+# ============================================================
+
+# Unique kebab-case identifier. Used as the session-store key.
+id: knowledge-bot
+
+# Display name shown in Feishu card title prefix.
+name: Knowledge Bot
+
+# One-sentence capability description injected into peer prompts
+# so other bots know when to @ this one.
+description: Answers code and architecture questions by reading the repo; never writes or commits.
+
+# Feishu app credentials — get from Feishu Open Platform → App → Credentials.
+app_id: cli_xxxxxxxxxxxxxxxx
+app_secret_env: KNOWLEDGE_BOT_APP_SECRET   # env var name; value stays in .env
+
+# The bot's own open_id inside the Feishu group(s) it joins.
+# Find it: Feishu Open Platform → Bot → "Bot's open_id in group" field,
+# or from a WS mention event's `mentioned_list[].id.open_id`.
+bot_open_id: ou_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+
+# Optional chat allowlist. Leave empty [] to respond in any group the bot joins.
+# Fill with specific chat_ids to restrict to those groups only.
+chats: []
+
+# Peer bot ids this bot may @ for handoff (must match ids of other loaded bots).
+peers: []
+
+# Repo pointer(s). With runtime: agent_workspace these are pointer-only —
+# the agent decides whether/when to clone and where.
+# With read_only: true the bridge skips per-thread worktree setup.
+repos:
+  - slug: acme/your-repo
+    branch: main
+    url: https://gitlab.example.com/acme/your-repo.git
+
+# Resource/worktree hint (NOT a git permission model).
+# true = bridge skips per-thread worktree + node_modules install;
+# the agent gets a scratch dir and the warm repo cache path instead.
+# Actual git read/write is determined solely by the GitLab token scope.
+read_only: true
+
+# V0.3 runtime layout.
+# "agent_workspace": bridge creates a long-lived agent workspace and
+# per-topic session artifact dir; agent orchestrates everything else.
+runtime: agent_workspace
+
+# Agent backend subprocess.
+# "claude" = local Claude Code (reads ~/.claude/.credentials.json).
+backend: claude
+
+# L2 Agent Memory file (relative to the bots/ directory at runtime).
+# Loaded at startup and injected as <agent-memory> role preamble.
+# Keep it thin: WHO the bot is + what it must NOT do.
+# Project workflow and toolchain details live in the repo's own CLAUDE.md / .claude/skills/.
+memory_file: knowledge-bot.memory.md
+
+# Max consecutive turns before the bot stops and notifies the user.
+turn_taking_limit: 8
+
+# lark-cli named profile for WS subscribe (required in multi-bot setups).
+# Run: lark-cli config init --name <profile-name> --app-id <app_id> ...
+lark_cli_profile: knowledge-bot-profile
+
+# Optional: env var name holding this bot's GitLab PAT.
+# For a pure read-only Q&A bot a read_api-scoped token is sufficient.
+# Omit to inherit the global GITLAB_TOKEN from .env.
+gitlab_token_env: KNOWLEDGE_BOT_GITLAB_TOKEN

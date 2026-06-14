@@ -1,0 +1,46 @@
+{
+  "_comment": "Larkway host-level config — copy to ~/.larkway/config.json and fill in real values.",
+  "_note": "Lark / GitLab credentials belong in .env (project root), not here. This file holds only non-sensitive, globally shareable host-level conventions.",
+  "_note_bots": "Per-bot settings (repo slug, branch, app_id, token env vars, etc.) live in ~/.larkway/bots/<id>.yaml — one file per bot. This file contains only host-wide conventions.",
+
+  "conventions": {
+    "_comment_devHostname": "Your machine's LAN IP or hostname. Teammates on the same VPN reach dev previews via this address. REQUIRED — change before use.",
+    "devHostname": "<your-laptop-LAN-IP>",
+
+    "_comment_portRange": "Port range the agent may use when starting a dev server. Bridge picks the first available port in this range.",
+    "portRangeStart": 3001,
+    "portRangeEnd": 3050
+  },
+
+  "permissions": {
+    "_comment_allowExtra": "Stack-specific Bash permissions merged into the Claude backend's worktree .claude/settings.local.json. Codex backend uses its own sandbox flags. Adjust to match your project stack: Rails → Bash(bundle *), Go → Bash(go *), Python → Bash(uv *), etc.",
+    "allowExtra": [
+      "Bash(pnpm *)",
+      "Bash(npm *)",
+      "Bash(node *)"
+    ]
+  },
+
+  "_comment_chats": "Optional host-level chat list for display/logging. Per-bot chat allowlists are set in each bot's yaml (chats field). Leave empty or omit if you manage allowlists per-bot.",
+  "chats": [
+    {
+      "label": "My Team × Larkway",
+      "chatId": "<oc_your_chat_id>",
+      "purpose": "production",
+      "description": "Main team group where members @ bots for real tasks"
+    },
+    {
+      "label": "Larkway Test",
+      "chatId": "<oc_your_test_chat_id>",
+      "purpose": "test",
+      "description": "Local E2E testing group — do not send real tasks here"
+    }
+  ],
+
+  "_comment_centralConfig": "Optional: V0.3 central config repo for multi-host deployments. When set, `larkway sync` pulls bot configs from this repo before restart. Omit this block entirely for single-host setups.",
+  "centralConfig": {
+    "repo": "git@github.com:your-org/larkway-bots.git",
+    "branch": "main",
+    "path": "bots"
+  }
+}

@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# 提交前查文档死链(指向仓库内不存在的本地文件)。装一次:git config core.hooksPath .githooks
+# 跳过本钩:git commit --no-verify
+exec bash "$(git rev-parse --show-toplevel)/bin/check-doc-links.sh"

@@ -1,0 +1,52 @@
+# Node.js
+node_modules/
+
+# TypeScript build output
+dist/
+*.tsbuildinfo
+
+# Larkway runtime data (本地状态,不入仓)
+data/
+~/.larkway/
+*.local.json
+
+# IDE
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Logs
+*.log
+logs/
+output/
+tmp/
+
+# Secrets
+.env
+.env.*
+!.env.example
+# Guard against accidentally committing production env backups
+.env.bak*
+.env.prod*
+.env.production*
+config.local.json
+
+# Bot configs are per-deployment (TEST app yamls live in bots-examples/ for reference;
+# real deployments populate bots/*.yaml at runtime, never committed)
+bots/*.yaml
+bots/*.yml
+bots/*.memory.md
+!bots/.gitkeep
+.agents/
+skills-lock.json
+.claude/
+
+# npm pack 产物(每次 build 重生成,不入库)
+*.tgz
+
+# Private / internal files (company-specific, not for OSS)
+private/
+
+# Local overrides
+*.local

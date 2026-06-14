@@ -1,0 +1,5 @@
+{
+  "//": "Build config for the distributable package: extends tsconfig.json but EXCLUDES test files so they (and their fixtures with internal repo names) never compile into dist/ and ship. typecheck still uses tsconfig.json (which includes tests).",
+  "extends": "./tsconfig.json",
+  "exclude": ["node_modules", "dist", "**/*.test.ts", "**/*.spec.ts"]
+}

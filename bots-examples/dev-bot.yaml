@@ -1,0 +1,72 @@
+# ============================================================
+# Example bot: WRITE / coding bot (opens MRs, never auto-merges)
+#
+# V0.3 key fields:
+#   runtime: agent_workspace  — V0.3 layout; bridge passes a long-lived
+#                               workspace and per-topic session dir; agent
+#                               decides how to clone, branch, and worktree.
+#   backend: codex            — uses OpenAI Codex subprocess.
+#                               Change to "claude" if using Claude Code.
+#
+# Copy to  ~/.larkway/bots/<your-id>.yaml  and fill in real values.
+# All sensitive values (secrets, tokens) go in .env — never in yaml.
+# ============================================================
+
+# Unique kebab-case identifier.
+id: dev-bot
+
+# Display name shown in Feishu card title prefix.
+name: Dev Bot
+
+# One-sentence capability description injected into peer prompts.
+description: Implements features and bug fixes in code, opens MRs for human review; never auto-merges.
+
+# Feishu app credentials.
+app_id: cli_yyyyyyyyyyyyyy
+app_secret_env: DEV_BOT_APP_SECRET   # env var name; value stays in .env
+
+# The bot's own open_id inside the Feishu group(s) it joins.
+bot_open_id: ou_yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy
+
+# Optional chat allowlist. Empty = respond in any group the bot joins.
+chats: []
+
+# Peer bot ids this bot may @ for handoff.
+# Example: after opening an MR, @ the knowledge-bot to answer review questions.
+peers:
+  - knowledge-bot
+
+# Repo pointer(s). With runtime: agent_workspace these are pointer-only —
+# the agent decides when to clone, which branch to create, etc.
+repos:
+  - slug: acme/web-app
+    branch: main
+    url: https://gitlab.example.com/acme/web-app.git
+
+# false (default) — dev bot needs full worktree access.
+read_only: false
+
+# V0.3 runtime layout.
+runtime: agent_workspace
+
+# Agent backend subprocess.
+# "codex" = OpenAI Codex CLI (reads CODEX_API_KEY from env).
+# Switch to "claude" to use local Claude Code instead.
+backend: codex
+
+# L2 Agent Memory (relative to the bots/ directory at runtime).
+memory_file: dev-bot.memory.md
+
+# Max consecutive turns before the bot stops and notifies the user.
+turn_taking_limit: 15
+
+# lark-cli named profile for WS subscribe.
+lark_cli_profile: dev-bot-profile
+
+# Env var name holding this bot's GitLab PAT (api-scoped for MR creation).
+gitlab_token_env: DEV_BOT_GITLAB_TOKEN
+
+# Optional git author identity for commits made in this bot's worktrees.
+git_identity:
+  name: Dev Bot
+  email: dev-bot@example.com

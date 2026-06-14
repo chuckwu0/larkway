@@ -1,0 +1,53 @@
+# .npmignore — belt-and-suspenders guard for npm pack / publish.
+# The primary control is the "files" whitelist in package.json.
+# This file catches anything the whitelist might not exclude explicitly.
+
+# Internal docs and deployment
+docs/
+CLAUDE.md
+AGENTS.md
+
+# Example bot configs (contain placeholder values but should not ship)
+bots-examples/
+
+# Source TypeScript (compiled dist/ ships instead)
+src/
+
+# Deployment and ops scripts
+bin/deploy.sh
+bin/server-deploy.sh
+bin/server-deploy-*.sh
+bin/start-bridge.sh
+bin/start-bridge-server.sh
+bin/local-e2e.sh
+
+# Tests (source AND compiled — build emits dist/**/*.test.js which carry
+# fixtures with internal repo names; keep them out of the package)
+*.test.ts
+*.spec.ts
+*.test.js
+*.spec.js
+vitest.config.ts
+
+# Claude / agent internals
+.claude/
+.agents/
+skills-lock.json
+MEMORY.md
+
+# Lock file (resolved by installer on-the-fly)
+pnpm-lock.yaml
+
+# Runtime data and secrets
+.env
+.env.*
+!.env.example
+bots/
+data/
+logs/
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+*.swp
