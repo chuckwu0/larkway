@@ -137,20 +137,21 @@ async function runV2Mode({
       continue;
     }
     if (bot.runtime === "agent_workspace") {
-      if (bot.repos.length > 0 && !bot.gitlab_token_env) {
+      const _agentTokenEnvName = bot.git_token_env ?? bot.gitlab_token_env;
+      if (bot.repos.length > 0 && !_agentTokenEnvName) {
         console.error(
           `[larkway] SKIPPING bot "${bot.id}": runtime=agent_workspace has repo pointers ` +
-            "but no gitlab_token_env. v0.3 workspace repo bots must reference an explicit " +
+            "but no git_token_env (or gitlab_token_env). v0.3 workspace repo bots must reference an explicit " +
             "per-agent token env name; they do not inherit global GITLAB_TOKEN.",
         );
         continue;
       }
-      if (bot.gitlab_token_env) {
-        const gitlabToken = process.env[bot.gitlab_token_env];
-        if (gitlabToken == null || gitlabToken === "") {
+      if (_agentTokenEnvName) {
+        const agentToken = process.env[_agentTokenEnvName];
+        if (agentToken == null || agentToken === "") {
           console.error(
             `[larkway] SKIPPING bot "${bot.id}": runtime=agent_workspace declares ` +
-              `gitlab_token_env="${bot.gitlab_token_env}", but that env var is unset/empty. ` +
+              `token env "${_agentTokenEnvName}", but that env var is unset/empty. ` +
               "Set the real token in ~/.larkway/.env; v0.3 workspace bots do not fall back to global GITLAB_TOKEN.",
           );
           continue;
@@ -208,17 +209,19 @@ async function runV2Mode({
   for (const bot of healthyBots) {
     const appSecret = process.env[bot.app_secret_env]!;
 
-    // V2: per-bot GitLab token (optional). When yaml field present, read env var
+    // V2: per-bot git token (optional). Prefer git_token_env, fall back to
+    // gitlab_token_env (legacy alias). When a yaml field is present, read env var
     // value and pass through to handler → runner → claude subprocess GITLAB_TOKEN.
-    // Legacy mode without gitlab_token_env inherits process.env.GITLAB_TOKEN as-is.
-    // V0.3 agent_workspace without gitlab_token_env masks the global token with
+    // Legacy mode without a token env inherits process.env.GITLAB_TOKEN as-is.
+    // V0.3 agent_workspace without a token env masks the global token with
     // an empty value so local host credentials never leak into a workspace agent.
-    const gitlabToken = bot.gitlab_token_env != null
-      ? process.env[bot.gitlab_token_env]
+    const tokenEnvName = bot.git_token_env ?? bot.gitlab_token_env;
+    const gitlabToken = tokenEnvName != null
+      ? process.env[tokenEnvName]
       : undefined;
-    if (bot.gitlab_token_env != null && (gitlabToken == null || gitlabToken === "")) {
+    if (tokenEnvName != null && (gitlabToken == null || gitlabToken === "")) {
       console.warn(
-        `[larkway] bot "${bot.id}" declares gitlab_token_env="${bot.gitlab_token_env}" ` +
+        `[larkway] bot "${bot.id}" declares token env "${tokenEnvName}" ` +
           `but that env var is unset/empty — falling back to global GITLAB_TOKEN.`,
       );
     }
@@ -337,7 +340,7 @@ async function runV2Mode({
       portRangeStart: configJson.conventions.portRangeStart,
       portRangeEnd: configJson.conventions.portRangeEnd,
       readOnly: bot.read_only,
-      gitlabTokenEnvName: bot.gitlab_token_env,
+      gitlabTokenEnvName: tokenEnvName,
     };
 
     // Inject gitlab_token whenever one is configured.
@@ -370,6 +373,7 @@ async function runV2Mode({
         git_identity: bot.git_identity,
         backend: bot.backend,
         runtime: bot.runtime,
+        git_token_env: bot.git_token_env,
         gitlab_token_env: bot.gitlab_token_env,
       },
       gitlabToken: effectiveGitlabToken,

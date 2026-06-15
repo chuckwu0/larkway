@@ -434,9 +434,9 @@ export async function createBotFromCreds(
 
   // Resolve gitlab_token_value → write secret + set env name (non-empty only).
   const gitlabTokenValue = form.gitlab_token_value?.trim() ?? "";
-  let gitlab_token_env: string | undefined;
+  let git_token_env: string | undefined;
   if (gitlabTokenValue) {
-    gitlab_token_env = `LARKWAY_BOT_${botId.toUpperCase().replace(/-/g, "_")}_GITLAB_TOKEN`;
+    git_token_env = `LARKWAY_BOT_${botId.toUpperCase().replace(/-/g, "_")}_GIT_TOKEN`;
   }
 
   const draft: BotConfig = {
@@ -450,7 +450,7 @@ export async function createBotFromCreds(
     peers: [],
     repos,
     turn_taking_limit: form.turn_taking_limit ?? 10,
-    ...(gitlab_token_env ? { gitlab_token_env } : {}),
+    ...(git_token_env ? { git_token_env } : {}),
     memory_file: memoryFile,
     read_only: false,
     runtime: "agent_workspace",
@@ -466,9 +466,9 @@ export async function createBotFromCreds(
 
   // 4. write secrets (0600) → yaml → memory (validation already passed)
   await writeSecretTo(envPath, app_secret_env, creds.client_secret);
-  // gitlab token: write to .env only when provided (non-empty). Never returned/logged.
-  if (gitlab_token_env && gitlabTokenValue) {
-    await writeSecretTo(envPath, gitlab_token_env, gitlabTokenValue);
+  // git token: write to .env only when provided (non-empty). Never returned/logged.
+  if (git_token_env && gitlabTokenValue) {
+    await writeSecretTo(envPath, git_token_env, gitlabTokenValue);
   }
   await atomicWrite(path.join(botsDir, `${botId}.yaml`), renderBotYaml(config));
   await atomicWrite(
@@ -489,7 +489,7 @@ export async function createBotFromCreds(
       name: config.name,
       description: config.description,
       chats: config.chats,
-      gitlab_token_env: config.gitlab_token_env,
+      gitlab_token_env: config.git_token_env ?? config.gitlab_token_env,
     },
     taskDescription: form.task_description?.trim() || description,
     agentMemory: memoryContent,
@@ -500,7 +500,7 @@ export async function createBotFromCreds(
       suggestedPath: path.join(reposPath, repo.slug.split("/").pop() ?? repo.slug),
     })),
     permissionRequests: permissionItemsFromCapabilities(
-      onboardPermissionRequests({ chats, repos, gitlab_token_env }, form.permission_requests ?? []),
+      onboardPermissionRequests({ chats, repos, gitlab_token_env: git_token_env }, form.permission_requests ?? []),
     ),
     humanGates: form.human_gates ?? [],
   });

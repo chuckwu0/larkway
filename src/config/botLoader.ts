@@ -147,13 +147,22 @@ export const BotConfigSchema = z.object({
   lark_cli_profile: z.string().min(1).optional(),
 
   /**
-   * Env-var *name* (not value) that holds this bot's GitLab PAT.
+   * Env-var *name* (not value) that holds this bot's Git PAT.
    * Read from process.env at startup and injected as GITLAB_TOKEN into the
-   * claude subprocess env, so MRs/git ops use the bot's own GitLab account.
-   * When absent, the claude subprocess inherits process.env.GITLAB_TOKEN
+   * agent subprocess env, so MRs/git ops use the bot's own account.
+   * When absent, the subprocess inherits process.env.GITLAB_TOKEN
    * (V1 single-bot behavior — one global token).
+   *
+   * Preferred field name; `gitlab_token_env` below is the backward-compat alias.
    */
-  gitlab_token_env: z.string().min(1).optional(),
+  git_token_env: z.string().min(1).optional(),   // preferred: generic git PAT env-var name
+
+  /**
+   * @deprecated Backward-compat alias for `git_token_env`. If both are present,
+   * main.ts prefers `git_token_env`. Old bot yamls with this field continue to
+   * work without changes.
+   */
+  gitlab_token_env: z.string().min(1).optional(),  // compat alias (legacy)
 
   /**
    * L2 Agent Memory (职能定义) — filename relative to the bots/ directory,

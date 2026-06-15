@@ -145,8 +145,8 @@ describe("createBotFromCreds", () => {
     const request = await readFile(path.join(workspace, "permissions-request.md"), "utf8");
 
     expect(request).toContain("Feishu chat allowlist: oc_room1");
-    expect(request).toContain("GitLab repo pointer: chuckwu0/larkway (main)");
-    expect(request).toContain(`LARKWAY_BOT_${botId.toUpperCase().replace(/-/g, "_")}_GITLAB_TOKEN`);
+    expect(request).toContain("Git repo pointer: chuckwu0/larkway (main)");
+    expect(request).toContain(`LARKWAY_BOT_${botId.toUpperCase().replace(/-/g, "_")}_GIT_TOKEN`);
     expect(request).toContain("deploy/restart");
     expect(request).toContain("external message to Feishu");
     expect(request).not.toContain("glpat-onboard-secret-xyz");
@@ -241,12 +241,12 @@ describe("createBotFromCreds", () => {
     expect(config.chats).toEqual(["oc_primary", "oc_secondary"]);
   });
 
-  it("gitlab_token_value: non-empty → writes .env secret + sets gitlab_token_env", async () => {
+  it("gitlab_token_value: non-empty → writes .env secret + sets git_token_env (new field)", async () => {
     const form: OnboardForm = {
       name: "Token Bot",
       gitlab_token_value: "glpat-supersecret-abc123",
       task_description: "Operate through Feishu",
-      permission_requests: ["GitLab write/MR", "Local shell tests"],
+      permission_requests: ["Git write/MR", "Local shell tests"],
       human_gates: ["deploy/restart"],
       repos: [
         {
@@ -258,8 +258,8 @@ describe("createBotFromCreds", () => {
     };
 
     const { botId, config } = await createBotFromCreds({ creds: FAKE_CREDS, form, botsDir, envPath });
-    const expectedEnvName = `LARKWAY_BOT_${botId.toUpperCase().replace(/-/g, "_")}_GITLAB_TOKEN`;
-    expect(config.gitlab_token_env).toBe(expectedEnvName);
+    const expectedEnvName = `LARKWAY_BOT_${botId.toUpperCase().replace(/-/g, "_")}_GIT_TOKEN`;
+    expect(config.git_token_env).toBe(expectedEnvName);
 
     // Secret written to .env.
     const envRaw = await readFile(envPath, "utf-8");
@@ -272,7 +272,7 @@ describe("createBotFromCreds", () => {
 
     const workspace = path.join(dir, "agents", botId, "workspace");
     const permissions = await readFile(path.join(workspace, "permissions-request.md"), "utf-8");
-    expect(permissions).toContain("GitLab write/MR");
+    expect(permissions).toContain("Git write/MR");
     expect(permissions).toContain("type=write");
     expect(permissions).toContain("deploy/restart");
     expect(permissions).toContain(expectedEnvName);
@@ -285,27 +285,27 @@ describe("createBotFromCreds", () => {
     await expect(readFile(path.join(workspace, "tasks", "_creation", "task.md"), "utf-8")).rejects.toThrow();
     const granted = await readFile(path.join(workspace, "permissions-granted.md"), "utf-8");
     expect(granted).toContain("This file is an audit note, not a startup gate.");
-    expect(granted).toContain("GitLab repo pointer: chuckwu0/larkway (main)");
+    expect(granted).toContain("Git repo pointer: chuckwu0/larkway (main)");
     expect(granted).toContain(`env=${expectedEnvName}`);
   });
 
-  it("gitlab_token_value: empty / absent → no gitlab_token_env on new bot", async () => {
+  it("gitlab_token_value: empty / absent → no git_token_env on new bot", async () => {
     const form: OnboardForm = {
       name: "No Token Bot",
       gitlab_token_value: "", // explicitly empty
     };
     const { config } = await createBotFromCreds({ creds: FAKE_CREDS, form, botsDir, envPath });
-    expect(config.gitlab_token_env).toBeUndefined();
+    expect(config.git_token_env).toBeUndefined();
   });
 
-  it("gitlab_token_value absent → no gitlab_token_env", async () => {
+  it("gitlab_token_value absent → no git_token_env", async () => {
     const { config } = await createBotFromCreds({
       creds: FAKE_CREDS,
       form: { name: "Pure QA Bot" }, // no gitlab_token_value
       botsDir,
       envPath,
     });
-    expect(config.gitlab_token_env).toBeUndefined();
+    expect(config.git_token_env).toBeUndefined();
     expect(config.repos).toEqual([]);
     expect(config.turn_taking_limit).toBe(10); // schema default
   });

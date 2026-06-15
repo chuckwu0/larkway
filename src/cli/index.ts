@@ -18,7 +18,6 @@ import { createRequire } from "node:module";
 import * as ui from "./ui.js";
 import * as botsStore from "./botsStore.js";
 import * as hostConfig from "./hostConfig.js";
-import * as centralStore from "./centralStore.js";
 import type { CliContext, CliFlags, CommandRun } from "./types.js";
 
 // Read package version at startup (synchronous; JSON, no async needed).
@@ -33,9 +32,6 @@ import { run as memoryRun } from "./commands/memory.js";
 import { run as permsRun } from "./commands/perms.js";
 import { run as lifecycleRun } from "./commands/lifecycle.js";
 import { run as updateRun } from "./commands/update.js";
-import { run as syncRun } from "./commands/sync.js";
-import { run as promoteRun } from "./commands/promote.js";
-import { run as centralRun } from "./commands/central.js";
 import { run as uiRun } from "./commands/ui.js";
 import { run as dogfoodRun } from "./commands/dogfood.js";
 
@@ -58,9 +54,6 @@ const COMMANDS: Record<string, CommandRun> = {
   status: lifecycleRun,
   logs: lifecycleRun,
   update: updateRun,
-  sync: syncRun,
-  promote: promoteRun,
-  central: centralRun,
   dogfood: dogfoodRun,
   ui: uiRun,
 };
@@ -79,9 +72,6 @@ const USAGE = `larkway — Feishu ↔ local CLI agent bridge host manager
   perms <id>             调 L1 暴露面 + 确认 workspace 权限 grant
   start|stop|status|logs 生命周期(status --deep / logs --follow)
   update                 pull + install + restart
-  sync                   从中心配置库拉 bots/(头部,A.2)
-  promote <id>           把本地 bot 晋升到中心配置库(A.2)
-  central set|show|unset 连接 / 查看 / 断开中心配置库(A.2)
   dogfood preflight|guide [id] v0.3 Phase 1 dogfood 前置验收 / 下一步指引
   ui                     启动轻量 Web UI 管理面(127.0.0.1 + token)
 
@@ -157,7 +147,6 @@ function buildContext(flags: CliFlags): CliContext {
     ui,
     botsStore,
     hostConfig,
-    centralStore,
     flags,
     cwd: process.cwd(),
   };

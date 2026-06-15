@@ -23,7 +23,6 @@ import path from "node:path";
 import * as ui from "../ui.js";
 import * as botsStore from "../botsStore.js";
 import * as hostConfig from "../hostConfig.js";
-import * as centralStore from "../centralStore.js";
 import type { CliContext } from "../types.js";
 
 // ---------------------------------------------------------------------------
@@ -44,7 +43,6 @@ function makeCtx(overrides: Partial<CliContext["flags"]> = {}): CliContext {
     ui,
     botsStore,
     hostConfig,
-    centralStore,
     flags: {
       json: false,
       nonInteractive: false,

@@ -253,7 +253,7 @@ async function runAdd(ctx: CliContext, args: string[]): Promise<number> {
   // ---- repos (optional, advanced) ----
   const repos: BotConfig["repos"] = [];
   if (flags.advanced) {
-    const repoSlug = await ui.prompt("GitLab repo slug (如 group/repo,留空=无 repo bot):", {
+    const repoSlug = await ui.prompt("Git repo slug (如 group/repo,留空=无 repo bot):", {
       default: setMap.get("repo_slug") ?? "",
       nonInteractive: flags.nonInteractive,
     });
@@ -262,7 +262,7 @@ async function runAdd(ctx: CliContext, args: string[]): Promise<number> {
         default: setMap.get("repo_branch") ?? "master",
         nonInteractive: flags.nonInteractive,
       });
-      const repoUrl = await ui.prompt("clone URL (可选,留空=用 GitLab 默认推导):", {
+      const repoUrl = await ui.prompt("clone URL (可选,留空=用默认 remote 推导):", {
         default: setMap.get("repo_url") ?? "",
         nonInteractive: flags.nonInteractive,
       });
@@ -290,7 +290,7 @@ async function runAdd(ctx: CliContext, args: string[]): Promise<number> {
     repos.length > 0 ? `LARKWAY_${id.toUpperCase().replace(/-/g, "_")}_GITLAB_TOKEN` : "";
   if (flags.advanced || setMap.has("gitlab_token_env") || repos.length > 0) {
     const rawGitlab = await ui.prompt(
-      "GitLab token 环境变量名(仅记录 KEY,真值写 ~/.larkway/.env):",
+      "Git access token 环境变量名(仅记录 KEY,真值写 ~/.larkway/.env):",
       {
         default: setMap.get("gitlab_token_env") ?? defaultGitlabTokenEnv,
         nonInteractive: flags.nonInteractive,
@@ -299,12 +299,12 @@ async function runAdd(ctx: CliContext, args: string[]): Promise<number> {
     if (rawGitlab && /^[A-Za-z_][A-Za-z0-9_]*$/.test(rawGitlab)) {
       gitlab_token_env = rawGitlab;
     } else if (rawGitlab) {
-      ui.failure(`gitlab_token_env 格式不合法: "${rawGitlab}"`);
+      ui.failure(`git_token_env 格式不合法: "${rawGitlab}"`);
       return 1;
     }
   }
   if (repos.length > 0 && !gitlab_token_env) {
-    ui.failure("agent_workspace repo bot 必须声明 gitlab_token_env;v0.3 不继承全局 GITLAB_TOKEN。");
+    ui.failure("agent_workspace repo bot 必须声明 git_token_env(或 gitlab_token_env);v0.3 不继承全局 GITLAB_TOKEN。");
     return 1;
   }
 
@@ -322,7 +322,7 @@ async function runAdd(ctx: CliContext, args: string[]): Promise<number> {
   }
 
   const permissionRequestsRaw = await ui.prompt(
-    "需要哪些权限?(分号分隔,如 GitLab read;GitLab write/MR;local shell):",
+    "需要哪些权限?(分号分隔,如 Git read;Git write/MR;local shell):",
     {
       default: setMap.get("permission_requests") ?? "",
       nonInteractive: flags.nonInteractive,
@@ -529,7 +529,7 @@ async function runEdit(ctx: CliContext, args: string[]): Promise<number> {
         .map((p) => p.trim())
         .filter(Boolean);
 
-      const rawGitlab = await ui.prompt("gitlab_token_env (留空=保留原值):", {
+      const rawGitlab = await ui.prompt("git_token_env (留空=保留原值):", {
         default: config.gitlab_token_env ?? "",
       });
       gitlab_token_env = rawGitlab || undefined;
@@ -710,7 +710,7 @@ function permissionSurfaceKey(config: BotConfig): string {
       branch: repo.branch,
       url: repo.url ?? "",
     })).sort((a, b) => a.slug.localeCompare(b.slug)),
-    gitlab_token_env: config.gitlab_token_env ?? "",
+    git_token_env: config.git_token_env ?? config.gitlab_token_env ?? "",
   });
 }
 
@@ -787,10 +787,10 @@ function defaultPermissionRequests(input: {
     items.push(`Feishu chat allowlist: ${input.chats.join(", ")}`);
   }
   for (const repo of input.repos) {
-    items.push(`GitLab repo pointer: ${repo.slug} (${repo.branch})`);
+    items.push(`Git repo pointer: ${repo.slug} (${repo.branch})`);
   }
   if (input.gitlab_token_env) {
-    items.push(`GitLab token env name: ${input.gitlab_token_env}`);
+    items.push(`Git access token env name: ${input.gitlab_token_env}`);
   }
   items.push("Local shell inside the Agent Workspace for task execution and verification");
   return items;

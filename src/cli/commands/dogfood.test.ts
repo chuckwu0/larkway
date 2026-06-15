@@ -6,7 +6,6 @@ import { mkdtemp } from "node:fs/promises";
 import { run } from "./dogfood.js";
 import * as botsStoreReal from "../botsStore.js";
 import * as hostConfigReal from "../hostConfig.js";
-import * as centralStoreReal from "../centralStore.js";
 import * as uiReal from "../ui.js";
 import type { CliContext } from "../types.js";
 
@@ -93,7 +92,6 @@ function makeCtx(captureJson: unknown[] = []): CliContext {
         return null;
       },
     },
-    centralStore: centralStoreReal,
     flags: { json: true, nonInteractive: true, advanced: false },
     cwd: path.join(root, "source-checkout"),
   };

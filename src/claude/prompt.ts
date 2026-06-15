@@ -537,7 +537,7 @@ export function renderPrompt(input: RenderPromptInput): string {
       `    lark-cli docs +get <doc-url>${profileFlag}`,
       "- 取本条消息的附件/内联图(post 内联图不在上面 attachments/images 里)、拉话题历史:",
       attachmentHelpLine,
-      "- glab / git / gitlab API",
+      "- glab / gh / git API",
       "- pnpm / npm",
       "",
       "**重要**:`thread_id` 就是话题首楼的 message_id。如果当前消息 attachments/feishu_doc_links 为空,说明运营把素材放在首楼,**先拉首楼看运营原始需求**,再决定下一步。",

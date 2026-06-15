@@ -15,7 +15,6 @@
 import type * as UI from "./ui.js";
 import type * as BotsStore from "./botsStore.js";
 import type * as HostConfig from "./hostConfig.js";
-import type * as CentralStore from "./centralStore.js";
 
 /** Global flags parsed from argv, shared across every command. */
 export interface CliFlags {
@@ -55,11 +54,6 @@ export interface CliContext {
   botsStore: typeof BotsStore;
   /** ~/.larkway/config.json + .env secret writes (src/cli/hostConfig.ts). */
   hostConfig: typeof HostConfig;
-  /**
-   * Central config repo ops (src/cli/centralStore.ts) — V2.2 §7 A.2.
-   * pull/plan/apply (sync) + stageAndCommit (promote). All git via execFile.
-   */
-  centralStore: typeof CentralStore;
   /** Parsed global flags. */
   flags: CliFlags;
   /** Process cwd at invocation (for detecting locally-cloned repos, etc.). */

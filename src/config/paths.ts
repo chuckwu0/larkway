@@ -38,8 +38,8 @@ export const LEGACY_BOT_ID = "v1-default";
  * logs entirely under that dir, never touching the real ~/.larkway). When unset,
  * defaults to ~/.larkway (so production behaviour is byte-for-byte unchanged).
  *
- * Every other path resolver (here, hostConfig, botsStore, main.ts, config.ts,
- * centralStore) derives from this so isolation is all-or-nothing, never partial.
+ * Every other path resolver (here, hostConfig, botsStore, main.ts, config.ts)
+ * derives from this so isolation is all-or-nothing, never partial.
  */
 export function larkwayHome(): string {
   const env = process.env.LARKWAY_HOME;

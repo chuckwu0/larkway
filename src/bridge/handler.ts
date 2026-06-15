@@ -454,7 +454,8 @@ export interface BridgeHandlerDeps {
     git_identity?: BotConfig["git_identity"];
     backend?: string;
     runtime?: "legacy" | "agent_workspace";
-    gitlab_token_env?: string;
+    git_token_env?: string;       // preferred: generic git PAT env-var name
+    gitlab_token_env?: string;    // compat alias (legacy)
   };
   /**
    * V2: L2 Agent Memory content (职能定义) — loaded from the bot's memory_file by
@@ -684,7 +685,7 @@ export class BridgeHandler {
           bot: {
             name: this.deps.botConfig?.name ?? "Larkway Agent",
             description: this.deps.botConfig?.description ?? "Local agent served through Larkway.",
-            gitlab_token_env: this.deps.botConfig?.gitlab_token_env,
+            gitlab_token_env: this.deps.botConfig?.git_token_env ?? this.deps.botConfig?.gitlab_token_env,
           },
           agentMemory: this.deps.agentMemory,
           repos: [

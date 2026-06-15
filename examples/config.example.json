@@ -35,12 +35,5 @@
       "purpose": "test",
       "description": "Local E2E testing group — do not send real tasks here"
     }
-  ],
-
-  "_comment_centralConfig": "Optional: V0.3 central config repo for multi-host deployments. When set, `larkway sync` pulls bot configs from this repo before restart. Omit this block entirely for single-host setups.",
-  "centralConfig": {
-    "repo": "git@github.com:your-org/larkway-bots.git",
-    "branch": "main",
-    "path": "bots"
-  }
+  ]
 }

@@ -94,7 +94,6 @@ async function buildCtx(flags?: Partial<{ json: boolean; nonInteractive: boolean
   const ui = await import("../ui.js");
   const botsStore = await import("../botsStore.js");
   const hostConfig = await import("../hostConfig.js");
-  const centralStore = await import("../centralStore.js");
 
   const effectiveFlags = {
     json: false,
@@ -113,7 +112,6 @@ async function buildCtx(flags?: Partial<{ json: boolean; nonInteractive: boolean
     ui,
     botsStore,
     hostConfig,
-    centralStore,
     flags: effectiveFlags,
     cwd: tmpDir,
   };
@@ -547,7 +545,7 @@ describe("larkway init --non-interactive --skip-register", () => {
       "--repo-slug=chuckwu0/larkway",
       "--repo-branch=main",
       "--gitlab-token-env=NEW_TOKEN_ENV",
-      "--permission-requests=GitLab write/MR",
+      "--permission-requests=Git write/MR",
       "--task-description=New task",
     ]);
 
@@ -559,14 +557,14 @@ describe("larkway init --non-interactive --skip-register", () => {
     const granted = await readFile(path.join(workspace, "permissions-granted.md"), "utf8");
 
     expect(request).toContain("Feishu chat allowlist: oc_new");
-    expect(request).toContain("GitLab repo pointer: chuckwu0/larkway (main)");
-    expect(request).toContain("GitLab token env name: NEW_TOKEN_ENV");
-    expect(request).toContain("GitLab write/MR");
+    expect(request).toContain("Git repo pointer: chuckwu0/larkway (main)");
+    expect(request).toContain("Git token env name: NEW_TOKEN_ENV");
+    expect(request).toContain("Git write/MR");
     expect(request).not.toContain("oc_old");
     expect(request).not.toContain("OLD_TOKEN_ENV");
     expect(granted).toContain("This file is an audit note, not a startup gate.");
     expect(granted).toContain("Feishu chat allowlist: oc_new");
-    expect(granted).toContain("GitLab repo pointer: chuckwu0/larkway (main)");
+    expect(granted).toContain("Git repo pointer: chuckwu0/larkway (main)");
     expect(granted).toContain("env=NEW_TOKEN_ENV");
     expect(granted).toContain("larkway init overwrite changed bot permission surface");
     expect(granted).not.toContain("confirmed env=OLD_TOKEN_ENV");
@@ -630,8 +628,8 @@ describe("larkway init --non-interactive --skip-register", () => {
     const workspace = path.join(tmpDir, ".larkway", "agents", "interactive-devops", "workspace");
     const request = await readFile(path.join(workspace, "permissions-request.md"), "utf8");
     expect(request).toContain("Develop and operate Larkway through Feishu");
-    expect(request).toContain("type=read GitLab read chuckwu0/larkway");
-    expect(request).toContain("type=write GitLab write/MR");
+    expect(request).toContain("type=read Git read chuckwu0/larkway");
+    expect(request).toContain("type=write Git write/MR");
     expect(request).toContain("type=write Local shell tests/build/checks");
     expect(request).toContain("type=read Server log/status read");
     expect(request).toContain("type=deploy deploy/restart gate=explicit-human-confirmation");

@@ -145,8 +145,8 @@ function renderPermissionsRequest(input: EnsureAgentWorkspaceInput): string {
     "",
     ...repoLines,
     input.bot.gitlab_token_env
-      ? `- GitLab token env name available after human setup: ${input.bot.gitlab_token_env}`
-      : "- GitLab token env name: pending human confirmation",
+      ? `- Git token env name available after human setup: ${input.bot.gitlab_token_env}`
+      : "- Git token env name: pending human confirmation",
     "",
     "## Human Gate",
     "",
@@ -267,11 +267,11 @@ function defaultWorkspacePermissionItems(input: EnsureAgentWorkspaceInput): Work
   }
   if (input.repos && input.repos.length > 0) {
     for (const repo of input.repos) {
-      capabilities.push(`GitLab repo pointer: ${repo.slug} (${repo.branch ?? "master"})`);
+      capabilities.push(`Git repo pointer: ${repo.slug} (${repo.branch ?? "master"})`);
     }
   }
   if (input.bot.gitlab_token_env) {
-    capabilities.push(`GitLab token env name: ${input.bot.gitlab_token_env}`);
+    capabilities.push(`Git token env name: ${input.bot.gitlab_token_env}`);
   }
   capabilities.push("Local shell inside the Agent Workspace for task execution and verification");
   return permissionItemsFromCapabilities(capabilities);
@@ -337,10 +337,10 @@ function renderDefaultPermissionGrantLines(input: EnsureAgentWorkspaceInput): st
     lines.push(`- type=read Feishu chat allowlist: ${chats.join(", ")} source=saved-agent-config`);
   }
   for (const repo of input.repos ?? []) {
-    lines.push(`- type=read GitLab repo pointer: ${repo.slug} (${repo.branch ?? "master"}) source=saved-agent-config`);
+    lines.push(`- type=read Git repo pointer: ${repo.slug} (${repo.branch ?? "master"}) source=saved-agent-config`);
   }
   if (input.bot.gitlab_token_env) {
-    lines.push(`- type=write GitLab write/MR env=${input.bot.gitlab_token_env} source=saved-agent-config`);
+    lines.push(`- type=write Git write/MR env=${input.bot.gitlab_token_env} source=saved-agent-config`);
   }
   const humanGates = input.humanGates && input.humanGates.length > 0
     ? input.humanGates
@@ -357,10 +357,10 @@ export function defaultPermissionCapabilitiesForBot(bot: WorkspacePermissionBot)
     items.push(`Feishu chat allowlist: ${bot.chats.join(", ")}`);
   }
   for (const repo of bot.repos) {
-    items.push(`GitLab repo pointer: ${repo.slug} (${repo.branch})`);
+    items.push(`Git repo pointer: ${repo.slug} (${repo.branch})`);
   }
   if (bot.gitlab_token_env) {
-    items.push(`GitLab token env name: ${bot.gitlab_token_env}`);
+    items.push(`Git token env name: ${bot.gitlab_token_env}`);
   }
   items.push("Local shell inside the Agent Workspace for task execution and verification");
   return items;

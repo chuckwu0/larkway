@@ -71,7 +71,7 @@ describe("ensureAgentWorkspace", () => {
     );
     expect(permissions).toContain("Feishu IM: receive mentions and reply in allowed chats");
     expect(permissions).toContain("Feishu chat allowlist: oc_test");
-    expect(permissions).toContain("GitLab repo pointer: chuckwu0/larkway (main)");
+    expect(permissions).toContain("Git repo pointer: chuckwu0/larkway (main)");
     expect(permissions).toContain("Local shell inside the Agent Workspace");
     expect(permissions).toContain("GitLab read/write MR");
     expect(permissions).toContain("deploy/restart requires confirmation");
@@ -206,7 +206,7 @@ describe("ensureAgentWorkspace", () => {
     const request = await fs.readFile(path.join(workspacePath, "permissions-request.md"), "utf8");
     expect(request).toContain("New task");
     expect(request).toContain("Feishu chat allowlist: oc_new");
-    expect(request).toContain("GitLab token env name: NEW_TOKEN_ENV");
+    expect(request).toContain("Git token env name: NEW_TOKEN_ENV");
     expect(request).not.toContain("oc_old");
     expect(request).not.toContain("OLD_TOKEN_ENV");
 
@@ -275,18 +275,18 @@ describe("ensureAgentWorkspace", () => {
     const request = await fs.readFile(path.join(workspacePath, "permissions-request.md"), "utf8");
     expect(request).toContain("Operate Larkway from Feishu.");
     expect(request).toContain("Feishu chat allowlist: oc_new");
-    expect(request).toContain("GitLab repo pointer: chuckwu0/larkway (main)");
-    expect(request).toContain("GitLab token env name: LARKWAY_DEVOPS_GITLAB_TOKEN");
+    expect(request).toContain("Git repo pointer: chuckwu0/larkway (main)");
+    expect(request).toContain("Git token env name: LARKWAY_DEVOPS_GITLAB_TOKEN");
     expect(request).toContain("external message to Feishu");
     expect(request).toContain("production-impact operations");
     expect(request).toContain("deploy/restart requires explicit confirmation");
     expect(request).toContain("production messages require explicit confirmation");
-    expect(request).not.toContain("GitLab repo pointer: old/repo");
+    expect(request).not.toContain("Git repo pointer: old/repo");
 
     const granted = await fs.readFile(path.join(workspacePath, "permissions-granted.md"), "utf8");
     expect(granted).toContain("This file is an audit note, not a startup gate.");
     expect(granted).toContain("Feishu chat allowlist: oc_new");
-    expect(granted).toContain("GitLab repo pointer: chuckwu0/larkway (main)");
+    expect(granted).toContain("Git repo pointer: chuckwu0/larkway (main)");
     expect(granted).toContain("env=LARKWAY_DEVOPS_GITLAB_TOKEN");
     expect(granted).toContain("Reset reason: repo changed");
   });

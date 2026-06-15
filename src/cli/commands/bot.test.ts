@@ -15,7 +15,6 @@ import path from "node:path";
 import * as ui from "../ui.js";
 import * as botsStore from "../botsStore.js";
 import * as hostConfig from "../hostConfig.js";
-import * as centralStore from "../centralStore.js";
 import type { CliContext } from "../types.js";
 import { run } from "./bot.js";
 
@@ -35,7 +34,6 @@ function makeCtx(botsDir: string, overrides: Partial<CliContext["flags"]> = {}):
     ui,
     botsStore,
     hostConfig,
-    centralStore,
     flags: { json: false, nonInteractive: true, advanced: false, ...overrides },
     cwd: botsDir,
   };
@@ -194,7 +192,7 @@ describe("bot add", () => {
     const workspace = path.join(tmpDir, "agents", "test-bot", "workspace");
     const permissions = await readFile(path.join(workspace, "permissions-request.md"), "utf8");
     expect(permissions).toContain("Feishu IM: receive mentions and reply in allowed chats");
-    expect(permissions).toContain("GitLab repo pointer: chuckwu0/larkway (main)");
+    expect(permissions).toContain("Git repo pointer: chuckwu0/larkway (main)");
     expect(permissions).toContain("Local shell inside the Agent Workspace");
     expect(permissions).toContain("GitLab read/write MR");
     expect(permissions).toContain("type=write");
@@ -226,8 +224,8 @@ describe("bot add", () => {
 
     const workspace = path.join(tmpDir, "agents", "test-bot", "workspace");
     const permissions = await readFile(path.join(workspace, "permissions-request.md"), "utf8");
-    expect(permissions).toContain("GitLab token env name: LARKWAY_TEST_BOT_GITLAB_TOKEN");
-    expect(permissions).toContain("GitLab repo pointer: chuckwu0/larkway (main)");
+    expect(permissions).toContain("Git token env name: LARKWAY_TEST_BOT_GITLAB_TOKEN");
+    expect(permissions).toContain("Git repo pointer: chuckwu0/larkway (main)");
   });
 
   it("accepts backend during creation", async () => {
@@ -433,7 +431,7 @@ describe("bot edit", () => {
     const granted = await readFile(path.join(workspace, "permissions-granted.md"), "utf8");
     expect(request).toContain("chuckwu0/larkway");
     expect(granted).toContain("This file is an audit note, not a startup gate.");
-    expect(granted).toContain("GitLab repo pointer: chuckwu0/larkway (main)");
+    expect(granted).toContain("Git repo pointer: chuckwu0/larkway (main)");
     expect(granted).toContain("larkway bot edit --set");
   });
 

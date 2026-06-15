@@ -5,8 +5,6 @@
  *
  * Strategy:
  *   - Each test creates a real tmp dir as localBotsDir.
- *   - For central-mode tests, a local bare git repo is used as the "central"
- *     repo, cloned from a tmp dir with a pre-populated bots/ subdir.
  *   - Handlers are called directly (no HTTP round-trip) via a fake ManagementContext
  *     that injects real store modules pointed at tmp dirs.
  *   - Secret non-disclosure is verified: app_secret_env / gitlab_token_env are
@@ -38,7 +36,6 @@ import {
 } from "./onboardSession.js";
 import * as botsStore from "../cli/botsStore.js";
 import * as hostConfig from "../cli/hostConfig.js";
-import * as centralStore from "../cli/centralStore.js";
 import * as bridgeControl from "../cli/bridgeControl.js";
 import { upsertRuntimeEvent } from "../bridge/eventLog.js";
 
@@ -104,40 +101,6 @@ async function makeLocalBotsDir(opts: { withMemory?: boolean } = {}): Promise<st
 }
 
 /**
- * Build a bare git repo containing a bots/ subdir, for use as central fixture.
- * Returns the path to the bare repo (usable as `centralConfig.repo`).
- */
-async function makeCentralRepo(sourceBotsDir: string): Promise<string> {
-  const workDir = await makeTmpDir();
-  const bareDir = await makeTmpDir();
-
-  // Init a non-bare repo with the bots/ files.
-  await execFileAsync("git", ["init", "--initial-branch=main", workDir]).catch(() =>
-    // older git doesn't have --initial-branch
-    execFileAsync("git", ["init", workDir]),
-  );
-  await execFileAsync("git", ["config", "user.email", "test@test.com"], { cwd: workDir });
-  await execFileAsync("git", ["config", "user.name", "Test"], { cwd: workDir });
-
-  // Copy bots/ into the work tree.
-  const botsSubdir = path.join(workDir, "bots");
-  await mkdir(botsSubdir, { recursive: true });
-  await writeFile(path.join(botsSubdir, "test-bot.yaml"), SAMPLE_BOT_YAML, "utf-8");
-  await writeFile(path.join(botsSubdir, "test-bot.memory.md"), SAMPLE_MEMORY, "utf-8");
-
-  await execFileAsync("git", ["add", "."], { cwd: workDir });
-  await execFileAsync("git", ["commit", "-m", "init"], { cwd: workDir });
-
-  // Clone to a bare repo (so push works in stageAndCommit tests).
-  await execFileAsync("git", ["clone", "--bare", workDir, bareDir]).catch(async () => {
-    // If clone fails, just re-use workDir as the "central" (path-based).
-    return workDir;
-  });
-
-  return bareDir;
-}
-
-/**
  * Make a ManagementContext with real stores pointed at tmp dirs.
  * host config (config.json) is optional.
  */
@@ -146,8 +109,6 @@ function makeCtx(
   opts: {
     mode?: "local" | "central";
     configJson?: Record<string, unknown>;
-    centralRepoPath?: string;
-    centralCacheDir?: string;
   } = {},
 ): ManagementContext {
   // Build a fake hostConfig store that returns the given config.
@@ -233,11 +194,6 @@ function makeCtx(
     },
   };
 
-  // Central store: use real module but override cache dir if provided.
-  const fakeCentralStore: typeof centralStore = {
-    ...centralStore,
-  };
-
   // Bridge control: use real module (no real processes in tests; individual
   // test cases can override via opts or inject a fake ctx manually).
   const fakeBridgeControl: typeof bridgeControl = {
@@ -251,38 +207,9 @@ function makeCtx(
     stores: {
       botsStore: fakeBotsStore,
       hostConfig: fakeHostConfig,
-      centralStore: fakeCentralStore,
       bridgeControl: fakeBridgeControl,
     },
   });
-
-  // If a central cache dir is provided, point the env var (tests use isolated dirs).
-  if (opts.centralCacheDir) {
-    // Override getCentralCheckout to use the provided cache dir.
-    const origGet = ctx.getCentralCheckout.bind(ctx);
-    void origGet;
-    ctx.getCentralCheckout = async () => {
-      if (!opts.centralRepoPath) return null;
-      // Use real pullCentral with LARKWAY_CENTRAL_CACHE override.
-      const orig = process.env.LARKWAY_CENTRAL_CACHE;
-      process.env.LARKWAY_CENTRAL_CACHE = opts.centralCacheDir;
-      try {
-        const pull = await centralStore.pullCentral({
-          repo: opts.centralRepoPath,
-          branch: "main",
-          path: "bots",
-        });
-        return pull.botsPath;
-      } finally {
-        if (orig === undefined) delete process.env.LARKWAY_CENTRAL_CACHE;
-        else process.env.LARKWAY_CENTRAL_CACHE = orig;
-      }
-    };
-    ctx.activeBotsDir = async () => {
-      if (ctx.mode === "local") return ctx.localBotsDir;
-      return ctx.getCentralCheckout();
-    };
-  }
 
   return ctx;
 }
@@ -326,50 +253,6 @@ describe("GET /api/context", () => {
     expect(res.status).toBe(200);
     expect((res.json as Record<string, unknown>).mode).toBe("local");
     expect((res.json as Record<string, unknown>).centralAvailable).toBe(false);
-  });
-
-  it("returns centralAvailable=true when config.json has centralConfig", async () => {
-    const dir = await makeLocalBotsDir();
-    const ctx = makeCtx(dir, {
-      configJson: {
-        conventions: { devHostname: "localhost" },
-        permissions: { allowExtra: [] },
-        chats: [],
-        centralConfig: { repo: "/fake/repo", branch: "main", path: "bots" },
-      },
-    });
-    const res = await call(ctx, "GET /api/context");
-    expect(res.status).toBe(200);
-    expect((res.json as Record<string, unknown>).centralAvailable).toBe(true);
-  });
-});
-
-// ---------------------------------------------------------------------------
-// POST /api/context
-// ---------------------------------------------------------------------------
-
-describe("POST /api/context", () => {
-  it("returns 400 for invalid mode", async () => {
-    const dir = await makeLocalBotsDir();
-    const ctx = makeCtx(dir);
-    const res = await call(ctx, "POST /api/context", { body: { mode: "invalid" } });
-    expect(res.status).toBe(400);
-  });
-
-  it("switches to local mode", async () => {
-    const dir = await makeLocalBotsDir();
-    const ctx = makeCtx(dir, { mode: "local" });
-    const res = await call(ctx, "POST /api/context", { body: { mode: "local" } });
-    expect(res.status).toBe(200);
-    expect((res.json as Record<string, unknown>).mode).toBe("local");
-  });
-
-  it("rejects switching to central when no centralConfig", async () => {
-    const dir = await makeLocalBotsDir();
-    const ctx = makeCtx(dir);
-    const res = await call(ctx, "POST /api/context", { body: { mode: "central" } });
-    // Should fail (no centralConfig configured)
-    expect(res.status).toBeGreaterThanOrEqual(400);
   });
 });
 
@@ -576,12 +459,12 @@ describe("PUT /api/bot/:id", () => {
     const claudeStat = await lstat(path.join(workspace, "CLAUDE.md"));
     expect(claudeStat.isSymbolicLink()).toBe(true);
     await expect(readlink(path.join(workspace, "CLAUDE.md"))).resolves.toBe("AGENTS.md");
-    expect(requestMd).toContain("type=read GitLab repo pointer: chuckwu0/larkway (main)");
-    expect(requestMd).toContain("GitLab token env name: pending human confirmation");
+    expect(requestMd).toContain("type=read Git repo pointer: chuckwu0/larkway (main)");
+    expect(requestMd).toContain("Git token env name: pending human confirmation");
     expect(requestMd).not.toContain("CALLER_ENV_NAME_SHOULD_BE_IGNORED");
     expect(requestMd).not.toContain("glpat");
     expect(grantedMd).toContain("This file is an audit note, not a startup gate.");
-    expect(grantedMd).toContain("GitLab repo pointer: chuckwu0/larkway (main)");
+    expect(grantedMd).toContain("Git repo pointer: chuckwu0/larkway (main)");
     await expect(readFile(path.join(workspace, "tasks", "_creation", "task.md"), "utf-8")).rejects.toThrow();
 
     const getRes = await call(ctx, "GET /api/bot/:id", { params: { id: "new-agent" } });
@@ -622,8 +505,9 @@ describe("PUT /api/bot/:id", () => {
     expect(repos[1].slug).toBe("acme/web-app");
     expect(repos[1].url).toBeUndefined();
     expect(bot.turn_taking_limit).toBe(5);
-    // gitlab_token_env from body is silently ignored (BL-4: backend auto-generates it).
+    // git_token_env / gitlab_token_env from body are silently ignored (BL-4: backend auto-generates).
     // Since no gitlab_token_value was sent, no env name should be set.
+    expect(bot.git_token_env).toBeUndefined();
     expect(bot.gitlab_token_env).toBeUndefined();
   });
 
@@ -671,7 +555,7 @@ runtime: agent_workspace
     expect(requestMd).toContain("oc_new");
     expect(grantedMd).toContain("This file is an audit note, not a startup gate.");
     expect(grantedMd).toContain("Feishu chat allowlist: oc_new");
-    expect(grantedMd).toContain("GitLab repo pointer: chuckwu0/larkway (main)");
+    expect(grantedMd).toContain("Git repo pointer: chuckwu0/larkway (main)");
     expect(grantedMd).toContain("bot permission surface changed through Web API");
   });
 
@@ -698,16 +582,6 @@ runtime: agent_workspace
     expect(res.status).toBe(400);
   });
 
-  it("returns 403 in central mode", async () => {
-    const dir = await makeLocalBotsDir();
-    const ctx = makeCtx(dir, { mode: "central" });
-
-    const res = await call(ctx, "PUT /api/bot/:id", {
-      params: { id: "test-bot" },
-      body: SAMPLE_BOT,
-    });
-    expect(res.status).toBe(403);
-  });
 });
 
 // ---------------------------------------------------------------------------
@@ -794,139 +668,6 @@ describe("PUT /api/memory/:id", () => {
     expect(res.status).toBe(400);
   });
 
-  it("returns 403 in central mode", async () => {
-    const dir = await makeLocalBotsDir({ withMemory: true });
-    const ctx = makeCtx(dir, { mode: "central" });
-    const res = await call(ctx, "PUT /api/memory/:id", {
-      params: { id: "test-bot" },
-      body: { content: "nope" },
-    });
-    expect(res.status).toBe(403);
-  });
-});
-
-// ---------------------------------------------------------------------------
-// POST /api/sync (dryRun path — no real git needed)
-// ---------------------------------------------------------------------------
-
-describe("POST /api/sync", () => {
-  it("returns 400 when no centralConfig", async () => {
-    const dir = await makeLocalBotsDir();
-    const ctx = makeCtx(dir);
-    const res = await call(ctx, "POST /api/sync", { body: { dryRun: true } });
-    expect(res.status).toBeGreaterThanOrEqual(400);
-    expect(JSON.stringify(res.json)).toMatch(/centralConfig/);
-  });
-
-  it("dry-run returns plan with added/updated/removed/unchanged", async () => {
-    const localDir = await makeLocalBotsDir({ withMemory: true });
-    const centralDir = await makeTmpDir();
-
-    // Put a different bot in the "central" dir for comparison.
-    const centralBot = {
-      ...SAMPLE_BOT,
-      id: "central-bot",
-      name: "Central Bot",
-      description: "Only in central",
-      bot_open_id: "ou_central",
-    };
-    await writeFile(
-      path.join(centralDir, "central-bot.yaml"),
-      yaml.dump(centralBot),
-      "utf-8",
-    );
-
-    // Use a fake centralStore that compares two local dirs directly.
-    const fakeCtx = makeCtx(localDir, {
-      configJson: {
-        conventions: { devHostname: "localhost" },
-        permissions: { allowExtra: [] },
-        chats: [],
-        centralConfig: { repo: "/fake/repo", branch: "main", path: "bots" },
-      },
-    });
-
-    // Inject fake centralStore that uses our prepared centralDir.
-    const fakeCentralStoreForSync: typeof centralStore = {
-      ...centralStore,
-      pullCentral: async () => ({
-        botsPath: centralDir,
-        head: "abc1234",
-        cacheDir: centralDir,
-      }),
-      // resolveCentral mirrors pullCentral for the test (display path is now
-      // local-resolve, not pullCentral — see ⑩ perf fix).
-      resolveCentral: async () => ({
-        botsPath: centralDir,
-        head: "abc1234",
-        cacheDir: centralDir,
-      }),
-      planSync: centralStore.planSync,
-      applySync: centralStore.applySync,
-      stageAndCommit: centralStore.stageAndCommit,
-      resolveCentralCacheDir: centralStore.resolveCentralCacheDir,
-    };
-    fakeCtx.stores.centralStore = fakeCentralStoreForSync;
-
-    const res = await call(fakeCtx, "POST /api/sync", { body: { dryRun: true } });
-    expect(res.status).toBe(200);
-    const json = res.json as { dryRun: boolean; plan: Record<string, string[]> };
-    expect(json.dryRun).toBe(true);
-    expect(Array.isArray(json.plan.added)).toBe(true);
-    expect(Array.isArray(json.plan.removed)).toBe(true);
-    // central-bot is in central but not local → added
-    expect(json.plan.added).toContain("central-bot");
-    // test-bot is in local but not central → removed
-    expect(json.plan.removed).toContain("test-bot");
-  });
-});
-
-// ---------------------------------------------------------------------------
-// POST /api/promote/:id (with real local bare git repo)
-// ---------------------------------------------------------------------------
-
-describe("POST /api/promote/:id", () => {
-  it("returns 400 when no centralConfig", async () => {
-    const dir = await makeLocalBotsDir({ withMemory: true });
-    const ctx = makeCtx(dir);
-    const res = await call(ctx, "POST /api/promote/:id", {
-      params: { id: "test-bot" },
-      body: { push: false },
-    });
-    expect(res.status).toBeGreaterThanOrEqual(400);
-    expect(JSON.stringify(res.json)).toMatch(/centralConfig/);
-  });
-
-  it("commits local bot to central repo (no push)", async () => {
-    const localDir = await makeLocalBotsDir({ withMemory: true });
-    const centralRepoPath = await makeCentralRepo(localDir);
-    const cacheDir = await makeTmpDir();
-
-    const ctx = makeCtx(localDir, {
-      configJson: {
-        conventions: { devHostname: "localhost" },
-        permissions: { allowExtra: [] },
-        chats: [],
-        centralConfig: {
-          repo: centralRepoPath,
-          branch: "main",
-          path: "bots",
-        },
-      },
-      centralRepoPath,
-      centralCacheDir: cacheDir,
-    });
-
-    const res = await call(ctx, "POST /api/promote/:id", {
-      params: { id: "test-bot" },
-      body: { push: false },
-    });
-    expect(res.status).toBe(200);
-    const json = res.json as { sha: string; pushed: boolean };
-    expect(typeof json.sha).toBe("string");
-    expect(json.sha.length).toBeGreaterThan(0);
-    expect(json.pushed).toBe(false);
-  });
 });
 
 // ---------------------------------------------------------------------------
@@ -1057,32 +798,6 @@ describe("secret non-disclosure", () => {
     expect(bot.app_secret_env).toBe("MY_VERY_SECRET_APP_KEY");
     expect(bot.gitlab_token_env).toBe("MY_GITLAB_PAT");
     // Real secret would only exist in ~/.larkway/.env, never returned by the API.
-  });
-});
-
-// ---------------------------------------------------------------------------
-// Central read-only 403 guard
-// ---------------------------------------------------------------------------
-
-describe("central mode write guards", () => {
-  it("PUT /api/bot/:id → 403 in central mode", async () => {
-    const dir = await makeLocalBotsDir();
-    const ctx = makeCtx(dir, { mode: "central" });
-    const res = await call(ctx, "PUT /api/bot/:id", {
-      params: { id: "test-bot" },
-      body: SAMPLE_BOT,
-    });
-    expect(res.status).toBe(403);
-  });
-
-  it("PUT /api/memory/:id → 403 in central mode", async () => {
-    const dir = await makeLocalBotsDir();
-    const ctx = makeCtx(dir, { mode: "central" });
-    const res = await call(ctx, "PUT /api/memory/:id", {
-      params: { id: "test-bot" },
-      body: { content: "nope" },
-    });
-    expect(res.status).toBe(403);
   });
 });
 
@@ -1295,21 +1010,6 @@ describe("DELETE /api/bot/:id", () => {
     expect(res.status).toBe(404);
   });
 
-  it("central mode: returns 403 and does NOT delete", async () => {
-    const dir = await makeLocalBotsDir({ withMemory: true });
-    const deletedBots: string[] = [];
-    const ctx = makeCtx(dir, { mode: "central" });
-    ctx.stores.botsStore = {
-      ...ctx.stores.botsStore,
-      deleteBot: async (id: string) => {
-        deletedBots.push(id);
-      },
-    };
-    const res = await call(ctx, "DELETE /api/bot/:id", { params: { id: "test-bot" } });
-    expect(res.status).toBe(403);
-    expect(deletedBots).toHaveLength(0);
-  });
-
   it("rejects a path-traversal id with 400 and does NOT delete", async () => {
     const dir = await makeLocalBotsDir();
     const deletedBots: string[] = [];
@@ -1323,795 +1023,6 @@ describe("DELETE /api/bot/:id", () => {
     const res = await call(ctx, "DELETE /api/bot/:id", { params: { id: "../config" } });
     expect(res.status).toBe(400);
     expect(deletedBots).toHaveLength(0); // guard fires before any disk op
-  });
-});
-
-// ---------------------------------------------------------------------------
-// Central config repo endpoints (公司中心库) — V2.2 §7 A.2
-// ---------------------------------------------------------------------------
-
-/**
- * Build a ctx whose hostConfig.readHostConfig returns a centralConfig pointing
- * at `repoPath`, and whose writeHostConfig records the written config. The real
- * centralStore is used (offline, against the bare-repo fixture); a per-test
- * LARKWAY_CENTRAL_CACHE keeps the clone cache isolated.
- */
-function makeCentralCtx(
-  localBotsDir: string,
-  opts: { repoPath?: string; cacheDir: string; mode?: "local" | "central" },
-): { ctx: ManagementContext; written: Array<Record<string, unknown>> } {
-  const written: Array<Record<string, unknown>> = [];
-  let current: Record<string, unknown> | null = opts.repoPath
-    ? {
-        conventions: { devHostname: "localhost", portRangeStart: 3001, portRangeEnd: 3050 },
-        permissions: { allowExtra: [] },
-        chats: [],
-        centralConfig: { repo: opts.repoPath, branch: "main", path: "bots" },
-      }
-    : {
-        conventions: { devHostname: "localhost", portRangeStart: 3001, portRangeEnd: 3050 },
-        permissions: { allowExtra: [] },
-        chats: [],
-      };
-
-  const fakeHostConfig: typeof hostConfig = {
-    ...hostConfig,
-    readHostConfig: async () =>
-      current as Awaited<ReturnType<typeof hostConfig.readHostConfig>>,
-    writeHostConfig: async (cfg) => {
-      current = cfg as unknown as Record<string, unknown>;
-      written.push(cfg as unknown as Record<string, unknown>);
-    },
-    resolveLarkwayHome: () => localBotsDir,
-  };
-
-  const ctx = createManagementContext({
-    mode: opts.mode ?? "local",
-    localBotsDir,
-    larkwayDir: localBotsDir,
-    stores: {
-      botsStore,
-      hostConfig: fakeHostConfig,
-      centralStore,
-      bridgeControl,
-    },
-  });
-  return { ctx, written };
-}
-
-async function withCache<T>(cacheDir: string, fn: () => Promise<T>): Promise<T> {
-  const orig = process.env.LARKWAY_CENTRAL_CACHE;
-  process.env.LARKWAY_CENTRAL_CACHE = cacheDir;
-  try {
-    return await fn();
-  } finally {
-    if (orig === undefined) delete process.env.LARKWAY_CENTRAL_CACHE;
-    else process.env.LARKWAY_CENTRAL_CACHE = orig;
-  }
-}
-
-describe("GET /api/central/status", () => {
-  it("connected:false when no centralConfig", async () => {
-    const dir = await makeLocalBotsDir();
-    const { ctx } = makeCentralCtx(dir, { cacheDir: await makeTmpDir() });
-    const res = await call(ctx, "GET /api/central/status");
-    expect(res.status).toBe(200);
-    expect((res.json as Record<string, unknown>).connected).toBe(false);
-  });
-
-  it("connected:true + repo + head + sharedCount when configured", async () => {
-    const dir = await makeLocalBotsDir();
-    const repo = await makeCentralRepo(dir);
-    const cacheDir = await makeTmpDir();
-    const { ctx } = makeCentralCtx(dir, { repoPath: repo, cacheDir });
-    const res = await withCache(cacheDir, () => call(ctx, "GET /api/central/status"));
-    expect(res.status).toBe(200);
-    const j = res.json as Record<string, unknown>;
-    expect(j.connected).toBe(true);
-    expect((j.repo as Record<string, unknown>).url).toBe(repo);
-    expect(typeof j.head).toBe("string");
-    expect(j.sharedCount).toBe(1); // fixture has test-bot
-  });
-});
-
-describe("POST /api/central/config", () => {
-  it("rejects empty url with kind=invalid", async () => {
-    const dir = await makeLocalBotsDir();
-    const { ctx } = makeCentralCtx(dir, { cacheDir: await makeTmpDir() });
-    const res = await call(ctx, "POST /api/central/config", { body: { url: "  " } });
-    expect(res.status).toBe(400);
-    const j = res.json as Record<string, unknown>;
-    expect(j.ok).toBe(false);
-    expect(j.kind).toBe("invalid");
-  });
-
-  it("unreachable repo → ok:false with classified kind (人话)", async () => {
-    const dir = await makeLocalBotsDir();
-    const { ctx } = makeCentralCtx(dir, { cacheDir: await makeTmpDir() });
-    const ghost = path.join(await makeTmpDir(), "ghost.git");
-    const res = await call(ctx, "POST /api/central/config", { body: { url: ghost } });
-    expect(res.status).toBe(200);
-    const j = res.json as Record<string, unknown>;
-    expect(j.ok).toBe(false);
-    expect(["unreachable", "invalid"]).toContain(j.kind);
-    expect(String(j.error)).not.toMatch(/fatal:/i);
-  });
-
-  it("reachable repo with branch → ok:true and persists centralConfig", async () => {
-    const dir = await makeLocalBotsDir();
-    const repo = await makeCentralRepo(dir);
-    const cacheDir = await makeTmpDir();
-    const { ctx, written } = makeCentralCtx(dir, { cacheDir });
-    const res = await withCache(cacheDir, () =>
-      call(ctx, "POST /api/central/config", { body: { url: repo } }),
-    );
-    expect(res.status).toBe(200);
-    expect((res.json as Record<string, unknown>).ok).toBe(true);
-    expect(written).toHaveLength(1);
-    expect((written[0].centralConfig as Record<string, unknown>).repo).toBe(repo);
-  });
-});
-
-describe("POST /api/central/disconnect", () => {
-  it("drops centralConfig and is idempotent", async () => {
-    const dir = await makeLocalBotsDir();
-    const repo = await makeCentralRepo(dir);
-    const { ctx, written } = makeCentralCtx(dir, { repoPath: repo, cacheDir: await makeTmpDir() });
-    const res1 = await call(ctx, "POST /api/central/disconnect");
-    expect(res1.status).toBe(200);
-    expect((res1.json as Record<string, unknown>).ok).toBe(true);
-    expect(written[written.length - 1].centralConfig).toBeUndefined();
-
-    // second call: already disconnected → still ok
-    const res2 = await call(ctx, "POST /api/central/disconnect");
-    expect((res2.json as Record<string, unknown>).ok).toBe(true);
-  });
-});
-
-describe("GET /api/central/sync/preview", () => {
-  it("409 when not connected", async () => {
-    const dir = await makeLocalBotsDir();
-    const { ctx } = makeCentralCtx(dir, { cacheDir: await makeTmpDir() });
-    const res = await call(ctx, "GET /api/central/sync/preview");
-    expect(res.status).toBe(409);
-  });
-
-  it("returns added/updated/removed + head against the fixture", async () => {
-    // Local bots dir is EMPTY → the central test-bot shows up as `added`.
-    const localDir = await makeTmpDir();
-    const repo = await makeCentralRepo(localDir);
-    const cacheDir = await makeTmpDir();
-    const { ctx } = makeCentralCtx(localDir, { repoPath: repo, cacheDir });
-    const res = await withCache(cacheDir, () => call(ctx, "GET /api/central/sync/preview"));
-    expect(res.status).toBe(200);
-    const j = res.json as { added: Array<{ id: string }>; head: string };
-    expect(j.added.map((a) => a.id)).toContain("test-bot");
-    expect(typeof j.head).toBe("string");
-  });
-});
-
-describe("POST /api/central/sync/apply", () => {
-  it("copies central bots into local and reports added", async () => {
-    const localDir = await makeTmpDir(); // empty local
-    const repo = await makeCentralRepo(localDir);
-    const cacheDir = await makeTmpDir();
-    const { ctx } = makeCentralCtx(localDir, { repoPath: repo, cacheDir });
-    const res = await withCache(cacheDir, () => call(ctx, "POST /api/central/sync/apply", { body: {} }));
-    expect(res.status).toBe(200);
-    const j = res.json as { ok: boolean; added: string[] };
-    expect(j.ok).toBe(true);
-    expect(j.added).toContain("test-bot");
-    // file actually landed locally
-    const { access } = await import("node:fs/promises");
-    await expect(access(path.join(localDir, "test-bot.yaml"))).resolves.toBeUndefined();
-  });
-});
-
-describe("GET /api/central/bots", () => {
-  it("409 when not connected", async () => {
-    const dir = await makeLocalBotsDir();
-    const { ctx } = makeCentralCtx(dir, { cacheDir: await makeTmpDir() });
-    const res = await call(ctx, "GET /api/central/bots");
-    expect(res.status).toBe(409);
-  });
-
-  it("returns roster with id/name/desc and best-effort meta", async () => {
-    const dir = await makeLocalBotsDir();
-    const repo = await makeCentralRepo(dir);
-    const cacheDir = await makeTmpDir();
-    const { ctx } = makeCentralCtx(dir, { repoPath: repo, cacheDir });
-    const res = await withCache(cacheDir, () => call(ctx, "GET /api/central/bots"));
-    expect(res.status).toBe(200);
-    const bots = (res.json as { bots: Array<Record<string, unknown>> }).bots;
-    const tb = bots.find((b) => b.id === "test-bot")!;
-    expect(tb).toBeTruthy();
-    expect(tb.name).toBe("Test Bot");
-    // meta fields present (may be empty strings, but keys exist)
-    expect(tb).toHaveProperty("by");
-    expect(tb).toHaveProperty("updated");
-    expect(tb).toHaveProperty("commit");
-    // central roster carries NO liveness keys
-    expect(tb).not.toHaveProperty("state");
-    expect(tb).not.toHaveProperty("wsConnected");
-    // backend field present and defaults to "claude" when yaml lacks the field
-    expect(tb).toHaveProperty("backend");
-    expect(tb.backend).toBe("claude");
-  });
-
-  it("returns backend from yaml when explicitly set", async () => {
-    // Build a central repo that contains a bot yaml with backend: codex.
-    const localDir = await makeTmpDir();
-    const workDir = await makeTmpDir();
-    const bareDir = await makeTmpDir();
-    await execFileAsync("git", ["init", "--initial-branch=main", workDir]).catch(() =>
-      execFileAsync("git", ["init", workDir]),
-    );
-    await execFileAsync("git", ["config", "user.email", "test@test.com"], { cwd: workDir });
-    await execFileAsync("git", ["config", "user.name", "Test"], { cwd: workDir });
-    const botsSubdir = path.join(workDir, "bots");
-    await mkdir(botsSubdir, { recursive: true });
-    const codexYaml =
-      SAMPLE_BOT_YAML.replace("id: test-bot", "id: codex-bot").replace(
-        "name: Test Bot",
-        "name: Codex Bot",
-      ) + "backend: codex\n";
-    await writeFile(path.join(botsSubdir, "codex-bot.yaml"), codexYaml, "utf-8");
-    await execFileAsync("git", ["add", "."], { cwd: workDir });
-    await execFileAsync("git", ["commit", "-m", "init"], { cwd: workDir });
-    await execFileAsync("git", ["clone", "--bare", workDir, bareDir]);
-    const cacheDir = await makeTmpDir();
-    const { ctx } = makeCentralCtx(localDir, { repoPath: bareDir, cacheDir });
-    const res = await withCache(cacheDir, () => call(ctx, "GET /api/central/bots"));
-    expect(res.status).toBe(200);
-    const bots = (res.json as { bots: Array<Record<string, unknown>> }).bots;
-    const cb = bots.find((b) => b.id === "codex-bot")!;
-    expect(cb).toBeTruthy();
-    expect(cb.backend).toBe("codex");
-  });
-});
-
-describe("POST /api/promote/:id (enhanced result)", () => {
-  it("returns { ok:true, commit, pushed } on success", async () => {
-    const localDir = await makeTmpDir();
-    await writeFile(path.join(localDir, "promo-bot.yaml"), SAMPLE_BOT_YAML.replace(/test-bot/g, "promo-bot"), "utf-8");
-    const repo = await makeCentralRepo(localDir);
-    const cacheDir = await makeTmpDir();
-    const { ctx } = makeCentralCtx(localDir, { repoPath: repo, cacheDir });
-    const res = await withCache(cacheDir, () =>
-      call(ctx, "POST /api/promote/:id", { params: { id: "promo-bot" }, body: { push: false } }),
-    );
-    expect(res.status).toBe(200);
-    const j = res.json as Record<string, unknown>;
-    expect(j.ok).toBe(true);
-    expect(typeof j.commit).toBe("string");
-    expect(j.pushed).toBe(false);
-  });
-
-  it("returns { ok:false, kind, error } on a classified failure", async () => {
-    const localDir = await makeTmpDir();
-    // invalid bot (missing required fields) → stageAndCommit throws (kind=other)
-    await writeFile(path.join(localDir, "bad-bot.yaml"), "id: bad-bot\nname: x\n", "utf-8");
-    const repo = await makeCentralRepo(localDir);
-    const cacheDir = await makeTmpDir();
-    const { ctx } = makeCentralCtx(localDir, { repoPath: repo, cacheDir });
-    const res = await withCache(cacheDir, () =>
-      call(ctx, "POST /api/promote/:id", { params: { id: "bad-bot" }, body: { push: false } }),
-    );
-    expect(res.status).toBe(200);
-    const j = res.json as Record<string, unknown>;
-    expect(j.ok).toBe(false);
-    expect(["behind", "noperm", "other"]).toContain(j.kind);
-    expect(j.error).toBeTruthy();
-  });
-});
-
-// ---------------------------------------------------------------------------
-// Onboard API (扫码优先): POST /api/onboard/start, GET /api/onboard/status,
-//   POST /api/onboard/finalize, POST /api/onboard/cancel
-// ---------------------------------------------------------------------------
-
-/**
- * Minimal fake RegisterAppResult returned by the injected registerApp stub.
- * We test the API layer (routes / request parsing / response shape) without
- * running a real Feishu device-code flow.
- */
-const ONBOARD_FAKE_CREDS: RegisterAppResult = {
-  client_id: "cli_apitest99",
-  client_secret: "secret-must-not-leak",
-  user_info: { open_id: "ou_apitest", tenant_brand: "feishu" },
-};
-
-/**
- * Resolve the env path that the handler uses (mirrors resolveEnvPath() in the
- * real hostConfig; we inject a fake that returns our tmp path).
- */
-async function makeOnboardCtx(
-  localBotsDir: string,
-  opts: {
-    /** If provided, the fake hostConfig resolveEnvPath returns this. */
-    envPath?: string;
-  } = {},
-): Promise<ManagementContext> {
-  const envPath = opts.envPath ?? path.join(localBotsDir, ".env");
-
-  const fakeHostConfig: typeof hostConfig = {
-    ...hostConfig,
-    readHostConfig: async () => null,
-    resolveEnvPath: () => envPath,
-    resolveConfigJsonPath: hostConfig.resolveConfigJsonPath,
-    resolveLarkwayHome: hostConfig.resolveLarkwayHome,
-    ensureLarkwayDir: hostConfig.ensureLarkwayDir,
-    writeHostConfig: hostConfig.writeHostConfig,
-    writeSecret: hostConfig.writeSecret,
-    readSecret: hostConfig.readSecret,
-    envFileExists: hostConfig.envFileExists,
-    removeSecret: async () => { /* no-op */ },
-  };
-
-  const fakeBotsStore: typeof botsStore = {
-    ...botsStore,
-    resolveBotsDir: () => localBotsDir,
-    ensureBotsDir: async () => localBotsDir,
-    listBots: async () => [],
-    readBot: botsStore.readBot,
-    writeBot: botsStore.writeBot,
-    readMemory: botsStore.readMemory,
-    writeMemory: botsStore.writeMemory,
-    deleteBot: botsStore.deleteBot,
-  };
-
-  return createManagementContext({
-    mode: "local",
-    localBotsDir,
-    larkwayDir: localBotsDir,
-    stores: {
-      botsStore: fakeBotsStore,
-      hostConfig: fakeHostConfig,
-      centralStore,
-      bridgeControl,
-    },
-  });
-}
-
-// Reset session table between onboard tests to avoid cross-test state pollution.
-beforeEach(() => _resetSessionsForTest());
-
-describe("POST /api/onboard/start (扫码优先)", () => {
-  it("403 when mode=central", async () => {
-    const dir = await makeLocalBotsDir();
-    const ctx = makeCtx(dir, { mode: "central" });
-    const res = await call(ctx, "POST /api/onboard/start", { body: {} });
-    expect(res.status).toBe(403);
-  });
-
-  it("returns { sessionId, status:'starting' } with no form required", async () => {
-    const dir = await makeTmpDir();
-    const ctx = await makeOnboardCtx(dir);
-    const res = await call(ctx, "POST /api/onboard/start", { body: {} });
-    expect(res.status).toBe(200);
-    const j = res.json as Record<string, unknown>;
-    expect(typeof j.sessionId).toBe("string");
-    expect(j.status).toBe("starting");
-  });
-
-  it("ignores any body fields (form is no longer required at start)", async () => {
-    const dir = await makeTmpDir();
-    const ctx = await makeOnboardCtx(dir);
-    // Passing name/description should not cause an error.
-    const res = await call(ctx, "POST /api/onboard/start", {
-      body: { name: "Ignored", description: "Also ignored" },
-    });
-    expect(res.status).toBe(200);
-    const j = res.json as Record<string, unknown>;
-    expect(typeof j.sessionId).toBe("string");
-  });
-});
-
-describe("GET /api/onboard/status", () => {
-  it("400 when ?session= is missing", async () => {
-    const dir = await makeTmpDir();
-    const ctx = await makeOnboardCtx(dir);
-    const res = await call(ctx, "GET /api/onboard/status", { query: {} });
-    expect(res.status).toBe(400);
-  });
-
-  it("404 for unknown session", async () => {
-    const dir = await makeTmpDir();
-    const ctx = await makeOnboardCtx(dir);
-    const res = await call(ctx, "GET /api/onboard/status", { query: { session: "nope" } });
-    expect(res.status).toBe(404);
-  });
-
-  it("returns the session view including prefill in awaiting-name", async () => {
-    const dir = await makeTmpDir();
-    const ctx = await makeOnboardCtx(dir);
-
-    // Start a session.
-    const startRes = await call(ctx, "POST /api/onboard/start", { body: {} });
-    const { sessionId } = startRes.json as { sessionId: string };
-
-    // Poll — it will be "starting" immediately.
-    const statusRes = await call(ctx, "GET /api/onboard/status", {
-      query: { session: sessionId },
-    });
-    expect(statusRes.status).toBe(200);
-    const j = statusRes.json as Record<string, unknown>;
-    // Status is one of the valid onboard statuses.
-    expect(["starting", "awaiting-scan", "polling", "awaiting-name", "done", "error", "cancelled"]).toContain(j.status);
-    // Secret never leaks.
-    expect(JSON.stringify(j)).not.toContain("secret-must-not-leak");
-  });
-});
-
-describe("POST /api/onboard/finalize", () => {
-  it("400 when session missing", async () => {
-    const dir = await makeTmpDir();
-    const ctx = await makeOnboardCtx(dir);
-    const res = await call(ctx, "POST /api/onboard/finalize", { body: { name: "X" } });
-    expect(res.status).toBe(400);
-  });
-
-  it("400 when name is empty", async () => {
-    const dir = await makeTmpDir();
-    const ctx = await makeOnboardCtx(dir);
-    const res = await call(ctx, "POST /api/onboard/finalize", {
-      body: { session: "fake-session", name: "   " },
-    });
-    expect(res.status).toBe(400);
-  });
-
-  it("404 for unknown session", async () => {
-    const dir = await makeTmpDir();
-    const ctx = await makeOnboardCtx(dir);
-    const res = await call(ctx, "POST /api/onboard/finalize", {
-      body: { session: "nonexistent", name: "Bot" },
-    });
-    expect(res.status).toBe(404);
-  });
-
-  it("409 when session is not in awaiting-name (e.g. still starting)", async () => {
-    const dir = await makeTmpDir();
-    const ctx = await makeOnboardCtx(dir);
-
-    // Start a session (it stays "starting" because the fake registerApp hangs).
-    const startRes = await call(ctx, "POST /api/onboard/start", { body: {} });
-    const { sessionId } = startRes.json as { sessionId: string };
-
-    // Finalize immediately — session is "starting", not "awaiting-name".
-    const res = await call(ctx, "POST /api/onboard/finalize", {
-      body: { session: sessionId, name: "Bot" },
-    });
-    expect(res.status).toBe(409);
-  });
-
-  /**
-   * End-to-end: finalize with token + repos → bot written with gitlab_token_env + repos;
-   * token value in .env; never in response.
-   *
-   * Strategy: we bypass postOnboardStart (which requires real registerApp) and instead
-   * call startOnboard() directly with a fake registerApp, then call the handler
-   * postOnboardFinalize via the ROUTES table — verifying the API layer correctly
-   * threads repos/turn_taking_limit/gitlab_token_value through to createBotFromCreds.
-   */
-  it("onboard with token+repos → bot has gitlab_token_env + repos; secret in .env only", async () => {
-    const dir = await makeTmpDir();
-    const envPath = path.join(dir, ".env");
-
-    // Create a session that reaches awaiting-name using a fake registerApp.
-    const fakeRegister: RegisterAppFn = async (opts) => {
-      await new Promise((r) => setTimeout(r, 0));
-      opts.onQRCodeReady({ url: "https://feishu/qr/x", expireIn: 300 });
-      return ONBOARD_FAKE_CREDS;
-    };
-
-    const { sessionId } = startOnboard({
-      botsDir: dir,
-      envPath,
-      registerApp: fakeRegister,
-      renderQrSvg: async () => "<svg/>",
-      resolveBotIdentity: async () => ({ open_id: "ou_codebot", name: "Code Bot" }),
-    });
-
-    // Wait for the session to reach awaiting-name.
-    const deadline = Date.now() + 2000;
-    while (Date.now() < deadline) {
-      const { getOnboard: getOnboard2 } = await import("./onboardSession.js");
-      if (getOnboard2(sessionId)?.status === "awaiting-name") break;
-      await new Promise((r) => setTimeout(r, 10));
-    }
-
-    const ctx = await makeOnboardCtx(dir, { envPath });
-
-    const res = await call(ctx, "POST /api/onboard/finalize", {
-      body: {
-        session: sessionId,
-        name: "Code Bot",
-        description: "handles code tasks",
-        repos: [{ slug: "acme/web-fe", branch: "master" }],
-        turn_taking_limit: 7,
-        gitlab_token_value: "glpat-onboard-secret-xyz",
-      },
-    });
-
-    expect(res.status).toBe(200);
-    const j = res.json as Record<string, unknown>;
-    expect(j.status).toBe("done");
-    expect(typeof j.botId).toBe("string");
-    const botId = j.botId as string;
-
-    // Response must NOT contain the real token value.
-    expect(JSON.stringify(j)).not.toContain("glpat-onboard-secret-xyz");
-
-    // .env has the secret.
-    const envRaw = await readFile(envPath, "utf-8");
-    expect(envRaw).toContain("glpat-onboard-secret-xyz");
-    const expectedTokenEnv = `LARKWAY_BOT_${botId.toUpperCase().replace(/-/g, "_")}_GITLAB_TOKEN`;
-    expect(envRaw).toContain(expectedTokenEnv);
-
-    // yaml has gitlab_token_env name (not value) + repos + turn_taking_limit.
-    const yamlRaw = await readFile(path.join(dir, `${botId}.yaml`), "utf-8");
-    expect(yamlRaw).not.toContain("glpat-onboard-secret-xyz");
-    expect(yamlRaw).toContain(expectedTokenEnv);
-    expect(yamlRaw).toContain("acme/web-fe");
-
-    const parsed = BotConfigSchema.parse(yaml.load(yamlRaw));
-    expect(parsed.gitlab_token_env).toBe(expectedTokenEnv);
-    expect(parsed.repos).toHaveLength(1);
-    expect(parsed.repos[0].slug).toBe("acme/web-fe");
-    expect(parsed.turn_taking_limit).toBe(7);
-  });
-});
-
-describe("POST /api/onboard/cancel", () => {
-  it("400 when session missing", async () => {
-    const dir = await makeTmpDir();
-    const ctx = await makeOnboardCtx(dir);
-    const res = await call(ctx, "POST /api/onboard/cancel", { body: {} });
-    expect(res.status).toBe(400);
-  });
-
-  it("{ ok: false } for unknown session", async () => {
-    const dir = await makeTmpDir();
-    const ctx = await makeOnboardCtx(dir);
-    const res = await call(ctx, "POST /api/onboard/cancel", { body: { session: "nope" } });
-    expect(res.status).toBe(200);
-    expect((res.json as Record<string, unknown>).ok).toBe(false);
-  });
-
-  it("{ ok: true } for an active session, session marked cancelled", async () => {
-    const dir = await makeTmpDir();
-    const ctx = await makeOnboardCtx(dir);
-
-    const startRes = await call(ctx, "POST /api/onboard/start", { body: {} });
-    const { sessionId } = startRes.json as { sessionId: string };
-
-    const cancelRes = await call(ctx, "POST /api/onboard/cancel", {
-      body: { session: sessionId },
-    });
-    expect(cancelRes.status).toBe(200);
-    expect((cancelRes.json as Record<string, unknown>).ok).toBe(true);
-
-    // Session now terminal — second cancel returns ok: false.
-    const cancelRes2 = await call(ctx, "POST /api/onboard/cancel", {
-      body: { session: sessionId },
-    });
-    expect((cancelRes2.json as Record<string, unknown>).ok).toBe(false);
-  });
-});
-
-describe("Onboard route registration", () => {
-  it("all four onboard routes are registered in ROUTES", () => {
-    expect(ROUTES["POST /api/onboard/start"]).toBeDefined();
-    expect(ROUTES["GET /api/onboard/status"]).toBeDefined();
-    expect(ROUTES["POST /api/onboard/finalize"]).toBeDefined();
-    expect(ROUTES["POST /api/onboard/cancel"]).toBeDefined();
-  });
-
-  it("matchRoute resolves /api/onboard/finalize", () => {
-    const m = matchRoute("POST", "/api/onboard/finalize");
-    expect(m).not.toBeNull();
-    expect(m!.handler).toBe(ROUTES["POST /api/onboard/finalize"]);
-  });
-});
-
-// ---------------------------------------------------------------------------
-// Bug ⑤: GET /api/status — per-bot liveness gated on bridge process running
-// ---------------------------------------------------------------------------
-
-describe("GET /api/status — bridge liveness gate (bug ⑤)", () => {
-  /**
-   * Helper: make a ctx whose bridgeControl.detectBridgeStatus returns `running`.
-   * The botsStore is pointed at `dir`; no real status.json files are created
-   * (so classifyStatus would normally return "offline" — we test the gate
-   * behaviour separately by verifying that `bridgeRunning` is echoed correctly).
-   */
-  function makeCtxWithBridge(dir: string, running: boolean): ManagementContext {
-    const ctx = makeCtx(dir, {
-      configJson: {
-        conventions: { devHostname: "localhost" },
-        permissions: { allowExtra: [] },
-        chats: [],
-      },
-    });
-    const fakeBc: typeof bridgeControl = {
-      ...bridgeControl,
-      detectBridgeStatus: async () => ({
-        running,
-        pid: running ? 42 : null,
-        platform: "mac" as bridgeControl.BridgePlatform,
-        mode: "local" as const,
-      }),
-    };
-    ctx.stores.bridgeControl = fakeBc;
-    return ctx;
-  }
-
-  it("returns bridgeRunning:false when bridge is stopped", async () => {
-    const dir = await makeLocalBotsDir();
-    const ctx = makeCtxWithBridge(dir, false);
-    const res = await call(ctx, "GET /api/status");
-    expect(res.status).toBe(200);
-    const j = res.json as Record<string, unknown>;
-    expect(j.bridgeRunning).toBe(false);
-  });
-
-  it("returns bridgeRunning:true when bridge is running", async () => {
-    const dir = await makeLocalBotsDir();
-    const ctx = makeCtxWithBridge(dir, true);
-    const res = await call(ctx, "GET /api/status");
-    expect(res.status).toBe(200);
-    const j = res.json as Record<string, unknown>;
-    expect(j.bridgeRunning).toBe(true);
-  });
-
-  it("all per-bot state values are 'offline' when bridge is stopped (even if status.json existed)", async () => {
-    // We simulate a bot with a status.json that classifyStatus would see as
-    // "serving" — but since bridge is stopped, the gate must force "offline".
-    const dir = await makeLocalBotsDir();
-    const ctx = makeCtxWithBridge(dir, false);
-
-    // Inject a fake readStatusFile via a wrapper: write a fresh status.json
-    // to the larkwayDir so classifyStatus *would* return "serving" if called.
-    // Instead we verify the gate fires before classification.
-    // (The makeCtx larkwayDir === dir, so write status there.)
-    const fakeStatusDir = path.join(dir, "test-bot");
-    await mkdir(fakeStatusDir, { recursive: true });
-    await writeFile(
-      path.join(fakeStatusDir, "status.json"),
-      JSON.stringify({
-        id: "test-bot",
-        name: "Test Bot",
-        ws: true,
-        updatedAt: new Date().toISOString(),
-      }),
-      "utf-8",
-    );
-
-    const res = await call(ctx, "GET /api/status");
-    expect(res.status).toBe(200);
-    const j = res.json as { bots: Array<{ state: string }>; bridgeRunning: boolean };
-    expect(j.bridgeRunning).toBe(false);
-    // Every bot must be forced to offline.
-    for (const bot of j.bots) {
-      expect(bot.state).toBe("offline");
-    }
-  });
-
-  it("overall is 'offline' when bridge is stopped and any bot would have been 'serving'", async () => {
-    const dir = await makeLocalBotsDir();
-    const ctx = makeCtxWithBridge(dir, false);
-    const res = await call(ctx, "GET /api/status");
-    expect(res.status).toBe(200);
-    const j = res.json as Record<string, unknown>;
-    expect(j.overall).toBe("offline");
-    expect(j.anyServing).toBe(false);
-  });
-});
-
-// ---------------------------------------------------------------------------
-// Bug ⑧: POST /api/promote/:id — block push to main/master without confirmMain
-// ---------------------------------------------------------------------------
-
-describe("POST /api/promote/:id — main branch safety gate (bug ⑧)", () => {
-  async function makePromoteCtx(localDir: string, repo: string, branch: string) {
-    const cacheDir = await makeTmpDir();
-    const { ctx } = makeCentralCtx(localDir, { repoPath: repo, cacheDir });
-    // Override centralConfig branch for this test.
-    const origHostConfig = ctx.stores.hostConfig;
-    ctx.stores.hostConfig = {
-      ...origHostConfig,
-      readHostConfig: async () => ({
-        conventions: { devHostname: "localhost", portRangeStart: 3001, portRangeEnd: 3050 },
-        permissions: { allowExtra: [] },
-        chats: [],
-        centralConfig: { repo, branch, path: "bots" },
-      } as Awaited<ReturnType<typeof hostConfig.readHostConfig>>),
-    };
-    return { ctx, cacheDir };
-  }
-
-  it("push to main WITHOUT confirmMain → 409 requiresConfirm", async () => {
-    const localDir = await makeLocalBotsDir({ withMemory: true });
-    const repo = await makeCentralRepo(localDir);
-    const { ctx, cacheDir } = await makePromoteCtx(localDir, repo, "main");
-    const res = await withCache(cacheDir, () =>
-      call(ctx, "POST /api/promote/:id", {
-        params: { id: "test-bot" },
-        body: { push: true }, // no confirmMain
-      }),
-    );
-    expect(res.status).toBe(409);
-    const j = res.json as Record<string, unknown>;
-    expect(j.requiresConfirm).toBe(true);
-    expect(j.branch).toBe("main");
-    expect(typeof j.error).toBe("string");
-  });
-
-  it("push to master WITHOUT confirmMain → 409 requiresConfirm", async () => {
-    const localDir = await makeLocalBotsDir({ withMemory: true });
-    const repo = await makeCentralRepo(localDir);
-    const { ctx, cacheDir } = await makePromoteCtx(localDir, repo, "master");
-    const res = await withCache(cacheDir, () =>
-      call(ctx, "POST /api/promote/:id", {
-        params: { id: "test-bot" },
-        body: { push: true }, // no confirmMain
-      }),
-    );
-    expect(res.status).toBe(409);
-    const j = res.json as Record<string, unknown>;
-    expect(j.requiresConfirm).toBe(true);
-    expect(j.branch).toBe("master");
-  });
-
-  it("push to main WITH confirmMain:true → proceeds normally (200)", async () => {
-    const localDir = await makeLocalBotsDir({ withMemory: true });
-    const repo = await makeCentralRepo(localDir);
-    const cacheDir = await makeTmpDir();
-    const { ctx } = makeCentralCtx(localDir, { repoPath: repo, cacheDir });
-    // Default branch is "main" in centralCtx fixture.
-    const res = await withCache(cacheDir, () =>
-      call(ctx, "POST /api/promote/:id", {
-        params: { id: "test-bot" },
-        body: { push: false, confirmMain: true }, // push:false so no actual git push needed
-      }),
-    );
-    // Should not be 409 — gate should pass.
-    expect(res.status).not.toBe(409);
-    expect(res.status).toBe(200);
-  });
-
-  it("push:false to main → NOT gated (only push operations require confirmMain)", async () => {
-    const localDir = await makeLocalBotsDir({ withMemory: true });
-    const repo = await makeCentralRepo(localDir);
-    const cacheDir = await makeTmpDir();
-    const { ctx } = makeCentralCtx(localDir, { repoPath: repo, cacheDir });
-    const res = await withCache(cacheDir, () =>
-      call(ctx, "POST /api/promote/:id", {
-        params: { id: "test-bot" },
-        body: { push: false }, // no push → gate should not fire
-      }),
-    );
-    expect(res.status).not.toBe(409);
-    expect(res.status).toBe(200);
-  });
-
-  it("push to non-main branch → NOT gated (feature branches are fine)", async () => {
-    const localDir = await makeLocalBotsDir({ withMemory: true });
-    const repo = await makeCentralRepo(localDir);
-    const { ctx, cacheDir } = await makePromoteCtx(localDir, repo, "my-feature");
-    // Fake stageAndCommit so we don't actually push to a non-existent branch.
-    ctx.stores.centralStore = {
-      ...ctx.stores.centralStore,
-      stageAndCommit: async () => ({ sha: "abc1234", pushed: true }),
-    };
-    const res = await withCache(cacheDir, () =>
-      call(ctx, "POST /api/promote/:id", {
-        params: { id: "test-bot" },
-        body: { push: true }, // no confirmMain, non-main branch
-      }),
-    );
-    // Gate should NOT fire for feature branches.
-    expect(res.status).not.toBe(409);
   });
 });
 
@@ -2146,7 +1057,7 @@ describe("PUT /api/bot/:id — gitlab_token_value handling (bug ①)", () => {
     expect(writtenSecrets[0].value).toBe("glpat-supersecret123");
 
     // The env-var name was auto-generated (bot id is "test-bot")
-    expect(writtenSecrets[0].name).toBe("LARKWAY_BOT_TEST_BOT_GITLAB_TOKEN");
+    expect(writtenSecrets[0].name).toBe("LARKWAY_BOT_TEST_BOT_GIT_TOKEN");
 
     // Response body MUST NOT contain the real token value
     expect(JSON.stringify(res.json)).not.toContain("glpat-supersecret123");
@@ -2191,7 +1102,7 @@ describe("PUT /api/bot/:id — gitlab_token_value handling (bug ①)", () => {
 
     expect(writtenSecrets).toEqual([
       {
-        name: "LARKWAY_BOT_NEW_TOKEN_BOT_GITLAB_TOKEN",
+        name: "LARKWAY_BOT_NEW_TOKEN_BOT_GIT_TOKEN",
         value: "glpat-newbot-secret",
       },
     ]);
@@ -2201,12 +1112,12 @@ describe("PUT /api/bot/:id — gitlab_token_value handling (bug ①)", () => {
     const bot = (getRes.json as { bot: Record<string, unknown> }).bot;
     expect(bot.runtime).toBe("agent_workspace");
     expect(bot.backend).toBe("codex");
-    expect(bot.gitlab_token_env).toBe("LARKWAY_BOT_NEW_TOKEN_BOT_GITLAB_TOKEN");
+    expect(bot.git_token_env).toBe("LARKWAY_BOT_NEW_TOKEN_BOT_GIT_TOKEN");
     expect(JSON.stringify(bot)).not.toContain("glpat-newbot-secret");
 
     const workspace = path.join(dir, "agents", "new-token-bot", "workspace");
     const requestMd = await readFile(path.join(workspace, "permissions-request.md"), "utf-8");
-    expect(requestMd).toContain("LARKWAY_BOT_NEW_TOKEN_BOT_GITLAB_TOKEN");
+    expect(requestMd).toContain("LARKWAY_BOT_NEW_TOKEN_BOT_GIT_TOKEN");
     expect(requestMd).not.toContain("glpat-newbot-secret");
   });
 
@@ -2250,7 +1161,7 @@ turn_taking_limit: 10
 
     // Backend always auto-generates the env-var name from the bot id.
     expect(writtenSecrets).toHaveLength(1);
-    expect(writtenSecrets[0].name).toBe("LARKWAY_BOT_TEST_BOT_GITLAB_TOKEN");
+    expect(writtenSecrets[0].name).toBe("LARKWAY_BOT_TEST_BOT_GIT_TOKEN");
     expect(writtenSecrets[0].value).toBe("new-token-value");
 
     // Response must not contain the real token value
@@ -2378,7 +1289,8 @@ turn_taking_limit: 10
 
     const getRes = await call(ctx, "GET /api/bot/:id", { params: { id: "test-bot" } });
     const bot = (getRes.json as { bot: Record<string, unknown> }).bot;
-    // The env name from body was ignored; no token was set.
+    // The env name from body was ignored; no token was set (neither new nor legacy field).
+    expect(bot.git_token_env).toBeUndefined();
     expect(bot.gitlab_token_env).toBeUndefined();
   });
 
@@ -2406,7 +1318,7 @@ turn_taking_limit: 10
 
     // env-var name is auto-generated from bot id "test-bot".
     expect(writtenSecrets).toHaveLength(1);
-    expect(writtenSecrets[0].name).toBe("LARKWAY_BOT_TEST_BOT_GITLAB_TOKEN");
+    expect(writtenSecrets[0].name).toBe("LARKWAY_BOT_TEST_BOT_GIT_TOKEN");
     expect(writtenSecrets[0].value).toBe("glpat-bl4-autoname");
 
     // Real token value must never appear in the response.
@@ -2416,7 +1328,7 @@ turn_taking_limit: 10
     // GET: bot has the auto-generated env name, not the raw token value.
     const getRes = await call(ctx, "GET /api/bot/:id", { params: { id: "test-bot" } });
     const bot = (getRes.json as { bot: Record<string, unknown> }).bot;
-    expect(bot.gitlab_token_env).toBe("LARKWAY_BOT_TEST_BOT_GITLAB_TOKEN");
+    expect(bot.git_token_env).toBe("LARKWAY_BOT_TEST_BOT_GIT_TOKEN");
     expect(JSON.stringify(bot)).not.toContain("glpat-bl4-autoname");
   });
 });

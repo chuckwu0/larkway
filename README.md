@@ -113,7 +113,7 @@ Larkway never injects `ANTHROPIC_API_KEY` or any other API key. The subprocess i
 | **L2 identity memory** | "Who I am, what I must not do, where to find the workflow" (thin) | `~/.larkway/bots/<id>.memory.md` |
 | **L3 workflow** | State machine, gates, commands — the actual job | **Your business repo**: `AGENTS.md`, `CLAUDE.md`, `.agents/skills/`, `.claude/skills/` |
 
-Secrets live only in `~/.larkway/.env` (mode 0600). Config and memory contain no secrets and are safe to share via the central config library.
+Secrets live only in `~/.larkway/.env` (mode 0600). Config and memory contain no secrets.
 
 ---
 
@@ -121,7 +121,6 @@ Secrets live only in `~/.larkway/.env` (mode 0600). Config and memory contain no
 
 - **Multiple bots on one bridge** — a read-only Q&A bot and a write-capable engineering bot can share the same process, each with its own L1/L2/L3 definition
 - **Web UI** — `larkway ui` opens a local management dashboard (127.0.0.1 + token); create bots, edit memory, watch live logs
-- **Central config library** — `larkway promote <id>` pushes bot config (no secrets) to a shared git repository so teammates can `larkway sync` and discover bots; the library stores config, not deployment state
 - **Session continuity** — every Feishu thread maps to a persistent `session_id`; the agent remembers what it did in prior turns
 - **Agent Workspace** — per-thread git worktrees; the agent can run multiple threads concurrently without git conflicts
 - **Codex runtime pre-checks** — `larkway doctor` validates Codex state directory writability before start
@@ -150,9 +149,6 @@ Secrets live only in `~/.larkway/.env` (mode 0600). Config and memory contain no
 | `larkway memory edit <id>` | Edit L2 identity memory |
 | `larkway perms <id>` | Adjust L1 permissions |
 | `larkway ui` | Start local web management UI |
-| `larkway central set \| show \| unset` | Connect/disconnect central config library |
-| `larkway promote <id>` | Push bot config (no secrets) to central library |
-| `larkway sync` | Pull bot configs from central library |
 | `larkway update` | Upgrade Larkway and restart bridge |
 
 ---

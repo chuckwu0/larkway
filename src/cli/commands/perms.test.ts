@@ -92,7 +92,6 @@ async function writeBotYaml(
 
 import * as botsStore from "../botsStore.js";
 import * as hostConfig from "../hostConfig.js";
-import * as centralStore from "../centralStore.js";
 import * as uiModule from "../ui.js";
 import type { CliContext } from "../types.js";
 
@@ -108,7 +107,6 @@ function makeCtx(fakeUi: ReturnType<typeof makeFakeUI>, extraFlags = {}): CliCon
     ui: fakeUi as unknown as typeof uiModule,
     botsStore,
     hostConfig,
-    centralStore,
     flags: {
       json: false,
       nonInteractive: true,
@@ -331,7 +329,7 @@ describe("perms --add-repo", () => {
     expect(request).toContain("LARKWAY_TEST_BOT_GITLAB_TOKEN");
     expect(request).toContain("type=read");
     expect(granted).toContain("This file is an audit note, not a startup gate.");
-    expect(granted).toContain("GitLab repo pointer: chuckwu0/larkway (main)");
+    expect(granted).toContain("Git repo pointer: chuckwu0/larkway (main)");
     expect(granted).toContain("env=LARKWAY_TEST_BOT_GITLAB_TOKEN");
     expect(granted).toContain("bot exposure changed through larkway perms");
     const out = ui.jsonLines[0] as Record<string, unknown>;

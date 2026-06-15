@@ -374,11 +374,11 @@ async function collectPermissionPlan(
   if (explicitRequests.length === 0) {
     ui.print(ui.dim("── 权限需求 ──"));
     if (repos.length > 0) {
-      if (await ui.confirm(`需要读取这些 GitLab repo 吗? (${repoNames})`, true, niOpts)) {
-        permissionRequests.push(`GitLab read ${repoNames}`);
+      if (await ui.confirm(`需要读取这些 Git repo 吗? (${repoNames})`, true, niOpts)) {
+        permissionRequests.push(`Git read ${repoNames}`);
       }
       if (await ui.confirm("需要写代码、提交分支或开 MR 吗?", false, niOpts)) {
-        permissionRequests.push("GitLab write/MR");
+        permissionRequests.push("Git write/MR");
       }
     }
     if (await ui.confirm("需要在本地 workspace 里跑测试、构建或链接检查吗?", repos.length > 0, niOpts)) {
@@ -511,7 +511,7 @@ async function collectBotBasics(
     // nonInteractive + 无 repo-slug = repo-less bot,合法
   } else {
     const localRepos = await detectLocalRepos(ctx.cwd);
-    const addRepo = await ui.confirm("是否为此 bot 配置 GitLab repo?(repo-less bot 可选 N)", true, niOpts);
+    const addRepo = await ui.confirm("是否为此 bot 配置 Git repo?(repo-less bot 可选 N)", true, niOpts);
     if (addRepo) {
       let repoSlug = argMap["repo-slug"] ?? "";
       if (!repoSlug) {
@@ -519,7 +519,7 @@ async function collectBotBasics(
           ui.print(ui.dim("检测到本地 git repo:"));
           localRepos.slice(0, 5).forEach((r) => ui.print(ui.dim(`  ${r}`)));
         }
-        repoSlug = (await ui.prompt("GitLab 路径(如 group/repo):", { default: "group/repo", ...niOpts })).trim();
+        repoSlug = (await ui.prompt("Git 仓库路径(如 group/repo):", { default: "group/repo", ...niOpts })).trim();
       }
       const branch = (await ui.prompt("目标分支:", { default: "master", ...niOpts })).trim();
       const url = (
@@ -728,9 +728,9 @@ async function runPublishExposure(ctx: CliContext, config: BotConfig): Promise<b
 
   // 能碰哪些 repo
   if (config.repos && config.repos.length > 0) {
-    ui.print(ui.bold("  可操作的 GitLab repo:"));
+    ui.print(ui.bold("  可操作的 Git repo:"));
     config.repos.forEach((r) => ui.print(`    • ${ui.cyan(r.slug)} (branch: ${r.branch})`));
-    ui.print(ui.warn("  ⚠ 需要配置 gitlab_token_env 指向有权限的 GitLab PAT"));
+    ui.print(ui.warn("  ⚠ 需要配置 git_token_env 指向有权限的 Git access token"));
   } else {
     ui.print(ui.bold("  Repo:") + ui.dim(" 无(repo-less bot)"));
   }
@@ -741,7 +741,7 @@ async function runPublishExposure(ctx: CliContext, config: BotConfig): Promise<b
   ui.print(`    • App Secret 存储在 ~/.larkway/.env(chmod 0600)`);
   ui.print(`    • bot yaml 只引用变量名,不含真值`);
   if (flags.advanced) {
-    ui.print(`    • 建议 GitLab PAT 只开 read_repository + write_repository + api scope`);
+    ui.print(`    • 建议 Git access token 只开 read_repository + write_repository + api scope`);
     ui.print(`    • 飞书应用权限已由 registerApp 自动预配(34 scope)`);
   }
   ui.print("");
@@ -857,10 +857,10 @@ function defaultInitPermissionRequests(basics: BotBasics): string[] {
     items.push(`Feishu chat allowlist: ${basics.chatId}`);
   }
   for (const repo of basics.repos) {
-    items.push(`GitLab repo pointer: ${repo.slug} (${repo.branch})`);
+    items.push(`Git repo pointer: ${repo.slug} (${repo.branch})`);
   }
   if (basics.gitlabTokenEnv) {
-    items.push(`GitLab token env name: ${basics.gitlabTokenEnv}`);
+    items.push(`Git access token env name: ${basics.gitlabTokenEnv}`);
   }
   items.push("Local shell inside the Agent Workspace for task execution and verification");
   return items;
@@ -876,7 +876,7 @@ function initPermissionRequests(basics: BotBasics): string[] {
   });
 }
 
-function permissionSurfaceKey(bot: Pick<BotConfig, "chats" | "repos" | "gitlab_token_env">): string {
+function permissionSurfaceKey(bot: Pick<BotConfig, "chats" | "repos" | "git_token_env" | "gitlab_token_env">): string {
   return JSON.stringify({
     chats: [...bot.chats].sort(),
     repos: bot.repos.map((repo) => ({
@@ -884,7 +884,7 @@ function permissionSurfaceKey(bot: Pick<BotConfig, "chats" | "repos" | "gitlab_t
       branch: repo.branch,
       url: repo.url ?? "",
     })).sort((a, b) => a.slug.localeCompare(b.slug)),
-    gitlab_token_env: bot.gitlab_token_env ?? "",
+    git_token_env: bot.git_token_env ?? bot.gitlab_token_env ?? "",
   });
 }
 

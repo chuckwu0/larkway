@@ -101,33 +101,6 @@ export const ChatEntry = z.object({
 
 export type ChatEntryType = z.infer<typeof ChatEntry>;
 
-/**
- * Central config repo (V2.2 §7 A.2 — 头部「中心配置库」).
- *
- * When set, this host pulls its `bots/` (L1 yaml + L2 memory.md) from a central
- * git repo (the single source of truth for headline agents) instead of managing
- * them purely locally. `larkway sync` clones/fetches this repo and materializes
- * the bots into the local bots/ dir; `server-deploy.sh` runs sync before
- * restart when this is configured.
- *
- * OPTIONAL — absence means pure local self-management (the 长尾/本地 posture).
- * An old config.json with no `centralConfig` stays valid.
- */
-export const CentralConfig = z.object({
-  /**
-   * Git URL or local path of the central config repo (where `bots/` lives).
-   * e.g. "git@gitlab.company.com:ops/larkway-bots.git" or a bare repo path.
-   */
-  repo: z.string().min(1, "centralConfig.repo is required (git url or path)"),
-  /** Branch to track on the central repo. @default "main" */
-  branch: z.string().min(1).default("main"),
-  /**
-   * Path INSIDE the central repo that holds the bot files (<id>.yaml +
-   * <id>.memory.md). @default "bots"
-   */
-  path: z.string().min(1).default("bots"),
-});
-
 export const ConfigJson = z.object({
   conventions: ConventionsConfig,
   permissions: PermissionsConfig,
@@ -136,15 +109,9 @@ export const ConfigJson = z.object({
    * to the legacy `LARK_ALLOWED_CHAT_IDS` env var (deprecated).
    */
   chats: z.array(ChatEntry).default([]),
-  /**
-   * Central config repo (V2.2 §7 A.2). Optional — when present, `larkway sync`
-   * pulls bots/ from it. Absent = local self-management.
-   */
-  centralConfig: CentralConfig.optional(),
 });
 
 export type ConventionsConfigType = z.infer<typeof ConventionsConfig>;
-export type CentralConfigType = z.infer<typeof CentralConfig>;
 export type ConfigJsonType = z.infer<typeof ConfigJson>;
 
 const DEFAULT_CONFIG_PATH = path.join(larkwayHome(), "config.json");
@@ -187,7 +154,6 @@ function defaultConfigJson(): ConfigJsonType {
     },
     permissions: { allowExtra: [] },
     chats: [],
-    centralConfig: undefined,
   };
 }
 

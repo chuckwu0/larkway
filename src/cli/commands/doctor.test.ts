@@ -38,7 +38,6 @@ import { run } from "./doctor.js";
 // Real module namespaces — used as base, then overridden per-test.
 import * as botsStoreReal from "../botsStore.js";
 import * as hostConfigReal from "../hostConfig.js";
-import * as centralStoreReal from "../centralStore.js";
 import * as uiReal from "../ui.js";
 import type { CliContext, CliFlags } from "../types.js";
 
@@ -188,7 +187,6 @@ function buildCtx(
     ui: customUi,
     botsStore: botsStoreReal,
     hostConfig: customHostConfig,
-    centralStore: centralStoreReal,
     flags: {
       json: false,
       nonInteractive: false,

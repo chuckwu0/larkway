@@ -105,15 +105,6 @@ function buildCtx(
     envFileExists: async () => false,
   } as unknown as CliContext["hostConfig"];
 
-  // centralStore — minimal stub (update doesn't use it)
-  const centralStore = {
-    resolveCentralCacheDir: () => path.join(tmpdir(), "larkway-test-central-cache"),
-    pullCentral: async () => { throw new Error("not used"); },
-    planSync: async () => ({ added: [], updated: [], removed: [], unchanged: [] }),
-    applySync: async () => ({ applied: [], pruned: [], skipped: [] }),
-    stageAndCommit: async () => { throw new Error("not used"); },
-  } as unknown as CliContext["centralStore"];
-
   return {
     paths: {
       larkwayDir: path.join(tmpdir(), "larkway-test-home"),
@@ -124,7 +115,6 @@ function buildCtx(
     ui,
     botsStore,
     hostConfig,
-    centralStore,
     flags: {
       json: false,
       nonInteractive: false,

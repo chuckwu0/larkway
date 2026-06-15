@@ -556,4 +556,73 @@ runtime: agent_workspace
     expect(bots).toHaveLength(1);
     expect(bots[0]?.runtime).toBe("agent_workspace");
   });
+
+  // ---------------------------------------------------------------------------
+  // Backward compat: git_token_env / gitlab_token_env field migration
+  // ---------------------------------------------------------------------------
+
+  it("backward compat: only gitlab_token_env present → parses successfully", async () => {
+    await createBotsDir();
+    await writeYaml(
+      "legacy-token.yaml",
+      `
+id: legacy-token-bot
+name: Legacy Token Bot
+description: old bot with gitlab_token_env field
+app_id: cli_legacy
+app_secret_env: LEGACY_SECRET
+bot_open_id: ou_legacy
+gitlab_token_env: LARKWAY_LEGACY_BOT_GITLAB_TOKEN
+`,
+    );
+
+    const bots = await loadBots(botsDir());
+    expect(bots).toHaveLength(1);
+    expect(bots[0]?.gitlab_token_env).toBe("LARKWAY_LEGACY_BOT_GITLAB_TOKEN");
+    expect(bots[0]?.git_token_env).toBeUndefined();
+  });
+
+  it("new field: only git_token_env present → parses successfully", async () => {
+    await createBotsDir();
+    await writeYaml(
+      "new-token.yaml",
+      `
+id: new-token-bot
+name: New Token Bot
+description: new bot with git_token_env field
+app_id: cli_new
+app_secret_env: NEW_SECRET
+bot_open_id: ou_new
+git_token_env: LARKWAY_BOT_NEW_TOKEN_BOT_GIT_TOKEN
+`,
+    );
+
+    const bots = await loadBots(botsDir());
+    expect(bots).toHaveLength(1);
+    expect(bots[0]?.git_token_env).toBe("LARKWAY_BOT_NEW_TOKEN_BOT_GIT_TOKEN");
+    expect(bots[0]?.gitlab_token_env).toBeUndefined();
+  });
+
+  it("both fields present → schema allows both (main.ts logic prefers git_token_env)", async () => {
+    await createBotsDir();
+    await writeYaml(
+      "both-tokens.yaml",
+      `
+id: both-tokens-bot
+name: Both Tokens Bot
+description: bot with both token fields (migration in-flight)
+app_id: cli_both
+app_secret_env: BOTH_SECRET
+bot_open_id: ou_both
+git_token_env: LARKWAY_BOT_BOTH_TOKENS_BOT_GIT_TOKEN
+gitlab_token_env: LARKWAY_BOT_BOTH_TOKENS_BOT_GITLAB_TOKEN
+`,
+    );
+
+    const bots = await loadBots(botsDir());
+    expect(bots).toHaveLength(1);
+    // Both fields parsed and present; main.ts uses git_token_env ?? gitlab_token_env.
+    expect(bots[0]?.git_token_env).toBe("LARKWAY_BOT_BOTH_TOKENS_BOT_GIT_TOKEN");
+    expect(bots[0]?.gitlab_token_env).toBe("LARKWAY_BOT_BOTH_TOKENS_BOT_GITLAB_TOKEN");
+  });
 });
