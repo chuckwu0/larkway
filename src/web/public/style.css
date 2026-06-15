@@ -971,12 +971,6 @@ body {
     radial-gradient(135% 90% at 50% -10%, color-mix(in oklab, var(--br) 6%, transparent) 0%, transparent 58%),
     var(--surface);
 }
-.lk-ed--ro {
-  /* 只读:更克制,微光改成中性灰 */
-  background:
-    radial-gradient(135% 90% at 50% -10%, color-mix(in oklab, var(--faint) 9%, transparent) 0%, transparent 58%),
-    var(--surface);
-}
 .lk-ed__inner {
   width: 100%;
   max-width: 580px;
@@ -997,11 +991,6 @@ body {
   background: var(--br-soft);
   border: 1px solid var(--br-edge);
   color: var(--br-text);
-}
-.lk-ed--ro .lk-ed__eyebrow {
-  background: var(--bg);
-  border-color: var(--border);
-  color: var(--muted);
 }
 .lk-ed__eyebrow svg {
   width: 14px;
@@ -1119,11 +1108,6 @@ body {
   border: 1px solid var(--br-edge);
   color: var(--br);
 }
-.lk-ed--ro .lk-ed__chip {
-  background: var(--bg);
-  border-color: var(--border);
-  color: var(--muted);
-}
 .lk-ed__chip svg {
   width: 21px;
   height: 21px;
@@ -1143,9 +1127,6 @@ body {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-}
-.lk-ed--ro .lk-ed__chip-no {
-  background: var(--faint);
 }
 .lk-ed__step-t {
   font-size: 13.5px;
@@ -2050,183 +2031,10 @@ textarea.input {
   line-height: 1.65;
 }
 
-/* ===========================================================================
-   promote section
-   =========================================================================== */
-.promote-actions {
-  display: flex;
-  gap: 10px;
-  margin-top: 14px;
-  flex-wrap: wrap;
-}
-.promote-hint {
-  margin-top: 12px;
-  font-size: 12.5px;
-  color: var(--muted);
-  display: flex;
-  align-items: flex-start;
-  gap: 7px;
-  line-height: 1.5;
-}
-.promote-hint .icon {
-  color: var(--destructive-strong);
-  flex-shrink: 0;
-  margin-top: 1px;
-}
-/* 未连接引导条(LkPromoteCard 未连接态):indigo 提示 + 「去连接」按钮 */
-.promote-connect-hint {
-  margin-top: 14px;
-  display: flex;
-  align-items: center;
-  gap: 9px;
-  padding: 11px 14px;
-  border-radius: 10px;
-  background: var(--br-soft);
-  border: 1px solid var(--br-edge);
-  font-size: 13px;
-  color: #334155;
-  line-height: 1.5;
-}
-.promote-connect-hint .icon {
-  color: var(--br);
-  flex-shrink: 0;
-}
-.promote-connect-hint > button {
-  margin-left: auto;
-  flex-shrink: 0;
-  white-space: nowrap;
-}
-/* 晋升内联结果面板(成功 / 失败):包裹 badge + 正文 + 按钮 */
-.promote-result-panel {
-  display: flex;
-  gap: 13px;
-  margin-top: 14px;
-  padding: 15px 16px;
-  border-radius: 12px;
-}
-.promote-result-panel .prp-badge {
-  flex-shrink: 0;
-  width: 34px;
-  height: 34px;
-  border-radius: 10px;
-  background: #fff;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-}
-.promote-result-panel .prp-body {
-  min-width: 0;
-  flex: 1;
-}
-.promote-result-panel .prp-title {
-  font-size: 14.5px;
-  font-weight: 700;
-  line-height: 1.35;
-}
-.promote-result-panel .prp-desc {
-  font-size: 13px;
-  color: #334155;
-  line-height: 1.55;
-  margin: 3px 0 0;
-}
-.promote-result-panel .prp-meta {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  margin-top: 8px;
-  font-size: 12px;
-  color: var(--muted);
-  flex-wrap: wrap;
-}
-.promote-result-panel .prp-actions {
-  display: flex;
-  gap: 9px;
-  flex-wrap: wrap;
-  margin-top: 12px;
-}
-/* 同步弹窗 header 升级:indigo 徽章 + 右侧 x 关闭按钮 */
-.modal-header-sync {
-  padding: 22px 26px 0;
-}
-.modal-header-sync-row {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-}
-.modal-header-sync h3 {
-  margin: 0;
-  font-size: 18px;
-  font-weight: 700;
-  color: var(--text);
-  display: flex;
-  align-items: center;
-  gap: 9px;
-}
-.modal-header-sync .sync-icon-badge {
-  width: 30px;
-  height: 30px;
-  border-radius: 9px;
-  background: var(--br-soft);
-  border: 1px solid var(--br-edge);
-  color: var(--br);
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  flex-shrink: 0;
-}
-.modal-header-sync .sync-close-btn {
-  display: inline-flex;
-  padding: 6px;
-  border: none;
-  border-radius: 8px;
-  background: transparent;
-  color: var(--muted);
-  cursor: pointer;
-  flex-shrink: 0;
-}
-.modal-header-sync .sync-close-btn:hover {
-  background: var(--bg);
-  color: var(--text);
-}
-.modal-header-sync p {
-  margin: 8px 0 0;
-  font-size: 13.5px;
-  color: var(--muted);
-  line-height: 1.55;
-}
 .btn-sm {
   padding: 7px 14px;
   font-size: 13px;
   border-radius: 9px;
-}
-
-/* ===========================================================================
-   sync group(modal)
-   =========================================================================== */
-.sync-group {
-  margin-bottom: 14px;
-}
-.sync-label {
-  font-size: 13px;
-  font-weight: 700;
-  display: block;
-  margin-bottom: 5px;
-}
-.sync-ok {
-  color: #15803d;
-}
-.sync-warn {
-  color: #b45309;
-}
-.sync-dim {
-  color: var(--muted);
-}
-.sync-list {
-  list-style: disc;
-  padding-left: 22px;
-  margin: 0;
-  font-family: ui-monospace, "Cascadia Code", monospace;
-  font-size: 13px;
 }
 
 /* ===========================================================================
@@ -3730,295 +3538,6 @@ textarea.input {
   flex-direction: column;
 }
 
-/* ===========================================================================
-   公司中心库 tab(centralConnect / centralTab / centralSync 复刻)
-   配色铁律:连接 / 同步 = indigo(--br);移除告警 = amber;不可逆外发 = 红。
-   中心库存「配置」不是「进程」→ 不显在线 / 心跳,只显「谁晋升的 · 多久前更新」。
-   =========================================================================== */
-
-/* ── 来源条(LkSyncBar):来自 <仓库>@<分支> · 最近同步 N 分钟前 + 同步入口 ── */
-.central-source-bar {
-  display: flex;
-  align-items: center;
-  gap: 14px;
-  flex-wrap: wrap;
-  padding: 12px 24px;
-  background: var(--surface);
-  border-bottom: 1px solid var(--border);
-  flex-shrink: 0;
-}
-.central-source-bar[hidden] {
-  display: none;
-}
-.csb-from {
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
-  min-width: 0;
-  font-size: 13px;
-  color: var(--muted);
-}
-.csb-from .icon {
-  color: var(--faint);
-  flex-shrink: 0;
-}
-.csb-repo {
-  color: var(--text);
-  font-family: ui-monospace, "Cascadia Code", monospace;
-  font-weight: 600;
-}
-.csb-branch {
-  display: inline-flex;
-  align-items: center;
-  gap: 3px;
-  color: var(--faint);
-}
-.csb-sep {
-  color: var(--faint);
-}
-.csb-synced {
-  color: var(--faint);
-  white-space: nowrap;
-}
-.csb-right {
-  margin-left: auto;
-  display: inline-flex;
-  align-items: center;
-  gap: 12px;
-}
-/* 「N 项可更新」indigo pill */
-.csb-updates {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  font-size: 12.5px;
-  font-weight: 600;
-  color: var(--br-text);
-  padding: 4px 11px;
-  border-radius: 999px;
-  background: var(--br-soft);
-  border: 1px solid var(--br-edge);
-}
-.csb-updates::before {
-  content: "";
-  width: 7px;
-  height: 7px;
-  border-radius: 50%;
-  background: var(--br);
-}
-/* 「已是最新」绿色平静态 */
-.csb-fresh {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  font-size: 12.5px;
-  color: #15803d;
-}
-/* 同步按钮:有更新 = indigo 实底;否则描边「检查更新」 */
-.csb-sync-btn {
-  display: inline-flex;
-  align-items: center;
-  gap: 7px;
-  padding: 8px 15px;
-  border-radius: 9px;
-  border: 1px solid var(--border);
-  background: var(--surface);
-  color: var(--text);
-  font-size: 13px;
-  font-weight: 600;
-  font-family: inherit;
-  white-space: nowrap;
-  cursor: pointer;
-  transition: background 0.14s, border-color 0.14s, color 0.14s;
-}
-.csb-sync-btn:hover:not(:disabled) {
-  background: var(--bg);
-}
-.csb-sync-btn.has-updates {
-  border: none;
-  background: var(--br);
-  color: #fff;
-}
-.csb-sync-btn.has-updates:hover:not(:disabled) {
-  background: #4338ca;
-}
-.csb-sync-btn:disabled {
-  cursor: wait;
-}
-
-/* ── 中心库只读名册行:头像 + 名字 + 「<by> 晋升 · <updated>」(无在线/心跳)── */
-.bot-list li.cc-roster-item .roster-state {
-  /* 复用 .roster-meta 容器,但替换底部行内容(by/updated)。 */
-}
-.cc-roster-by {
-  display: inline-flex;
-  align-items: center;
-  gap: 5px;
-  font-size: 11.5px;
-  color: var(--faint);
-}
-.cc-roster-by .icon {
-  width: 11px;
-  height: 11px;
-  flex-shrink: 0;
-}
-
-/* ── 「想改?回本机」只读横幅(中心库详情顶部)── */
-.cc-readonly-banner {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  padding: 14px 16px;
-  border-radius: var(--radius-sm);
-  background: var(--br-soft);
-  border: 1px solid var(--br-edge);
-  margin-bottom: 20px;
-}
-.cc-readonly-banner .icon {
-  color: var(--br);
-  flex-shrink: 0;
-  width: 18px;
-  height: 18px;
-}
-.cc-readonly-banner-title {
-  font-size: 13.5px;
-  font-weight: 700;
-  color: var(--br-text);
-}
-.cc-readonly-banner-sub {
-  font-size: 12.5px;
-  color: #334155;
-  line-height: 1.5;
-  margin-top: 1px;
-}
-.cc-go-local-btn {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  padding: 8px 14px;
-  border-radius: 9px;
-  border: none;
-  background: var(--br);
-  color: #fff;
-  font-size: 13px;
-  font-weight: 600;
-  font-family: inherit;
-  cursor: pointer;
-  white-space: nowrap;
-  flex-shrink: 0;
-  margin-left: auto;
-  transition: background 0.14s;
-}
-.cc-go-local-btn:hover {
-  background: #4338ca;
-}
-
-/* ── 中心库侧栏底部「去本机添加/晋升」(只读 = 无添加按钮)── */
-.sidebar-actions .cc-go-local-block {
-  width: 100%;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  gap: 7px;
-  padding: 10px 14px;
-  font-size: 13px;
-  font-weight: 600;
-  color: var(--br-text);
-  background: var(--br-soft);
-  border: 1px solid var(--br-edge);
-  border-radius: 10px;
-  cursor: pointer;
-  font-family: inherit;
-}
-.sidebar-actions .cc-go-local-block:hover {
-  background: var(--br-hover);
-}
-
-/* 同步预览弹窗:设计稿 520px / 圆角 16px(加 .modal--sync class 时生效,关闭后清掉) */
-.modal--sync {
-  width: 520px;
-  border-radius: 16px;
-}
-/* ── 连接弹窗:整张卡内容由 JS 注入,这里只放容器尺寸 ── */
-.connect-modal {
-  width: 520px;
-  padding: 0;
-  overflow-y: auto;
-}
-.connect-modal .modal-body,
-.connect-modal .modal-footer,
-.connect-modal .modal-header {
-  /* 各 phase 自带内边距,容器不重复加。 */
-}
-
-/* 连接表单输入(沿用 LkConfigForm 视觉:mono + focus 环) */
-.cc-input {
-  width: 100%;
-  padding: 10px 12px;
-  border: 1px solid var(--border);
-  border-radius: 9px;
-  font-size: 13.5px;
-  font-family: ui-monospace, "Cascadia Code", monospace;
-  color: var(--text);
-  background: var(--surface);
-  outline: none;
-  box-sizing: border-box;
-  transition: border-color 0.15s, box-shadow 0.15s;
-}
-.cc-input:focus {
-  border-color: var(--br-focus);
-  box-shadow: var(--ring);
-}
-
-/* 同步预览变更行(LkSyncPreview · CcChangeRow):新增=绿 / 更新=indigo / 移除=amber */
-.cc-change-row {
-  display: flex;
-  align-items: flex-start;
-  gap: 11px;
-  padding: 11px 13px;
-  border-radius: 10px;
-  background: var(--bg);
-  border: 1px solid var(--border);
-}
-.cc-change-row.is-removed {
-  background: #fffbeb;
-  border-color: #fde68a;
-}
-.cc-change-badge {
-  flex-shrink: 0;
-  width: 26px;
-  height: 26px;
-  border-radius: 8px;
-  background: var(--surface);
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-}
-.cc-change-tag {
-  font-size: 10.5px;
-  font-weight: 700;
-  padding: 1px 7px;
-  border-radius: 999px;
-}
-
-/* 中心库只读详情:大头像(68px 圆角方,对齐 CcReadonlyDetail LkAvatar size=68 radius=19) */
-.avatar-list.cc-detail-avatar {
-  width: 68px;
-  height: 68px;
-  border-radius: 19px;
-}
-.avatar-list.cc-detail-avatar .avatar-fallback {
-  font-size: 28px;
-  border-radius: inherit;
-}
-
-/* 断开按钮:hover 走危险红(不可逆外发以外的破坏性操作,与 LkConnectedBlock 一致) */
-.csb-disconnect-btn:hover:not(:disabled) {
-  color: var(--destructive-text);
-  border-color: #fecaca;
-  background: var(--destructive-weak);
-}
-
 /* ── Backend 身份层组件(backendKit.jsx 复刻)── */
 /*
  * 三轴分离颜色铁律:
@@ -4194,29 +3713,6 @@ textarea.input {
   font-size: 12.5px;
 }
 
-/* readonly 展示(中心库) */
-.lk-bk-readonly {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  padding: 13px 15px;
-  border-radius: 11px;
-  background: #f8fafc;
-  border: 1px solid #e2e8f0;
-}
-.lk-bk-readonly-name { font-size: 14px; font-weight: 700; color: #1e293b; }
-.lk-bk-readonly-vendor { font-size: 12.5px; color: #64748b; margin-top: 1px; }
-.lk-bk-readonly-lock {
-  display: inline-flex;
-  align-items: center;
-  gap: 5px;
-  font-size: 12px;
-  font-weight: 600;
-  color: #94a3b8;
-  margin-left: auto;
-  flex-shrink: 0;
-}
-
 /* meta strip 5 列(原 4 列扩展;响应自动折行) */
 .hero-meta.hero-meta-5 {
   grid-template-columns: repeat(5, 1fr);
@@ -4255,4 +3751,33 @@ textarea.input {
   color: var(--muted);
   font-size: 13px;
   line-height: 1.55;
+}
+
+/* ── 页头 B:本机静态标识(非交互) ── */
+.ctx-static {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-left: 10px;
+  padding: 4px 11px 4px 9px;
+  border-radius: 999px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--muted);
+  white-space: nowrap;
+}
+.ctx-static .ctx-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--br);
+  flex-shrink: 0;
+}
+.ctx-static .ctx-host {
+  font-family: ui-monospace, "Cascadia Code", monospace;
+  font-size: 11.5px;
+  font-weight: 500;
+  color: var(--faint);
 }

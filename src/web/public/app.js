@@ -3,7 +3,7 @@
  *
  * Larkway 管理面 — 原生 ES module SPA，无框架、无构建步骤。
  *
- * Token 解析:server 注入 window.__LARKWAY_TOKEN__ > ?token= 回退。
+ * Token 解析:server 注入 window.__LK_BOOT_TOKEN__ > ?token= 回退。
  * 所有 /api/* 请求自动带 X-Larkway-Token header。
  * secret 绝不显示真值(gitlab_token_env 变量名是内部细节,UI 不暴露)。
  *
@@ -37,7 +37,6 @@ const ICONS = {
   scan: `<svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 8V6a2 2 0 0 1 2-2h2M16 4h2a2 2 0 0 1 2 2v2M20 16v2a2 2 0 0 1-2 2h-2M8 20H6a2 2 0 0 1-2-2v-2"/></svg>`,
   box: `<svg class="icon icon-sm" viewBox="0 0 24 24" aria-hidden="true"><path d="M21 8 12 3 3 8v8l9 5 9-5Z"/><path d="m3 8 9 5 9-5M12 13v8"/></svg>`,
   plus: `<svg class="icon icon-sm" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>`,
-  // ── 公司中心库专用(centralData.jsx CC_ICON + LK_ICON 复刻)──
   repo: `<svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M3 6a2 2 0 0 1 2-2h11l3 3v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2zM16 4v3h3M7 13h8M7 16h5"/></svg>`,
   branch: `<svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M6 4v9M6 20a2 2 0 1 0 0-4 2 2 0 0 0 0 4ZM6 6a2 2 0 1 0 0-4 2 2 0 0 0 0 4ZM18 8a2 2 0 1 0 0-4 2 2 0 0 0 0 4ZM18 6c0 5-6 4-6 9"/></svg>`,
   folder: `<svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>`,
@@ -101,7 +100,7 @@ function heartSVG(liveKey, w = 72, h = 22, sw = 1.8) {
 const PLACEHOLDER = "__LARKWAY_TOKEN__";
 
 function resolveToken() {
-  const injected = window.__LARKWAY_TOKEN__;
+  const injected = window.__LK_BOOT_TOKEN__;
   if (typeof injected === "string" && injected && injected !== PLACEHOLDER) {
     return injected;
   }
@@ -287,7 +286,7 @@ function deleteAssistantDialog(bot) {
           <div style="background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:10px 14px;display:flex;align-items:flex-start;gap:10px;margin-bottom:20px">
             <input type="checkbox" id="del-ack-chk" style="margin-top:3px;accent-color:#dc2626;flex-shrink:0" />
             <label for="del-ack-chk" style="font-size:13.5px;color:var(--text);cursor:pointer;line-height:1.5">
-              我明白删除后它会停止服务，且不会自动同步到公司中心库。
+              我明白删除后它会停止服务。
             </label>
           </div>
         </div>
@@ -326,110 +325,6 @@ function deleteAssistantDialog(bot) {
   });
 }
 
-// ---------------------------------------------------------------------------
-// uploadConfirmDialog — 正式上传(晋升 push)二次确认弹窗
-//   复刻 centralPromote.jsx LkUploadConfirm:红 upload 徽章 + 标题 + 三条「会发生
-//   什么」+ ack 勾选 gate + 红「确认上传」。不可逆外发,样式走 destructive 红。
-// ---------------------------------------------------------------------------
-
-/**
- * 弹出「正式上传到公司中心库」二次确认弹窗,返回 Promise<boolean>。
- * 勾选「我明白这是不可逆外发」前确认按钮 disabled。点确认 → true;取消/Esc/点背景 → false。
- *
- * @param {{name:string}} bot   要上传的助手(显示名)
- * @param {{name?:string,branch?:string}|null} repo 中心库信息(展示推到哪)
- * @returns {Promise<boolean>}
- */
-function uploadConfirmDialog(bot, repo) {
-  return new Promise((resolve) => {
-    let resolved = false;
-    function done(result) {
-      if (resolved) return;
-      resolved = true;
-      document.removeEventListener("keydown", onKey);
-      backdrop.remove();
-      resolve(result);
-    }
-    function onKey(e) {
-      if (e.key === "Escape") done(false);
-    }
-
-    const botName = esc(bot?.name || "这个助手");
-    const repoName = esc(repo?.name || "公司中心库");
-    const branch = esc(repo?.branch || "main");
-
-    // 三条「会发生什么」(upload / users / lock)
-    const bullets = [
-      [ICONS.upload, `推送到 ${repoName}@${branch}`],
-      [ICONS.users, "团队任何人都能同步、复用这一份"],
-      [ICONS.lock, "只上传配置 —— 密钥、本机 .env 永远不会被推上去"],
-    ];
-
-    const uploadBadge = `<svg class="icon" viewBox="0 0 24 24" aria-hidden="true" style="width:19px;height:19px"><path d="M12 15V3M8 7l4-4 4 4"/><path d="M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2"/></svg>`;
-    const uploadIcon15 = `<svg class="icon" viewBox="0 0 24 24" aria-hidden="true" style="width:15px;height:15px;flex-shrink:0"><path d="M12 15V3M8 7l4-4 4 4"/><path d="M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2"/></svg>`;
-
-    const backdrop = document.createElement("div");
-    backdrop.className = "modal-backdrop";
-    backdrop.setAttribute("role", "dialog");
-    backdrop.setAttribute("aria-modal", "true");
-
-    backdrop.innerHTML = `
-      <div class="modal" style="max-width:520px">
-        <div class="modal-body" style="padding:24px 26px 0">
-          <div style="display:flex;gap:14px;align-items:flex-start">
-            <div style="flex-shrink:0;width:40px;height:40px;border-radius:11px;background:var(--destructive-weak);border:1px solid #fecaca;color:var(--destructive-strong);display:flex;align-items:center;justify-content:center">
-              ${uploadBadge}
-            </div>
-            <div style="min-width:0">
-              <div style="font-size:18px;font-weight:700;color:var(--text);line-height:1.3">正式上传「${botName}」？</div>
-              <p style="margin:6px 0 0;font-size:13.5px;color:var(--muted);line-height:1.58">
-                这会把它推送到团队仓库 <b style="color:var(--text);font-family:ui-monospace,monospace">${repoName}</b>，<b style="color:var(--destructive-text)">所有人同步都能拉到</b>。推上去之后<b style="color:var(--destructive-text)">没法自动撤回</b>（要撤得让工程师改仓库）。
-              </p>
-            </div>
-          </div>
-          <ul style="list-style:none;margin:14px 0 0;padding:0;display:flex;flex-direction:column;gap:8px">
-            ${bullets
-              .map(
-                ([ic, tx]) =>
-                  `<li style="display:flex;align-items:center;gap:9px;font-size:13px;color:#334155"><span style="color:var(--faint);flex-shrink:0;display:inline-flex">${ic}</span>${esc(tx)}</li>`,
-              )
-              .join("")}
-          </ul>
-          <label style="display:flex;align-items:flex-start;gap:9px;margin:16px 0 0;padding:12px 14px;border-radius:10px;background:var(--bg);border:1px solid var(--border);cursor:pointer">
-            <input type="checkbox" id="up-ack-chk" style="margin-top:2px;width:16px;height:16px;accent-color:var(--destructive-strong);flex-shrink:0;cursor:pointer" />
-            <span style="font-size:13px;color:var(--text);line-height:1.5">我明白这是不可逆的外发，全团队同步都会拉到这一份。</span>
-          </label>
-        </div>
-        <div class="modal-footer" style="padding:18px 26px 22px">
-          <div class="modal-btns">
-            <button class="btn" id="up-cancel" type="button">取消</button>
-            <button class="btn btn-del-confirm" id="up-confirm" type="button" disabled>
-              ${uploadIcon15} 确认上传
-            </button>
-          </div>
-        </div>
-      </div>
-    `;
-
-    const ackChk = backdrop.querySelector("#up-ack-chk");
-    const confirmBtn = backdrop.querySelector("#up-confirm");
-    ackChk.addEventListener("change", () => {
-      confirmBtn.disabled = !ackChk.checked;
-    });
-    backdrop.addEventListener("click", (e) => {
-      if (e.target === backdrop) done(false);
-    });
-    backdrop.querySelector("#up-cancel").addEventListener("click", () => done(false));
-    confirmBtn.addEventListener("click", () => {
-      if (!ackChk.checked) return;
-      done(true);
-    });
-    document.addEventListener("keydown", onKey);
-
-    document.body.appendChild(backdrop);
-    backdrop.querySelector("#up-cancel").focus();
-  });
-}
 
 /**
  * 删除助手流程:弹确认 → DELETE /api/bot/:id → 更新 state → toast。
@@ -474,14 +369,12 @@ async function doDeleteBot(id) {
 // ---------------------------------------------------------------------------
 
 const state = {
-  /** @type {"local"|"central"} */
+  /** @type {"local"} */
   mode: "local",
   /** @type {Array<{id:string,name:string,description:string,avatar:string|null}>} */
   bots: [],
   /** @type {string|null} */
   selected: null,
-  /** 中心上下文是否可用 */
-  centralAvailable: false,
   /** Bridge 进程状态(来自 GET /api/bridge;null = 未知)。 */
   bridge: /** @type {{running:boolean,pid:number|null,platform:string,mode:string}|null} */ (null),
   /**
@@ -515,21 +408,6 @@ const state = {
   /** 当前详情 memory 是否有未保存改动。 */
   memoryDirty: false,
 
-  // ── 公司中心库(connect / roster / sync)──────────────────────────────
-  /** 是否已连接中心库(config.json.centralConfig 已设)。来自 GET /api/central/status。 */
-  centralConnected: false,
-  /** 已连接时的仓库信息 { name, url, branch, path }。 */
-  centralRepo: /** @type {{name:string,url:string,branch:string,path:string}|null} */ (null),
-  /** 最近同步时间(ms epoch,来自 status.lastSyncMs);null = 未知。 */
-  centralLastSyncMs: /** @type {number|null} */ (null),
-  /** 中心库共享助手数(来自 status.sharedCount)。 */
-  centralSharedCount: 0,
-  /** 中心库只读名册 [{id,name,desc,by,updated,commit,chats,repos}]。来自 GET /api/central/bots。 */
-  centralBots: /** @type {Array<{id:string,name:string,desc:string,by:string,updated:string,commit:string,chats:number,repos:number,avatar:string|null}>} */ ([]),
-  /** 来源条同步态:'fresh'(已是最新) | 'updates'(有更新可拉) | 'syncing' | 'unknown'。 */
-  centralSyncState: /** @type {"fresh"|"updates"|"syncing"|"unknown"} */ ("unknown"),
-  /** 可更新项数(added+updated+removed),驱动来源条「N 项可更新」pill。 */
-  centralUpdateCount: 0,
   /**
    * 待重启提示:来自 GET /api/status 的 pendingRestart 字段。
    * newCount = 有 yaml 无 status.json(新增 bot,待重启上线);
@@ -825,24 +703,9 @@ async function loadBackends() {
  * 选中项用 indigo 交互色;未就绪提示用中性 slate(绝不染状态色)。
  *
  * @param {string} value        当前选中的 backend id
- * @param {boolean} [readOnly]  只读态(中心库展示)
  * @param {string} [containerId] 容器 id(用于 change 事件冒泡)
  */
-function lkBackendSelectHTML(value, readOnly = false, containerId = "") {
-  if (readOnly) {
-    const b = lkBackend(value);
-    return (
-      `<div class="lk-bk-readonly">` +
-      lkBackendMonoHTML(value, "lg") +
-      `<div style="min-width:0;flex:1">` +
-      `<div class="lk-bk-readonly-name">${esc(b.name)}</div>` +
-      `<div class="lk-bk-readonly-vendor">${esc(b.vendor)}</div>` +
-      `</div>` +
-      `<span class="lk-bk-readonly-lock">${ICONS.lock} 只读</span>` +
-      `</div>`
-    );
-  }
-
+function lkBackendSelectHTML(value, containerId = "") {
   const items = LK_BACKEND_ORDER.map((id) => {
     const b = lkBackend(id);
     const sel = id === value;
@@ -1390,589 +1253,12 @@ function formatDuration(ms) {
 // ---------------------------------------------------------------------------
 
 function renderContextSwitch() {
-  for (const btn of document.querySelectorAll(".ctx-btn")) {
-    btn.classList.toggle("is-active", btn.dataset.mode === state.mode);
-  }
-  // 「公司中心库」段永远可点 —— 未连接时进去看的是连接引导卡(这正是要进的页)。
-  const central = document.getElementById("ctx-central");
-  if (central) central.disabled = false;
-
-  // 侧栏底部按钮:本机显「添加新助手」;中心(只读)隐藏添加,改在 renderBotList 注入
-  // 「去本机添加/晋升」。旧的 #btn-sync(从公司中心库拉取)由来源条的同步入口替代,常隐藏。
-  const btnAdd = document.getElementById("btn-add");
-  if (btnAdd) btnAdd.style.display = state.mode === "central" ? "none" : "";
-  const btnSync = document.getElementById("btn-sync");
-  if (btnSync) btnSync.style.display = "none";
-
-  // 中心库(只读)= 无「添加」按钮,改放「去本机添加/晋升」引导(CcRoster 底部)。
-  const actions = document.getElementById("sidebar-actions");
-  if (actions) {
-    let goLocal = document.getElementById("cc-go-local-block");
-    if (state.mode === "central") {
-      if (!goLocal) {
-        goLocal = document.createElement("button");
-        goLocal.id = "cc-go-local-block";
-        goLocal.type = "button";
-        goLocal.className = "cc-go-local-block";
-        goLocal.innerHTML = `${ICONS.plus} 去「本机」添加 / 晋升`;
-        goLocal.addEventListener("click", () => switchContext("local"));
-        actions.appendChild(goLocal);
-      }
-      goLocal.style.display = "";
-    } else if (goLocal) {
-      goLocal.style.display = "none";
-    }
-  }
+  // Static local-only mode — show hostname badge, nothing to toggle.
+  const hostEl = document.getElementById("ctx-host");
+  if (hostEl) hostEl.textContent = location.hostname ? " · " + location.hostname : "";
 }
 
-// ---------------------------------------------------------------------------
-// 渲染:公司中心库来源条(LkSyncBar 复刻)
-// ---------------------------------------------------------------------------
 
-/** 把「距上次同步的毫秒数」换算成「N 分钟前 / 刚刚 / N 小时前」。 */
-function formatSyncAgo(lastSyncMs) {
-  if (typeof lastSyncMs !== "number" || !isFinite(lastSyncMs)) return null;
-  const diff = Date.now() - lastSyncMs;
-  if (diff < 0) return "刚刚";
-  const min = Math.floor(diff / 60000);
-  if (min < 1) return "刚刚";
-  if (min < 60) return `${min} 分钟前`;
-  const hr = Math.floor(min / 60);
-  if (hr < 24) return `${hr} 小时前`;
-  return `${Math.floor(hr / 24)} 天前`;
-}
-
-/**
- * 渲染顶部来源条:来自 <仓库>@<分支> · 最近同步 N 分钟前 + 同步入口。
- * 仅在 central 已连接态显示;其余态隐藏。
- * 状态:'fresh'(已是最新) / 'updates'(有更新可拉) / 'syncing' / 'unknown'(检查更新)。
- */
-function renderCentralSourceBar() {
-  const bar = document.getElementById("central-source-bar");
-  if (!bar) return;
-
-  if (state.mode !== "central" || !state.centralConnected || !state.centralRepo) {
-    bar.hidden = true;
-    bar.innerHTML = "";
-    return;
-  }
-
-  const r = state.centralRepo;
-  const syncState = state.centralSyncState;
-  const ago = syncState === "syncing" ? "…" : (formatSyncAgo(state.centralLastSyncMs) ?? "未知");
-
-  // 右侧状态指示(updates pill / fresh 平静态)
-  let statusBadge = "";
-  if (syncState === "updates") {
-    statusBadge = `<span class="csb-updates">${state.centralUpdateCount} 项可更新</span>`;
-  } else if (syncState === "fresh") {
-    statusBadge = `<span class="csb-fresh">${ICONS.check} 已是最新</span>`;
-  }
-
-  const hasUpdates = syncState === "updates";
-  const syncing = syncState === "syncing";
-  const btnLabel = syncing ? "正在同步…" : hasUpdates ? "拉取最新" : "检查更新";
-  const btnIcon = syncing
-    ? `<span class="spinner" style="width:14px;height:14px;border-width:2px"></span>`
-    : ICONS.pull;
-
-  bar.innerHTML =
-    `<span class="csb-from">` +
-    ICONS.repo +
-    `<span>来自 <b class="csb-repo">${esc(r.name)}</b></span>` +
-    `<span class="csb-branch">${ICONS.branch}${esc(r.branch)}</span>` +
-    `<span class="csb-sep">·</span>` +
-    `<span class="csb-synced">最近同步 ${esc(ago)}</span>` +
-    `</span>` +
-    `<span class="csb-right">` +
-    statusBadge +
-    `<button type="button" id="btn-central-sync" class="csb-sync-btn${hasUpdates ? " has-updates" : ""}"${syncing ? " disabled" : ""}>` +
-    btnIcon + esc(btnLabel) +
-    `</button>` +
-    // 已连接设置块(改配置 / 断开)—— LkConnectedBlock 复刻,放在同步入口右侧
-    `<button type="button" id="btn-central-edit" class="csb-sync-btn" title="改中心库配置">${ICONS.gear} 改配置</button>` +
-    `<button type="button" id="btn-central-disconnect" class="csb-sync-btn csb-disconnect-btn" title="断开公司中心库">断开</button>` +
-    `</span>`;
-  bar.hidden = false;
-
-  bar.querySelector("#btn-central-sync")?.addEventListener("click", () => doCentralSync());
-  bar.querySelector("#btn-central-edit")?.addEventListener("click", () => openConnectFlow(true));
-  bar.querySelector("#btn-central-disconnect")?.addEventListener("click", () => doCentralDisconnect());
-}
-
-// ---------------------------------------------------------------------------
-// 公司中心库:连接状态 + 名册拉取
-// ---------------------------------------------------------------------------
-
-/**
- * 拉 GET /api/central/status,写入 state.central*。
- * connected = config.json.centralConfig 已设;best-effort 回填 repo/head/sharedCount/lastSyncMs。
- * 失败时降级:connected 保持已知值(不抛),让 UI 仍能渲染连接引导。
- */
-async function loadCentralStatus() {
-  const res = await api("GET", "/api/central/status");
-  if (!res.ok || !res.json) {
-    state.centralConnected = false;
-    state.centralRepo = null;
-    return;
-  }
-  const j = res.json;
-  state.centralConnected = j.connected === true;
-  state.centralRepo = j.repo ?? null;
-  state.centralLastSyncMs = typeof j.lastSyncMs === "number" ? j.lastSyncMs : null;
-  state.centralSharedCount = typeof j.sharedCount === "number" ? j.sharedCount : 0;
-  // 与 /api/context 的 centralAvailable 对齐(连接=可用)
-  state.centralAvailable = state.centralConnected;
-}
-
-/**
- * 拉 GET /api/central/bots → state.centralBots(只读名册,含 by/updated/commit)。
- * @returns {Promise<boolean>} 成功与否
- */
-async function loadCentralBots() {
-  const res = await api("GET", "/api/central/bots");
-  if (!res.ok) {
-    state.centralBots = [];
-    return false;
-  }
-  state.centralBots = Array.isArray(res.json?.bots) ? res.json.bots : [];
-  return true;
-}
-
-// ---------------------------------------------------------------------------
-// 公司中心库:连接流弹窗(form → connecting → connected/failed)
-//   复刻 centralConnect.jsx LkConnectFlow。connecting 调 POST /api/central/config。
-// ---------------------------------------------------------------------------
-
-/** 连接流弹窗的瞬态(表单值 + 连上后回填的仓库)。 */
-const connectFlow = {
-  /** @type {{url:string,branch:string,path:string}} */
-  values: { url: "", branch: "main", path: "bots/" },
-  /** @type {{name:string,url:string,branch:string,path:string}|null} */
-  repo: null,
-  /** @type {{kind?:string,error?:string}|null} */
-  fail: null,
-};
-
-/** 打开连接流弹窗(默认 form 态;edit=true 时预填现有配置)。 */
-function openConnectFlow(edit = false) {
-  if (edit && state.centralRepo) {
-    connectFlow.values = {
-      url: state.centralRepo.url ?? "",
-      branch: state.centralRepo.branch ?? "main",
-      path: state.centralRepo.path ?? "bots/",
-    };
-  } else {
-    connectFlow.values = { url: "", branch: "main", path: "bots/" };
-  }
-  connectFlow.repo = null;
-  connectFlow.fail = null;
-  renderConnectFlow("form");
-  const backdrop = document.getElementById("connect-backdrop");
-  if (backdrop) backdrop.hidden = false;
-  document.getElementById("cc-url")?.focus();
-}
-
-function closeConnectFlow() {
-  const backdrop = document.getElementById("connect-backdrop");
-  if (backdrop) backdrop.hidden = true;
-}
-
-/** 连接弹窗 header(indigo link 徽章 + 标题 + 副标题 + 关闭)。 */
-function connectHead(title, sub) {
-  return (
-    `<div style="padding:22px 26px 0">` +
-    `<div style="display:flex;align-items:center;justify-content:space-between">` +
-    `<h3 style="margin:0;font-size:18px;font-weight:700;color:var(--text);display:flex;align-items:center;gap:9px">` +
-    `<span style="width:30px;height:30px;border-radius:9px;background:var(--br-soft);border:1px solid var(--br-edge);color:var(--br);display:inline-flex;align-items:center;justify-content:center">${ICONS.link2}</span>` +
-    esc(title) +
-    `</h3>` +
-    `<button type="button" id="cc-close" aria-label="关闭" style="display:inline-flex;padding:6px;border:none;border-radius:8px;background:transparent;color:var(--muted);cursor:pointer">${ICONS.x}</button>` +
-    `</div>` +
-    (sub ? `<p style="margin:8px 0 0;font-size:13.5px;color:var(--muted);line-height:1.55">${esc(sub)}</p>` : "") +
-    `</div>`
-  );
-}
-
-/**
- * 渲染连接流弹窗的某个 phase。
- * @param {"form"|"connecting"|"connected"|"failed"} phase
- */
-function renderConnectFlow(phase) {
-  const modal = document.getElementById("connect-modal");
-  if (!modal) return;
-  const v = connectFlow.values;
-
-  if (phase === "connecting") {
-    const steps = ["找到这个仓库", "验证这台机器有没有权限", `读取 ${v.path || "bots/"} 里的助手`];
-    modal.innerHTML =
-      connectHead("正在连接…", "在测试这台电脑能不能访问这个仓库。不会改动仓库里任何东西。") +
-      `<div style="padding:20px 26px 26px">` +
-      `<div style="display:flex;flex-direction:column;align-items:center;gap:14px;padding:18px 0 22px">` +
-      `<span class="spinner spinner-lg"></span>` +
-      `<code style="font-size:12.5px;color:var(--muted);font-family:ui-monospace,monospace;word-break:break-all;text-align:center;max-width:380px">${esc(v.url)}</code>` +
-      `</div>` +
-      `<ul style="list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:10px">` +
-      steps.map((s, i) =>
-        `<li style="display:flex;align-items:center;gap:10px;font-size:13.5px;color:${i === 0 ? "var(--text)" : "var(--faint)"}">` +
-        (i === 0
-          ? `<span class="spinner" style="width:15px;height:15px;border-width:2px"></span>`
-          : `<span style="width:15px;height:15px;border-radius:50%;border:1.6px solid var(--border);flex-shrink:0"></span>`) +
-        esc(s) + `</li>`
-      ).join("") +
-      `</ul></div>`;
-    // connecting 态不可关闭(无 close 按钮)
-    return;
-  }
-
-  if (phase === "connected") {
-    const r = connectFlow.repo ?? state.centralRepo ?? { name: "", branch: "main", path: "bots/" };
-    const rows = [
-      ["repo", "仓库", r.name, true],
-      ["branch", "分支", r.branch, false],
-      ["folder", "助手目录", r.path, false],
-    ];
-    modal.innerHTML =
-      `<div style="padding:26px 26px 0;display:flex;gap:14px">` +
-      `<span style="flex-shrink:0;width:40px;height:40px;border-radius:11px;background:${LIVE_SOFT.serving};border:1px solid ${LIVE_EDGE.serving};color:${LIVE_COLOR.serving};display:flex;align-items:center;justify-content:center">${ICONS.check}</span>` +
-      `<div style="min-width:0">` +
-      `<h3 style="margin:0;font-size:18px;font-weight:700;color:var(--text)">连上了</h3>` +
-      `<p style="margin:6px 0 0;font-size:13.5px;color:var(--muted);line-height:1.55">这台电脑已经能访问公司中心库了。现在去本机详情页，<b style="color:var(--br-text)">晋升</b>按钮就能点了。</p>` +
-      `</div></div>` +
-      `<div style="margin:16px 26px 0;border-radius:12px;border:1px solid var(--border);overflow:hidden">` +
-      rows.map(([ic, k, val, mono], i) =>
-        `<div style="display:flex;align-items:center;gap:10px;padding:11px 14px;${i ? "border-top:1px solid var(--border);" : ""}background:${i % 2 ? "var(--surface)" : "var(--bg)"}">` +
-        ICONS[ic] +
-        `<span style="font-size:12.5px;color:var(--faint);width:64px">${esc(k)}</span>` +
-        `<span style="font-size:13.5px;font-weight:600;color:var(--text);${mono ? "font-family:ui-monospace,monospace" : ""}">${esc(val ?? "")}</span>` +
-        `</div>`
-      ).join("") +
-      `</div>` +
-      `<p style="margin:14px 26px 0;font-size:13px;color:var(--muted);display:flex;align-items:center;gap:8px">${ICONS.users} 中心库里现在有 <b style="color:var(--text)">${state.centralSharedCount}</b> 个共享助手，去「公司中心库」看看。</p>` +
-      `<div style="display:flex;justify-content:flex-end;gap:10px;padding:20px 26px 22px">` +
-      `<button type="button" id="cc-done" class="btn btn-primary">${ICONS.check} 完成</button>` +
-      `</div>`;
-    modal.querySelector("#cc-done")?.addEventListener("click", () => {
-      closeConnectFlow();
-      // 连上后进入中心库视图并加载名册。
-      // 注意:若此前已在「公司中心库」上下文(从引导卡进来),switchContext('central')
-      // 会因 mode 未变而 no-op,所以这里直接强制刷新中心视图。
-      void enterCentralConnected();
-    });
-    return;
-  }
-
-  if (phase === "failed") {
-    const f = connectFlow.fail ?? {};
-    const reasons = [
-      ["地址可能写错了", "核对一下仓库地址有没有漏字符、对不对。"],
-      ["这台机器没有访问权限", "让工程师把你这台电脑的 SSH key 加进仓库，或换 HTTPS + 令牌。"],
-    ];
-    const errLine = f.error
-      ? `<div style="margin:14px 26px 0;font-size:12.5px;color:var(--destructive-text);line-height:1.5">${esc(f.error)}</div>`
-      : "";
-    modal.innerHTML =
-      `<div style="padding:24px 26px 0;display:flex;gap:14px">` +
-      `<span style="flex-shrink:0;width:40px;height:40px;border-radius:11px;background:${LIVE_SOFT.offline};border:1px solid ${LIVE_EDGE.offline};color:${LIVE_COLOR.offline};display:flex;align-items:center;justify-content:center">${ICONS.warn}</span>` +
-      `<div style="min-width:0">` +
-      `<h3 style="margin:0;font-size:18px;font-weight:700;color:var(--text)">仓库连不上</h3>` +
-      `<p style="margin:6px 0 0;font-size:13.5px;color:var(--muted);line-height:1.55">没改动任何东西。多半是下面两种情况之一：</p>` +
-      `</div></div>` +
-      `<ul style="list-style:none;margin:14px 26px 0;padding:0;display:flex;flex-direction:column;gap:10px">` +
-      reasons.map(([h, d], i) =>
-        `<li style="display:flex;gap:11px;align-items:flex-start;padding:12px 14px;border-radius:10px;background:${LIVE_SOFT.offline};border:1px solid ${LIVE_EDGE.offline}">` +
-        `<span style="flex-shrink:0;width:20px;height:20px;margin-top:1px;border-radius:999px;background:var(--surface);border:1px solid ${LIVE_EDGE.offline};color:${LIVE_TEXT.offline};font-size:11px;font-weight:700;display:flex;align-items:center;justify-content:center">${i + 1}</span>` +
-        `<div><div style="font-size:13.5px;font-weight:600;color:#334155">${esc(h)}</div><div style="font-size:12.5px;color:var(--muted);line-height:1.5;margin-top:1px">${esc(d)}</div></div>` +
-        `</li>`
-      ).join("") +
-      `</ul>` +
-      errLine +
-      `<div style="display:flex;justify-content:space-between;align-items:center;gap:10px;padding:20px 26px 22px">` +
-      `<button type="button" id="cc-edit" class="btn">改一下配置</button>` +
-      `<button type="button" id="cc-retry" class="btn btn-primary">${ICONS.refresh} 重试</button>` +
-      `</div>`;
-    modal.querySelector("#cc-edit")?.addEventListener("click", () => renderConnectFlow("form"));
-    modal.querySelector("#cc-retry")?.addEventListener("click", () => submitConnect());
-    return;
-  }
-
-  // ── form(默认)──
-  modal.innerHTML =
-    connectHead(
-      "连接公司中心库",
-      "把一个 git 仓库连上，团队的助手就能互相同步。地址一般让工程师帮你配一次，之后就不用管了。",
-    ) +
-    `<div style="padding:18px 26px 0;display:flex;flex-direction:column;gap:16px">` +
-    ccField("仓库地址", "团队放助手配置的 git 仓库。SSH 或 HTTPS 都行。不知道填啥？问下工程师。",
-      `<input id="cc-url" class="cc-input" value="${esc(v.url)}" placeholder="git@gitlab.公司.com:team/larkway-bots.git" />`) +
-    `<div style="display:grid;grid-template-columns:1fr 1fr;gap:14px">` +
-    ccField("分支", "一般就是 main，别动。", `<input id="cc-branch" class="cc-input" value="${esc(v.branch)}" />`) +
-    ccField("助手放在仓库哪个目录", "团队约定的目录，默认就行。", `<input id="cc-path" class="cc-input" value="${esc(v.path)}" />`) +
-    `</div>` +
-    `<div style="display:flex;align-items:center;gap:8px;padding:10px 13px;border-radius:10px;background:var(--bg);border:1px solid var(--border);font-size:12.5px;color:var(--muted)">${ICONS.lock} 只做一次只读连接测试，不会往仓库里写任何东西。</div>` +
-    `</div>` +
-    `<div style="display:flex;justify-content:space-between;align-items:center;gap:10px;padding:20px 26px 22px">` +
-    `<button type="button" id="cc-cancel" class="btn">取消</button>` +
-    `<button type="button" id="cc-submit" class="btn btn-primary">${ICONS.link2} 连接</button>` +
-    `</div>`;
-
-  const urlEl = modal.querySelector("#cc-url");
-  const submitEl = modal.querySelector("#cc-submit");
-  const syncCan = () => {
-    const can = (urlEl?.value ?? "").trim().length > 6;
-    if (submitEl) submitEl.disabled = !can;
-  };
-  syncCan();
-  urlEl?.addEventListener("input", syncCan);
-  modal.querySelector("#cc-close")?.addEventListener("click", () => closeConnectFlow());
-  modal.querySelector("#cc-cancel")?.addEventListener("click", () => closeConnectFlow());
-  submitEl?.addEventListener("click", () => submitConnect());
-}
-
-/** label + 说人话 help + 输入(CcField 复刻)。 */
-function ccField(label, help, inputHTML) {
-  return (
-    `<div style="display:flex;flex-direction:column;gap:6px">` +
-    `<label style="font-size:14px;font-weight:600;color:var(--text)">${esc(label)}</label>` +
-    (help ? `<p style="margin:0;font-size:12.5px;color:var(--muted);line-height:1.5">${esc(help)}</p>` : "") +
-    inputHTML +
-    `</div>`
-  );
-}
-
-/**
- * 提交连接:读表单 → connecting 态 → POST /api/central/config →
- * ok → connected 态 + 刷新 status;否则 → failed 态(说人话,不甩堆栈)。
- */
-async function submitConnect() {
-  const modal = document.getElementById("connect-modal");
-  // form 态时从输入读取最新值;retry 时沿用上次 values
-  const urlEl = modal?.querySelector("#cc-url");
-  if (urlEl) {
-    connectFlow.values = {
-      url: (modal.querySelector("#cc-url")?.value ?? "").trim(),
-      branch: (modal.querySelector("#cc-branch")?.value ?? "").trim() || "main",
-      path: (modal.querySelector("#cc-path")?.value ?? "").trim() || "bots/",
-    };
-  }
-  const v = connectFlow.values;
-  if (!v.url || v.url.length <= 6) {
-    toast("请填写仓库地址。", "warn");
-    return;
-  }
-
-  renderConnectFlow("connecting");
-  const res = await api("POST", "/api/central/config", {
-    url: v.url,
-    branch: v.branch,
-    path: v.path,
-  });
-
-  if (res.ok && res.json?.ok === true) {
-    connectFlow.repo = res.json.repo ?? null;
-    // 刷新连接状态(取 sharedCount 等)
-    await loadCentralStatus();
-    renderConnectFlow("connected");
-  } else {
-    const j = res.json ?? {};
-    connectFlow.fail = { kind: j.kind, error: j.error };
-    renderConnectFlow("failed");
-  }
-}
-
-// ---------------------------------------------------------------------------
-// 公司中心库:断开连接
-// ---------------------------------------------------------------------------
-
-async function doCentralDisconnect() {
-  const ok = await confirmDialog({
-    title: "断开公司中心库？",
-    body:
-      "断开后这台电脑不再跟团队中心库同步,「晋升」也会停用。本机已有的助手不受影响,继续在本机跑。\n\n随时可以再连回来。",
-    confirmText: "断开",
-    confirmDanger: true,
-  });
-  if (!ok) return;
-  const res = await api("POST", "/api/central/disconnect");
-  if (!res.ok || res.json?.ok !== true) {
-    toast(`断开失败：${res.json?.error ?? res.status}`, "error");
-    return;
-  }
-  toast("已断开公司中心库", "ok");
-  state.centralConnected = false;
-  state.centralRepo = null;
-  state.centralAvailable = false;
-  // 后端断开后会把 mode 重置为 local;前端跟随切回本机
-  state.mode = "local";
-  state.selected = null;
-  renderContextSwitch();
-  renderCentralSourceBar();
-  renderBotDetail(null);
-  await loadBots();
-  renderServiceIndicator();
-}
-
-// ---------------------------------------------------------------------------
-// 公司中心库:同步(中心 → 本地)—— preview(dry-run)+ ack gate + apply
-//   复刻 centralSync.jsx LkSyncPreview。preview 走 GET /api/central/sync/preview,
-//   apply 走 POST /api/central/sync/apply。移除类醒目(amber)+ ack 勾选。
-// ---------------------------------------------------------------------------
-
-async function doCentralSync() {
-  state.centralSyncState = "syncing";
-  renderCentralSourceBar();
-
-  const res = await api("GET", "/api/central/sync/preview");
-  if (!res.ok) {
-    state.centralSyncState = "unknown";
-    renderCentralSourceBar();
-    toast(`同步预览失败：${res.json?.error ?? res.status}`, "error");
-    return;
-  }
-  const preview = {
-    added: Array.isArray(res.json?.added) ? res.json.added : [],
-    updated: Array.isArray(res.json?.updated) ? res.json.updated : [],
-    removed: Array.isArray(res.json?.removed) ? res.json.removed : [],
-  };
-  // 「N 项可更新」只数中心 sync 会真正应用的增量(added + updated)。removed(本机自建未晋升的
-  // bot)本机自管、绝不删,不该算「可更新」—— 否则本地独有 bot 会让来源条永远显示「1 项可更新」,
-  // 点进去又走删除路径(2026-06-01 误删 larkway-2 的连锁起点)。
-  const total = preview.added.length + preview.updated.length;
-  state.centralUpdateCount = total;
-  state.centralSyncState = total > 0 ? "updates" : "fresh";
-  renderCentralSourceBar();
-
-  if (total === 0) {
-    toast("已是最新，没有要同步的改动。", "ok");
-    return;
-  }
-  showCentralSyncModal(preview);
-}
-
-/** 一行变更项(CcChangeRow):added=绿 / updated=indigo / removed=amber。 */
-function ccChangeRow(kind, item) {
-  const map = {
-    added: { c: LIVE_COLOR.serving, soft: LIVE_SOFT.serving, edge: LIVE_EDGE.serving, text: LIVE_TEXT.serving, icon: ICONS.plus, tag: "新增" },
-    updated: { c: BR.c, soft: BR.soft, edge: BR.edge, text: BR.text, icon: ICONS.refresh, tag: "更新" },
-    removed: { c: LIVE_COLOR.degraded, soft: LIVE_SOFT.degraded, edge: LIVE_EDGE.degraded, text: LIVE_TEXT.degraded, icon: ICONS.trash, tag: "移除" },
-  }[kind];
-  const removed = kind === "removed";
-  const by = item.by ? `<span style="font-size:11.5px;color:var(--faint)">· ${esc(item.by)}</span>` : "";
-  const note = removed
-    ? "中心库里已被移除 —— 同步后本机这份(由中心库管理)也会删掉。"
-    : (item.note ?? "");
-  return (
-    `<div class="cc-change-row${removed ? " is-removed" : ""}">` +
-    `<span class="cc-change-badge" style="border:1px solid ${map.edge};color:${map.c}">${map.icon}</span>` +
-    `<div style="min-width:0;flex:1">` +
-    `<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">` +
-    `<span style="font-size:14px;font-weight:600;color:var(--text)">${esc(item.name)}</span>` +
-    `<span class="cc-change-tag" style="color:${map.text};background:${map.soft};border:1px solid ${map.edge}">${map.tag}</span>` +
-    by +
-    `</div>` +
-    `<div style="font-size:12.5px;color:${removed ? map.text : "var(--muted)"};line-height:1.5;margin-top:2px">${esc(note)}</div>` +
-    `</div></div>`
-  );
-}
-
-/** 同步预览 modal(复用 #modal-backdrop)。移除>0 时 ack gate。 */
-function showCentralSyncModal(preview) {
-  const backdrop = document.getElementById("modal-backdrop");
-  const modal = document.getElementById("modal");
-  if (!backdrop || !modal) return;
-  // 同步弹窗:设计稿 520px / 圆角 16px,加 class 后关闭时清掉
-  modal.classList.add("modal--sync");
-
-  const nAdd = preview.added.length, nUpd = preview.updated.length;
-  // 中心 sync 只做增量:added(中心有本机没有)+ updated(两边都有、中心更新)。
-  // `preview.removed` = 「本机有、中心没有」,即本机自建没晋升过的 bot —— 本机自管,中心 sync
-  // 绝不删它(见下方 prune=false)。所以这里不计入改动、不展示为「移除」、不做 ack gate,
-  // 避免把用户自己的本地 bot 误报成「会被移除」吓人(2026-06-01 误删 larkway-2 的教训)。
-  const nRem = 0;
-  const total = nAdd + nUpd;
-
-  const sumCell = (n, label, c) =>
-    `<span style="display:inline-flex;align-items:baseline;gap:5px"><b style="font-size:16px;font-weight:800;color:${n ? c : "var(--faint)"}">${n}</b><span style="font-size:12.5px;color:var(--muted)">${label}</span></span>`;
-  const sep = `<span style="width:1px;height:20px;background:var(--border)"></span>`;
-
-  const removeWarn = "";
-
-  const list =
-    preview.added.map((it) => ccChangeRow("added", it)).join("") +
-    preview.updated.map((it) => ccChangeRow("updated", it)).join("");
-
-  const ackBlock = "";
-
-  modal.querySelector(".modal-header")?.remove();
-  modal.querySelector(".modal-header-sync")?.remove();
-  modal.innerHTML =
-    `<div class="modal-header-sync">` +
-    `<div class="modal-header-sync-row">` +
-    `<h3><span class="sync-icon-badge">${ICONS.pull}</span>同步前先看一眼</h3>` +
-    `<button class="sync-close-btn" id="cc-sync-close-x" type="button" aria-label="关闭">${ICONS.x}</button>` +
-    `</div>` +
-    `<p>把中心库最新的拉到本机。下面是会发生的改动，确认了再应用。</p>` +
-    `</div>` +
-    `<div class="modal-body">` +
-    `<div style="display:flex;align-items:center;gap:20px;padding:12px 16px;border-radius:11px;background:var(--bg);border:1px solid var(--border)">` +
-    sumCell(nAdd, "新增", LIVE_COLOR.serving) + sep + sumCell(nUpd, "更新", BR.c) + sep + sumCell(nRem, "移除", LIVE_COLOR.degraded) +
-    `</div>` +
-    removeWarn +
-    `<div style="margin:16px 0 0;display:flex;flex-direction:column;gap:8px">${list}</div>` +
-    ackBlock +
-    `</div>` +
-    `<div class="modal-footer">` +
-    `<div class="modal-btns">` +
-    `<button class="btn" id="cc-sync-cancel" type="button">先不同步</button>` +
-    `<button class="btn btn-primary" id="cc-sync-apply" type="button">${ICONS.pull} 应用更新（${total}）</button>` +
-    `</div></div>`;
-
-  const applyBtn = modal.querySelector("#cc-sync-apply");
-  const ackChk = modal.querySelector("#cc-sync-ack");
-  if (ackChk && applyBtn) {
-    applyBtn.disabled = true;
-    ackChk.addEventListener("change", () => { applyBtn.disabled = !ackChk.checked; });
-  }
-
-  backdrop.hidden = false;
-
-  const closeSync = () => { backdrop.hidden = true; modal.classList.remove("modal--sync"); };
-  modal.querySelector("#cc-sync-cancel")?.addEventListener("click", closeSync);
-  modal.querySelector("#cc-sync-close-x")?.addEventListener("click", closeSync);
-  applyBtn?.addEventListener("click", async () => {
-    if (applyBtn.disabled) return;
-    // 安全:中心库 sync 永不自动删本机 bot。planSync 的 `removed` = 「本机有、中心没有」,
-    // 它把「本机自建从没晋升过的 bot」(如本地新建测试 bot)和「曾被中心管理后从中心删掉的」
-    // 混为一谈 —— 旧代码 `nRem>0` 就 prune=true 会把前者一并硬删(2026-06-01 误删 larkway-2)。
-    // 在 provenance-aware prune 落地前,这里强制 false:本机自管是安全默认,中心 sync 只增量
-    // 拉 added/updated,绝不删本机。真要清理本机多余 bot 走「拉取最新」里显式勾选 prune 的流程。
-    const prune = false;
-    const restore = btnLoading(applyBtn, "正在应用…");
-    const res = await api("POST", "/api/central/sync/apply", { prune });
-    restore();
-    backdrop.hidden = true;
-    modal.classList.remove("modal--sync");
-    if (!res.ok || res.json?.ok !== true) {
-      toast(`同步失败：${res.json?.error ?? res.status}`, "error");
-      return;
-    }
-    const j = res.json;
-    const parts = [];
-    if ((j.added ?? []).length) parts.push(`新增 ${j.added.length}`);
-    if ((j.updated ?? []).length) parts.push(`更新 ${j.updated.length}`);
-    if ((j.removed ?? []).length) parts.push(`移除 ${j.removed.length}`);
-    toast(`同步完成。${parts.join("、") || "无变化"}`, "ok");
-    if ((j.warnings ?? []).length) {
-      for (const w of j.warnings) console.warn("[larkway central sync]", w);
-    }
-    // 同步后刷新中心库状态 + 名册(本机也变了,但当前在中心视图,刷中心名册)
-    state.centralSyncState = "fresh";
-    state.centralUpdateCount = 0;
-    await loadCentralStatus();
-    renderCentralSourceBar();
-    await loadBots();
-  });
-}
 
 // ---------------------------------------------------------------------------
 // 渲染:主机状态 pill
@@ -2088,12 +1374,11 @@ function renderDetailBanner() {
  * 一行(名字下方的「● 连接异常/正常服务中 · N 秒前心跳」+ 头像光环)是 renderBotDetail
  * 选中时一次性渲染的,poll 不碰它 → bot 恢复在线后 hero pill 卡在旧的「连接异常」+ 旧心跳。
  * 这里在每次 /api/status 落地后,用 acRefreshHero 按 state.liveness/lastSeenMs 重建 hero body
- * (它读 AC 面板的实时表单值,所以不会丢用户正在编辑的输入)。仅本机可改模式生效:
- * 中心库(只读)hero 不显在线/心跳,且没有 AC 面板可读。
+ * (它读 AC 面板的实时表单值,所以不会丢用户正在编辑的输入)。
  */
 function refreshDetailHero() {
   const id = state.selected;
-  if (!id || state.mode === "central") return;
+  if (!id) return;
   const panel = document.getElementById("detail");
   if (!panel || !panel.querySelector("#detail-hero-body")) return;
   if (!panel.querySelector("#ac-panel")) return; // 编辑式面板未挂载(加载中/占位)
@@ -2118,19 +1403,12 @@ function renderBotListLoading() {
   }
 }
 
-/** 更新名册顶部计数文案「这台电脑上的 N 个助手」（中心库时换措辞）。 */
+/** 更新名册顶部计数文案「这台电脑上的 N 个助手」。 */
 function renderRosterCount() {
   const el = document.getElementById("roster-count-text");
   if (!el) return;
   const n = state.bots.length;
-  if (n === 0) {
-    el.textContent =
-      state.mode === "central" ? "中心库还没有共享助手" : "这台电脑上还没有助手";
-  } else if (state.mode === "central") {
-    el.textContent = `公司中心库的 ${n} 个助手`;
-  } else {
-    el.textContent = `这台电脑上的 ${n} 个助手`;
-  }
+  el.textContent = n === 0 ? "这台电脑上还没有助手" : `这台电脑上的 ${n} 个助手`;
 }
 
 /**
@@ -2141,7 +1419,7 @@ function renderRosterCount() {
  */
 function renderRosterRestartStatus() {
   const el = document.getElementById("roster-restart-status");
-  if (!el || state.mode === "central") return;
+  if (!el) return;
   const rs = state.restart;
   if (rs.status === "restarting") {
     const total = state.bots.length;
@@ -2217,7 +1495,6 @@ function renderBotList() {
   }
 
   // 添加/更新条目(顺序也要对得上编号 01/02 → 按 state.bots 顺序 re-append)
-  const readonly = state.mode === "central";
   state.bots.forEach((bot, i) => {
     let li = list.querySelector(`li[data-bot-id="${CSS.escape(bot.id)}"]`);
     if (!li) {
@@ -2239,40 +1516,13 @@ function renderBotList() {
     li.classList.toggle("is-selected", selected);
     const num = String(i + 1).padStart(2, "0");
 
-    // ── 中心库只读名册行(CcRosterItem):头像 + 名字 + 「<by> 晋升 · <updated>」──
-    // 中心库存「配置」不是「进程」→ 不显在线/心跳,只显谁晋升的 + 更新时间;无删除。
-    if (readonly) {
-      li.classList.add("cc-roster-item");
-      const meta = state.centralBots.find((b) => b.id === bot.id) ?? {};
-      const by = meta.by || "";
-      const updated = meta.updated || "";
-      const byLine = by || updated
-        ? `<span class="cc-roster-by">${ICONS.upload} ${esc(by)}${by ? " 晋升" : ""}${updated ? ` · ${esc(updated)}` : ""}</span>`
-        : `<span class="cc-roster-by">${ICONS.upload} 共享助手</span>`;
-      // ⑦ 中心库名册:用 bot.avatar 飞书头像,没有才回退首字母
-      const ccAvatar = state.avatars[bot.id] ?? bot.avatar ?? null;
-      li.innerHTML =
-        `<span class="roster-num">${num}</span>` +
-        avatarHTML(bot.id, bot.name, ccAvatar, "list", "unknown").replace(
-          /<span class="avatar-dot[^>]*><\/span>/,
-          "", // 中心库无在线状态,去掉头像角标圆点
-        ) +
-        `<span class="roster-meta">` +
-        `<span class="bot-name">${esc(bot.name)}</span>` +
-        `<span class="roster-state">${byLine}</span>` +
-        `</span>`;
-      return;
-    }
-
     // ── BL-18:显示覆盖 —— restarting/timeout 时用 restartDisplayLive 替代真实 liveKey ─
     const realLiveKey = botLiveness(bot.id);
     const dispLiveKey = restartDisplayLive(realLiveKey, state.restart.status);
     const liveKey = dispLiveKey;
     const live = LIVENESS[liveKey] ?? LIVENESS.unknown;
     const avatar = state.avatars[bot.id] ?? bot.avatar ?? null;
-    const delBtn = readonly
-      ? ""
-      : `<button class="lk-del" type="button" aria-label="删除 ${esc(bot.name)}" title="删除助手">${ICONS.trash}</button>`;
+    const delBtn = `<button class="lk-del" type="button" aria-label="删除 ${esc(bot.name)}" title="删除助手">${ICONS.trash}</button>`;
     // 名册头部:重启中显示进度「已连回 N/total」
     // (已在名册标题区渲染,不再重复到行级)
     // LkAttentionPill / LkRestartPill:
@@ -2329,14 +1579,12 @@ function renderBotList() {
       `</span>` +
       delBtn;
     // Wire del button after innerHTML (DOM replaced)
-    if (!readonly) {
-      const delEl = li.querySelector(".lk-del");
-      if (delEl) {
-        delEl.addEventListener("click", (e) => {
-          e.stopPropagation();
-          doDeleteBot(bot.id);
-        });
-      }
+    const delEl = li.querySelector(".lk-del");
+    if (delEl) {
+      delEl.addEventListener("click", (e) => {
+        e.stopPropagation();
+        doDeleteBot(bot.id);
+      });
     }
   });
 }
@@ -2474,11 +1722,9 @@ function buildStepFlowHTML() {
 
 /**
  * 构建 LkEmptyState 的完整 HTML。
- * @param {'local'|'central'} variant
  * @param {boolean} serviceRunning  false 时在 CTA 下加温和提示
  */
-function buildEmptyStateHTML(variant, serviceRunning) {
-  const central = variant === "central";
+function buildEmptyStateHTML(serviceRunning) {
   const c = BR.c;
   const soft = BR.soft;
   const edge = BR.edge;
@@ -2495,23 +1741,8 @@ function buildEmptyStateHTML(variant, serviceRunning) {
   const bgStyle = `radial-gradient(120% 90% at 50% 0%, ${lkHexA(c, 0.05)} 0%, ${surface} 56%)`;
 
   let mainContent;
-  if (central) {
-    // 中心库变体:只读引导
-    const switchBtn = `<button class="es-central-switch-btn" type="button"
-      style="margin-top:24px;display:inline-flex;align-items:center;gap:8px;padding:11px 20px;font-size:14.5px;font-weight:700;font-family:inherit;color:${brText};background:${soft};border:1px solid ${edge};border-radius:11px;cursor:pointer">
-      切到「本机」去添加
-      <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 12h14M13 6l6 6-6 6"/></svg>
-    </button>`;
-
-    mainContent = `
-      <h1 style="margin:20px 0 0;font-size:30px;font-weight:800;letter-spacing:-.03em;line-height:1.12;color:${text}">公司中心库还没有共享助手</h1>
-      <p style="margin:12px 0 0;font-size:16px;color:${muted};line-height:1.62;max-width:460px">
-        中心库是<b style="color:#334155">只读</b>的展示窗。先在<b style="color:${brText}">「本机」</b>配好一个助手，再把它<b style="color:#334155">晋升到这里</b>，全组就都能看到、复用。
-      </p>
-      ${switchBtn}
-    `;
-  } else {
-    // 本机变体:欢迎 + CTA
+  {
+    // 本机:欢迎 + CTA
     const ctaBtn = `<button id="es-add-btn" type="button"
       class="es-cta-btn"
       style="display:inline-flex;align-items:center;gap:9px;padding:14px 28px;font-size:16px;font-weight:700;font-family:inherit;color:#fff;cursor:pointer;background:${c};border:none;border-radius:13px;box-shadow:0 4px 14px ${lkHexA(c, 0.26)};transition:background .15s,box-shadow .18s,transform .18s">
@@ -2546,7 +1777,7 @@ function buildEmptyStateHTML(variant, serviceRunning) {
   }
 
   // 底部安心语(两变体共有)
-  const shieldNote = `<div style="margin-top:${central ? 34 : 26}px;display:inline-flex;align-items:center;gap:7px;font-size:12.5px;color:${faint}">
+  const shieldNote = `<div style="margin-top:26px;display:inline-flex;align-items:center;gap:7px;font-size:12.5px;color:${faint}">
     <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3l7 3v6c0 4.4-3 7.6-7 9-4-1.4-7-4.6-7-9V6z"/></svg>
     全程不碰终端；密钥只存在你本机，别人看不到
   </div>`;
@@ -2560,56 +1791,9 @@ function buildEmptyStateHTML(variant, serviceRunning) {
   </div>`;
 }
 
-/**
- * 构建 LkConnectGuide(未连接引导卡)的 HTML —— 复刻 centralConnect.jsx。
- * 母题:本机一份 → 仓库 → 同事各自一份(共享);CTA = indigo「连接公司中心库」。
- */
-function buildConnectGuideHTML() {
-  const c = BR.c, soft = BR.soft, text = "#1e293b", muted = "#64748b", faint = "#94a3b8", brText = BR.text;
-  const bgStyle = `radial-gradient(120% 90% at 50% 0%, ${lkHexA(c, 0.05)} 0%, #fff 56%)`;
-
-  // 连接母题插画(中央仓库 + 三个同事机器 + 双向同步弧线/流动光点)
-  const machines = [[34, 38], [34, 94], [266, 66]]
-    .map(([x, y]) =>
-      `<g><rect x="${x - 20}" y="${y - 14}" width="40" height="28" rx="7" fill="#fff" stroke="#cbd5e1" stroke-width="1.5"/>` +
-      `<circle cx="${x - 9}" cy="${y}" r="3.5" fill="#cbd5e1"/>` +
-      `<rect x="${x - 2}" y="${y - 4}" width="16" height="3.5" rx="1.75" fill="#e2e8f0"/>` +
-      `<rect x="${x - 2}" y="${y + 3}" width="11" height="3" rx="1.5" fill="#eef0f4"/></g>`,
-    ).join("");
-  const arcs = [[54, 44, 123, 56], [54, 88, 123, 78], [246, 66, 177, 67]]
-    .map((p, i) => {
-      const d = `M${p[0]} ${p[1]} Q ${(p[0] + p[2]) / 2} ${(p[1] + p[3]) / 2 - 14}, ${p[2]} ${p[3]}`;
-      return (
-        `<g><path d="${d}" fill="none" stroke="${lkHexA(c, 0.4)}" stroke-width="1.8" stroke-dasharray="3 4" stroke-linecap="round"/>` +
-        `<circle r="2.6" fill="${c}">` +
-        `<animateMotion dur="2.6s" begin="${i * 0.5}s" repeatCount="indefinite" path="${d}"/>` +
-        `<animate attributeName="opacity" dur="2.6s" begin="${i * 0.5}s" repeatCount="indefinite" values="0;1;1;0" keyTimes="0;0.15;0.8;1"/>` +
-        `</circle></g>`
-      );
-    }).join("");
-  const svg =
-    `<svg viewBox="0 0 300 132" width="272" height="120" aria-hidden="true" style="display:block">` +
-    `<ellipse cx="150" cy="66" rx="132" ry="58" fill="${lkHexA(c, 0.05)}"/>` +
-    `<rect x="123" y="44" width="54" height="46" rx="11" fill="#fff" stroke="${c}" stroke-width="1.8"/>` +
-    `<path d="M135 58h30M135 67h30M135 76h20" stroke="${lkHexA(c, 0.5)}" stroke-width="2" stroke-linecap="round"/>` +
-    machines + arcs +
-    `</svg>`;
-
-  return (
-    `<div class="es-root" style="width:100%;height:100%;display:flex;align-items:center;justify-content:center;box-sizing:border-box;padding:40px 32px;background:${bgStyle};overflow-y:auto">` +
-    `<div style="width:100%;max-width:520px;display:flex;flex-direction:column;align-items:center;text-align:center">` +
-    svg +
-    `<h1 style="margin:18px 0 0;font-size:27px;font-weight:800;letter-spacing:-.025em;line-height:1.14;color:${text};text-wrap:balance">连接公司中心库，和团队共享助手</h1>` +
-    `<p style="margin:11px 0 0;font-size:15.5px;color:${muted};line-height:1.62;max-width:440px;text-wrap:pretty">把本机调好的助手<b style="color:${brText}">晋升</b>到团队的中心库，别的同事一拉就能用同一份；别人晋升的，你也<b style="color:#334155">一键同步</b>下来。</p>` +
-    `<button id="cc-guide-connect" type="button" class="es-cta-btn" style="margin-top:24px;display:inline-flex;align-items:center;gap:9px;padding:13px 26px;font-size:15.5px;font-weight:700;font-family:inherit;color:#fff;background:${c};border:none;border-radius:12px;cursor:pointer;box-shadow:0 4px 14px ${lkHexA(c, 0.26)};transition:background .15s">${ICONS.link2} 连接公司中心库</button>` +
-    `<div style="margin-top:18px;display:inline-flex;align-items:center;gap:7px;font-size:12.5px;color:${faint}">${ICONS.info} 第一次连可能要工程师帮忙给个仓库地址；连好之后日常同步、晋升你自己点就行</div>` +
-    `</div></div>`
-  );
-}
 
 // ---------------------------------------------------------------------------
 // 详情区「空态」(名册有助手但未选中)—— 复刻 Claude Design empty-detail 稿。
-// 两个变体:本机(可改,indigo)/ 公司中心库(只读,slate)。设计稿 emptyDetail.jsx。
 // ---------------------------------------------------------------------------
 
 /** 空态用的 icon path(复合 path 按 'M' 拆段,见 edIcon)。 */
@@ -2697,34 +1881,20 @@ function edRail(steps) {
     `</div>`;
 }
 
-/** 详情区空态 HTML(ro=公司中心库只读变体)。 */
-function buildEmptyDetailHTML(ro) {
-  if (ro) {
-    return `<div class="lk-ed lk-ed--ro" style="container-type:inline-size;container-name:lk-ed">` +
-      `<div class="lk-ed__inner">${edHeroSVG(true, 348)}` +
-      `<span class="lk-ed__eyebrow">${edIcon(ED_ICON.lock, 14, 2.1)} 公司中心库 · 只读</span>` +
-      `<h2 class="lk-ed__title">选一个共享助手，看它怎么配的</h2>` +
-      `<p class="lk-ed__body">这里是全组共享的助手，内容<b>只读</b> —— 能看它的配置和职责，照着用。想改？先回<b class="br">「本机」</b>改好，再<b>「晋升」</b>覆盖回来。</p>` +
-      `<div class="lk-ed__actions"><button type="button" id="ed-go-local" class="lk-ed__btn lk-ed__btn--soft">${edIcon(ED_ICON.arrowL, 16, 2.1)} 回「本机」去改配置</button></div>` +
-      edRail([
-        { d: ED_ICON.eye, t: "在这里浏览", s: "只读看配置 / 职责" },
-        { d: ED_ICON.edit, t: "回本机修改", s: "改动只能在本机做" },
-        { d: ED_ICON.upload, t: "晋升覆盖", s: "推上来，全组更新" },
-      ]) +
-      `<span class="lk-ed__foot">${edIcon(ED_ICON.lock, 14, 1.7)} 中心库只读；任何改动都要从本机晋升上来</span></div></div>`;
-  }
+/** 详情区空态 HTML(本机 · 可改)。 */
+function buildEmptyDetailHTML() {
   return `<div class="lk-ed" style="container-type:inline-size;container-name:lk-ed">` +
     `<div class="lk-ed__inner">${edHeroSVG(false, 348)}` +
     `<span class="lk-ed__eyebrow">${edIcon(ED_ICON.edit, 14, 2)} 本机 · 可改</span>` +
     `<h2 class="lk-ed__title">从左边选一个助手，开始配置</h2>` +
-    `<p class="lk-ed__body">在<b>「本机」</b>里可以改它的名字、介绍、能用它的群、能改的代码仓库，还有它的职责说明。改好后用<b class="br">「晋升」</b>把配置交给公司中心库，别的电脑就能拉到同一份。</p>` +
+    `<p class="lk-ed__body">在这里可以改它的名字、介绍、能用它的群、能改的代码仓库，还有它的职责说明。改好点<b class="br">「保存」</b>就写入本机生效，同事在群里 @ 它就能用。</p>` +
     `<div class="lk-ed__actions">` +
     `<button type="button" id="ed-add-bot" class="lk-ed__btn lk-ed__btn--primary">${edIcon(ED_ICON.plus, 18, 2.2)} 添加新助手</button>` +
     `<button type="button" id="ed-pick" class="lk-ed__btn lk-ed__btn--ghost">${edIcon(ED_ICON.arrowL, 16, 2)} 从名册里挑一个</button></div>` +
     edRail([
       { d: ED_ICON.sliders, t: "配置", s: "改名字、群、仓库、职责" },
-      { d: ED_ICON.upload, t: "晋升", s: "交给公司中心库" },
-      { d: ED_ICON.users, t: "全组复用", s: "别的电脑拉同一份" },
+      { d: ED_ICON.edit, t: "保存", s: "写入本机即生效" },
+      { d: ED_ICON.users, t: "群里 @", s: "同事直接用" },
     ]) +
     `<span class="lk-ed__foot">${edIcon(ED_ICON.shield, 14, 1.7)} 全程不碰终端；密钥只存在你本机，别人看不到</span></div></div>`;
 }
@@ -2733,16 +1903,11 @@ function buildEmptyDetailHTML(ro) {
 function renderDetailPlaceholder() {
   const placeholder = document.getElementById("detail-placeholder");
   if (!placeholder) return;
-  const ro = state.mode === "central";
-  placeholder.innerHTML = buildEmptyDetailHTML(ro);
-  if (ro) {
-    placeholder.querySelector("#ed-go-local")?.addEventListener("click", () => switchContext("local"));
-  } else {
-    placeholder.querySelector("#ed-add-bot")?.addEventListener("click", () => openOnboardModal());
-    placeholder.querySelector("#ed-pick")?.addEventListener("click", () => {
-      if (state.bots[0]) selectBot(state.bots[0].id);
-    });
-  }
+  placeholder.innerHTML = buildEmptyDetailHTML();
+  placeholder.querySelector("#ed-add-bot")?.addEventListener("click", () => openOnboardModal());
+  placeholder.querySelector("#ed-pick")?.addEventListener("click", () => {
+    if (state.bots[0]) selectBot(state.bots[0].id);
+  });
 }
 
 /**
@@ -2760,26 +1925,6 @@ function renderEmptyOrPlaceholder() {
   const existingEs = detail.querySelector(".es-panel");
   const panel = detail.querySelector(".detail-panel");
 
-  // 中心库未连接 → 全屏连接引导卡(LkConnectGuide),优先级高于空态。
-  const centralDisconnected = state.mode === "central" && !state.centralConnected;
-
-  if (centralDisconnected) {
-    if (placeholder) placeholder.style.display = "none";
-    if (panel) panel.style.display = "none";
-    if (!existingEs) {
-      const esEl = document.createElement("div");
-      esEl.className = "es-panel";
-      esEl.style.cssText = "flex:1;min-height:0;display:flex;flex-direction:column;height:100%";
-      detail.appendChild(esEl);
-    }
-    const es = detail.querySelector(".es-panel");
-    if (es) {
-      es.innerHTML = buildConnectGuideHTML();
-      es.querySelector("#cc-guide-connect")?.addEventListener("click", () => openConnectFlow());
-    }
-    return;
-  }
-
   if (state.bots.length === 0 && !state.selected) {
     // 零助手 → 空态全屏
     if (placeholder) placeholder.style.display = "none";
@@ -2793,9 +1938,8 @@ function renderEmptyOrPlaceholder() {
     }
     const es = detail.querySelector(".es-panel");
     if (es) {
-      const variant = state.mode === "central" ? "central" : "local";
       const serviceRunning = state.bridge?.running ?? false;
-      es.innerHTML = buildEmptyStateHTML(variant, serviceRunning);
+      es.innerHTML = buildEmptyStateHTML(serviceRunning);
       wireEmptyStateEvents(es);
     }
   } else {
@@ -2803,7 +1947,7 @@ function renderEmptyOrPlaceholder() {
     if (existingEs) existingEs.remove();
     if (panel) panel.style.display = "";
     if (!state.selected && placeholder) {
-      renderDetailPlaceholder(); // 按当前 mode 渲染本机/只读空态变体
+      renderDetailPlaceholder();
       placeholder.style.display = "";
     }
   }
@@ -2811,13 +1955,9 @@ function renderEmptyOrPlaceholder() {
 
 /** 接线空态内的事件。*/
 function wireEmptyStateEvents(container) {
-  // 本机变体:CTA → openOnboardModal
+  // CTA → openOnboardModal
   const addBtn = container.querySelector("#es-add-btn");
   addBtn?.addEventListener("click", () => openOnboardModal());
-
-  // central 变体:「切到本机」→ switchContext('local')
-  const switchBtn = container.querySelector(".es-central-switch-btn");
-  switchBtn?.addEventListener("click", () => switchContext("local"));
 
   // CTA hover 效果
   addBtn?.addEventListener("mouseenter", () => {
@@ -2866,8 +2006,6 @@ async function renderBotDetail(id) {
   }
   panel.innerHTML = `<div class="loading-block"><span class="spinner spinner-lg"></span><span>正在打开助手…</span></div>`;
 
-  const readonly = state.mode === "central";
-
   // 并行拉配置 + memory
   const [botRes, memRes] = await Promise.all([
     api("GET", `/api/bot/${encodeURIComponent(id)}`),
@@ -2889,17 +2027,7 @@ async function renderBotDetail(id) {
   state.formDirty = false;
   state.memoryDirty = false;
 
-  // 中心库 = 只读展示窗(CcReadonlyDetail):by/updated/commit + 回本机引导 + 只读 memory。
-  if (readonly) {
-    panel.innerHTML = buildCentralDetailHTML(id, bot, memContent);
-    panel.classList.remove("panel-enter");
-    void panel.offsetWidth;
-    panel.classList.add("panel-enter");
-    panel.querySelector("#cc-detail-golocal")?.addEventListener("click", () => switchContext("local"));
-    return;
-  }
-
-  panel.innerHTML = buildDetailHTML(id, bot, memContent, readonly);
+  panel.innerHTML = buildDetailHTML(id, bot, memContent);
   // 切 bot 丝滑:详情区淡入(reduced-motion 下 transition 被禁,无白闪)
   panel.classList.remove("panel-enter");
   void panel.offsetWidth; // 强制 reflow 重新触发动画
@@ -2908,135 +2036,11 @@ async function renderBotDetail(id) {
   const avatar = state.avatars[id] ?? bot.avatar ?? null;
   const liveKey = botLiveness(id);
   acRenderAvatar(panel, id, bot.name || id, avatar, liveKey);
-  wireDetailEvents(panel, id, bot, readonly);
+  wireDetailEvents(panel, id, bot);
   renderDetailBanner();
   loadRecentEvents(id, panel);
 }
 
-/**
- * 构建中心库只读详情(CcReadonlyDetail 复刻):
- * hero(标题 + 描述 + by/updated/commit + 谁能用它/能改仓库/谁晋升的) + 只读横幅(回本机改) + 只读职责说明。
- * 中心库不显在线/心跳;memory 即「职责说明」,只读;密钥不显示。
- */
-function buildCentralDetailHTML(id, bot, memContent) {
-  const meta = state.centralBots.find((b) => b.id === id) ?? {};
-  const by = meta.by || "—";
-  const updated = meta.updated || "—";
-  const commit = meta.commit || "—";
-  const name = bot.name ?? id;
-  const desc = bot.description ?? "";
-  const chats = Array.isArray(bot.chats) ? bot.chats.length : 0;
-  const repos = Array.isArray(bot.repos) ? bot.repos.length : 0;
-
-  // L1 权限层(只读):能改仓库 / repos 明细 / 令牌变量名(脱敏,绝不显真值)+ 约束。
-  const repoList = Array.isArray(bot.repos) ? bot.repos : [];
-  const codeAccess = !!(bot.gitlab_token_env || repoList.length > 0);
-  const turnLimit = bot.turn_taking_limit ?? 10;
-  // chats 元素可能是字符串(oc_…)或 {label/chat_id} 对象;统一成可读文案。
-  const chatLabel = (c) =>
-    typeof c === "string" ? c : (c?.label || c?.chat_id || c?.id || JSON.stringify(c));
-  const chatsList = Array.isArray(bot.chats) ? bot.chats.map(chatLabel) : [];
-
-  // 只读卡片外壳(与「它的职责说明」同款)。
-  const roCard = (title, inner) =>
-    `<div style="background:var(--surface);border:1px solid var(--border);border-radius:14px;padding:22px 24px;box-shadow:var(--shadow-sm);margin-bottom:16px">` +
-    `<h4 style="margin:0 0 14px;font-size:16px;font-weight:700;color:var(--text)">${esc(title)}</h4>` +
-    inner +
-    `</div>`;
-  const roKv = (label, value) =>
-    `<div style="display:flex;gap:12px;align-items:baseline;padding:7px 0">` +
-    `<span style="font-size:12.5px;color:var(--faint);width:104px;flex-shrink:0">${esc(label)}</span>` +
-    `<span style="font-size:13.5px;color:var(--text);line-height:1.5">${esc(value)}</span></div>`;
-
-  // 「它的权限」卡内容
-  const permInner = codeAccess
-    ? `<div style="display:inline-flex;align-items:center;gap:7px;font-size:14px;font-weight:600;color:${LIVE_TEXT.serving}">${ICONS.check} 能改代码仓库 · 通过 GitLab 令牌</div>` +
-      (repoList.length
-        ? `<div style="margin-top:12px;display:flex;flex-direction:column;gap:8px">` +
-          repoList.map((r) =>
-            `<div style="padding:10px 12px;border:1px solid var(--border);border-radius:10px;background:var(--bg)">` +
-            `<div style="font-size:13.5px;font-weight:600;color:var(--text);font-family:ui-monospace,monospace">${esc(r.slug || "—")} <span style="color:var(--faint);font-weight:400">@ ${esc(r.branch || "main")}</span></div>` +
-            (r.url ? `<div style="margin-top:3px;font-size:12px;color:var(--muted);font-family:ui-monospace,monospace;word-break:break-all">${esc(r.url)}</div>` : "") +
-            `</div>`
-          ).join("") +
-          `</div>`
-        : `<p style="margin:10px 0 0;font-size:13px;color:var(--muted);line-height:1.55">未列具体仓库 —— agent 用令牌自己判断需要哪些、自己 clone。</p>`) +
-      (bot.gitlab_token_env
-        ? `<p style="margin:12px 0 0;font-size:12px;color:var(--faint);display:flex;align-items:center;gap:6px">${ICONS.lock} 令牌已配置，真值只存本机 <code>.env</code>（0600），这里看不到。</p>`
-        : "")
-    : `<div style="display:inline-flex;align-items:center;gap:7px;font-size:14px;color:var(--muted)">${ICONS.lock} 纯答疑，不碰代码。</div>`;
-
-  // 「行为约束」卡内容
-  const constraintInner =
-    roKv("谁能 @ 它", chatsList.length ? chatsList.join("、") : "任何群都能 @(没限制)") +
-    roKv("最多连做", `${turnLimit} 步就停下问人`);
-
-  const metaCell = (label, value, tone) =>
-    `<div style="display:flex;flex-direction:column;gap:3px">` +
-    `<span style="font-size:10.5px;font-weight:600;letter-spacing:.08em;text-transform:uppercase;color:var(--faint)">${esc(label)}</span>` +
-    `<span style="font-size:13.5px;font-weight:600;color:${tone || "var(--text)"}">${esc(value)}</span>` +
-    `</div>`;
-
-  const chatVal = chats === 0 ? "任何群都能 @" : `仅 ${chats} 个群`;
-  const repoVal = repos === 0 ? "纯答疑" : `${repos} 个仓库`;
-  const botBackend = bot.backend || LK_BACKEND_DEFAULT;
-
-  // 底座列:用 chip(sm + mono)内联显示,套进 metaCell value 位置
-  const backendCellValue =
-    `<span style="display:inline-flex">${lkBackendChipHTML(botBackend, { size: "sm", mono: true })}</span>`;
-  const metaCellRaw = (label, innerHTML) =>
-    `<div style="display:flex;flex-direction:column;gap:3px">` +
-    `<span style="font-size:10.5px;font-weight:600;letter-spacing:.08em;text-transform:uppercase;color:var(--faint)">${esc(label)}</span>` +
-    innerHTML +
-    `</div>`;
-
-  return (
-    // hero band
-    `<div style="padding:30px 44px 24px;background:linear-gradient(180deg,var(--bg) 0%,var(--surface) 100%);border-bottom:1px solid var(--border)">` +
-    `<div style="max-width:800px;display:flex;align-items:flex-start;gap:22px">` +
-    avatarHTML(id, name, bot.avatar ?? null, "list", "unknown").replace(/avatar-list/, "avatar-list cc-detail-avatar").replace(/<span class="avatar-dot[^>]*><\/span>/, "") +
-    `<div style="flex:1;min-width:0;padding-top:2px">` +
-    `<div style="display:flex;align-items:center;gap:10px;margin-bottom:8px">` +
-    `<span style="font-size:11px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:var(--faint)">公司中心库 · 共享助手</span>` +
-    `<span style="display:inline-flex;align-items:center;gap:5px;padding:2px 9px;border-radius:999px;font-size:11.5px;font-weight:700;color:var(--muted);background:var(--bg);border:1px solid var(--border)">${ICONS.lock} 只读</span>` +
-    `</div>` +
-    `<h1 style="margin:0 0 8px;font-size:31px;font-weight:800;letter-spacing:-.025em;line-height:1.06;color:var(--text)">${esc(name)}</h1>` +
-    `<p style="margin:0 0 14px;font-size:15.5px;color:var(--muted);line-height:1.55;max-width:540px">${esc(desc || "（还没填介绍）")}</p>` +
-    `<div style="display:flex;align-items:center;gap:14px;flex-wrap:wrap;font-size:13px;color:var(--muted)">` +
-    `<span style="display:inline-flex;align-items:center;gap:6px">${ICONS.upload} ${esc(by)} 晋升</span>` +
-    `<span style="color:var(--faint)">·</span><span>更新于 ${esc(updated)}</span>` +
-    `<span style="color:var(--faint)">·</span><span style="font-family:ui-monospace,monospace">commit ${esc(commit)}</span>` +
-    `</div></div></div>` +
-    `<div style="max-width:800px;margin-top:22px;padding-top:18px;border-top:1px solid var(--border);display:grid;grid-template-columns:repeat(4,1fr);gap:16px">` +
-    metaCell("谁能用它", chatVal, chats === 0 ? BR.text : null) +
-    metaCell("能改仓库", repoVal, null) +
-    metaCell("谁晋升的", by, null) +
-    metaCellRaw("底座", backendCellValue) +
-    `</div></div>` +
-    // body
-    `<div style="padding:24px 44px 36px"><div style="max-width:800px">` +
-    // 只读横幅 + 回本机引导
-    `<div class="cc-readonly-banner">${ICONS.lock}` +
-    `<div style="min-width:0;flex:1">` +
-    `<div class="cc-readonly-banner-title">这是中心库里的只读副本</div>` +
-    `<div class="cc-readonly-banner-sub">中心库不能直接改。想改？回「本机」改好那一份，再<b>晋升</b>覆盖上来。</div>` +
-    `</div>` +
-    `<button type="button" id="cc-detail-golocal" class="cc-go-local-btn">回本机改 ${ICONS.arrowRight}</button>` +
-    `</div>` +
-    // 只读底座展示卡
-    roCard("底座", lkBackendSelectHTML(botBackend, true)) +
-    // L1 权限层(只读):它能改哪些仓库 + 令牌变量名(脱敏)
-    roCard("它的权限", permInner) +
-    // 约束层(只读):谁能 @ + 最多连做几步
-    roCard("行为约束", constraintInner) +
-    // 只读职责说明(memory)
-    `<div style="background:var(--surface);border:1px solid var(--border);border-radius:14px;padding:22px 24px;box-shadow:var(--shadow-sm)">` +
-    `<h4 style="margin:0 0 14px;font-size:16px;font-weight:700;color:var(--text)">它的职责说明</h4>` +
-    `<div style="width:100%;padding:12px 14px;border:1px solid var(--border);border-radius:10px;background:var(--bg);font-size:13.5px;line-height:1.65;color:#334155;font-family:ui-monospace,'Cascadia Code',monospace;white-space:pre-wrap">${esc(memContent || "（没有职责说明）")}</div>` +
-    `<p style="margin:12px 0 0;font-size:12px;color:var(--faint);display:flex;align-items:center;gap:6px">${ICONS.lock} 只读 —— 在这里看不到、也改不了真密钥;每个人同步到本机后用自己的密钥跑。</p>` +
-    `</div></div></div>`
-  );
-}
 
 /**
  * 构建 hero band 内层(名字 / 介绍 / meta strip）—— 依赖 P.form 的实时值,
@@ -3046,7 +2050,7 @@ function buildCentralDetailHTML(id, bot, memContent) {
  * @param {{name:string,description:string,chatCount:number,repoCount:number}} f 当前表单值
  * @param {boolean} readonly
  */
-function buildHeroInner(id, bot, f, readonly) {
+function buildHeroInner(id, bot, f) {
   const idx = state.bots.findIndex((b) => b.id === id);
   const num = String((idx < 0 ? 0 : idx) + 1).padStart(2, "0");
   // ⑤ hero 内状态条:BL-18 重启窗口内用 restartDisplayLive 覆盖;否则 effLive
@@ -3057,10 +2061,8 @@ function buildHeroInner(id, bot, f, readonly) {
   const dispLiveKey = (isR || isTimeout) ? restartDisplayLive(realLive, rs.status) : realLive;
   const liveKey = dispLiveKey;
 
-  const editBadge = readonly
-    ? `<span class="hero-badge hero-badge-ro">${ICONS.lock} 只读</span>`
-    : `<span class="hero-badge">${ICONS.check} 可改</span>`;
-  const eyebrowLabel = readonly ? "公司中心库 · 第" : "本机助手 · 第";
+  const editBadge = `<span class="hero-badge">${ICONS.check} 可改</span>`;
+  const eyebrowLabel = "本机助手 · 第";
 
   // 状态条(1.5px edge pill):重启中 → sky「重启中 · 预期内,正在恢复」;否则正常
   const statusPillText = isR
@@ -3109,11 +2111,9 @@ function buildHeroInner(id, bot, f, readonly) {
     `<span style="display:inline-flex">${lkBackendChipHTML(bot.backend || LK_BACKEND_DEFAULT, { size: "sm", mono: true })}</span>` +
     `</div>`;
 
-  const heroDelBtn = readonly
-    ? ""
-    : `<button class="btn btn-hero-del" id="btn-hero-del" type="button" title="删除助手">` +
-      `<svg class="icon" viewBox="0 0 24 24" aria-hidden="true" style="width:14px;height:14px;flex-shrink:0"><path d="M3 6h18M8 6V4a1 1 0 0 1 1-1h6a1 1 0 0 1 1 1v2M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6M10 11v6M14 11v6"/></svg>` +
-      ` 删除</button>`;
+  const heroDelBtn = `<button class="btn btn-hero-del" id="btn-hero-del" type="button" title="删除助手">` +
+    `<svg class="icon" viewBox="0 0 24 24" aria-hidden="true" style="width:14px;height:14px;flex-shrink:0"><path d="M3 6h18M8 6V4a1 1 0 0 1 1-1h6a1 1 0 0 1 1 1v2M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6M10 11v6M14 11v6"/></svg>` +
+    ` 删除</button>`;
 
   // 触点②:hero kicker 行,紧跟眉批加 backend chip(mono + vendor)
   const backendKickerChip = lkBackendChipHTML(bot.backend || LK_BACKEND_DEFAULT, { mono: true, vendor: true });
@@ -3323,7 +2323,7 @@ function acRepoRowHTML(idx, repo) {
     `</div>` +
     `<div class="ac-field" style="margin-top:8px">` +
     `<label class="ac-label" for="ac-repo-url-${idx}">clone 地址 <span class="ac-optional">私有库必需</span></label>` +
-    `<input id="ac-repo-url-${idx}" class="ac-input ac-mono" type="text" placeholder="git@your-gitlab.example.com:group/repo.git" spellcheck="false" data-repo="url" data-repo-idx="${idx}" value="${esc(repo.url)}" />` +
+    `<input id="ac-repo-url-${idx}" class="ac-input ac-mono" type="text" placeholder="git@github.com:org/repo.git" spellcheck="false" data-repo="url" data-repo-idx="${idx}" value="${esc(repo.url)}" />` +
     `</div>` +
     `<button type="button" class="ac-repo-del" title="移除这个仓库" data-repo-idx="${idx}" aria-label="移除仓库 ${esc(repo.slug || idx + 1)}">` +
     xIcon +
@@ -3355,8 +2355,8 @@ function acPillHTML(tone, iconD, text) {
 function buildAgentConfigHTML(bot, memContent, mode, prefill) {
   const isCreate = mode === "create";
   const repos = normalizeRepos(bot.repos);
-  // ① 用 gitlab_token_env 非空来判断「已配置」——新保存契约:值存后端,前端只知道「有/无」
-  const gitlabConfigured = !!(bot.gitlab_token_env);
+  // ① 用 git_token_env(兼容旧 gitlab_token_env)非空来判断「已配置」——新保存契约:值存后端,前端只知道「有/无」
+  const gitlabConfigured = !!(bot.git_token_env || bot.gitlab_token_env);
   const codeAccess = !!(gitlabConfigured || repos.length > 0);
   const chatsVal = Array.isArray(bot.chats) ? bot.chats.join("\n") : (bot.chats || "");
   const turnLimit = bot.turn_taking_limit ?? 10;
@@ -3450,7 +2450,7 @@ function buildAgentConfigHTML(bot, memContent, mode, prefill) {
     `<div class="ac-access-toggle-row${codeAccess ? " is-on" : ""}" id="ac-access-row">` +
     `<div class="ac-access-info">` +
     `<div class="ac-access-title">给它访问代码仓库的权限</div>` +
-    `<p class="ac-access-desc">通过配一个 <b>GitLab 访问令牌</b> 来表达。读和改都用这一个令牌 —— <b>没有读 / 写之分</b>，agent 看任务自己定。不开 = 纯对话 / 自带知识答疑。</p>` +
+    `<p class="ac-access-desc">通过配一个 <b>Git 访问令牌</b> 来表达。读和改都用这一个令牌 —— <b>没有读 / 写之分</b>，agent 看任务自己定。不开 = 纯对话 / 自带知识答疑。</p>` +
     `</div>` +
     `<button type="button" class="ac-toggle${codeAccess ? " is-on" : ""}" id="ac-code-access-btn" role="switch" aria-checked="${codeAccess}" title="开 / 关代码访问权限">` +
     `<span class="ac-toggle-thumb"></span>` +
@@ -3464,8 +2464,8 @@ function buildAgentConfigHTML(bot, memContent, mode, prefill) {
     // 开启态:令牌 + 仓库
     `<div class="ac-access-fields" id="ac-access-fields" ${codeAccess ? "" : 'style="display:none"'}>` +
     `<div class="ac-field">` +
-    `<label class="ac-label" for="ac-gitlab-token">GitLab Access Token</label>` +
-    `<p class="ac-hint">把 GitLab access token 粘这里。只存本机 <code>~/.larkway/.env</code>（权限 0600），不回显、不外发。</p>` +
+    `<label class="ac-label" for="ac-gitlab-token">Git Access Token</label>` +
+    `<p class="ac-hint">把 Git access token 粘这里。只存本机 <code>~/.larkway/.env</code>（权限 0600），不回显、不外发。</p>` +
     (gitlabConfigured
       ? `<div class="ac-token-configured" id="ac-token-configured">` +
         `<span class="ac-token-mask">${ICONS.lock} 已配置 <span style="letter-spacing:.12em">••••••</span></span>` +
@@ -3477,7 +2477,7 @@ function buildAgentConfigHTML(bot, memContent, mode, prefill) {
         `</div>`
       : `<div class="ac-secret-wrap" id="ac-token-input-wrap">` +
         `<svg class="ac-secret-icon" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 11h14a1 1 0 0 1 1 1v7a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1v-7a1 1 0 0 1 1-1ZM8 11V7a4 4 0 0 1 8 0v4"/></svg>` +
-        `<input id="ac-gitlab-token" name="gitlab_token_value" class="ac-input ac-secret-input" type="password" autocomplete="new-password" placeholder="粘贴 GitLab access token（只存本机，不回显）" value="" />` +
+        `<input id="ac-gitlab-token" name="gitlab_token_value" class="ac-input ac-secret-input" type="password" autocomplete="new-password" placeholder="粘贴 Git access token（只存本机，不回显）" value="" />` +
         `</div>`
     ) +
     `</div>` +
@@ -4116,7 +3116,7 @@ function wireRecentEvents(panel, id) {
  * hero band + status action 保留;配置表单 + memory 由 AC 面板统一承载。
  * secret 只显示变量名。
  */
-function buildDetailHTML(id, bot, memContent, readonly) {
+function buildDetailHTML(id, bot, memContent) {
   // 详情头像(hero,右下角状态角标 + 健康脉冲环);头像 URL 复用列表/status 同源
   const avatar = state.avatars[id] ?? bot.avatar ?? null;
   // ⑤ hero 颜色以后端 effLive 为准:bridge 停时即使 status 说 serving,也强制 offline
@@ -4135,61 +3135,32 @@ function buildDetailHTML(id, bot, memContent, readonly) {
       chatCount: chatLines.length,
       repoCount: repos.length,
     },
-    readonly,
   );
 
   // 状态可操作化面板
   const effLiveKey = effLive(id);
-  const statusActionPanel = !readonly && effLiveKey !== "serving"
+  const statusActionPanel = effLiveKey !== "serving"
     ? `<div id="detail-status-action">${buildStatusActionPanel(effLiveKey, null, false)}</div>`
     : `<div id="detail-status-action"></div>`;
-
-  const centralReadonlyNotice = readonly
-    ? `<div class="notice notice-warn">${ICONS.lock}<div>中心库的配置是只读的，改本地后用「晋升」推上去。</div></div>`
-    : "";
 
   // 三层 AC 配置面板(edit 态)
   const acPanelHTML = buildAgentConfigHTML(bot, memContent, "edit");
 
-  // 触点④(编辑表单顶部):底座选择卡(仅本机 edit 模式)
-  // backendKickerChip 已在 kicker 展示;这里用完整 select 控件让用户改
+  // 触点④(编辑表单顶部):底座选择卡
   const _configuredBk4 = bot.backend || LK_BACKEND_DEFAULT;
   const _runningBk4 = state.runningBackends[id] ?? null;
-  // BL-17:底座不一致 badge(详情区,md)— 只在本机 edit 模式 + bridge 在跑时显示
+  // BL-17:底座不一致 badge(详情区,md)— 只在 bridge 在跑时显示
   const bkMismatchDetail =
-    !readonly && state.bridge?.running && isBackendMismatch(_runningBk4, _configuredBk4)
+    state.bridge?.running && isBackendMismatch(_runningBk4, _configuredBk4)
       ? `<div style="margin-top:10px">${backendMismatchBadgeHTML(_runningBk4, _configuredBk4, "md")}` +
         `<span style="margin-left:8px;font-size:12px;color:var(--muted)">右上角重启服务后生效</span></div>`
       : "";
-  const backendCardHTML = !readonly ? (
-    `<div class="lk-bk-card" id="lk-bk-card">` +
+  const backendCardHTML = `<div class="lk-bk-card" id="lk-bk-card">` +
     `<h4 class="lk-bk-card-title">${ICONS.box} 用哪个底座驱动它</h4>` +
     `<p class="lk-bk-card-desc">底座决定这个助手背后跑哪个 CLI agent。默认 Codex；切换后需重启服务生效。</p>` +
-    lkBackendSelectHTML(_configuredBk4, false, `bk-edit-${id}`) +
+    lkBackendSelectHTML(_configuredBk4, `bk-edit-${id}`) +
     bkMismatchDetail +
-    `</div>`
-  ) : "";
-
-  // 晋升区(仅本机非只读时显示)
-  const promoteSection = !readonly ? `
-<div class="form-section promote-section" id="promote-section">
-  <h4 class="section-title">${ICONS.box} 交给公司统一管理（晋升）</h4>
-  <p class="section-desc">${
-    state.centralAvailable
-      ? `已连上 <b style="font-family:ui-monospace,monospace;color:var(--text)">${esc(state.centralRepo?.name ?? "公司中心库")}</b>。先暂存只动本机副本；正式上传会推给全团队。`
-      : "把这个本地助手交给公司中心库，其它机器就能拉到同一份。"
-  }</p>
-  <div class="promote-actions">
-    <button class="btn${state.centralAvailable ? "" : " is-disabled"}" id="btn-promote-no-push" type="button"${state.centralAvailable ? "" : " disabled"}>${ICONS.box} 先暂存到本机副本（不上传）</button>
-    <button class="btn btn-upload${state.centralAvailable ? "" : " is-disabled"}" id="btn-promote-push" type="button"${state.centralAvailable ? "" : " disabled"}>${ICONS.upload} 正式上传到公司中心库</button>
-  </div>
-  ${
-    state.centralAvailable
-      ? `<p class="promote-hint">${ICONS.warn}<span><b style="color:var(--destructive-text)">正式上传</b>会推送到团队仓库，所有人都拉得到，<b style="color:var(--destructive-text)">推后无法自动撤销</b> —— 点了会再确认一次。</span></p>`
-      : `<div class="promote-connect-hint">${ICONS.link2}<span>得先<b>连接公司中心库</b>，这两个按钮才能用。</span><button type="button" id="btn-promote-connect" class="btn btn-primary btn-sm">${ICONS.link2} 去连接</button></div>`
-  }
-</div>
-` : "";
+    `</div>`;
 
   return `
 <!-- 编辑式 hero band(健康=indigo soft 渐变,异常=status soft 渐变） -->
@@ -4204,7 +3175,6 @@ function buildDetailHTML(id, bot, memContent, readonly) {
 <div class="config-area">
   <div class="status-banner" id="detail-status-banner" role="status" aria-live="polite" hidden></div>
   ${statusActionPanel}
-  ${centralReadonlyNotice}
 
   ${buildRecentEventsPanelHTML(id)}
 
@@ -4215,8 +3185,6 @@ function buildDetailHTML(id, bot, memContent, readonly) {
   <div class="ac-panel-wrap" id="ac-panel-wrap">
     ${acPanelHTML}
   </div>
-
-  ${promoteSection}
 </div>
 `;
 }
@@ -4301,15 +3269,12 @@ function wireRestartPanelButtons(panel) {
 }
 
 /** 为详情区内的按钮绑定事件(三层 AC 面板版)。 */
-function wireDetailEvents(panel, id, bot, readonly) {
+function wireDetailEvents(panel, id, bot) {
   wireRecentEvents(panel, id);
-  // Wire status-action fix buttons (always, even in readonly — fix buttons only appear in non-readonly)
   const statusActionContainer = panel.querySelector("#detail-status-action");
   if (statusActionContainer) wireStatusActionButtons(statusActionContainer);
   // Wire restart panel buttons (timeout panel: logs/restart/rescan)
   wireRestartPanelButtons(panel);
-
-  if (readonly) return;
 
   // ── 三层 AC 面板:交互 + 脏检测 + 保存 ──────────────────────────────────
   wireAgentConfigEvents(panel, id, bot);
@@ -4372,7 +3337,6 @@ function wireDetailEvents(panel, id, bot, readonly) {
             chatCount: chatLines.length,
             repoCount: repos.length,
           },
-          false,
         );
         // re-wire hero del btn
         heroBody.querySelector("#btn-hero-del")?.addEventListener("click", () => doDeleteBot(id));
@@ -4393,34 +3357,6 @@ function wireDetailEvents(panel, id, bot, readonly) {
     btnHeroDel.addEventListener("click", () => doDeleteBot(id));
   }
 
-  // promote 不推送
-  const btnPromoteNoP = panel.querySelector("#btn-promote-no-push");
-  if (btnPromoteNoP) {
-    btnPromoteNoP.addEventListener("click", async () => {
-      if (btnPromoteNoP.disabled) return;
-      await doPromote(btnPromoteNoP, id, false, panel);
-    });
-  }
-
-  // promote 并推送(不可逆外发 → LkUploadConfirm 样式二次确认弹窗)
-  const btnPromoteP = panel.querySelector("#btn-promote-push");
-  if (btnPromoteP) {
-    btnPromoteP.addEventListener("click", async () => {
-      if (btnPromoteP.disabled) return;
-      const confirmed = await uploadConfirmDialog(
-        { name: bot.name || id },
-        state.centralRepo,
-      );
-      if (!confirmed) return;
-      await doPromote(btnPromoteP, id, true, panel);
-    });
-  }
-
-  // 未连接态:「去连接」→ 打开连接流弹窗(连上后 centralAvailable 变 true,晋升按钮启用)
-  const btnPromoteConnect = panel.querySelector("#btn-promote-connect");
-  if (btnPromoteConnect) {
-    btnPromoteConnect.addEventListener("click", () => openConnectFlow());
-  }
 }
 
 /**
@@ -4435,13 +3371,12 @@ function acRefreshHero(panel, id, bot) {
   const vals = readAgentConfigValues(panel);
   const chatCount = Array.isArray(vals.chats) ? vals.chats.length : 0;
   const repoCount = Array.isArray(vals.repos) ? vals.repos.length : 0;
-  const readonly = false;
   body.innerHTML = buildHeroInner(id, { ...bot, name: vals.name, description: vals.description }, {
     name: vals.name ?? "",
     description: vals.description ?? "",
     chatCount,
     repoCount,
-  }, readonly);
+  });
   // re-wire del button(内容重建后需重绑)
   const btnHeroDel = body.querySelector("#btn-hero-del");
   if (btnHeroDel) btnHeroDel.addEventListener("click", () => doDeleteBot(id));
@@ -4606,190 +3541,7 @@ async function saveAcBot(panel, id) {
   }
 }
 
-/** commit hash → 短 7 位(便于运营报给工程师);取不到给原值。 */
-function shortHash(sha) {
-  return typeof sha === "string" && sha.length >= 7 ? sha.slice(0, 7) : (sha ?? "?");
-}
 
-/**
- * 晋升:暂存(本地 indigo)/ 正式上传(红,不可逆外发)。
- * 成功 → toast 给 commit 短 hash;失败按 kind 走「怎么办」:
- *   - behind → 要先同步别人的改动,带「去同步」入口
- *   - noperm → 没写权限,提示找工程师开权限
- *   - 其它   → 原样人话错误
- * 增强后的 POST /api/promote/:id:成功 { ok:true, commit, pushed };
- * 失败(HTTP 200){ ok:false, kind:"behind"|"noperm"|"other", error };
- * 未连接(HTTP 409){ error }。
- * @param {HTMLElement} btn
- * @param {string} id
- * @param {boolean} push  true=正式上传 / false=仅暂存本机
- * @param {HTMLElement|null} [panel]  详情面板根元素,有则在 promote-section 内联渲染结果
- */
-async function doPromote(btn, id, push, panel, _extraBody) {
-  const restore = btnLoading(btn, push ? "正在上传…" : "暂存中…");
-  const body = { push, ...((_extraBody) ? _extraBody : {}) };
-  const res = await api("POST", `/api/promote/${encodeURIComponent(id)}`, body);
-  restore();
-
-  // ⑧ 409 有两种情况:requiresConfirm(推 main 需要二次确认) 或 未连接中心库
-  if (res.status === 409) {
-    if (res.json?.requiresConfirm) {
-      const branch = res.json.branch ?? "main";
-      const confirmed = await confirmDialog({
-        title: "推送到主干分支",
-        body: `你正要晋升到公司主干 \`${branch}\`！确认？此操作会覆盖团队共享内容，推后无法自动撤销。`,
-        confirmText: "确认晋升",
-        confirmDanger: true,
-      });
-      if (confirmed) {
-        await doPromote(btn, id, push, panel, { confirmMain: true });
-      }
-      return;
-    }
-    toast("未连接公司中心库,无法晋升。先在顶部「公司中心库」里连接一次。", "error");
-    return;
-  }
-
-  // 网络/服务器层错误(无 json.ok 字段)
-  if (!res.ok && res.json?.ok === undefined) {
-    toast(`失败：${res.json?.error ?? res.status}`, "error");
-    return;
-  }
-
-  const j = res.json ?? {};
-
-  // 业务失败(HTTP 200 + ok:false + kind)
-  if (j.ok === false) {
-    if (j.kind === "behind") {
-      // 落后:内联渲染 amber 失败面板 + 「先同步再上传」按钮
-      renderPromoteFailPanel(panel, "behind", null, async () => {
-        if (state.mode !== "central") await switchContext("central");
-        if (state.centralConnected) await doCentralSync();
-      });
-      return;
-    }
-    if (j.kind === "noperm") {
-      // 无权限:内联渲染红色失败面板 + 「重试」按钮
-      renderPromoteFailPanel(panel, "noperm", j.error ?? null, async () => {
-        await doPromote(btn, id, push, panel);
-      });
-      return;
-    }
-    // 其它失败:内联渲染红色失败面板
-    renderPromoteFailPanel(panel, "other", j.error ?? null, async () => {
-      await doPromote(btn, id, push, panel);
-    });
-    return;
-  }
-
-  // 成功:commit 短 hash + 是否真推到了中心库
-  const commit = shortHash(j.commit ?? j.sha);
-  if (j.pushed) {
-    const botName = state.bots.find((b) => b.id === id)?.name ?? id;
-    const repoPath = state.centralRepo?.path ?? "bots/";
-    renderPromoteSuccessPanel(panel, botName, commit, repoPath);
-  } else {
-    toast(`已暂存到本机副本(未上传)· commit ${commit}`, "ok");
-  }
-}
-
-/**
- * 在 promote-section 内渲染上传成功内联面板(复刻 LkPromoteCard phase==='success')。
- * 绿色 check 徽章 + 「已上传」标题 + larkway sync 提示 + 路径/commit + 「去中心库看看」。
- * @param {HTMLElement|null} panel
- * @param {string} botName
- * @param {string} commit  短 7 位 hash
- * @param {string} repoPath  "bots/" 之类
- */
-function renderPromoteSuccessPanel(panel, botName, commit, repoPath) {
-  const section = panel?.querySelector(".promote-section");
-  if (!section) { toast(`已上传「${esc(botName)}」到公司中心库 · commit ${commit}`, "ok"); return; }
-
-  const gC = LIVE_COLOR.serving, gE = LIVE_EDGE.serving, gS = LIVE_SOFT.serving, gT = LIVE_TEXT.serving;
-  const checkSVG = `<svg class="icon" viewBox="0 0 24 24" aria-hidden="true" style="width:19px;height:19px;stroke-width:2.4"><path d="M20 6 9 17l-5-5"/></svg>`;
-  const arrowSVG = `<svg class="icon" viewBox="0 0 24 24" aria-hidden="true" style="width:15px;height:15px"><path d="M5 12h14M13 6l6 6-6 6"/></svg>`;
-
-  section.innerHTML =
-    `<h4 class="section-title">${ICONS.box} 交给公司统一管理（晋升）</h4>` +
-    `<div class="promote-result-panel" style="background:${gS};border:1px solid ${gE}">` +
-    `<span class="prp-badge" style="border:1px solid ${gE};color:${gC}">${checkSVG}</span>` +
-    `<div class="prp-body">` +
-    `<div class="prp-title" style="color:${gT}">已上传「${esc(botName)}」到中心库</div>` +
-    `<div class="prp-desc">同事 <code style="font-family:ui-monospace,monospace;background:#fff;padding:1px 5px;border-radius:5px;border:1px solid var(--border)">larkway sync</code> 一下就能拉到这一份了。</div>` +
-    `<div class="prp-meta">` +
-    `<span style="display:inline-flex;align-items:center;gap:5px">${ICONS.folder} ${esc(repoPath)}${esc(botName)}/</span>` +
-    `<span>·</span>` +
-    `<span style="font-family:ui-monospace,monospace">commit ${esc(commit)}</span>` +
-    `</div>` +
-    `<div class="prp-actions">` +
-    `<button class="btn" id="prp-go-central" type="button" style="background:var(--br-soft);border:1px solid var(--br-edge);color:var(--br-text);font-size:13.5px;padding:8px 15px;border-radius:9px">去「公司中心库」看看 ${arrowSVG}</button>` +
-    `</div>` +
-    `</div>` +
-    `</div>`;
-
-  section.querySelector("#prp-go-central")?.addEventListener("click", () => switchContext("central"));
-}
-
-/**
- * 在 promote-section 内渲染上传失败内联面板(复刻 LkPromoteCard phase==='failed')。
- * behind=amber 「推不上去」;noperm/other=红「上传失败」。
- * @param {HTMLElement|null} panel
- * @param {"behind"|"noperm"|"other"} kind
- * @param {string|null} errorMsg
- * @param {function():Promise<void>} onAction  主 CTA 点击回调(同步 / 重试)
- */
-function renderPromoteFailPanel(panel, kind, errorMsg, onAction) {
-  const section = panel?.querySelector(".promote-section");
-  const behind = kind === "behind";
-
-  if (!section) {
-    // 无 panel 降级 toast
-    if (behind) {
-      toast("推不上去 —— 中心库有别人的新改动,得先同步再上传。", "error");
-    } else {
-      toast(`上传失败${errorMsg ? "：" + errorMsg : ""}`, "error");
-    }
-    return;
-  }
-
-  // amber(behind) or red(noperm/other)
-  const sc = behind
-    ? { c: LIVE_COLOR.degraded, soft: LIVE_SOFT.degraded, edge: LIVE_EDGE.degraded, text: LIVE_TEXT.degraded }
-    : { c: "#dc2626", soft: "#fef2f2", edge: "#fecaca", text: "#b91c1c" };
-
-  const warnSVG = `<svg class="icon" viewBox="0 0 24 24" aria-hidden="true" style="width:18px;height:18px"><path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0Z"/><path d="M12 9v4M12 17h.01"/></svg>`;
-  const pullSVG = `<svg class="icon" viewBox="0 0 24 24" aria-hidden="true" style="width:15px;height:15px"><path d="M12 3v12M8 11l4 4 4-4M4 21h16"/></svg>`;
-  const refreshSVG = `<svg class="icon" viewBox="0 0 24 24" aria-hidden="true" style="width:15px;height:15px"><path d="M3 12a9 9 0 0 1 15-6.7L21 8M21 3v5h-5M21 12a9 9 0 0 1-15 6.7L3 16M3 21v-5h5"/></svg>`;
-
-  const titleText = behind ? "推不上去 —— 中心库有新改动" : "上传失败";
-  const descText = behind
-    ? "别人在你之前也晋升了东西。你得先把那些「同步」拉下来，跟你的合到一起，再上传一次。"
-    : (errorMsg
-      ? esc(errorMsg)
-      : "这台机器可能没有往团队仓库写的权限。让工程师给你开一下，或换一台有权限的机器再试。");
-  const ctaLabel = behind ? "先同步，再上传" : "重试";
-  const ctaIcon = behind ? pullSVG : refreshSVG;
-
-  section.innerHTML =
-    `<h4 class="section-title">${ICONS.box} 交给公司统一管理（晋升）</h4>` +
-    `<div class="promote-result-panel" style="background:${sc.soft};border:1px solid ${sc.edge}">` +
-    `<span class="prp-badge" style="border:1px solid ${sc.edge};color:${sc.c}">${warnSVG}</span>` +
-    `<div class="prp-body">` +
-    `<div class="prp-title" style="color:${sc.text}">${titleText}</div>` +
-    `<p class="prp-desc">${descText}</p>` +
-    `<div class="prp-actions">` +
-    `<button class="btn" id="prp-cta" type="button" style="background:var(--br);border:none;color:#fff;font-size:13.5px;padding:8px 15px;border-radius:9px">${ctaIcon} ${ctaLabel}</button>` +
-    `<button class="btn" id="prp-detail" type="button" style="border:1px solid var(--border);background:#fff;color:var(--muted);font-size:13.5px;padding:8px 15px;border-radius:9px">${ICONS.code} 查看详情</button>` +
-    `</div>` +
-    `</div>` +
-    `</div>`;
-
-  section.querySelector("#prp-cta")?.addEventListener("click", () => { void onAction(); });
-  section.querySelector("#prp-detail")?.addEventListener("click", () => {
-    const detail = errorMsg ?? (behind ? "中心库有新改动,需先同步。" : "无权限写入团队仓库。");
-    toast(detail, "error");
-  });
-}
 
 // ---------------------------------------------------------------------------
 // 行为:Bridge 服务控制(B3)
@@ -4819,7 +3571,6 @@ async function refreshBridgeStatus() {
  *   - restart.status='timeout' → 红「重启异常」+「再试一次」(照 LkServiceRestartChip timeout)
  *   - pendingNew>0 → amber提示+重启
  *   - running+ok → 绿chip+重启服务幽灵按钮(照 LkServiceRestartChip serving)
- * central 只读模式:操作按钮隐藏(本机操作无意义)。
  */
 function renderServiceIndicator() {
   const container = document.getElementById("bridge-indicator");
@@ -4827,7 +3578,7 @@ function renderServiceIndicator() {
 
   const b = state.bridge;
   const running = b?.running ?? false;
-  const readonly = state.mode === "central";
+  const readonly = false;
 
   if (!b) {
     // 未知态(/api/bridge 没拉到):中性灰 chip,不报警也不显绿。
@@ -4840,7 +3591,7 @@ function renderServiceIndicator() {
   }
 
   // 状态(running)与按钮(readonly)是两个独立维度:服务没跑/有新助手时**始终**显示
-  // 报警状态条;只读上下文(中心库)只是省掉「本机操作」按钮,绝不把状态改成绿色。
+  // 报警状态条:服务异常时绝不把状态改成绿色。
   const svcBtn = (id, borderColor, icon, label, action) =>
     readonly
       ? ""
@@ -4866,7 +3617,7 @@ function renderServiceIndicator() {
     return;
   }
 
-  // ── BL-18:中心库只读时不显重启过渡态(本机运行概念) ─────────────────────────
+  // ── BL-18:重启过渡态 ─────────────────────────
   if (!readonly) {
     const rs = state.restart;
 
@@ -4962,7 +3713,7 @@ function renderServiceIndicator() {
     return;
   }
 
-  // 中心库只读 → 旧版绿 chip(无按钮)
+  // 绿 chip(serving 正常态)
   container.innerHTML =
     `<span class="lk-svc-indicator lk-svc-indicator--ok">` +
     `<span class="bridge-dot is-running" style="margin-right:6px"></span>` +
@@ -5231,114 +3982,6 @@ async function doBridgeRestart(triggerBtn = null, successMsg = null) {
 }
 
 // ---------------------------------------------------------------------------
-// 行为:上下文切换
-// ---------------------------------------------------------------------------
-
-async function switchContext(mode) {
-  if (mode === state.mode) return;
-
-  // ── 切到公司中心库 ──────────────────────────────────────────────────────
-  if (mode === "central") {
-    // 先确认连接状态 —— 未连接也允许进入(进去看的是连接引导卡)。
-    await loadCentralStatus();
-    if (!state.centralConnected) {
-      // 未连接:不调 POST /api/context(后端会 409),只在前端切视图显引导。
-      state.mode = "central";
-      state.selected = null;
-      state.bots = [];
-      renderContextSwitch();
-      renderCentralSourceBar();
-      renderBotList();
-      renderBotDetail(null);
-      renderServiceIndicator();
-      return;
-    }
-    // 已连接:正常切 context
-    const res = await api("POST", "/api/context", { mode });
-    if (!res.ok) {
-      toast(`切换失败：${res.json?.error ?? res.status}`, "error");
-      return;
-    }
-    state.mode = res.json?.mode ?? mode;
-    state.selected = null;
-    renderContextSwitch();
-    renderCentralSourceBar();
-    renderBotDetail(null);
-    await loadBots();
-    // 进中心库后台算一次同步预览,驱动来源条「N 项可更新 / 已是最新」
-    void refreshCentralSyncState();
-    renderServiceIndicator();
-    return;
-  }
-
-  // ── 切回本机 ────────────────────────────────────────────────────────────
-  const res = await api("POST", "/api/context", { mode });
-  if (!res.ok) {
-    toast(`切换失败：${res.json?.error ?? res.status}`, "error");
-    return;
-  }
-  state.mode = res.json?.mode ?? mode;
-  state.selected = null;
-  renderContextSwitch();
-  renderCentralSourceBar();
-  // 清空详情
-  renderBotDetail(null);
-  await loadBots();
-  // 切换上下文后刷新 bridge 指示(central 模式下按钮要隐藏)
-  renderServiceIndicator();
-}
-
-/**
- * 强制进入「已连接的公司中心库」视图并刷新名册 + 来源条。
- * 用于连接成功后(此时 mode 可能已是 central,switchContext 会 no-op)。
- */
-async function enterCentralConnected() {
-  await loadCentralStatus();
-  if (!state.centralConnected) {
-    // 极端情况下连接态丢失 → 退回引导
-    state.mode = "central";
-    state.selected = null;
-    state.bots = [];
-    renderContextSwitch();
-    renderCentralSourceBar();
-    renderBotList();
-    renderBotDetail(null);
-    return;
-  }
-  // 确保后端上下文也切到 central(幂等;失败不阻断前端展示)
-  await api("POST", "/api/context", { mode: "central" });
-  state.mode = "central";
-  state.selected = null;
-  renderContextSwitch();
-  renderCentralSourceBar();
-  renderBotDetail(null);
-  await loadBots();
-  void refreshCentralSyncState();
-  renderServiceIndicator();
-}
-
-/**
- * 后台算一次同步预览,只为驱动来源条状态(不弹 modal)。
- * 失败静默(来源条退回「检查更新」)。
- */
-async function refreshCentralSyncState() {
-  if (state.mode !== "central" || !state.centralConnected) return;
-  const res = await api("GET", "/api/central/sync/preview");
-  if (!res.ok) {
-    state.centralSyncState = "unknown";
-    renderCentralSourceBar();
-    return;
-  }
-  // 只数会真正应用的增量(added + updated);removed(本机自建未晋升)本机自管不删,见上。
-  const total =
-    (res.json?.added?.length ?? 0) +
-    (res.json?.updated?.length ?? 0);
-  state.centralUpdateCount = total;
-  state.centralSyncState = total > 0 ? "updates" : "fresh";
-  renderCentralSourceBar();
-}
-
-// ---------------------------------------------------------------------------
 // 行为:选中 bot
 // ---------------------------------------------------------------------------
 
@@ -5360,30 +4003,6 @@ function selectBot(id) {
 async function loadBots(opts = {}) {
   if (!opts.silent) renderBotListLoading();
 
-  // 中心库:只读名册走 GET /api/central/bots(含 by/updated/commit),不显在线/心跳。
-  if (state.mode === "central") {
-    const ok = await loadCentralBots();
-    if (!ok) {
-      if (!opts.silent) toast("加载中心库名册失败", "error");
-      state.bots = [];
-    } else {
-      // 归一化成名册行需要的 {id,name,description,avatar}(中心库 yaml 现在带飞书头像,用它)
-      state.bots = state.centralBots.map((b) => ({
-        id: b.id,
-        name: b.name ?? b.id,
-        description: b.desc ?? "",
-        avatar: b.avatar ?? null,
-        backend: b.backend || LK_BACKEND_DEFAULT,
-      }));
-      // 中心库头像并入 state.avatars,名册行 + 详情区都能用(与本机分支一致)
-      for (const b of state.centralBots) {
-        if (b && typeof b.id === "string" && b.avatar) state.avatars[b.id] = b.avatar;
-      }
-    }
-    renderBotList();
-    return;
-  }
-
   const res = await api("GET", "/api/bots");
   if (!res.ok) {
     if (!opts.silent) toast(`加载助手列表失败：${res.json?.error ?? res.status}`, "error");
@@ -5395,91 +4014,6 @@ async function loadBots(opts = {}) {
     }
   }
   renderBotList();
-}
-
-// ---------------------------------------------------------------------------
-// 行为:从中心同步(先 dryRun,再二次确认)
-// ---------------------------------------------------------------------------
-
-async function doSync() {
-  const btn = document.getElementById("btn-sync");
-  const restore = btnLoading(btn, "拉取预览中…");
-  const dryRes = await api("POST", "/api/sync", { dryRun: true });
-  restore();
-  if (!dryRes.ok) {
-    toast(`同步预览失败：${dryRes.json?.error ?? dryRes.status}`, "error");
-    return;
-  }
-  const plan = dryRes.json?.plan ?? { added: [], updated: [], removed: [], unchanged: [] };
-  showSyncModal(plan);
-}
-
-function showSyncModal(plan) {
-  const backdrop = document.getElementById("modal-backdrop");
-  const body = document.getElementById("modal-body");
-  const footer = document.getElementById("modal-footer");
-  if (!backdrop || !body || !footer) return;
-
-  const rows = [
-    { label: "新增", items: plan.added, cls: "ok" },
-    { label: "更新", items: plan.updated, cls: "warn" },
-    { label: "本机独有（中心库没有，默认保留）", items: plan.removed, cls: "dim" },
-    { label: "无变化", items: plan.unchanged, cls: "dim" },
-  ];
-
-  let html = "";
-  for (const row of rows) {
-    if (!Array.isArray(row.items) || row.items.length === 0) continue;
-    html += `<div class="sync-group"><span class="sync-label sync-${row.cls}">${esc(row.label)}（${row.items.length}）</span>`;
-    html += `<ul class="sync-list">${row.items.map((id) => `<li>${esc(id)}</li>`).join("")}</ul></div>`;
-  }
-  if (!html) html = `<p class="dim">没有变化，本机已与公司中心库一致。</p>`;
-
-  body.innerHTML = html;
-  footer.innerHTML = `
-    <label class="prune-label">
-      <input type="checkbox" id="chk-prune" />
-      同时删除本机独有的助手（prune）
-    </label>
-    <div class="modal-btns">
-      <button class="btn" id="modal-cancel" type="button">取消</button>
-      <button class="btn btn-primary" id="modal-confirm" type="button">确认拉取</button>
-    </div>
-  `;
-
-  backdrop.hidden = false;
-
-  document.getElementById("modal-cancel")?.addEventListener("click", () => {
-    backdrop.hidden = true;
-  });
-
-  document.getElementById("modal-confirm")?.addEventListener("click", async () => {
-    const prune = document.getElementById("chk-prune")?.checked ?? false;
-    const confirmBtn = document.getElementById("modal-confirm");
-    const restore = btnLoading(confirmBtn, "拉取中…");
-    const res = await api("POST", "/api/sync", { dryRun: false, prune });
-    restore();
-    backdrop.hidden = true;
-    if (!res.ok) {
-      toast(`同步失败：${res.json?.error ?? res.status}`, "error");
-      return;
-    }
-    const result = res.json?.result ?? {};
-    const parts = [];
-    if ((result.applied ?? []).length) parts.push(`应用 ${result.applied.length}`);
-    if ((result.pruned ?? []).length) parts.push(`删除 ${result.pruned.length}`);
-    if ((result.skipped ?? []).length) parts.push(`跳过 ${result.skipped.length}`);
-    toast(`同步完成。${parts.join("、") || "无变化"}`, "ok");
-    if ((res.json?.warnings ?? []).length) {
-      for (const w of res.json.warnings) console.warn("[larkway sync]", w);
-    }
-    await loadBots();
-    // 如果当前选中 bot 已被删除,清空详情
-    if (state.selected && !state.bots.find((b) => b.id === state.selected)) {
-      state.selected = null;
-      renderBotDetail(null);
-    }
-  });
 }
 
 // ---------------------------------------------------------------------------
@@ -5749,7 +4283,7 @@ function renderOnboardNameForm(prefill, sessionId) {
     `<div class="lk-bk-card" id="ob2-bk-card" style="margin:0 0 18px">` +
     `<h4 class="lk-bk-card-title" style="font-size:14.5px">${ICONS.box} 用哪个底座` +
     `<span style="font-weight:400;color:var(--faint);font-size:13px;margin-left:4px">默认 Codex</span></h4>` +
-    lkBackendSelectHTML(LK_BACKEND_DEFAULT, false, "ob2-bk") +
+    lkBackendSelectHTML(LK_BACKEND_DEFAULT, "ob2-bk") +
     `</div>`;
 
   modal.innerHTML =
@@ -5952,23 +4486,11 @@ function renderOnboardError(msg) {
 // ---------------------------------------------------------------------------
 
 function wireEvents() {
-  // 上下文切换
-  for (const btn of document.querySelectorAll(".ctx-btn")) {
-    btn.addEventListener("click", () => switchContext(btn.dataset.mode));
-  }
-
   // 刷新列表
   document.getElementById("btn-refresh")?.addEventListener("click", () => loadBots());
 
-  // 从中心同步
-  document.getElementById("btn-sync")?.addEventListener("click", () => doSync());
-
   // 添加新助手:页面内扫码开通(POST /api/onboard/start → 轮询 → 落盘)
   document.getElementById("btn-add")?.addEventListener("click", () => {
-    if (state.mode === "central") {
-      toast("「公司中心库」是只读的，新建助手请先切到「本机」。", "warn");
-      return;
-    }
     openOnboardModal();
   });
 
@@ -5977,13 +4499,6 @@ function wireEvents() {
     if (e.target === e.currentTarget) {
       e.currentTarget.hidden = true;
     }
-  });
-
-  // 连接公司中心库 modal 背景点击关闭(connecting 态正在测网络,不打断)
-  document.getElementById("connect-backdrop")?.addEventListener("click", (e) => {
-    if (e.target !== e.currentTarget) return;
-    if (document.getElementById("connect-modal")?.querySelector(".spinner-lg")) return;
-    closeConnectFlow();
   });
 
   // 添加新助手 modal 背景点击 → 走取消(中止后端 + 清定时器)
@@ -5998,18 +4513,12 @@ function wireEvents() {
     await doBridgeRestart(e.currentTarget);
   });
 
-  // Esc 关闭 modal（同步预览直接关；添加新助手走取消清理；连接弹窗 connecting 态不打断）
+  // Esc 关闭 modal（同步预览直接关；添加新助手走取消清理）
   document.addEventListener("keydown", (e) => {
     if (e.key !== "Escape") return;
     const ob = document.getElementById("onboard-backdrop");
     if (ob && !ob.hidden) {
       closeOnboardModal();
-      return;
-    }
-    const cb = document.getElementById("connect-backdrop");
-    if (cb && !cb.hidden) {
-      if (document.getElementById("connect-modal")?.querySelector(".spinner-lg")) return;
-      closeConnectFlow();
       return;
     }
     const bd = document.getElementById("modal-backdrop");
@@ -6024,32 +4533,26 @@ async function boot() {
 
   wireEvents();
 
-  // 拉初始上下文状态(mode + centralAvailable)
+  // 拉初始上下文状态(version + hostname)
   const ctxRes = await api("GET", "/api/context");
   if (ctxRes.ok) {
-    state.mode = ctxRes.json?.mode ?? "local";
-    state.centralAvailable = ctxRes.json?.centralAvailable ?? false;
+    state.mode = "local";
     const ver = ctxRes.json?.version;
     const verEl = document.getElementById("brand-ver");
     if (verEl && ver) verEl.textContent = "v" + ver;
+    // 填充本机 hostname badge(浏览器侧地址,本机即 127.0.0.1)
+    const hostEl = document.getElementById("ctx-host");
+    const host = location.hostname || "";
+    if (hostEl && host) hostEl.textContent = " · " + host;
   }
 
-  // 拉中心库连接状态(driver:连接引导 vs 已连接名册 + 来源条)
-  await loadCentralStatus();
-
   renderContextSwitch();
-  renderCentralSourceBar();
 
   // 拉 backend 注册表(驱动底座选择就绪态;失败静默)
   void loadBackends();
 
   // 拉 bot 列表(先于首次状态轮询,确保左侧条目存在好让圆点落上去)
   await loadBots();
-
-  // 若初始就处于已连接的中心库上下文,后台算同步预览驱动来源条
-  if (state.mode === "central" && state.centralConnected) {
-    void refreshCentralSyncState();
-  }
 
   // 拉 bridge 服务状态并渲染顶栏指示
   await refreshBridgeStatus();
