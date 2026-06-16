@@ -42,13 +42,13 @@ export interface RunOptions {
   /**
    * Git author/committer identity for commits made in this session.
    * V2: sourced from bots/*.yaml `git_identity` field.
-   * V1 compat: if absent, falls back to hardcoded "larkway-bot" identity.
+   * If absent, the child uses the host repo/global git config naturally.
    */
   botGitIdentity?: { name: string; email: string };
   /**
    * GitLab PAT to inject as GITLAB_TOKEN env into the agent subprocess.
    * V2: per-bot value resolved by main.ts from `bots/*.yaml gitlab_token_env`.
-   * V1 compat: if absent, the child inherits process.env.GITLAB_TOKEN as-is.
+   * If absent, the child inherits the host Git auth environment unchanged.
    */
   gitlabToken?: string;
 }

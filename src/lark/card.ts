@@ -69,6 +69,8 @@ export interface CardHandle {
     finalText?: string;
     success: boolean;
     failureReason?: string;
+    /** Feishu open_id/user_id to @-mention in the finalized card body. */
+    mentionOpenId?: string;
     /** Optional bot-supplied overrides — when present, used verbatim. */
     titleOverride?: string;
     /** "success" | "failure" | "neutral" — overrides default header color. */
@@ -264,6 +266,8 @@ function buildCardJson(opts: {
   showToolSummary: boolean;
   status: "thinking" | "streaming" | "success" | "failure";
   failureReason?: string;
+  /** Feishu open_id/user_id to @-mention in the card body. */
+  mentionOpenId?: string;
   /**
    * V2 dynamic-choice buttons — agent-declared, rendered VERBATIM as Card 2.0
    * callback buttons. Only passed on finalize() (never mid-stream). Empty/absent
@@ -318,11 +322,13 @@ function buildCardJson(opts: {
   // Sanitize leaked tool-call markup so the operator never sees raw
   // `<invoke …>` / `<parameter …>` XML when the model mis-emits a tool call as
   // text. May reduce to empty (whole body was leaked markup) → fall through.
+  const mentionPrefix = atMentionMarkdown(opts.mentionOpenId);
   const cleanBody = opts.bodyText ? stripLeakedToolMarkup(opts.bodyText) : "";
-  if (cleanBody) {
+  const bodyWithMention = [mentionPrefix, cleanBody].filter(Boolean).join("\n\n");
+  if (bodyWithMention) {
     // Split into chunks to stay within Feishu's ~3000-char markdown element
     // limit; each chunk becomes its own markdown element.
-    const chunks = chunkMarkdown(cleanBody);
+    const chunks = chunkMarkdown(bodyWithMention);
     for (let i = 0; i < chunks.length; i++) {
       elements.push({
         tag: "markdown",
@@ -399,6 +405,14 @@ function buildCardJson(opts: {
   };
 
   return JSON.stringify(card);
+}
+
+function atMentionMarkdown(userId: string | undefined): string {
+  if (!userId) return "";
+  // Feishu card markdown supports <at id=ou_xxx></at>. Keep the id narrow so
+  // a malformed event cannot inject arbitrary markdown/html into the card body.
+  if (!/^[A-Za-z0-9_:-]+$/.test(userId)) return "";
+  return `<at id=${userId}></at>`;
 }
 
 // ---------------------------------------------------------------------------
@@ -491,6 +505,7 @@ class CardHandleImpl implements CardHandle {
     finalText?: string;
     success: boolean;
     failureReason?: string;
+    mentionOpenId?: string;
     titleOverride?: string;
     colorOverride?: "success" | "failure" | "neutral";
     choices?: Choice[];
@@ -532,6 +547,7 @@ class CardHandleImpl implements CardHandle {
       showToolSummary: this.showToolSummary,
       status: cardStatus,
       failureReason: opts.failureReason,
+      mentionOpenId: opts.mentionOpenId,
       // V2 dynamic-choice buttons — agent-declared, only on finalize.
       choices: opts.choices,
       choicePrompt: opts.choicePrompt,

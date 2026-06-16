@@ -404,6 +404,44 @@ describe("CardRenderer — injected OutboundCardClient (throttle + finalize)", (
     expect(hasBody).toBe(true);
   });
 
+  it("finalize() prefixes final body with a Feishu mention when mentionOpenId is set", async () => {
+    const { CardRenderer } = await import("./card.js");
+    const fake = new FakeOutbound();
+    const renderer = new CardRenderer({ outbound: fake, patchIntervalMs: 10_000 });
+    const handle = await renderer.start("om_user_msg");
+
+    await handle.finalize({
+      success: true,
+      finalText: "all done",
+      mentionOpenId: "ou_sender",
+    });
+
+    const patched = JSON.parse(fake.patchCalls[0]!.cardJson) as {
+      body: { elements: Array<{ tag: string; content?: string }> };
+    };
+    const firstMarkdown = patched.body.elements.find((el) => el.tag === "markdown");
+    expect(firstMarkdown?.content).toBe("<at id=ou_sender></at>\n\nall done");
+  });
+
+  it("finalize() ignores malformed mentionOpenId values", async () => {
+    const { CardRenderer } = await import("./card.js");
+    const fake = new FakeOutbound();
+    const renderer = new CardRenderer({ outbound: fake, patchIntervalMs: 10_000 });
+    const handle = await renderer.start("om_user_msg");
+
+    await handle.finalize({
+      success: true,
+      finalText: "all done",
+      mentionOpenId: "ou_sender></at><at id=ou_other",
+    });
+
+    const patched = JSON.parse(fake.patchCalls[0]!.cardJson) as {
+      body: { elements: Array<{ tag: string; content?: string }> };
+    };
+    const firstMarkdown = patched.body.elements.find((el) => el.tag === "markdown");
+    expect(firstMarkdown?.content).toBe("all done");
+  });
+
   it("finalize() re-throws when patchCard rejects (throwOnFinalFail)", async () => {
     const { CardRenderer } = await import("./card.js");
     const fake = new FakeOutbound();

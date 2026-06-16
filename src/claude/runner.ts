@@ -42,13 +42,11 @@ const SIGKILL_GRACE_MS = 5_000;
 
 /**
  * Build env for the child process:
- *  - inherit everything from process.env
+ *  - inherit everything from process.env, including the host's normal Git auth
+ *    surface (SSH agent, credential helper, GITLAB_TOKEN/GITHUB_TOKEN, etc.)
  *  - strip ANTHROPIC_API_KEY (subscription account, API key would switch billing)
- *  - force GIT_AUTHOR_NAME / GIT_AUTHOR_EMAIL / GIT_COMMITTER_NAME / GIT_COMMITTER_EMAIL
- *    to the bot service-account identity (§B.16 fix).
- *
- * V1 compat: called with no argument, falls back to the hardcoded "larkway-bot" identity.
- * V2: called with `botGitIdentity` from the bot's yaml, uses that identity instead.
+ *  - only override git author/committer identity when the bot explicitly
+ *    configures `git_identity`; otherwise git uses the host repo/global config.
  *
  * @param botGitIdentity  Optional override from bots/*.yaml `git_identity` field.
  *                        If absent, uses the V1 default "larkway-bot" identity.
@@ -60,15 +58,14 @@ function buildEnv(
   const env: NodeJS.ProcessEnv = { ...process.env };
   delete env["ANTHROPIC_API_KEY"];
 
-  const name = botGitIdentity?.name ?? "larkway-bot";
-  const email = botGitIdentity?.email ?? "bot@larkway.local";
+  if (botGitIdentity) {
+    env["GIT_AUTHOR_NAME"] = botGitIdentity.name;
+    env["GIT_AUTHOR_EMAIL"] = botGitIdentity.email;
+    env["GIT_COMMITTER_NAME"] = botGitIdentity.name;
+    env["GIT_COMMITTER_EMAIL"] = botGitIdentity.email;
+  }
 
-  env["GIT_AUTHOR_NAME"] = name;
-  env["GIT_AUTHOR_EMAIL"] = email;
-  env["GIT_COMMITTER_NAME"] = name;
-  env["GIT_COMMITTER_EMAIL"] = email;
-
-  // V2: per-bot GitLab token overrides any inherited GITLAB_TOKEN.
+  // V2: explicit per-bot Git token overrides any inherited GITLAB_TOKEN.
   // V1: gitlabToken undefined → child inherits process.env.GITLAB_TOKEN as-is.
   if (gitlabToken !== undefined) {
     env["GITLAB_TOKEN"] = gitlabToken;

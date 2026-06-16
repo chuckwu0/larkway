@@ -1,4 +1,3 @@
-import { execSync } from "node:child_process";
 import { mkdirSync } from "node:fs";
 import path from "node:path";
 import { resolveLarkwayVersion } from "./version.js";
@@ -31,6 +30,7 @@ import { ClaudeRunner } from "./claude/runner.js";
 import { CodexRunner } from "./codex/runner.js";
 import { ensureLarkCliProfile, deriveLarkCliProfile } from "./lark/profileBootstrap.js";
 import { checkWorkspacePermissionGrant } from "./agent/permissionGate.js";
+import { runtimeRequirementsForBots } from "./runtimeRequirements.js";
 
 /** How often the bridge rewrites each bot's status.json liveness heartbeat. */
 const STATUS_WRITE_INTERVAL_MS = 30_000;
@@ -38,41 +38,21 @@ const STATUS_WRITE_INTERVAL_MS = 30_000;
 /** Larkway 版本号 —— 读最近的 package.json(单一源,不再硬编码,避免 banner 撒谎)。 */
 const VERSION: string = resolveLarkwayVersion(import.meta.url);
 
-// ---------------------------------------------------------------------------
-// CLI probe (kept from D1 — startup validation)
-// ---------------------------------------------------------------------------
-
-function checkCli(name: string): { ok: boolean; version: string } {
-  try {
-    const p = execSync(`which ${name}`, { stdio: ["pipe", "pipe", "pipe"] })
-      .toString()
-      .trim();
-    if (!p) return { ok: false, version: "" };
-    const version = execSync(`${name} --version`, {
-      stdio: ["pipe", "pipe", "pipe"],
-    })
-      .toString()
-      .trim()
-      .split("\n")[0] ?? "";
-    return { ok: true, version };
-  } catch {
-    return { ok: false, version: "" };
-  }
-}
-
-function externalClisForBots(bots: BotConfig[]): string[] {
-  const backendBins = bots.map((bot) => bot.backend ?? "claude");
-  return Array.from(new Set(["lark-cli", ...backendBins, "glab"]));
-}
-
 function printExternalCliProbe(bots: BotConfig[]): void {
-  console.log("External CLIs:");
-  for (const name of externalClisForBots(bots)) {
-    const { ok, version } = checkCli(name);
-    if (ok) {
-      console.log(`  ${name.padEnd(10)}  ✓  ${version}`);
+  console.log("Runtime requirements:");
+  for (const req of runtimeRequirementsForBots(bots)) {
+    const icon = req.ok ? "✓" : "✗";
+    const tag = req.severity === "optional" ? "optional" : "required";
+    const target = req.command ?? req.label;
+    const botScope = req.botIds.length > 0 ? ` [${req.botIds.join(", ")}]` : "";
+    if (req.ok) {
+      console.log(`  ${target.padEnd(14)} ${icon}  ${req.version ?? tag}${botScope}`);
     } else {
-      console.warn(`  ${name.padEnd(10)}  ✗  (not found — install before running bots that use it)`);
+      const message = req.kind === "secret"
+        ? req.reason
+        : `not found — ${req.reason}`;
+      console.warn(`  ${target.padEnd(14)} ${icon}  (${tag}) ${message}${botScope}`);
+      if (req.installHint) console.warn(`  ${"".padEnd(14)}    ${req.installHint}`);
     }
   }
 }
@@ -139,22 +119,19 @@ async function runV2Mode({
     if (bot.runtime === "agent_workspace") {
       const _agentTokenEnvName = bot.git_token_env ?? bot.gitlab_token_env;
       if (bot.repos.length > 0 && !_agentTokenEnvName) {
-        console.error(
-          `[larkway] SKIPPING bot "${bot.id}": runtime=agent_workspace has repo pointers ` +
-            "but no git_token_env (or gitlab_token_env). v0.3 workspace repo bots must reference an explicit " +
-            "per-agent token env name; they do not inherit global GITLAB_TOKEN.",
+        console.warn(
+          `[larkway] bot "${bot.id}": runtime=agent_workspace has repo pointers but no git_token_env. ` +
+            "Starting anyway; the agent will use the host's normal Git identity/auth.",
         );
-        continue;
       }
       if (_agentTokenEnvName) {
         const agentToken = process.env[_agentTokenEnvName];
         if (agentToken == null || agentToken === "") {
-          console.error(
-            `[larkway] SKIPPING bot "${bot.id}": runtime=agent_workspace declares ` +
+          console.warn(
+            `[larkway] bot "${bot.id}": runtime=agent_workspace declares ` +
               `token env "${_agentTokenEnvName}", but that env var is unset/empty. ` +
-              "Set the real token in ~/.larkway/.env; v0.3 workspace bots do not fall back to global GITLAB_TOKEN.",
+              "Starting anyway; the agent will use the host's normal Git identity/auth.",
           );
-          continue;
         }
       }
 
@@ -222,7 +199,7 @@ async function runV2Mode({
     if (tokenEnvName != null && (gitlabToken == null || gitlabToken === "")) {
       console.warn(
         `[larkway] bot "${bot.id}" declares token env "${tokenEnvName}" ` +
-          `but that env var is unset/empty — falling back to global GITLAB_TOKEN.`,
+          `but that env var is unset/empty — leaving the host Git auth environment unchanged.`,
       );
     }
 
@@ -346,9 +323,7 @@ async function runV2Mode({
     // Inject gitlab_token whenever one is configured.
     // Token scope (read-only vs read-write) is determined by the GitLab token
     // itself — the bridge does NOT model read vs write at the provisioning level.
-    const effectiveGitlabToken = bot.runtime === "agent_workspace"
-      ? (gitlabToken ?? "")
-      : gitlabToken;
+    const effectiveGitlabToken = gitlabToken;
 
     // Resolve peer bots: map this bot's peers (string[] of bot ids) to PeerBot[]
     // with id=bot_open_id (what agent uses to @ peer), name, description.
@@ -379,6 +354,7 @@ async function runV2Mode({
       gitlabToken: effectiveGitlabToken,
       agentMemory: bot.agent_memory,
       larkCliProfile,
+      runtimeRequirements: runtimeRequirementsForBots([bot]),
       recordRuntimeEvent: async (patch) => {
         await upsertRuntimeEvent(larkwayHome(), bot.id, patch);
       },

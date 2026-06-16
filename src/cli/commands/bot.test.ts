@@ -207,7 +207,7 @@ describe("bot add", () => {
     await expect(readFile(path.join(workspace, "tasks", "_creation", "task.md"), "utf8")).rejects.toThrow();
   });
 
-  it("defaults gitlab_token_env for agent_workspace repo bots", async () => {
+  it("does not require or default gitlab_token_env for agent_workspace repo bots", async () => {
     const ctx = makeCtx(tmpDir);
     const code = await run(ctx, [
       "add",
@@ -220,11 +220,12 @@ describe("bot add", () => {
     expect(code).toBe(0);
 
     const cfg = await botsStore.readBot("test-bot");
-    expect(cfg.gitlab_token_env).toBe("LARKWAY_TEST_BOT_GITLAB_TOKEN");
+    expect(cfg.gitlab_token_env).toBeUndefined();
+    expect(cfg.git_token_env).toBeUndefined();
 
     const workspace = path.join(tmpDir, "agents", "test-bot", "workspace");
     const permissions = await readFile(path.join(workspace, "permissions-request.md"), "utf8");
-    expect(permissions).toContain("Git token env name: LARKWAY_TEST_BOT_GITLAB_TOKEN");
+    expect(permissions).toContain("Git token env name: pending human confirmation");
     expect(permissions).toContain("Git repo pointer: chuckwu0/larkway (main)");
   });
 

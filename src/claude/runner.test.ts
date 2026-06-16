@@ -85,12 +85,12 @@ describe("buildEnv", () => {
     expect(env["ANTHROPIC_API_KEY"]).toBeUndefined();
   });
 
-  it("uses V1 default larkway-bot identity when no botGitIdentity (V1 compat)", () => {
+  it("does not override host git identity when no botGitIdentity is configured", () => {
     const env = buildEnv();
-    expect(env["GIT_AUTHOR_NAME"]).toBe("larkway-bot");
-    expect(env["GIT_AUTHOR_EMAIL"]).toBe("bot@larkway.local");
-    expect(env["GIT_COMMITTER_NAME"]).toBe("larkway-bot");
-    expect(env["GIT_COMMITTER_EMAIL"]).toBe("bot@larkway.local");
+    expect(env["GIT_AUTHOR_NAME"]).toBeUndefined();
+    expect(env["GIT_AUTHOR_EMAIL"]).toBeUndefined();
+    expect(env["GIT_COMMITTER_NAME"]).toBeUndefined();
+    expect(env["GIT_COMMITTER_EMAIL"]).toBeUndefined();
   });
 
   it("uses provided botGitIdentity instead of V1 default", () => {

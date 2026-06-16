@@ -107,6 +107,7 @@ interface FinalizeArgs {
   finalText?: string;
   success: boolean;
   failureReason?: string;
+  mentionOpenId?: string;
   titleOverride?: string;
   colorOverride?: string;
 }
@@ -279,6 +280,68 @@ async function seedRepoCachePath(): Promise<void> {
 }
 
 describe("handleOne — thin-channel finalize", () => {
+  it("passes missing lark-cli as an advisory runtime warning without blocking the agent", async () => {
+    let runOpts: { prompt?: string } | undefined;
+    runClaudeImpl = (opts: unknown) => {
+      runOpts = opts as { prompt?: string };
+      return {
+        events: (async function* () {
+          yield { type: "system_init", sessionId: "sess_warn", raw: {} };
+          yield { type: "text_delta", text: "我会先基于当前消息处理。" };
+        })(),
+        done: Promise.resolve({ exitCode: 0, sessionId: "sess_warn" }),
+        kill: () => {},
+      };
+    };
+
+    const { renderer, finalizeArgs, whenFinalized } = makeCardRenderer();
+    const { store } = makeSessionStore();
+    const { client, acked } = makeClient(makeEvent());
+    await seedRepoCachePath();
+
+    const handler = new BridgeHandler({
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      client: client as any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      cardRenderer: renderer as any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      sessionStore: store as any,
+      conventions: makeConventions(),
+      botConfig: { id: "frontend", name: "Frontend", turn_taking_limit: 10, backend: "claude" },
+      runtimeRequirements: [
+        {
+          id: "cli:lark-cli",
+          label: "Feishu CLI",
+          command: "lark-cli",
+          kind: "cli",
+          severity: "required",
+          ok: false,
+          reason: "Required to read Feishu context.",
+          installHint: "Install and configure lark-cli before starting Feishu bots.",
+          botIds: ["frontend"],
+        },
+      ],
+    });
+
+    await handler.run();
+    await whenFinalized;
+    for (let i = 0; i < 100 && acked.length === 0; i++) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
+
+    expect(finalizeArgs).toHaveLength(1);
+    expect(finalizeArgs[0]?.success).toBe(true);
+    expect(finalizeArgs[0]?.mentionOpenId).toBeUndefined();
+    expect(finalizeArgs[0]?.finalText).toContain("我会先基于当前消息处理。");
+    expect(acked).toEqual(["om_msg"]);
+    expect(runnerBackends).toEqual(["claude"]);
+    expect(runOpts?.prompt).toContain("<runtime-warnings>");
+    expect(runOpts?.prompt).toContain("Feishu CLI (lark-cli)");
+    expect(runOpts?.prompt).toContain("这是提示,不是强制停止条件");
+    expect(runOpts?.prompt).toContain("不要额外 @ 用户");
+    expect(runOpts?.prompt).toContain("npx -y @larksuite/cli@latest install");
+  });
+
   it("adds a received reaction before card start, then removes it once the processing card exists", async () => {
     const callOrder: string[] = [];
     const client = {
@@ -389,6 +452,7 @@ describe("handleOne — thin-channel finalize", () => {
     expect(finalizeArgs[0]?.success).toBe(true);
     // Bot's last_message is rendered verbatim — no "阶段回退" copy.
     expect(finalizeArgs[0]?.finalText).toBe("已走灰度,MR 已提");
+    expect(finalizeArgs[0]?.mentionOpenId).toBeUndefined();
     expect(finalizeArgs[0]?.failureReason).toBeUndefined();
   });
 });

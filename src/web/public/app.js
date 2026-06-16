@@ -377,6 +377,8 @@ const state = {
   selected: null,
   /** Bridge 进程状态(来自 GET /api/bridge;null = 未知)。 */
   bridge: /** @type {{running:boolean,pid:number|null,platform:string,mode:string}|null} */ (null),
+  /** Runtime requirement diagnostics from GET /api/runtime/requirements. */
+  requirements: /** @type {{requirements:Array<any>,missingRequired:Array<any>,missingOptional:Array<any>}|null} */ (null),
   /**
    * 每个 bot 的实时在线状态(来自 GET /api/status 的 bots[]),按 id 索引。
    * "serving"=🟢正常服务中 / "degraded"=🟡连接异常 / "offline"=🔴未运行掉线 / null=状态未知。
@@ -867,6 +869,34 @@ function effLive(id) {
   return bridgeRunning ? botLiveness(id) : "offline";
 }
 
+function missingRequiredForBot(id) {
+  const missing = state.requirements?.missingRequired;
+  if (!Array.isArray(missing)) return [];
+  return missing.filter((req) => Array.isArray(req.botIds) && req.botIds.includes(id));
+}
+
+function missingRequiredAll() {
+  return Array.isArray(state.requirements?.missingRequired) ? state.requirements.missingRequired : [];
+}
+
+function requirementShortLabel(req) {
+  if (!req) return "运行依赖";
+  if (req.command === "lark-cli") return "飞书 CLI";
+  if (req.kind === "secret") return req.label === "Git access token env" ? "Git 访问令牌" : req.label;
+  return req.label || req.command || "运行依赖";
+}
+
+function requirementInstallText(req) {
+  if (!req) return "";
+  if (req.command === "lark-cli") return "安装并配置 lark-cli 后重启服务。";
+  if (req.kind === "secret") return req.installHint || "在看板里粘贴 Git access token，或补齐 bot yaml 的 git_token_env。";
+  return req.installHint || "安装缺失的 CLI 后重启服务。";
+}
+
+function primaryMissingForBot(id) {
+  return missingRequiredForBot(id)[0] ?? null;
+}
+
 /**
  * pendingNew:bridge 在跑且存在从未上报过 status 的 bot(unknown liveness)的数量。
  * 对应 LkServiceIndicator pendingNew prop。
@@ -988,6 +1018,8 @@ function buildStatusActionPanel(liveKey, busyAction = null, moreOpen = false) {
   };
 
   const primaryBusy = busyAction === fx.primary.action;
+  const heading = fx.heading;
+  const say = fx.say;
 
   // Build "more" section for degraded
   let moreSection = "";
@@ -1045,8 +1077,8 @@ function buildStatusActionPanel(liveKey, busyAction = null, moreOpen = false) {
     iconSvg + `</span>` +
     `<div style="min-width:0;flex:1">` +
     `<div style="font-size:12.5px;font-weight:700;letter-spacing:.04em;color:${sc.text};margin-bottom:4px">` +
-    esc(fx.heading) + `</div>` +
-    `<p style="margin:0;font-size:14px;line-height:1.55;color:#334155">${esc(fx.say)}</p>` +
+    esc(heading) + `</div>` +
+    `<p style="margin:0;font-size:14px;line-height:1.55;color:#334155">${esc(say)}</p>` +
     `<div style="display:flex;gap:10px;flex-wrap:wrap;margin-top:13px;align-items:center">` +
     fixBtnPrimary(primaryBusy) +
     (fx.secondary ? fixBtnSecondary(fx.secondary) : "") +
@@ -2295,37 +2327,44 @@ function normalizeRepos(raw) {
   if (!Array.isArray(raw)) return [];
   return raw.map((r) => {
     if (typeof r === "string") {
-      const [slug, branch = "master"] = r.split(":").map((s) => s.trim());
+      const [slug, branch = "main"] = r.split(":").map((s) => s.trim());
       return { slug, branch, url: "" };
     }
-    return { slug: r.slug ?? "", branch: r.branch ?? "master", url: r.url ?? "" };
+    return { slug: r.slug ?? "", branch: r.branch ?? "main", url: r.url ?? "" };
   });
 }
 
+function inferRepoSlugFromUrl(url) {
+  const text = String(url ?? "").trim();
+  if (!text) return "";
+  const stripGit = (s) => s.replace(/\.git$/i, "").replace(/^\/+|\/+$/g, "");
+
+  const scp = /^[A-Za-z0-9_.-]+@[^:\s]+:(.+)$/.exec(text);
+  if (scp) return stripGit(scp[1] ?? "");
+
+  try {
+    const parsed = new URL(text);
+    return stripGit(parsed.pathname);
+  } catch {
+    return "";
+  }
+}
+
 /**
- * 生成一个仓库行的 HTML(可读 / 可删)。
+ * 生成一个仓库行的 HTML。UI 只暴露 Git 地址;slug/branch 都是内部细节。
  * @param {number} idx
  * @param {{slug:string,branch:string,url:string}} repo
  */
 function acRepoRowHTML(idx, repo) {
   const xIcon = `<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M18 6 6 18M6 6l12 12"/></svg>`;
+  const displayUrl = repo.url || "";
   return (
     `<div class="ac-repo-row" data-repo-idx="${idx}">` +
-    `<div class="ac-repo-grid">` +
     `<div class="ac-field">` +
-    `<label class="ac-label" for="ac-repo-slug-${idx}">组 / 项目</label>` +
-    `<input id="ac-repo-slug-${idx}" class="ac-input ac-mono" type="text" placeholder="chuckwu0/larkway" spellcheck="false" data-repo="slug" data-repo-idx="${idx}" value="${esc(repo.slug)}" />` +
+    `<label class="ac-label" for="ac-repo-url-${idx}">仓库 Git 地址 <span class="ac-required">必填</span></label>` +
+    `<input id="ac-repo-url-${idx}" class="ac-input ac-mono" type="text" placeholder="git@github.com:org/repo.git" spellcheck="false" data-repo="url" data-repo-idx="${idx}" value="${esc(displayUrl)}" />` +
     `</div>` +
-    `<div class="ac-field">` +
-    `<label class="ac-label" for="ac-repo-branch-${idx}">分支</label>` +
-    `<input id="ac-repo-branch-${idx}" class="ac-input ac-mono" type="text" placeholder="main" spellcheck="false" data-repo="branch" data-repo-idx="${idx}" value="${esc(repo.branch)}" />` +
-    `</div>` +
-    `</div>` +
-    `<div class="ac-field" style="margin-top:8px">` +
-    `<label class="ac-label" for="ac-repo-url-${idx}">clone 地址 <span class="ac-optional">私有库必需</span></label>` +
-    `<input id="ac-repo-url-${idx}" class="ac-input ac-mono" type="text" placeholder="git@github.com:org/repo.git" spellcheck="false" data-repo="url" data-repo-idx="${idx}" value="${esc(repo.url)}" />` +
-    `</div>` +
-    `<button type="button" class="ac-repo-del" title="移除这个仓库" data-repo-idx="${idx}" aria-label="移除仓库 ${esc(repo.slug || idx + 1)}">` +
+    `<button type="button" class="ac-repo-del" title="移除这个仓库" data-repo-idx="${idx}" aria-label="移除仓库 ${esc(repo.slug || repo.url || idx + 1)}">` +
     xIcon +
     `</button>` +
     `</div>`
@@ -2367,7 +2406,8 @@ function buildAgentConfigHTML(bot, memContent, mode, prefill) {
   // 层二 summary 药丸(收起态)
   const permSummaryHTML = codeAccess
     ? acPillHTML("brand", "m16 18 6-6-6-6M8 6l-6 6 6 6", "可访问代码仓库") +
-      acPillHTML("muted", "M21 8 12 3 3 8v8l9 5 9-5ZM3 8l9 5 9-5M12 13v8", repos.length ? `预热 ${repos.length} 个仓库` : "agent 自己 clone")
+      acPillHTML("muted", "M21 8 12 3 3 8v8l9 5 9-5ZM3 8l9 5 9-5M12 13v8", repos.length ? `${repos.length} 个仓库` : "待添加仓库") +
+      acPillHTML("muted", "M5 11h14a1 1 0 0 1 1 1v7a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1v-7a1 1 0 0 1 1-1ZM8 11V7a4 4 0 0 1 8 0v4", gitlabConfigured ? "Agent 级 Git 身份" : "沿用本机 Git 身份")
     : acPillHTML("muted", "M5 11h14a1 1 0 0 1 1 1v7a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1v-7a1 1 0 0 1 1-1ZM8 11V7a4 4 0 0 1 8 0v4", "纯对话 · 不碰任何代码仓库");
 
   // 层三 summary 药丸
@@ -2450,7 +2490,7 @@ function buildAgentConfigHTML(bot, memContent, mode, prefill) {
     `<div class="ac-access-toggle-row${codeAccess ? " is-on" : ""}" id="ac-access-row">` +
     `<div class="ac-access-info">` +
     `<div class="ac-access-title">给它访问代码仓库的权限</div>` +
-    `<p class="ac-access-desc">通过配一个 <b>Git 访问令牌</b> 来表达。读和改都用这一个令牌 —— <b>没有读 / 写之分</b>，agent 看任务自己定。不开 = 纯对话 / 自带知识答疑。</p>` +
+    `<p class="ac-access-desc">打开后给这个 Agent 配一组仓库地址；它只有这些 repo 作为默认工作范围。Git 身份是 Agent 级的：不填就沿用这台机器现有的 SSH key、credential helper 或环境变量。</p>` +
     `</div>` +
     `<button type="button" class="ac-toggle${codeAccess ? " is-on" : ""}" id="ac-code-access-btn" role="switch" aria-checked="${codeAccess}" title="开 / 关代码访问权限">` +
     `<span class="ac-toggle-thumb"></span>` +
@@ -2461,40 +2501,43 @@ function buildAgentConfigHTML(bot, memContent, mode, prefill) {
     `<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" style="flex-shrink:0;color:var(--faint)"><path d="M5 11h14a1 1 0 0 1 1 1v7a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1v-7a1 1 0 0 1 1-1ZM8 11V7a4 4 0 0 1 8 0v4"/></svg>` +
     `当前这个 agent 不访问任何代码仓库。需要它读 / 改代码时，再打开上面的开关。` +
     `</div>` +
-    // 开启态:令牌 + 仓库
+    // 开启态:仓库 + Agent 级 Git 身份
     `<div class="ac-access-fields" id="ac-access-fields" ${codeAccess ? "" : 'style="display:none"'}>` +
-    `<div class="ac-field">` +
-    `<label class="ac-label" for="ac-gitlab-token">Git Access Token</label>` +
-    `<p class="ac-hint">把 Git access token 粘这里。只存本机 <code>~/.larkway/.env</code>（权限 0600），不回显、不外发。</p>` +
-    (gitlabConfigured
-      ? `<div class="ac-token-configured" id="ac-token-configured">` +
-        `<span class="ac-token-mask">${ICONS.lock} 已配置 <span style="letter-spacing:.12em">••••••</span></span>` +
-        `<button type="button" class="btn btn-sm ac-token-reset-btn" id="ac-token-reset-btn">重新设置</button>` +
-        `</div>` +
-        `<div class="ac-secret-wrap" id="ac-token-input-wrap" style="display:none">` +
-        `<svg class="ac-secret-icon" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 11h14a1 1 0 0 1 1 1v7a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1v-7a1 1 0 0 1 1-1ZM8 11V7a4 4 0 0 1 8 0v4"/></svg>` +
-        `<input id="ac-gitlab-token" name="gitlab_token_value" class="ac-input ac-secret-input" type="password" autocomplete="new-password" placeholder="粘贴新 token（只存本机，不回显）" value="" />` +
-        `</div>`
-      : `<div class="ac-secret-wrap" id="ac-token-input-wrap">` +
-        `<svg class="ac-secret-icon" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 11h14a1 1 0 0 1 1 1v7a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1v-7a1 1 0 0 1 1-1ZM8 11V7a4 4 0 0 1 8 0v4"/></svg>` +
-        `<input id="ac-gitlab-token" name="gitlab_token_value" class="ac-input ac-secret-input" type="password" autocomplete="new-password" placeholder="粘贴 Git access token（只存本机，不回显）" value="" />` +
-        `</div>`
-    ) +
-    `</div>` +
     // 仓库列表
     `<div class="ac-repos-section">` +
     `<div class="ac-repos-header">` +
-    `<span class="ac-repos-title">预热这些仓库</span>` +
-    `<span class="ac-optional-badge">可选</span>` +
+    `<span class="ac-repos-title">这个 Agent 可碰的仓库</span>` +
+    `<span class="ac-optional-badge">可多个</span>` +
     `</div>` +
-    `<p class="ac-hint">列出主要会用到的仓库 → 我们提前 clone 好，agent 一上来就有，提速。<b>留空也行</b> —— agent 会用上面的令牌自己判断需要哪些、自己 clone。</p>` +
-    `<div class="ac-repos-empty" id="ac-repos-empty" ${repos.length ? 'style="display:none"' : ""}><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" style="flex-shrink:0"><path d="M12 3l1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9L12 3Z"/></svg>未列仓库 —— agent 会用令牌自己理解需要哪些、自己 clone。</div>` +
+    `<p class="ac-hint">每行只填 clone 地址。分支默认 main；同一个 Agent 的所有仓库共用下面的 Git 身份。</p>` +
+    `<div class="ac-repos-empty" id="ac-repos-empty" ${repos.length ? 'style="display:none"' : ""}><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" style="flex-shrink:0"><path d="M12 3l1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9L12 3Z"/></svg>还没有仓库。需要访问代码时，请添加仓库 Git 地址。</div>` +
     `<div class="ac-repos-list" id="ac-repos-list" ${repos.length ? "" : 'style="display:none"'}>${repos.map((r, i) => acRepoRowHTML(i, r)).join("")}</div>` +
     `<button type="button" class="ac-add-repo-btn" id="ac-add-repo-btn">` +
     `<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>` +
     ` 添加仓库` +
     `</button>` +
     `</div>` + // ac-repos-section
+    `<details class="ac-token-advanced">` +
+    `<summary>Git 身份 <span>可选，作用于上面所有仓库</span></summary>` +
+    `<div class="ac-field">` +
+    `<label class="ac-label" for="ac-gitlab-token">Agent 级 Git Access Token <span class="ac-optional">可选</span></label>` +
+    `<p class="ac-hint">只配置一个，供这个 Agent 的所有仓库使用。GitHub fine-grained PAT 可以在 GitHub 里只勾选这些仓库；这里只保存 token 真值到本机 <code>~/.larkway/.env</code>（权限 0600），页面不回显。</p>` +
+    (gitlabConfigured
+      ? `<div class="ac-token-configured" id="ac-token-configured">` +
+        `<span class="ac-token-mask">${ICONS.lock} 已配置此 Agent 的 Git 身份 <span style="letter-spacing:.12em">••••••</span></span>` +
+        `<button type="button" class="btn btn-sm ac-token-reset-btn" id="ac-token-reset-btn">重新设置</button>` +
+        `</div>` +
+        `<div class="ac-secret-wrap" id="ac-token-input-wrap" style="display:none">` +
+        `<svg class="ac-secret-icon" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 11h14a1 1 0 0 1 1 1v7a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1v-7a1 1 0 0 1 1-1ZM8 11V7a4 4 0 0 1 8 0v4"/></svg>` +
+        `<input id="ac-gitlab-token" name="gitlab_token_value" class="ac-input ac-secret-input" type="password" autocomplete="new-password" placeholder="粘贴新的 Agent 级 token" value="" />` +
+        `</div>`
+      : `<div class="ac-secret-wrap" id="ac-token-input-wrap">` +
+        `<svg class="ac-secret-icon" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 11h14a1 1 0 0 1 1 1v7a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1v-7a1 1 0 0 1 1-1ZM8 11V7a4 4 0 0 1 8 0v4"/></svg>` +
+        `<input id="ac-gitlab-token" name="gitlab_token_value" class="ac-input ac-secret-input" type="password" autocomplete="new-password" placeholder="可留空，或粘贴 Agent 级 token" value="" />` +
+        `</div>`
+    ) +
+    `</div>` +
+    `</details>` +
     `</div>` + // ac-access-fields
     `</div>` + // ac-perm-body
     `</section>` +
@@ -2652,17 +2695,9 @@ function wireAgentConfigEvents(panel, id, bot) {
     if (accessRow) accessRow.classList.toggle("is-on", on);
     if (noAccessHint) noAccessHint.style.display = on ? "none" : "";
     if (accessFields) accessFields.style.display = on ? "" : "none";
-    // 关 → 清令牌 + 仓库
-    if (!on) {
-      if (gitlabInput) gitlabInput.value = "";
-      // 隐藏密码框,重置 tokenReset 标记(关闭等于「清除」)
-      const configured = ac.querySelector("#ac-token-configured");
-      const inputWrap = ac.querySelector("#ac-token-input-wrap");
-      if (configured) configured.style.display = "none";
-      if (inputWrap) { inputWrap.style.display = ""; } // 关闭态直接露空框,保存时会带 ""
-      delete ac.dataset.tokenReset;
-      acClearRepos(ac);
-    }
+    // 关掉代码访问只改变本次保存的序列化结果,不立即清空表单里的仓库行。
+    // 这样用户误点开关后再打开,未保存的仓库地址还在。
+    if (!on && gitlabInput) gitlabInput.value = "";
     // open 徽标
     if (permLayerTitleRow) {
       let badge = permLayerTitleRow.querySelector(".ac-open-badge");
@@ -2770,11 +2805,10 @@ function readAgentConfigValues(panel) {
   if (codeAccess) {
     const repoRows = ac.querySelectorAll(".ac-repo-row");
     for (const row of repoRows) {
-      const slug   = (row.querySelector("[data-repo='slug']")?.value ?? "").trim();
-      const branch = (row.querySelector("[data-repo='branch']")?.value ?? "").trim() || "master";
-      const url    = (row.querySelector("[data-repo='url']")?.value ?? "").trim();
-      if (slug) {
-        const r = { slug, branch };
+      const url = (row.querySelector("[data-repo='url']")?.value ?? "").trim();
+      const inferredSlug = inferRepoSlugFromUrl(url);
+      if (inferredSlug || url) {
+        const r = { slug: inferredSlug, branch: "main" };
         if (url) r.url = url;
         repos.push(r);
       }
@@ -2803,12 +2837,46 @@ function readAgentConfigValues(panel) {
 
 function acGetRepos(ac) {
   const rows = ac.querySelectorAll(".ac-repo-row");
-  return Array.from(rows).map((row) => ({
-    slug:   (row.querySelector("[data-repo='slug']")?.value ?? "").trim(),
-    branch: (row.querySelector("[data-repo='branch']")?.value ?? "").trim() || "master",
-    url:    (row.querySelector("[data-repo='url']")?.value ?? "").trim(),
-    _idx:   parseInt(row.dataset.repoIdx ?? "-1", 10),
-  }));
+  return Array.from(rows).map((row) => {
+    const url = (row.querySelector("[data-repo='url']")?.value ?? "").trim();
+    return {
+      slug: inferRepoSlugFromUrl(url),
+      branch: "main",
+      url,
+      _idx: parseInt(row.dataset.repoIdx ?? "-1", 10),
+    };
+  });
+}
+
+function validateCodeAccessConfig(panel) {
+  const ac = panel?.querySelector?.("#ac-panel") ?? panel;
+  if (!ac) return true;
+  const codeAccessBtn = ac.querySelector("#ac-code-access-btn");
+  const codeAccess = codeAccessBtn?.getAttribute("aria-checked") === "true";
+  if (!codeAccess) return true;
+
+  const repos = acGetRepos(ac);
+  if (repos.length === 0) {
+    toast("已打开代码访问，请至少添加一个仓库。", "warn");
+    ac.querySelector("#ac-add-repo-btn")?.focus();
+    return false;
+  }
+
+  for (const repo of repos) {
+    const row = ac.querySelector(`.ac-repo-row[data-repo-idx="${repo._idx}"]`);
+    const urlInput = row?.querySelector("[data-repo='url']");
+    if (!repo.url) {
+      toast("请填写代码仓库 Git 地址。Git Access Token 是选填。", "warn");
+      urlInput?.focus();
+      return false;
+    }
+    if (!repo.slug) {
+      toast("无法从 Git 地址识别仓库，请检查地址格式。", "warn");
+      urlInput?.focus();
+      return false;
+    }
+  }
+  return true;
 }
 
 function acRebuildRepoRows(ac) {
@@ -2836,8 +2904,7 @@ function acAddRepo(ac) {
   list.appendChild(tmp.firstElementChild);
   list.style.display = "";
   if (empty) empty.style.display = "none";
-  // 聚焦新行 slug 输入
-  list.querySelector(`#ac-repo-slug-${newIdx}`)?.focus();
+  list.querySelector(`#ac-repo-url-${newIdx}`)?.focus();
   acUpdatePermSummary(ac);
   ac.dispatchEvent(new Event("ac-change", { bubbles: true }));
 }
@@ -2855,14 +2922,6 @@ function acRemoveRepo(ac, idx) {
   ac.dispatchEvent(new Event("ac-change", { bubbles: true }));
 }
 
-function acClearRepos(ac) {
-  const list = ac.querySelector("#ac-repos-list");
-  const empty = ac.querySelector("#ac-repos-empty");
-  if (list) { list.innerHTML = ""; list.style.display = "none"; }
-  if (empty) empty.style.display = "";
-  acUpdatePermSummary(ac);
-}
-
 // ── summary 药丸实时更新 ─────────────────────────────────────────────────────
 
 function acUpdatePermSummary(ac) {
@@ -2874,9 +2933,17 @@ function acUpdatePermSummary(ac) {
   const repoCount = ac.querySelectorAll(".ac-repo-row").length;
   const html = codeAccess
     ? acPillHTML("brand", "m16 18 6-6-6-6M8 6l-6 6 6 6", "可访问代码仓库") +
-      acPillHTML("muted", "M21 8 12 3 3 8v8l9 5 9-5ZM3 8l9 5 9-5M12 13v8", repoCount ? `预热 ${repoCount} 个仓库` : "agent 自己 clone")
+      acPillHTML("muted", "M21 8 12 3 3 8v8l9 5 9-5ZM3 8l9 5 9-5M12 13v8", repoCount ? `${repoCount} 个仓库` : "待添加仓库") +
+      acPillHTML("muted", "M5 11h14a1 1 0 0 1 1 1v7a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1v-7a1 1 0 0 1 1-1ZM8 11V7a4 4 0 0 1 8 0v4", acHasAgentGitIdentity(ac) ? "Agent 级 Git 身份" : "沿用本机 Git 身份")
     : acPillHTML("muted", "M5 11h14a1 1 0 0 1 1 1v7a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1v-7a1 1 0 0 1 1-1ZM8 11V7a4 4 0 0 1 8 0v4", "纯对话 · 不碰任何代码仓库");
   summaryEl.innerHTML = html;
+}
+
+function acHasAgentGitIdentity(ac) {
+  const typedValue = ac.querySelector("#ac-gitlab-token")?.value ?? "";
+  if (typedValue.trim()) return true;
+  const configuredEl = ac.querySelector("#ac-token-configured");
+  return !!(configuredEl && configuredEl.style.display !== "none");
 }
 
 function acUpdateAdvSummary(ac) {
@@ -3400,7 +3467,7 @@ function readFormValues(form) {
     .map((s) => s.trim())
     .filter(Boolean)
     .map((line) => {
-      const [slug, branch = "master"] = line.split(":").map((p) => p.trim());
+      const [slug, branch = "main"] = line.split(":").map((p) => p.trim());
       return { slug, branch };
     });
   const peers = peersRaw
@@ -3504,6 +3571,8 @@ async function saveMemory(panel, id) {
  * memory 随「保存」一起提交。序列化字段见 readAgentConfigValues。
  */
 async function saveAcBot(panel, id) {
+  if (!validateCodeAccessConfig(panel)) return;
+
   const vals = readAgentConfigValues(panel);
   const memContent = vals._memContent ?? "";
 
@@ -3602,22 +3671,10 @@ function renderServiceIndicator() {
         icon + label +
         `</button>`;
 
-  if (!running) {
-    // running=false → 红报警条(+ indigo 启动按钮,只读时省略)
-    container.innerHTML =
-      `<div class="lk-svc-indicator lk-svc-indicator--offline">` +
-      `<span class="lk-svc-label">` +
-      `<span class="bridge-dot is-stopped" style="margin-right:6px"></span>` +
-      `服务未运行` +
-      `<span class="lk-svc-sublabel"> · 助手都不会回复</span>` +
-      `</span>` +
-      svcBtn("btn-svc-start", "#fecaca", ICONS.zap, "启动服务", "start") +
-      `</div>`;
-    container.querySelector("#btn-svc-start")?.addEventListener("click", () => doFixAction("start"));
-    return;
-  }
-
-  // ── BL-18:重启过渡态 ─────────────────────────
+  // ── BL-18:启动/重启过渡态 ─────────────────────
+  // Must run before the `!running` branch: after clicking "启动服务", the
+  // backend has accepted the start but detectBridgeStatus may still report
+  // running=false for a few seconds while bridge boots and bots reconnect.
   if (!readonly) {
     const rs = state.restart;
 
@@ -3662,6 +3719,21 @@ function renderServiceIndicator() {
       });
       return;
     }
+  }
+
+  if (!running) {
+    // running=false → 红报警条(+ indigo 启动按钮,只读时省略)
+    container.innerHTML =
+      `<div class="lk-svc-indicator lk-svc-indicator--offline">` +
+      `<span class="lk-svc-label">` +
+      `<span class="bridge-dot is-stopped" style="margin-right:6px"></span>` +
+      `服务未运行` +
+      `<span class="lk-svc-sublabel"> · 助手都不会回复</span>` +
+      `</span>` +
+      svcBtn("btn-svc-start", "#fecaca", ICONS.zap, "启动服务", "start") +
+      `</div>`;
+    container.querySelector("#btn-svc-start")?.addEventListener("click", () => doFixAction("start"));
+    return;
   }
 
   // 综合 pendingRestart(后端感知新增/已删)与本地 pendingNewCount(客户端推算)
@@ -3781,29 +3853,33 @@ async function doFixAction(action, triggerEl = null) {
     const errMsg = res.json?.message ?? res.json?.error ?? res.status;
     toast(`操作失败：${errMsg}`, "error");
     // Refresh status even on failure
+    await refreshRuntimeRequirements();
     await refreshBridgeStatus();
     await pollStatus();
     if (state.selected) rerenderStatusAction(state.selected);
     return;
   }
 
-  // ── BL-18:POST 成功后 → 进入 restarting 过渡态(仅 restart 动作) ─────────
-  if (action === "restart") {
-    // 重置任何旧的机器状态,进入 restarting
-    stopRestartTicker();
-    state.restart = { status: "restarting", startedAt: Date.now(), elapsed: 0 };
-    toast("正在重启服务 —— 好了会自动转回正常,不用重复点", "info");
-    // 全量刷新三触点(顶栏+名册+hero)
-    renderServiceIndicator();
-    renderBotList();
-    if (state.selected) refreshDetailHero();
-    // 启动 1s ticker 刷新已用时显示
-    startRestartTicker();
-  } else {
-    toast("服务已启动", "ok");
-  }
+  // ── BL-18:POST 成功后 → 进入 restarting 过渡态(start/restart 都走同一套) ──
+  // "启动服务" 和 "重启服务" 都调用同一个后端 restart endpoint。返回成功只
+  // 代表 supervisor 已接受请求,不代表 bridge 已连回飞书或 bot 已写心跳。
+  stopRestartTicker();
+  state.restart = { status: "restarting", startedAt: Date.now(), elapsed: 0 };
+  toast(
+    action === "start"
+      ? "正在启动服务 —— 连上后会自动转回正常,不用重复点"
+      : "正在重启服务 —— 好了会自动转回正常,不用重复点",
+    "info",
+  );
+  // 全量刷新三触点(顶栏+名册+hero)
+  renderServiceIndicator();
+  renderBotList();
+  if (state.selected) refreshDetailHero();
+  // 启动 1s ticker 刷新已用时显示
+  startRestartTicker();
 
   // Refresh bridge + liveness
+  await refreshRuntimeRequirements();
   await refreshBridgeStatus();
   await pollStatus();
   if (state.selected) rerenderStatusAction(state.selected);
@@ -3819,6 +3895,7 @@ async function doFixAction(action, triggerEl = null) {
   const BURST_INTERVAL = 2000;
   _restartPollHandle = setInterval(async () => {
     burstCount++;
+    await refreshRuntimeRequirements();
     await refreshBridgeStatus();
     await pollStatus();
     if (state.selected) rerenderStatusAction(state.selected);
@@ -4326,6 +4403,7 @@ function renderOnboardNameForm(prefill, sessionId) {
 async function submitOnboardName(prefill, sessionId, modal) {
   if (!modal) modal = document.getElementById("onboard-modal");
   const sid = sessionId ?? onboard.sessionId;
+  if (!validateCodeAccessConfig(modal)) return;
 
   // 从 AC 面板读取表单值
   const vals = readAgentConfigValues(modal);
@@ -4553,6 +4631,7 @@ async function boot() {
 
   // 拉 bot 列表(先于首次状态轮询,确保左侧条目存在好让圆点落上去)
   await loadBots();
+  await refreshRuntimeRequirements();
 
   // 拉 bridge 服务状态并渲染顶栏指示
   await refreshBridgeStatus();
@@ -4560,6 +4639,7 @@ async function boot() {
   // 首次拉状态 + 每 15s 轮询(实时在线状态可视化)
   await pollStatus();
   setInterval(pollStatus, 15000);
+  setInterval(refreshRuntimeRequirements, 30000);
 }
 
 /**
@@ -4569,6 +4649,13 @@ async function boot() {
 async function pollStatus() {
   const res = await api("GET", "/api/status");
   renderStatus(res.ok ? res.json : null);
+}
+
+async function refreshRuntimeRequirements() {
+  const res = await api("GET", "/api/runtime/requirements");
+  state.requirements = res.ok ? res.json : null;
+  renderServiceIndicator();
+  if (state.selected) rerenderStatusAction(state.selected);
 }
 
 boot();

@@ -615,6 +615,35 @@ describe("renderPrompt — workspace warm-up block", () => {
   });
 });
 
+describe("renderPrompt — advisory runtime warnings", () => {
+  it("renders missing lark-cli as an advisory warning, not a hard stop", () => {
+    const prompt = renderPrompt(
+      makeInput({
+        runtimeWarnings: [
+          {
+            label: "Feishu CLI",
+            command: "lark-cli",
+            reason: "Required for agents to read Feishu topic history, attachments, docs, and other context.",
+            installHint: "Install and configure lark-cli, then restart Larkway.",
+          },
+        ],
+      }),
+    );
+
+    expect(prompt).toContain("<runtime-warnings>");
+    expect(prompt).toContain("Feishu CLI (lark-cli)");
+    expect(prompt).toContain("这是提示,不是强制停止条件");
+    expect(prompt).toContain("能仅凭当前消息继续的任务,继续处理");
+    expect(prompt).toContain("不要额外 @ 用户");
+    expect(prompt).toContain('choice_prompt: "读取飞书历史需要本机安装最新版飞书 CLI,是否允许我尝试安装?"');
+    expect(prompt).toContain('choices: [{label:"允许安装", value:"允许安装 lark-cli"}');
+    expect(prompt).toContain("不要在未确认前改宿主机全局环境");
+    expect(prompt).toContain("npx -y @larksuite/cli@latest install");
+    expect(prompt).toContain("不要默认要求 sudo");
+    expect(prompt).toContain("</runtime-warnings>");
+  });
+});
+
 // ---------------------------------------------------------------------------
 // larkCliProfile: --profile injection into lark-cli command examples (BL-19)
 // ---------------------------------------------------------------------------
