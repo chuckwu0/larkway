@@ -27,6 +27,15 @@ const GitIdentitySchema = z.object({
   email: z.string().email(),
 });
 
+const GitCloneUrlSchema = z.string().min(1).refine(
+  (value) => {
+    if (/^https?:\/\/\S+$/i.test(value)) return true;
+    if (/^ssh:\/\/\S+$/i.test(value)) return true;
+    return /^[A-Za-z0-9_.-]+@[^:\s]+:[^ \t\r\n]+$/.test(value);
+  },
+  "url must be an http(s), ssh://, or scp-like Git clone URL",
+);
+
 export const BotConfigSchema = z.object({
   /** Unique identifier, kebab-case. Used as key in sessionStore. */
   id: z.string().regex(/^[a-z0-9]+(-[a-z0-9]+)*$/, "id must be kebab-case"),
@@ -110,7 +119,7 @@ export const BotConfigSchema = z.object({
          * Agent workspace runtime: URL is a pointer only; the Agent decides clone
          * timing and destination.
          */
-        url: z.string().url().optional(),
+        url: GitCloneUrlSchema.optional(),
       }),
     )
     .default([]),

@@ -259,14 +259,14 @@ async function runAdd(ctx: CliContext, args: string[]): Promise<number> {
     });
     if (repoSlug) {
       const repoBranch = await ui.prompt("默认分支:", {
-        default: setMap.get("repo_branch") ?? "master",
+        default: setMap.get("repo_branch") ?? "main",
         nonInteractive: flags.nonInteractive,
       });
-      const repoUrl = await ui.prompt("clone URL (可选,留空=用默认 remote 推导):", {
+      const repoUrl = await ui.prompt("clone URL (建议填写;agent 用它 clone):", {
         default: setMap.get("repo_url") ?? "",
         nonInteractive: flags.nonInteractive,
       });
-      const repoEntry: BotConfig["repos"][number] = { slug: repoSlug, branch: repoBranch || "master" };
+      const repoEntry: BotConfig["repos"][number] = { slug: repoSlug, branch: repoBranch || "main" };
       if (repoUrl) repoEntry.url = repoUrl;
       repos.push(repoEntry);
     }
@@ -276,7 +276,7 @@ async function runAdd(ctx: CliContext, args: string[]): Promise<number> {
     if (repoSlug) {
       const repoEntry: BotConfig["repos"][number] = {
         slug: repoSlug,
-        branch: setMap.get("repo_branch") ?? "master",
+        branch: setMap.get("repo_branch") ?? "main",
       };
       const repoUrl = setMap.get("repo_url");
       if (repoUrl) repoEntry.url = repoUrl;
@@ -284,15 +284,13 @@ async function runAdd(ctx: CliContext, args: string[]): Promise<number> {
     }
   }
 
-  // ---- gitlab_token_env (required for agent_workspace repo bots) ----
+  // ---- gitlab_token_env (optional; needed for private repos / write ops) ----
   let gitlab_token_env: string | undefined;
-  const defaultGitlabTokenEnv =
-    repos.length > 0 ? `LARKWAY_${id.toUpperCase().replace(/-/g, "_")}_GITLAB_TOKEN` : "";
-  if (flags.advanced || setMap.has("gitlab_token_env") || repos.length > 0) {
+  if (flags.advanced || setMap.has("gitlab_token_env")) {
     const rawGitlab = await ui.prompt(
-      "Git access token 环境变量名(仅记录 KEY,真值写 ~/.larkway/.env):",
+      "Git access token 环境变量名(可选;私有库/push/MR 才需要):",
       {
-        default: setMap.get("gitlab_token_env") ?? defaultGitlabTokenEnv,
+        default: setMap.get("gitlab_token_env") ?? "",
         nonInteractive: flags.nonInteractive,
       },
     );
@@ -302,10 +300,6 @@ async function runAdd(ctx: CliContext, args: string[]): Promise<number> {
       ui.failure(`git_token_env 格式不合法: "${rawGitlab}"`);
       return 1;
     }
-  }
-  if (repos.length > 0 && !gitlab_token_env) {
-    ui.failure("agent_workspace repo bot 必须声明 git_token_env(或 gitlab_token_env);v0.3 不继承全局 GITLAB_TOKEN。");
-    return 1;
   }
 
   // ---- lark_cli_profile (optional, advanced) ----

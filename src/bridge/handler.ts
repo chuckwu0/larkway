@@ -34,6 +34,7 @@ import { ensureAgentWorkspace } from "../agent/workspaceStore.js";
 import { ensureStateFile, readStateFile, stateFilePathOf } from "./stateFile.js";
 import { writeCardFile, deleteCardFile } from "./cardFile.js";
 import type { RuntimeEventPatch } from "./eventLog.js";
+import type { RuntimeRequirement } from "../runtimeRequirements.js";
 
 // ---------------------------------------------------------------------------
 // Private helpers — worktree bootstrap
@@ -484,6 +485,12 @@ export interface BridgeHandlerDeps {
    * recent Feishu events, so the Web UI can explain silent @ mentions.
    */
   recordRuntimeEvent?: (patch: RuntimeEventPatch) => Promise<void>;
+  /**
+   * Per-bot startup/runtime probes. The handler injects missing local tools
+   * and auth material into the prompt so the agent can ask the Feishu user for
+   * confirmation or fall back to the host's normal environment.
+   */
+  runtimeRequirements?: RuntimeRequirement[];
 }
 
 // ---------------------------------------------------------------------------
@@ -496,6 +503,12 @@ export class BridgeHandler {
 
   constructor(deps: BridgeHandlerDeps) {
     this.deps = deps;
+  }
+
+  private runtimeWarnings(): RuntimeRequirement[] {
+    return (this.deps.runtimeRequirements ?? []).filter((req) =>
+      !req.ok && (req.severity === "required" || req.kind === "secret")
+    );
   }
 
   /**
@@ -925,6 +938,7 @@ export class BridgeHandler {
           backend: this.deps.botConfig?.backend,
           agentMemory: this.deps.agentMemory,
           larkCliProfile: this.deps.larkCliProfile,
+          runtimeWarnings: this.runtimeWarnings(),
         });
 
         // Step 4c: spawn local agent backend.

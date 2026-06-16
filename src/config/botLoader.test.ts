@@ -172,6 +172,33 @@ repos:
     expect(bot?.repos[0]?.slug).toBe("acme/web-app");
   });
 
+  it("accepts scp-like SSH clone URLs for repo pointers", async () => {
+    await createBotsDir();
+    await writeYaml(
+      "ssh-url.yaml",
+      `
+id: ssh-url-bot
+name: SSH URL Bot
+description: uses github ssh url
+app_id: cli_ssh
+app_secret_env: SSH_SECRET
+bot_open_id: ou_ssh
+repos:
+  - slug: chuckwu0/larkway
+    branch: main
+    url: git@github.com:chuckwu0/larkway.git
+`,
+    );
+
+    const bots = await loadBots(botsDir());
+    const bot = bots.find((b) => b.id === "ssh-url-bot");
+    expect(bot?.repos[0]).toEqual({
+      slug: "chuckwu0/larkway",
+      branch: "main",
+      url: "git@github.com:chuckwu0/larkway.git",
+    });
+  });
+
   it("throws on missing required field (name)", async () => {
     await createBotsDir();
     await writeYaml(

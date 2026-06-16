@@ -53,6 +53,7 @@ import {
   finalizeOnboard,
   type OnboardForm,
 } from "./onboardSession.js";
+import { runtimeRequirementsForBots } from "../runtimeRequirements.js";
 
 const execFileAsync = promisify(execFileCallback);
 const CHAT_NAME_CACHE_MS = 5 * 60 * 1000;
@@ -1250,6 +1251,29 @@ const getBridgeLogs: ApiHandler = async (req) => {
   };
 };
 
+/**
+ * GET /api/runtime/requirements — host-side startup prerequisites for the
+ * current bot roster. This is the dashboard version of main.ts's startup probe:
+ * it checks only what the configured bots actually need, so GitLab-specific
+ * tools do not look mandatory for GitHub / generic Git bots.
+ */
+const getRuntimeRequirements: ApiHandler = async (req) => {
+  const { ctx } = req;
+  const ids = await ctx.stores.botsStore.listBots();
+  const bots = await Promise.all(
+    ids.map(async (id) => ctx.stores.botsStore.readBot(id)),
+  );
+  const requirements = runtimeRequirementsForBots(bots);
+  return {
+    status: 200,
+    json: {
+      requirements,
+      missingRequired: requirements.filter((req) => req.severity === "required" && !req.ok),
+      missingOptional: requirements.filter((req) => req.severity === "optional" && !req.ok),
+    },
+  };
+};
+
 // ---------------------------------------------------------------------------
 // GET /api/backends — backend registry with real-time ready detection
 // ---------------------------------------------------------------------------
@@ -1319,6 +1343,7 @@ export const ROUTES: Record<string, ApiHandler> = {
   "GET /api/bridge": getBridge,
   "POST /api/bridge/restart": postBridgeRestart,
   "GET /api/bridge/logs": getBridgeLogs,
+  "GET /api/runtime/requirements": getRuntimeRequirements,
   "GET /api/backends": getBackends,
 };
 

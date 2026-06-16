@@ -955,6 +955,89 @@ describe("GET /api/bridge/logs", () => {
 });
 
 // ---------------------------------------------------------------------------
+// GET /api/runtime/requirements
+// ---------------------------------------------------------------------------
+
+describe("GET /api/runtime/requirements", () => {
+  it("reports missing git token env as optional advisory for agent_workspace repo bots", async () => {
+    const dir = await makeLocalBotsDir();
+    await writeFile(
+      path.join(dir, "test-bot.yaml"),
+      `id: test-bot
+name: Test Bot
+description: A bot
+app_id: cli_test123
+app_secret_env: APP_SECRET_ENV
+bot_open_id: ou_test123
+runtime: agent_workspace
+backend: codex
+repos:
+  - slug: chuckwu0/larkway
+    branch: main
+    url: https://github.com/chuckwu0/larkway.git
+`,
+      "utf-8",
+    );
+    const ctx = makeCtx(dir);
+
+    const res = await call(ctx, "GET /api/runtime/requirements");
+    expect(res.status).toBe(200);
+    const json = res.json as {
+      missingRequired: Array<{ kind: string; label: string; botIds: string[]; reason: string }>;
+      missingOptional: Array<{ kind: string; label: string; botIds: string[]; reason: string }>;
+    };
+    expect(json.missingRequired.some((req) => req.kind === "secret")).toBe(false);
+    expect(json.missingOptional.some((req) =>
+      req.kind === "secret" &&
+      req.label === "Git access token env" &&
+      req.botIds.includes("test-bot") &&
+      req.reason.includes("no git_token_env")
+    )).toBe(true);
+    expect(json.missingOptional.some((req) => "command" in req && req.command === "glab")).toBe(false);
+  });
+
+  it("treats glab as optional only for GitLab-looking repos", async () => {
+    const dir = await makeLocalBotsDir();
+    await writeFile(
+      path.join(dir, "test-bot.yaml"),
+      `id: test-bot
+name: Test Bot
+description: A bot
+app_id: cli_test123
+app_secret_env: APP_SECRET_ENV
+bot_open_id: ou_test123
+runtime: agent_workspace
+backend: codex
+git_token_env: TEST_GIT_TOKEN
+repos:
+  - slug: group/project
+    branch: main
+    url: https://gitlab.com/group/project.git
+`,
+      "utf-8",
+    );
+    const oldToken = process.env.TEST_GIT_TOKEN;
+    process.env.TEST_GIT_TOKEN = "test-token";
+    const ctx = makeCtx(dir);
+
+    try {
+      const res = await call(ctx, "GET /api/runtime/requirements");
+      expect(res.status).toBe(200);
+      const json = res.json as {
+        requirements: Array<{ command?: string; severity: string; ok: boolean }>;
+      };
+      expect(json.requirements.some((req) => req.command === "glab" && req.severity === "optional")).toBe(true);
+    } finally {
+      if (oldToken === undefined) {
+        delete process.env.TEST_GIT_TOKEN;
+      } else {
+        process.env.TEST_GIT_TOKEN = oldToken;
+      }
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
 // DELETE /api/bot/:id
 // ---------------------------------------------------------------------------
 

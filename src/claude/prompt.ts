@@ -100,6 +100,13 @@ export interface PeerBot {
   description: string;
 }
 
+export interface RuntimeWarning {
+  label: string;
+  command?: string;
+  reason?: string;
+  installHint?: string;
+}
+
 export interface RenderPromptInput {
   parsed: ParsedMessage;
   isNewThread: boolean;
@@ -155,6 +162,12 @@ export interface RenderPromptInput {
    * the default profile naturally.
    */
   larkCliProfile?: string;
+  /**
+   * Missing local runtime capabilities detected by the bridge. These are
+   * advisory, not gates: the agent decides whether it can proceed with the
+   * current message or needs to ask the user/owner for remediation.
+   */
+  runtimeWarnings?: RuntimeWarning[];
 }
 
 // ---------------------------------------------------------------------------
@@ -271,6 +284,36 @@ function renderTurnTakingHint(limit: number): string[] {
   ];
 }
 
+function renderRuntimeWarningsBlock(warnings: RuntimeWarning[]): string[] {
+  if (warnings.length === 0) return [];
+  const hasMissingLarkCli = warnings.some((warning) => warning.command === "lark-cli");
+  return [
+    "<runtime-warnings>",
+    "Bridge 检测到以下本机能力暂不可用。这是提示,不是强制停止条件:",
+    ...warnings.map((warning) => {
+      const name = warning.command ? `${warning.label} (${warning.command})` : warning.label;
+      const reason = warning.reason ? `: ${warning.reason}` : "";
+      const installHint = warning.installHint ? ` Fix hint: ${warning.installHint}` : "";
+      return `- ${name}${reason}${installHint}`;
+    }),
+    "",
+    "处理原则:",
+    "- 能仅凭当前消息继续的任务,继续处理,不要因为 warning 直接拒绝。",
+    "- 只有当任务确实需要缺失能力时,再在 last_message 里用产品化语言告诉用户缺什么、会影响什么、如何继续。",
+    ...(hasMissingLarkCli
+      ? [
+          "- 对缺少 lark-cli 的情况:不要额外 @ 用户;在卡片里轻量说明当前无法自动读取飞书话题历史、附件或文档即可。",
+          "- 如果当前任务需要这些上下文,用 choices 问是否允许安装最新版飞书 CLI。建议: `choice_prompt: \"读取飞书历史需要本机安装最新版飞书 CLI,是否允许我尝试安装?\"`, `choices: [{label:\"允许安装\", value:\"允许安装 lark-cli\"}, {label:\"先不安装\", value:\"先不安装 lark-cli,我会把要处理的内容贴到话题里\"}]`。",
+          "- 用户明确选择/回复允许安装后,再尝试安装;不要在未确认前改宿主机全局环境。",
+          "- 推荐安装命令: `npx -y @larksuite/cli@latest install`,然后运行 `lark-cli --version` 验证。",
+          "- 如遇 npm 全局目录权限错误(EACCES/permission denied),使用用户级 prefix 后重试: `mkdir -p ~/.npm-global && npm config set prefix \"$HOME/.npm-global\" && export PATH=\"$HOME/.npm-global/bin:$PATH\" && npx -y @larksuite/cli@latest install`。不要默认要求 sudo。",
+          "- 安装成功后,如果本轮需要立即读取飞书上下文,可在当前 shell 中带上修复后的 PATH 继续尝试;若需要 bridge 后续轮次稳定使用,请提示 owner 重启 Larkway。",
+        ]
+      : []),
+    "</runtime-warnings>",
+  ];
+}
+
 /**
  * Render the `<workspace>` warm-up block telling the agent what the bridge
  * has already prepared (clone + fetch). Pure information — no read/write
@@ -371,7 +414,17 @@ function sceneFacts(parsed: ParsedMessage, isNewThread: boolean): {
 // ---------------------------------------------------------------------------
 
 export function renderPrompt(input: RenderPromptInput): string {
-  const { parsed, isNewThread, conventions, peers, turn_taking_limit, agentMemory, extraRepoPaths, larkCliProfile } = input;
+  const {
+    parsed,
+    isNewThread,
+    conventions,
+    peers,
+    turn_taking_limit,
+    agentMemory,
+    extraRepoPaths,
+    larkCliProfile,
+    runtimeWarnings = [],
+  } = input;
   const backend = input.backend ?? "claude";
 
   // Build the --profile flag suffix for lark-cli commands.
@@ -397,6 +450,7 @@ export function renderPrompt(input: RenderPromptInput): string {
   const turnTakingBlock = turn_taking_limit && turn_taking_limit > 0
     ? renderTurnTakingHint(turn_taking_limit)
     : [];
+  const runtimeWarningsBlock = renderRuntimeWarningsBlock(runtimeWarnings);
   // Workspace warm-up block — rendered for all bots that have at least one repo.
   const extraRepos = extraRepoPaths ?? conventions.extraRepoPaths ?? [];
   const workspaceBlock = isAgentWorkspace
@@ -487,6 +541,7 @@ export function renderPrompt(input: RenderPromptInput): string {
       "",
       ...agentMemoryBlock,
       ...skillIntroNew,
+      ...(runtimeWarningsBlock.length > 0 ? [...runtimeWarningsBlock, ""] : []),
       "<thread-context>",
       `thread_id:        ${parsed.threadId}`,
       `message_id:       ${parsed.messageId}`,
@@ -562,6 +617,7 @@ export function renderPrompt(input: RenderPromptInput): string {
   return [
     ...agentMemoryBlock,
     ...skillIntroCont,
+    ...(runtimeWarningsBlock.length > 0 ? [...runtimeWarningsBlock, ""] : []),
     "<thread-context>",
     `thread_id:        ${parsed.threadId}`,
     `message_id:       ${parsed.messageId}`,

@@ -72,10 +72,11 @@ export function productizeCodexFailure(stderr: string): string | undefined {
 
 /**
  * Build env for the Codex child process:
- *  - Inherit everything from process.env
+ *  - Inherit everything from process.env, including the host's normal Git auth
+ *    surface (SSH agent, credential helper, GITLAB_TOKEN/GITHUB_TOKEN, etc.)
  *  - Strip OPENAI_API_KEY (subscription account — prevent API key billing)
  *  - Strip ANTHROPIC_API_KEY (belt-and-suspenders)
- *  - Inject GIT_AUTHOR_x/GIT_COMMITTER_x from botGitIdentity (or V1 default)
+ *  - Only inject GIT_AUTHOR_x/GIT_COMMITTER_x when botGitIdentity is explicit
  *  - Optionally override GITLAB_TOKEN from per-bot config
  */
 export function buildCodexEnv(
@@ -86,13 +87,12 @@ export function buildCodexEnv(
   delete env["OPENAI_API_KEY"];
   delete env["ANTHROPIC_API_KEY"];
 
-  const name = botGitIdentity?.name ?? "larkway-bot";
-  const email = botGitIdentity?.email ?? "bot@larkway.local";
-
-  env["GIT_AUTHOR_NAME"] = name;
-  env["GIT_AUTHOR_EMAIL"] = email;
-  env["GIT_COMMITTER_NAME"] = name;
-  env["GIT_COMMITTER_EMAIL"] = email;
+  if (botGitIdentity) {
+    env["GIT_AUTHOR_NAME"] = botGitIdentity.name;
+    env["GIT_AUTHOR_EMAIL"] = botGitIdentity.email;
+    env["GIT_COMMITTER_NAME"] = botGitIdentity.name;
+    env["GIT_COMMITTER_EMAIL"] = botGitIdentity.email;
+  }
 
   if (gitlabToken !== undefined) {
     env["GITLAB_TOKEN"] = gitlabToken;
