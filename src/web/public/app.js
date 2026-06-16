@@ -2361,7 +2361,7 @@ function acRepoRowHTML(idx, repo) {
   return (
     `<div class="ac-repo-row" data-repo-idx="${idx}">` +
     `<div class="ac-field">` +
-    `<label class="ac-label" for="ac-repo-url-${idx}">代码仓库 Git 地址 <span class="ac-required">必填</span></label>` +
+    `<label class="ac-label" for="ac-repo-url-${idx}">仓库 Git 地址 <span class="ac-required">必填</span></label>` +
     `<input id="ac-repo-url-${idx}" class="ac-input ac-mono" type="text" placeholder="git@github.com:org/repo.git" spellcheck="false" data-repo="url" data-repo-idx="${idx}" value="${esc(displayUrl)}" />` +
     `</div>` +
     `<button type="button" class="ac-repo-del" title="移除这个仓库" data-repo-idx="${idx}" aria-label="移除仓库 ${esc(repo.slug || repo.url || idx + 1)}">` +
@@ -2406,7 +2406,8 @@ function buildAgentConfigHTML(bot, memContent, mode, prefill) {
   // 层二 summary 药丸(收起态)
   const permSummaryHTML = codeAccess
     ? acPillHTML("brand", "m16 18 6-6-6-6M8 6l-6 6 6 6", "可访问代码仓库") +
-      acPillHTML("muted", "M21 8 12 3 3 8v8l9 5 9-5ZM3 8l9 5 9-5M12 13v8", repos.length ? `预热 ${repos.length} 个仓库` : "agent 自己 clone")
+      acPillHTML("muted", "M21 8 12 3 3 8v8l9 5 9-5ZM3 8l9 5 9-5M12 13v8", repos.length ? `${repos.length} 个仓库` : "待添加仓库") +
+      acPillHTML("muted", "M5 11h14a1 1 0 0 1 1 1v7a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1v-7a1 1 0 0 1 1-1ZM8 11V7a4 4 0 0 1 8 0v4", gitlabConfigured ? "Agent 级 Git 身份" : "沿用本机 Git 身份")
     : acPillHTML("muted", "M5 11h14a1 1 0 0 1 1 1v7a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1v-7a1 1 0 0 1 1-1ZM8 11V7a4 4 0 0 1 8 0v4", "纯对话 · 不碰任何代码仓库");
 
   // 层三 summary 药丸
@@ -2489,7 +2490,7 @@ function buildAgentConfigHTML(bot, memContent, mode, prefill) {
     `<div class="ac-access-toggle-row${codeAccess ? " is-on" : ""}" id="ac-access-row">` +
     `<div class="ac-access-info">` +
     `<div class="ac-access-title">给它访问代码仓库的权限</div>` +
-    `<p class="ac-access-desc">打开后给 agent 一组仓库 clone 地址。Git 访问令牌是可选的身份材料：不填就用这台机器现有的 SSH key、credential helper 或环境变量；能不能读 / push 由 GitHub/GitLab 那边决定。</p>` +
+    `<p class="ac-access-desc">打开后给这个 Agent 配一组仓库地址；它只有这些 repo 作为默认工作范围。Git 身份是 Agent 级的：不填就沿用这台机器现有的 SSH key、credential helper 或环境变量。</p>` +
     `</div>` +
     `<button type="button" class="ac-toggle${codeAccess ? " is-on" : ""}" id="ac-code-access-btn" role="switch" aria-checked="${codeAccess}" title="开 / 关代码访问权限">` +
     `<span class="ac-toggle-thumb"></span>` +
@@ -2500,14 +2501,15 @@ function buildAgentConfigHTML(bot, memContent, mode, prefill) {
     `<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" style="flex-shrink:0;color:var(--faint)"><path d="M5 11h14a1 1 0 0 1 1 1v7a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1v-7a1 1 0 0 1 1-1ZM8 11V7a4 4 0 0 1 8 0v4"/></svg>` +
     `当前这个 agent 不访问任何代码仓库。需要它读 / 改代码时，再打开上面的开关。` +
     `</div>` +
-    // 开启态:仓库 + 高级 Token
+    // 开启态:仓库 + Agent 级 Git 身份
     `<div class="ac-access-fields" id="ac-access-fields" ${codeAccess ? "" : 'style="display:none"'}>` +
     // 仓库列表
     `<div class="ac-repos-section">` +
     `<div class="ac-repos-header">` +
-    `<span class="ac-repos-title">代码仓库</span>` +
+    `<span class="ac-repos-title">这个 Agent 可碰的仓库</span>` +
+    `<span class="ac-optional-badge">可多个</span>` +
     `</div>` +
-    `<p class="ac-hint">打开代码访问后，只需要填仓库的 Git 地址；其余交给 Larkway 自动处理。</p>` +
+    `<p class="ac-hint">每行只填 clone 地址。分支默认 main；同一个 Agent 的所有仓库共用下面的 Git 身份。</p>` +
     `<div class="ac-repos-empty" id="ac-repos-empty" ${repos.length ? 'style="display:none"' : ""}><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" style="flex-shrink:0"><path d="M12 3l1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9L12 3Z"/></svg>还没有仓库。需要访问代码时，请添加仓库 Git 地址。</div>` +
     `<div class="ac-repos-list" id="ac-repos-list" ${repos.length ? "" : 'style="display:none"'}>${repos.map((r, i) => acRepoRowHTML(i, r)).join("")}</div>` +
     `<button type="button" class="ac-add-repo-btn" id="ac-add-repo-btn">` +
@@ -2516,22 +2518,22 @@ function buildAgentConfigHTML(bot, memContent, mode, prefill) {
     `</button>` +
     `</div>` + // ac-repos-section
     `<details class="ac-token-advanced">` +
-    `<summary>高级设置 <span>使用特定 Git 身份</span></summary>` +
+    `<summary>Git 身份 <span>可选，作用于上面所有仓库</span></summary>` +
     `<div class="ac-field">` +
-    `<label class="ac-label" for="ac-gitlab-token">Git Access Token <span class="ac-optional">可选</span></label>` +
-    `<p class="ac-hint">可选。填了会作为 agent 的 Git 认证材料；不填就用本机已有 Git 身份。只存本机 <code>~/.larkway/.env</code>（权限 0600），不回显、不外发。</p>` +
+    `<label class="ac-label" for="ac-gitlab-token">Agent 级 Git Access Token <span class="ac-optional">可选</span></label>` +
+    `<p class="ac-hint">只配置一个，供这个 Agent 的所有仓库使用。GitHub fine-grained PAT 可以在 GitHub 里只勾选这些仓库；这里只保存 token 真值到本机 <code>~/.larkway/.env</code>（权限 0600），页面不回显。</p>` +
     (gitlabConfigured
       ? `<div class="ac-token-configured" id="ac-token-configured">` +
-        `<span class="ac-token-mask">${ICONS.lock} 已配置 <span style="letter-spacing:.12em">••••••</span></span>` +
+        `<span class="ac-token-mask">${ICONS.lock} 已配置此 Agent 的 Git 身份 <span style="letter-spacing:.12em">••••••</span></span>` +
         `<button type="button" class="btn btn-sm ac-token-reset-btn" id="ac-token-reset-btn">重新设置</button>` +
         `</div>` +
         `<div class="ac-secret-wrap" id="ac-token-input-wrap" style="display:none">` +
         `<svg class="ac-secret-icon" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 11h14a1 1 0 0 1 1 1v7a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1v-7a1 1 0 0 1 1-1ZM8 11V7a4 4 0 0 1 8 0v4"/></svg>` +
-        `<input id="ac-gitlab-token" name="gitlab_token_value" class="ac-input ac-secret-input" type="password" autocomplete="new-password" placeholder="粘贴新 token（只存本机，不回显）" value="" />` +
+        `<input id="ac-gitlab-token" name="gitlab_token_value" class="ac-input ac-secret-input" type="password" autocomplete="new-password" placeholder="粘贴新的 Agent 级 token" value="" />` +
         `</div>`
       : `<div class="ac-secret-wrap" id="ac-token-input-wrap">` +
         `<svg class="ac-secret-icon" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 11h14a1 1 0 0 1 1 1v7a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1v-7a1 1 0 0 1 1-1ZM8 11V7a4 4 0 0 1 8 0v4"/></svg>` +
-        `<input id="ac-gitlab-token" name="gitlab_token_value" class="ac-input ac-secret-input" type="password" autocomplete="new-password" placeholder="粘贴 Git access token（只存本机，不回显）" value="" />` +
+        `<input id="ac-gitlab-token" name="gitlab_token_value" class="ac-input ac-secret-input" type="password" autocomplete="new-password" placeholder="可留空，或粘贴 Agent 级 token" value="" />` +
         `</div>`
     ) +
     `</div>` +
@@ -2693,17 +2695,9 @@ function wireAgentConfigEvents(panel, id, bot) {
     if (accessRow) accessRow.classList.toggle("is-on", on);
     if (noAccessHint) noAccessHint.style.display = on ? "none" : "";
     if (accessFields) accessFields.style.display = on ? "" : "none";
-    // 关 → 清令牌 + 仓库
-    if (!on) {
-      if (gitlabInput) gitlabInput.value = "";
-      // 隐藏密码框,重置 tokenReset 标记(关闭等于「清除」)
-      const configured = ac.querySelector("#ac-token-configured");
-      const inputWrap = ac.querySelector("#ac-token-input-wrap");
-      if (configured) configured.style.display = "none";
-      if (inputWrap) { inputWrap.style.display = ""; } // 关闭态直接露空框,保存时会带 ""
-      delete ac.dataset.tokenReset;
-      acClearRepos(ac);
-    }
+    // 关掉代码访问只改变本次保存的序列化结果,不立即清空表单里的仓库行。
+    // 这样用户误点开关后再打开,未保存的仓库地址还在。
+    if (!on && gitlabInput) gitlabInput.value = "";
     // open 徽标
     if (permLayerTitleRow) {
       let badge = permLayerTitleRow.querySelector(".ac-open-badge");
@@ -2928,14 +2922,6 @@ function acRemoveRepo(ac, idx) {
   ac.dispatchEvent(new Event("ac-change", { bubbles: true }));
 }
 
-function acClearRepos(ac) {
-  const list = ac.querySelector("#ac-repos-list");
-  const empty = ac.querySelector("#ac-repos-empty");
-  if (list) { list.innerHTML = ""; list.style.display = "none"; }
-  if (empty) empty.style.display = "";
-  acUpdatePermSummary(ac);
-}
-
 // ── summary 药丸实时更新 ─────────────────────────────────────────────────────
 
 function acUpdatePermSummary(ac) {
@@ -2947,9 +2933,17 @@ function acUpdatePermSummary(ac) {
   const repoCount = ac.querySelectorAll(".ac-repo-row").length;
   const html = codeAccess
     ? acPillHTML("brand", "m16 18 6-6-6-6M8 6l-6 6 6 6", "可访问代码仓库") +
-      acPillHTML("muted", "M21 8 12 3 3 8v8l9 5 9-5ZM3 8l9 5 9-5M12 13v8", repoCount ? `预热 ${repoCount} 个仓库` : "agent 自己 clone")
+      acPillHTML("muted", "M21 8 12 3 3 8v8l9 5 9-5ZM3 8l9 5 9-5M12 13v8", repoCount ? `${repoCount} 个仓库` : "待添加仓库") +
+      acPillHTML("muted", "M5 11h14a1 1 0 0 1 1 1v7a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1v-7a1 1 0 0 1 1-1ZM8 11V7a4 4 0 0 1 8 0v4", acHasAgentGitIdentity(ac) ? "Agent 级 Git 身份" : "沿用本机 Git 身份")
     : acPillHTML("muted", "M5 11h14a1 1 0 0 1 1 1v7a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1v-7a1 1 0 0 1 1-1ZM8 11V7a4 4 0 0 1 8 0v4", "纯对话 · 不碰任何代码仓库");
   summaryEl.innerHTML = html;
+}
+
+function acHasAgentGitIdentity(ac) {
+  const typedValue = ac.querySelector("#ac-gitlab-token")?.value ?? "";
+  if (typedValue.trim()) return true;
+  const configuredEl = ac.querySelector("#ac-token-configured");
+  return !!(configuredEl && configuredEl.style.display !== "none");
 }
 
 function acUpdateAdvSummary(ac) {

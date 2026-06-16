@@ -204,9 +204,9 @@ export interface OnboardForm {
    */
   turn_taking_limit?: number;
   /**
-   * Real GitLab token value to write to .env and link via gitlab_token_env.
+   * Real Git token value to write to .env and link via git_token_env.
    * NEVER stored/returned — only written to disk then discarded.
-   * Absent / empty → no gitlab_token_env on the new bot.
+   * Absent / empty → no Git token env reference on the new bot.
    */
   gitlab_token_value?: string;
   /** Optional explicit bot id (kebab-case). Derived from name when omitted. */
@@ -522,10 +522,10 @@ function defaultOnboardPermissionRequests(input: {
     items.push(`Feishu chat allowlist: ${input.chats.join(", ")}`);
   }
   for (const repo of input.repos) {
-    items.push(`GitLab repo pointer: ${repo.slug} (${repo.branch})`);
+    items.push(`Git repo pointer: ${repo.slug} (${repo.branch})`);
   }
   if (input.gitlab_token_env) {
-    items.push(`GitLab token env name: ${input.gitlab_token_env}`);
+    items.push(`Agent-level Git token env name: ${input.gitlab_token_env}`);
   }
   items.push("Local shell inside the Agent Workspace for task execution and verification");
   return items;

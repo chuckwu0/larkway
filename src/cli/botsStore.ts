@@ -8,7 +8,7 @@
  * crash mid-write can't corrupt a live bot config.
  *
  * Credential posture (V2.2 decision 1): yaml stores env-var *names*
- * (app_secret_env / gitlab_token_env), never secret values. Secret real values
+ * (app_secret_env / git_token_env), never secret values. Secret real values
  * go to ~/.larkway/.env via hostConfig.writeSecret().
  */
 
@@ -211,7 +211,7 @@ export function renderBotYaml(config: BotConfig): string {
   const header = [
     "# Larkway bot config (L1) — generated/edited via `larkway` CLI.",
     "# Credentials are env-var NAMES, never values:",
-    "#   app_secret_env / gitlab_token_env reference keys in ~/.larkway/.env (chmod 0600).",
+    "#   app_secret_env / git_token_env reference keys in ~/.larkway/.env (chmod 0600).",
     "# L2 职能 memory lives alongside in <id>.memory.md (memory_file points at it).",
     "",
   ].join("\n");
