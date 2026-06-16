@@ -1,26 +1,21 @@
 /**
  * src/cli/commands/update.ts
  *
- * `larkway update` — 从 release 源一行升级(推荐),回退到 git pull + build。
+ * `larkway update` — 从 npm 一行升级(推荐),回退到 git pull + build。
  *
  * 升级策略(按优先级):
- *   1. Release 源(默认):
- *      a. 从当前安装的 package.json 读取 LARKWAY_RELEASE_REPO / GITLAB_HOST。
- *      b. 构造 latest tgz 的 release 直链。
- *      c. `npm i -g <latest tgz url>`  —— 原子升级,无需 repo clone。
- *      d. `larkway stop` + `larkway start` 重启 bridge。
+ *   1. npm 源(默认):
+ *      a. `npm i -g larkway@latest` —— 原子升级,无需 repo clone。
+ *      b. `larkway stop` + `larkway start` 重启 bridge。
+ *      c. 运维可用 LARKWAY_UPDATE_URL 显式覆盖为一个 npm 可安装 URL/tarball。
  *   2. 回退(git pull + build):
- *      当 --git-pull flag 被显式传入,或 release 升级失败(非 0 退出)时触发。
+ *      当 --git-pull flag 被显式传入,或 npm 升级失败(非 0 退出)时触发。
  *      步骤同原有逻辑:git pull --ff-only → pnpm install → restart。
- *      回退时打印提示,告知用户也可手动走 release 路径。
  *
  * Flags:
  *   --dry-run    Print steps without executing; exit 0.
- *   --git-pull   强制走 git pull + build 路径(跳过 release 源)。
+ *   --git-pull   强制走 git pull + build 路径(跳过 npm 源)。
  *   --json       Machine-readable output (emitJson events).
- *
- * Release URL 形如:
- *   https://<GITLAB_HOST>/git/<REPO>/-/releases/permalink/latest/downloads/larkway-latest.tgz
  *
  * Exit codes:  0 = ok  |  1 = error
  */
@@ -32,37 +27,17 @@ import path from "node:path";
 import type { CliContext } from "../types.js";
 
 // ---------------------------------------------------------------------------
-// Release URL resolution
+// npm package resolution
 // ---------------------------------------------------------------------------
 
-const DEFAULT_GITLAB_HOST = "github.com";
-const DEFAULT_RELEASE_REPO = "chuckwu0/larkway";
-const LATEST_TGZ_NAME = "larkway-latest.tgz";
+const DEFAULT_NPM_PACKAGE_SPEC = "larkway@latest";
 
 /**
- * Build the npm-installable URL for the latest release tgz.
- * Format matches what bin/release.sh prints after a successful upload.
+ * Resolve the npm-installable package spec. By default Larkway updates from the
+ * public npm package. Operators can override with a tarball/Git URL via env.
  */
-function buildLatestUrl(gitlabHost: string, repo: string): string {
-  // GitLab's "latest release" permalink is `/-/releases/permalink/latest/downloads/<asset>`
-  // — NOT GitHub's `/releases/latest/...`, which 404s on GitLab (verified against
-  // <YOUR_GIT_HOST>: `/releases/latest/...` → 404, `/releases/permalink/latest/...` → 302).
-  // bin/release.sh uploads `larkway-latest.tgz` as a stable alias to each release, so
-  // permalink/latest always resolves to the newest one.
-  // Operators can override via LARKWAY_UPDATE_URL env var.
-  // TODO: adapt release URL to GitHub releases / npm for OSS
-  return `https://${gitlabHost}/git/${repo}/-/releases/permalink/latest/downloads/${LATEST_TGZ_NAME}`;
-}
-
-/**
- * Try to read GITLAB_HOST and RELEASE_REPO from the environment (set by the
- * operator) or fall back to the defaults baked into the CLI at release time.
- */
-function resolveReleaseCoords(): { gitlabHost: string; repo: string; latestUrl: string } {
-  const gitlabHost = process.env["GITLAB_HOST"] ?? DEFAULT_GITLAB_HOST;
-  const repo = process.env["LARKWAY_RELEASE_REPO"] ?? DEFAULT_RELEASE_REPO;
-  const latestUrl = process.env["LARKWAY_UPDATE_URL"] ?? buildLatestUrl(gitlabHost, repo);
-  return { gitlabHost, repo, latestUrl };
+function resolveNpmPackageSpec(): string {
+  return process.env["LARKWAY_UPDATE_URL"] ?? DEFAULT_NPM_PACKAGE_SPEC;
 }
 
 // ---------------------------------------------------------------------------
@@ -76,13 +51,13 @@ interface Step {
   cwd: string;
 }
 
-/** Steps for the release-source upgrade path. */
-function buildReleaseSteps(latestUrl: string, cwd: string): Step[] {
+/** Steps for the npm-source upgrade path. */
+function buildNpmSteps(packageSpec: string, cwd: string): Step[] {
   return [
     {
-      label: `npm i -g ${latestUrl}`,
+      label: `npm i -g ${packageSpec}`,
       cmd: "npm",
-      args: ["i", "-g", latestUrl],
+      args: ["i", "-g", packageSpec],
       cwd,
     },
     {
@@ -207,7 +182,7 @@ function runCmd(
 }
 
 // ---------------------------------------------------------------------------
-// Shared step runner — used by both release and git-pull paths
+// Shared step runner — used by both npm and git-pull paths
 // ---------------------------------------------------------------------------
 
 /**
@@ -293,13 +268,13 @@ export async function run(ctx: CliContext, args: string[]): Promise<number> {
   const isDryRun = args.includes("--dry-run");
   const forceGitPull = args.includes("--git-pull");
 
-  const { latestUrl } = resolveReleaseCoords();
+  const packageSpec = resolveNpmPackageSpec();
 
   // ------------------------------------------------------------------
-  // Release path (default)
+  // npm path (default)
   // ------------------------------------------------------------------
   if (!forceGitPull) {
-    const releaseSteps = buildReleaseSteps(latestUrl, cwd);
+    const npmSteps = buildNpmSteps(packageSpec, cwd);
     const lifecycleLabels = new Set(["larkway stop (bridge lifecycle)", "larkway start (bridge lifecycle)"]);
 
     if (isDryRun) {
@@ -307,15 +282,15 @@ export async function run(ctx: CliContext, args: string[]): Promise<number> {
         ui.emitJson({
           ok: true,
           dryRun: true,
-          mode: "release",
-          latestUrl,
-          steps: releaseSteps.map((s) => ({ label: s.label, cmd: s.cmd, args: s.args, cwd: s.cwd })),
+          mode: "npm",
+          packageSpec,
+          steps: npmSteps.map((s) => ({ label: s.label, cmd: s.cmd, args: s.args, cwd: s.cwd })),
         });
       } else {
-        ui.print(ui.bold("larkway update --dry-run  (release 源模式)"));
-        ui.print(ui.dim(`  latest url: ${latestUrl}`));
+        ui.print(ui.bold("larkway update --dry-run  (npm 源模式)"));
+        ui.print(ui.dim(`  package: ${packageSpec}`));
         ui.print("");
-        releaseSteps.forEach((s, i) => {
+        npmSteps.forEach((s, i) => {
           ui.print(`  ${ui.cyan(String(i + 1) + ".")} ${s.label}`);
           ui.print(ui.dim(`     $ ${s.cmd} ${s.args.join(" ")}`));
         });
@@ -327,18 +302,18 @@ export async function run(ctx: CliContext, args: string[]): Promise<number> {
     }
 
     if (flags.json) {
-      ui.emitJson({ ok: true, status: "starting", mode: "release", latestUrl, stepCount: releaseSteps.length });
+      ui.emitJson({ ok: true, status: "starting", mode: "npm", packageSpec, stepCount: npmSteps.length });
     } else {
-      ui.print(ui.bold("larkway update  (release 源)"));
-      ui.print(ui.dim(`  latest: ${latestUrl}`));
+      ui.print(ui.bold("larkway update  (npm 源)"));
+      ui.print(ui.dim(`  package: ${packageSpec}`));
     }
 
-    const { ok, lifecycleWarnings } = await runSteps(releaseSteps, lifecycleLabels, flags, ui);
+    const { ok, lifecycleWarnings } = await runSteps(npmSteps, lifecycleLabels, flags, ui);
 
     if (!ok) {
-      // Release upgrade failed — inform user and suggest fallback.
+      // npm upgrade failed — inform user and suggest fallback.
       const fallbackMsg =
-        "release 升级失败。若网络不通或 latest 链接未就绪,可改用 `larkway update --git-pull` 走 git pull + build 路径。";
+        "npm 升级失败。若网络不通、npm 权限不足或源不可用,可改用 `larkway update --git-pull` 走 git pull + build 路径。";
       if (flags.json) {
         ui.emitJson({ ok: false, hint: fallbackMsg });
       } else {
@@ -354,14 +329,14 @@ export async function run(ctx: CliContext, args: string[]): Promise<number> {
       if (hadWarning) {
         ui.emitJson({ ok: true, status: "complete_with_warnings", warning: lifecycleWarnings.join("; ") });
       } else {
-        ui.emitJson({ ok: true, status: "complete", mode: "release" });
+        ui.emitJson({ ok: true, status: "complete", mode: "npm" });
       }
     } else {
       ui.print("");
       if (hadWarning) {
         ui.success("larkway update 完成,但 bridge 需手动重启(请运行 `larkway start`)。");
       } else {
-        ui.success("larkway update 完成。已升级到最新 release,bridge 已重启。");
+        ui.success("larkway update 完成。已升级到最新 npm 版本,bridge 已重启。");
       }
     }
     return 0;

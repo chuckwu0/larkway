@@ -4,7 +4,7 @@
  * Unit tests for `larkway update` command.
  *
  * Two upgrade paths are tested:
- *   - Release path (default): npm i -g <latest tgz> + lifecycle restart (3 steps).
+ *   - npm path (default): npm i -g larkway@latest + lifecycle restart (3 steps).
  *   - Git-pull path (--git-pull): git pull --ff-only + pnpm install + lifecycle (4 steps).
  *
  * Isolation strategy:
@@ -172,16 +172,17 @@ vi.mock("node:child_process", () => {
 });
 
 // ---------------------------------------------------------------------------
-// Tests: release path (default)
+// Tests: npm path (default)
 // ---------------------------------------------------------------------------
 
-describe("larkway update --dry-run (release path, default)", () => {
+describe("larkway update --dry-run (npm path, default)", () => {
   beforeEach(() => {
     spawnCalls = [];
     spawnResults = [];
+    delete process.env["LARKWAY_UPDATE_URL"];
   });
 
-  it("exits 0 and prints release step without spawning anything", async () => {
+  it("exits 0 and prints npm step without spawning anything", async () => {
     const out = buildCapture();
     const ctx = buildCtx(out);
 
@@ -190,9 +191,10 @@ describe("larkway update --dry-run (release path, default)", () => {
     expect(code).toBe(0);
     // No spawn calls — dry-run must not execute
     expect(spawnCalls).toHaveLength(0);
-    // Should mention npm i (release path)
+    // Should mention npm i (npm path)
     const allPrints = out.prints.join("\n");
     expect(allPrints).toContain("npm");
+    expect(allPrints).toContain("larkway@latest");
     expect(allPrints).toContain("stop");
     expect(allPrints).toContain("start");
   });
@@ -219,22 +221,31 @@ describe("larkway update --dry-run (release path, default)", () => {
     expect(result.ok).toBe(true);
     expect(result.dryRun).toBe(true);
     expect(Array.isArray(result.steps)).toBe(true);
-    expect(result.mode).toBe("release");
-    // Release path: npm install + stop + start = 3 steps
+    expect(result.mode).toBe("npm");
+    // npm path: npm install + stop + start = 3 steps
     expect((result.steps as unknown[]).length).toBe(3);
   });
 
-  it("includes latestUrl in --json output", async () => {
+  it("includes packageSpec in --json output", async () => {
     const out = buildCapture();
     const ctx = buildCtx(out, { json: true });
 
     await run(ctx, ["--dry-run"]);
 
-    const result = out.jsons[0] as { latestUrl: string };
-    expect(result.latestUrl).toBeTruthy();
-    expect(result.latestUrl).toContain("larkway-latest.tgz");
-    // GitLab latest permalink — NOT GitHub's /releases/latest/ (404s on GitLab).
-    expect(result.latestUrl).toContain("/releases/permalink/latest/downloads/");
+    const result = out.jsons[0] as { packageSpec: string };
+    expect(result.packageSpec).toBe("larkway@latest");
+  });
+
+  it("lets LARKWAY_UPDATE_URL override the npm package spec", async () => {
+    process.env["LARKWAY_UPDATE_URL"] = "https://example.com/larkway.tgz";
+    const out = buildCapture();
+    const ctx = buildCtx(out, { json: true });
+
+    await run(ctx, ["--dry-run"]);
+
+    const result = out.jsons[0] as { packageSpec: string; steps: Array<{ args: string[] }> };
+    expect(result.packageSpec).toBe("https://example.com/larkway.tgz");
+    expect(result.steps[0]?.args).toEqual(["i", "-g", "https://example.com/larkway.tgz"]);
   });
 });
 
@@ -277,16 +288,17 @@ describe("larkway update --dry-run --git-pull (git-pull fallback path)", () => {
 });
 
 // ---------------------------------------------------------------------------
-// Tests: release path full run
+// Tests: npm path full run
 // ---------------------------------------------------------------------------
 
-describe("larkway update (release path, full run)", () => {
+describe("larkway update (npm path, full run)", () => {
   beforeEach(() => {
     spawnCalls = [];
     spawnResults = [];
+    delete process.env["LARKWAY_UPDATE_URL"];
   });
 
-  it("spawns npm i -g <latest> + stop + start in order (3 spawns)", async () => {
+  it("spawns npm i -g larkway@latest + stop + start in order (3 spawns)", async () => {
     const out = buildCapture();
     const ctx = buildCtx(out);
     spawnResults = [0, 0, 0]; // all succeed
@@ -298,7 +310,7 @@ describe("larkway update (release path, full run)", () => {
     expect(spawnCalls[0].cmd).toBe("npm");
     expect(spawnCalls[0].args[0]).toBe("i");
     expect(spawnCalls[0].args[1]).toBe("-g");
-    expect(spawnCalls[0].args[2]).toContain("larkway-latest.tgz");
+    expect(spawnCalls[0].args[2]).toBe("larkway@latest");
     // steps 1 & 2 are lifecycle stop|start
     expect(spawnCalls[1].args).toEqual(["stop"]);
     expect(spawnCalls[2].args).toEqual(["start"]);
@@ -331,7 +343,7 @@ describe("larkway update (release path, full run)", () => {
     expect(out.warnings.some((w) => w.includes("stop"))).toBe(true);
   });
 
-  it("--json emits structured events including final ok:true + mode=release", async () => {
+  it("--json emits structured events including final ok:true + mode=npm", async () => {
     const out = buildCapture();
     const ctx = buildCtx(out, { json: true });
     spawnResults = [0, 0, 0];
@@ -342,7 +354,7 @@ describe("larkway update (release path, full run)", () => {
     const lastEvent = out.jsons[out.jsons.length - 1] as { ok: boolean; status: string; mode: string };
     expect(lastEvent.ok).toBe(true);
     expect(lastEvent.status).toBe("complete");
-    expect(lastEvent.mode).toBe("release");
+    expect(lastEvent.mode).toBe("npm");
   });
 
   it("--json emits error event with ok:false on npm i failure", async () => {
@@ -408,7 +420,7 @@ describe("larkway update (release path, full run)", () => {
     expect(code).toBe(0);
     const successMsgs = out.successes.join("\n");
     // Should NOT claim bridge was restarted cleanly
-    expect(successMsgs).not.toContain("已升级到最新 release");
+    expect(successMsgs).not.toContain("已升级到最新 npm 版本");
     // Should hint manual restart
     expect(successMsgs).toMatch(/手动重启/);
   });
@@ -422,7 +434,7 @@ describe("larkway update (release path, full run)", () => {
 
     expect(code).toBe(0);
     const successMsgs = out.successes.join("\n");
-    expect(successMsgs).toContain("已升级到最新 release");
+    expect(successMsgs).toContain("已升级到最新 npm 版本");
   });
 });
 
