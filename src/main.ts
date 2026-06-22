@@ -215,17 +215,13 @@ async function runV2Mode({
     // Layer 3 — startup profile bootstrap:
     //   Ensure the profile exists with the correct credentials before the agent
     //   starts running commands. Non-fatal: a failed setup only produces a warning.
-    if (healthyBots.length > 1) {
-      // Only auto-ensure in multi-bot mode; single-bot scenarios don't need
-      // per-profile isolation and the default profile is sufficient.
-      ensureLarkCliProfile(bot.id, larkCliProfile, bot.app_id, appSecret);
-    } else {
-      // Single-bot mode: still ensure if yaml explicitly requested a profile name
-      // (the user opted in to named profiles intentionally).
-      if (bot.lark_cli_profile) {
-        ensureLarkCliProfile(bot.id, larkCliProfile, bot.app_id, appSecret);
-      }
-    }
+    // Every bot loaded from bots/*.yaml is invoked with `--profile <larkCliProfile>`
+    // — by the agent AND by the channel client's gap-fill / chat discovery — even
+    // when only one bot is loaded. So the named profile must always exist, otherwise
+    // lark-cli fails with "profile not found". (Previously single-bot mode skipped
+    // this and assumed a default profile that the channel client never actually uses.)
+    // Non-fatal: a failed setup only produces a warning.
+    ensureLarkCliProfile(bot.id, larkCliProfile, bot.app_id, appSecret);
 
     // Per-bot directories
     const botDir = resolveLarkwayDir(bot.id);
