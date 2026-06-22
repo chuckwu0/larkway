@@ -747,6 +747,91 @@ describe("ChannelClient — gap-fill after reconnect (BL-15)", () => {
     vi.resetModules();
   });
 
+  it("dispatches a gap thread reply nested under chat-messages-list thread_replies", async () => {
+    const rootMessageId = "om_thread_root";
+    const replyMessageId = "om_thread_reply";
+
+    vi.resetModules();
+    vi.doMock("node:child_process", () => ({
+      execFile: (
+        _cmd: string,
+        _args: string[],
+        cb: (err: null, result: { stdout: string; stderr: string }) => void,
+      ) => {
+        const items = [
+          {
+            message_id: rootMessageId,
+            chat_id: "oc_1",
+            chat_type: "group",
+            content: JSON.stringify({ text: "@other root task" }),
+            sender: { id: "ou_sender" },
+            create_time: String(Date.now()),
+            mentions: [{ id: { open_id: "ou_other" } }],
+            thread_id: "omt_topic",
+            thread_replies: [
+              {
+                message_id: replyMessageId,
+                chat_id: "oc_1",
+                chat_type: "group",
+                content: JSON.stringify({ text: "@bot 断线期间在旧话题里被@了" }),
+                sender: { id: "ou_sender" },
+                create_time: String(Date.now()),
+                mentions: [{ id: { open_id: "ou_bot" } }],
+                thread_id: "omt_topic",
+                root_id: "",
+              },
+              "malformed-reply",
+            ],
+          },
+        ];
+        cb(null, { stdout: JSON.stringify({ ok: true, data: { messages: items } }), stderr: "" });
+      },
+    }));
+    const chObj = makeFakeChannelWithHandlers();
+    vi.doMock("@larksuiteoapi/node-sdk", () => ({
+      createLarkChannel: () => chObj.ch,
+    }));
+
+    const { ChannelClient } = await import("./channelClient.js");
+    const client = new ChannelClient({
+      allowedChatIds: new Set(["oc_1"]),
+      botOpenId: "ou_bot",
+      appId: "cli_x",
+      appSecret: "secret",
+      connectGraceMs: 0,
+      channelStaleMs: 0,
+      openChatDiscoveryMs: 0,
+    });
+
+    const dispatched: Array<{ messageId: string; rootId?: string }> = [];
+    void (async () => {
+      for await (const ev of client.events()) {
+        dispatched.push({
+          messageId: ev.message_id,
+          rootId: typeof ev.root_id === "string" ? ev.root_id : undefined,
+        });
+      }
+    })();
+    for (let i = 0; i < 100 && !chObj.handlers["reconnected"]; i++) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
+
+    chObj.handlers["reconnecting"]!(undefined);
+    chObj.handlers["reconnected"]!(undefined);
+
+    for (let i = 0; i < 100 && !dispatched.some((ev) => ev.messageId === replyMessageId); i++) {
+      await new Promise((r) => setTimeout(r, 20));
+    }
+
+    expect(dispatched).toContainEqual({ messageId: replyMessageId, rootId: rootMessageId });
+    expect(dispatched.map((ev) => ev.messageId)).not.toContain(rootMessageId);
+
+    await client.close();
+    vi.doUnmock("@larksuiteoapi/node-sdk");
+    vi.doUnmock("node:child_process");
+    vi.resetModules();
+  });
+
   it("uses live-seen chats for gap-fill when allowedChatIds is empty (open bot)", async () => {
     const liveMessageId = "om_live_open";
     const gapMessageId = "om_gap_open";
