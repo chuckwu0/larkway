@@ -123,6 +123,11 @@ function stringField(obj: unknown, key: string): string | undefined {
   return typeof value === "string" ? value : undefined;
 }
 
+function nonEmptyStringField(obj: unknown, key: string): string | undefined {
+  const value = stringField(obj, key);
+  return value && value.length > 0 ? value : undefined;
+}
+
 function parseLarkCliMessages(stdout: string): unknown[] | null {
   const parsed = JSON.parse(stdout) as unknown;
   if (Array.isArray(parsed)) return parsed;
@@ -135,6 +140,26 @@ function parseLarkCliMessages(stdout: string): unknown[] | null {
     return arrayField(data, "messages") ?? arrayField(data, "items") ?? arrayField(data, "chats");
   }
   return null;
+}
+
+function expandMessagesWithThreadReplies(messages: unknown[]): unknown[] {
+  const expanded: unknown[] = [];
+  for (const raw of messages) {
+    expanded.push(raw);
+    if (!raw || typeof raw !== "object") continue;
+    const parent = raw as Record<string, unknown>;
+    const parentRootId = nonEmptyStringField(parent, "root_id") ?? nonEmptyStringField(parent, "message_id");
+    const replies = arrayField(parent, "thread_replies") ?? [];
+    for (const replyRaw of replies) {
+      if (!replyRaw || typeof replyRaw !== "object") continue;
+      const reply = replyRaw as Record<string, unknown>;
+      expanded.push({
+        ...reply,
+        root_id: nonEmptyStringField(reply, "root_id") ?? parentRootId,
+      });
+    }
+  }
+  return expanded;
 }
 
 /** A card-button click delivered by the SDK (raw `card.action.trigger`). */
@@ -594,9 +619,10 @@ export class ChannelClient {
           continue;
         }
 
-        totalFetched += messages.length;
+        const messagesWithReplies = expandMessagesWithThreadReplies(messages);
+        totalFetched += messagesWithReplies.length;
 
-        for (const raw of messages) {
+        for (const raw of messagesWithReplies) {
           if (this.closed) break;
           const m = raw as Record<string, unknown>;
           const messageId = m["message_id"] as string | undefined;
