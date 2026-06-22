@@ -18,7 +18,8 @@
 | v0.3.4 | v0.3.4 | patch / 已发布 | Agent prompt 明确 `lark-cli update` 权限失败是维护问题,业务任务继续,并给用户级 npm prefix 修复命令。 |
 | v0.3.8 | v0.3.8 | patch / 已发布 | 本地管理面瘦身为 local-only,发布 v0.3.8 基线。 |
 | v0.3.9 | v0.3.9 | patch / 已发布 | 简化 repo access 设置:多仓库共享 Agent 级 Git 身份,token 可选,运行时依赖按实际 bot 提示。 |
-| v0.3.10 | v0.3.10 | 当前 patch / 待发布 | `larkway update` 默认改走 npm package,避免旧 GitLab release URL 误拼到 GitHub。 |
+| v0.3.10 | v0.3.10 | patch / 已发布 | `larkway update` 默认改走 npm package,避免旧 GitLab release URL 误拼到 GitHub。 |
+| v0.3.11 | v0.3.11 | 当前 patch / 已发布 | gap-fill 展开话题内 `thread_replies`,避免 WebSocket 重连窗口漏掉旧话题 @。 |
 
 ## 使用原则
 
@@ -41,4 +42,5 @@ v0.3.4        = lark-cli update EACCES 维护提示进入 Agent prompt
 v0.3.8        = local-only 管理面基线
 v0.3.9        = repo access 设置简化 + Agent 级 Git 身份
 v0.3.10       = update 默认走 npm package
+v0.3.11       = gap-fill 恢复 thread replies
 ```
