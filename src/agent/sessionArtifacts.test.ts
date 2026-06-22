@@ -46,6 +46,13 @@ describe("ensureSessionArtifacts", () => {
           mentions: [{ key: "@_user_1", id: { open_id: "ou_bot" }, name: "bot" }],
         }),
       });
+      const memoryCandidates = await readFile(
+        path.join(root, "memory-candidates.md"),
+        "utf8",
+      );
+      expect(memoryCandidates).toContain("Memory Candidates");
+      expect(memoryCandidates).toContain("../../memory/<category>.md");
+
       const transcript = await readFile(path.join(root, "transcript.md"), "utf8");
       expect(transcript).toContain("- trigger_type: topic_continuation");
       expect(transcript).toContain("- mention_type: bot_or_user_mention");

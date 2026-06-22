@@ -30,6 +30,16 @@ function renderSummaryPlaceholder(): string {
   ].join("\n");
 }
 
+function renderMemoryCandidatesPlaceholder(): string {
+  return [
+    "# Memory Candidates",
+    "",
+    "本 session 里值得提升为跨 session 长期记忆的候选,记在这。",
+    "owner 确认后,由你(Agent)写进 ../../memory/<category>.md。",
+    "",
+  ].join("\n");
+}
+
 function indentBlock(value: string): string {
   const trimmed = value.trim();
   if (!trimmed) return "  (empty)";
@@ -94,6 +104,10 @@ export async function ensureSessionArtifacts(
 ): Promise<void> {
   await fs.mkdir(input.sessionPath, { recursive: true });
   await writeIfMissing(path.join(input.sessionPath, "summary.md"), renderSummaryPlaceholder());
+  await writeIfMissing(
+    path.join(input.sessionPath, "memory-candidates.md"),
+    renderMemoryCandidatesPlaceholder(),
+  );
   await fs.appendFile(
     path.join(input.sessionPath, "transcript.md"),
     `${renderTranscriptEntry(input)}\n`,

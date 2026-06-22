@@ -11,8 +11,40 @@
  * See docs/prompt-contract.md and examples/prompt.template.md for the spec.
  */
 
+import { readFileSync } from "node:fs";
 import type { ParsedMessage } from "../lark/message.js";
 import { deriveTriggerFacts } from "../agent/triggerFacts.js";
+
+/** Memory category files watched for the over-size hint (D9). */
+const MEMORY_CATEGORY_FILE_NAMES = [
+  "preferences.md",
+  "reusable-knowledge.md",
+  "workflows.md",
+  "decisions.md",
+  "assets.md",
+] as const;
+
+/** Line count above which a memory file should be distilled at next 整理记忆. */
+const MEMORY_FILE_LINE_LIMIT = 200;
+
+/**
+ * Read a file's line count synchronously. Returns 0 if the file is missing or
+ * unreadable — never throws. Used only to inject an advisory hint into the
+ * memory prompt block; it must not break prompt rendering.
+ */
+function statMemoryLines(filePath: string): number {
+  try {
+    const text = readFileSync(filePath, "utf8");
+    if (text.length === 0) return 0;
+    // True line count (wc -l semantics): count newlines, +1 only when the file
+    // does not end in a newline. `split("\n").length` over-counts by 1 on the
+    // common trailing-newline case, which would false-trigger the over-limit
+    // hint and report a wrong "已 N 行" to the agent.
+    return (text.match(/\n/g)?.length ?? 0) + (text.endsWith("\n") ? 0 : 1);
+  } catch {
+    return 0;
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -347,6 +379,10 @@ function renderAgentWorkspaceBlock(
   const summaryFilePath = conventions.workspaceSessionPath
     ? `${conventions.workspaceSessionPath}/summary.md`
     : undefined;
+  const memoryDir = conventions.agentWorkspacePath
+    ? `${conventions.agentWorkspacePath}/memory`
+    : undefined;
+  const memoryIndex = memoryDir ? `${memoryDir}/index.md` : undefined;
   const lines = [
     "<agent-workspace>",
     "Larkway 是 thin bridge:它只把飞书触发场景和本地路径指针交给你,不替你编排任务。",
@@ -355,12 +391,29 @@ function renderAgentWorkspaceBlock(
     `- summary_file_path:  ${summaryFilePath ?? "(topic_session_path)/summary.md"}`,
     `- state_file_path:     ${conventions.stateFilePath}`,
     `- workspace_repos_dir: ${conventions.workspaceReposPath}`,
+    `- memory_dir:          ${memoryDir ?? "(agent_workspace_path)/memory"}`,
+    `- memory_index:        ${memoryIndex ?? "(memory_dir)/index.md"}`,
     "- 一个飞书话题 = 一个 task/session。话题内续接时,继续使用同一个 topic_session_path。",
     "- 群里 @ 你时,bridge 会拉起/关联一个话题;是否读取群历史、话题历史、附件、文档,由你根据任务自行决定。",
     "- 不要假设 bridge 已经 clone/fetch/worktree/pnpm install;需要代码时,你在 workspace 里自己 clone/branch/install/test。",
     "- summary.md 是你维护本话题摘要、决策和下一步 notes 的地方;bridge 只创建占位,不替你总结。",
-    "- 优先读取 workspace 内的 AGENTS.md、CLAUDE.md(如存在)、permissions-request.md、permissions-granted.md。",
+    "- 起手先读 memory/index.md 拉起跨 session 长期记忆(preferences / reusable-knowledge / workflows / decisions / assets),再读 workspace 内的 AGENTS.md、CLAUDE.md(如存在)、permissions-request.md、permissions-granted.md。",
+    "- 本 session 里跨 session 可复用的内容,先记到 topic_session_path/memory-candidates.md;owner 确认后,由你写进 memory/<category>.md。",
+    "- 热路径(每轮)只允许 ADD / NOOP:把候选 append 到 memory-candidates.md,或往 category 文件追加新条目;不在热路径做 UPDATE/DELETE/改写已有条目。",
+    "- 改写、删除、解决冲突 → 推迟到 owner 显式说「整理记忆」时的离线步骤做。失效/被推翻的条目移 memory/archive/(注一句原因),不物理删。",
+    "- 离线整理/改写已有记忆前,先用 rg 在 sessions/*/transcript.md 核到来源行;commit/笔记引用该行;核不到来源的结论降级为 candidate,不写进正文。(单 agent 自己做,别 spawn 别的 agent。)",
+    "- 只有跨 session 还会再用到的才进 memory/(单次任务留在 summary,随 session 过期);新增、以及会改变行为或边界的改写/删除都要 owner 确认。",
   ];
+  if (memoryDir) {
+    for (const fileName of MEMORY_CATEGORY_FILE_NAMES) {
+      const count = statMemoryLines(`${memoryDir}/${fileName}`);
+      if (count > MEMORY_FILE_LINE_LIMIT) {
+        lines.push(
+          `- ⚠️ ${fileName} 已 ${count} 行,超限——下次「整理记忆」时先蒸馏压缩。`,
+        );
+      }
+    }
+  }
   if (conventions.defaultProjectSlug) {
     lines.push("");
     lines.push("Repo pointers(只是指针,不是已准备好的 clone):");

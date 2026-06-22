@@ -153,6 +153,18 @@ Agent 判断分类:preference / reusable knowledge / workflow / decision / asset
 - 写 `sessions/`:不需要 owner-gated,这是当前任务上下文。
 - 写 `repos/`:按 Agent 配置里的 repo pointer / token env 和高风险 gate 执行;`permissions/granted.md` 只做审计参考。
 
+记忆删减 / 生命周期(减法是结构性兜底,不靠 Agent 在写入那一刻自律删自己):
+
+- **热路径只做加法(ADD / NOOP)**:每轮里只允许把候选 append 到 `memory-candidates.md`,或往 category 文件追加新条目。不在热路径改写 / 删除已有条目(靠 LLM 在写入那一刻自我去重 / 删除不可靠,会退化成只增不减)。
+- **减法推迟到离线步骤**:改写、删除、解决冲突,只在 owner 显式说「整理记忆」时离线做。
+- **失效 / 被推翻的条目移 `archive/`**:不物理删,注一句原因 + 对应 commit,不手写 superseded 戳;`archive/` 的长期清理交给 git history。
+- **裁决 = source 优先**:user 亲口说的 >> agent 推断;冲突时保留旧的 user 条目,把新推断降级为 candidate。同 source 内 recency 以 git 历史为准,不手写日期戳。
+- **超量提示 = 结构性兜底**:某个分类文件超过约 200 行时,prompt 会注入一行 ⚠️ 提示,要求下次「整理记忆」时先蒸馏压缩。这是注入侧的提示,不是 Larkway 的 GC 定时器(thin bridge 不替 Agent 删 memory)。
+- **grounding(离线整理时)**:改写已有记忆前,先用 `rg` 在 `sessions/*/transcript.md` 核到来源行;commit / 笔记引用该行;核不到来源的结论降级为 candidate,不写进正文。单 agent 自己做,不 spawn 别的 agent。
+- **owner-gated**:会改变 Agent 行为或边界的改写 / 删除,与"提升"一样必须 owner 确认。
+- 没被提升的 `memory-candidates.md` 内容会随 session 过期消失(未提升 = 判定不值得长期保留)。
+- **transcript 随 session 回收**:上面的 grounding(`rg` 核来源行)只在 session 窗口内有效;session 一过期 transcript 就没了,无法再回溯防漂移对账。需要长期保留的结论,必须在 session 内提炼进 `decisions.md`(或对应 category 文件),别指望以后还能从 transcript 翻出来。
+
 ## 6. Owner 与修改权限
 
 创建 Agent 时必须记录 owner 身份,例如 `owner_open_id`。该身份不应只写在

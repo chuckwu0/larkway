@@ -58,7 +58,56 @@ describe("ensureAgentWorkspace", () => {
     await expect(fs.stat(path.join(workspacePath, "tasks"))).rejects.toThrow();
     await expect(fs.stat(sessionPath)).resolves.toBeTruthy();
 
+    await expect(
+      fs.stat(path.join(workspacePath, "memory")),
+    ).resolves.toBeTruthy();
+    await expect(
+      fs.stat(path.join(workspacePath, "memory", "index.md")),
+    ).resolves.toBeTruthy();
+    for (const file of [
+      "preferences.md",
+      "reusable-knowledge.md",
+      "workflows.md",
+      "decisions.md",
+      "assets.md",
+    ]) {
+      await expect(
+        fs.stat(path.join(workspacePath, "memory", file)),
+      ).resolves.toBeTruthy();
+    }
+    // D5/D8: assets/ and archive/ container dirs are scaffolded too.
+    await expect(
+      fs.stat(path.join(workspacePath, "memory", "assets")),
+    ).resolves.toBeTruthy();
+    await expect(
+      fs.stat(path.join(workspacePath, "memory", "archive")),
+    ).resolves.toBeTruthy();
+    const memoryIndex = await fs.readFile(
+      path.join(workspacePath, "memory", "index.md"),
+      "utf8",
+    );
+    expect(memoryIndex).toContain("跨 session 长期记忆");
+    expect(memoryIndex).toContain("preferences.md");
+    expect(memoryIndex).toContain("assets.md");
+    // D6: hot-path is ADD-only; rewrites/deletes are deferred offline.
+    expect(memoryIndex).toContain("热路径(每轮)只做加法");
+    expect(memoryIndex).toContain("整理记忆");
+    expect(memoryIndex).toContain("archive/");
+    expect(memoryIndex).toContain("source 优先");
+    // D1: category skeletons carry the write-discipline hint, not "按需 append。"
+    const prefSkeleton = await fs.readFile(
+      path.join(workspacePath, "memory", "preferences.md"),
+      "utf8",
+    );
+    expect(prefSkeleton).not.toContain("按需 append");
+    // skeleton must agree with the hot-path ADD/NOOP rule (no in-place 改写/去重)
+    expect(prefSkeleton).toContain("有相同/相关条目就 NOOP 不重复写");
+    expect(prefSkeleton).not.toContain("改写并把旧条目移 archive");
+
     const agentsMd = await fs.readFile(path.join(workspacePath, "AGENTS.md"), "utf8");
+    // D4: unskippable startup-load contract is baked into the AGENTS.md template.
+    expect(agentsMd).toContain("开场不可跳过");
+    expect(agentsMd).toContain("Read `memory/index.md`");
     expect(agentsMd).toContain("Develop and operate Larkway from Feishu.");
     expect(agentsMd).toContain("You are the Larkway DevOps agent.");
     expect(agentsMd).toContain("https://gitlab.example.com/chuckwu0/larkway.git");

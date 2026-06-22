@@ -3,6 +3,9 @@
  */
 
 import { describe, it, expect } from "vitest";
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import { renderPrompt, type RenderPromptInput, type PeerBot, type RepoRef } from "./prompt.js";
 import type { ParsedMessage } from "../lark/message.js";
 import type { LarkMessageEvent } from "../lark/transport.js";
@@ -534,6 +537,23 @@ describe("renderPrompt — workspace warm-up block", () => {
       "summary_file_path:  /tmp/larkway/agents/larkway-devops/workspace/sessions/om_thread001/summary.md",
     );
     expect(prompt).toContain("state_file_path:");
+    expect(prompt).toContain(
+      "memory_dir:          /tmp/larkway/agents/larkway-devops/workspace/memory",
+    );
+    expect(prompt).toContain(
+      "memory_index:        /tmp/larkway/agents/larkway-devops/workspace/memory/index.md",
+    );
+    expect(prompt).toContain("起手先读 memory/index.md 拉起跨 session 长期记忆");
+    expect(prompt).toContain("assets"); // D5: assets is in the startup read list
+    expect(prompt).toContain("owner 确认后,由你写进 memory/<category>.md");
+    // D2: hot-path is ADD/NOOP only; rewrites/deletes deferred to offline 整理记忆
+    expect(prompt).toContain("热路径(每轮)只允许 ADD / NOOP");
+    expect(prompt).toContain("整理记忆");
+    expect(prompt).toContain("memory/archive/");
+    // D3: offline reorg must ground rewrites against transcript.md via rg
+    expect(prompt).toContain("rg 在 sessions/*/transcript.md 核到来源行");
+    // D2 no longer frames memory as 增删一体 in the hot path
+    expect(prompt).not.toContain("写 memory 是「增删一体」");
     expect(prompt).toContain("summary.md 是你维护本话题摘要、决策和下一步 notes 的地方");
     expect(prompt).toContain("Repo pointers(只是指针");
     expect(prompt).toContain("gitlab_token_env_name: LARKWAY_DEVOPS_GITLAB_TOKEN");
@@ -612,6 +632,75 @@ describe("renderPrompt — workspace warm-up block", () => {
     expect(prompt).toContain("npm config set prefix");
     expect(prompt).toContain("lark-cli update");
     expect(prompt).toContain("不要默认要求 sudo");
+  });
+
+  it("D9: injects an over-size hint when a memory category file exceeds the line limit", () => {
+    const workspaceDir = mkdtempSync(path.join(tmpdir(), "larkway-mem-"));
+    try {
+      const memoryDir = path.join(workspaceDir, "memory");
+      mkdirSync(memoryDir, { recursive: true });
+      // 201 lines > 200 limit → should trigger the hint.
+      const bigFile = path.join(memoryDir, "preferences.md");
+      writeFileSync(bigFile, "x\n".repeat(201), "utf8");
+      // Exactly 200 lines = at the limit, NOT over → must NOT trigger. Pins the
+      // off-by-one: a 200-line file with a trailing newline must count as 200.
+      writeFileSync(path.join(memoryDir, "reusable-knowledge.md"), "x\n".repeat(200), "utf8");
+      // A small file must NOT trigger the hint.
+      writeFileSync(path.join(memoryDir, "decisions.md"), "x\n".repeat(3), "utf8");
+
+      const prompt = renderPrompt(
+        makeInput({
+          conventions: {
+            ...makeConventions(),
+            runtime: "agent_workspace",
+            agentWorkspacePath: workspaceDir,
+            workspaceSessionPath: path.join(workspaceDir, "sessions", "om_thread001"),
+            workspaceReposPath: path.join(workspaceDir, "repos"),
+            stateFilePath: path.join(
+              workspaceDir,
+              "sessions",
+              "om_thread001",
+              ".larkway",
+              "state.json",
+            ),
+          },
+        }),
+      );
+
+      expect(prompt).toContain("⚠️ preferences.md 已 201 行,超限");
+      expect(prompt).not.toContain("⚠️ reusable-knowledge.md");
+      expect(prompt).not.toContain("⚠️ decisions.md");
+    } finally {
+      rmSync(workspaceDir, { recursive: true, force: true });
+    }
+  });
+
+  it("D9: statMemoryLines is non-throwing — no hint when memory dir is absent", () => {
+    const workspaceDir = mkdtempSync(path.join(tmpdir(), "larkway-nomem-"));
+    try {
+      // No memory/ dir created → reads return 0, no hint, no throw.
+      const prompt = renderPrompt(
+        makeInput({
+          conventions: {
+            ...makeConventions(),
+            runtime: "agent_workspace",
+            agentWorkspacePath: workspaceDir,
+            workspaceSessionPath: path.join(workspaceDir, "sessions", "om_thread001"),
+            workspaceReposPath: path.join(workspaceDir, "repos"),
+            stateFilePath: path.join(
+              workspaceDir,
+              "sessions",
+              "om_thread001",
+              ".larkway",
+              "state.json",
+            ),
+          },
+        }),
+      );
+      expect(prompt).not.toContain("超限");
+    } finally {
+      rmSync(workspaceDir, { recursive: true, force: true });
+    }
   });
 });
 
