@@ -20,7 +20,8 @@
 | v0.3.9 | v0.3.9 | patch / 已发布 | 简化 repo access 设置:多仓库共享 Agent 级 Git 身份,token 可选,运行时依赖按实际 bot 提示。 |
 | v0.3.10 | v0.3.10 | patch / 已发布 | `larkway update` 默认改走 npm package,避免旧 GitLab release URL 误拼到 GitHub。 |
 | v0.3.11 | v0.3.11 | patch / 已发布 | gap-fill 展开话题内 `thread_replies`,避免 WebSocket 重连窗口漏掉旧话题 @。 |
-| v0.3.12 | v0.3.12 | 当前 patch / 已发布 | 补齐跨 session 长期记忆 memory/ 层(增删一体生命周期)+ 修复单 bot 模式 lark-cli profile 缺失。 |
+| v0.3.12 | v0.3.12 | patch / 已发布 | 补齐跨 session 长期记忆 memory/ 层(增删一体生命周期)+ 修复单 bot 模式 lark-cli profile 缺失。 |
+| v0.3.13 | v0.3.13 | 当前 patch / 已发布 | lark-cli profile 启动改为幂等重灌:去掉"已注册就跳过"的弱检查,凭据漂移(keychain 迁移 / 无 `--name` 遗留 profile)重启自愈。 |
 
 ## 使用原则
 
@@ -45,4 +46,5 @@ v0.3.9        = repo access 设置简化 + Agent 级 Git 身份
 v0.3.10       = update 默认走 npm package
 v0.3.11       = gap-fill 恢复 thread replies
 v0.3.12       = 跨 session 记忆 memory/ 层 + 单 bot lark-cli profile 修复
+v0.3.13       = lark-cli profile 启动幂等重灌(凭据漂移重启自愈)
 ```
