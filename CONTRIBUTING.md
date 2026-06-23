@@ -26,6 +26,32 @@ Tests are pure unit tests (no subprocess spawning, no network). The full
 acceptance suite (`pnpm test:v0.3`) requires a live Feishu app credential and
 is intended for maintainers.
 
+## Releasing (maintainers)
+
+Cutting a release is a single deterministic step — use the script, don't do it
+by hand:
+
+```bash
+scripts/release.sh <version> "<one-line changelog>"
+# e.g.
+scripts/release.sh 0.3.14 "harden profile bootstrap; fix gap-fill race"
+
+# preview the file changes without committing/publishing:
+scripts/release.sh 0.3.14 "..." --dry-run
+```
+
+It bumps `package.json`, updates the version banners in `README.md` /
+`README.zh.md` and the table + main-line in `docs/versioning.md`, then commits
+`chore: release v<version>`, tags `v<version>`, publishes to npm
+(`npm publish --access public`, `prepack` builds `dist/`), and pushes `main` +
+the tag.
+
+Preconditions (the script enforces them): clean tree on `main`, the tag must not
+already exist, `pnpm typecheck` passes, and you are logged in to npm (`npm whoami`,
+or an `NPM_TOKEN` in `~/.npmrc`). npm auth is read from your environment — never
+hardcode it. The version (`package.json`) is the single source of truth;
+`src/version.ts` reads it, so never hardcode a version anywhere else.
+
 ## Code style
 
 - **TypeScript strict** throughout — every file has `"strict": true` inherited
