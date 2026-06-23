@@ -1,10 +1,11 @@
 /**
  * Tests for src/lark/profileBootstrap.ts
  *
- * Tests three behaviors (BL-19):
+ * Tests four behaviors (BL-19 + self-heal fix):
  *  1. Profile derivation: lark_cli_profile ?? app_id
- *  2. Skip creation when profile already exists with correct appId
+ *  2. Always provision via config init on every startup (self-healing approach)
  *  3. Create profile when missing; degrade gracefully on failure
+ *  4. Self-heal: profile registered but credential unusable → re-init is invoked
  */
 
 import { describe, it, expect, vi } from "vitest";
@@ -15,8 +16,8 @@ import { ensureLarkCliProfile, deriveLarkCliProfile, type SpawnSyncFn } from "./
 // ---------------------------------------------------------------------------
 
 const BOT_ID = "activity-frontend";
-const APP_ID = "cli_xxxxxxxx";
-const APP_SECRET = "supersecret123";
+const APP_ID = "cli_test_app";
+const APP_SECRET = "test-secret";
 const PROFILE_NAME = APP_ID; // conventional: profile name = app_id
 
 /** Build a fake spawnSync that returns a canned result. */
@@ -51,31 +52,107 @@ describe("deriveLarkCliProfile — profile name derivation (Layer 2)", () => {
   });
 
   it("falls back to app_id when lark_cli_profile is undefined and app_id differs", () => {
-    const OTHER_APP_ID = "cli_xxxxxxxx";
+    const OTHER_APP_ID = "cli_other_app";
     expect(deriveLarkCliProfile(undefined, OTHER_APP_ID)).toBe(OTHER_APP_ID);
   });
 });
 
 // ---------------------------------------------------------------------------
-// Layer 3: ensureLarkCliProfile — profile exists → no-op
+// Layer 3: ensureLarkCliProfile — always provisions (self-healing approach)
 // ---------------------------------------------------------------------------
 
-describe("ensureLarkCliProfile — profile already exists with correct appId (Layer 3)", () => {
-  it("does not call config init when config show returns the expected appId", () => {
-    const initCalled = vi.fn();
-    const spawn = makeSpawn([
-      // config show → success with appId in output
-      { status: 0, stdout: `{\n  "appId": "${APP_ID}"\n}` },
-    ]);
-    const spySpawn: SpawnSyncFn = (_cmd, args, opts) => {
-      if (args.includes("init")) initCalled();
-      return spawn(_cmd, args, opts);
+describe("ensureLarkCliProfile — always provisions via config init on startup (Layer 3)", () => {
+  it("calls config init on every startup, even when profile already appears registered", () => {
+    // Self-heal rationale: config show returning exit 0 + correct appId does NOT
+    // prove the stored credential is usable (e.g. keychain drift, legacy nameless
+    // profile). Always re-provisioning is the only way to guarantee usability.
+    const initArgs = vi.fn();
+    const spawn: SpawnSyncFn = (_cmd, args, _opts) => {
+      if (args.includes("init")) initArgs(args);
+      return {
+        status: 0,
+        stdout: `{"appId": "${APP_ID}"}`,
+        stderr: "",
+        pid: 0,
+        signal: null,
+        output: [],
+        error: undefined,
+      };
     };
     const fakeConsole = { log: vi.fn(), warn: vi.fn() };
 
-    ensureLarkCliProfile(BOT_ID, PROFILE_NAME, APP_ID, APP_SECRET, spySpawn, fakeConsole);
+    ensureLarkCliProfile(BOT_ID, PROFILE_NAME, APP_ID, APP_SECRET, spawn, fakeConsole);
 
-    expect(initCalled).not.toHaveBeenCalled();
+    // config init must have been called (self-healing: always re-provision)
+    expect(initArgs).toHaveBeenCalledOnce();
+    const capturedArgs = initArgs.mock.calls[0]![0] as string[];
+    // --name invariant: must always include --name to avoid clobbering
+    // the shared default profile
+    expect(capturedArgs).toContain("--name");
+    expect(capturedArgs).toContain(PROFILE_NAME);
+    expect(fakeConsole.warn).not.toHaveBeenCalled();
+  });
+
+  it("logs success when config init exits 0", () => {
+    const spawn = makeSpawn([{ status: 0 }]);
+    const fakeConsole = { log: vi.fn(), warn: vi.fn() };
+
+    ensureLarkCliProfile(BOT_ID, PROFILE_NAME, APP_ID, APP_SECRET, spawn, fakeConsole);
+
+    expect(fakeConsole.log).toHaveBeenCalledWith(
+      expect.stringContaining("provisioned OK"),
+    );
+    expect(fakeConsole.warn).not.toHaveBeenCalled();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Layer 3: ensureLarkCliProfile — self-heal: credential unusable → re-init
+// ---------------------------------------------------------------------------
+
+describe("ensureLarkCliProfile — self-heal: registered profile with unusable credential (Layer 3)", () => {
+  it("re-inits when profile exists in config show but credential is unreadable at runtime", () => {
+    // Simulates the production incident: a legacy profile whose `name` field was
+    // absent (created without --name) reports the correct appId via config show,
+    // but its secret cannot be decrypted. The self-healing approach always runs
+    // config init, so the credential is unconditionally re-written from .env.
+    const initArgs = vi.fn();
+    const showCalled = vi.fn();
+    const spawn: SpawnSyncFn = (_cmd, args, _opts) => {
+      if (args.includes("show")) {
+        showCalled();
+        // Profile appears registered (exit 0 + correct appId) but credential
+        // is actually corrupt — this is indistinguishable via config show alone.
+        return {
+          status: 0,
+          stdout: `{"appId": "${APP_ID}"}`,
+          stderr: "",
+          pid: 0,
+          signal: null,
+          output: [],
+          error: undefined,
+        };
+      }
+      if (args.includes("init")) {
+        initArgs(args);
+        return { status: 0, stdout: "", stderr: "", pid: 0, signal: null, output: [], error: undefined };
+      }
+      return { status: 1, stdout: "", stderr: "", pid: 0, signal: null, output: [], error: undefined };
+    };
+    const fakeConsole = { log: vi.fn(), warn: vi.fn() };
+
+    ensureLarkCliProfile(BOT_ID, PROFILE_NAME, APP_ID, APP_SECRET, spawn, fakeConsole);
+
+    // config init must be called regardless of what config show reports
+    expect(initArgs).toHaveBeenCalledOnce();
+    const capturedArgs = initArgs.mock.calls[0]![0] as string[];
+    expect(capturedArgs).toContain("--app-id");
+    expect(capturedArgs).toContain(APP_ID);
+    expect(capturedArgs).toContain("--app-secret-stdin");
+    expect(capturedArgs).toContain("--name");
+    expect(capturedArgs).toContain(PROFILE_NAME);
+    // app_secret must NOT appear in the argument list
+    expect(capturedArgs.join(" ")).not.toContain(APP_SECRET);
     expect(fakeConsole.warn).not.toHaveBeenCalled();
   });
 });
@@ -89,9 +166,8 @@ describe("ensureLarkCliProfile — profile missing, create succeeds (Layer 3)", 
     const initArgs = vi.fn();
     const spawn: SpawnSyncFn = (_cmd, args) => {
       if (args.includes("init")) initArgs(args);
-      // show → not found (status 1); init → success
       return {
-        status: args.includes("show") ? 1 : 0,
+        status: 0,
         stdout: "",
         stderr: "",
         pid: 0,
@@ -115,31 +191,15 @@ describe("ensureLarkCliProfile — profile missing, create succeeds (Layer 3)", 
     expect(capturedArgs.join(" ")).not.toContain(APP_SECRET);
     expect(fakeConsole.warn).not.toHaveBeenCalled();
   });
-
-  it("logs success when config init exits 0", () => {
-    const spawn = makeSpawn([
-      { status: 1 },  // show: profile missing
-      { status: 0 },  // init: success
-    ]);
-    const fakeConsole = { log: vi.fn(), warn: vi.fn() };
-
-    ensureLarkCliProfile(BOT_ID, PROFILE_NAME, APP_ID, APP_SECRET, spawn, fakeConsole);
-
-    expect(fakeConsole.log).toHaveBeenCalledWith(
-      expect.stringContaining("created/updated OK"),
-    );
-    expect(fakeConsole.warn).not.toHaveBeenCalled();
-  });
 });
 
 // ---------------------------------------------------------------------------
 // Layer 3: ensureLarkCliProfile — creation fails → non-fatal warn
 // ---------------------------------------------------------------------------
 
-describe("ensureLarkCliProfile — profile creation fails, degrades gracefully (Layer 3)", () => {
+describe("ensureLarkCliProfile — profile provisioning fails, degrades gracefully (Layer 3)", () => {
   it("emits a WARNING when config init exits non-zero, does not throw", () => {
     const spawn = makeSpawn([
-      { status: 1, stdout: "" },  // show: missing
       { status: 1, stderr: "unsupported flag" },  // init: failure
     ]);
     const fakeConsole = { log: vi.fn(), warn: vi.fn() };
@@ -179,7 +239,6 @@ describe("ensureLarkCliProfile — profile creation fails, degrades gracefully (
 
   it("never leaks appSecret in logged messages on success path", () => {
     const spawn = makeSpawn([
-      { status: 1 },  // show: missing
       { status: 0 },  // init: success
     ]);
     const fakeConsole = { log: vi.fn(), warn: vi.fn() };

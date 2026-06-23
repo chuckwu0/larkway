@@ -7,7 +7,13 @@
  * same default lark-cli profile and therefore the same Feishu app credentials.
  *
  * Design:
- *  - Idempotent: re-running on an already-correct profile is a no-op.
+ *  - Self-healing: always re-provisions via `config init --name` on startup so
+ *    credential drift (e.g. macOS keychain migration, legacy nameless profiles)
+ *    is automatically repaired without manual surgery. Safe because re-running
+ *    `config init --app-id X --app-secret-stdin --name X` on an already-correct
+ *    named profile is a no-op (no re-key, no impact on other profiles). The
+ *    ONLY dangerous variant is running WITHOUT --name, which clobbers the
+ *    shared default profile; the --name invariant is strictly enforced here.
  *  - Non-fatal: any failure produces a clear WARNING, never crashes the bridge.
  *  - Secure: app secret is passed via stdin, never via argv or logs.
  */
@@ -33,16 +39,24 @@ export type SpawnSyncFn = (
 // ---------------------------------------------------------------------------
 
 /**
- * Ensure a lark-cli named profile exists with the correct app credentials.
+ * Ensure a lark-cli named profile exists and its credential is usable.
  *
- * Strategy:
- *  1. Check whether `lark-cli config show --profile <profileName>` reports
- *     the expected appId — if so, profile already correct, nothing to do.
- *  2. Create/update the profile via
- *     `lark-cli config init --app-id <id> --app-secret-stdin --name <profileName>`
- *     with the app secret piped into stdin (never exposed in argv / logs).
- *  3. If creation fails (e.g. lark-cli too old, non-zero exit), emit a clear
- *     WARNING and continue — never crash the bridge over profile setup.
+ * Strategy (self-healing approach):
+ *  Always re-provisions the named profile via `config init --name` on every
+ *  bridge startup. This is safe because:
+ *   - With `--name`, lark-cli creates/updates only that isolated profile slot.
+ *   - Other named profiles and the shared default profile are untouched.
+ *   - Re-running on an already-correct profile is a no-op (no re-key).
+ *  This ensures that credential drift (e.g. macOS keychain migration, a legacy
+ *  profile created without --name that passes `config show` but whose secret
+ *  is unreadable at runtime) is automatically repaired on restart.
+ *
+ *  The previous "skip if appId matches" optimisation was dropped because
+ *  `config show` only proves the profile is *registered*, not that the stored
+ *  credential is *usable* — exactly the failure mode seen in production.
+ *
+ *  If provisioning fails (e.g. lark-cli too old, non-zero exit), a clear
+ *  WARNING is emitted and the bridge continues — never crash over profile setup.
  *
  * @param botId       Bot id (for logging only).
  * @param profileName The lark-cli profile name to create/verify.
@@ -61,23 +75,11 @@ export function ensureLarkCliProfile(
   _spawnSync: SpawnSyncFn = spawnSync as SpawnSyncFn,
   _console: Pick<Console, "log" | "warn"> = console,
 ): void {
-  // Step 1: check if profile already exists with correct app_id
-  try {
-    const showResult = _spawnSync("lark-cli", ["config", "show", "--profile", profileName], {
-      encoding: "utf-8",
-      timeout: 5_000,
-    });
-    if (showResult.status === 0 && typeof showResult.stdout === "string" && showResult.stdout.includes(appId)) {
-      // Profile exists and reports the correct appId — nothing to do.
-      return;
-    }
-  } catch {
-    // lark-cli may not be installed; fall through to create attempt.
-  }
-
-  // Step 2: create/update profile via config init (app secret via stdin)
+  // Always (re-)provision the named profile so credential drift self-heals.
+  // `config init --name` is idempotent for named profiles: no re-key, no
+  // impact on other profiles. See module-level design comment for rationale.
   _console.log(
-    `[larkway] bot "${botId}": creating lark-cli profile "${profileName}" for app ${appId.slice(0, 8)}…`,
+    `[larkway] bot "${botId}": provisioning lark-cli profile "${profileName}" for app ${appId.slice(0, 8)}…`,
   );
   try {
     const initResult = _spawnSync(
@@ -90,19 +92,19 @@ export function ensureLarkCliProfile(
       },
     );
     if (initResult.status === 0) {
-      _console.log(`[larkway] bot "${botId}": lark-cli profile "${profileName}" created/updated OK.`);
+      _console.log(`[larkway] bot "${botId}": lark-cli profile "${profileName}" provisioned OK.`);
     } else {
       const stderr = typeof initResult.stderr === "string" ? initResult.stderr.trim() : "";
-      // Step 3: non-fatal warn — bridge continues with degraded lark-cli identity
+      // Non-fatal: bridge continues with potentially degraded lark-cli identity
       _console.warn(
-        `[larkway] WARNING: bot "${botId}" failed to create lark-cli profile "${profileName}" ` +
+        `[larkway] WARNING: bot "${botId}" failed to provision lark-cli profile "${profileName}" ` +
           `(exit ${initResult.status}${stderr ? `: ${stderr}` : ""}). ` +
           `Multi-bot lark-cli calls may use the wrong app credentials. ` +
           `Fix: lark-cli config init --app-id ${appId} --app-secret-stdin --name ${profileName}`,
       );
     }
   } catch (err) {
-    // Step 3: unexpected error (e.g. lark-cli not found) — non-fatal
+    // Unexpected error (e.g. lark-cli not found) — non-fatal
     _console.warn(
       `[larkway] WARNING: bot "${botId}" lark-cli profile setup failed: ${String(err)}. ` +
         `Multi-bot lark-cli calls may use the wrong app credentials. ` +
