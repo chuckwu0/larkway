@@ -7,7 +7,7 @@
  *   dist/cli/index.js  — `larkway` CLI (all runtime deps inlined)
  *   dist/main.js       — bridge process (all runtime deps inlined)
  *
- * Node built-ins (node:*) and vendored SDK are inlined (not external).
+ * Node built-ins (node:*) and Lark SDK are inlined (not external).
  * Native node:* modules are automatically external via esbuild.
  *
  * After bundling, copies src/web/public/ → dist/web/public/ so that
@@ -53,7 +53,7 @@ const sharedOpts = {
       `import { dirname as __pathDirname } from "node:path";`,
       `globalThis.require = __createRequire(import.meta.url);`,
       // CJS globals __filename/__dirname are undefined in ESM output; bundled
-      // CJS packages (and the vendored Lark SDK's registerApp) reference them.
+      // CJS packages (and the Lark SDK's registerApp) reference them.
       // Define them at module scope so any reference resolves via closure.
       `const __filename = __fileURLToPath(import.meta.url);`,
       `const __dirname = __pathDirname(__filename);`,

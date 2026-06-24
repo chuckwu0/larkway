@@ -40,7 +40,7 @@ import { resolveAgentWorkspacePathFromHome } from "../../config/paths.js";
 const execFileAsync = promisify(execFile);
 
 // ---------------------------------------------------------------------------
-// Types matching the vendored SDK's registerApp API
+// Types matching the Lark SDK's registerApp API
 // (SDK has no bundled .d.ts for this function; we declare our own minimal slice)
 // ---------------------------------------------------------------------------
 
@@ -182,12 +182,12 @@ interface AppCredentials {
 
 /**
  * 通过 registerApp 设备码流获取凭据。
- * 调用 vendored SDK 的 registerApp,回调渲染二维码。
+ * 调用 Lark SDK 的 registerApp,回调渲染二维码。
  */
 async function registerViaQRCode(ctx: CliContext, botId: string): Promise<AppCredentials> {
   const { ui } = ctx;
 
-  // 动态 import 已 vendored 的 SDK(照抄 channelClient.ts 的 import 方式)
+  // 动态 import 已装的 Lark SDK(@larksuiteoapi/node-sdk)(照抄 channelClient.ts 的 import 方式)
   const sdk = await import("@larksuiteoapi/node-sdk") as {
     registerApp: (opts: RegisterAppOptions) => Promise<RegisterAppResult>;
   };

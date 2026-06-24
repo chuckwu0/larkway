@@ -509,7 +509,20 @@ export class ChannelClient {
       // narrows chats; an empty chats list is the product's open mode.
       policy,
       // We need the raw event body to reconstruct the lark-cli-shaped content.
-      includeRawInMessage: true,
+      // (`includeRawInMessage` is the deprecated alias for this.)
+      includeRawEvent: true,
+      // ── WS robustness knobs (node-sdk ≥1.64; all OFF by default) ──────────
+      // Abort a handshake that hangs on a stuck DNS/proxy/NAT path so the retry
+      // loop can try again, instead of waiting indefinitely. Successful TLS
+      // handshakes are tens of ms; 15s is a wide safety margin.
+      handshakeTimeoutMs: 15_000,
+      // Liveness watchdog (SECONDS): if no inbound frame arrives within this
+      // window after the last ping, treat the socket as dead and reconnect —
+      // catches silently half-open connections that never emit a close event.
+      // This IS the 1.64 keepalive fix; the app-level `keepalive` watchdog
+      // option only exists in the split-out @larksuite/channel package, not in
+      // node-sdk's bundled createLarkChannel, so we don't pass it here.
+      wsConfig: { pingTimeout: 60 },
     } as Parameters<typeof createLarkChannel>[0]) as unknown as LarkChannel;
 
     channel.on("message", (msg) => {

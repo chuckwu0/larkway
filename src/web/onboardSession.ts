@@ -40,7 +40,7 @@ import { permissionItemsFromCapabilities } from "../agent/permissionPlan.js";
 import { resolveAgentWorkspacePathFromHome } from "../config/paths.js";
 
 // ---------------------------------------------------------------------------
-// registerApp SDK slice (vendored SDK has no bundled .d.ts for registerApp;
+// registerApp SDK slice (Lark SDK has no bundled .d.ts for registerApp;
 // declare our own minimal slice — mirrors src/cli/commands/init.ts).
 // ---------------------------------------------------------------------------
 
@@ -65,7 +65,7 @@ export interface RegisterAppResult {
 export type RegisterAppFn = (opts: RegisterAppOptions) => Promise<RegisterAppResult>;
 
 /**
- * Resolve the real registerApp from the vendored SDK (dynamic import, same as
+ * Resolve the real registerApp from the Lark SDK (dynamic import, same as
  * init.ts / channelClient.ts). Isolated so tests inject a fake instead.
  */
 async function defaultRegisterApp(opts: RegisterAppOptions): Promise<RegisterAppResult> {
@@ -558,7 +558,7 @@ export interface StartOnboardDeps {
   botsDir: string;
   /** Absolute .env path to write the secret into. */
   envPath: string;
-  /** registerApp fn (defaults to the vendored SDK; tests inject a fake). */
+  /** registerApp fn (defaults to the Lark SDK; tests inject a fake). */
   registerApp?: RegisterAppFn;
   /**
    * Identity resolver: resolves bot open_id + avatar_url + display name from the

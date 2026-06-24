@@ -3,7 +3,7 @@
  *
  * Channel-SDK-backed OUTBOUND card client — the sole implementation of the
  * `OutboundCardClient` surface card.ts depends on (createCard + patchCard).
- * Talks to Feishu through the vendored Channel SDK (`LarkChannel`).
+ * Talks to Feishu through the official Channel SDK (`LarkChannel`).
  *
  * Why this exists:
  *   The two outbound network calls live behind `OutboundCardClient`. We already
@@ -230,7 +230,7 @@ export class ChannelCardClient implements OutboundCardClient {
    * The OutboundCardClient.createCard signature gives us only a `replyToMessageId`
    * (om_xxx) — never a chatId — whereas send/stream require `to` (a chat/user id)
    * and treat replyTo as an option. The reply API is anchored purely by
-   * message_id, is fully typed in the vendored .d.ts, and reliably returns
+   * message_id, is fully typed in the SDK .d.ts, and reliably returns
    * data.message_id. No 30 s timeout (the SDK owns retry/timeout policy).
    *
    * @param replyToMessageId  om_xxx of the user's message to reply to.

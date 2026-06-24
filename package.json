@@ -41,7 +41,7 @@
     "tsx": "^4.7.0",
     "typescript": "^5.4.0",
     "vitest": "^4.1.7",
-    "@larksuiteoapi/node-sdk": "file:vendor/larksuiteoapi-node-sdk",
+    "@larksuiteoapi/node-sdk": "1.67.0",
     "dotenv": "^16.4.0",
     "js-yaml": "^4.1.1",
     "qrcode": "^1.5.4",
