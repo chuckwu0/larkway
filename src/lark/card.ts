@@ -722,6 +722,51 @@ function extractRawMessageId(raw: unknown): string | null {
   return typeof id === "string" ? id : null;
 }
 
+/**
+ * Create the initial card with short-backoff retry on transient failures.
+ *
+ * The Feishu card-create call occasionally fails with a momentary TLS / network
+ * timeout. Before this retry, a single such blip threw out of CardRenderer.start
+ * and aborted the whole turn (the card-start catch in handler.ts). Retrying 2
+ * extra times (3 attempts total) with 400ms / 800ms backoff recovers the common
+ * transient case in-line. On the final attempt the error is re-thrown so the
+ * caller's catch can still mark the turn unhandled (→ re-dispatchable next
+ * gap-fill).
+ *
+ * Delays: 400ms, 800ms (400 * 2^(attempt-1)).
+ */
+async function createCardWithRetry(
+  outbound: OutboundCardClient,
+  replyToMessageId: string,
+  cardJson: string,
+  opts: { replyInThread: boolean; threadId?: string },
+  maxAttempts = 3
+): Promise<{ messageId: string }> {
+  let lastErr: unknown;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      return await outbound.createCard(replyToMessageId, cardJson, opts);
+    } catch (err) {
+      lastErr = err;
+      if (attempt === maxAttempts) {
+        console.error(
+          `[lark.card] createCard failed after ${attempt} attempts:`,
+          err
+        );
+        throw err;
+      }
+      const delay = 400 * Math.pow(2, attempt - 1); // 400, 800
+      console.warn(
+        `[lark.card] createCard attempt ${attempt} failed, retrying in ${delay}ms:`,
+        (err as Error).message
+      );
+      await new Promise<void>((r) => setTimeout(r, delay));
+    }
+  }
+  // Unreachable (loop either returns or throws), but satisfies the type checker.
+  throw lastErr;
+}
+
 // ---------------------------------------------------------------------------
 // CardRenderer
 // ---------------------------------------------------------------------------
@@ -776,7 +821,12 @@ export class CardRenderer {
     // opts.replyInThread defaults to true (top-level mentions open a topic;
     // thread-replies pass false explicitly).
     const replyInThread = opts?.replyInThread ?? true;
-    const { messageId } = await this.outbound.createCard(
+    // Retry the create with short backoff: a momentary TLS/timeout blip on the
+    // Feishu card-create call must NOT abort the whole turn. With markUnhandled
+    // a give-up is itself retriable next gap-fill, but retrying here recovers the
+    // common transient case in-line (no operator re-@ needed).
+    const { messageId } = await createCardWithRetry(
+      this.outbound,
       replyToMessageId,
       initialCardJson,
       { replyInThread, threadId: opts?.threadId }

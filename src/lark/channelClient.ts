@@ -35,6 +35,14 @@ import type { OutboundCardClient } from "./outboundCardClient.js";
 const execFile = promisify(execFileCallback);
 const LEARNED_CHATS_LIMIT = 100;
 const SEEN_MESSAGES_LIMIT = 1000;
+/**
+ * Poison-message guard: how many times a single message_id may be (re-)dispatched
+ * before we give up on it. With self-heal, a message that fails DETERMINISTICALLY
+ * (always throws) would otherwise be re-dispatched on every gap-fill forever. At
+ * this cap, markUnhandled promotes it to seen (stops retrying) and logs a clear
+ * warning so the drop is visible, not silent.
+ */
+const MAX_MESSAGE_ATTEMPTS = 5;
 const OPEN_CHAT_DISCOVERY_LOOKBACK_MS = 90_000;
 const OPEN_CHAT_DISCOVERY_BOOTSTRAP_LOOKBACK_MS = 30 * 60 * 1000;
 const PROCESSING_REACTION_EMOJI = "Typing";
@@ -160,6 +168,37 @@ function expandMessagesWithThreadReplies(messages: unknown[]): unknown[] {
     }
   }
   return expanded;
+}
+
+/**
+ * Resolve the originating thread anchor (omt_… / message id) for a recovered
+ * gap-fill item. Feishu's +chat-messages-list items vary by version: some carry
+ * an explicit `thread_id`/`root_id`, others only embed the thread in a
+ * `message_app_link` query param (`open_thread_id=omt_…`).
+ *
+ * Deliberately NOT consulted: `parent_id` / `upper_message_id`. Feishu populates
+ * `parent_id` for ANY reply, including an ordinary quote-reply that is NOT in a
+ * topic thread (no `root_id`, no `open_thread_id`). Consulting them would
+ * misclassify such a quote-reply as a `thread_reply` and re-key it to the quoted
+ * message — whereas the SAME message over the live WS path
+ * ({@link channelMsgToLarkEvent}, which only looks at `thread_id`/`root_id`/
+ * `message_id`) is a plain `mention` keyed to its own id. Restricting the chain
+ * to `thread_id → root_id → message_app_link(open_thread_id)` aligns gap-fill
+ * thread classification with the live path and removes that false positive.
+ *
+ * Returns null when nothing thread-like is found (caller falls back to message id).
+ */
+export function resolveRecoveredThreadId(m: Record<string, unknown>): string | null {
+  const explicit =
+    nonEmptyStringField(m, "thread_id") ??
+    nonEmptyStringField(m, "root_id");
+  if (explicit) return explicit;
+  const link = nonEmptyStringField(m, "message_app_link");
+  if (link) {
+    const match = link.match(/open_thread_id=(omt_[A-Za-z0-9_-]+)/);
+    if (match) return match[1] ?? null;
+  }
+  return null;
 }
 
 /** A card-button click delivered by the SDK (raw `card.action.trigger`). */
@@ -333,14 +372,42 @@ export class ChannelClient {
    */
   private lastDisconnectAt = 0;
   /**
-   * Set of message_ids that have been dispatched (pushed onto the inbound queue)
-   * during this process lifetime. Used by gapFill to avoid dispatching the same
-   * message twice — once from the live WS handler, once from history catch-up.
-   * Bounded: we only add live-delivered messages here (not synthetics like
-   * cardAction turns), and Feishu message_id space is stable and non-recycling
-   * within any reasonable bridge uptime.
+   * Message_ids that have reached a terminal SUCCESS (handler.markHandled) OR
+   * were explicitly acknowledged. These are persisted so open-chat recovery
+   * does not replay an already-completed message after a restart. gap-fill
+   * skips anything in this set.
+   *
+   * Bounded: we only add completed/acknowledged messages here (not synthetics
+   * like cardAction turns), and Feishu message_id space is stable and
+   * non-recycling within any reasonable bridge uptime.
    */
   private readonly seenMessageIds = new Set<string>();
+  /**
+   * Message_ids that have been DISPATCHED (pushed onto the inbound queue) but
+   * whose turn has not yet reached a terminal outcome. This is the no-duplicate
+   * guard: gap-fill (and the WS path) skip a message that is already in-flight,
+   * so a message delivered live is never also gap-filled, and two overlapping
+   * gap-fill windows never double-dispatch the same message.
+   *
+   * CRITICAL (the core self-heal): a message stays here only while its turn is
+   * running. handler.markHandled() promotes it into {@link seenMessageIds} on
+   * SUCCESS; handler.markUnhandled() REMOVES it on FAILURE so the next gap-fill
+   * window re-dispatches it — one transient blip (e.g. a TLS timeout creating
+   * the card) no longer swallows the @ forever. NOT persisted: an in-flight
+   * message interrupted by a restart SHOULD be re-dispatchable.
+   */
+  private readonly inFlightMessageIds = new Set<string>();
+  /**
+   * Per-message (re-)dispatch counter for the poison-message guard. Incremented
+   * every time a message_id is pushed onto the inbound queue (live WS or either
+   * gap-fill branch) and once more when a turn is released as unhandled. When the
+   * count reaches {@link MAX_MESSAGE_ATTEMPTS}, markUnhandled GIVES UP: it
+   * promotes the message to seen (so it stops being re-dispatched) and logs a
+   * warning. markHandled clears the entry on terminal success. Not persisted:
+   * post-restart, an interrupted message starts fresh — same policy as
+   * inFlightMessageIds.
+   */
+  private readonly messageAttempts = new Map<string, number>();
   /**
    * Chats observed from live WS events during this process lifetime.
    *
@@ -453,8 +520,16 @@ export class ChannelClient {
         return;
       }
       this.noteSeenChat(ev.chat_id);
-      // Mark as seen so gap-fill skips this if it's also in the history window.
-      this.noteSeenMessage(ev.message_id);
+      // Guard against double-delivery without permanently marking seen: if this
+      // message is already handled (seen) or in-flight, skip. Otherwise mark it
+      // in-flight so gap-fill won't also deliver it while the turn runs. It is
+      // promoted to seen only on terminal SUCCESS (handler.markHandled), so a
+      // failed turn stays re-dispatchable.
+      if (this.seenMessageIds.has(ev.message_id) || this.inFlightMessageIds.has(ev.message_id)) {
+        return;
+      }
+      this.inFlightMessageIds.add(ev.message_id);
+      this.noteDispatchAttempt(ev.message_id);
       log(`dispatching (channel-sdk): message_id=${ev.message_id} thread=${ev.thread_id ?? "?"}`);
       this.queue.push(ev);
     });
@@ -627,8 +702,11 @@ export class ChannelClient {
           const m = raw as Record<string, unknown>;
           const messageId = m["message_id"] as string | undefined;
           if (!messageId) continue;
-          // Skip already-seen (delivered over live WS).
-          if (this.seenMessageIds.has(messageId)) continue;
+          // Skip already-handled (terminal success) OR currently in-flight
+          // (dispatched live or by an overlapping gap-fill window). Same two-set
+          // guard as the WS path — a failed turn is removed from inFlight by
+          // handler.markUnhandled, so it becomes re-dispatchable here.
+          if (this.seenMessageIds.has(messageId) || this.inFlightMessageIds.has(messageId)) continue;
 
           // Only dispatch messages that @ this bot.
           const mentions = m["mentions"] as Array<{ id?: string | { open_id?: string } }> | undefined;
@@ -639,6 +717,21 @@ export class ChannelClient {
             },
           );
           if (!mentionsBot) continue;
+
+          // Resolve the REAL originating thread for a recovered thread-reply.
+          // +chat-messages-list items don't always carry root_id directly; the
+          // thread may only live in message_app_link (open_thread_id=omt_…).
+          // When we recover a real thread anchor that differs from the message's
+          // own id, inject it as root_id so (a) channelMsgToLarkEvent derives the
+          // right thread_id and (b) handler.ts's triggerType comes out
+          // "thread_reply" (it keys off parsed.raw.root_id). A true top-level @
+          // resolves to null → root_id stays unset → triggerType "mention".
+          const recoveredThread = resolveRecoveredThreadId(m);
+          const isThreadReply =
+            recoveredThread !== null && recoveredThread !== messageId;
+          if (isThreadReply && !nonEmptyStringField(m, "root_id")) {
+            m["root_id"] = recoveredThread;
+          }
 
           // Reconstruct a LarkMessageEvent from the raw lark-cli list item.
           // lark-cli +chat-messages-list returns items in the same shape as
@@ -664,22 +757,34 @@ export class ChannelClient {
                 message_id: mid,
                 chat_id: cid,
                 chat_type: (m["chat_type"] as string | undefined) ?? "group",
-                thread_id: (m["thread_id"] as string | undefined) ?? (m["root_id"] as string | undefined) ?? mid,
-                root_id: m["root_id"] as string | undefined,
+                thread_id:
+                  (m["thread_id"] as string | undefined) ??
+                  (isThreadReply ? recoveredThread ?? undefined : undefined) ??
+                  (m["root_id"] as string | undefined) ??
+                  mid,
+                root_id:
+                  (m["root_id"] as string | undefined) ??
+                  (isThreadReply ? recoveredThread ?? undefined : undefined),
                 sender_id: sid,
                 content: typeof m["content"] === "string" ? m["content"] : JSON.stringify({ text: "" }),
                 create_time: (m["create_time"] as string | undefined) ?? String(Date.now()),
               };
             })();
             if (!fallbackEv) continue;
-            this.noteSeenMessage(fallbackEv.message_id);
+            // Mark in-flight (NOT seen): the turn hasn't run yet. Promotion to
+            // seen happens on terminal success (handler.markHandled); a failed
+            // turn is released (handler.markUnhandled) and re-dispatchable.
+            this.inFlightMessageIds.add(fallbackEv.message_id);
+            this.noteDispatchAttempt(fallbackEv.message_id);
             log(`gap-fill dispatching (fallback): message_id=${fallbackEv.message_id} chat=${chatId}`);
             this.queue.push(fallbackEv);
             totalDispatched++;
             continue;
           }
 
-          this.noteSeenMessage(ev.message_id);
+          // Mark in-flight (NOT seen): see fallback branch above.
+          this.inFlightMessageIds.add(ev.message_id);
+          this.noteDispatchAttempt(ev.message_id);
           log(`gap-fill dispatching: message_id=${ev.message_id} thread=${ev.thread_id ?? "?"} chat=${chatId}`);
           this.queue.push(ev);
           totalDispatched++;
@@ -933,7 +1038,55 @@ export class ChannelClient {
    * already handled message after a restart.
    */
   acknowledgeMessage(messageId: string): void {
+    this.markHandled(messageId);
+  }
+
+  /**
+   * Terminal SUCCESS: promote a message out of the in-flight set into the
+   * persisted seen set. After this, neither the WS path nor any gap-fill window
+   * (this process or post-restart) re-dispatches it. Persistence flows through
+   * {@link noteSeenMessage} (the same channel-seen-messages json the success
+   * set has always used), so post-restart recovery skips completed messages.
+   */
+  markHandled(messageId: string): void {
+    this.inFlightMessageIds.delete(messageId);
+    this.messageAttempts.delete(messageId);
     this.noteSeenMessage(messageId);
+  }
+
+  /**
+   * Terminal FAILURE/ABORT: release a message from the in-flight set WITHOUT
+   * marking it seen, so the next gap-fill window can re-dispatch it (the core
+   * self-heal — one transient blip no longer swallows the @ forever). Does not
+   * touch persisted seen state.
+   *
+   * Poison-message guard: count this failed turn as one more attempt. If the
+   * message has now failed {@link MAX_MESSAGE_ATTEMPTS} times, GIVE UP — promote
+   * it to seen (so it stops being re-dispatched on every gap-fill) and log a
+   * visible warning instead of silently looping forever.
+   */
+  markUnhandled(messageId: string): void {
+    this.inFlightMessageIds.delete(messageId);
+    const attempts = (this.messageAttempts.get(messageId) ?? 0) + 1;
+    this.messageAttempts.set(messageId, attempts);
+    if (attempts >= MAX_MESSAGE_ATTEMPTS) {
+      console.warn(
+        `[channel.client] giving up on message_id=${messageId} after ${attempts} failed attempts` +
+          ` — promoting to seen so it is no longer re-dispatched (poison-message guard)`,
+      );
+      this.messageAttempts.delete(messageId);
+      this.noteSeenMessage(messageId);
+    }
+  }
+
+  /**
+   * Increment the per-message dispatch counter (poison-message guard). Called
+   * each time a message_id is pushed onto the inbound queue. The counter is also
+   * bumped in {@link markUnhandled} so both dispatch and failed settlement
+   * contribute toward the cap.
+   */
+  private noteDispatchAttempt(messageId: string): void {
+    this.messageAttempts.set(messageId, (this.messageAttempts.get(messageId) ?? 0) + 1);
   }
 
   async close(): Promise<void> {

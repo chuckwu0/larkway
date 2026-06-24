@@ -583,6 +583,26 @@ export class BridgeHandler {
   // ---------------------------------------------------------------------------
 
   private async handleOne(event: import("../lark/transport.js").LarkMessageEvent): Promise<void> {
+    // Terminal-settle guard: EVERY exit path of handleOne must settle the
+    // message exactly once (markHandled on success, markUnhandled on failure).
+    // The dispatcher adds the message to inFlightMessageIds BEFORE handleOne
+    // runs; if anything here throws before the success/failure sites below
+    // (e.g. addProcessingReaction rejecting on a TLS blip, the card-start
+    // try/finally throwing), the throw would otherwise escape to run()'s queue
+    // .catch — which only console.errors — leaving the message stuck in-flight
+    // forever (permanently dropped, no reply). The finally below is the safety
+    // net: anything that throws before settling is released as UNHANDLED, so the
+    // next gap-fill window can re-dispatch it. messageId comes straight off the
+    // raw event (== parsed.messageId) so it's available even before parsing.
+    const settleMessageId = event.message_id;
+    let settled = false;
+    const settle = (ok: boolean): void => {
+      if (settled) return;
+      settled = true;
+      if (ok) this.deps.client.markHandled?.(settleMessageId);
+      else this.deps.client.markUnhandled?.(settleMessageId);
+    };
+    try {
     // Step 1: parse
     const parsed = parseMessage(event);
     const { threadId, messageId, senderOpenId } = parsed;
@@ -1111,9 +1131,11 @@ export class BridgeHandler {
             await deleteCardFile(worktreePath);
           }
 
-          // Acknowledge: move message from pending → persistently seen so it
-          // won't be re-dispatched on next bridge restart (Fix B / Bug #10).
-          this.deps.client.acknowledgeMessage(messageId);
+          // Terminal SUCCESS: promote the message out of in-flight into the
+          // persisted seen set so it is never re-dispatched (live WS or gap-fill,
+          // this process or post-restart). This is the single terminal call on
+          // the success path (Fix B / Bug #10 + self-heal in-flight tracking).
+          settle(true);
           await recordEvent({
             status: "completed",
             finishedAt: new Date().toISOString(),
@@ -1156,9 +1178,13 @@ export class BridgeHandler {
         reason: String(err),
       });
 
-      // Acknowledge even on failure: prevents this message from being
-      // re-dispatched on next restart (which would re-trigger the same crash).
-      this.deps.client.acknowledgeMessage(messageId);
+      // Terminal FAILURE/ABORT: release the message from in-flight WITHOUT
+      // marking it seen, so the next gap-fill window can re-dispatch it. This is
+      // the core self-heal — a transient blip (e.g. TLS timeout creating the
+      // card, an aborted run) no longer swallows the @ forever; the operator
+      // need not re-send. (Replaces the old acknowledge-on-failure, which
+      // permanently buried failed turns.)
+      settle(false);
 
       // Best-effort failure card — swallow any finalize error
       if (card) {
@@ -1183,6 +1209,16 @@ export class BridgeHandler {
           : path.join(this.deps.conventions.worktreesDir, threadId);
         await deleteCardFile(wtPath);
       }
+    }
+    } finally {
+      // Safety net for EVERY exit path of handleOne. The success site calls
+      // settle(true) and the failure catch calls settle(false); both make
+      // settled=true so this is a no-op for them. But if anything threw BEFORE
+      // reaching either site (e.g. addProcessingReaction rejecting at the top,
+      // the card-start finally throwing) it escapes the inner catch and lands
+      // here — releasing the message as UNHANDLED instead of stranding it
+      // in-flight forever. Idempotent: only the FIRST settle() wins.
+      settle(false);
     }
   }
 }

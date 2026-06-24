@@ -8,7 +8,7 @@
  * subprocess spawn argv (there is no subprocess anymore).
  */
 
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 
 // ---------------------------------------------------------------------------
 // Shared fake outbound transport — records createCard / patchCard calls so
@@ -538,5 +538,81 @@ describe("CardRenderer — finalize lands after in-flight live PATCH (issue #3)"
     await handle.finalize({ success: true });
 
     expect(landed).toEqual(["live2", "live1", "final"]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// CardRenderer.start() — transient-failure retry (Fix 2)
+//
+// A momentary TLS/timeout on the Feishu card-create call must NOT abort the
+// turn: start() retries with short backoff. Fake timers skip the real backoff
+// delay so the test stays fast and pure (no network/subprocess).
+// ---------------------------------------------------------------------------
+
+describe("CardRenderer.start() — transient create retry (Fix 2)", () => {
+  it("retries on a transient create error, then succeeds", async () => {
+    vi.useFakeTimers();
+    try {
+      const { CardRenderer } = await import("./card.js");
+
+      let attempts = 0;
+      const outbound = {
+        async createCard() {
+          attempts++;
+          if (attempts < 2) throw new Error("ETIMEDOUT: TLS handshake timed out");
+          return { messageId: "om_test_msg" };
+        },
+        async patchCard() {},
+      };
+
+      const renderer = new CardRenderer({
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        outbound: outbound as any,
+        patchIntervalMs: 0,
+      });
+
+      const startPromise = renderer.start("om_user_msg");
+      // Drain the backoff timers (400ms first retry) so the retry fires.
+      await vi.advanceTimersByTimeAsync(1000);
+      const handle = await startPromise;
+
+      expect(attempts).toBe(2); // failed once, succeeded on the second attempt
+      expect(handle.messageId).toBe("om_test_msg");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("gives up after maxAttempts and rethrows (so the turn can mark unhandled)", async () => {
+    vi.useFakeTimers();
+    try {
+      const { CardRenderer } = await import("./card.js");
+
+      let attempts = 0;
+      const outbound = {
+        async createCard() {
+          attempts++;
+          throw new Error("ECONNRESET: connection reset");
+        },
+        async patchCard() {},
+      };
+
+      const renderer = new CardRenderer({
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        outbound: outbound as any,
+        patchIntervalMs: 0,
+      });
+
+      const startPromise = renderer.start("om_user_msg");
+      // Attach the rejection expectation BEFORE advancing timers so the
+      // unhandled-rejection isn't flagged while the backoff drains.
+      const assertion = expect(startPromise).rejects.toThrow("ECONNRESET");
+      await vi.advanceTimersByTimeAsync(5000);
+      await assertion;
+
+      expect(attempts).toBe(3); // 3 attempts total (2 retries), then give up
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

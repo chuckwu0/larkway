@@ -57,6 +57,23 @@ export interface InboundClient {
    */
   removeProcessingReaction?(messageId: string): Promise<void>;
   acknowledgeMessage(messageId: string): void;
+  /**
+   * Promote a message from "in-flight" (dispatched, being handled) to
+   * "handled/seen": its turn reached a terminal SUCCESS. After this, gap-fill
+   * (and post-restart recovery) never re-dispatches it.
+   *
+   * Distinct from {@link markUnhandled}: a message that FAILED to produce a
+   * completed turn must NOT be marked handled, so the next gap-fill window can
+   * re-dispatch it (the core self-heal — one transient blip no longer swallows
+   * the @ forever). Optional so non-ChannelClient transports can no-op.
+   */
+  markHandled?(messageId: string): void;
+  /**
+   * Release a message from the "in-flight" set WITHOUT marking it handled: its
+   * turn failed/aborted. The message becomes re-dispatchable by the next
+   * gap-fill window. Optional so non-ChannelClient transports can no-op.
+   */
+  markUnhandled?(messageId: string): void;
   close(): Promise<void>;
 }
 

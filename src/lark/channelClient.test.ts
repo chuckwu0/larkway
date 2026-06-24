@@ -11,6 +11,7 @@ import path from "node:path";
 import { describe, it, expect, vi } from "vitest";
 import {
   channelMsgToLarkEvent,
+  resolveRecoveredThreadId,
   synthesizeCardActionEvent,
   type ChannelCardAction,
 } from "./channelClient.js";
@@ -1212,5 +1213,455 @@ describe("ChannelClient — gap-fill after reconnect (BL-15)", () => {
     vi.doUnmock("@larksuiteoapi/node-sdk");
     vi.doUnmock("node:child_process");
     vi.resetModules();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// resolveRecoveredThreadId — pure thread-anchor resolution for recovered items.
+// ---------------------------------------------------------------------------
+
+describe("resolveRecoveredThreadId", () => {
+  it("prefers an explicit thread_id over everything else", () => {
+    expect(
+      resolveRecoveredThreadId({ thread_id: "omt_test_thread", root_id: "om_root" }),
+    ).toBe("omt_test_thread");
+  });
+
+  it("falls through to root_id when no thread_id", () => {
+    expect(resolveRecoveredThreadId({ root_id: "om_root" })).toBe("om_root");
+  });
+
+  it("parses open_thread_id=omt_… from message_app_link when no explicit field", () => {
+    const link =
+      "https://applink.feishu.cn/client/chat/open?openChatId=oc_test_chat&open_thread_id=omt_test_thread&foo=bar";
+    expect(resolveRecoveredThreadId({ message_app_link: link })).toBe("omt_test_thread");
+  });
+
+  it("ignores parent_id / upper_message_id — an ordinary quote-reply (not in a topic thread) is NOT a thread_reply", () => {
+    // Feishu sets parent_id on ANY reply, including a quote-reply with no
+    // root_id / open_thread_id. Consulting it would misclassify this as a
+    // thread_reply; the live WS path treats it as a plain mention → null here.
+    expect(resolveRecoveredThreadId({ parent_id: "om_parent" })).toBeNull();
+    expect(resolveRecoveredThreadId({ upper_message_id: "om_upper" })).toBeNull();
+  });
+
+  it("returns null when nothing thread-like is present (true top-level @)", () => {
+    expect(resolveRecoveredThreadId({ message_id: "om_test_msg" })).toBeNull();
+    expect(resolveRecoveredThreadId({ message_app_link: "https://x/y?z=1" })).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// In-flight self-heal: markHandled / markUnhandled gate gap-fill re-dispatch.
+//   (a) failed turn (markUnhandled) → re-dispatchable next gap-fill
+//   (b) successful turn (markHandled) → NOT re-dispatched
+//   (c) an in-flight message is never double-dispatched (live + gap-fill)
+//   (d) gap-fill resolves a real omt_ thread from message_app_link
+// All pure: createLarkChannel + node:child_process (lark-cli) are mocked.
+// ---------------------------------------------------------------------------
+
+describe("ChannelClient — in-flight self-heal (markHandled/markUnhandled)", () => {
+  function makeFakeChannelWithHandlers() {
+    const handlers: Record<string, ((arg: unknown) => void) | undefined> = {};
+    const ch = {
+      botIdentity: { openId: "ou_bot", name: "test-bot" },
+      on(event: string, handler: (arg: unknown) => void) {
+        handlers[event] = handler;
+      },
+      async connect() {},
+      async disconnect() {},
+    };
+    return { ch, handlers };
+  }
+
+  /** lark-cli stub returning a single gap message that @s the bot. Optional
+   *  extra fields (e.g. message_app_link) are merged onto the item. */
+  function gapItemMock(messageId: string, extra: Record<string, unknown> = {}) {
+    return (
+      _cmd: string,
+      _args: string[],
+      cb: (err: null, result: { stdout: string; stderr: string }) => void,
+    ) => {
+      const items = [
+        {
+          message_id: messageId,
+          chat_id: "oc_test_chat",
+          chat_type: "group",
+          content: JSON.stringify({ text: "@bot 断线期间被@了" }),
+          sender: { id: "ou_sender" },
+          create_time: String(Date.now()),
+          mentions: [{ id: { open_id: "ou_bot" } }],
+          ...extra,
+        },
+      ];
+      cb(null, { stdout: JSON.stringify({ ok: true, data: { messages: items } }), stderr: "" });
+    };
+  }
+
+  async function bootClient(execMock: ReturnType<typeof gapItemMock>, larkwayDir?: string) {
+    vi.resetModules();
+    vi.doMock("node:child_process", () => ({ execFile: execMock }));
+    const chObj = makeFakeChannelWithHandlers();
+    vi.doMock("@larksuiteoapi/node-sdk", () => ({ createLarkChannel: () => chObj.ch }));
+
+    const { ChannelClient } = await import("./channelClient.js");
+    const client = new ChannelClient({
+      allowedChatIds: new Set(["oc_test_chat"]),
+      botOpenId: "ou_bot",
+      appId: "cli_x",
+      appSecret: "secret",
+      ...(larkwayDir ? { larkwayDir } : {}),
+      connectGraceMs: 0,
+      channelStaleMs: 0,
+      openChatDiscoveryMs: 0,
+    });
+
+    const dispatched: Array<{ messageId: string; rootId?: string; threadId?: string }> = [];
+    void (async () => {
+      for await (const ev of client.events()) {
+        dispatched.push({
+          messageId: ev.message_id,
+          rootId: typeof ev.root_id === "string" ? ev.root_id : undefined,
+          threadId: typeof ev.thread_id === "string" ? ev.thread_id : undefined,
+        });
+      }
+    })();
+    for (let i = 0; i < 100 && !chObj.handlers["reconnected"]; i++) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    return { client, chObj, dispatched };
+  }
+
+  function triggerGapFill(chObj: { handlers: Record<string, ((arg: unknown) => void) | undefined> }) {
+    chObj.handlers["reconnecting"]!(undefined);
+    chObj.handlers["reconnected"]!(undefined);
+  }
+
+  function cleanup() {
+    vi.doUnmock("@larksuiteoapi/node-sdk");
+    vi.doUnmock("node:child_process");
+    vi.resetModules();
+  }
+
+  it("(a) a FAILED turn (markUnhandled) is re-dispatchable on the next gap-fill", async () => {
+    const messageId = "om_test_msg";
+    const { client, chObj, dispatched } = await bootClient(gapItemMock(messageId));
+
+    // First WS delivery → in-flight, dispatched once.
+    chObj.handlers["message"]!({
+      raw: {
+        event: {
+          message: {
+            message_id: messageId,
+            chat_id: "oc_test_chat",
+            chat_type: "group",
+            content: JSON.stringify({ text: "@bot do it" }),
+            mentions: [{ id: { open_id: "ou_bot" } }],
+          },
+          sender: { sender_id: { open_id: "ou_sender" } },
+        },
+      },
+    });
+    for (let i = 0; i < 50 && dispatched.length < 1; i++) await new Promise((r) => setTimeout(r, 10));
+    expect(dispatched.filter((d) => d.messageId === messageId)).toHaveLength(1);
+
+    // Turn FAILS → release from in-flight (not seen).
+    client.markUnhandled(messageId);
+
+    // Next gap-fill returns the SAME message → it IS re-dispatched (self-heal).
+    triggerGapFill(chObj);
+    for (let i = 0; i < 100 && dispatched.filter((d) => d.messageId === messageId).length < 2; i++) {
+      await new Promise((r) => setTimeout(r, 20));
+    }
+    expect(dispatched.filter((d) => d.messageId === messageId)).toHaveLength(2);
+
+    await client.close();
+    cleanup();
+  });
+
+  it("(b) a SUCCESSFUL turn (markHandled) is NOT re-dispatched by gap-fill", async () => {
+    const messageId = "om_test_msg";
+    const { client, chObj, dispatched } = await bootClient(gapItemMock(messageId));
+
+    chObj.handlers["message"]!({
+      raw: {
+        event: {
+          message: {
+            message_id: messageId,
+            chat_id: "oc_test_chat",
+            chat_type: "group",
+            content: JSON.stringify({ text: "@bot do it" }),
+            mentions: [{ id: { open_id: "ou_bot" } }],
+          },
+          sender: { sender_id: { open_id: "ou_sender" } },
+        },
+      },
+    });
+    for (let i = 0; i < 50 && dispatched.length < 1; i++) await new Promise((r) => setTimeout(r, 10));
+    expect(dispatched.filter((d) => d.messageId === messageId)).toHaveLength(1);
+
+    // Turn SUCCEEDS → promote into the persisted seen set.
+    client.markHandled(messageId);
+
+    // Gap-fill returns the same message → it must be skipped (already seen).
+    triggerGapFill(chObj);
+    await new Promise((r) => setTimeout(r, 150));
+    expect(dispatched.filter((d) => d.messageId === messageId)).toHaveLength(1);
+
+    await client.close();
+    cleanup();
+  });
+
+  it("(c) an in-flight message (live, not yet terminal) is never double-dispatched", async () => {
+    const messageId = "om_test_msg";
+    const { client, chObj, dispatched } = await bootClient(gapItemMock(messageId));
+
+    // Live WS delivery → in-flight. No terminal call yet (turn still running).
+    chObj.handlers["message"]!({
+      raw: {
+        event: {
+          message: {
+            message_id: messageId,
+            chat_id: "oc_test_chat",
+            chat_type: "group",
+            content: JSON.stringify({ text: "@bot do it" }),
+            mentions: [{ id: { open_id: "ou_bot" } }],
+          },
+          sender: { sender_id: { open_id: "ou_sender" } },
+        },
+      },
+    });
+    for (let i = 0; i < 50 && dispatched.length < 1; i++) await new Promise((r) => setTimeout(r, 10));
+
+    // Gap-fill overlaps while the turn is still in-flight → must NOT re-dispatch.
+    triggerGapFill(chObj);
+    await new Promise((r) => setTimeout(r, 150));
+    expect(dispatched.filter((d) => d.messageId === messageId)).toHaveLength(1);
+
+    await client.close();
+    cleanup();
+  });
+
+  it("(d) gap-fill resolves the real omt_ thread from message_app_link", async () => {
+    const messageId = "om_test_msg";
+    const link =
+      "https://applink.feishu.cn/client/chat/open?openChatId=oc_test_chat&open_thread_id=omt_test_thread";
+    // Item carries NO root_id/thread_id — only the app link encodes the thread.
+    const { client, chObj, dispatched } = await bootClient(
+      gapItemMock(messageId, { message_app_link: link }),
+    );
+
+    triggerGapFill(chObj);
+    for (let i = 0; i < 100 && !dispatched.some((d) => d.messageId === messageId); i++) {
+      await new Promise((r) => setTimeout(r, 20));
+    }
+
+    const ev = dispatched.find((d) => d.messageId === messageId);
+    expect(ev).toBeDefined();
+    // root_id (→ handler triggerType "thread_reply") and thread_id both resolve
+    // to the real topic anchor parsed from the app link, not the message's own id.
+    expect(ev!.rootId).toBe("omt_test_thread");
+    expect(ev!.threadId).toBe("omt_test_thread");
+
+    await client.close();
+    cleanup();
+  });
+
+  it("(e) poison-message guard: after the attempt cap, markUnhandled GIVES UP (promotes to seen, warns) and stops re-dispatching", async () => {
+    const messageId = "om_poison_msg";
+    const { client, chObj, dispatched } = await bootClient(gapItemMock(messageId));
+
+    // Live WS delivery → attempt #1 (dispatched once).
+    chObj.handlers["message"]!({
+      raw: {
+        event: {
+          message: {
+            message_id: messageId,
+            chat_id: "oc_test_chat",
+            chat_type: "group",
+            content: JSON.stringify({ text: "@bot do it" }),
+            mentions: [{ id: { open_id: "ou_bot" } }],
+          },
+          sender: { sender_id: { open_id: "ou_sender" } },
+        },
+      },
+    });
+    for (let i = 0; i < 50 && dispatched.length < 1; i++) await new Promise((r) => setTimeout(r, 10));
+    expect(dispatched.filter((d) => d.messageId === messageId)).toHaveLength(1);
+
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    // Attempt accounting (cap = MAX_MESSAGE_ATTEMPTS = 5):
+    //   WS dispatch          → 1
+    //   markUnhandled #1     → 2  (below cap: still re-dispatchable)
+    //   markUnhandled #2     → 3
+    //   markUnhandled #3     → 4
+    //   markUnhandled #4     → 5  (>= cap: GIVE UP — promote to seen + warn)
+    client.markUnhandled(messageId); // 2
+    client.markUnhandled(messageId); // 3
+    client.markUnhandled(messageId); // 4
+    expect(warnSpy).not.toHaveBeenCalled(); // still below cap → no give-up yet
+    client.markUnhandled(messageId); // 5 → give up
+
+    // The give-up warning must be visible and name the message + attempt count.
+    expect(warnSpy).toHaveBeenCalledTimes(1);
+    const warnMsg = String(warnSpy.mock.calls[0]?.[0] ?? "");
+    expect(warnMsg).toContain(messageId);
+    expect(warnMsg).toContain("5");
+
+    // After give-up the message is in the persisted seen set → a fresh gap-fill
+    // returning the same message must NOT re-dispatch it (no infinite loop).
+    triggerGapFill(chObj);
+    await new Promise((r) => setTimeout(r, 150));
+    expect(dispatched.filter((d) => d.messageId === messageId)).toHaveLength(1);
+
+    warnSpy.mockRestore();
+    await client.close();
+    cleanup();
+  });
+
+  it("(f) below the attempt cap, a failed message is still re-dispatchable", async () => {
+    const messageId = "om_below_cap_msg";
+    const { client, chObj, dispatched } = await bootClient(gapItemMock(messageId));
+
+    // WS dispatch → attempt #1.
+    chObj.handlers["message"]!({
+      raw: {
+        event: {
+          message: {
+            message_id: messageId,
+            chat_id: "oc_test_chat",
+            chat_type: "group",
+            content: JSON.stringify({ text: "@bot do it" }),
+            mentions: [{ id: { open_id: "ou_bot" } }],
+          },
+          sender: { sender_id: { open_id: "ou_sender" } },
+        },
+      },
+    });
+    for (let i = 0; i < 50 && dispatched.length < 1; i++) await new Promise((r) => setTimeout(r, 10));
+    expect(dispatched.filter((d) => d.messageId === messageId)).toHaveLength(1);
+
+    // Two failed turns (attempts 2 and 3) — both well below the cap of 5.
+    client.markUnhandled(messageId);
+
+    // Next gap-fill re-dispatches (self-heal) → attempt #3, still below cap.
+    triggerGapFill(chObj);
+    for (let i = 0; i < 100 && dispatched.filter((d) => d.messageId === messageId).length < 2; i++) {
+      await new Promise((r) => setTimeout(r, 20));
+    }
+    expect(dispatched.filter((d) => d.messageId === messageId)).toHaveLength(2);
+
+    await client.close();
+    cleanup();
+  });
+
+  // --- Cross-restart survival ------------------------------------------------
+  // The self-heal state machine spans two dimensions: in-flight (NON-persisted →
+  // re-dispatchable after a crash) and seen (persisted → never replayed). Tests
+  // (a)–(f) exercise one ChannelClient. (g)/(h) exercise a SECOND, fresh
+  // ChannelClient (with larkwayDir so seen-state persists/loads) to lock down
+  // what survives a restart.
+
+  it("(g) restart re-dispatch: an interrupted in-flight message is re-dispatched after a fresh ChannelClient boots", async () => {
+    const messageId = "om_restart_inflight";
+    const larkwayDir = await mkdtemp(path.join(tmpdir(), "larkway-seen-msgs-"));
+
+    // --- Process 1: dispatch into in-flight, then "crash" (never settle). ---
+    const boot1 = await bootClient(gapItemMock(messageId), larkwayDir);
+    boot1.chObj.handlers["message"]!({
+      raw: {
+        event: {
+          message: {
+            message_id: messageId,
+            chat_id: "oc_test_chat",
+            chat_type: "group",
+            content: JSON.stringify({ text: "@bot do it" }),
+            mentions: [{ id: { open_id: "ou_bot" } }],
+          },
+          sender: { sender_id: { open_id: "ou_sender" } },
+        },
+      },
+    });
+    for (let i = 0; i < 50 && boot1.dispatched.length < 1; i++) await new Promise((r) => setTimeout(r, 10));
+    expect(boot1.dispatched.filter((d) => d.messageId === messageId)).toHaveLength(1);
+    // CRASH mid-turn: NO markHandled / markUnhandled. in-flight is non-persisted,
+    // so nothing about this message should reach the seen json.
+    await boot1.client.close();
+    cleanup();
+
+    // The seen json must NOT contain the message (it never reached markHandled).
+    const seenPath = path.join(larkwayDir, "runtime", "channel-seen-messages", "cli_x.json");
+    let seenRaw = "";
+    try {
+      seenRaw = await readFile(seenPath, "utf8");
+    } catch {
+      // ENOENT is fine: nothing was ever persisted.
+    }
+    expect(seenRaw.includes(messageId)).toBe(false);
+
+    // --- Process 2: fresh ChannelClient loads persisted state, then gap-fills.
+    const boot2 = await bootClient(gapItemMock(messageId), larkwayDir);
+    triggerGapFill(boot2.chObj);
+    for (let i = 0; i < 100 && !boot2.dispatched.some((d) => d.messageId === messageId); i++) {
+      await new Promise((r) => setTimeout(r, 20));
+    }
+    // Re-dispatched: in-flight didn't persist + was never promoted to seen.
+    expect(boot2.dispatched.filter((d) => d.messageId === messageId)).toHaveLength(1);
+
+    await boot2.client.close();
+    cleanup();
+  });
+
+  it("(h) completed-not-replayed: a markHandled message is persisted and NOT re-dispatched after a fresh ChannelClient boots", async () => {
+    const messageId = "om_restart_done";
+    const larkwayDir = await mkdtemp(path.join(tmpdir(), "larkway-seen-msgs-"));
+
+    // --- Process 1: dispatch, then complete the turn (markHandled). ---
+    const boot1 = await bootClient(gapItemMock(messageId), larkwayDir);
+    boot1.chObj.handlers["message"]!({
+      raw: {
+        event: {
+          message: {
+            message_id: messageId,
+            chat_id: "oc_test_chat",
+            chat_type: "group",
+            content: JSON.stringify({ text: "@bot do it" }),
+            mentions: [{ id: { open_id: "ou_bot" } }],
+          },
+          sender: { sender_id: { open_id: "ou_sender" } },
+        },
+      },
+    });
+    for (let i = 0; i < 50 && boot1.dispatched.length < 1; i++) await new Promise((r) => setTimeout(r, 10));
+    expect(boot1.dispatched.filter((d) => d.messageId === messageId)).toHaveLength(1);
+    // Turn SUCCEEDS → promoted to the persisted seen set.
+    boot1.client.markHandled(messageId);
+
+    // Assert the persistence write actually happens for MESSAGES (not just chats).
+    const seenPath = path.join(larkwayDir, "runtime", "channel-seen-messages", "cli_x.json");
+    let seenRaw = "";
+    for (let i = 0; i < 100; i++) {
+      try {
+        seenRaw = await readFile(seenPath, "utf8");
+        if (seenRaw.includes(messageId)) break;
+      } catch {
+        // wait below
+      }
+      await new Promise((r) => setTimeout(r, 20));
+    }
+    expect(JSON.parse(seenRaw)).toContain(messageId);
+    await boot1.client.close();
+    cleanup();
+
+    // --- Process 2: fresh ChannelClient loads the seen json, then gap-fills. ---
+    const boot2 = await bootClient(gapItemMock(messageId), larkwayDir);
+    triggerGapFill(boot2.chObj);
+    await new Promise((r) => setTimeout(r, 150));
+    // Already-seen across restart → must NOT re-dispatch.
+    expect(boot2.dispatched.filter((d) => d.messageId === messageId)).toHaveLength(0);
+
+    await boot2.client.close();
+    cleanup();
   });
 });

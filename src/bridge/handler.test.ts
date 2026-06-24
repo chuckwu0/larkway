@@ -192,7 +192,12 @@ function makePersistentSessionStore() {
  * handler.run() processes a single handleOne and returns.
  */
 function makeClient(event: Record<string, unknown>) {
+  // `acked` collects TERMINAL-SUCCESS ids (markHandled). `unhandled` collects
+  // terminal FAILURE/ABORT releases (markUnhandled). acknowledgeMessage is kept
+  // for interface parity and also records into `acked` (its production impl
+  // delegates to markHandled).
   const acked: string[] = [];
+  const unhandled: string[] = [];
   const reactionCalls: Array<{ op: "add" | "remove"; messageId: string }> = [];
   const client = {
     // eslint-disable-next-line @typescript-eslint/require-await
@@ -208,8 +213,14 @@ function makeClient(event: Record<string, unknown>) {
     acknowledgeMessage: (id: string) => {
       acked.push(id);
     },
+    markHandled: (id: string) => {
+      acked.push(id);
+    },
+    markUnhandled: (id: string) => {
+      unhandled.push(id);
+    },
   };
-  return { client, acked, reactionCalls };
+  return { client, acked, unhandled, reactionCalls };
 }
 
 function makeEvent(): Record<string, unknown> {
@@ -358,6 +369,12 @@ describe("handleOne — thin-channel finalize", () => {
       acknowledgeMessage: (id: string) => {
         callOrder.push(`ack:${id}`);
       },
+      markHandled: (id: string) => {
+        callOrder.push(`ack:${id}`);
+      },
+      markUnhandled: (id: string) => {
+        callOrder.push(`unhandled:${id}`);
+      },
     };
     const renderer = {
       async start(messageId: string) {
@@ -454,6 +471,69 @@ describe("handleOne — thin-channel finalize", () => {
     expect(finalizeArgs[0]?.finalText).toBe("已走灰度,MR 已提");
     expect(finalizeArgs[0]?.mentionOpenId).toBeUndefined();
     expect(finalizeArgs[0]?.failureReason).toBeUndefined();
+  });
+
+  it("releases the message as unhandled when handleOne throws BEFORE the main try (e.g. addProcessingReaction rejects)", async () => {
+    // Regression: the dispatcher adds the message to inFlightMessageIds BEFORE
+    // handleOne runs, but the FAILURE catch only covers the main try opened
+    // after card-start. A throw before that (here: a TLS-blip-style reject from
+    // the addProcessingReaction network call) used to escape to run()'s queue
+    // .catch (console.error only) → message stuck in-flight forever → no reply.
+    // The top-level settle guard must release it as UNHANDLED so the next
+    // gap-fill window can re-dispatch it.
+    runClaudeImpl = () => {
+      throw new Error("runner must not start when handleOne throws before the main try");
+    };
+
+    const acked: string[] = [];
+    const unhandled: string[] = [];
+    const client = {
+      // eslint-disable-next-line @typescript-eslint/require-await
+      async *events() {
+        yield makeEvent();
+      },
+      addProcessingReaction: async (_id: string) => {
+        // Transient network failure exactly at the pre-main-try call site.
+        throw new Error("TLS handshake timeout");
+      },
+      removeProcessingReaction: async (_id: string) => {},
+      acknowledgeMessage: (id: string) => {
+        acked.push(id);
+      },
+      markHandled: (id: string) => {
+        acked.push(id);
+      },
+      markUnhandled: (id: string) => {
+        unhandled.push(id);
+      },
+    };
+
+    const { renderer } = makeCardRenderer();
+    const { store } = makeSessionStore();
+
+    const handler = new BridgeHandler({
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      client: client as any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      cardRenderer: renderer as any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      sessionStore: store as any,
+      conventions: makeConventions(),
+      botConfig: { id: "frontend", name: "Frontend", turn_taking_limit: 10, backend: "claude" },
+    });
+
+    await handler.run();
+    // run() is fire-and-forget; the turn settles in the queue's .finally. Yield
+    // a few microtask turns so the dispatched promise chain (and our settle
+    // guard's finally) has run.
+    for (let i = 0; i < 10; i++) await Promise.resolve();
+
+    // The runner must never have started.
+    expect(runnerBackends).toHaveLength(0);
+    // The message must be RELEASED as unhandled (re-dispatchable), not stranded.
+    expect(unhandled).toEqual(["om_msg"]);
+    // And it must NOT be marked handled/seen (that would permanently bury it).
+    expect(acked).toEqual([]);
   });
 });
 
@@ -743,7 +823,7 @@ describe("handleOne — provisioning decision tree (unified model)", () => {
 
     const card = makeCardRenderer();
     const { store } = makeSessionStore();
-    const { client, acked } = makeClient(makeEvent());
+    const { client, acked, unhandled } = makeClient(makeEvent());
     const handler = new BridgeHandler({
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       client: client as any,
@@ -784,7 +864,10 @@ describe("handleOne — provisioning decision tree (unified model)", () => {
     expect(card.finalizeArgs).toHaveLength(1);
     expect(card.finalizeArgs[0]?.success).toBe(false);
     expect(card.finalizeArgs[0]?.failureReason).toContain("transcript.md");
-    expect(acked).toEqual([threadId]);
+    // Terminal FAILURE → markUnhandled (re-dispatchable), NOT markHandled.
+    // The failed turn must stay re-dispatchable by the next gap-fill window.
+    expect(acked).toEqual([]);
+    expect(unhandled).toEqual([threadId]);
     const gitCalls = spawnCalls.filter((c) => c.cmd === "git");
     expect(gitCalls).toHaveLength(0);
   });
