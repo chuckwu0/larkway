@@ -2,8 +2,8 @@
 # scripts/release.sh — cut a Larkway release end-to-end.
 #
 # Bumps the version, updates the version references in README.md / README.zh.md /
-# docs/versioning.md, commits `chore: release vX`, tags, publishes to npm, and
-# pushes. Deterministic; refuses to run if the tag already exists.
+# docs/versioning.md, commits `chore: release vX`, tags, publishes to npm, pushes,
+# and creates a GitHub Release. Deterministic; refuses to run if the tag exists.
 #
 # Usage:
 #   scripts/release.sh <version> "<one-line changelog>"
@@ -90,6 +90,20 @@ git commit -q -m "chore: release v$VERSION"
 git tag "v$VERSION"
 echo "→ npm publish"; npm publish --access public   # prepack builds dist
 echo "→ git push"; git push origin main && git push origin "v$VERSION"
+
+# ── GitHub Release (non-fatal — the tag + npm publish are the source of truth) ─
+# Without this, pushed tags never appear on the repo's Releases page (the "Latest"
+# badge goes stale). Uses the origin repo (fork-friendly; no hardcoded slug).
+if command -v gh >/dev/null 2>&1; then
+  echo "→ gh release create"
+  if gh release create "v$VERSION" --title "larkway v$VERSION" --notes "$NOTES" --latest; then
+    echo "  ✓ GitHub Release v$VERSION created"
+  else
+    echo "  ⚠ gh release create failed — tag is pushed; create the Release manually if you want it on the Releases page."
+  fi
+else
+  echo "  ⚠ gh CLI not found — skipped GitHub Release (tag pushed, npm published). Install gh to auto-create Releases."
+fi
 
 echo
 echo "✓ released larkway v$VERSION"
