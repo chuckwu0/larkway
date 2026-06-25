@@ -185,3 +185,62 @@ describe("StateFileSchema — V2 dynamic choices (agent-declared, bridge-opaque)
     expect(r.success).toBe(false);
   });
 });
+
+describe("StateFileSchema — V2 image blocks (agent-declared, bridge-opaque)", () => {
+  it("parses image_blocks and fills safe card-render defaults", () => {
+    const r = StateFileSchema.safeParse({
+      status: "ready",
+      last_message: "平台正文",
+      image_blocks: [
+        { img_key: "img_v3_preview_001" },
+        {
+          img_key: "img_v3_preview_002",
+          alt: "小红书预览图",
+          title: "对应图片",
+          mode: "crop_center",
+          preview: false,
+        },
+      ],
+      updated_at: "2026-06-25T10:00:00Z",
+    });
+    expect(r.success).toBe(true);
+    if (r.success) {
+      expect(r.data.image_blocks).toEqual([
+        {
+          img_key: "img_v3_preview_001",
+          alt: "图片预览",
+          mode: "fit_horizontal",
+          preview: true,
+        },
+        {
+          img_key: "img_v3_preview_002",
+          alt: "小红书预览图",
+          title: "对应图片",
+          mode: "crop_center",
+          preview: false,
+        },
+      ]);
+    }
+  });
+
+  it("rejects malformed image blocks without weakening required status", () => {
+    expect(
+      StateFileSchema.safeParse({
+        status: "ready",
+        image_blocks: [{ alt: "missing key" }],
+        updated_at: "x",
+      }).success,
+    ).toBe(false);
+
+    const tooMany = Array.from({ length: 5 }, (_, i) => ({
+      img_key: `img_v3_${i}`,
+    }));
+    expect(
+      StateFileSchema.safeParse({
+        status: "ready",
+        image_blocks: tooMany,
+        updated_at: "x",
+      }).success,
+    ).toBe(false);
+  });
+});

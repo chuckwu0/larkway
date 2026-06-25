@@ -350,6 +350,51 @@ describe("buildChoiceRow / dynamic choice card (V2)", () => {
   });
 });
 
+describe("CardRenderer — image blocks (V2)", () => {
+  it("finalize renders markdown body and agent-declared image blocks in the same Card 2.0 body", async () => {
+    const { CardRenderer } = await import("./card.js");
+    const fake = new FakeOutbound();
+    const renderer = new CardRenderer({ outbound: fake, patchIntervalMs: 10_000, botName: "Frontend" });
+    const handle = await renderer.start("om_user_msg");
+
+    await handle.finalize({
+      success: true,
+      finalText: "平台正文",
+      imageBlocks: [
+        {
+          img_key: "img_v3_preview_001",
+          alt: "平台图片预览",
+          title: "图片 1",
+          mode: "crop_center",
+          preview: true,
+        },
+      ],
+      choicePrompt: "继续?",
+      choices: [{ label: "开 PR", value: "请开 PR" }],
+    });
+
+    const card = lastPatchedCard(fake) as unknown as ElementsCard;
+    expect(card.body.elements.some((el) =>
+      el["tag"] === "markdown" && String(el["content"]).includes("平台正文")
+    )).toBe(true);
+
+    const imageEl = card.body.elements.find((el) => el["tag"] === "img");
+    expect(imageEl).toEqual({
+      tag: "img",
+      img_key: "img_v3_preview_001",
+      alt: { tag: "plain_text", content: "平台图片预览" },
+      title: { tag: "plain_text", content: "图片 1" },
+      scale_type: "crop_center",
+      preview: true,
+    });
+
+    const imageIndex = card.body.elements.findIndex((el) => el["tag"] === "img");
+    const choicesIndex = card.body.elements.findIndex((el) => el["tag"] === "column_set");
+    expect(imageIndex).toBeGreaterThan(-1);
+    expect(choicesIndex).toBeGreaterThan(imageIndex);
+  });
+});
+
 // ---------------------------------------------------------------------------
 // Injected OutboundCardClient — proves card.ts orchestration (throttle +
 // finalize) is intact and only the leaf network call is swapped.

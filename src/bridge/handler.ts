@@ -1123,6 +1123,7 @@ export class BridgeHandler {
               // (stale-guard), so stale leftover choices never reappear.
               choices: reportedState?.choices,
               choicePrompt: reportedState?.choice_prompt,
+              imageBlocks: reportedState?.image_blocks,
             });
 
             // Card was finalized successfully — drop its card.json so boot

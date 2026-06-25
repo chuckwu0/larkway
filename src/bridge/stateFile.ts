@@ -38,6 +38,28 @@ const optionalUrl = z.preprocess(
   z.string().optional(),
 );
 
+const imageAlt = z.preprocess(
+  (v) => (typeof v === "string" && v.trim() === "" ? undefined : v),
+  z.string().trim().min(1).max(200).default("图片预览"),
+);
+
+const imageTitle = z.preprocess(
+  (v) => (typeof v === "string" && v.trim() === "" ? undefined : v),
+  z.string().trim().min(1).max(200).optional(),
+);
+
+const ImageBlockSchema = z.object({
+  img_key: z.string().trim().min(1).max(256),
+  alt: imageAlt,
+  title: imageTitle,
+  /**
+   * Agent-facing mode maps directly to Feishu Card JSON 2.0 `scale_type`.
+   * Keep the enum narrow until we have live-card evidence for more modes.
+   */
+  mode: z.enum(["crop_center", "fit_horizontal"]).default("fit_horizontal"),
+  preview: z.boolean().default(true),
+});
+
 export const StateFileSchema = z.object({
   // Thin channel: the bridge only validates `status`. Any other key the bot
   // writes (incl. a legacy `stage`) is a business field — z.object STRIPS
@@ -117,6 +139,13 @@ export const StateFileSchema = z.object({
     .array(z.object({ label: z.string().min(1), value: z.string().min(1) }))
     .max(5)
     .optional(),
+  /**
+   * V2 image blocks (thin-channel). Agents upload or otherwise obtain `img_key`
+   * themselves, then declare generic image previews here. Bridge only renders the
+   * already-declared keys into Feishu Card JSON 2.0 image elements; it does not
+   * download, upload, choose assets, or interpret platform workflows.
+   */
+  image_blocks: z.array(ImageBlockSchema).max(4).optional(),
   /**
    * Optional one-line prompt rendered above the choice buttons (e.g. "选哪个方案?").
    * Rendered VERBATIM, bridge-opaque. Only meaningful alongside `choices`.
