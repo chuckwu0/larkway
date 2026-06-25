@@ -22,9 +22,11 @@ pnpm test          # run all unit tests (vitest)
 pnpm typecheck     # TypeScript strict check (no emit)
 ```
 
-Tests are pure unit tests (no subprocess spawning, no network). The full
-acceptance suite (`pnpm test:v0.3`) requires a live Feishu app credential and
-is intended for maintainers.
+Tests are pure unit tests (no subprocess spawning, no network). The v0.3 local
+readiness gate (`pnpm test:v0.3`) is also safe to run without live Feishu
+credentials; it combines local checks and synthetic smoke fixtures. Real Feishu
+E2E smoke testing is maintainer-only and requires a separately approved test
+environment; see [docs/phase0-readiness.md](docs/phase0-readiness.md).
 
 ## Releasing (maintainers)
 
