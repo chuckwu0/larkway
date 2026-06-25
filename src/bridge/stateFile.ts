@@ -60,6 +60,17 @@ const ImageBlockSchema = z.object({
   preview: z.boolean().default(true),
 });
 
+const CardSectionSchema = z.object({
+  title: imageTitle,
+  body: z.string().trim().min(1).max(12_000),
+  /**
+   * Optional native image shown immediately after this section's markdown body.
+   * This is the strict review-surface path for "text + corresponding thumbnail"
+   * workflows; legacy image_blocks remain available for whole-card appendices.
+   */
+  image: ImageBlockSchema.optional(),
+});
+
 export const StateFileSchema = z.object({
   // Thin channel: the bridge only validates `status`. Any other key the bot
   // writes (incl. a legacy `stage`) is a business field — z.object STRIPS
@@ -146,6 +157,12 @@ export const StateFileSchema = z.object({
    * download, upload, choose assets, or interpret platform workflows.
    */
   image_blocks: z.array(ImageBlockSchema).max(4).optional(),
+  /**
+   * Ordered Card sections (thin-channel). Use when the review surface needs text
+   * and its corresponding native image block to stay adjacent in the same card.
+   * Each section renders as markdown body followed immediately by `image`.
+   */
+  card_sections: z.array(CardSectionSchema).max(8).optional(),
   /**
    * Optional one-line prompt rendered above the choice buttons (e.g. "选哪个方案?").
    * Rendered VERBATIM, bridge-opaque. Only meaningful alongside `choices`.

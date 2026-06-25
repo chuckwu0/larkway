@@ -242,6 +242,7 @@ function renderStateContract(stateFilePath?: string): string[] {
     "- error: 失败原因(搭配 status=failed)",
     "- card_title: 卡片标题覆盖(可选)",
     "- card_color: 卡片配色(可选,success/failure/neutral,也可直接写 green/red/grey)",
+    "- card_sections: 可选有序内容 section 数组,最多 8 个。每项 `{title?, body, image?}`; `body` 是该 section 的 markdown 正文,`image` 与 `image_blocks` 单项格式相同。bridge 会按顺序渲染每个 section,且把 `image` 原生图片块紧跟在该 section 正文之后。需要“平台正文 + 对应缩略图”相邻展示时优先用它。",
     "- image_blocks: 可选图片预览块数组,最多 4 个。每项 `{img_key, alt?, title?, mode?, preview?}`; `img_key` 必须是已上传/可用于卡片的 Feishu 图片 key,`alt` 省略时 bridge 默认“图片预览”,`mode` 只允许 `crop_center`/`fit_horizontal` 并映射到 Card JSON 2.0 `scale_type`,`preview` 默认 true。bridge 不负责下载/上传/选择图片;这些由你用 lark-cli 等工具先完成。",
     "- dev_url / mr_url / 其余业务字段:自由写入,bridge 不感知其业务含义;要让运营看到,请写进 last_message",
     "- updated_at: ISO 8601 timestamp",

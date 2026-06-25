@@ -393,6 +393,67 @@ describe("CardRenderer — image blocks (V2)", () => {
     expect(imageIndex).toBeGreaterThan(-1);
     expect(choicesIndex).toBeGreaterThan(imageIndex);
   });
+
+  it("finalize renders ordered card_sections with each image immediately after its section body", async () => {
+    const { CardRenderer } = await import("./card.js");
+    const fake = new FakeOutbound();
+    const renderer = new CardRenderer({ outbound: fake, patchIntervalMs: 10_000, botName: "Frontend" });
+    const handle = await renderer.start("om_user_msg");
+
+    await handle.finalize({
+      success: true,
+      finalText: "三平台预览",
+      cardSections: [
+        {
+          title: "Jike",
+          body: "即刻正文",
+          image: {
+            img_key: "img_v3_jike",
+            alt: "Jike 图片",
+            mode: "fit_horizontal",
+            preview: true,
+          },
+        },
+        {
+          title: "X",
+          body: "X fallback 正文",
+          image: {
+            img_key: "img_v3_x",
+            alt: "X 图片",
+            mode: "crop_center",
+            preview: true,
+          },
+        },
+        {
+          title: "小红书",
+          body: "小红书正文",
+          image: {
+            img_key: "img_v3_xhs",
+            alt: "小红书图片",
+            mode: "fit_horizontal",
+            preview: true,
+          },
+        },
+      ],
+    });
+
+    const card = lastPatchedCard(fake) as unknown as ElementsCard;
+    const elements = card.body.elements;
+
+    const jikeText = elements.findIndex((el) =>
+      el["tag"] === "markdown" && String(el["content"]).includes("即刻正文")
+    );
+    const xText = elements.findIndex((el) =>
+      el["tag"] === "markdown" && String(el["content"]).includes("X fallback 正文")
+    );
+    const xhsText = elements.findIndex((el) =>
+      el["tag"] === "markdown" && String(el["content"]).includes("小红书正文")
+    );
+
+    expect(elements[jikeText + 1]).toMatchObject({ tag: "img", img_key: "img_v3_jike" });
+    expect(elements[xText + 1]).toMatchObject({ tag: "img", img_key: "img_v3_x" });
+    expect(elements[xhsText + 1]).toMatchObject({ tag: "img", img_key: "img_v3_xhs" });
+  });
 });
 
 // ---------------------------------------------------------------------------

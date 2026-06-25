@@ -88,6 +88,12 @@ export interface CardHandle {
      * The agent owns upload/resource selection; bridge only renders img_key.
      */
     imageBlocks?: ImageBlock[];
+    /**
+     * Agent-declared ordered sections. Each section's image, when present,
+     * renders immediately after that section body so review cards can show
+     * "platform copy + matching thumbnail" as adjacent native blocks.
+     */
+    cardSections?: CardSection[];
   }): Promise<void>;
 }
 
@@ -143,6 +149,15 @@ export interface ImageBlock {
   mode: ImageScaleType;
   /** Whether Feishu should allow image preview on click. */
   preview: boolean;
+}
+
+export interface CardSection {
+  /** Optional section title rendered above the markdown body. */
+  title?: string;
+  /** Markdown body for this section. */
+  body: string;
+  /** Optional native image rendered immediately after this section body. */
+  image?: ImageBlock;
 }
 
 /**
@@ -216,6 +231,22 @@ function buildImageElement(block: ImageBlock): Record<string, unknown> {
     element["title"] = plainText(block.title);
   }
   return element;
+}
+
+function sectionMarkdown(section: CardSection): string {
+  return [section.title ? `**${section.title}**` : "", section.body]
+    .filter(Boolean)
+    .join("\n\n");
+}
+
+function pushMarkdown(elements: unknown[], markdown: string): void {
+  const chunks = chunkMarkdown(markdown);
+  for (let i = 0; i < chunks.length; i++) {
+    elements.push({
+      tag: "markdown",
+      content: i === 0 ? chunks[i] : `(续 ${i + 1})\n${chunks[i]}`,
+    });
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -315,6 +346,7 @@ function buildCardJson(opts: {
   /** Optional one-line prompt rendered above the choice buttons. */
   choicePrompt?: string;
   imageBlocks?: ImageBlock[];
+  cardSections?: CardSection[];
   /** Bot-supplied header title override (e.g. "🎉 dev server 起来了"). */
   titleOverride?: string;
   /**
@@ -367,13 +399,7 @@ function buildCardJson(opts: {
   if (bodyWithMention) {
     // Split into chunks to stay within Feishu's ~3000-char markdown element
     // limit; each chunk becomes its own markdown element.
-    const chunks = chunkMarkdown(bodyWithMention);
-    for (let i = 0; i < chunks.length; i++) {
-      elements.push({
-        tag: "markdown",
-        content: i === 0 ? chunks[i] : `(续 ${i + 1})\n${chunks[i]}`,
-      });
-    }
+    pushMarkdown(elements, bodyWithMention);
   } else if (opts.status === "thinking") {
     elements.push({
       tag: "markdown",
@@ -390,11 +416,31 @@ function buildCardJson(opts: {
     });
   }
 
+  // ── Agent-declared ordered sections ────────────────────────────────────────
+  // Use this when native image adjacency matters. Each section body is pushed
+  // as markdown, then its image element is pushed immediately after it. Section
+  // boundaries get an hr only before the next section, never between a section
+  // body and its corresponding image.
+  if (opts.cardSections && opts.cardSections.length) {
+    if (bodyWithMention || (opts.status === "failure" && opts.failureReason)) {
+      elements.push({ tag: "hr" });
+    }
+    opts.cardSections.forEach((section, index) => {
+      if (index > 0) elements.push({ tag: "hr" });
+      pushMarkdown(elements, sectionMarkdown(section));
+      if (section.image) elements.push(buildImageElement(section.image));
+    });
+  }
+
   // ── Agent-declared image previews ────────────────────────────────────────────
   // The bridge stays thin: it never uploads or selects images. It only renders
   // `img_key` values the agent already declared in state.json.
   if (opts.imageBlocks && opts.imageBlocks.length) {
-    if (bodyWithMention || (opts.status === "failure" && opts.failureReason)) {
+    if (
+      bodyWithMention ||
+      (opts.status === "failure" && opts.failureReason) ||
+      (opts.cardSections && opts.cardSections.length)
+    ) {
       elements.push({ tag: "hr" });
     }
     for (const block of opts.imageBlocks) {
@@ -562,6 +608,7 @@ class CardHandleImpl implements CardHandle {
     choices?: Choice[];
     choicePrompt?: string;
     imageBlocks?: ImageBlock[];
+    cardSections?: CardSection[];
   }): Promise<void> {
     this.finalized = true;
 
@@ -603,6 +650,7 @@ class CardHandleImpl implements CardHandle {
       // V2 dynamic-choice buttons — agent-declared, only on finalize.
       choices: opts.choices,
       choicePrompt: opts.choicePrompt,
+      cardSections: opts.cardSections,
       imageBlocks: opts.imageBlocks,
       titleOverride: opts.titleOverride,
       // Hide tool-use summary on every finalize — the agent finished, so the

@@ -117,6 +117,17 @@ interface FinalizeArgs {
     mode: "crop_center" | "fit_horizontal";
     preview: boolean;
   }>;
+  cardSections?: Array<{
+    title?: string;
+    body: string;
+    image?: {
+      img_key: string;
+      alt: string;
+      title?: string;
+      mode: "crop_center" | "fit_horizontal";
+      preview: boolean;
+    };
+  }>;
 }
 
 /**
@@ -533,6 +544,84 @@ describe("handleOne — thin-channel finalize", () => {
     expect(finalizeArgs).toHaveLength(1);
     expect(finalizeArgs[0]?.finalText).toBe("平台正文");
     expect(finalizeArgs[0]?.imageBlocks).toEqual(finalState.image_blocks);
+  });
+
+  it("passes agent-declared card_sections from fresh state.json into card.finalize", async () => {
+    const threadId = "om_msg";
+    const finalState = {
+      status: "ready",
+      last_message: "三平台预览如下。",
+      card_sections: [
+        {
+          title: "Jike",
+          body: "即刻正文",
+          image: {
+            img_key: "img_v3_jike",
+            alt: "Jike 图片",
+            mode: "fit_horizontal",
+            preview: true,
+          },
+        },
+        {
+          title: "X",
+          body: "X fallback 正文",
+          image: {
+            img_key: "img_v3_x",
+            alt: "X 图片",
+            mode: "crop_center",
+            preview: true,
+          },
+        },
+        {
+          title: "小红书",
+          body: "小红书正文",
+          image: {
+            img_key: "img_v3_xhs",
+            alt: "小红书图片",
+            mode: "fit_horizontal",
+            preview: true,
+          },
+        },
+      ],
+      updated_at: "2026-06-25T10:00:00.000Z",
+    };
+    const wt = await seedWorktree(threadId);
+    await seedRepoCachePath();
+
+    runClaudeImpl = () => ({
+      events: (async function* () {
+        yield { type: "system_init", sessionId: "sess_sections", raw: {} };
+        await writeFile(
+          stateFileMod.stateFilePathOf(wt),
+          JSON.stringify(finalState, null, 2),
+          "utf8",
+        );
+      })(),
+      done: Promise.resolve({ exitCode: 0, sessionId: "sess_sections" }),
+      kill: () => {},
+    });
+
+    const { renderer, finalizeArgs, whenFinalized } = makeCardRenderer();
+    const { store } = makeSessionStore();
+    const { client } = makeClient(makeEvent());
+
+    const handler = new BridgeHandler({
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      client: client as any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      cardRenderer: renderer as any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      sessionStore: store as any,
+      conventions: makeConventions(),
+      botConfig: { id: "frontend", name: "Frontend", turn_taking_limit: 10, backend: "claude" },
+    });
+
+    await handler.run();
+    await whenFinalized;
+
+    expect(finalizeArgs).toHaveLength(1);
+    expect(finalizeArgs[0]?.finalText).toBe("三平台预览如下。");
+    expect(finalizeArgs[0]?.cardSections).toEqual(finalState.card_sections);
   });
 
   it("releases the message as unhandled when handleOne throws BEFORE the main try (e.g. addProcessingReaction rejects)", async () => {

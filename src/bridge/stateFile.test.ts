@@ -244,3 +244,77 @@ describe("StateFileSchema — V2 image blocks (agent-declared, bridge-opaque)", 
     ).toBe(false);
   });
 });
+
+describe("StateFileSchema — ordered card sections with adjacent images", () => {
+  it("parses card_sections and defaults each section image independently", () => {
+    const r = StateFileSchema.safeParse({
+      status: "ready",
+      last_message: "三平台预览如下。",
+      card_sections: [
+        {
+          title: "Jike",
+          body: "即刻正文",
+          image: { img_key: "img_v3_jike" },
+        },
+        {
+          title: "X",
+          body: "X fallback 正文",
+          image: {
+            img_key: "img_v3_x",
+            alt: "X 预览",
+            mode: "crop_center",
+          },
+        },
+      ],
+      updated_at: "2026-06-25T10:00:00Z",
+    });
+
+    expect(r.success).toBe(true);
+    if (r.success) {
+      expect(r.data.card_sections).toEqual([
+        {
+          title: "Jike",
+          body: "即刻正文",
+          image: {
+            img_key: "img_v3_jike",
+            alt: "图片预览",
+            mode: "fit_horizontal",
+            preview: true,
+          },
+        },
+        {
+          title: "X",
+          body: "X fallback 正文",
+          image: {
+            img_key: "img_v3_x",
+            alt: "X 预览",
+            mode: "crop_center",
+            preview: true,
+          },
+        },
+      ]);
+    }
+  });
+
+  it("rejects blank section bodies and caps section count", () => {
+    expect(
+      StateFileSchema.safeParse({
+        status: "ready",
+        card_sections: [{ title: "Jike", body: " " }],
+        updated_at: "x",
+      }).success,
+    ).toBe(false);
+
+    const tooMany = Array.from({ length: 9 }, (_, i) => ({
+      title: `section ${i}`,
+      body: "body",
+    }));
+    expect(
+      StateFileSchema.safeParse({
+        status: "ready",
+        card_sections: tooMany,
+        updated_at: "x",
+      }).success,
+    ).toBe(false);
+  });
+});

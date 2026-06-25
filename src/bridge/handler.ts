@@ -1123,6 +1123,7 @@ export class BridgeHandler {
               // (stale-guard), so stale leftover choices never reappear.
               choices: reportedState?.choices,
               choicePrompt: reportedState?.choice_prompt,
+              cardSections: reportedState?.card_sections,
               imageBlocks: reportedState?.image_blocks,
             });
 
