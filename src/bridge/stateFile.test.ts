@@ -347,4 +347,38 @@ describe("StateFileSchema — V2 content blocks (ordered card body)", () => {
       }).success,
     ).toBe(false);
   });
+
+  it("accepts the scheduled social review-card path: platform markdown followed by matching images", () => {
+    const r = StateFileSchema.safeParse({
+      status: "ready",
+      last_message: "legacy fallback for old renderers",
+      image_blocks: [{ img_key: "img_v3_legacy_tail" }],
+      content_blocks: [
+        { type: "markdown", content: "**Jike**\n\n平台正文 A" },
+        { type: "image", img_key: "img_v3_jike", alt: "Jike 配图" },
+        { type: "markdown", content: "**X**\n\nPlatform copy B" },
+        { type: "image", img_key: "img_v3_x", alt: "X 配图", mode: "crop_center" },
+        { type: "markdown", content: "**小红书**\n\n平台正文 C\n\n#话题" },
+        { type: "image", img_key: "img_v3_xhs", alt: "小红书配图" },
+      ],
+      choices: [{ label: "转 Turing 重审", value: "请转 Turing 重审这个 review card" }],
+      updated_at: "2026-06-26T00:00:00.000Z",
+    });
+
+    expect(r.success).toBe(true);
+    if (r.success) {
+      expect(r.data.last_message).toBe("legacy fallback for old renderers");
+      expect(r.data.image_blocks?.[0]?.img_key).toBe("img_v3_legacy_tail");
+      expect(r.data.content_blocks?.map((block) => block.type)).toEqual([
+        "markdown",
+        "image",
+        "markdown",
+        "image",
+        "markdown",
+        "image",
+      ]);
+      expect(r.data.content_blocks?.filter((block) => block.type === "image")).toHaveLength(3);
+      expect(r.data.choices?.[0]?.value).toBe("请转 Turing 重审这个 review card");
+    }
+  });
 });

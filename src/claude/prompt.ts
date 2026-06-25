@@ -244,6 +244,7 @@ function renderStateContract(stateFilePath?: string): string[] {
     "- card_color: 卡片配色(可选,success/failure/neutral,也可直接写 green/red/grey)",
     "- image_blocks: 可选图片预览块数组,最多 4 个。每项 `{img_key, alt?, title?, mode?, preview?}`; `img_key` 必须是已上传/可用于卡片的 Feishu 图片 key,`alt` 省略时 bridge 默认“图片预览”,`mode` 只允许 `crop_center`/`fit_horizontal` 并映射到 Card JSON 2.0 `scale_type`,`preview` 默认 true。bridge 不负责下载/上传/选择图片;这些由你用 lark-cli 等工具先完成。",
     "- content_blocks: 可选有序正文块数组,最多 12 个 block、最多 4 个 image block。只支持窄 union:`{type:\"markdown\", content}` 和 `{type:\"image\", img_key, alt?, title?, mode?, preview?}`;不支持 raw card JSON。用于正文与图片交错排版,例如 markdown -> image -> markdown -> image。若 `content_blocks` 非空,bridge 以它作为主正文并忽略 `last_message` + `image_blocks` 的正文渲染,避免重复;若省略则保持旧 `last_message` + `image_blocks` 行为。",
+    "- scheduled reply / daily social ops review card 等需要“平台正文 + 匹配图片”同段相邻展示的场景,应先取得各图片 `img_key`,再写 `content_blocks` 为 `平台 markdown -> 对应 image -> 下个平台 markdown -> 对应 image`;不要用单独话题图片消息或尾部 `image_blocks` 代替验收面。",
     "- dev_url / mr_url / 其余业务字段:自由写入,bridge 不感知其业务含义;要让运营看到,请写进 last_message",
     "- updated_at: ISO 8601 timestamp",
     "",

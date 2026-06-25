@@ -543,6 +543,88 @@ describe("CardRenderer — content blocks (V2 ordered card body)", () => {
     expect(choiceIndex).toBeGreaterThan(imageIndex);
   });
 
+  it("renders a scheduled social review card with each platform body adjacent to its matching image", async () => {
+    const { CardRenderer } = await import("./card.js");
+    const fake = new FakeOutbound();
+    const renderer = new CardRenderer({ outbound: fake, patchIntervalMs: 10_000, botName: "SocialOps" });
+    const handle = await renderer.start("om_user_msg");
+
+    handle.handle({
+      type: "tool_use",
+      toolName: "shell",
+      toolInput: { command: "upload synthetic review images" },
+      raw: {},
+    });
+
+    await handle.finalize({
+      success: true,
+      finalText: "legacy fallback should not render when content_blocks exist",
+      imageBlocks: [
+        {
+          img_key: "img_v3_tail",
+          alt: "tail image should not render",
+          mode: "fit_horizontal",
+          preview: true,
+        },
+      ],
+      contentBlocks: [
+        { type: "markdown", content: "**Jike**\n\n即刻正文" },
+        {
+          type: "image",
+          img_key: "img_v3_jike",
+          alt: "Jike 配图",
+          mode: "fit_horizontal",
+          preview: true,
+        },
+        { type: "markdown", content: "**X**\n\nX post body" },
+        {
+          type: "image",
+          img_key: "img_v3_x",
+          alt: "X 配图",
+          mode: "crop_center",
+          preview: true,
+        },
+        { type: "markdown", content: "**小红书**\n\n小红书正文\n\n#话题" },
+        {
+          type: "image",
+          img_key: "img_v3_xhs",
+          alt: "小红书配图",
+          mode: "fit_horizontal",
+          preview: true,
+        },
+      ],
+      choicePrompt: "提交重审?",
+      choices: [{ label: "转 Turing 重审", value: "请转 Turing 重审这个 review card" }],
+    });
+
+    const card = lastPatchedCard(fake) as unknown as ElementsCard;
+    const elements = card.body.elements;
+    const bodyText = JSON.stringify(elements);
+
+    expect(bodyText).toContain("即刻正文");
+    expect(bodyText).toContain("X post body");
+    expect(bodyText).toContain("小红书正文");
+    expect(bodyText).not.toContain("legacy fallback should not render");
+    expect(bodyText).not.toContain("img_v3_tail");
+    expect(bodyText).not.toContain("upload synthetic review images");
+
+    const jikeIndex = elements.findIndex((el) =>
+      el["tag"] === "markdown" && String(el["content"]).includes("即刻正文")
+    );
+    const xIndex = elements.findIndex((el) =>
+      el["tag"] === "markdown" && String(el["content"]).includes("X post body")
+    );
+    const xhsIndex = elements.findIndex((el) =>
+      el["tag"] === "markdown" && String(el["content"]).includes("小红书正文")
+    );
+    const choiceIndex = elements.findIndex((el) => el["tag"] === "column_set");
+
+    expect(elements[jikeIndex + 1]).toMatchObject({ tag: "img", img_key: "img_v3_jike" });
+    expect(elements[xIndex + 1]).toMatchObject({ tag: "img", img_key: "img_v3_x" });
+    expect(elements[xhsIndex + 1]).toMatchObject({ tag: "img", img_key: "img_v3_xhs" });
+    expect(choiceIndex).toBeGreaterThan(xhsIndex + 1);
+  });
+
   it("failure reason stays visible after content blocks and finalized tool summary remains hidden", async () => {
     const { CardRenderer } = await import("./card.js");
     const fake = new FakeOutbound();

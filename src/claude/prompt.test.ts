@@ -95,6 +95,8 @@ describe("renderPrompt — V2 mode (botName set)", () => {
     expect(prompt).toContain("content_blocks");
     expect(prompt).toContain("markdown -> image -> markdown -> image");
     expect(prompt).toContain("若 `content_blocks` 非空");
+    expect(prompt).toContain("scheduled reply / daily social ops review card");
+    expect(prompt).toContain("不要用单独话题图片消息或尾部 `image_blocks` 代替验收面");
     expect(prompt).toContain("choices 渲染在正文内容之后");
     expect(prompt).toContain("last_message 应包含足够让运营验收的证据");
     expect(prompt).toContain("具体证据由任务决定");

@@ -152,6 +152,7 @@ Agent 通过工作区里的 `.larkway/state.json` 或 v0.3 session state artifac
 - `error`: 失败原因。
 - `card_title` / `card_color`: 可选的标题和色彩语义。
 - `choices` / `choice_prompt`: 可选的离散选择。按钮点击只把 value 作为新一轮文本交回 Agent。
+- `content_blocks`: 可选的有序 markdown/image 正文块。需要平台正文与匹配图片在同一 review card 里相邻展示时使用;优先级和示例见 [Review Card Content Blocks](review-card-content-blocks.md)。
 
 关键边界:
 
