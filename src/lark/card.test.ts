@@ -395,6 +395,200 @@ describe("CardRenderer — image blocks (V2)", () => {
   });
 });
 
+describe("CardRenderer — content blocks (V2 ordered card body)", () => {
+  it("renders markdown -> image -> markdown -> image in exact body order", async () => {
+    const { CardRenderer } = await import("./card.js");
+    const fake = new FakeOutbound();
+    const renderer = new CardRenderer({ outbound: fake, patchIntervalMs: 10_000, botName: "Frontend" });
+    const handle = await renderer.start("om_user_msg");
+
+    await handle.finalize({
+      success: true,
+      finalText: "legacy body",
+      contentBlocks: [
+        { type: "markdown", content: "正文 1" },
+        {
+          type: "image",
+          img_key: "img_v3_preview_001",
+          alt: "图 1",
+          mode: "fit_horizontal",
+          preview: true,
+        },
+        { type: "markdown", content: "正文 2" },
+        {
+          type: "image",
+          img_key: "img_v3_preview_002",
+          alt: "图 2",
+          title: "第二张",
+          mode: "crop_center",
+          preview: false,
+        },
+      ],
+    });
+
+    const card = lastPatchedCard(fake) as unknown as ElementsCard;
+    const body = card.body.elements.filter((el) => ["markdown", "img"].includes(String(el["tag"])));
+    expect(body.map((el) => el["tag"])).toEqual(["markdown", "img", "markdown", "img"]);
+    expect(body[0]?.["content"]).toBe("正文 1");
+    expect(body[1]).toEqual({
+      tag: "img",
+      img_key: "img_v3_preview_001",
+      alt: { tag: "plain_text", content: "图 1" },
+      scale_type: "fit_horizontal",
+      preview: true,
+    });
+    expect(body[2]?.["content"]).toBe("正文 2");
+    expect(body[3]).toEqual({
+      tag: "img",
+      img_key: "img_v3_preview_002",
+      alt: { tag: "plain_text", content: "图 2" },
+      title: { tag: "plain_text", content: "第二张" },
+      scale_type: "crop_center",
+      preview: false,
+    });
+  });
+
+  it("keeps legacy image_blocks append path when content_blocks is absent", async () => {
+    const { CardRenderer } = await import("./card.js");
+    const fake = new FakeOutbound();
+    const renderer = new CardRenderer({ outbound: fake, patchIntervalMs: 10_000, botName: "Frontend" });
+    const handle = await renderer.start("om_user_msg");
+
+    await handle.finalize({
+      success: true,
+      finalText: "平台正文",
+      imageBlocks: [
+        {
+          img_key: "img_v3_preview_legacy",
+          alt: "旧图",
+          mode: "fit_horizontal",
+          preview: true,
+        },
+      ],
+    });
+
+    const card = lastPatchedCard(fake) as unknown as ElementsCard;
+    const body = card.body.elements;
+    const markdownIndex = body.findIndex((el) => el["tag"] === "markdown" && el["content"] === "平台正文");
+    const hrIndex = body.findIndex((el, i) => i > markdownIndex && el["tag"] === "hr");
+    const imageIndex = body.findIndex((el) => el["tag"] === "img");
+    expect(markdownIndex).toBeGreaterThan(-1);
+    expect(hrIndex).toBeGreaterThan(markdownIndex);
+    expect(imageIndex).toBeGreaterThan(hrIndex);
+  });
+
+  it("content_blocks take precedence over finalText and image_blocks to avoid duplicate rendering", async () => {
+    const { CardRenderer } = await import("./card.js");
+    const fake = new FakeOutbound();
+    const renderer = new CardRenderer({ outbound: fake, patchIntervalMs: 10_000, botName: "Frontend" });
+    const handle = await renderer.start("om_user_msg");
+
+    await handle.finalize({
+      success: true,
+      finalText: "legacy last_message",
+      imageBlocks: [
+        {
+          img_key: "img_v3_legacy",
+          alt: "旧图",
+          mode: "fit_horizontal",
+          preview: true,
+        },
+      ],
+      contentBlocks: [
+        { type: "markdown", content: "新版正文" },
+        {
+          type: "image",
+          img_key: "img_v3_new",
+          alt: "新图",
+          mode: "fit_horizontal",
+          preview: true,
+        },
+      ],
+    });
+
+    const card = lastPatchedCard(fake) as unknown as ElementsCard;
+    const bodyText = JSON.stringify(card.body.elements);
+    expect(bodyText).toContain("新版正文");
+    expect(bodyText).toContain("img_v3_new");
+    expect(bodyText).not.toContain("legacy last_message");
+    expect(bodyText).not.toContain("img_v3_legacy");
+  });
+
+  it("renders choices after ordered content blocks", async () => {
+    const { CardRenderer } = await import("./card.js");
+    const fake = new FakeOutbound();
+    const renderer = new CardRenderer({ outbound: fake, patchIntervalMs: 10_000, botName: "Frontend" });
+    const handle = await renderer.start("om_user_msg");
+
+    await handle.finalize({
+      success: true,
+      contentBlocks: [
+        { type: "markdown", content: "正文" },
+        {
+          type: "image",
+          img_key: "img_v3_preview",
+          alt: "图",
+          mode: "fit_horizontal",
+          preview: true,
+        },
+      ],
+      choicePrompt: "继续?",
+      choices: [{ label: "继续", value: "继续处理" }],
+    });
+
+    const card = lastPatchedCard(fake) as unknown as ElementsCard;
+    const imageIndex = card.body.elements.findIndex((el) => el["tag"] === "img");
+    const choiceIndex = card.body.elements.findIndex((el) => el["tag"] === "column_set");
+    expect(imageIndex).toBeGreaterThan(-1);
+    expect(choiceIndex).toBeGreaterThan(imageIndex);
+  });
+
+  it("failure reason stays visible after content blocks and finalized tool summary remains hidden", async () => {
+    const { CardRenderer } = await import("./card.js");
+    const fake = new FakeOutbound();
+    const renderer = new CardRenderer({ outbound: fake, patchIntervalMs: 10_000, botName: "Frontend" });
+    const handle = await renderer.start("om_user_msg");
+
+    handle.handle({
+      type: "tool_use",
+      toolName: "shell",
+      toolInput: { command: "pnpm test" },
+      raw: {},
+    });
+    await handle.finalize({
+      success: false,
+      failureReason: "state schema rejected content_blocks",
+      contentBlocks: [{ type: "markdown", content: "我先说明失败前的上下文" }],
+    });
+
+    const card = lastPatchedCard(fake) as unknown as ElementsCard;
+    const bodyText = JSON.stringify(card.body.elements);
+    expect(bodyText).toContain("我先说明失败前的上下文");
+    expect(bodyText).toContain("state schema rejected content_blocks");
+    expect(bodyText).not.toContain("pnpm test");
+    expect(bodyText).not.toContain("shell");
+  });
+
+  it("chunks long markdown content_blocks while keeping total card elements capped", async () => {
+    const { _buildCardJson } = await import("./card.js");
+    const veryLong = Array.from({ length: 90 }, (_, i) => `line-${i} ${"x".repeat(2800)}`).join("\n");
+
+    const jsonStr = _buildCardJson({
+      bodyText: "legacy",
+      toolLines: [],
+      showToolSummary: true,
+      status: "success",
+      contentBlocks: [{ type: "markdown", content: veryLong }],
+      choices: [{ label: "继续", value: "继续" }],
+    });
+    const card = JSON.parse(jsonStr) as ElementsCard;
+    const markdownEls = card.body.elements.filter((el) => el["tag"] === "markdown");
+    expect(markdownEls.length).toBeGreaterThan(1);
+    expect(card.body.elements.length).toBeLessThanOrEqual(50);
+    expect(findColumnSet(card)).toBeDefined();
+  });
+});
+
 // ---------------------------------------------------------------------------
 // Injected OutboundCardClient — proves card.ts orchestration (throttle +
 // finalize) is intact and only the leaf network call is swapped.

@@ -88,6 +88,12 @@ export interface CardHandle {
      * The agent owns upload/resource selection; bridge only renders img_key.
      */
     imageBlocks?: ImageBlock[];
+    /**
+     * Ordered generic card body blocks. When present and non-empty, this is the
+     * authoritative body sequence and legacy bodyText + imageBlocks are ignored
+     * to avoid duplicate rendering.
+     */
+    contentBlocks?: ContentBlock[];
   }): Promise<void>;
 }
 
@@ -144,6 +150,17 @@ export interface ImageBlock {
   /** Whether Feishu should allow image preview on click. */
   preview: boolean;
 }
+
+export interface MarkdownContentBlock {
+  type: "markdown";
+  content: string;
+}
+
+export type ImageContentBlock = ImageBlock & { type: "image" };
+
+export type ContentBlock = MarkdownContentBlock | ImageContentBlock;
+
+const MAX_CARD_ELEMENTS = 50;
 
 /**
  * Short button markers. The agent's `label` can be long (e.g. "Migrate the
@@ -216,6 +233,63 @@ function buildImageElement(block: ImageBlock): Record<string, unknown> {
     element["title"] = plainText(block.title);
   }
   return element;
+}
+
+function canPushElement(elements: unknown[], reservedTail = 0): boolean {
+  return elements.length + reservedTail < MAX_CARD_ELEMENTS;
+}
+
+function pushElement(
+  elements: unknown[],
+  element: unknown,
+  reservedTail = 0,
+): boolean {
+  if (!canPushElement(elements, reservedTail)) return false;
+  elements.push(element);
+  return true;
+}
+
+function pushMarkdownElements(
+  elements: unknown[],
+  text: string,
+  reservedTail = 0,
+): void {
+  const chunks = chunkMarkdown(text);
+  let truncated = false;
+  for (let i = 0; i < chunks.length; i++) {
+    const content = i === 0 ? chunks[i] : `(续 ${i + 1})\n${chunks[i]}`;
+    if (!pushElement(elements, { tag: "markdown", content }, reservedTail)) {
+      truncated = true;
+      break;
+    }
+  }
+  if (truncated && canPushElement(elements, reservedTail)) {
+    pushElement(elements, {
+      tag: "markdown",
+      content: "_内容过长,后续部分已省略_",
+    }, reservedTail);
+  }
+}
+
+function buildContentBlockElements(
+  blocks: ContentBlock[],
+  opts: { mentionOpenId?: string; reservedTail?: number } = {},
+): unknown[] {
+  const elements: unknown[] = [];
+  const mentionPrefix = atMentionMarkdown(opts.mentionOpenId);
+  const reservedTail = opts.reservedTail ?? 0;
+  if (mentionPrefix) {
+    pushMarkdownElements(elements, mentionPrefix, reservedTail);
+  }
+  for (const block of blocks) {
+    if (block.type === "markdown") {
+      const clean = stripLeakedToolMarkup(block.content);
+      if (clean) pushMarkdownElements(elements, clean, reservedTail);
+      continue;
+    }
+    pushElement(elements, buildImageElement(block), reservedTail);
+  }
+  return elements;
 }
 
 // ---------------------------------------------------------------------------
@@ -315,6 +389,7 @@ function buildCardJson(opts: {
   /** Optional one-line prompt rendered above the choice buttons. */
   choicePrompt?: string;
   imageBlocks?: ImageBlock[];
+  contentBlocks?: ContentBlock[];
   /** Bot-supplied header title override (e.g. "🎉 dev server 起来了"). */
   titleOverride?: string;
   /**
@@ -326,6 +401,14 @@ function buildCardJson(opts: {
   hideTools?: boolean;
 }): string {
   const elements: unknown[] = [];
+  const hasContentBlocks = !!opts.contentBlocks?.length;
+  const failureReserve = opts.status === "failure" && opts.failureReason ? 2 : 0;
+  const choicesReserve = opts.choices && opts.choices.length ? 4 : 0;
+  const legacyImagesReserve =
+    !hasContentBlocks && opts.imageBlocks?.length
+      ? opts.imageBlocks.length + 1
+      : 0;
+  const tailReserve = failureReserve + choicesReserve + legacyImagesReserve;
 
   // ── Tool-use summary ───────────────────────────────────────────────────────
   // Position above the body so operator's reading flow is:
@@ -350,11 +433,11 @@ function buildCardJson(opts: {
       omitted > 0
         ? `_(略前 ${omitted} 条工具调用)_\n${recent.join("\n")}`
         : recent.join("\n");
-    elements.push({
+    pushElement(elements, {
       tag: "markdown",
       content,
     });
-    elements.push({ tag: "hr" });
+    pushElement(elements, { tag: "hr" });
   }
 
   // ── Main text block ───────────────────────────────────────────────────────
@@ -364,18 +447,19 @@ function buildCardJson(opts: {
   const mentionPrefix = atMentionMarkdown(opts.mentionOpenId);
   const cleanBody = opts.bodyText ? stripLeakedToolMarkup(opts.bodyText) : "";
   const bodyWithMention = [mentionPrefix, cleanBody].filter(Boolean).join("\n\n");
-  if (bodyWithMention) {
+  if (hasContentBlocks) {
+    elements.push(
+      ...buildContentBlockElements(opts.contentBlocks ?? [], {
+        mentionOpenId: opts.mentionOpenId,
+        reservedTail: tailReserve,
+      }),
+    );
+  } else if (bodyWithMention) {
     // Split into chunks to stay within Feishu's ~3000-char markdown element
     // limit; each chunk becomes its own markdown element.
-    const chunks = chunkMarkdown(bodyWithMention);
-    for (let i = 0; i < chunks.length; i++) {
-      elements.push({
-        tag: "markdown",
-        content: i === 0 ? chunks[i] : `(续 ${i + 1})\n${chunks[i]}`,
-      });
-    }
+    pushMarkdownElements(elements, bodyWithMention, tailReserve);
   } else if (opts.status === "thinking") {
-    elements.push({
+    pushElement(elements, {
       tag: "markdown",
       content: "🤔 思考中…",
     });
@@ -383,22 +467,22 @@ function buildCardJson(opts: {
 
   // ── Failure reason ─────────────────────────────────────────────────────────
   if (opts.status === "failure" && opts.failureReason) {
-    elements.push({ tag: "hr" });
-    elements.push({
+    pushElement(elements, { tag: "hr" }, choicesReserve);
+    pushElement(elements, {
       tag: "markdown",
       content: `⚠️ **错误**: ${opts.failureReason}`,
-    });
+    }, choicesReserve);
   }
 
   // ── Agent-declared image previews ────────────────────────────────────────────
   // The bridge stays thin: it never uploads or selects images. It only renders
   // `img_key` values the agent already declared in state.json.
-  if (opts.imageBlocks && opts.imageBlocks.length) {
+  if (!hasContentBlocks && opts.imageBlocks && opts.imageBlocks.length) {
     if (bodyWithMention || (opts.status === "failure" && opts.failureReason)) {
-      elements.push({ tag: "hr" });
+      pushElement(elements, { tag: "hr" }, choicesReserve);
     }
     for (const block of opts.imageBlocks) {
-      elements.push(buildImageElement(block));
+      pushElement(elements, buildImageElement(block), choicesReserve);
     }
   }
 
@@ -411,14 +495,14 @@ function buildCardJson(opts: {
   // a new turn whose text is the chosen `value` verbatim. Only on finalize:
   // doLivePatch passes NO choices, so buttons never flash mid-stream.
   if (opts.choices && opts.choices.length) {
-    elements.push({ tag: "hr" });
+    pushElement(elements, { tag: "hr" });
     if (opts.choicePrompt) {
-      elements.push({ tag: "markdown", content: opts.choicePrompt });
+      pushElement(elements, { tag: "markdown", content: opts.choicePrompt });
     }
     // Legend (A. <label> / B. <label> …) above short-marker buttons so a long
     // label never truncates inside a narrow column. See buildChoiceRow.
-    elements.push({ tag: "markdown", content: buildChoiceLegend(opts.choices) });
-    elements.push(buildChoiceRow(opts.choices));
+    pushElement(elements, { tag: "markdown", content: buildChoiceLegend(opts.choices) });
+    pushElement(elements, buildChoiceRow(opts.choices));
   }
 
   const headerColor =
@@ -562,6 +646,7 @@ class CardHandleImpl implements CardHandle {
     choices?: Choice[];
     choicePrompt?: string;
     imageBlocks?: ImageBlock[];
+    contentBlocks?: ContentBlock[];
   }): Promise<void> {
     this.finalized = true;
 
@@ -604,6 +689,7 @@ class CardHandleImpl implements CardHandle {
       choices: opts.choices,
       choicePrompt: opts.choicePrompt,
       imageBlocks: opts.imageBlocks,
+      contentBlocks: opts.contentBlocks,
       titleOverride: opts.titleOverride,
       // Hide tool-use summary on every finalize — the agent finished, so the
       // Feishu card should present the result/error only. Diagnostics remain in

@@ -60,6 +60,36 @@ const ImageBlockSchema = z.object({
   preview: z.boolean().default(true),
 });
 
+const ContentMarkdownBlockSchema = z.object({
+  type: z.literal("markdown"),
+  content: z.string().trim().min(1).max(20_000),
+});
+
+const ContentImageBlockSchema = ImageBlockSchema.extend({
+  type: z.literal("image"),
+});
+
+const ContentBlockSchema = z.discriminatedUnion("type", [
+  ContentMarkdownBlockSchema,
+  ContentImageBlockSchema,
+]);
+
+const ContentBlocksSchema = z
+  .array(ContentBlockSchema)
+  .max(12)
+  .superRefine((blocks, ctx) => {
+    const imageCount = blocks.filter((b) => b.type === "image").length;
+    if (imageCount > 4) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.too_big,
+        type: "array",
+        maximum: 4,
+        inclusive: true,
+        message: "content_blocks supports at most 4 image blocks",
+      });
+    }
+  });
+
 export const StateFileSchema = z.object({
   // Thin channel: the bridge only validates `status`. Any other key the bot
   // writes (incl. a legacy `stage`) is a business field — z.object STRIPS
@@ -146,6 +176,13 @@ export const StateFileSchema = z.object({
    * download, upload, choose assets, or interpret platform workflows.
    */
   image_blocks: z.array(ImageBlockSchema).max(4).optional(),
+  /**
+   * V2 ordered card body blocks (thin-channel). When present and non-empty,
+   * these are the authoritative card body sequence and take precedence over
+   * legacy `last_message` + tail-appended `image_blocks` rendering. Narrow union
+   * only: markdown and image. No raw card JSON escape hatch.
+   */
+  content_blocks: ContentBlocksSchema.optional(),
   /**
    * Optional one-line prompt rendered above the choice buttons (e.g. "选哪个方案?").
    * Rendered VERBATIM, bridge-opaque. Only meaningful alongside `choices`.

@@ -1124,6 +1124,7 @@ export class BridgeHandler {
               choices: reportedState?.choices,
               choicePrompt: reportedState?.choice_prompt,
               imageBlocks: reportedState?.image_blocks,
+              contentBlocks: reportedState?.content_blocks,
             });
 
             // Card was finalized successfully — drop its card.json so boot

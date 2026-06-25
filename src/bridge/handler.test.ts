@@ -117,6 +117,17 @@ interface FinalizeArgs {
     mode: "crop_center" | "fit_horizontal";
     preview: boolean;
   }>;
+  contentBlocks?: Array<
+    | { type: "markdown"; content: string }
+    | {
+        type: "image";
+        img_key: string;
+        alt: string;
+        title?: string;
+        mode: "crop_center" | "fit_horizontal";
+        preview: boolean;
+      }
+  >;
 }
 
 /**
@@ -533,6 +544,66 @@ describe("handleOne — thin-channel finalize", () => {
     expect(finalizeArgs).toHaveLength(1);
     expect(finalizeArgs[0]?.finalText).toBe("平台正文");
     expect(finalizeArgs[0]?.imageBlocks).toEqual(finalState.image_blocks);
+  });
+
+  it("passes ordered content_blocks from fresh state.json into card.finalize", async () => {
+    const threadId = "om_msg";
+    const finalState = {
+      status: "ready",
+      last_message: "legacy body should be ignored by renderer",
+      image_blocks: [{ img_key: "img_v3_legacy" }],
+      content_blocks: [
+        { type: "markdown", content: "正文 1" },
+        { type: "image", img_key: "img_v3_preview_001", alt: "图 1", mode: "fit_horizontal", preview: true },
+        { type: "markdown", content: "正文 2" },
+      ],
+      updated_at: "2026-06-25T10:00:00.000Z",
+    };
+    const wt = await seedWorktree(threadId);
+    await seedRepoCachePath();
+
+    runClaudeImpl = () => ({
+      events: (async function* () {
+        yield { type: "system_init", sessionId: "sess_content", raw: {} };
+        await writeFile(
+          stateFileMod.stateFilePathOf(wt),
+          JSON.stringify(finalState, null, 2),
+          "utf8",
+        );
+      })(),
+      done: Promise.resolve({ exitCode: 0, sessionId: "sess_content" }),
+      kill: () => {},
+    });
+
+    const { renderer, finalizeArgs, whenFinalized } = makeCardRenderer();
+    const { store } = makeSessionStore();
+    const { client } = makeClient(makeEvent());
+
+    const handler = new BridgeHandler({
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      client: client as any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      cardRenderer: renderer as any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      sessionStore: store as any,
+      conventions: makeConventions(),
+      botConfig: { id: "frontend", name: "Frontend", turn_taking_limit: 10, backend: "claude" },
+    });
+
+    await handler.run();
+    await whenFinalized;
+
+    expect(finalizeArgs).toHaveLength(1);
+    expect(finalizeArgs[0]?.finalText).toBe("legacy body should be ignored by renderer");
+    expect(finalizeArgs[0]?.imageBlocks).toEqual([
+      {
+        img_key: "img_v3_legacy",
+        alt: "图片预览",
+        mode: "fit_horizontal",
+        preview: true,
+      },
+    ]);
+    expect(finalizeArgs[0]?.contentBlocks).toEqual(finalState.content_blocks);
   });
 
   it("releases the message as unhandled when handleOne throws BEFORE the main try (e.g. addProcessingReaction rejects)", async () => {
