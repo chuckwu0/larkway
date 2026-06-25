@@ -83,6 +83,11 @@ export interface CardHandle {
     choices?: Choice[];
     /** Optional one-line prompt above the choice buttons. */
     choicePrompt?: string;
+    /**
+     * Agent-declared image previews rendered as Card 2.0 image elements.
+     * The agent owns upload/resource selection; bridge only renders img_key.
+     */
+    imageBlocks?: ImageBlock[];
   }): Promise<void>;
 }
 
@@ -123,6 +128,21 @@ export interface Choice {
   label: string;
   /** String round-tripped back to the agent verbatim as the next turn's text. */
   value: string;
+}
+
+export type ImageScaleType = "crop_center" | "fit_horizontal";
+
+export interface ImageBlock {
+  /** Feishu uploaded image key, usually returned by im.images.create. */
+  img_key: string;
+  /** Plain-text alt content; caller/schema should provide a non-empty default. */
+  alt: string;
+  /** Optional plain-text title above the image. */
+  title?: string;
+  /** Maps directly to Feishu Card JSON 2.0 `scale_type`. */
+  mode: ImageScaleType;
+  /** Whether Feishu should allow image preview on click. */
+  preview: boolean;
 }
 
 /**
@@ -178,6 +198,24 @@ function buildChoiceLegend(choices: Choice[]): string {
   return choices
     .map((c, i) => `**${choiceMarker(i)}.** ${c.label}`)
     .join("\n");
+}
+
+function plainText(content: string): { tag: "plain_text"; content: string } {
+  return { tag: "plain_text", content };
+}
+
+function buildImageElement(block: ImageBlock): Record<string, unknown> {
+  const element: Record<string, unknown> = {
+    tag: "img",
+    img_key: block.img_key,
+    alt: plainText(block.alt || "图片预览"),
+    scale_type: block.mode,
+    preview: block.preview,
+  };
+  if (block.title) {
+    element["title"] = plainText(block.title);
+  }
+  return element;
 }
 
 // ---------------------------------------------------------------------------
@@ -276,6 +314,7 @@ function buildCardJson(opts: {
   choices?: Choice[];
   /** Optional one-line prompt rendered above the choice buttons. */
   choicePrompt?: string;
+  imageBlocks?: ImageBlock[];
   /** Bot-supplied header title override (e.g. "🎉 dev server 起来了"). */
   titleOverride?: string;
   /**
@@ -349,6 +388,18 @@ function buildCardJson(opts: {
       tag: "markdown",
       content: `⚠️ **错误**: ${opts.failureReason}`,
     });
+  }
+
+  // ── Agent-declared image previews ────────────────────────────────────────────
+  // The bridge stays thin: it never uploads or selects images. It only renders
+  // `img_key` values the agent already declared in state.json.
+  if (opts.imageBlocks && opts.imageBlocks.length) {
+    if (bodyWithMention || (opts.status === "failure" && opts.failureReason)) {
+      elements.push({ tag: "hr" });
+    }
+    for (const block of opts.imageBlocks) {
+      elements.push(buildImageElement(block));
+    }
   }
 
   // ── Dynamic choice buttons (V2) ─────────────────────────────────────────────
@@ -510,6 +561,7 @@ class CardHandleImpl implements CardHandle {
     colorOverride?: "success" | "failure" | "neutral";
     choices?: Choice[];
     choicePrompt?: string;
+    imageBlocks?: ImageBlock[];
   }): Promise<void> {
     this.finalized = true;
 
@@ -551,6 +603,7 @@ class CardHandleImpl implements CardHandle {
       // V2 dynamic-choice buttons — agent-declared, only on finalize.
       choices: opts.choices,
       choicePrompt: opts.choicePrompt,
+      imageBlocks: opts.imageBlocks,
       titleOverride: opts.titleOverride,
       // Hide tool-use summary on every finalize — the agent finished, so the
       // Feishu card should present the result/error only. Diagnostics remain in

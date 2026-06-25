@@ -110,6 +110,13 @@ interface FinalizeArgs {
   mentionOpenId?: string;
   titleOverride?: string;
   colorOverride?: string;
+  imageBlocks?: Array<{
+    img_key: string;
+    alt: string;
+    title?: string;
+    mode: "crop_center" | "fit_horizontal";
+    preview: boolean;
+  }>;
 }
 
 /**
@@ -471,6 +478,61 @@ describe("handleOne — thin-channel finalize", () => {
     expect(finalizeArgs[0]?.finalText).toBe("已走灰度,MR 已提");
     expect(finalizeArgs[0]?.mentionOpenId).toBeUndefined();
     expect(finalizeArgs[0]?.failureReason).toBeUndefined();
+  });
+
+  it("passes agent-declared image_blocks from fresh state.json into card.finalize", async () => {
+    const threadId = "om_msg";
+    const finalState = {
+      status: "ready",
+      last_message: "平台正文",
+      image_blocks: [
+        {
+          img_key: "img_v3_preview_001",
+          alt: "平台图片预览",
+          title: "预览图",
+          mode: "fit_horizontal",
+          preview: true,
+        },
+      ],
+      updated_at: "2026-06-25T10:00:00.000Z",
+    };
+    const wt = await seedWorktree(threadId);
+    await seedRepoCachePath();
+
+    runClaudeImpl = () => ({
+      events: (async function* () {
+        yield { type: "system_init", sessionId: "sess_img", raw: {} };
+        await writeFile(
+          stateFileMod.stateFilePathOf(wt),
+          JSON.stringify(finalState, null, 2),
+          "utf8",
+        );
+      })(),
+      done: Promise.resolve({ exitCode: 0, sessionId: "sess_img" }),
+      kill: () => {},
+    });
+
+    const { renderer, finalizeArgs, whenFinalized } = makeCardRenderer();
+    const { store } = makeSessionStore();
+    const { client } = makeClient(makeEvent());
+
+    const handler = new BridgeHandler({
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      client: client as any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      cardRenderer: renderer as any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      sessionStore: store as any,
+      conventions: makeConventions(),
+      botConfig: { id: "frontend", name: "Frontend", turn_taking_limit: 10, backend: "claude" },
+    });
+
+    await handler.run();
+    await whenFinalized;
+
+    expect(finalizeArgs).toHaveLength(1);
+    expect(finalizeArgs[0]?.finalText).toBe("平台正文");
+    expect(finalizeArgs[0]?.imageBlocks).toEqual(finalState.image_blocks);
   });
 
   it("releases the message as unhandled when handleOne throws BEFORE the main try (e.g. addProcessingReaction rejects)", async () => {
