@@ -1692,11 +1692,11 @@ describe("ChannelClient — gap-fill retry + failed-window replay (0.3.17)", () 
     return { ch, handlers };
   }
 
-  function gapItemStdout(messageId: string): string {
+  function gapItemStdout(messageId: string, chatId: string): string {
     const items = [
       {
         message_id: messageId,
-        chat_id: "oc_test_chat",
+        chat_id: chatId,
         chat_type: "group",
         content: JSON.stringify({ text: "@bot 断线期间被@了" }),
         sender: { id: "ou_sender" },
@@ -1707,12 +1707,23 @@ describe("ChannelClient — gap-fill retry + failed-window replay (0.3.17)", () 
     return JSON.stringify({ ok: true, data: { messages: items } });
   }
 
+  /** Pull `--chat-id <X>` and `--start <iso>` out of a captured lark-cli argv. */
+  function chatIdOf(args: string[]): string {
+    const i = args.indexOf("--chat-id");
+    return i >= 0 ? args[i + 1]! : "";
+  }
+  function startOf(args: string[]): string {
+    const i = args.indexOf("--start");
+    return i >= 0 ? args[i + 1]! : "";
+  }
+
   async function bootClient(
     execMock: (
       cmd: string,
       args: string[],
       cb: (err: Error | null, result?: { stdout: string; stderr: string }) => void,
     ) => void,
+    allowedChatIds: string[] = ["oc_test_chat"],
   ) {
     vi.resetModules();
     vi.doMock("node:child_process", () => ({ execFile: execMock }));
@@ -1721,7 +1732,7 @@ describe("ChannelClient — gap-fill retry + failed-window replay (0.3.17)", () 
 
     const { ChannelClient } = await import("./channelClient.js");
     const client = new ChannelClient({
-      allowedChatIds: new Set(["oc_test_chat"]),
+      allowedChatIds: new Set(allowedChatIds),
       botOpenId: "ou_bot",
       appId: "cli_x",
       appSecret: "secret",
@@ -1757,7 +1768,7 @@ describe("ChannelClient — gap-fill retry + failed-window replay (0.3.17)", () 
     // Fail the first 2 calls, succeed on the 3rd (== GAP_FILL_MAX_ATTEMPTS).
     const execMock = (
       _cmd: string,
-      _args: string[],
+      args: string[],
       cb: (err: Error | null, result?: { stdout: string; stderr: string }) => void,
     ) => {
       calls++;
@@ -1765,7 +1776,7 @@ describe("ChannelClient — gap-fill retry + failed-window replay (0.3.17)", () 
         cb(new Error("TLS handshake timeout"));
         return;
       }
-      cb(null, { stdout: gapItemStdout(messageId), stderr: "" });
+      cb(null, { stdout: gapItemStdout(messageId, chatIdOf(args)), stderr: "" });
     };
 
     const { client, chObj, dispatched } = await bootClient(execMock);
@@ -1791,13 +1802,104 @@ describe("ChannelClient — gap-fill retry + failed-window replay (0.3.17)", () 
     cleanup();
   });
 
+  // Locks down the look-back EXTENSION (kills BLOCKER 2's silent-clear too): the
+  // replay run's `--start` must reach back to (≤) the earlier failed window's
+  // lower bound. If the extension is reverted, `--start` stays at the newer
+  // reconnect window and this assertion goes RED.
+  it("replay run extends `--start` back to the previously-failed (older) window", async () => {
+    const messageId = "om_replay_start_msg";
+    const starts: string[] = [];
+    let phaseAlwaysFail = true;
+    const execMock = (
+      _cmd: string,
+      args: string[],
+      cb: (err: Error | null, result?: { stdout: string; stderr: string }) => void,
+    ) => {
+      starts.push(startOf(args));
+      if (phaseAlwaysFail) {
+        cb(new Error("TLS handshake timeout"));
+        return;
+      }
+      cb(null, { stdout: gapItemStdout(messageId, chatIdOf(args)), stderr: "" });
+    };
+
+    const { client, chObj, dispatched } = await bootClient(execMock);
+    client.setGapFillSleepForTest(async () => {});
+
+    // Run 1 fails for an OLD disconnect (8 min ago) → window queued at ~8min-buffer.
+    const oldDisconnect = Date.now() - 8 * 60 * 1000;
+    await client.gapFillForTest(oldDisconnect, new Set(["oc_test_chat"]));
+    expect(client.unresolvedGapWindowsForTest().get("oc_test_chat")).toBeDefined();
+    const failedWindowStart = client.unresolvedGapWindowsForTest().get("oc_test_chat")!;
+    const startsBeforeReplay = starts.length;
+
+    // Run 2 succeeds for a RECENT reconnect (now). Without the look-back
+    // extension its `--start` would be ~now; WITH it, `--start` must reach back
+    // to cover the older failed window.
+    phaseAlwaysFail = false;
+    triggerGapFill(chObj);
+    for (let i = 0; i < 200 && !dispatched.includes(messageId); i++) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    expect(dispatched).toContain(messageId);
+
+    const replayStarts = starts.slice(startsBeforeReplay).map((s) => Date.parse(s));
+    const earliestReplayStart = Math.min(...replayStarts);
+    // The replay actually reached back to the old failed window (not just "now").
+    expect(earliestReplayStart).toBeLessThanOrEqual(failedWindowStart);
+    // And once truly covered, the per-chat window is cleared.
+    expect(client.unresolvedGapWindowsForTest().get("oc_test_chat")).toBeUndefined();
+
+    await client.close();
+    cleanup();
+  });
+
+  // BLOCKER 1 direct repro: chatA fails (queued); a SEPARATE successful gapFill
+  // over only {chatB} must NOT clear chatA's unresolved window. With the old
+  // shared-queue clear-up-to-now logic, chatA was wrongly resolved → its @ lost.
+  it("a success over {chatB} does NOT falsely resolve chatA's failed window (cross-chat-set)", async () => {
+    const chatA = "oc_chat_a";
+    const chatB = "oc_chat_b";
+    const msgB = "om_b_msg";
+    // chatA always fails; chatB always succeeds.
+    const execMock = (
+      _cmd: string,
+      args: string[],
+      cb: (err: Error | null, result?: { stdout: string; stderr: string }) => void,
+    ) => {
+      if (chatIdOf(args) === chatA) {
+        cb(new Error("TLS handshake timeout"));
+        return;
+      }
+      cb(null, { stdout: gapItemStdout(msgB, chatIdOf(args)), stderr: "" });
+    };
+
+    const { client, dispatched } = await bootClient(execMock, [chatA, chatB]);
+    client.setGapFillSleepForTest(async () => {});
+
+    // Run 1 over ONLY {chatA} → fails → chatA window queued.
+    await client.gapFillForTest(Date.now() - 60_000, new Set([chatA]));
+    expect(client.unresolvedGapWindowsForTest().get(chatA)).toBeDefined();
+
+    // Run 2 over ONLY {chatB} → succeeds. Must leave chatA's window UNTOUCHED.
+    await client.gapFillForTest(Date.now(), new Set([chatB]));
+    for (let i = 0; i < 100 && !dispatched.includes(msgB); i++) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    expect(dispatched).toContain(msgB); // chatB recovered fine
+    expect(client.unresolvedGapWindowsForTest().get(chatA)).toBeDefined(); // chatA NOT falsely cleared
+
+    await client.close();
+    cleanup();
+  });
+
   it("queues a window for replay when a chat keeps failing, then replays it once the pull recovers", async () => {
     const messageId = "om_replay_msg";
     let phaseAlwaysFail = true;
     let calls = 0;
     const execMock = (
       _cmd: string,
-      _args: string[],
+      args: string[],
       cb: (err: Error | null, result?: { stdout: string; stderr: string }) => void,
     ) => {
       calls++;
@@ -1805,7 +1907,7 @@ describe("ChannelClient — gap-fill retry + failed-window replay (0.3.17)", () 
         cb(new Error("TLS handshake timeout"));
         return;
       }
-      cb(null, { stdout: gapItemStdout(messageId), stderr: "" });
+      cb(null, { stdout: gapItemStdout(messageId, chatIdOf(args)), stderr: "" });
     };
 
     const { client, chObj, dispatched } = await bootClient(execMock);
@@ -1813,10 +1915,10 @@ describe("ChannelClient — gap-fill retry + failed-window replay (0.3.17)", () 
 
     // First gap-fill: every attempt fails → window queued, nothing dispatched.
     triggerGapFill(chObj);
-    for (let i = 0; i < 200 && client.unresolvedGapWindowsForTest().length === 0; i++) {
+    for (let i = 0; i < 200 && client.unresolvedGapWindowsForTest().size === 0; i++) {
       await new Promise((r) => setTimeout(r, 10));
     }
-    expect(client.unresolvedGapWindowsForTest().length).toBe(1);
+    expect(client.unresolvedGapWindowsForTest().get("oc_test_chat")).toBeDefined();
     expect(dispatched).not.toContain(messageId);
     expect(calls).toBe(GAP_FILL_MAX_ATTEMPTS); // retried, didn't abandon after 1
 
@@ -1827,8 +1929,8 @@ describe("ChannelClient — gap-fill retry + failed-window replay (0.3.17)", () 
       await new Promise((r) => setTimeout(r, 10));
     }
     expect(dispatched).toContain(messageId); // the previously-dropped @ is recovered
-    // Queue cleared after the fully-successful replay.
-    expect(client.unresolvedGapWindowsForTest().length).toBe(0);
+    // Per-chat window cleared after the fully-successful replay.
+    expect(client.unresolvedGapWindowsForTest().get("oc_test_chat")).toBeUndefined();
 
     await client.close();
     cleanup();

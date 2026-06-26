@@ -57,13 +57,20 @@ const GAP_FILL_MAX_ATTEMPTS = 3;
 /** Base backoff (ms): attempt N waits BASE * 2^(N-1) → ~1s / 2s / 4s. */
 const GAP_FILL_BACKOFF_BASE_MS = 1000;
 /**
- * Failed-window replay queue cap (bounded, deletable). If a gapFill window still
- * has an unresolved chat after all retries, we record its windowStart so the NEXT
- * successful reconnect/gapFill extends its look-back to cover it (真正补回漏的 @).
- * Keep small + time-bounded so a persistently-broken chat can't grow this forever.
+ * Failed-window replay cap (bounded, deletable). We track, PER CHAT, the oldest
+ * windowStart whose lark-cli pull still failed after all retries, so a later
+ * gapFill that actually pulls that chat extends its look-back to cover it (真正补
+ * 回漏的 @). Cap the number of tracked chats so a persistently-broken fleet can't
+ * grow this unboundedly.
  */
-const UNRESOLVED_WINDOW_MAX_ENTRIES = 20;
-/** Drop unresolved windows older than this — beyond it the @ is unrecoverable anyway. */
+const UNRESOLVED_WINDOW_MAX_CHATS = 50;
+/**
+ * Drop unresolved windows older than this — beyond it the @ is unrecoverable from
+ * history anyway. This is ALSO the replay look-back ceiling: when replaying an old
+ * unresolved window we widen the pull window up to this age (instead of the normal
+ * 5-min clamp) so the pull can actually reach back far enough to recover it —
+ * otherwise an old window could never be covered and would only ever age out.
+ */
 const UNRESOLVED_WINDOW_MAX_AGE_MS = 30 * 60 * 1000; // 30 min
 
 // ---------------------------------------------------------------------------
@@ -438,14 +445,20 @@ export class ChannelClient {
    */
   private readonly recentlySeenChatIds = new Set<string>();
   /**
-   * Bounded queue of gapFill windowStarts that did NOT fully complete (some chat
-   * kept failing after all retries). On the next successful gapFill we extend the
-   * look-back to cover the OLDEST unresolved window, so a transiently-broken
-   * lark-cli pull no longer permanently drops that window's @. Entries are pruned
-   * by age (UNRESOLVED_WINDOW_MAX_AGE_MS) and count (UNRESOLVED_WINDOW_MAX_ENTRIES)
-   * so this stays small and self-cleaning.
+   * PER-CHAT unresolved gapFill windows: chatId → the OLDEST windowStart (ms) for
+   * which that chat's lark-cli history pull still failed after all retries. On a
+   * later gapFill that ACTUALLY pulls this chat, we extend the look-back to cover
+   * its oldest unresolved windowStart and only clear it once the pull truly
+   * reached back that far (its `--start` <= the tracked windowStart). Per-chat (not
+   * a single shared list) so a successful run over chat-set {B} can never falsely
+   * resolve chat A's window (BLOCKER 1), and the look-back-vs-clamp mismatch can
+   * never mark a window resolved before it was reached (BLOCKER 2).
+   *
+   * Bounded: one timestamp per chat (so naturally bounded by #chats), pruned by age
+   * (UNRESOLVED_WINDOW_MAX_AGE_MS — older = unrecoverable from history anyway) and
+   * capped at UNRESOLVED_WINDOW_MAX_CHATS tracked chats.
    */
-  private readonly unresolvedGapWindows: number[] = [];
+  private readonly unresolvedGapWindowByChat = new Map<string, number>();
   /**
    * Backoff sleep used by the per-chat history-pull retry. Indirected through a
    * field purely so tests can observe/await the backoff deterministically; in
@@ -486,9 +499,19 @@ export class ChannelClient {
     this.gapFillSleep = fn;
   }
 
-  /** TEST-ONLY read of the pending unresolved-window replay queue. */
-  unresolvedGapWindowsForTest(): readonly number[] {
-    return [...this.unresolvedGapWindows];
+  /** TEST-ONLY read of the per-chat unresolved-window replay map (chatId → windowStart). */
+  unresolvedGapWindowsForTest(): ReadonlyMap<string, number> {
+    return new Map(this.unresolvedGapWindowByChat);
+  }
+
+  /**
+   * TEST-ONLY direct gapFill invocation with an explicit chat-set override —
+   * mirrors exactly how open-chat discovery calls gapFill on a SUBSET of chats.
+   * Used to reproduce the cross-chat-set replay isolation (BLOCKER 1) without
+   * standing up the full discovery timer.
+   */
+  async gapFillForTest(disconnectAt: number, chatIds: ReadonlySet<string>): Promise<void> {
+    await this.gapFill(disconnectAt, (s) => console.log(`[channel.client] ${s}`), chatIds);
   }
 
   /**
@@ -720,17 +743,6 @@ export class ChannelClient {
     const MAX_GAP_FILL_WINDOW_MS = 5 * 60 * 1000; // 5 minutes
     const BUFFER_MS = 30_000; // 30 s overlap to catch near-boundary messages
     const now = Date.now();
-    // Prune stale unresolved windows, then extend this run's look-back to cover
-    // the OLDEST still-unresolved window so a previously-failed pull gets replayed
-    // (root cause B: one TLS-timeout no longer permanently drops that window's @).
-    this.pruneUnresolvedGapWindows(now);
-    const oldestUnresolved =
-      this.unresolvedGapWindows.length > 0 ? Math.min(...this.unresolvedGapWindows) : disconnectAt;
-    const lookBackFrom = Math.min(disconnectAt, oldestUnresolved);
-    // Clamp the look-back so we never flood the bridge with ancient messages.
-    const windowStart = Math.max(lookBackFrom - BUFFER_MS, now - MAX_GAP_FILL_WINDOW_MS);
-    const startIso = new Date(windowStart).toISOString();
-    const endIso = new Date(now + BUFFER_MS).toISOString();
     const larkCli = this.opts.larkCliPath ?? "lark-cli";
     const profileArgs = this.opts.larkCliProfile ? ["--profile", this.opts.larkCliProfile] : [];
     const botOpenId = this.opts.botOpenId;
@@ -744,6 +756,29 @@ export class ChannelClient {
           ...this.opts.allowedChatIds,
           ...this.recentlySeenChatIds,
         ]);
+
+    // Prune stale per-chat unresolved windows BEFORE we read them for look-back.
+    this.pruneUnresolvedGapWindows(now);
+
+    // Extend this run's look-back ONLY to cover the oldest unresolved window of a
+    // chat we are ACTUALLY pulling this run (BLOCKER 1: never widen for a chat
+    // outside gapFillChatIds, so we also never falsely clear it later). When
+    // replaying such an old window, widen the clamp ceiling to the replay max age
+    // so the pull truly reaches back far enough (BLOCKER 2: no clamp-vs-clear
+    // mismatch — we only clear what `--start` actually covered).
+    let oldestRelevantUnresolved = Infinity;
+    for (const chatId of gapFillChatIds) {
+      const ws = this.unresolvedGapWindowByChat.get(chatId);
+      if (ws !== undefined && ws < oldestRelevantUnresolved) oldestRelevantUnresolved = ws;
+    }
+    const hasReplay = oldestRelevantUnresolved !== Infinity;
+    const lookBackFrom = Math.min(disconnectAt, hasReplay ? oldestRelevantUnresolved : disconnectAt);
+    // Normal runs clamp at 5 min to avoid flooding; replay runs widen the ceiling
+    // to the replay max age so an old unresolved window can actually be reached.
+    const clampCeilingMs = hasReplay ? UNRESOLVED_WINDOW_MAX_AGE_MS : MAX_GAP_FILL_WINDOW_MS;
+    const windowStart = Math.max(lookBackFrom - BUFFER_MS, now - clampCeilingMs);
+    const startIso = new Date(windowStart).toISOString();
+    const endIso = new Date(now + BUFFER_MS).toISOString();
 
     if (gapFillChatIds.size === 0) {
       log(
@@ -881,9 +916,18 @@ export class ChannelClient {
           this.queue.push(ev);
           totalDispatched++;
         }
+        // PER-CHAT resolve (success path): this chat's pull succeeded. Clear its
+        // unresolved window ONLY if THIS run's `--start` actually reached back to
+        // (i.e. <=) the tracked windowStart (BLOCKER 2). If the clamp kept
+        // windowStart NEWER than the tracked window, the old window wasn't really
+        // covered — keep it queued for a later, wider replay.
+        this.resolveUnresolvedGapWindow(chatId, windowStart);
       } catch (e) {
-        // All retries for this chat exhausted → its window may have missed an @.
+        // All retries for this chat exhausted → record THIS chat's window so a
+        // later gapFill that pulls it widens the look-back (BLOCKER 1: per-chat —
+        // another chat's success can't clear this).
         anyChatFailed = true;
+        this.recordUnresolvedGapWindow(chatId, windowStart, log);
         log(
           `gap-fill: lark-cli failed for chat ${chatId} after ${GAP_FILL_MAX_ATTEMPTS} attempt(s): ` +
             (e instanceof Error ? e.message : String(e)),
@@ -891,22 +935,10 @@ export class ChannelClient {
       }
     }
 
-    // Failed-window replay bookkeeping: if every chat succeeded, this run covered
-    // (and cleared) all unresolved windows it looked back over; drop them. If some
-    // chat still failed, remember THIS window's start so the next gapFill extends
-    // its look-back to cover it again.
-    if (!this.closed) {
-      if (anyChatFailed) {
-        this.recordUnresolvedGapWindow(windowStart, log);
-      } else {
-        this.clearUnresolvedGapWindowsUpTo(now);
-      }
-    }
-
     log(
       `gap-fill complete: window=${startIso}..${endIso}, ` +
         `fetched=${totalFetched}, dispatched=${totalDispatched}` +
-        (anyChatFailed ? ` (some chats failed — window queued for replay)` : ``),
+        (anyChatFailed ? ` (some chats failed — per-chat windows queued for replay)` : ``),
     );
   }
 
@@ -945,36 +977,50 @@ export class ChannelClient {
     throw lastErr;
   }
 
-  /** Drop unresolved windows older than UNRESOLVED_WINDOW_MAX_AGE_MS (unrecoverable). */
+  /** Drop per-chat unresolved windows older than the replay max age (unrecoverable). */
   private pruneUnresolvedGapWindows(now: number): void {
     const cutoff = now - UNRESOLVED_WINDOW_MAX_AGE_MS;
-    for (let i = this.unresolvedGapWindows.length - 1; i >= 0; i--) {
-      if ((this.unresolvedGapWindows[i] ?? 0) < cutoff) this.unresolvedGapWindows.splice(i, 1);
+    for (const [chatId, windowStart] of this.unresolvedGapWindowByChat) {
+      if (windowStart < cutoff) this.unresolvedGapWindowByChat.delete(chatId);
     }
   }
 
-  /** Record a window that still had a failing chat, keeping the queue bounded. */
-  private recordUnresolvedGapWindow(windowStart: number, log: (s: string) => void): void {
-    if (!this.unresolvedGapWindows.includes(windowStart)) {
-      this.unresolvedGapWindows.push(windowStart);
-      // Bound by count: drop the NEWEST extras so the OLDEST (most at-risk of
-      // aging out) survive to be replayed first.
-      if (this.unresolvedGapWindows.length > UNRESOLVED_WINDOW_MAX_ENTRIES) {
-        this.unresolvedGapWindows.sort((a, b) => a - b);
-        this.unresolvedGapWindows.length = UNRESOLVED_WINDOW_MAX_ENTRIES;
+  /**
+   * Record (or keep the OLDEST) unresolved window for a chat whose pull failed.
+   * Bounded by chat count: if the map is at capacity and this is a new chat, we
+   * evict the chat with the NEWEST window (least at risk of aging out) so the
+   * oldest at-risk windows survive to be replayed first.
+   */
+  private recordUnresolvedGapWindow(chatId: string, windowStart: number, log: (s: string) => void): void {
+    const existing = this.unresolvedGapWindowByChat.get(chatId);
+    if (existing !== undefined && existing <= windowStart) return; // already tracking an older window
+    if (existing === undefined && this.unresolvedGapWindowByChat.size >= UNRESOLVED_WINDOW_MAX_CHATS) {
+      let newestChat: string | null = null;
+      let newestWs = -Infinity;
+      for (const [c, ws] of this.unresolvedGapWindowByChat) {
+        if (ws > newestWs) { newestWs = ws; newestChat = c; }
       }
-      log(
-        `gap-fill: queued unresolved window start=${new Date(windowStart).toISOString()} ` +
-          `for replay (pending=${this.unresolvedGapWindows.length})`,
-      );
+      if (newestChat !== null && newestWs > windowStart) this.unresolvedGapWindowByChat.delete(newestChat);
+      else if (newestChat !== null) return; // all tracked windows are older — keep them, drop this one
     }
+    this.unresolvedGapWindowByChat.set(chatId, windowStart);
+    log(
+      `gap-fill: queued unresolved window for chat ${chatId} ` +
+        `start=${new Date(windowStart).toISOString()} (tracked chats=${this.unresolvedGapWindowByChat.size})`,
+    );
   }
 
-  /** A fully-successful gapFill covering [windowStart..now] clears windows ≤ now. */
-  private clearUnresolvedGapWindowsUpTo(now: number): void {
-    for (let i = this.unresolvedGapWindows.length - 1; i >= 0; i--) {
-      if ((this.unresolvedGapWindows[i] ?? Infinity) <= now) this.unresolvedGapWindows.splice(i, 1);
-    }
+  /**
+   * Resolve a chat's unresolved window on a SUCCESSFUL pull — but ONLY if this
+   * run's `coveredFrom` (its lark-cli `--start`) actually reached back to at or
+   * before the tracked windowStart. If the clamp kept `coveredFrom` NEWER than the
+   * tracked window, the old window was NOT really covered → keep it queued so a
+   * later, wider replay can reach it (BLOCKER 2).
+   */
+  private resolveUnresolvedGapWindow(chatId: string, coveredFrom: number): void {
+    const tracked = this.unresolvedGapWindowByChat.get(chatId);
+    if (tracked === undefined) return;
+    if (coveredFrom <= tracked) this.unresolvedGapWindowByChat.delete(chatId);
   }
 
   private startOpenChatDiscovery(log: (s: string) => void): void {

@@ -45,9 +45,33 @@ describe("crashGuard handlers", () => {
 
     expect(exitSpy).not.toHaveBeenCalled();
     expect(errors).toHaveLength(1);
-    // Non-Error reasons are coerced to an Error so a stack is always logged.
-    expect(errors[0]?.[1]).toBeInstanceOf(Error);
-    expect((errors[0]?.[1] as Error).message).toBe("some non-error reason");
+    // Non-Error reasons are rendered via util.inspect (string), not coerced.
+    expect(String(errors[0]?.[1])).toContain("some non-error reason");
+  });
+
+  it("handleUnhandledRejection renders a non-Error OBJECT reason without collapsing to [object Object]", () => {
+    vi.spyOn(process, "exit").mockImplementation((() => undefined) as unknown as typeof process.exit);
+    const errors: unknown[][] = [];
+    const log = { error: (...args: unknown[]) => errors.push(args) };
+
+    // An object reason (e.g. an SDK error-like payload) must keep its fields.
+    handleUnhandledRejection({ code: "ETIMEDOUT", detail: "tls handshake" }, log);
+
+    const rendered = String(errors[0]?.[1]);
+    expect(rendered).not.toContain("[object Object]");
+    expect(rendered).toContain("ETIMEDOUT");
+    expect(rendered).toContain("tls handshake");
+  });
+
+  it("handleUnhandledRejection passes an Error reason through (stack preserved)", () => {
+    vi.spyOn(process, "exit").mockImplementation((() => undefined) as unknown as typeof process.exit);
+    const errors: unknown[][] = [];
+    const log = { error: (...args: unknown[]) => errors.push(args) };
+
+    const err = new Error("rejected with a real error");
+    handleUnhandledRejection(err, log);
+
+    expect(errors[0]?.[1]).toBe(err); // same Error object → stack intact
   });
 
   it("registerCrashGuard registers process handlers without throwing", () => {

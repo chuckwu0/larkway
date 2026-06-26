@@ -33,7 +33,15 @@
  *   directly (e.g. the split-out `@larksuite/channel` package attaching its own
  *   ws 'error' listener, or a node-sdk that no longer re-throws), delete this file
  *   and its single call site in main.ts.
+ *
+ * BOUNDARY:
+ *   The guard's own logging is the last line of defence — if the injected logger
+ *   ITSELF throws, that throw is NOT caught here and would re-enter the crash path
+ *   (a second uncaughtException). The default logger is `console`, whose `.error`
+ *   does not throw in normal operation, so this is a non-issue in production; it's
+ *   only a caveat for an exotic custom logger.
  */
+import { inspect } from "node:util";
 
 /** Default logger — overridable in tests so we can assert "logged, never exited". */
 export interface CrashGuardLogger {
@@ -55,9 +63,13 @@ export function handleUncaughtException(
 
 /** Handle unhandledRejection: log full reason, NEVER exit. Exported for testing. */
 export function handleUnhandledRejection(reason: unknown, log: CrashGuardLogger = console): void {
+  // An Error reason is passed through (full stack stays visible). A non-Error
+  // reason is rendered with util.inspect so an object keeps its code/detail
+  // fields instead of collapsing to "[object Object]" via String().
+  const rendered = reason instanceof Error ? reason : inspect(reason, { depth: 4 });
   log.error(
     "[larkway] unhandledRejection — bridge STAYS UP (crash guard). Full reason:",
-    reason instanceof Error ? reason : new Error(String(reason)),
+    rendered,
   );
 }
 
