@@ -24,7 +24,8 @@
 | v0.3.13 | v0.3.13 | patch / 已发布 | lark-cli profile 启动改为幂等重灌:去掉"已注册就跳过"的弱检查,凭据漂移(keychain 迁移 / 无 `--name` 遗留 profile)重启自愈。 |
 | v0.3.14 | v0.3.14 | patch / 已发布 | gap-fill 恢复话题回复 @ 不再静默丢失:in-flight/seen 双集合自愈 + handleOne 终态 settle 保证 + 建卡片瞬时错误重试 + 从 message_app_link 解析真实 omt_ thread + 重试上限 |
 | v0.3.15 | v0.3.15 | patch / 已发布 | drop vendored node-sdk for pinned @larksuiteoapi/node-sdk 1.67.0; enable WS handshake-timeout + ping liveness watchdog |
-| v0.3.16 | v0.3.16 | 当前 patch / 已发布 | render ordered content_blocks in review cards |
+| v0.3.16 | v0.3.16 | patch / 已发布 | render ordered content_blocks in review cards |
+| v0.3.17 | v0.3.17 | 当前 patch / 已发布 | resilience: bridge no longer dies on a WebSocket transport error (process-level uncaughtException/unhandledRejection guard); gap-fill now retries with backoff and replays windows missed during a disconnect (per-chat tracking) so @-mentions landing during a reconnect are recovered instead of silently dropped |
 
 ## 使用原则
 
@@ -53,4 +54,5 @@ v0.3.13       = lark-cli profile 启动幂等重灌(凭据漂移重启自愈)
 v0.3.14       = gap-fill 恢复话题回复 @ 不再静默丢失:in-flight/seen 双集合自愈 + handleOne 终态 settle 保证 + 建卡片瞬时错误重试 + 从 message_app_link 解析真实 omt_ thread + 重试上限
 v0.3.15       = drop vendored node-sdk for pinned @larksuiteoapi/node-sdk 1.67.0; enable WS handshake-timeout + ping liveness watchdog
 v0.3.16       = render ordered content_blocks in review cards
+v0.3.17       = resilience: bridge no longer dies on a WebSocket transport error (process-level uncaughtException/unhandledRejection guard); gap-fill now retries with backoff and replays windows missed during a disconnect (per-chat tracking) so @-mentions landing during a reconnect are recovered instead of silently dropped
 ```
