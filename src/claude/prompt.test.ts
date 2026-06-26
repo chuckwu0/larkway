@@ -92,6 +92,12 @@ describe("renderPrompt — V2 mode (botName set)", () => {
     const prompt = renderPrompt(makeInput({ botName: "Frontend" }));
     expect(prompt).toContain("<state-contract>");
     expect(prompt).toContain("status: in_progress / ready / failed");
+    expect(prompt).toContain("content_blocks");
+    expect(prompt).toContain("markdown -> image -> markdown -> image");
+    expect(prompt).toContain("若 `content_blocks` 非空");
+    expect(prompt).toContain("scheduled reply / daily social ops review card");
+    expect(prompt).toContain("不要用单独话题图片消息或尾部 `image_blocks` 代替验收面");
+    expect(prompt).toContain("choices 渲染在正文内容之后");
     expect(prompt).toContain("last_message 应包含足够让运营验收的证据");
     expect(prompt).toContain("具体证据由任务决定");
     expect(prompt).toContain("dogfood E2E 的严格清单只在 dogfood guide 中要求");
@@ -309,7 +315,7 @@ describe("renderPrompt — V2 mode (botName set)", () => {
 
   it("base contract: agent owns final card content, bridge does not infer business status", () => {
     const prompt = renderPrompt(makeInput({ botName: "Frontend" }));
-    expect(prompt).toContain("最终成功卡片以你的 last_message 为主");
+    expect(prompt).toContain("最终成功卡片以你的 `content_blocks`(若非空)或 `last_message` 为主");
     expect(prompt).toContain("不要依赖 bridge 从输出里解析业务阶段");
     expect(prompt).toContain("不要求固定格式");
   });

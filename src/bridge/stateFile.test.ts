@@ -244,3 +244,141 @@ describe("StateFileSchema — V2 image blocks (agent-declared, bridge-opaque)", 
     ).toBe(false);
   });
 });
+
+describe("StateFileSchema — V2 content blocks (ordered card body)", () => {
+  it("parses ordered markdown/image content_blocks and fills image defaults", () => {
+    const r = StateFileSchema.safeParse({
+      status: "ready",
+      last_message: "legacy fallback",
+      image_blocks: [{ img_key: "img_v3_legacy" }],
+      content_blocks: [
+        { type: "markdown", content: "正文 1" },
+        { type: "image", img_key: "img_v3_001" },
+        { type: "markdown", content: "正文 2" },
+        {
+          type: "image",
+          img_key: "img_v3_002",
+          alt: "第二张图",
+          title: "图 2",
+          mode: "crop_center",
+          preview: false,
+        },
+      ],
+      updated_at: "2026-06-25T10:00:00Z",
+    });
+    expect(r.success).toBe(true);
+    if (r.success) {
+      expect(r.data.content_blocks).toEqual([
+        { type: "markdown", content: "正文 1" },
+        {
+          type: "image",
+          img_key: "img_v3_001",
+          alt: "图片预览",
+          mode: "fit_horizontal",
+          preview: true,
+        },
+        { type: "markdown", content: "正文 2" },
+        {
+          type: "image",
+          img_key: "img_v3_002",
+          alt: "第二张图",
+          title: "图 2",
+          mode: "crop_center",
+          preview: false,
+        },
+      ]);
+      // Schema preserves legacy fields; renderer owns precedence.
+      expect(r.data.last_message).toBe("legacy fallback");
+      expect(r.data.image_blocks?.[0]?.img_key).toBe("img_v3_legacy");
+    }
+  });
+
+  it("rejects unsupported content block types instead of exposing raw card JSON", () => {
+    const r = StateFileSchema.safeParse({
+      status: "ready",
+      content_blocks: [
+        { type: "raw_card_json", elements: [{ tag: "markdown", content: "x" }] },
+      ],
+      updated_at: "x",
+    });
+    expect(r.success).toBe(false);
+  });
+
+  it("rejects malformed markdown/image content blocks", () => {
+    expect(
+      StateFileSchema.safeParse({
+        status: "ready",
+        content_blocks: [{ type: "markdown", content: "" }],
+        updated_at: "x",
+      }).success,
+    ).toBe(false);
+
+    expect(
+      StateFileSchema.safeParse({
+        status: "ready",
+        content_blocks: [{ type: "image", alt: "missing key" }],
+        updated_at: "x",
+      }).success,
+    ).toBe(false);
+  });
+
+  it("caps content block count and image count", () => {
+    const thirteen = Array.from({ length: 13 }, (_, i) => ({
+      type: "markdown",
+      content: `block ${i}`,
+    }));
+    expect(
+      StateFileSchema.safeParse({
+        status: "ready",
+        content_blocks: thirteen,
+        updated_at: "x",
+      }).success,
+    ).toBe(false);
+
+    const fiveImages = Array.from({ length: 5 }, (_, i) => ({
+      type: "image",
+      img_key: `img_v3_${i}`,
+    }));
+    expect(
+      StateFileSchema.safeParse({
+        status: "ready",
+        content_blocks: fiveImages,
+        updated_at: "x",
+      }).success,
+    ).toBe(false);
+  });
+
+  it("accepts the scheduled social review-card path: platform markdown followed by matching images", () => {
+    const r = StateFileSchema.safeParse({
+      status: "ready",
+      last_message: "legacy fallback for old renderers",
+      image_blocks: [{ img_key: "img_v3_legacy_tail" }],
+      content_blocks: [
+        { type: "markdown", content: "**Jike**\n\n平台正文 A" },
+        { type: "image", img_key: "img_v3_jike", alt: "Jike 配图" },
+        { type: "markdown", content: "**X**\n\nPlatform copy B" },
+        { type: "image", img_key: "img_v3_x", alt: "X 配图", mode: "crop_center" },
+        { type: "markdown", content: "**小红书**\n\n平台正文 C\n\n#话题" },
+        { type: "image", img_key: "img_v3_xhs", alt: "小红书配图" },
+      ],
+      choices: [{ label: "转 Turing 重审", value: "请转 Turing 重审这个 review card" }],
+      updated_at: "2026-06-26T00:00:00.000Z",
+    });
+
+    expect(r.success).toBe(true);
+    if (r.success) {
+      expect(r.data.last_message).toBe("legacy fallback for old renderers");
+      expect(r.data.image_blocks?.[0]?.img_key).toBe("img_v3_legacy_tail");
+      expect(r.data.content_blocks?.map((block) => block.type)).toEqual([
+        "markdown",
+        "image",
+        "markdown",
+        "image",
+        "markdown",
+        "image",
+      ]);
+      expect(r.data.content_blocks?.filter((block) => block.type === "image")).toHaveLength(3);
+      expect(r.data.choices?.[0]?.value).toBe("请转 Turing 重审这个 review card");
+    }
+  });
+});
