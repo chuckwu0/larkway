@@ -23,7 +23,8 @@
 | v0.3.12 | v0.3.12 | patch / 已发布 | 补齐跨 session 长期记忆 memory/ 层(增删一体生命周期)+ 修复单 bot 模式 lark-cli profile 缺失。 |
 | v0.3.13 | v0.3.13 | patch / 已发布 | lark-cli profile 启动改为幂等重灌:去掉"已注册就跳过"的弱检查,凭据漂移(keychain 迁移 / 无 `--name` 遗留 profile)重启自愈。 |
 | v0.3.14 | v0.3.14 | patch / 已发布 | gap-fill 恢复话题回复 @ 不再静默丢失:in-flight/seen 双集合自愈 + handleOne 终态 settle 保证 + 建卡片瞬时错误重试 + 从 message_app_link 解析真实 omt_ thread + 重试上限 |
-| v0.3.15 | v0.3.15 | 当前 patch / 已发布 | drop vendored node-sdk for pinned @larksuiteoapi/node-sdk 1.67.0; enable WS handshake-timeout + ping liveness watchdog |
+| v0.3.15 | v0.3.15 | patch / 已发布 | drop vendored node-sdk for pinned @larksuiteoapi/node-sdk 1.67.0; enable WS handshake-timeout + ping liveness watchdog |
+| v0.3.16 | v0.3.16 | 当前 patch / 已发布 | render ordered content_blocks in review cards |
 
 ## 使用原则
 
@@ -51,4 +52,5 @@ v0.3.12       = 跨 session 记忆 memory/ 层 + 单 bot lark-cli profile 修复
 v0.3.13       = lark-cli profile 启动幂等重灌(凭据漂移重启自愈)
 v0.3.14       = gap-fill 恢复话题回复 @ 不再静默丢失:in-flight/seen 双集合自愈 + handleOne 终态 settle 保证 + 建卡片瞬时错误重试 + 从 message_app_link 解析真实 omt_ thread + 重试上限
 v0.3.15       = drop vendored node-sdk for pinned @larksuiteoapi/node-sdk 1.67.0; enable WS handshake-timeout + ping liveness watchdog
+v0.3.16       = render ordered content_blocks in review cards
 ```
