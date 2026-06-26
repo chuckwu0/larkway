@@ -369,3 +369,45 @@ export async function markPostLedgerFallbackVisible(
   await writePostFile(worktreePath, next);
   return next;
 }
+
+export async function markPostLedgerPolicyBlockedVisible(
+  worktreePath: string,
+  idempotencyKey: string,
+  opts: {
+    fallbackCardMessageId: string;
+    error: string;
+    now?: () => string;
+  },
+): Promise<PostFile> {
+  const existing = (await readPostFile(worktreePath)) ?? emptyPostFile();
+  const idx = existing.posts.findIndex((post) => post.idempotencyKey === idempotencyKey);
+  if (idx < 0) {
+    throw new Error(`post ledger entry not found: ${idempotencyKey}`);
+  }
+
+  const current = existing.posts[idx];
+  assertPostStatusTransition(current.status, "policy_blocked");
+  const now = opts.now?.() ?? new Date().toISOString();
+  const nextPosts = [...existing.posts];
+  nextPosts[idx] = {
+    ...current,
+    status: "policy_blocked",
+    fallbackCardMessageId: opts.fallbackCardMessageId,
+    error: opts.error,
+    updatedAt: now,
+    attempts: [
+      ...current.attempts,
+      {
+        attemptedAt: now,
+        status: "failed",
+        retryable: false,
+        code: "mention_policy_blocked",
+        error: opts.error,
+      },
+    ],
+  };
+
+  const next = { version: 1 as const, posts: nextPosts };
+  await writePostFile(worktreePath, next);
+  return next;
+}

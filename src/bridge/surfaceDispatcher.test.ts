@@ -222,6 +222,35 @@ describe("dispatchResponseSurface", () => {
       expect(after?.posts[0]?.attempts).toEqual([]);
     }));
 
+  it("does not terminalize policy_blocked before a visible fallback card is finalized", async () =>
+    withTemp(async (dir) => {
+      const { client, calls } = fakePostClient();
+      const result = await dispatchResponseSurface(
+        baseInput({
+          worktreePath: dir,
+          cardStarted: false,
+          postClient: client,
+          state: state({
+            mode: "post",
+            primary: "post",
+            post: { mentions: [{ user_id: "user_blocked", label: "Blocked" }] },
+          }),
+        }),
+      );
+
+      expect(result.reason).toBe("mention-policy-blocked");
+      expect(result.visible).toBe(true);
+      expect(result.card?.success).toBe(false);
+      expect(result.post?.requiresPolicyLedgerMark).toBe(true);
+      expect(calls).toHaveLength(0);
+
+      const after = await readPostFile(dir);
+      expect(after?.posts[0]?.status).toBe("planned");
+      expect(after?.posts[0]?.fallbackCardMessageId).toBeUndefined();
+      expect(after?.posts[0]?.postMessageId).toBeUndefined();
+      expect(after?.posts[0]?.attempts).toEqual([]);
+    }));
+
   it("uses a compact secondary card for hybrid without repeating the main post body", async () =>
     withTemp(async (dir) => {
       const { client } = fakePostClient();

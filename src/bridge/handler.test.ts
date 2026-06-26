@@ -11,6 +11,7 @@ import { mkdtemp, rm, mkdir, writeFile, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { readPostFile, writePostFile } from "./postFile.js";
+import { reconcileOrphanedCards } from "./reconcile.js";
 import { buildPostContent } from "../lark/postContent.js";
 import { derivePostIdempotencyKey, digestPostContent } from "../lark/idempotency.js";
 import type { OutboundPostClient } from "../lark/outboundPostClient.js";
@@ -981,6 +982,99 @@ describe("handleOne — thin-channel finalize", () => {
     expect(ledger?.posts[0]?.status).toBe("fallback_visible");
     expect(ledger?.posts[0]?.fallbackCardMessageId).toBe("om_card");
     expect(ledger?.posts[0]?.attempts[0]?.code).toBe("orphan_reconcile");
+  });
+
+  it("late-starts a visible fallback card before marking a disallowed mention policy_blocked", async () => {
+    const threadId = "om_msg";
+    const finalState = {
+      status: "ready",
+      last_message: "policy blocked 也必须先有可见卡",
+      response_surface: {
+        mode: "post",
+        primary: "post",
+        post: { mentions: [{ user_id: "user_blocked", label: "Blocked" }] },
+      },
+      updated_at: "2026-06-26T10:00:00.000Z",
+    };
+    const wt = await seedWorktree(threadId);
+    await seedRepoCachePath();
+    const { client: postClient, calls } = makePostClient();
+
+    runClaudeImpl = () => ({
+      events: (async function* () {
+        yield { type: "system_init", sessionId: "sess_surface_policy_blocked", raw: {} };
+        await writeFile(
+          stateFileMod.stateFilePathOf(wt),
+          JSON.stringify(finalState, null, 2),
+          "utf8",
+        );
+      })(),
+      done: Promise.resolve({ exitCode: 0, sessionId: "sess_surface_policy_blocked" }),
+      kill: () => {},
+    });
+
+    const { renderer, startArgs, finalizeArgs, whenFinalized } = makeCardRenderer();
+    const { store } = makeSessionStore();
+    const { client } = makeClient(makeEvent());
+
+    const handler = new BridgeHandler({
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      client: client as any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      cardRenderer: renderer as any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      sessionStore: store as any,
+      conventions: makeConventions(),
+      botConfig: {
+        id: "frontend",
+        name: "Frontend",
+        turn_taking_limit: 10,
+        backend: "claude",
+        response_surface_prototype: {
+          enabled: true,
+          allowed_chats: [],
+          allowed_threads: ["om_msg"],
+          lazy_card_creation: true,
+          kill_switch: false,
+          post_outbound_enabled: true,
+          allowed_mention_open_ids: ["user_allowed"],
+          max_posts_per_turn: 1,
+          max_posts_per_window: 4,
+          post_window_ms: 60_000,
+          max_post_attempts: 3,
+          text_threshold_chars: 900,
+        },
+      },
+      postClient,
+    });
+
+    await handler.run();
+    await whenFinalized;
+
+    expect(startArgs).toHaveLength(1);
+    expect(finalizeArgs).toHaveLength(1);
+    expect(finalizeArgs[0]?.success).toBe(false);
+    expect(finalizeArgs[0]?.failureReason).toContain("allowed_mention_open_ids");
+    expect(calls).toHaveLength(0);
+    let ledger = await readPostFile(wt);
+    for (let i = 0; i < 100 && ledger?.posts[0]?.status !== "policy_blocked"; i++) {
+      await new Promise((r) => setTimeout(r, 10));
+      ledger = await readPostFile(wt);
+    }
+    expect(ledger?.posts[0]?.status).toBe("policy_blocked");
+    expect(ledger?.posts[0]?.fallbackCardMessageId).toBe("om_card");
+    expect(ledger?.posts[0]?.postMessageId).toBeUndefined();
+    expect(ledger?.posts[0]?.attempts[0]?.code).toBe("mention_policy_blocked");
+
+    await reconcileOrphanedCards({
+      worktreesDir: root,
+      botId: "frontend",
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      cardRenderer: renderer as any,
+      log: () => {},
+    });
+    expect(startArgs).toHaveLength(1);
+    expect((await readPostFile(wt))?.posts[0]?.status).toBe("policy_blocked");
   });
 
   it("late-stage state.json WITHOUT dev_url is NOT probed and NOT demoted (status=ready → success)", async () => {

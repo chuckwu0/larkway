@@ -42,7 +42,7 @@ import {
   type ResponseSurfacePrototypeConfig,
 } from "../responseSurface.js";
 import type { OutboundPostClient } from "../lark/outboundPostClient.js";
-import { markPostLedgerFallbackVisible } from "./postFile.js";
+import { markPostLedgerFallbackVisible, markPostLedgerPolicyBlockedVisible } from "./postFile.js";
 import { ResponseSurfacePostBudget } from "./postBudget.js";
 
 // ---------------------------------------------------------------------------
@@ -1243,11 +1243,32 @@ export class BridgeHandler {
                 );
               }
             }
+            if (surfaceDispatch.post?.requiresPolicyLedgerMark) {
+              try {
+                await markPostLedgerPolicyBlockedVisible(
+                  worktreePath,
+                  surfaceDispatch.post.idempotencyKey,
+                  {
+                    fallbackCardMessageId: card.messageId,
+                    error:
+                      surfaceDispatch.post.policyError ??
+                      surfaceDispatch.card.failureReason ??
+                      "mention policy blocked; visible card fallback used",
+                  },
+                );
+              } catch (err) {
+                keepCardFileForRetry = true;
+                console.warn(
+                  "[bridge.handler] policy-blocked ledger mark failed after visible card finalize; keeping card.json for retry:",
+                  err,
+                );
+              }
+            }
 
             // Card was finalized successfully — drop its card.json so boot
             // reconcile doesn't re-finalize an already-finalized card. If the
-            // post fallback ledger mark failed, keep card.json so boot reconcile
-            // can retry association with the existing visible card.
+            // post fallback/policy ledger mark failed, keep card.json so boot
+            // reconcile can retry association with the existing visible card.
             if (!keepCardFileForRetry) {
               await deleteCardFile(worktreePath);
             }

@@ -5,6 +5,7 @@ import path from "node:path";
 import {
   assertPostStatusTransition,
   markPostLedgerFallbackVisible,
+  markPostLedgerPolicyBlockedVisible,
   postFilePathOf,
   readPostFile,
   reconcilePostFileOrphans,
@@ -203,5 +204,21 @@ describe("postFile ledger", () => {
     expect(next.posts[0]?.fallbackCardMessageId).toBe("om_card_fallback");
     expect(next.posts[0]?.attempts[0]?.code).toBe("orphan_reconcile");
     expect(next.posts[0]?.error).toBe("visible card finalized");
+  });
+
+  it("marks policy_blocked only after a visible fallback card exists", async () => {
+    const wt = await tempWorktree();
+    await writePostFile(wt, { version: 1, posts: [entry("planned")] });
+
+    const next = await markPostLedgerPolicyBlockedVisible(wt, "lw-p-entry", {
+      fallbackCardMessageId: "om_card_policy",
+      error: "mention blocked after visible card finalized",
+      now: () => "2026-06-26T00:02:00.000Z",
+    });
+
+    expect(next.posts[0]?.status).toBe("policy_blocked");
+    expect(next.posts[0]?.fallbackCardMessageId).toBe("om_card_policy");
+    expect(next.posts[0]?.attempts[0]?.code).toBe("mention_policy_blocked");
+    expect(next.posts[0]?.error).toBe("mention blocked after visible card finalized");
   });
 });

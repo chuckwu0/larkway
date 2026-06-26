@@ -82,6 +82,8 @@ export interface SurfaceDispatchResult {
     role: PostSurfaceRole;
     requiresFallbackLedgerMark?: boolean;
     fallbackError?: string;
+    requiresPolicyLedgerMark?: boolean;
+    policyError?: string;
   };
   budget?: ResponseSurfacePostBudgetDecision;
 }
@@ -330,10 +332,11 @@ async function dispatchResponseSurfaceInner(
   const now = input.now?.() ?? new Date().toISOString();
 
   if (blockedMention) {
+    const policyError = `mention target is not allowed: ${blockedMention.user_id}`;
     await writeLedger(
       input,
       newLedgerEntry({
-        status: "policy_blocked",
+        status: "planned",
         idempotencyKey: policyIdempotencyKey,
         now,
         facts: input.facts,
@@ -341,14 +344,19 @@ async function dispatchResponseSurfaceInner(
         logicalIndex,
         contentDigest: policyDigest,
         mentionCount: mentions.length,
-        error: `mention target is not allowed: ${blockedMention.user_id}`,
+        error: policyError,
       }),
     );
     return {
       card: policyBlockedCard(input),
       reason: "mention-policy-blocked",
       visible: true,
-      post: { idempotencyKey: policyIdempotencyKey, role },
+      post: {
+        idempotencyKey: policyIdempotencyKey,
+        role,
+        requiresPolicyLedgerMark: true,
+        policyError,
+      },
     };
   }
 
