@@ -336,6 +336,9 @@ async function runV2Mode({
       sessionStore,
       conventions,
       permissionsAllowExtra: configJson.permissions.allowExtra,
+      // Unset → handler defaults to bypassPermissions (aligns Claude with Codex
+      // full-host posture); set to acceptEdits/ask to tighten via config.
+      permissionMode: configJson.permissions.mode,
       peers: resolvedPeers,
       botConfig: {
         id: bot.id,

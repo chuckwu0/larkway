@@ -122,7 +122,12 @@ describe("buildEnv", () => {
 });
 
 describe("buildCommand", () => {
-  it("defaults to Claude acceptEdits mode for v0.3 agent_workspace safety", () => {
+  it("buildCommand opts fallback is acceptEdits when no permissionMode is passed", () => {
+    // This exercises buildCommand's own `?? \"acceptEdits\"` fallback in
+    // isolation. In the live path this fallback is never hit: the bridge
+    // handler always passes an explicit permissionMode (bypassPermissions by
+    // default, or the operator-configured permissions.mode), which overrides
+    // this default. Kept to pin the pure-function behavior.
     const [bin, args] = buildCommand({ prompt: "hello" });
 
     expect(bin).toBe("claude");

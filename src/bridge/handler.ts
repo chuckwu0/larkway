@@ -433,7 +433,7 @@ export interface BridgeHandlerDeps {
   conventions: HandlerConventions;
   /** Project-stack Bash allow rules merged with bridge core. */
   permissionsAllowExtra?: string[];
-  /** @default 'acceptEdits' */
+  /** @default 'bypassPermissions' (aligns Claude with Codex full-host posture). */
   permissionMode?: "acceptEdits" | "ask" | "bypassPermissions";
   /** @default 60 * 60 * 1000 (60 min — real D1-D3 with Agent subagent easily exceeds 15min) */
   subprocessTimeoutMs?: number;
@@ -962,15 +962,17 @@ export class BridgeHandler {
         });
 
         // Step 4c: spawn local agent backend.
-        // Legacy bots keep bypassPermissions to preserve V0.2 behavior: Claude
-        // Code's acceptEdits mode rejects common shell loops/pipes and can
-        // dead-lock existing workflows. Agent Workspace bots are the v0.3 path,
-        // so they default to the runtime's safer edit mode. Codex maps this to
-        // `--sandbox workspace-write`; Claude receives `--permission-mode acceptEdits`.
+        // Both bot classes (agent_workspace and legacy) default to
+        // bypassPermissions so the Claude backend aligns with Codex's existing
+        // full-host posture (Codex runs `--dangerously-bypass-approvals-and-sandbox`).
+        // In headless `-p` mode Claude Code cannot interactively approve, and
+        // acceptEdits would gate every Bash command through an allow-list —
+        // blocking even lark-cli (a larkway dependency), so a @-ed Claude bot
+        // would silently stop responding. Operators who want a stricter gate can
+        // opt back into acceptEdits / ask via `~/.larkway/config.json`'s
+        // `permissions.mode` (the future "real allow-list" path).
         const backend = this.deps.botConfig?.backend ?? "claude";
-        const permissionMode = this.deps.permissionMode ?? (
-          isAgentWorkspace ? "acceptEdits" : "bypassPermissions"
-        );
+        const permissionMode = this.deps.permissionMode ?? "bypassPermissions";
         // Default 60min — real-business prompts (D1-D3 multi-file write +
         // Agent-tool subagent spawn) easily exceed 15min. Per-spawn timeout
         // is just a runaway guard, not a UX choice.

@@ -783,7 +783,9 @@ describe("handleOne — provisioning decision tree (unified model)", () => {
 
     expect(runOpts?.cwd).toBe(workspacePath);
     expect(runnerBackends).toContain("codex");
-    expect(runOpts?.permissionMode).toBe("acceptEdits");
+    // Default (no permissions.mode configured) → bypassPermissions for both
+    // bot classes, aligning the Claude backend with Codex's full-host posture.
+    expect(runOpts?.permissionMode).toBe("bypassPermissions");
     expect(runOpts?.prompt).toContain("<agent-workspace>");
     expect(runOpts?.prompt).toContain(`topic_session_path:  ${sessionPath}`);
     await expect(import("node:fs/promises").then((fs) => fs.stat(sessionPath))).resolves.toBeTruthy();
@@ -1005,7 +1007,7 @@ describe("handleOne — provisioning decision tree (unified model)", () => {
     expect(gitCalls).toHaveLength(0);
   });
 
-  it("agent_workspace runtime with Claude backend defaults to acceptEdits, not legacy bypass", async () => {
+  it("agent_workspace runtime with Claude backend defaults to bypassPermissions (aligns with Codex full-host)", async () => {
     const threadId = "om_msg";
     const workspacePath = join(root, "agents", "claude-agent", "workspace");
     const sessionsDir = join(workspacePath, "sessions");
@@ -1058,10 +1060,70 @@ describe("handleOne — provisioning decision tree (unified model)", () => {
 
     expect(runnerBackends).toContain("claude");
     expect(runOpts?.cwd).toBe(workspacePath);
-    expect(runOpts?.permissionMode).toBe("acceptEdits");
+    expect(runOpts?.permissionMode).toBe("bypassPermissions");
     await expect(import("node:fs/promises").then((fs) =>
       fs.stat(join(sessionsDir, threadId, "transcript.md")),
     )).resolves.toBeTruthy();
+  });
+
+  it("configured permissions.mode overrides the bypass default (tightens to acceptEdits)", async () => {
+    // When operators set `permissions.mode` in config, main.ts forwards it as
+    // deps.permissionMode and the handler must pass that value through to the
+    // runner instead of the bypassPermissions default.
+    const threadId = "om_msg";
+    const workspacePath = join(root, "agents", "claude-strict", "workspace");
+    const sessionsDir = join(workspacePath, "sessions");
+    const reposDir = join(workspacePath, "repos");
+    let runOpts: { cwd?: string; permissionMode?: string } | undefined;
+
+    runClaudeImpl = (opts: unknown) => {
+      runOpts = opts as { cwd?: string; permissionMode?: string };
+      return {
+        events: (async function* () {
+          yield { type: "system_init", sessionId: "sess_claude_strict", raw: {} };
+        })(),
+        done: Promise.resolve({ exitCode: 0, sessionId: "sess_claude_strict" }),
+        kill: () => {},
+      };
+    };
+
+    const { renderer, whenFinalized } = makeCardRenderer();
+    const { store } = makeSessionStore();
+    const { client } = makeClient(makeEvent());
+    const handler = new BridgeHandler({
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      client: client as any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      cardRenderer: renderer as any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      sessionStore: store as any,
+      // Operator-configured tighter posture, plumbed from permissions.mode.
+      permissionMode: "acceptEdits",
+      conventions: {
+        runtime: "agent_workspace",
+        worktreesDir: join(root, "legacy-worktrees"),
+        agentWorkspacePath: workspacePath,
+        workspaceSessionsDir: sessionsDir,
+        workspaceReposPath: reposDir,
+        devHostname: "10.0.0.1",
+        portRangeStart: 3000,
+        portRangeEnd: 3999,
+      },
+      botConfig: {
+        id: "claude-strict",
+        name: "Claude Strict",
+        description: "Agent workspace served by Claude Code with a tighter gate",
+        turn_taking_limit: 10,
+        backend: "claude",
+        runtime: "agent_workspace",
+      },
+    });
+
+    await handler.run();
+    await whenFinalized;
+
+    expect(runnerBackends).toContain("claude");
+    expect(runOpts?.permissionMode).toBe("acceptEdits");
   });
 
   it("bot with existing primary repo (no url): uses existing worktree (no clone called)", async () => {

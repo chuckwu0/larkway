@@ -75,6 +75,15 @@ export const PermissionsConfig = z
      * "Bash(pnpm *)" / "Bash(NEXT_PUBLIC_PORT=* *)" here.
      */
     allowExtra: z.array(z.string()).default([]),
+    /**
+     * Permission posture for the Claude backend (and the bypass flag for Codex).
+     * Unset (undefined) = the bridge default `bypassPermissions`, which aligns
+     * the Claude backend with Codex's existing full-host posture and avoids
+     * acceptEdits gating necessary Bash (e.g. lark-cli) in headless `-p` mode.
+     * Set to `acceptEdits` / `ask` to TIGHTEN: Claude Code then routes Bash
+     * through its allow-list gate (the stricter, future "real allow-list" path).
+     */
+    mode: z.enum(["acceptEdits", "ask", "bypassPermissions"]).optional(),
   })
   .default({ allowExtra: [] });
 
@@ -143,6 +152,8 @@ function getLanIp(): string {
  *   conventions.devHostname  — first non-internal LAN IPv4, fallback 127.0.0.1
  *   conventions.portRangeStart/End — 3001 / 3050 (same as schema defaults)
  *   permissions.allowExtra  — [] (bridge uses its built-in core allow-list)
+ *   permissions.mode        — unset → bypassPermissions default (aligns Claude
+ *                             with Codex full-host; set acceptEdits/ask to tighten)
  *   chats                   — [] (bot yaml chats[] is the V2 source of truth)
  */
 function defaultConfigJson(): ConfigJsonType {
