@@ -1,11 +1,13 @@
 # Response Surface Prototype
 
-Status: PR1/PR2 foundation only. Default disabled.
+Status: PR1/PR3 foundation only. Default disabled.
 
 This document defines the dark-launch foundation for future `card` / `post` /
-`hybrid` response surfaces. It does not implement real IM post outbound, peer
-`at`, post ledger, visible post failure fallback, Feishu E2E, deployment, or
-production enablement.
+`hybrid` response surfaces. PR3 adds post transport, post payload construction,
+idempotency helpers, and `post.json` ledger primitives, but they remain
+default-off and are not wired into production surface dispatch. It does not
+enable real IM post outbound, peer `at`, visible post failure fallback, Feishu
+E2E, deployment, or production enablement.
 
 ## Principles
 
@@ -67,6 +69,10 @@ response_surface_prototype:
   allowed_threads:
     - <thread_id>
   lazy_card_creation: true
+  post_outbound_enabled: false
+  allowed_mention_open_ids: []
+  max_posts_per_turn: 1
+  max_post_attempts: 3
   text_threshold_chars: 1200
 ```
 
@@ -76,6 +82,10 @@ Defaults:
 - `allowed_chats: []`
 - `allowed_threads: []`
 - `lazy_card_creation: false`
+- `post_outbound_enabled: false`
+- `allowed_mention_open_ids: []`
+- `max_posts_per_turn: 1`
+- `max_post_attempts: 3`
 - `text_threshold_chars: 1200`
 
 `enabled: true` alone is insufficient. A current chat or thread must match the
@@ -100,7 +110,7 @@ outbound, idempotency, ledger, and visible failure fallback.
 
 ## PR3 Idempotency Reservation
 
-PR3 must derive post idempotency keys in the bridge, not trust arbitrary
+PR3 derives post idempotency keys in the bridge, not from arbitrary
 Agent-authored strings.
 
 Reserved rule:
@@ -116,11 +126,26 @@ Reason: live dogfood found that overly long Feishu idempotency keys can trigger
 `99992402 field validation failed`. The card path already uses compact derived
 UUIDs for card replies; PR3 should follow that shape.
 
-## Non-Goals In PR1/PR2
+## PR3 Post Foundation
 
-- No real IM post outbound.
-- No real peer `at`.
-- No `post.json` / post ledger.
+PR3 adds default-off primitives only:
+
+- `OutboundPostClient` / `ChannelPostClient` for Feishu `msg_type=post` replies.
+- A pure post content builder that can construct Feishu text and real `at` tag
+  payloads.
+- `post.json` ledger IO with atomic writes and the status machine:
+  `planned -> pending -> sent | failed | fallback_visible | policy_blocked`.
+- Retry classification for future post sends: only 5xx responses are retryable.
+- Config gates for post outbound and mention target allowlisting.
+
+Production wiring still passes `postOutboundAvailable: false` in
+`BridgeHandler`. PR3 therefore cannot create a live post unless a future PR
+explicitly connects the transport to surface dispatch and enables the gates.
+
+## Non-Goals Until Later PRs
+
+- No production-wired real IM post outbound.
+- No production-wired real peer `at`.
 - No visible post failure fallback.
 - No Feishu E2E or test cards.
 - No deployment, restart, or production bridge touch.
