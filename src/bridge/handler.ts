@@ -42,7 +42,8 @@ import {
   type ResponseSurfacePrototypeConfig,
 } from "../responseSurface.js";
 import type { OutboundPostClient } from "../lark/outboundPostClient.js";
-import { markPostLedgerFallbackVisible } from "./postFile.js";
+import { markPostLedgerFallbackVisible, markPostLedgerPolicyBlockedVisible } from "./postFile.js";
+import { ResponseSurfacePostBudget } from "./postBudget.js";
 
 // ---------------------------------------------------------------------------
 // Private helpers — worktree bootstrap
@@ -515,6 +516,7 @@ export interface BridgeHandlerDeps {
 
 export class BridgeHandler {
   private readonly deps: BridgeHandlerDeps;
+  private readonly responseSurfacePostBudget = new ResponseSurfacePostBudget();
   private closed = false;
 
   constructor(deps: BridgeHandlerDeps) {
@@ -1184,6 +1186,20 @@ export class BridgeHandler {
             postLedgerAvailable: true,
             visibleFallbackAvailable: true,
             postClient: this.deps.postClient,
+            postBudget: prototypeConfig
+              ? {
+                  reserve: () =>
+                    this.responseSurfacePostBudget.reserve({
+                      scope: {
+                        botId: this.deps.botConfig?.id ?? "v1-default",
+                        chatId: parsed.chatId,
+                        threadId,
+                      },
+                      maxPosts: prototypeConfig.max_posts_per_window,
+                      windowMs: prototypeConfig.post_window_ms,
+                    }),
+                }
+              : undefined,
           });
 
           if (surfaceDispatch.card) {
@@ -1227,11 +1243,32 @@ export class BridgeHandler {
                 );
               }
             }
+            if (surfaceDispatch.post?.requiresPolicyLedgerMark) {
+              try {
+                await markPostLedgerPolicyBlockedVisible(
+                  worktreePath,
+                  surfaceDispatch.post.idempotencyKey,
+                  {
+                    fallbackCardMessageId: card.messageId,
+                    error:
+                      surfaceDispatch.post.policyError ??
+                      surfaceDispatch.card.failureReason ??
+                      "mention policy blocked; visible card fallback used",
+                  },
+                );
+              } catch (err) {
+                keepCardFileForRetry = true;
+                console.warn(
+                  "[bridge.handler] policy-blocked ledger mark failed after visible card finalize; keeping card.json for retry:",
+                  err,
+                );
+              }
+            }
 
             // Card was finalized successfully — drop its card.json so boot
             // reconcile doesn't re-finalize an already-finalized card. If the
-            // post fallback ledger mark failed, keep card.json so boot reconcile
-            // can retry association with the existing visible card.
+            // post fallback/policy ledger mark failed, keep card.json so boot
+            // reconcile can retry association with the existing visible card.
             if (!keepCardFileForRetry) {
               await deleteCardFile(worktreePath);
             }

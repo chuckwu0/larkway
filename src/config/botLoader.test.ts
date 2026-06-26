@@ -566,9 +566,12 @@ bot_open_id: ou_surface_default
       allowed_chats: [],
       allowed_threads: [],
       lazy_card_creation: false,
+      kill_switch: false,
       post_outbound_enabled: false,
       allowed_mention_open_ids: [],
       max_posts_per_turn: 1,
+      max_posts_per_window: 4,
+      post_window_ms: 60_000,
       max_post_attempts: 3,
       text_threshold_chars: 1200,
     });
@@ -592,10 +595,13 @@ response_surface_prototype:
   allowed_threads:
     - om_thread
   lazy_card_creation: true
+  kill_switch: true
   post_outbound_enabled: true
   allowed_mention_open_ids:
     - surface_peer
   max_posts_per_turn: 2
+  max_posts_per_window: 7
+  post_window_ms: 30000
   max_post_attempts: 2
   text_threshold_chars: 900
 `,
@@ -608,9 +614,12 @@ response_surface_prototype:
       allowed_chats: ["oc_test"],
       allowed_threads: ["om_thread"],
       lazy_card_creation: true,
+      kill_switch: true,
       post_outbound_enabled: true,
       allowed_mention_open_ids: ["surface_peer"],
       max_posts_per_turn: 2,
+      max_posts_per_window: 7,
+      post_window_ms: 30_000,
       max_post_attempts: 2,
       text_threshold_chars: 900,
     });

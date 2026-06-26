@@ -8,9 +8,12 @@ export function defaultResponseSurfacePrototypeConfig() {
     allowed_chats: [] as string[],
     allowed_threads: [] as string[],
     lazy_card_creation: false,
+    kill_switch: false,
     post_outbound_enabled: false,
     allowed_mention_open_ids: [] as string[],
     max_posts_per_turn: 1,
+    max_posts_per_window: 4,
+    post_window_ms: 60_000,
     max_post_attempts: 3,
     text_threshold_chars: 1200,
   };
@@ -23,9 +26,12 @@ const responseSurfacePrototypeConfigDefaults = () => ({
   allowed_chats: [] as string[],
   allowed_threads: [] as string[],
   lazy_card_creation: false,
+  kill_switch: false,
   post_outbound_enabled: false,
   allowed_mention_open_ids: [] as string[],
   max_posts_per_turn: 1,
+  max_posts_per_window: 4,
+  post_window_ms: 60_000,
   max_post_attempts: 3,
   text_threshold_chars: 1200,
 });
@@ -108,6 +114,12 @@ export const ResponseSurfacePrototypeConfigSchema = z
      */
     lazy_card_creation: z.boolean().default(false),
     /**
+     * Runtime kill switch for emergency rollback. When true, every response
+     * surface post path is treated as disabled even if enabled/allowlists are
+     * otherwise configured. Default false preserves current default-off behavior.
+     */
+    kill_switch: z.boolean().default(false),
+    /**
      * PR3 dark-launch gate for real post outbound. This must stay false by
      * default. PR4's dispatcher also requires this gate before any post path.
      */
@@ -123,6 +135,16 @@ export const ResponseSurfacePrototypeConfigSchema = z
      * unavailable, but fake-channel dispatch tests enforce this bounded shape.
      */
     max_posts_per_turn: z.number().int().min(0).max(10).default(1),
+    /**
+     * Sliding-window hard cap for real post sends within one bot/chat/thread
+     * runtime scope. This is enforced in the production handler before a post
+     * transport call is attempted; exhausted windows degrade to visible cards.
+     */
+    max_posts_per_window: z.number().int().min(0).max(100).default(4),
+    /**
+     * Sliding-window duration for max_posts_per_window.
+     */
+    post_window_ms: z.number().int().min(1_000).max(86_400_000).default(60_000),
     /**
      * Max attempts for one logical post. Retry classification is intentionally
      * narrow in PR3: only 5xx errors are retryable.
@@ -145,6 +167,7 @@ export function isResponseSurfacePrototypeAllowlisted(
   facts: { chatId: string; threadId: string },
 ): boolean {
   if (!config?.enabled) return false;
+  if (config.kill_switch) return false;
   const chatAllowed =
     config.allowed_chats.length > 0 && config.allowed_chats.includes(facts.chatId);
   const threadAllowed =
@@ -157,8 +180,10 @@ export function shouldProvideResponseSurfacePostClient(
 ): boolean {
   return !!(
     config?.enabled &&
+    !config.kill_switch &&
     config.post_outbound_enabled &&
     config.max_posts_per_turn >= 1 &&
+    config.max_posts_per_window >= 1 &&
     (config.allowed_chats.length > 0 || config.allowed_threads.length > 0)
   );
 }

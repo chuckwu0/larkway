@@ -6,9 +6,12 @@ const allowlistedConfig = {
   allowed_chats: ["chat_allowed"],
   allowed_threads: [],
   lazy_card_creation: true,
+  kill_switch: false,
   post_outbound_enabled: false,
   allowed_mention_open_ids: [],
   max_posts_per_turn: 1,
+  max_posts_per_window: 4,
+  post_window_ms: 60_000,
   max_post_attempts: 3,
   text_threshold_chars: 1200,
 };
@@ -26,9 +29,12 @@ describe("SurfaceController", () => {
         allowed_chats: [],
         allowed_threads: [],
         lazy_card_creation: false,
+        kill_switch: false,
         post_outbound_enabled: false,
         allowed_mention_open_ids: [],
         max_posts_per_turn: 1,
+        max_posts_per_window: 4,
+        post_window_ms: 60_000,
         max_post_attempts: 3,
         text_threshold_chars: 1200,
       },
@@ -63,6 +69,23 @@ describe("SurfaceController", () => {
 
     expect(controller.shouldStartCardImmediately()).toBe(true);
     expect(controller.decision.reason).toBe("post-outbound-disabled");
+  });
+
+  it("keeps card fallback while the runtime kill switch is active", () => {
+    const controller = SurfaceController.create({
+      prototypeConfig: {
+        ...postEnabledConfig,
+        kill_switch: true,
+      },
+      chatId: "chat_allowed",
+      threadId: "om_thread",
+      postOutboundAvailable: true,
+      postLedgerAvailable: true,
+      visibleFallbackAvailable: true,
+    });
+
+    expect(controller.shouldStartCardImmediately()).toBe(true);
+    expect(controller.decision.reason).toBe("kill-switch-active");
   });
 
   it("keeps card fallback before post outbound transport is available", () => {
