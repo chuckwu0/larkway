@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import {
   assertPostStatusTransition,
+  markPostLedgerFallbackVisible,
   postFilePathOf,
   readPostFile,
   reconcilePostFileOrphans,
@@ -94,8 +95,8 @@ describe("postFile ledger", () => {
     );
   });
 
-  it("reconciles old planned or pending entries to visible fallback without resend", () => {
-    const { file, result } = reconcilePostLedgerEntries(
+  it("selects old planned or pending entries as needing visible fallback without marking them", () => {
+    const { file, result, visibleFallbackCandidates } = reconcilePostLedgerEntries(
       {
         version: 1,
         posts: [
@@ -111,17 +112,17 @@ describe("postFile ledger", () => {
     );
 
     expect(result).toEqual({
-      changed: true,
+      changed: false,
       sent: 0,
-      fallbackVisible: 2,
+      fallbackVisible: 0,
+      needsVisibleFallback: 2,
       skippedLive: 0,
     });
-    expect(file.posts.map((post) => post.status)).toEqual([
-      "fallback_visible",
-      "fallback_visible",
+    expect(file.posts.map((post) => post.status)).toEqual(["planned", "pending"]);
+    expect(visibleFallbackCandidates.map((post) => post.idempotencyKey)).toEqual([
+      "lw-p-entry",
+      "lw-p-pending",
     ]);
-    expect(file.posts[0]?.attempts[0]?.code).toBe("orphan_reconcile");
-    expect(file.posts[1]?.error).toContain("without resend");
   });
 
   it("reconciles pending entries with a recorded postMessageId to sent", () => {
@@ -179,10 +180,28 @@ describe("postFile ledger", () => {
       now: () => "2026-06-26T00:02:00.000Z",
     });
 
-    expect(result.changed).toBe(true);
-    expect(result.fallbackVisible).toBe(1);
+    expect(result.changed).toBe(false);
+    expect(result.fallbackVisible).toBe(0);
+    expect(result.needsVisibleFallback).toBe(1);
+    expect(result.visibleFallbackCandidates[0]?.status).toBe("failed");
     const read = await readPostFile(wt);
-    expect(read?.posts[0]?.status).toBe("fallback_visible");
+    expect(read?.posts[0]?.status).toBe("failed");
     expect(read?.posts[0]?.error).toBe("crashed");
+  });
+
+  it("marks fallback_visible only after a visible fallback card exists", async () => {
+    const wt = await tempWorktree();
+    await writePostFile(wt, { version: 1, posts: [entry("pending")] });
+
+    const next = await markPostLedgerFallbackVisible(wt, "lw-p-entry", {
+      fallbackCardMessageId: "om_card_fallback",
+      error: "visible card finalized",
+      now: () => "2026-06-26T00:02:00.000Z",
+    });
+
+    expect(next.posts[0]?.status).toBe("fallback_visible");
+    expect(next.posts[0]?.fallbackCardMessageId).toBe("om_card_fallback");
+    expect(next.posts[0]?.attempts[0]?.code).toBe("orphan_reconcile");
+    expect(next.posts[0]?.error).toBe("visible card finalized");
   });
 });

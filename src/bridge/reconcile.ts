@@ -43,7 +43,11 @@ import {
   deleteCardFile,
   type CardFile,
 } from "./cardFile.js";
-import { reconcilePostFileOrphans } from "./postFile.js";
+import {
+  markPostLedgerFallbackVisible,
+  reconcilePostFileOrphans,
+  type PostLedgerEntry,
+} from "./postFile.js";
 import { readStateFile, stateFilePathOf, type StateFile } from "./stateFile.js";
 import type { CardHandle, CardRenderer } from "../lark/card.js";
 
@@ -229,6 +233,62 @@ function mapFinalizeArgs(
   };
 }
 
+function postFallbackText(entry: PostLedgerEntry): string {
+  return (
+    "Bridge restarted while reconciling a post-only response. " +
+    "No post message id was recorded, so Larkway created this visible fallback card instead of resending the post.\n" +
+    `post_status: ${entry.status}\n` +
+    `idempotency_key: ${entry.idempotencyKey}`
+  );
+}
+
+async function finalizePostOnlyFallbackCard(input: {
+  deps: ReconcileDeps;
+  worktreePath: string;
+  entry: PostLedgerEntry;
+  existingCard: CardFile | null;
+  nowIso: string;
+  log: (msg: string) => void;
+}): Promise<void> {
+  const fallbackError =
+    input.entry.error ??
+    "orphaned post ledger entry reconciled after visible fallback card finalize";
+  const handle = input.existingCard
+    ? input.deps.cardRenderer.handleFor(input.existingCard.messageId)
+    : await input.deps.cardRenderer.start(input.entry.replyToMessageId, {
+        replyInThread: true,
+        threadId: input.entry.threadId,
+      });
+
+  if (!input.existingCard) {
+    await writeCardFile(input.worktreePath, {
+      messageId: handle.messageId,
+      chatId: input.entry.chatId,
+      threadId: input.entry.threadId,
+      botId: input.entry.botId,
+      retryCount: 0,
+      createdAt: input.nowIso,
+    });
+  }
+
+  await handle.finalize({
+    finalText: postFallbackText(input.entry),
+    success: false,
+    failureReason: fallbackError,
+    titleOverride: "Post fallback recovered",
+    colorOverride: "failure",
+  });
+  await markPostLedgerFallbackVisible(input.worktreePath, input.entry.idempotencyKey, {
+    fallbackCardMessageId: handle.messageId,
+    error: fallbackError,
+    now: () => input.nowIso,
+  });
+  await deleteCardFile(input.worktreePath);
+  input.log(
+    `[reconcile] post-only fallback card finalized for ${input.entry.idempotencyKey} as ${handle.messageId}`,
+  );
+}
+
 // ---------------------------------------------------------------------------
 // Impure reconcile shell
 // ---------------------------------------------------------------------------
@@ -242,7 +302,7 @@ export interface ReconcileDeps {
    * The bot's CardRenderer — reconcile uses handleFor(messageId) to rebuild a
    * handle on the SAME outbound transport / identity that created the card.
    */
-  cardRenderer: Pick<CardRenderer, "handleFor">;
+  cardRenderer: Pick<CardRenderer, "handleFor" | "start">;
   /** Minimum state.json age before a card is eligible. @default 60000 */
   minAgeMs?: number;
   /** Logger. @default console.log */
@@ -313,6 +373,30 @@ export async function reconcileOrphanedCards(deps: ReconcileDeps): Promise<void>
             log(
               `[reconcile] post ledger ${name}: sent=${postResult.sent}, fallback_visible=${postResult.fallbackVisible}`,
             );
+          }
+          if (postResult.visibleFallbackCandidates.length > 0) {
+            if (card && state) {
+              log(
+                `[reconcile] post ledger ${name}: ${postResult.visibleFallbackCandidates.length} candidate(s) need visible fallback; existing card+state will reconcile separately`,
+              );
+            } else {
+              for (const entry of postResult.visibleFallbackCandidates) {
+                try {
+                  await finalizePostOnlyFallbackCard({
+                    deps,
+                    worktreePath: wtPath,
+                    entry,
+                    existingCard: state ? null : card,
+                    nowIso,
+                    log,
+                  });
+                } catch (err) {
+                  log(
+                    `[reconcile] post-only fallback failed for ${name}/${entry.idempotencyKey} (ledger left non-terminal): ${String(err)}`,
+                  );
+                }
+              }
+            }
           }
         } catch (err) {
           log(`[reconcile] post ledger failed for ${name} (skipping): ${String(err)}`);

@@ -160,6 +160,7 @@ export interface ReconcilePostLedgerResult {
   changed: boolean;
   sent: number;
   fallbackVisible: number;
+  needsVisibleFallback: number;
   skippedLive: number;
 }
 
@@ -175,9 +176,14 @@ function timestampAgeMs(iso: string, nowMs: number): number | null {
 function reconcilePostEntry(
   entry: PostLedgerEntry,
   opts: Required<ReconcilePostLedgerOpts>,
-): { entry: PostLedgerEntry; changed: boolean; sent: boolean; fallbackVisible: boolean } {
+): {
+  entry: PostLedgerEntry;
+  changed: boolean;
+  sent: boolean;
+  needsVisibleFallback: boolean;
+} {
   if (entry.botId !== opts.botId) {
-    return { entry, changed: false, sent: false, fallbackVisible: false };
+    return { entry, changed: false, sent: false, needsVisibleFallback: false };
   }
 
   if (
@@ -185,13 +191,13 @@ function reconcilePostEntry(
     entry.status === "fallback_visible" ||
     entry.status === "policy_blocked"
   ) {
-    return { entry, changed: false, sent: false, fallbackVisible: false };
+    return { entry, changed: false, sent: false, needsVisibleFallback: false };
   }
 
   const now = opts.now();
   const ageMs = timestampAgeMs(entry.updatedAt, Date.parse(now));
   if (ageMs == null || ageMs < opts.minAgeMs) {
-    return { entry, changed: false, sent: false, fallbackVisible: false };
+    return { entry, changed: false, sent: false, needsVisibleFallback: false };
   }
 
   if (entry.postMessageId) {
@@ -212,41 +218,26 @@ function reconcilePostEntry(
       },
       changed: true,
       sent: true,
-      fallbackVisible: false,
+      needsVisibleFallback: false,
     };
   }
 
-  const error =
-    entry.status === "failed" && entry.error
-      ? entry.error
-      : "orphaned post ledger entry reconciled without resend; visible card fallback required";
   return {
-    entry: {
-      ...entry,
-      status: "fallback_visible",
-      error,
-      updatedAt: now,
-      attempts: [
-        ...entry.attempts,
-        {
-          attemptedAt: now,
-          status: "failed",
-          retryable: false,
-          code: "orphan_reconcile",
-          error,
-        },
-      ],
-    },
-    changed: true,
+    entry,
+    changed: false,
     sent: false,
-    fallbackVisible: true,
+    needsVisibleFallback: true,
   };
 }
 
 export function reconcilePostLedgerEntries(
   data: PostFile,
   opts: ReconcilePostLedgerOpts,
-): { file: PostFile; result: ReconcilePostLedgerResult } {
+): {
+  file: PostFile;
+  result: ReconcilePostLedgerResult;
+  visibleFallbackCandidates: PostLedgerEntry[];
+} {
   const normalizedOpts: Required<ReconcilePostLedgerOpts> = {
     botId: opts.botId,
     minAgeMs: opts.minAgeMs ?? DEFAULT_POST_RECONCILE_MIN_AGE_MS,
@@ -254,13 +245,17 @@ export function reconcilePostLedgerEntries(
   };
 
   let sent = 0;
-  let fallbackVisible = 0;
+  const fallbackVisible = 0;
+  let needsVisibleFallback = 0;
   let skippedLive = 0;
+  const visibleFallbackCandidates: PostLedgerEntry[] = [];
   const posts = data.posts.map((post) => {
     const reconciled = reconcilePostEntry(post, normalizedOpts);
     if (reconciled.changed) {
       if (reconciled.sent) sent += 1;
-      if (reconciled.fallbackVisible) fallbackVisible += 1;
+    } else if (reconciled.needsVisibleFallback) {
+      needsVisibleFallback += 1;
+      visibleFallbackCandidates.push(reconciled.entry);
     } else if (
       post.botId === normalizedOpts.botId &&
       (post.status === "planned" || post.status === "pending" || post.status === "failed")
@@ -272,22 +267,72 @@ export function reconcilePostLedgerEntries(
   const changed = sent > 0 || fallbackVisible > 0;
   return {
     file: changed ? { version: 1, posts } : data,
-    result: { changed, sent, fallbackVisible, skippedLive },
+    result: { changed, sent, fallbackVisible, needsVisibleFallback, skippedLive },
+    visibleFallbackCandidates,
   };
 }
 
 export async function reconcilePostFileOrphans(
   worktreePath: string,
   opts: ReconcilePostLedgerOpts,
-): Promise<ReconcilePostLedgerResult> {
+): Promise<ReconcilePostLedgerResult & { visibleFallbackCandidates: PostLedgerEntry[] }> {
   const existing = await readPostFile(worktreePath);
   if (!existing) {
-    return { changed: false, sent: 0, fallbackVisible: 0, skippedLive: 0 };
+    return {
+      changed: false,
+      sent: 0,
+      fallbackVisible: 0,
+      needsVisibleFallback: 0,
+      skippedLive: 0,
+      visibleFallbackCandidates: [],
+    };
   }
 
-  const { file, result } = reconcilePostLedgerEntries(existing, opts);
+  const { file, result, visibleFallbackCandidates } = reconcilePostLedgerEntries(existing, opts);
   if (result.changed) {
     await writePostFile(worktreePath, file);
   }
-  return result;
+  return { ...result, visibleFallbackCandidates };
+}
+
+export async function markPostLedgerFallbackVisible(
+  worktreePath: string,
+  idempotencyKey: string,
+  opts: {
+    fallbackCardMessageId: string;
+    error: string;
+    now?: () => string;
+  },
+): Promise<PostFile> {
+  const existing = (await readPostFile(worktreePath)) ?? emptyPostFile();
+  const idx = existing.posts.findIndex((post) => post.idempotencyKey === idempotencyKey);
+  if (idx < 0) {
+    throw new Error(`post ledger entry not found: ${idempotencyKey}`);
+  }
+
+  const current = existing.posts[idx];
+  assertPostStatusTransition(current.status, "fallback_visible");
+  const now = opts.now?.() ?? new Date().toISOString();
+  const nextPosts = [...existing.posts];
+  nextPosts[idx] = {
+    ...current,
+    status: "fallback_visible",
+    fallbackCardMessageId: opts.fallbackCardMessageId,
+    error: opts.error,
+    updatedAt: now,
+    attempts: [
+      ...current.attempts,
+      {
+        attemptedAt: now,
+        status: "failed",
+        retryable: false,
+        code: "orphan_reconcile",
+        error: opts.error,
+      },
+    ],
+  };
+
+  const next = { version: 1 as const, posts: nextPosts };
+  await writePostFile(worktreePath, next);
+  return next;
 }

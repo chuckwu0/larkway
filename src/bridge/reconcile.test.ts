@@ -159,25 +159,46 @@ interface SpyHandle extends CardHandle {
   finalizeArgs: Parameters<CardHandle["finalize"]>[0][];
 }
 
-function makeFakeRenderer(opts?: { rejectFinalize?: boolean }) {
+function makeFakeRenderer(opts?: { rejectFinalize?: boolean; rejectStart?: boolean }) {
   const handlesByMessageId = new Map<string, SpyHandle>();
+  const startCalls: Array<{
+    replyToMessageId: string;
+    replyInThread?: boolean;
+    threadId?: string;
+  }> = [];
+  let nextStartedCard = 1;
+  function makeHandle(messageId: string): SpyHandle {
+    const finalizeArgs: Parameters<CardHandle["finalize"]>[0][] = [];
+    const handle: SpyHandle = {
+      messageId,
+      finalizeArgs,
+      handle: () => {},
+      finalize: vi.fn(async (a) => {
+        finalizeArgs.push(a);
+        if (opts?.rejectFinalize) throw new Error("PATCH 230001 not the sender");
+      }) as unknown as CardHandle["finalize"],
+    };
+    handlesByMessageId.set(messageId, handle);
+    return handle;
+  }
   const renderer = {
+    async start(
+      replyToMessageId: string,
+      startOpts?: { replyInThread?: boolean; threadId?: string },
+    ): Promise<CardHandle> {
+      startCalls.push({
+        replyToMessageId,
+        replyInThread: startOpts?.replyInThread,
+        threadId: startOpts?.threadId,
+      });
+      if (opts?.rejectStart) throw new Error("create card failed");
+      return makeHandle(`om_started_${nextStartedCard++}`);
+    },
     handleFor(messageId: string): CardHandle {
-      const finalizeArgs: Parameters<CardHandle["finalize"]>[0][] = [];
-      const handle: SpyHandle = {
-        messageId,
-        finalizeArgs,
-        handle: () => {},
-        finalize: vi.fn(async (a) => {
-          finalizeArgs.push(a);
-          if (opts?.rejectFinalize) throw new Error("PATCH 230001 not the sender");
-        }) as unknown as CardHandle["finalize"],
-      };
-      handlesByMessageId.set(messageId, handle);
-      return handle;
+      return makeHandle(messageId);
     },
   };
-  return { renderer, handlesByMessageId };
+  return { renderer, handlesByMessageId, startCalls };
 }
 
 let root: string;
@@ -347,11 +368,39 @@ describe("reconcileOrphanedCards — integration", () => {
     expect(await readCardFile(wt)).toBeNull();
   });
 
-  it("reconciles an old post ledger orphan even when no card.json exists", async () => {
+  it("creates and finalizes a visible fallback card before marking a post-only orphan fallback_visible", async () => {
     const wt = join(root, "om_post_only");
     await mkdir(join(wt, ".larkway"), { recursive: true });
     await writePostFile(wt, { version: 1, posts: [postEntry()] });
-    const { renderer, handlesByMessageId } = makeFakeRenderer();
+    const { renderer, handlesByMessageId, startCalls } = makeFakeRenderer();
+
+    await reconcileOrphanedCards({
+      botId: "gitlab",
+      worktreesDir: root,
+      cardRenderer: renderer,
+      minAgeMs: 60_000,
+      log: () => {},
+    });
+
+    expect(startCalls).toEqual([
+      { replyToMessageId: "om_trigger", replyInThread: true, threadId: "om_thread" },
+    ]);
+    const handle = handlesByMessageId.get("om_started_1");
+    expect(handle?.finalizeArgs).toHaveLength(1);
+    expect(handle?.finalizeArgs[0]?.success).toBe(false);
+    expect(handle?.finalizeArgs[0]?.finalText).toContain("visible fallback card");
+    const ledger = await readPostFile(wt);
+    expect(ledger?.posts[0]?.status).toBe("fallback_visible");
+    expect(ledger?.posts[0]?.fallbackCardMessageId).toBe("om_started_1");
+    expect(ledger?.posts[0]?.attempts[0]?.code).toBe("orphan_reconcile");
+    expect(await readCardFile(wt)).toBeNull();
+  });
+
+  it("leaves a post-only orphan non-terminal when fallback card creation fails", async () => {
+    const wt = join(root, "om_post_only_start_fail");
+    await mkdir(join(wt, ".larkway"), { recursive: true });
+    await writePostFile(wt, { version: 1, posts: [postEntry()] });
+    const { renderer, handlesByMessageId } = makeFakeRenderer({ rejectStart: true });
 
     await reconcileOrphanedCards({
       botId: "gitlab",
@@ -363,8 +412,8 @@ describe("reconcileOrphanedCards — integration", () => {
 
     expect(handlesByMessageId.size).toBe(0);
     const ledger = await readPostFile(wt);
-    expect(ledger?.posts[0]?.status).toBe("fallback_visible");
-    expect(ledger?.posts[0]?.attempts[0]?.code).toBe("orphan_reconcile");
+    expect(ledger?.posts[0]?.status).toBe("pending");
+    expect(ledger?.posts[0]?.fallbackCardMessageId).toBeUndefined();
   });
 
   it("does NOT throw on finalize rejection and bumps retryCount in card.json", async () => {

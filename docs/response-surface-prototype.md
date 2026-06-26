@@ -184,8 +184,13 @@ PR5 extends boot-time reconcile without enabling post outbound:
 - Old `post.json` entries for the current bot are reconciled when the worktree
   has no live runner process:
   - `pending` or `planned` with `postMessageId` -> `sent`
-  - `planned`, `pending`, or `failed` without `postMessageId` ->
-    `fallback_visible` with an `orphan_reconcile` attempt
+  - `planned`, `pending`, or `failed` without `postMessageId` first require a
+    visible fallback card. Reconcile creates and finalizes that card, then marks
+    the ledger `fallback_visible` with `fallbackCardMessageId` and an
+    `orphan_reconcile` attempt.
+  - if the fallback card cannot be created/finalized, the ledger stays
+    non-terminal and reconcile logs the failure; it must not silently mark
+    `fallback_visible`.
   - terminal `sent`, `fallback_visible`, and `policy_blocked` entries are left
     untouched
 - Dispatcher re-entry is also idempotent. If the same logical post key is
@@ -194,7 +199,8 @@ PR5 extends boot-time reconcile without enabling post outbound:
   visible fallback instead of resending.
 
 This is a conservative reconcile policy. It never queries or sends real Feishu
-post messages in PR5, and it never repeats an outbound post during recovery.
+post messages in PR5, never repeats an outbound post during recovery, and never
+marks `fallback_visible` unless a visible fallback artifact exists.
 
 ## Non-Goals Until Later PRs
 
