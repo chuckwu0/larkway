@@ -1206,10 +1206,7 @@ export class BridgeHandler {
             await card.finalize(surfaceDispatch.card);
 
             let keepCardFileForRetry = false;
-            if (
-              surfaceDispatch.reason === "post-failed-fallback-card" &&
-              surfaceDispatch.post?.idempotencyKey
-            ) {
+            if (surfaceDispatch.post?.requiresFallbackLedgerMark) {
               try {
                 await markPostLedgerFallbackVisible(
                   worktreePath,
@@ -1217,6 +1214,7 @@ export class BridgeHandler {
                   {
                     fallbackCardMessageId: card.messageId,
                     error:
+                      surfaceDispatch.post.fallbackError ??
                       surfaceDispatch.card.failureReason ??
                       "post outbound failed; visible card fallback used",
                   },
@@ -1224,7 +1222,7 @@ export class BridgeHandler {
               } catch (err) {
                 keepCardFileForRetry = true;
                 console.warn(
-                  "[bridge.handler] post fallback ledger mark failed after visible card finalize; keeping card.json for retry:",
+                  "[bridge.handler] fallback ledger mark failed after visible card finalize; keeping card.json for retry:",
                   err,
                 );
               }

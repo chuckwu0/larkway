@@ -174,7 +174,7 @@ describe("dispatchResponseSurface", () => {
       expect(second.calls).toHaveLength(0);
     }));
 
-  it("reconciles an existing pending ledger entry to visible fallback without resending", async () =>
+  it("returns visible fallback for an existing pending ledger without marking it before card finalize", async () =>
     withTemp(async (dir) => {
       const first = fakePostClient();
       await dispatchResponseSurface(
@@ -214,8 +214,9 @@ describe("dispatchResponseSurface", () => {
       expect(second.calls).toHaveLength(0);
 
       const after = await readPostFile(dir);
-      expect(after?.posts[0]?.status).toBe("fallback_visible");
-      expect(after?.posts[0]?.attempts[0]?.code).toBe("orphan_reconcile");
+      expect(after?.posts[0]?.status).toBe("pending");
+      expect(after?.posts[0]?.fallbackCardMessageId).toBeUndefined();
+      expect(after?.posts[0]?.attempts).toEqual([]);
     }));
 
   it("uses a compact secondary card for hybrid without repeating the main post body", async () =>

@@ -72,6 +72,8 @@ export interface SurfaceDispatchResult {
     idempotencyKey: string;
     messageId?: string;
     role: PostSurfaceRole;
+    requiresFallbackLedgerMark?: boolean;
+    fallbackError?: string;
   };
 }
 
@@ -348,32 +350,20 @@ export async function dispatchResponseSurface(
     };
   }
   if (existing) {
-    const reconciledAt = input.now?.() ?? new Date().toISOString();
     const error =
       existing.status === "failed" && existing.error
         ? existing.error
         : "orphaned post ledger entry reconciled without resend; visible card fallback used";
-    await writeLedger(input, {
-      ...existing,
-      status: "fallback_visible",
-      error,
-      updatedAt: reconciledAt,
-      attempts: [
-        ...existing.attempts,
-        {
-          attemptedAt: reconciledAt,
-          status: "failed",
-          retryable: false,
-          code: "orphan_reconcile",
-          error,
-        },
-      ],
-    });
     return {
       card: fallbackFailureCard(input, error),
       reason: "post-orphan-reconciled-fallback-card",
       visible: true,
-      post: { idempotencyKey, role },
+      post: {
+        idempotencyKey,
+        role,
+        requiresFallbackLedgerMark: true,
+        fallbackError: error,
+      },
     };
   }
 
@@ -462,7 +452,12 @@ export async function dispatchResponseSurface(
       card: fallbackFailureCard(input, err),
       reason: "post-failed-fallback-card",
       visible: true,
-      post: { idempotencyKey, role },
+      post: {
+        idempotencyKey,
+        role,
+        requiresFallbackLedgerMark: true,
+        fallbackError: error,
+      },
     };
   }
 }

@@ -10,7 +10,9 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { mkdtemp, rm, mkdir, writeFile, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { readPostFile } from "./postFile.js";
+import { readPostFile, writePostFile } from "./postFile.js";
+import { buildPostContent } from "../lark/postContent.js";
+import { derivePostIdempotencyKey, digestPostContent } from "../lark/idempotency.js";
 import type { OutboundPostClient } from "../lark/outboundPostClient.js";
 
 // ---------------------------------------------------------------------------
@@ -263,6 +265,39 @@ function makePostClient(opts: { fail?: boolean } = {}) {
     },
   };
   return { client, calls };
+}
+
+async function seedPendingPostLedger(worktreePath: string, text: string): Promise<void> {
+  const content = buildPostContent({ text, mentions: [] });
+  const contentDigest = digestPostContent(content);
+  const idempotencyKey = derivePostIdempotencyKey({
+    botId: "frontend",
+    threadId: "om_msg",
+    triggerMessageId: "om_msg",
+    role: "primary",
+    logicalIndex: 0,
+    contentDigest,
+  });
+  await writePostFile(worktreePath, {
+    version: 1,
+    posts: [
+      {
+        idempotencyKey,
+        status: "pending",
+        botId: "frontend",
+        chatId: "chat_allowed",
+        threadId: "om_msg",
+        replyToMessageId: "om_msg",
+        role: "primary",
+        logicalIndex: 0,
+        contentDigest,
+        mentionCount: 0,
+        attempts: [],
+        createdAt: "2026-06-26T10:00:00.000Z",
+        updatedAt: "2026-06-26T10:00:00.000Z",
+      },
+    ],
+  });
 }
 
 function makeEvent(): Record<string, unknown> {
@@ -778,6 +813,85 @@ describe("handleOne — thin-channel finalize", () => {
     expect(ledger?.posts[0]?.status).toBe("fallback_visible");
     expect(ledger?.posts[0]?.fallbackCardMessageId).toBe("om_card");
     expect(ledger?.posts[0]?.attempts[0]?.status).toBe("failed");
+  });
+
+  it("late-starts a visible fallback card before marking an existing pending post ledger fallback_visible", async () => {
+    const threadId = "om_msg";
+    const finalState = {
+      status: "ready",
+      last_message: "existing ledger 必须等可见卡后再终态",
+      response_surface: {
+        mode: "post",
+        primary: "post",
+      },
+      updated_at: "2026-06-26T10:00:00.000Z",
+    };
+    const wt = await seedWorktree(threadId);
+    await seedPendingPostLedger(wt, finalState.last_message);
+    await seedRepoCachePath();
+    const { client: postClient, calls } = makePostClient();
+
+    runClaudeImpl = () => ({
+      events: (async function* () {
+        yield { type: "system_init", sessionId: "sess_surface_existing_pending", raw: {} };
+        await writeFile(
+          stateFileMod.stateFilePathOf(wt),
+          JSON.stringify(finalState, null, 2),
+          "utf8",
+        );
+      })(),
+      done: Promise.resolve({ exitCode: 0, sessionId: "sess_surface_existing_pending" }),
+      kill: () => {},
+    });
+
+    const { renderer, startArgs, finalizeArgs, whenFinalized } = makeCardRenderer();
+    const { store } = makeSessionStore();
+    const { client } = makeClient(makeEvent());
+
+    const handler = new BridgeHandler({
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      client: client as any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      cardRenderer: renderer as any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      sessionStore: store as any,
+      conventions: makeConventions(),
+      botConfig: {
+        id: "frontend",
+        name: "Frontend",
+        turn_taking_limit: 10,
+        backend: "claude",
+        response_surface_prototype: {
+          enabled: true,
+          allowed_chats: [],
+          allowed_threads: ["om_msg"],
+          lazy_card_creation: true,
+          post_outbound_enabled: true,
+          allowed_mention_open_ids: [],
+          max_posts_per_turn: 1,
+          max_post_attempts: 3,
+          text_threshold_chars: 900,
+        },
+      },
+      postClient,
+    });
+
+    await handler.run();
+    await whenFinalized;
+
+    expect(startArgs).toHaveLength(1);
+    expect(finalizeArgs).toHaveLength(1);
+    expect(finalizeArgs[0]?.success).toBe(false);
+    expect(finalizeArgs[0]?.failureReason).toContain("visible card fallback used");
+    expect(calls).toHaveLength(0);
+    let ledger = await readPostFile(wt);
+    for (let i = 0; i < 100 && ledger?.posts[0]?.status !== "fallback_visible"; i++) {
+      await new Promise((r) => setTimeout(r, 10));
+      ledger = await readPostFile(wt);
+    }
+    expect(ledger?.posts[0]?.status).toBe("fallback_visible");
+    expect(ledger?.posts[0]?.fallbackCardMessageId).toBe("om_card");
+    expect(ledger?.posts[0]?.attempts[0]?.code).toBe("orphan_reconcile");
   });
 
   it("late-stage state.json WITHOUT dev_url is NOT probed and NOT demoted (status=ready → success)", async () => {
