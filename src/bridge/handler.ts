@@ -37,7 +37,12 @@ import { SurfaceController } from "./surfaceController.js";
 import { dispatchResponseSurface } from "./surfaceDispatcher.js";
 import type { RuntimeEventPatch } from "./eventLog.js";
 import type { RuntimeRequirement } from "../runtimeRequirements.js";
-import type { ResponseSurfacePrototypeConfig } from "../responseSurface.js";
+import {
+  isResponseSurfacePostOutboundAvailable,
+  type ResponseSurfacePrototypeConfig,
+} from "../responseSurface.js";
+import type { OutboundPostClient } from "../lark/outboundPostClient.js";
+import { markPostLedgerFallbackVisible } from "./postFile.js";
 
 // ---------------------------------------------------------------------------
 // Private helpers — worktree bootstrap
@@ -463,6 +468,13 @@ export interface BridgeHandlerDeps {
     response_surface_prototype?: ResponseSurfacePrototypeConfig;
   };
   /**
+   * Optional outbound post transport. main.ts only injects this when the bot's
+   * config explicitly enables the response-surface post gate behind an allowlist.
+   * Each turn still re-checks chat/thread allowlists before considering it
+   * available.
+   */
+  postClient?: OutboundPostClient;
+  /**
    * V2: L2 Agent Memory content (职能定义) — loaded from the bot's memory_file by
    * botLoader. Injected into the prompt as a `<agent-memory>` role preamble.
    * When absent (V1 or no memory_file), no memory block is rendered.
@@ -650,13 +662,17 @@ export class BridgeHandler {
     // anchored on the user's message. Thread-replies pass false.
     const isTopLevel = !(typeof parsed.raw.root_id === "string" && parsed.raw.root_id);
     const replyInThread = isTopLevel;
+    const prototypeConfig = this.deps.botConfig?.response_surface_prototype;
+    const postOutboundAvailable = isResponseSurfacePostOutboundAvailable(
+      prototypeConfig,
+      { chatId: parsed.chatId, threadId },
+      { postClientAvailable: !!this.deps.postClient },
+    );
     const surfaceController = SurfaceController.create({
-      prototypeConfig: this.deps.botConfig?.response_surface_prototype,
+      prototypeConfig,
       chatId: parsed.chatId,
       threadId,
-      // PR3 owns real post outbound + ledger + visible post failure fallback.
-      // Until then every runtime path keeps the legacy visible card fallback.
-      postOutboundAvailable: false,
+      postOutboundAvailable,
       postLedgerAvailable: true,
       visibleFallbackAvailable: true,
     });
@@ -1096,90 +1112,129 @@ export class BridgeHandler {
           //
           // Card body text = bot's `last_message` (preferred, productized),
           // falling back to streamed text only when bot didn't write one.
-          if (card) {
-            const reportedStatus = reportedState?.status;
-            const reportedError = reportedState?.error;
-            let success: boolean;
-            let failureReason: string | undefined;
+          const reportedStatus = reportedState?.status;
+          const reportedError = reportedState?.error;
+          let success: boolean;
+          let failureReason: string | undefined;
 
-            if (reportedStatus === "failed") {
-              success = false;
-              failureReason = reportedError ?? "bot 报告 failed (无 error 字段)";
-            } else if (reportedStatus === "ready") {
-              success = true;
-            } else if (result.exitCode === 0) {
-              success = true;
-            } else {
-              success = false;
-              failureReason = `claude exited ${result.exitCode} 且 bot 未更新 state.json status — 可能崩溃`;
+          if (reportedStatus === "failed") {
+            success = false;
+            failureReason = reportedError ?? "bot 报告 failed (无 error 字段)";
+          } else if (reportedStatus === "ready") {
+            success = true;
+          } else if (result.exitCode === 0) {
+            success = true;
+          } else {
+            success = false;
+            failureReason = `claude exited ${result.exitCode} 且 bot 未更新 state.json status — 可能崩溃`;
+          }
+
+          // reportedState is null when the bot didn't rewrite state.json this
+          // turn (stale-guard above), so this falls back to the agent's fresh
+          // streamed text instead of repeating the previous reply. If there's
+          // also no fresh text (e.g. run was interrupted before any output),
+          // show an honest prompt to retry rather than a blank/stale card.
+          const cardBody =
+            reportedState?.last_message ??
+            (lastText.trim()
+              ? lastText
+              : "⚠️ 本轮没有拿到 agent 的新回复(可能被中断或未更新状态),再 @ 我一次重试。");
+
+          // When the agent didn't report status this turn (reportedState null,
+          // per stale-guard) but exited cleanly, don't let the card default to
+          // "✅ 完成" — the agent just produced text without a status, claiming
+          // success is misleading. Show a neutral title/color; the fresh body
+          // text tells the real story. (On a real failure we keep failure style.)
+          const noReportThisTurn = reportedState === null;
+          const neutralTitle =
+            noReportThisTurn && success && !failureReason
+              ? "💬 已回复"
+              : undefined;
+
+          const baseCardPayload = {
+            finalText: cardBody,
+            success,
+            failureReason,
+            titleOverride: reportedState?.card_title ?? neutralTitle,
+            colorOverride:
+              reportedState?.card_color ?? (neutralTitle ? "neutral" : undefined),
+            // V2 dynamic-choice buttons — agent-declared, rendered verbatim.
+            // reportedState is null when state.json wasn't freshly written
+            // (stale-guard), so stale leftover choices never reappear.
+            choices: reportedState?.choices,
+            choicePrompt: reportedState?.choice_prompt,
+            imageBlocks: reportedState?.image_blocks,
+            contentBlocks: reportedState?.content_blocks,
+          };
+          const surfaceDispatch = await dispatchResponseSurface({
+            state: reportedState,
+            prototypeConfig,
+            facts: {
+              botId: this.deps.botConfig?.id ?? "v1-default",
+              chatId: parsed.chatId,
+              threadId,
+              triggerMessageId: messageId,
+              replyToMessageId: messageId,
+              replyInThread,
+            },
+            worktreePath,
+            baseCard: baseCardPayload,
+            cardStarted: !!card,
+            postOutboundAvailable,
+            postLedgerAvailable: true,
+            visibleFallbackAvailable: true,
+            postClient: this.deps.postClient,
+          });
+
+          if (surfaceDispatch.card) {
+            if (!card) {
+              card = await this.deps.cardRenderer.start(messageId, { replyInThread, threadId });
+              try {
+                await writeCardFile(worktreePath, {
+                  messageId: card.messageId,
+                  chatId: parsed.chatId,
+                  threadId,
+                  botId: this.deps.botConfig?.id ?? "",
+                  replyInThread,
+                  createdAt: new Date().toISOString(),
+                });
+              } catch (err) {
+                console.warn("[bridge.handler] writeCardFile(late) failed (continuing):", err);
+              }
             }
 
-            // reportedState is null when the bot didn't rewrite state.json this
-            // turn (stale-guard above), so this falls back to the agent's fresh
-            // streamed text instead of repeating the previous reply. If there's
-            // also no fresh text (e.g. run was interrupted before any output),
-            // show an honest prompt to retry rather than a blank/stale card.
-            const cardBody =
-              reportedState?.last_message ??
-              (lastText.trim()
-                ? lastText
-                : "⚠️ 本轮没有拿到 agent 的新回复(可能被中断或未更新状态),再 @ 我一次重试。");
+            await card.finalize(surfaceDispatch.card);
 
-            // When the agent didn't report status this turn (reportedState null,
-            // per stale-guard) but exited cleanly, don't let the card default to
-            // "✅ 完成" — the agent just produced text without a status, claiming
-            // success is misleading. Show a neutral title/color; the fresh body
-            // text tells the real story. (On a real failure we keep failure style.)
-            const noReportThisTurn = reportedState === null;
-            const neutralTitle =
-              noReportThisTurn && success && !failureReason
-                ? "💬 已回复"
-                : undefined;
-
-            const baseCardPayload = {
-              finalText: cardBody,
-              success,
-              failureReason,
-              titleOverride: reportedState?.card_title ?? neutralTitle,
-              colorOverride:
-                reportedState?.card_color ?? (neutralTitle ? "neutral" : undefined),
-              // V2 dynamic-choice buttons — agent-declared, rendered verbatim.
-              // reportedState is null when state.json wasn't freshly written
-              // (stale-guard), so stale leftover choices never reappear.
-              choices: reportedState?.choices,
-              choicePrompt: reportedState?.choice_prompt,
-              imageBlocks: reportedState?.image_blocks,
-              contentBlocks: reportedState?.content_blocks,
-            };
-            const surfaceDispatch = await dispatchResponseSurface({
-              state: reportedState,
-              prototypeConfig: this.deps.botConfig?.response_surface_prototype,
-              facts: {
-                botId: this.deps.botConfig?.id ?? "v1-default",
-                chatId: parsed.chatId,
-                threadId,
-                triggerMessageId: messageId,
-                replyToMessageId: messageId,
-                replyInThread,
-              },
-              worktreePath,
-              baseCard: baseCardPayload,
-              cardStarted: true,
-              // PR4 wires the dispatcher but keeps production post outbound
-              // unavailable. Real post transport remains behind a later,
-              // separately-authorized PR and explicit bot config gates.
-              postOutboundAvailable: false,
-              postLedgerAvailable: true,
-              visibleFallbackAvailable: true,
-            });
-            if (surfaceDispatch.card) {
-              await card.finalize(surfaceDispatch.card);
+            let keepCardFileForRetry = false;
+            if (surfaceDispatch.post?.requiresFallbackLedgerMark) {
+              try {
+                await markPostLedgerFallbackVisible(
+                  worktreePath,
+                  surfaceDispatch.post.idempotencyKey,
+                  {
+                    fallbackCardMessageId: card.messageId,
+                    error:
+                      surfaceDispatch.post.fallbackError ??
+                      surfaceDispatch.card.failureReason ??
+                      "post outbound failed; visible card fallback used",
+                  },
+                );
+              } catch (err) {
+                keepCardFileForRetry = true;
+                console.warn(
+                  "[bridge.handler] fallback ledger mark failed after visible card finalize; keeping card.json for retry:",
+                  err,
+                );
+              }
             }
 
             // Card was finalized successfully — drop its card.json so boot
-            // reconcile doesn't re-finalize an already-finalized card.
-            // Best-effort (deleteCardFile never throws).
-            await deleteCardFile(worktreePath);
+            // reconcile doesn't re-finalize an already-finalized card. If the
+            // post fallback ledger mark failed, keep card.json so boot reconcile
+            // can retry association with the existing visible card.
+            if (!keepCardFileForRetry) {
+              await deleteCardFile(worktreePath);
+            }
           }
 
           // Terminal SUCCESS: promote the message out of in-flight into the

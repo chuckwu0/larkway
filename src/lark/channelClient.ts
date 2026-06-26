@@ -30,7 +30,9 @@ import { promisify } from "node:util";
 import type { LarkMessageEvent, LarkClientOptions } from "./transport.js";
 import { AsyncQueue } from "./transport.js";
 import { ChannelCardClient, type OutboundLarkChannel } from "./channelCardClient.js";
+import { ChannelPostClient } from "./channelPostClient.js";
 import type { OutboundCardClient } from "./outboundCardClient.js";
+import type { OutboundPostClient } from "./outboundPostClient.js";
 
 const execFile = promisify(execFileCallback);
 const LEARNED_CHATS_LIMIT = 100;
@@ -478,6 +480,8 @@ export class ChannelClient {
   private readonly cardThreads = new Map<string, string>();
   /** Lazily built (after connect) so it can bind the live channel handle. */
   private cardClient: ChannelCardClient | null = null;
+  /** Lazily built and only requested by main.ts when post outbound gates are configured. */
+  private postClient: ChannelPostClient | null = null;
 
   constructor(opts: LarkClientOptions) {
     if (!opts.appId || !opts.appSecret) {
@@ -707,6 +711,23 @@ export class ChannelClient {
       });
     }
     return this.cardClient;
+  }
+
+  /**
+   * Return an OutboundPostClient bound to this client's channel handle.
+   *
+   * main.ts only calls this when the per-bot response-surface config explicitly
+   * enables post outbound behind an allowlist. The returned client still resolves
+   * the live channel lazily at send time, so default production bots never create
+   * or inject a real post client.
+   */
+  outboundPostClient(): OutboundPostClient {
+    if (!this.postClient) {
+      this.postClient = new ChannelPostClient({
+        resolveChannel: () => this.channel,
+      });
+    }
+    return this.postClient;
   }
 
   /**

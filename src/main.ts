@@ -32,6 +32,7 @@ import { ensureLarkCliProfile, deriveLarkCliProfile } from "./lark/profileBootst
 import { checkWorkspacePermissionGrant } from "./agent/permissionGate.js";
 import { runtimeRequirementsForBots } from "./runtimeRequirements.js";
 import { registerCrashGuard } from "./crashGuard.js";
+import { shouldProvideResponseSurfacePostClient } from "./responseSurface.js";
 
 /** How often the bridge rewrites each bot's status.json liveness heartbeat. */
 const STATUS_WRITE_INTERVAL_MS = 30_000;
@@ -330,6 +331,10 @@ async function runV2Mode({
       return [{ id: peer.bot_open_id, name: peer.name, description: peer.description ?? "" }];
     });
 
+    const postClient = shouldProvideResponseSurfacePostClient(bot.response_surface_prototype)
+      ? client.outboundPostClient()
+      : undefined;
+
     const handler = new BridgeHandler({
       client,
       cardRenderer,
@@ -352,6 +357,7 @@ async function runV2Mode({
         gitlab_token_env: bot.gitlab_token_env,
         response_surface_prototype: bot.response_surface_prototype,
       },
+      postClient,
       gitlabToken: effectiveGitlabToken,
       agentMemory: bot.agent_memory,
       larkCliProfile,

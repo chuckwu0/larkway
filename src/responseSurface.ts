@@ -151,3 +151,26 @@ export function isResponseSurfacePrototypeAllowlisted(
     config.allowed_threads.length > 0 && config.allowed_threads.includes(facts.threadId);
   return chatAllowed || threadAllowed;
 }
+
+export function shouldProvideResponseSurfacePostClient(
+  config: ResponseSurfacePrototypeConfig | undefined,
+): boolean {
+  return !!(
+    config?.enabled &&
+    config.post_outbound_enabled &&
+    config.max_posts_per_turn >= 1 &&
+    (config.allowed_chats.length > 0 || config.allowed_threads.length > 0)
+  );
+}
+
+export function isResponseSurfacePostOutboundAvailable(
+  config: ResponseSurfacePrototypeConfig | undefined,
+  facts: { chatId: string; threadId: string },
+  opts: { postClientAvailable: boolean },
+): boolean {
+  return !!(
+    opts.postClientAvailable &&
+    shouldProvideResponseSurfacePostClient(config) &&
+    isResponseSurfacePrototypeAllowlisted(config, facts)
+  );
+}

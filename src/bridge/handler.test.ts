@@ -10,6 +10,10 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { mkdtemp, rm, mkdir, writeFile, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { readPostFile, writePostFile } from "./postFile.js";
+import { buildPostContent } from "../lark/postContent.js";
+import { derivePostIdempotencyKey, digestPostContent } from "../lark/idempotency.js";
+import type { OutboundPostClient } from "../lark/outboundPostClient.js";
 
 // ---------------------------------------------------------------------------
 // handler.ts calls createRunner("claude").run(...) from agent/runner.
@@ -241,6 +245,61 @@ function makeClient(event: Record<string, unknown>) {
   return { client, acked, unhandled, reactionCalls };
 }
 
+function makePostClient(opts: { fail?: boolean } = {}) {
+  const calls: Array<{
+    replyToMessageId: string;
+    content: string;
+    idempotencyKey: string;
+    replyInThread: boolean;
+  }> = [];
+  const client: OutboundPostClient = {
+    async createPostReply(replyToMessageId, content, callOpts) {
+      calls.push({
+        replyToMessageId,
+        content,
+        idempotencyKey: callOpts.idempotencyKey,
+        replyInThread: callOpts.replyInThread,
+      });
+      if (opts.fail) throw new Error("fake post failed");
+      return { messageId: "om_post" };
+    },
+  };
+  return { client, calls };
+}
+
+async function seedPendingPostLedger(worktreePath: string, text: string): Promise<void> {
+  const content = buildPostContent({ text, mentions: [] });
+  const contentDigest = digestPostContent(content);
+  const idempotencyKey = derivePostIdempotencyKey({
+    botId: "frontend",
+    threadId: "om_msg",
+    triggerMessageId: "om_msg",
+    role: "primary",
+    logicalIndex: 0,
+    contentDigest,
+  });
+  await writePostFile(worktreePath, {
+    version: 1,
+    posts: [
+      {
+        idempotencyKey,
+        status: "pending",
+        botId: "frontend",
+        chatId: "chat_allowed",
+        threadId: "om_msg",
+        replyToMessageId: "om_msg",
+        role: "primary",
+        logicalIndex: 0,
+        contentDigest,
+        mentionCount: 0,
+        attempts: [],
+        createdAt: "2026-06-26T10:00:00.000Z",
+        updatedAt: "2026-06-26T10:00:00.000Z",
+      },
+    ],
+  });
+}
+
 function makeEvent(): Record<string, unknown> {
   return {
     message_id: "om_msg",
@@ -456,8 +515,8 @@ describe("handleOne — thin-channel finalize", () => {
         backend: "claude",
         response_surface_prototype: {
           enabled: true,
-          allowed_chats: ["oc_chat"],
-          allowed_threads: [],
+          allowed_chats: [],
+          allowed_threads: ["om_msg"],
           lazy_card_creation: true,
           post_outbound_enabled: true,
           allowed_mention_open_ids: [],
@@ -527,8 +586,8 @@ describe("handleOne — thin-channel finalize", () => {
         backend: "claude",
         response_surface_prototype: {
           enabled: true,
-          allowed_chats: ["oc_chat"],
-          allowed_threads: [],
+          allowed_chats: [],
+          allowed_threads: ["om_msg"],
           lazy_card_creation: true,
           post_outbound_enabled: true,
           allowed_mention_open_ids: [],
@@ -546,6 +605,293 @@ describe("handleOne — thin-channel finalize", () => {
     expect(finalizeArgs).toHaveLength(1);
     expect(finalizeArgs[0]?.success).toBe(true);
     expect(finalizeArgs[0]?.finalText).toBe("post 声明下的正文仍必须可见");
+  });
+
+  it("keeps production-default config on visible card fallback even when a post client dependency exists", async () => {
+    const threadId = "om_msg";
+    const finalState = {
+      status: "ready",
+      last_message: "默认配置仍走卡片",
+      response_surface: {
+        mode: "post",
+        primary: "post",
+      },
+      updated_at: "2026-06-26T10:00:00.000Z",
+    };
+    const wt = await seedWorktree(threadId);
+    await seedRepoCachePath();
+    const { client: postClient, calls } = makePostClient();
+
+    runClaudeImpl = () => ({
+      events: (async function* () {
+        yield { type: "system_init", sessionId: "sess_surface_default_off", raw: {} };
+        await writeFile(
+          stateFileMod.stateFilePathOf(wt),
+          JSON.stringify(finalState, null, 2),
+          "utf8",
+        );
+      })(),
+      done: Promise.resolve({ exitCode: 0, sessionId: "sess_surface_default_off" }),
+      kill: () => {},
+    });
+
+    const { renderer, startArgs, finalizeArgs, whenFinalized } = makeCardRenderer();
+    const { store } = makeSessionStore();
+    const { client } = makeClient(makeEvent());
+
+    const handler = new BridgeHandler({
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      client: client as any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      cardRenderer: renderer as any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      sessionStore: store as any,
+      conventions: makeConventions(),
+      botConfig: { id: "frontend", name: "Frontend", turn_taking_limit: 10, backend: "claude" },
+      postClient,
+    });
+
+    await handler.run();
+    await whenFinalized;
+
+    expect(startArgs).toHaveLength(1);
+    expect(finalizeArgs).toHaveLength(1);
+    expect(finalizeArgs[0]?.success).toBe(true);
+    expect(finalizeArgs[0]?.finalText).toBe("默认配置仍走卡片");
+    expect(calls).toHaveLength(0);
+  });
+
+  it("uses an injected post client for allowlisted post-only turns without starting a card", async () => {
+    const threadId = "om_msg";
+    const finalState = {
+      status: "ready",
+      last_message: "隔离配置走 post-only",
+      response_surface: {
+        mode: "post",
+        primary: "post",
+      },
+      updated_at: "2026-06-26T10:00:00.000Z",
+    };
+    const wt = await seedWorktree(threadId);
+    await seedRepoCachePath();
+    const { client: postClient, calls } = makePostClient();
+
+    runClaudeImpl = () => ({
+      events: (async function* () {
+        yield { type: "system_init", sessionId: "sess_surface_post_enabled", raw: {} };
+        await writeFile(
+          stateFileMod.stateFilePathOf(wt),
+          JSON.stringify(finalState, null, 2),
+          "utf8",
+        );
+      })(),
+      done: Promise.resolve({ exitCode: 0, sessionId: "sess_surface_post_enabled" }),
+      kill: () => {},
+    });
+
+    const { renderer, startArgs, finalizeArgs } = makeCardRenderer();
+    const { store } = makeSessionStore();
+    const { client, acked } = makeClient(makeEvent());
+
+    const handler = new BridgeHandler({
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      client: client as any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      cardRenderer: renderer as any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      sessionStore: store as any,
+      conventions: makeConventions(),
+      botConfig: {
+        id: "frontend",
+        name: "Frontend",
+        turn_taking_limit: 10,
+        backend: "claude",
+        response_surface_prototype: {
+          enabled: true,
+          allowed_chats: [],
+          allowed_threads: ["om_msg"],
+          lazy_card_creation: true,
+          post_outbound_enabled: true,
+          allowed_mention_open_ids: [],
+          max_posts_per_turn: 1,
+          max_post_attempts: 3,
+          text_threshold_chars: 900,
+        },
+      },
+      postClient,
+    });
+
+    await handler.run();
+    for (let i = 0; i < 100 && acked.length === 0; i++) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
+
+    expect(acked).toEqual(["om_msg"]);
+    expect(startArgs).toHaveLength(0);
+    expect(finalizeArgs).toHaveLength(0);
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.replyToMessageId).toBe("om_msg");
+    expect(calls[0]?.content).toContain("隔离配置走 post-only");
+    const ledger = await readPostFile(wt);
+    expect(ledger?.posts[0]?.status).toBe("sent");
+    expect(ledger?.posts[0]?.postMessageId).toBe("om_post");
+  });
+
+  it("late-starts a visible fallback card before marking a failed post ledger fallback_visible", async () => {
+    const threadId = "om_msg";
+    const finalState = {
+      status: "ready",
+      last_message: "post 失败必须有可见 fallback",
+      response_surface: {
+        mode: "post",
+        primary: "post",
+      },
+      updated_at: "2026-06-26T10:00:00.000Z",
+    };
+    const wt = await seedWorktree(threadId);
+    await seedRepoCachePath();
+    const { client: postClient, calls } = makePostClient({ fail: true });
+
+    runClaudeImpl = () => ({
+      events: (async function* () {
+        yield { type: "system_init", sessionId: "sess_surface_post_failed", raw: {} };
+        await writeFile(
+          stateFileMod.stateFilePathOf(wt),
+          JSON.stringify(finalState, null, 2),
+          "utf8",
+        );
+      })(),
+      done: Promise.resolve({ exitCode: 0, sessionId: "sess_surface_post_failed" }),
+      kill: () => {},
+    });
+
+    const { renderer, startArgs, finalizeArgs, whenFinalized } = makeCardRenderer();
+    const { store } = makeSessionStore();
+    const { client } = makeClient(makeEvent());
+
+    const handler = new BridgeHandler({
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      client: client as any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      cardRenderer: renderer as any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      sessionStore: store as any,
+      conventions: makeConventions(),
+      botConfig: {
+        id: "frontend",
+        name: "Frontend",
+        turn_taking_limit: 10,
+        backend: "claude",
+        response_surface_prototype: {
+          enabled: true,
+          allowed_chats: [],
+          allowed_threads: ["om_msg"],
+          lazy_card_creation: true,
+          post_outbound_enabled: true,
+          allowed_mention_open_ids: [],
+          max_posts_per_turn: 1,
+          max_post_attempts: 3,
+          text_threshold_chars: 900,
+        },
+      },
+      postClient,
+    });
+
+    await handler.run();
+    await whenFinalized;
+
+    expect(startArgs).toHaveLength(1);
+    expect(finalizeArgs).toHaveLength(1);
+    expect(finalizeArgs[0]?.success).toBe(false);
+    expect(finalizeArgs[0]?.failureReason).toContain("visible card fallback used");
+    expect(calls).toHaveLength(1);
+    let ledger = await readPostFile(wt);
+    for (let i = 0; i < 100 && ledger?.posts[0]?.status !== "fallback_visible"; i++) {
+      await new Promise((r) => setTimeout(r, 10));
+      ledger = await readPostFile(wt);
+    }
+    expect(ledger?.posts[0]?.status).toBe("fallback_visible");
+    expect(ledger?.posts[0]?.fallbackCardMessageId).toBe("om_card");
+    expect(ledger?.posts[0]?.attempts[0]?.status).toBe("failed");
+  });
+
+  it("late-starts a visible fallback card before marking an existing pending post ledger fallback_visible", async () => {
+    const threadId = "om_msg";
+    const finalState = {
+      status: "ready",
+      last_message: "existing ledger 必须等可见卡后再终态",
+      response_surface: {
+        mode: "post",
+        primary: "post",
+      },
+      updated_at: "2026-06-26T10:00:00.000Z",
+    };
+    const wt = await seedWorktree(threadId);
+    await seedPendingPostLedger(wt, finalState.last_message);
+    await seedRepoCachePath();
+    const { client: postClient, calls } = makePostClient();
+
+    runClaudeImpl = () => ({
+      events: (async function* () {
+        yield { type: "system_init", sessionId: "sess_surface_existing_pending", raw: {} };
+        await writeFile(
+          stateFileMod.stateFilePathOf(wt),
+          JSON.stringify(finalState, null, 2),
+          "utf8",
+        );
+      })(),
+      done: Promise.resolve({ exitCode: 0, sessionId: "sess_surface_existing_pending" }),
+      kill: () => {},
+    });
+
+    const { renderer, startArgs, finalizeArgs, whenFinalized } = makeCardRenderer();
+    const { store } = makeSessionStore();
+    const { client } = makeClient(makeEvent());
+
+    const handler = new BridgeHandler({
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      client: client as any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      cardRenderer: renderer as any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      sessionStore: store as any,
+      conventions: makeConventions(),
+      botConfig: {
+        id: "frontend",
+        name: "Frontend",
+        turn_taking_limit: 10,
+        backend: "claude",
+        response_surface_prototype: {
+          enabled: true,
+          allowed_chats: [],
+          allowed_threads: ["om_msg"],
+          lazy_card_creation: true,
+          post_outbound_enabled: true,
+          allowed_mention_open_ids: [],
+          max_posts_per_turn: 1,
+          max_post_attempts: 3,
+          text_threshold_chars: 900,
+        },
+      },
+      postClient,
+    });
+
+    await handler.run();
+    await whenFinalized;
+
+    expect(startArgs).toHaveLength(1);
+    expect(finalizeArgs).toHaveLength(1);
+    expect(finalizeArgs[0]?.success).toBe(false);
+    expect(finalizeArgs[0]?.failureReason).toContain("visible card fallback used");
+    expect(calls).toHaveLength(0);
+    let ledger = await readPostFile(wt);
+    for (let i = 0; i < 100 && ledger?.posts[0]?.status !== "fallback_visible"; i++) {
+      await new Promise((r) => setTimeout(r, 10));
+      ledger = await readPostFile(wt);
+    }
+    expect(ledger?.posts[0]?.status).toBe("fallback_visible");
+    expect(ledger?.posts[0]?.fallbackCardMessageId).toBe("om_card");
+    expect(ledger?.posts[0]?.attempts[0]?.code).toBe("orphan_reconcile");
   });
 
   it("late-stage state.json WITHOUT dev_url is NOT probed and NOT demoted (status=ready → success)", async () => {
