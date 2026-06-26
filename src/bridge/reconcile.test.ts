@@ -10,7 +10,7 @@
  *      and that a finalize rejection does NOT throw + bumps retryCount.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { mkdtemp, rm, mkdir, utimes } from "node:fs/promises";
+import { chmod, mkdtemp, rm, mkdir, utimes } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -159,7 +159,11 @@ interface SpyHandle extends CardHandle {
   finalizeArgs: Parameters<CardHandle["finalize"]>[0][];
 }
 
-function makeFakeRenderer(opts?: { rejectFinalize?: boolean; rejectStart?: boolean }) {
+function makeFakeRenderer(opts?: {
+  rejectFinalize?: boolean;
+  rejectStart?: boolean;
+  onFinalize?: (messageId: string) => Promise<void> | void;
+}) {
   const handlesByMessageId = new Map<string, SpyHandle>();
   const startCalls: Array<{
     replyToMessageId: string;
@@ -176,6 +180,7 @@ function makeFakeRenderer(opts?: { rejectFinalize?: boolean; rejectStart?: boole
       finalize: vi.fn(async (a) => {
         finalizeArgs.push(a);
         if (opts?.rejectFinalize) throw new Error("PATCH 230001 not the sender");
+        await opts?.onFinalize?.(messageId);
       }) as unknown as CardHandle["finalize"],
     };
     handlesByMessageId.set(messageId, handle);
@@ -439,6 +444,68 @@ describe("reconcileOrphanedCards — integration", () => {
     const ledgerAfterSecond = await readPostFile(wt);
     expect(ledgerAfterSecond?.posts[0]?.status).toBe("fallback_visible");
     expect(ledgerAfterSecond?.posts[0]?.fallbackCardMessageId).toBe("om_existing_card");
+  });
+
+  it("keeps card.json when post ledger mark fails after finalize even past retry cap", async () => {
+    const wt = await seedWorktree(
+      "om_mark_fails_at_cap",
+      card({
+        messageId: "om_existing_card_cap",
+        threadId: "om_mark_fails_at_cap",
+        retryCount: 3,
+      }),
+      state("ready", { last_message: "existing card is visible" }),
+    );
+    await writePostFile(wt, {
+      version: 1,
+      posts: [postEntry({ threadId: "om_mark_fails_at_cap" })],
+    });
+    const larkwayDir = join(wt, ".larkway");
+    let failMarkOnce = true;
+    const logs: string[] = [];
+    const { renderer, startCalls, handlesByMessageId } = makeFakeRenderer({
+      onFinalize: async (messageId) => {
+        if (messageId !== "om_existing_card_cap" || !failMarkOnce) return;
+        failMarkOnce = false;
+        await chmod(larkwayDir, 0o500);
+      },
+    });
+
+    await expect(
+      reconcileOrphanedCards({
+        botId: "gitlab",
+        worktreesDir: root,
+        cardRenderer: renderer,
+        minAgeMs: 60_000,
+        log: (message) => logs.push(message),
+      }),
+    ).resolves.toBeUndefined();
+
+    const cardAfterMarkFailure = await readCardFile(wt);
+    expect(cardAfterMarkFailure).not.toBeNull();
+    expect(cardAfterMarkFailure?.retryCount).toBe(3);
+    const ledgerAfterMarkFailure = await readPostFile(wt);
+    expect(ledgerAfterMarkFailure?.posts[0]?.status).toBe("pending");
+    expect(ledgerAfterMarkFailure?.posts[0]?.fallbackCardMessageId).toBeUndefined();
+    expect(logs.some((message) => message.includes("post ledger mark failed"))).toBe(true);
+    expect(logs.some((message) => message.includes("finalize FAILED"))).toBe(false);
+
+    await chmod(larkwayDir, 0o700);
+
+    await reconcileOrphanedCards({
+      botId: "gitlab",
+      worktreesDir: root,
+      cardRenderer: renderer,
+      minAgeMs: 60_000,
+      log: () => {},
+    });
+
+    expect(startCalls).toEqual([]);
+    expect(handlesByMessageId.has("om_started_1")).toBe(false);
+    const ledgerAfterRetry = await readPostFile(wt);
+    expect(ledgerAfterRetry?.posts[0]?.status).toBe("fallback_visible");
+    expect(ledgerAfterRetry?.posts[0]?.fallbackCardMessageId).toBe("om_existing_card_cap");
+    expect(await readCardFile(wt)).toBeNull();
   });
 
   it("leaves a post-only orphan non-terminal when fallback card creation fails", async () => {

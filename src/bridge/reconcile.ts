@@ -457,22 +457,10 @@ export async function reconcileOrphanedCards(deps: ReconcileDeps): Promise<void>
     const state = cand?.state;
     if (!state) continue; // defensive — selector already ensured this
 
+    let handle: CardHandle;
     try {
-      const handle = deps.cardRenderer.handleFor(orphan.card.messageId);
+      handle = deps.cardRenderer.handleFor(orphan.card.messageId);
       await handle.finalize(mapFinalizeArgs(state, orphan.success, orphan.stateFresh));
-      await markVisiblePostFallbacksForCard({
-        worktreePath: wtPath,
-        botId: deps.botId,
-        minAgeMs,
-        nowIso,
-        fallbackCardMessageId: handle.messageId,
-        log,
-      });
-      // Success → drop card.json so the next boot doesn't re-finalize.
-      await deleteCardFile(wtPath);
-      log(
-        `[reconcile] finalized ${orphan.name} as ${orphan.success ? "success" : "failure"} (${orphan.reason})`,
-      );
     } catch (err) {
       // Finalize PATCH rejected (e.g. message deleted, transient network).
       // Bump retryCount; if over the cap, delete card.json to stop looping.
@@ -490,6 +478,33 @@ export async function reconcileOrphanedCards(deps: ReconcileDeps): Promise<void>
           log(`[reconcile] could not bump retryCount for ${orphan.name} (ignoring): ${String(writeErr)}`);
         }
       }
+      continue;
+    }
+
+    try {
+      await markVisiblePostFallbacksForCard({
+        worktreePath: wtPath,
+        botId: deps.botId,
+        minAgeMs,
+        nowIso,
+        fallbackCardMessageId: handle.messageId,
+        log,
+      });
+    } catch (err) {
+      log(
+        `[reconcile] post ledger mark failed for ${orphan.name} after visible card finalize; keeping card.json for retry: ${String(err)}`,
+      );
+      continue;
+    }
+
+    try {
+      // Success → drop card.json so the next boot doesn't re-finalize.
+      await deleteCardFile(wtPath);
+      log(
+        `[reconcile] finalized ${orphan.name} as ${orphan.success ? "success" : "failure"} (${orphan.reason})`,
+      );
+    } catch (err) {
+      log(`[reconcile] could not delete card.json for ${orphan.name} after finalize (ignoring): ${String(err)}`);
     }
   }
 }
