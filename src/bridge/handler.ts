@@ -33,8 +33,10 @@ import { ensureSessionArtifacts } from "../agent/sessionArtifacts.js";
 import { ensureAgentWorkspace } from "../agent/workspaceStore.js";
 import { ensureStateFile, readStateFile, stateFilePathOf } from "./stateFile.js";
 import { writeCardFile, deleteCardFile } from "./cardFile.js";
+import { SurfaceController } from "./surfaceController.js";
 import type { RuntimeEventPatch } from "./eventLog.js";
 import type { RuntimeRequirement } from "../runtimeRequirements.js";
+import type { ResponseSurfacePrototypeConfig } from "../responseSurface.js";
 
 // ---------------------------------------------------------------------------
 // Private helpers — worktree bootstrap
@@ -457,6 +459,7 @@ export interface BridgeHandlerDeps {
     runtime?: "legacy" | "agent_workspace";
     git_token_env?: string;       // preferred: generic git PAT env-var name
     gitlab_token_env?: string;    // compat alias (legacy)
+    response_surface_prototype?: ResponseSurfacePrototypeConfig;
   };
   /**
    * V2: L2 Agent Memory content (职能定义) — loaded from the bot's memory_file by
@@ -646,27 +649,44 @@ export class BridgeHandler {
     // anchored on the user's message. Thread-replies pass false.
     const isTopLevel = !(typeof parsed.raw.root_id === "string" && parsed.raw.root_id);
     const replyInThread = isTopLevel;
+    const surfaceController = SurfaceController.create({
+      prototypeConfig: this.deps.botConfig?.response_surface_prototype,
+      chatId: parsed.chatId,
+      threadId,
+      // PR3 owns real post outbound + ledger + visible post failure fallback.
+      // Until then every runtime path keeps the legacy visible card fallback.
+      postOutboundAvailable: false,
+    });
     let card: import("../lark/card.js").CardHandle | undefined;
-    try {
-      card = await this.deps.cardRenderer.start(messageId, { replyInThread, threadId });
+    if (surfaceController.shouldStartCardImmediately()) {
+      try {
+        card = await this.deps.cardRenderer.start(messageId, { replyInThread, threadId });
+        await recordEvent({
+          status: "running",
+          startedAt: new Date().toISOString(),
+          appendPath: "已创建卡片",
+          reason: "已交给本地 Agent 处理。",
+        });
+      } catch (err) {
+        console.error("[bridge.handler] Failed to start card for thread", threadId, err);
+        await recordEvent({
+          status: "running",
+          startedAt: new Date().toISOString(),
+          appendPath: "卡片创建失败，继续执行",
+          reason: "卡片创建失败，但 bridge 会继续启动本地 Agent。",
+        });
+        // Without a card we can still run Claude, but operator won't see output.
+        // Proceed — sessionStore still needs updating.
+      } finally {
+        await this.deps.client.removeProcessingReaction?.(messageId);
+      }
+    } else {
       await recordEvent({
         status: "running",
         startedAt: new Date().toISOString(),
-        appendPath: "已创建卡片",
-        reason: "已交给本地 Agent 处理。",
+        appendPath: "延迟创建卡片",
+        reason: "response_surface prototype lazy card creation is enabled.",
       });
-    } catch (err) {
-      console.error("[bridge.handler] Failed to start card for thread", threadId, err);
-      await recordEvent({
-        status: "running",
-        startedAt: new Date().toISOString(),
-        appendPath: "卡片创建失败，继续执行",
-        reason: "卡片创建失败，但 bridge 会继续启动本地 Agent。",
-      });
-      // Without a card we can still run Claude, but operator won't see output.
-      // Proceed — sessionStore still needs updating.
-    } finally {
-      await this.deps.client.removeProcessingReaction?.(messageId);
     }
 
     try {

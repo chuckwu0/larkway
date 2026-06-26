@@ -435,6 +435,48 @@ describe("handleOne — thin-channel finalize", () => {
     expect(callOrder.at(-1)).toBe("ack:om_msg");
   });
 
+  it("keeps visible card fallback when response-surface prototype is dark-launched before post outbound exists", async () => {
+    const { renderer, startArgs, finalizeArgs, whenFinalized } = makeCardRenderer();
+    const { store } = makeSessionStore();
+    const { client } = makeClient(makeEvent());
+    stubRunClaude("sess_surface", 0);
+
+    const handler = new BridgeHandler({
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      client: client as any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      cardRenderer: renderer as any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      sessionStore: store as any,
+      conventions: makeConventions(),
+      botConfig: {
+        id: "frontend",
+        name: "Frontend",
+        turn_taking_limit: 10,
+        backend: "claude",
+        response_surface_prototype: {
+          enabled: true,
+          allowed_chats: ["oc_chat"],
+          allowed_threads: [],
+          lazy_card_creation: true,
+          text_threshold_chars: 900,
+        },
+      },
+    });
+
+    await seedRepoCachePath();
+    await handler.run();
+    await whenFinalized;
+
+    expect(startArgs).toHaveLength(1);
+    expect(startArgs[0]).toMatchObject({
+      messageId: "om_msg",
+      threadId: "om_msg",
+    });
+    expect(finalizeArgs).toHaveLength(1);
+    expect(finalizeArgs[0]?.success).toBe(true);
+  });
+
   it("late-stage state.json WITHOUT dev_url is NOT probed and NOT demoted (status=ready → success)", async () => {
     // parseMessage derives threadId from root_id || message_id; makeEvent() has
     // no root_id, so the per-thread worktree dir is named after message_id.

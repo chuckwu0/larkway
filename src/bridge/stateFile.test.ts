@@ -186,6 +186,82 @@ describe("StateFileSchema — V2 dynamic choices (agent-declared, bridge-opaque)
   });
 });
 
+describe("StateFileSchema — response_surface prototype declaration", () => {
+  it("parses a card response surface declaration without changing legacy fields", () => {
+    const r = StateFileSchema.safeParse({
+      status: "ready",
+      last_message: "still rendered by the legacy card path",
+      response_surface: {
+        mode: "card",
+        primary: "card",
+        card: {
+          compact: false,
+          capabilities: ["choices", "content_blocks"],
+        },
+      },
+      updated_at: "2026-06-26T09:00:00.000Z",
+    });
+
+    expect(r.success).toBe(true);
+    if (r.success) {
+      expect(r.data.last_message).toBe("still rendered by the legacy card path");
+      expect(r.data.response_surface).toEqual({
+        mode: "card",
+        primary: "card",
+        card: {
+          compact: false,
+          capabilities: ["choices", "content_blocks"],
+        },
+      });
+    }
+  });
+
+  it("parses a hybrid declaration with post mentions and compact card metadata", () => {
+    const r = StateFileSchema.safeParse({
+      status: "ready",
+      response_surface: {
+        mode: "hybrid",
+        primary: "post",
+        post: {
+          mentions: [{ user_id: "ou_peer", label: "Peer bot" }],
+        },
+        card: {
+          compact: true,
+          capabilities: ["audit", "fallback"],
+        },
+      },
+      updated_at: "2026-06-26T09:00:00.000Z",
+    });
+
+    expect(r.success).toBe(true);
+    if (r.success) {
+      expect(r.data.response_surface?.post?.mentions).toEqual([
+        { user_id: "ou_peer", label: "Peer bot" },
+      ]);
+      expect(r.data.response_surface?.card?.compact).toBe(true);
+    }
+  });
+
+  it("soft-fails malformed response_surface so status is still usable", () => {
+    const r = StateFileSchema.safeParse({
+      status: "ready",
+      last_message: "must survive a bad prototype field",
+      response_surface: {
+        mode: "card",
+        primary: "post",
+      },
+      updated_at: "2026-06-26T09:00:00.000Z",
+    });
+
+    expect(r.success).toBe(true);
+    if (r.success) {
+      expect(r.data.status).toBe("ready");
+      expect(r.data.last_message).toBe("must survive a bad prototype field");
+      expect(r.data.response_surface).toBeUndefined();
+    }
+  });
+});
+
 describe("StateFileSchema — V2 image blocks (agent-declared, bridge-opaque)", () => {
   it("parses image_blocks and fills safe card-render defaults", () => {
     const r = StateFileSchema.safeParse({

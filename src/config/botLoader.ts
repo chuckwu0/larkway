@@ -17,6 +17,7 @@ import { readdir, readFile } from "node:fs/promises";
 import path from "node:path";
 import { z } from "zod";
 import yaml from "js-yaml";
+import { ResponseSurfacePrototypeConfigSchema } from "../responseSurface.js";
 
 // ---------------------------------------------------------------------------
 // Zod schema
@@ -200,6 +201,15 @@ export const BotConfigSchema = z.object({
    * @default false  — 所有现存 bot yaml 未设此字段时行为字节级不变。
    */
   read_only: z.boolean().default(false),
+
+  /**
+   * Dark-launch gate for the response-surface prototype.
+   *
+   * Default stays disabled so existing bots keep the legacy card-only path.
+   * Even when enabled, PR1/PR2 only prepare schema/controller plumbing; post
+   * outbound is not implemented here, so handler keeps a visible card fallback.
+   */
+  response_surface_prototype: ResponseSurfacePrototypeConfigSchema,
 
   /**
    * Runtime layout used by the bridge.

@@ -38,6 +38,7 @@ import type { BotConfig } from "../config/botLoader.js";
 import { ensureAgentWorkspace } from "../agent/workspaceStore.js";
 import { permissionItemsFromCapabilities } from "../agent/permissionPlan.js";
 import { resolveAgentWorkspacePathFromHome } from "../config/paths.js";
+import { DEFAULT_RESPONSE_SURFACE_PROTOTYPE } from "../responseSurface.js";
 
 // ---------------------------------------------------------------------------
 // registerApp SDK slice (Lark SDK has no bundled .d.ts for registerApp;
@@ -453,6 +454,7 @@ export async function createBotFromCreds(
     ...(git_token_env ? { git_token_env } : {}),
     memory_file: memoryFile,
     read_only: false,
+    response_surface_prototype: DEFAULT_RESPONSE_SURFACE_PROTOTYPE,
     runtime: "agent_workspace",
     backend: form.backend && form.backend.trim() ? form.backend.trim() : "codex",
     // Persist the Feishu avatar URL so the Web 管理面 can show an avatar before

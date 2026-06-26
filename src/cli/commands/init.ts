@@ -36,6 +36,7 @@ import {
 import { ensureAgentWorkspace, resetAgentWorkspacePermissions } from "../../agent/workspaceStore.js";
 import { permissionItemsFromCapabilities } from "../../agent/permissionPlan.js";
 import { resolveAgentWorkspacePathFromHome } from "../../config/paths.js";
+import { DEFAULT_RESPONSE_SURFACE_PROTOTYPE } from "../../responseSurface.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -631,6 +632,7 @@ async function runCreateBot(
     repos: basics.repos,
     turn_taking_limit: basics.turnLimit ?? 10,
     read_only: false,
+    response_surface_prototype: DEFAULT_RESPONSE_SURFACE_PROTOTYPE,
     runtime: "agent_workspace",
     backend: basics.backend,
     memory_file: memoryFile,
