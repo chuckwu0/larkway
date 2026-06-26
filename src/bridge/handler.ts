@@ -34,6 +34,7 @@ import { ensureAgentWorkspace } from "../agent/workspaceStore.js";
 import { ensureStateFile, readStateFile, stateFilePathOf } from "./stateFile.js";
 import { writeCardFile, deleteCardFile } from "./cardFile.js";
 import { SurfaceController } from "./surfaceController.js";
+import { dispatchResponseSurface } from "./surfaceDispatcher.js";
 import type { RuntimeEventPatch } from "./eventLog.js";
 import type { RuntimeRequirement } from "../runtimeRequirements.js";
 import type { ResponseSurfacePrototypeConfig } from "../responseSurface.js";
@@ -656,6 +657,8 @@ export class BridgeHandler {
       // PR3 owns real post outbound + ledger + visible post failure fallback.
       // Until then every runtime path keeps the legacy visible card fallback.
       postOutboundAvailable: false,
+      postLedgerAvailable: true,
+      visibleFallbackAvailable: true,
     });
     let card: import("../lark/card.js").CardHandle | undefined;
     if (surfaceController.shouldStartCardImmediately()) {
@@ -1133,7 +1136,7 @@ export class BridgeHandler {
                 ? "💬 已回复"
                 : undefined;
 
-            await card.finalize({
+            const baseCardPayload = {
               finalText: cardBody,
               success,
               failureReason,
@@ -1147,7 +1150,31 @@ export class BridgeHandler {
               choicePrompt: reportedState?.choice_prompt,
               imageBlocks: reportedState?.image_blocks,
               contentBlocks: reportedState?.content_blocks,
+            };
+            const surfaceDispatch = await dispatchResponseSurface({
+              state: reportedState,
+              prototypeConfig: this.deps.botConfig?.response_surface_prototype,
+              facts: {
+                botId: this.deps.botConfig?.id ?? "v1-default",
+                chatId: parsed.chatId,
+                threadId,
+                triggerMessageId: messageId,
+                replyToMessageId: messageId,
+                replyInThread,
+              },
+              worktreePath,
+              baseCard: baseCardPayload,
+              cardStarted: true,
+              // PR4 wires the dispatcher but keeps production post outbound
+              // unavailable. Real post transport remains behind a later,
+              // separately-authorized PR and explicit bot config gates.
+              postOutboundAvailable: false,
+              postLedgerAvailable: true,
+              visibleFallbackAvailable: true,
             });
+            if (surfaceDispatch.card) {
+              await card.finalize(surfaceDispatch.card);
+            }
 
             // Card was finalized successfully — drop its card.json so boot
             // reconcile doesn't re-finalize an already-finalized card.

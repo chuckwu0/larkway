@@ -109,7 +109,7 @@ export const ResponseSurfacePrototypeConfigSchema = z
     lazy_card_creation: z.boolean().default(false),
     /**
      * PR3 dark-launch gate for real post outbound. This must stay false by
-     * default and is not wired into production dispatch in PR3.
+     * default. PR4's dispatcher also requires this gate before any post path.
      */
     post_outbound_enabled: z.boolean().default(false),
     /**
@@ -119,8 +119,8 @@ export const ResponseSurfacePrototypeConfigSchema = z
      */
     allowed_mention_open_ids: z.array(z.string().min(1)).default([]),
     /**
-     * Hard cap for future surface dispatch. PR3 only persists the config; it
-     * does not connect this to handler routing.
+     * Hard cap for surface dispatch. PR4 still keeps production post outbound
+     * unavailable, but fake-channel dispatch tests enforce this bounded shape.
      */
     max_posts_per_turn: z.number().int().min(0).max(10).default(1),
     /**
@@ -129,8 +129,8 @@ export const ResponseSurfacePrototypeConfigSchema = z
      */
     max_post_attempts: z.number().int().min(1).max(5).default(3),
     /**
-     * Future channel threshold for lazy card creation. Reserved for PR3+; bounded
-     * now so config cannot grow unbounded or encode business rules.
+     * Future channel threshold for lazy card creation. Bounded so config cannot
+     * grow unbounded or encode business rules.
      */
     text_threshold_chars: z.number().int().min(1).max(20_000).default(1200),
   })

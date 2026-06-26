@@ -1,12 +1,13 @@
 # Response Surface Prototype
 
-Status: PR1/PR3 foundation only. Default disabled.
+Status: PR1/PR4 foundation only. Default disabled.
 
 This document defines the dark-launch foundation for future `card` / `post` /
-`hybrid` response surfaces. PR3 adds post transport, post payload construction,
-idempotency helpers, and `post.json` ledger primitives, but they remain
-default-off and are not wired into production surface dispatch. It does not
-enable real IM post outbound, peer `at`, visible post failure fallback, Feishu
+`hybrid` response surfaces. PR3 added post transport, post payload construction,
+idempotency helpers, and `post.json` ledger primitives. PR4 adds the default-off
+surface dispatcher for `card` / `post` / `hybrid` planning, compact secondary
+cards, and fake-channel tests. Production wiring still keeps post outbound
+unavailable, so this does not enable real IM post outbound, peer `at`, Feishu
 E2E, deployment, or production enablement.
 
 ## Principles
@@ -47,8 +48,8 @@ Supported narrow fields:
 
 - `mode`: `card`, `post`, or `hybrid`.
 - `primary`: `card` or `post`.
-- `post.mentions[]`: future post mention targets. These are declarations only
-  until PR3 implements real post outbound.
+- `post.mentions[]`: future post mention targets. PR4 can validate/build these
+  in fake-channel tests, but production dispatch still does not send them.
 - `card.compact`: whether the card is intended as a compact secondary surface.
 - `card.capabilities[]`: `choices`, `image_blocks`, `content_blocks`,
   `fallback`, or `audit`.
@@ -91,22 +92,30 @@ Defaults:
 `enabled: true` alone is insufficient. A current chat or thread must match the
 allowlist before the prototype can affect runtime behavior.
 
-## PR2 SurfaceController Foundation
+## PR2 / PR4 SurfaceController Foundation
 
-`SurfaceController` centralizes the card-start decision. In this PR it is wired
-with `postOutboundAvailable: false`, because real post outbound and ledger are
-explicitly out of scope.
+`SurfaceController` centralizes the card-start decision. Production wiring still
+passes `postOutboundAvailable: false`, so every production path creates the
+legacy visible card before the Agent runs.
 
-Therefore all production paths still create the legacy visible card before the
-Agent runs:
+The lazy branch is eligible only when all of these are true:
+
+- prototype enabled
+- chat/thread allowlisted
+- `lazy_card_creation: true`
+- `post_outbound_enabled: true`
+- post outbound transport available
+- post ledger available
+- visible failure fallback available
+
+Otherwise the controller starts the legacy card immediately:
 
 - prototype disabled -> card immediately
 - not allowlisted -> card immediately
 - lazy card disabled -> card immediately
-- lazy card enabled but post outbound unavailable -> card immediately
-
-The future lazy branch only becomes eligible after a later PR supplies real post
-outbound, idempotency, ledger, and visible failure fallback.
+- post outbound disabled/unavailable -> card immediately
+- post ledger unavailable -> card immediately
+- visible fallback unavailable -> card immediately
 
 ## PR3 Idempotency Reservation
 
@@ -138,9 +147,29 @@ PR3 adds default-off primitives only:
 - Retry classification for future post sends: only 5xx responses are retryable.
 - Config gates for post outbound and mention target allowlisting.
 
+## PR4 Surface Dispatcher Foundation
+
+PR4 adds `SurfaceDispatcher` and wires `BridgeHandler` finalization through it.
+The handler still passes `postOutboundAvailable: false` and no production post
+client, so live runs continue to finalize the legacy visible card.
+
+The dispatcher is covered with unit/fake-channel tests for:
+
+- `mode=card`: legacy card finalization.
+- `mode=post`: fake post send when every gate is explicitly ready.
+- `mode=hybrid`: fake post primary plus compact secondary card.
+- non-allowlisted or disabled gates: mechanical fallback to the visible card.
+- post failure: ledger marks `fallback_visible` and a visible failure card is
+  returned.
+- choices/content/image card-only capabilities: keep the legacy card path so
+  interaction controls are not lost.
+
+The compact secondary card is intentionally audit-only. It records status,
+post message id, and idempotency key; it does not repeat the primary post body.
+
 Production wiring still passes `postOutboundAvailable: false` in
-`BridgeHandler`. PR3 therefore cannot create a live post unless a future PR
-explicitly connects the transport to surface dispatch and enables the gates.
+`BridgeHandler`. PR4 therefore cannot create a live post unless a future PR
+explicitly connects the transport to production dispatch and enables the gates.
 
 ## Non-Goals Until Later PRs
 
