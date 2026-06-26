@@ -6,6 +6,10 @@ const allowlistedConfig = {
   allowed_chats: ["oc_allowed"],
   allowed_threads: [],
   lazy_card_creation: true,
+  post_outbound_enabled: false,
+  allowed_mention_open_ids: [],
+  max_posts_per_turn: 1,
+  max_post_attempts: 3,
   text_threshold_chars: 1200,
 };
 
@@ -17,6 +21,10 @@ describe("SurfaceController", () => {
         allowed_chats: [],
         allowed_threads: [],
         lazy_card_creation: false,
+        post_outbound_enabled: false,
+        allowed_mention_open_ids: [],
+        max_posts_per_turn: 1,
+        max_post_attempts: 3,
         text_threshold_chars: 1200,
       },
       chatId: "oc_allowed",

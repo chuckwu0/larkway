@@ -8,6 +8,10 @@ export function defaultResponseSurfacePrototypeConfig() {
     allowed_chats: [] as string[],
     allowed_threads: [] as string[],
     lazy_card_creation: false,
+    post_outbound_enabled: false,
+    allowed_mention_open_ids: [] as string[],
+    max_posts_per_turn: 1,
+    max_post_attempts: 3,
     text_threshold_chars: 1200,
   };
 }
@@ -19,6 +23,10 @@ const responseSurfacePrototypeConfigDefaults = () => ({
   allowed_chats: [] as string[],
   allowed_threads: [] as string[],
   lazy_card_creation: false,
+  post_outbound_enabled: false,
+  allowed_mention_open_ids: [] as string[],
+  max_posts_per_turn: 1,
+  max_post_attempts: 3,
   text_threshold_chars: 1200,
 });
 
@@ -99,6 +107,27 @@ export const ResponseSurfacePrototypeConfigSchema = z
      * exists and is explicitly enabled in a later PR.
      */
     lazy_card_creation: z.boolean().default(false),
+    /**
+     * PR3 dark-launch gate for real post outbound. This must stay false by
+     * default and is not wired into production dispatch in PR3.
+     */
+    post_outbound_enabled: z.boolean().default(false),
+    /**
+     * Explicit target allowlist for future real post @ mentions. Empty means no
+     * mention target is authorized. Keep real IDs in private bot config, never
+     * in public docs/tests.
+     */
+    allowed_mention_open_ids: z.array(z.string().min(1)).default([]),
+    /**
+     * Hard cap for future surface dispatch. PR3 only persists the config; it
+     * does not connect this to handler routing.
+     */
+    max_posts_per_turn: z.number().int().min(0).max(10).default(1),
+    /**
+     * Max attempts for one logical post. Retry classification is intentionally
+     * narrow in PR3: only 5xx errors are retryable.
+     */
+    max_post_attempts: z.number().int().min(1).max(5).default(3),
     /**
      * Future channel threshold for lazy card creation. Reserved for PR3+; bounded
      * now so config cannot grow unbounded or encode business rules.
