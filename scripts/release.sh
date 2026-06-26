@@ -39,6 +39,7 @@ ROOT="$(git rev-parse --show-toplevel)" || die "not in a git repo"
 cd "$ROOT"
 [ "$(node -p "require('./package.json').name")" = "larkway" ] || die "package.json name != larkway (wrong repo?)"
 PREV="$(node -p "require('./package.json').version")"
+RELEASE_FILES=(package.json README.md README.zh.md docs/versioning.md)
 
 # ── preflight ────────────────────────────────────────────────────────────────
 [ -z "$(git status --porcelain)" ]          || die "working tree not clean — commit/stash first"
@@ -49,11 +50,13 @@ git rev-parse "v$VERSION" >/dev/null 2>&1   && die "tag v$VERSION already exists
 echo "→ releasing larkway: $PREV → $VERSION"
 [ "$DRY_RUN" = 1 ] && echo "  (dry-run: no commit / tag / publish / push)"
 
-# ── gates: typecheck + npm packaging sanity (prepack builds dist) ─────────────
-echo "→ pnpm typecheck"; pnpm -s typecheck
-echo "→ npm publish --dry-run (validates build + package contents)"; npm publish --dry-run >/dev/null
 if [ "$DRY_RUN" != 1 ]; then
   npm whoami >/dev/null 2>&1 || die "not logged in to npm (run \`npm login\` or set NPM_TOKEN in ~/.npmrc)"
+else
+  cleanup_dry_run() {
+    git checkout -- "${RELEASE_FILES[@]}"
+  }
+  trap cleanup_dry_run EXIT
 fi
 
 # ── edits (the 4 files a release touches) ─────────────────────────────────────
@@ -71,21 +74,26 @@ awk -v prev="$PREV" -v ver="$VERSION" -v notes="$NOTES" '
   { print }
 ' docs/versioning.md > docs/versioning.md.tmp && mv docs/versioning.md.tmp docs/versioning.md
 
-echo "→ changes:"; git --no-pager diff -- package.json README.md README.zh.md docs/versioning.md
+echo "→ changes:"; git --no-pager diff -- "${RELEASE_FILES[@]}"
+
+# guard: every target file must actually mention the new version after editing
+for f in "${RELEASE_FILES[@]}"; do
+  grep -q "$VERSION" "$f" || die "$f does not mention $VERSION after edit — aborting (check the file format)"
+done
+
+# ── gates: typecheck + npm packaging sanity against the bumped version ─────────
+echo "→ pnpm typecheck"; pnpm -s typecheck
+echo "→ npm publish --dry-run (validates bumped build + package contents)"; npm publish --dry-run >/dev/null
 
 if [ "$DRY_RUN" = 1 ]; then
-  git checkout -- package.json README.md README.zh.md docs/versioning.md
+  trap - EXIT
+  git checkout -- "${RELEASE_FILES[@]}"
   echo "✓ dry-run complete — reverted, nothing committed."
   exit 0
 fi
 
-# guard: every target file must actually mention the new version after editing
-for f in package.json README.md README.zh.md docs/versioning.md; do
-  grep -q "$VERSION" "$f" || die "$f does not mention $VERSION after edit — aborting (check the file format)"
-done
-
 # ── commit + tag + publish + push ─────────────────────────────────────────────
-git add package.json README.md README.zh.md docs/versioning.md
+git add "${RELEASE_FILES[@]}"
 git commit -q -m "chore: release v$VERSION"
 git tag "v$VERSION"
 echo "→ npm publish"; npm publish --access public   # prepack builds dist
