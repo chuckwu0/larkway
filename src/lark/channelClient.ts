@@ -47,6 +47,25 @@ const OPEN_CHAT_DISCOVERY_LOOKBACK_MS = 90_000;
 const OPEN_CHAT_DISCOVERY_BOOTSTRAP_LOOKBACK_MS = 30 * 60 * 1000;
 const PROCESSING_REACTION_EMOJI = "Typing";
 
+// ── gap-fill resilience knobs (root cause B: lark-cli history pull撞 TLS timeout) ──
+/**
+ * Bounded retries for a single chat's lark-cli history pull. The pull itself can
+ *撞上 a transient TLS timeout; failing once used to permanently abandon that
+ * chat's window. We retry with exponential backoff before giving up on the chat.
+ */
+const GAP_FILL_MAX_ATTEMPTS = 3;
+/** Base backoff (ms): attempt N waits BASE * 2^(N-1) → ~1s / 2s / 4s. */
+const GAP_FILL_BACKOFF_BASE_MS = 1000;
+/**
+ * Failed-window replay queue cap (bounded, deletable). If a gapFill window still
+ * has an unresolved chat after all retries, we record its windowStart so the NEXT
+ * successful reconnect/gapFill extends its look-back to cover it (真正补回漏的 @).
+ * Keep small + time-bounded so a persistently-broken chat can't grow this forever.
+ */
+const UNRESOLVED_WINDOW_MAX_ENTRIES = 20;
+/** Drop unresolved windows older than this — beyond it the @ is unrecoverable anyway. */
+const UNRESOLVED_WINDOW_MAX_AGE_MS = 30 * 60 * 1000; // 30 min
+
 // ---------------------------------------------------------------------------
 // Minimal structural types for the SDK surface we use.
 // (The SDK's aggregated .d.ts is huge; we only need this slice and cast to it.)
@@ -418,6 +437,21 @@ export class ChannelClient {
    * search space.
    */
   private readonly recentlySeenChatIds = new Set<string>();
+  /**
+   * Bounded queue of gapFill windowStarts that did NOT fully complete (some chat
+   * kept failing after all retries). On the next successful gapFill we extend the
+   * look-back to cover the OLDEST unresolved window, so a transiently-broken
+   * lark-cli pull no longer permanently drops that window's @. Entries are pruned
+   * by age (UNRESOLVED_WINDOW_MAX_AGE_MS) and count (UNRESOLVED_WINDOW_MAX_ENTRIES)
+   * so this stays small and self-cleaning.
+   */
+  private readonly unresolvedGapWindows: number[] = [];
+  /**
+   * Backoff sleep used by the per-chat history-pull retry. Indirected through a
+   * field purely so tests can observe/await the backoff deterministically; in
+   * production it is the real timer-based {@link sleep}.
+   */
+  private gapFillSleep: (ms: number) => Promise<void> = sleep;
   private openChatDiscoveryTimer: NodeJS.Timeout | null = null;
   private openChatDiscoveryRunning = false;
   private openChatDiscoveryBootstrapped = false;
@@ -440,6 +474,21 @@ export class ChannelClient {
       );
     }
     this.opts = opts;
+  }
+
+  /**
+   * TEST SEAM (deletable): override the gap-fill retry backoff sleep so unit
+   * tests can observe the backoff durations and avoid real timers. No-op for
+   * production — the default is the real {@link sleep}. Returns the recorded
+   * backoff arg via the provided callback's own bookkeeping.
+   */
+  setGapFillSleepForTest(fn: (ms: number) => Promise<void>): void {
+    this.gapFillSleep = fn;
+  }
+
+  /** TEST-ONLY read of the pending unresolved-window replay queue. */
+  unresolvedGapWindowsForTest(): readonly number[] {
+    return [...this.unresolvedGapWindows];
   }
 
   /**
@@ -514,7 +563,25 @@ export class ChannelClient {
       // ── WS robustness knobs (node-sdk ≥1.64; all OFF by default) ──────────
       // Abort a handshake that hangs on a stuck DNS/proxy/NAT path so the retry
       // loop can try again, instead of waiting indefinitely. Successful TLS
-      // handshakes are tens of ms; 15s is a wide safety margin.
+      // handshakes are tens of ms; 15s is a wide safety margin. KEPT ON: it is
+      // the right behaviour (abort + reconnect beats hanging forever).
+      //
+      // CAVEAT — raw '_WebSocket' 'error' on abort: when this timeout fires the
+      // SDK aborts the underlying ws, which emits a RAW 'error' event on the
+      // socket. That socket is owned privately inside node-sdk's WSClient
+      // (no public `on()`, no accessor for the raw ws — verified against
+      // node-sdk 1.67.0 types: WSClient is not an EventEmitter and keeps the
+      // `_WebSocket` in a closure), so we CANNOT attach a precise 'error'
+      // listener here. With no listener, Node re-throws it as an
+      // uncaughtException → it would kill the whole (multi-bot) process.
+      //   → That raw error is instead caught by the process-level crash guard
+      //     in main.ts (registerCrashGuard: uncaughtException handler that logs
+      //     and never exits). The channel-level `channel.on("error", …)` below
+      //     is a DIFFERENT, higher-level error and does NOT cover this raw case.
+      //   → Residual uncertainty (left for acceptance load-testing): that the
+      //     process guard reliably catches this specific raw abort path under
+      //     real network flap. If a future node-sdk / @larksuite/channel exposes
+      //     the ws or attaches its own listener, prefer that and drop the guard.
       handshakeTimeoutMs: 15_000,
       // Liveness watchdog (SECONDS): if no inbound frame arrives within this
       // window after the last ping, treat the socket as dead and reconnect —
@@ -653,8 +720,15 @@ export class ChannelClient {
     const MAX_GAP_FILL_WINDOW_MS = 5 * 60 * 1000; // 5 minutes
     const BUFFER_MS = 30_000; // 30 s overlap to catch near-boundary messages
     const now = Date.now();
+    // Prune stale unresolved windows, then extend this run's look-back to cover
+    // the OLDEST still-unresolved window so a previously-failed pull gets replayed
+    // (root cause B: one TLS-timeout no longer permanently drops that window's @).
+    this.pruneUnresolvedGapWindows(now);
+    const oldestUnresolved =
+      this.unresolvedGapWindows.length > 0 ? Math.min(...this.unresolvedGapWindows) : disconnectAt;
+    const lookBackFrom = Math.min(disconnectAt, oldestUnresolved);
     // Clamp the look-back so we never flood the bridge with ancient messages.
-    const windowStart = Math.max(disconnectAt - BUFFER_MS, now - MAX_GAP_FILL_WINDOW_MS);
+    const windowStart = Math.max(lookBackFrom - BUFFER_MS, now - MAX_GAP_FILL_WINDOW_MS);
     const startIso = new Date(windowStart).toISOString();
     const endIso = new Date(now + BUFFER_MS).toISOString();
     const larkCli = this.opts.larkCliPath ?? "lark-cli";
@@ -679,10 +753,11 @@ export class ChannelClient {
       return;
     }
 
+    let anyChatFailed = false;
     for (const chatId of gapFillChatIds) {
       if (this.closed) break;
       try {
-        const { stdout } = await execFile(larkCli, [
+        const args = [
           "im",
           "+chat-messages-list",
           "--as", "bot",
@@ -694,7 +769,11 @@ export class ChannelClient {
           "--format", "json",
           "--no-reactions",
           ...profileArgs,
-        ]);
+        ];
+        // Bounded retry + exponential backoff: the history pull itself can撞上 a
+        // transient TLS timeout. Retrying turns a one-off blip into a recovered
+        // window instead of a permanently-dropped @ (root cause B).
+        const { stdout } = await this.execWithRetry(larkCli, args, chatId, log);
 
         let messages: unknown[];
         try {
@@ -803,17 +882,99 @@ export class ChannelClient {
           totalDispatched++;
         }
       } catch (e) {
+        // All retries for this chat exhausted → its window may have missed an @.
+        anyChatFailed = true;
         log(
-          `gap-fill: lark-cli failed for chat ${chatId}: ` +
+          `gap-fill: lark-cli failed for chat ${chatId} after ${GAP_FILL_MAX_ATTEMPTS} attempt(s): ` +
             (e instanceof Error ? e.message : String(e)),
         );
       }
     }
 
+    // Failed-window replay bookkeeping: if every chat succeeded, this run covered
+    // (and cleared) all unresolved windows it looked back over; drop them. If some
+    // chat still failed, remember THIS window's start so the next gapFill extends
+    // its look-back to cover it again.
+    if (!this.closed) {
+      if (anyChatFailed) {
+        this.recordUnresolvedGapWindow(windowStart, log);
+      } else {
+        this.clearUnresolvedGapWindowsUpTo(now);
+      }
+    }
+
     log(
       `gap-fill complete: window=${startIso}..${endIso}, ` +
-        `fetched=${totalFetched}, dispatched=${totalDispatched}`,
+        `fetched=${totalFetched}, dispatched=${totalDispatched}` +
+        (anyChatFailed ? ` (some chats failed — window queued for replay)` : ``),
     );
+  }
+
+  /**
+   * Run a lark-cli history pull with bounded retries + exponential backoff.
+   * Retries on ANY thrown error (transient TLS timeout being the motivating case),
+   * up to {@link GAP_FILL_MAX_ATTEMPTS}. Backoff is GAP_FILL_BACKOFF_BASE_MS *
+   * 2^(attempt-1) (~1s / 2s). Re-throws the last error if all attempts fail so the
+   * caller can flag the window for replay. Backoff goes through {@link gapFillSleep}
+   * (injectable) so tests can observe it deterministically.
+   */
+  private async execWithRetry(
+    larkCli: string,
+    args: string[],
+    chatId: string,
+    log: (s: string) => void,
+  ): Promise<{ stdout: string; stderr: string }> {
+    let lastErr: unknown;
+    for (let attempt = 1; attempt <= GAP_FILL_MAX_ATTEMPTS; attempt++) {
+      if (this.closed) throw lastErr ?? new Error("closed");
+      try {
+        return await execFile(larkCli, args);
+      } catch (e) {
+        lastErr = e;
+        if (attempt < GAP_FILL_MAX_ATTEMPTS) {
+          const backoffMs = GAP_FILL_BACKOFF_BASE_MS * 2 ** (attempt - 1);
+          log(
+            `gap-fill: lark-cli pull failed for chat ${chatId} ` +
+              `(attempt ${attempt}/${GAP_FILL_MAX_ATTEMPTS}) — retrying in ${backoffMs}ms: ` +
+              (e instanceof Error ? e.message : String(e)),
+          );
+          await this.gapFillSleep(backoffMs);
+        }
+      }
+    }
+    throw lastErr;
+  }
+
+  /** Drop unresolved windows older than UNRESOLVED_WINDOW_MAX_AGE_MS (unrecoverable). */
+  private pruneUnresolvedGapWindows(now: number): void {
+    const cutoff = now - UNRESOLVED_WINDOW_MAX_AGE_MS;
+    for (let i = this.unresolvedGapWindows.length - 1; i >= 0; i--) {
+      if ((this.unresolvedGapWindows[i] ?? 0) < cutoff) this.unresolvedGapWindows.splice(i, 1);
+    }
+  }
+
+  /** Record a window that still had a failing chat, keeping the queue bounded. */
+  private recordUnresolvedGapWindow(windowStart: number, log: (s: string) => void): void {
+    if (!this.unresolvedGapWindows.includes(windowStart)) {
+      this.unresolvedGapWindows.push(windowStart);
+      // Bound by count: drop the NEWEST extras so the OLDEST (most at-risk of
+      // aging out) survive to be replayed first.
+      if (this.unresolvedGapWindows.length > UNRESOLVED_WINDOW_MAX_ENTRIES) {
+        this.unresolvedGapWindows.sort((a, b) => a - b);
+        this.unresolvedGapWindows.length = UNRESOLVED_WINDOW_MAX_ENTRIES;
+      }
+      log(
+        `gap-fill: queued unresolved window start=${new Date(windowStart).toISOString()} ` +
+          `for replay (pending=${this.unresolvedGapWindows.length})`,
+      );
+    }
+  }
+
+  /** A fully-successful gapFill covering [windowStart..now] clears windows ≤ now. */
+  private clearUnresolvedGapWindowsUpTo(now: number): void {
+    for (let i = this.unresolvedGapWindows.length - 1; i >= 0; i--) {
+      if ((this.unresolvedGapWindows[i] ?? Infinity) <= now) this.unresolvedGapWindows.splice(i, 1);
+    }
   }
 
   private startOpenChatDiscovery(log: (s: string) => void): void {

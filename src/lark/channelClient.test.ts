@@ -1665,3 +1665,172 @@ describe("ChannelClient — in-flight self-heal (markHandled/markUnhandled)", ()
     cleanup();
   });
 });
+
+// ---------------------------------------------------------------------------
+// 0.3.17 gap-fill resilience (root cause B):
+//   - lark-cli history pull is retried with exponential backoff (not abandoned
+//     on the first TLS-timeout).
+//   - a window whose chat keeps failing is queued and replayed on the next
+//     gap-fill (look-back extended to cover it).
+// All pure: createLarkChannel + node:child_process (lark-cli) are mocked.
+// GAP_FILL_MAX_ATTEMPTS is 3 in channelClient.ts (kept in sync below).
+// ---------------------------------------------------------------------------
+
+describe("ChannelClient — gap-fill retry + failed-window replay (0.3.17)", () => {
+  const GAP_FILL_MAX_ATTEMPTS = 3; // mirror of the const in channelClient.ts
+
+  function makeFakeChannelWithHandlers() {
+    const handlers: Record<string, ((arg: unknown) => void) | undefined> = {};
+    const ch = {
+      botIdentity: { openId: "ou_bot", name: "test-bot" },
+      on(event: string, handler: (arg: unknown) => void) {
+        handlers[event] = handler;
+      },
+      async connect() {},
+      async disconnect() {},
+    };
+    return { ch, handlers };
+  }
+
+  function gapItemStdout(messageId: string): string {
+    const items = [
+      {
+        message_id: messageId,
+        chat_id: "oc_test_chat",
+        chat_type: "group",
+        content: JSON.stringify({ text: "@bot 断线期间被@了" }),
+        sender: { id: "ou_sender" },
+        create_time: String(Date.now()),
+        mentions: [{ id: { open_id: "ou_bot" } }],
+      },
+    ];
+    return JSON.stringify({ ok: true, data: { messages: items } });
+  }
+
+  async function bootClient(
+    execMock: (
+      cmd: string,
+      args: string[],
+      cb: (err: Error | null, result?: { stdout: string; stderr: string }) => void,
+    ) => void,
+  ) {
+    vi.resetModules();
+    vi.doMock("node:child_process", () => ({ execFile: execMock }));
+    const chObj = makeFakeChannelWithHandlers();
+    vi.doMock("@larksuiteoapi/node-sdk", () => ({ createLarkChannel: () => chObj.ch }));
+
+    const { ChannelClient } = await import("./channelClient.js");
+    const client = new ChannelClient({
+      allowedChatIds: new Set(["oc_test_chat"]),
+      botOpenId: "ou_bot",
+      appId: "cli_x",
+      appSecret: "secret",
+      connectGraceMs: 0,
+      channelStaleMs: 0,
+      openChatDiscoveryMs: 0,
+    });
+
+    const dispatched: string[] = [];
+    void (async () => {
+      for await (const ev of client.events()) dispatched.push(ev.message_id);
+    })();
+    for (let i = 0; i < 100 && !chObj.handlers["reconnected"]; i++) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    return { client, chObj, dispatched };
+  }
+
+  function triggerGapFill(chObj: { handlers: Record<string, ((arg: unknown) => void) | undefined> }) {
+    chObj.handlers["reconnecting"]!(undefined);
+    chObj.handlers["reconnected"]!(undefined);
+  }
+
+  function cleanup() {
+    vi.doUnmock("@larksuiteoapi/node-sdk");
+    vi.doUnmock("node:child_process");
+    vi.resetModules();
+  }
+
+  it("retries the lark-cli pull on transient failure (backoff observed) then dispatches", async () => {
+    const messageId = "om_retry_msg";
+    let calls = 0;
+    // Fail the first 2 calls, succeed on the 3rd (== GAP_FILL_MAX_ATTEMPTS).
+    const execMock = (
+      _cmd: string,
+      _args: string[],
+      cb: (err: Error | null, result?: { stdout: string; stderr: string }) => void,
+    ) => {
+      calls++;
+      if (calls < 3) {
+        cb(new Error("TLS handshake timeout"));
+        return;
+      }
+      cb(null, { stdout: gapItemStdout(messageId), stderr: "" });
+    };
+
+    const { client, chObj, dispatched } = await bootClient(execMock);
+
+    // Observe (and skip the real wait of) the backoff sleeps.
+    const backoffs: number[] = [];
+    client.setGapFillSleepForTest(async (ms) => {
+      backoffs.push(ms);
+    });
+
+    triggerGapFill(chObj);
+
+    for (let i = 0; i < 200 && !dispatched.includes(messageId); i++) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
+
+    expect(dispatched).toContain(messageId); // recovered after retries
+    expect(calls).toBe(3); // 2 failures + 1 success
+    // Exponential backoff between the 3 attempts: ~1s then ~2s.
+    expect(backoffs).toEqual([1000, 2000]);
+
+    await client.close();
+    cleanup();
+  });
+
+  it("queues a window for replay when a chat keeps failing, then replays it once the pull recovers", async () => {
+    const messageId = "om_replay_msg";
+    let phaseAlwaysFail = true;
+    let calls = 0;
+    const execMock = (
+      _cmd: string,
+      _args: string[],
+      cb: (err: Error | null, result?: { stdout: string; stderr: string }) => void,
+    ) => {
+      calls++;
+      if (phaseAlwaysFail) {
+        cb(new Error("TLS handshake timeout"));
+        return;
+      }
+      cb(null, { stdout: gapItemStdout(messageId), stderr: "" });
+    };
+
+    const { client, chObj, dispatched } = await bootClient(execMock);
+    client.setGapFillSleepForTest(async () => {}); // no real waiting
+
+    // First gap-fill: every attempt fails → window queued, nothing dispatched.
+    triggerGapFill(chObj);
+    for (let i = 0; i < 200 && client.unresolvedGapWindowsForTest().length === 0; i++) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    expect(client.unresolvedGapWindowsForTest().length).toBe(1);
+    expect(dispatched).not.toContain(messageId);
+    expect(calls).toBe(GAP_FILL_MAX_ATTEMPTS); // retried, didn't abandon after 1
+
+    // Recovery: pull now succeeds. Next gap-fill must replay the queued window.
+    phaseAlwaysFail = false;
+    triggerGapFill(chObj);
+    for (let i = 0; i < 200 && !dispatched.includes(messageId); i++) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    expect(dispatched).toContain(messageId); // the previously-dropped @ is recovered
+    // Queue cleared after the fully-successful replay.
+    expect(client.unresolvedGapWindowsForTest().length).toBe(0);
+
+    await client.close();
+    cleanup();
+  });
+});

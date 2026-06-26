@@ -31,6 +31,7 @@ import { CodexRunner } from "./codex/runner.js";
 import { ensureLarkCliProfile, deriveLarkCliProfile } from "./lark/profileBootstrap.js";
 import { checkWorkspacePermissionGrant } from "./agent/permissionGate.js";
 import { runtimeRequirementsForBots } from "./runtimeRequirements.js";
+import { registerCrashGuard } from "./crashGuard.js";
 
 /** How often the bridge rewrites each bot's status.json liveness heartbeat. */
 const STATUS_WRITE_INTERVAL_MS = 30_000;
@@ -444,6 +445,9 @@ async function runV2Mode({
 
   process.on("SIGINT", () => { void shutdown("SIGINT"); });
   process.on("SIGTERM", () => { void shutdown("SIGTERM"); });
+
+  // ── Process-level crash guard (THIN / DELETABLE) ───────────────────────────
+  registerCrashGuard();
 
   // ── Dry-run mode ──────────────────────────────────────────────────────────
   if (dryRun) {
