@@ -43,8 +43,13 @@ import {
   deleteCardFile,
   type CardFile,
 } from "./cardFile.js";
+import {
+  markPostLedgerFallbackVisible,
+  reconcilePostFileOrphans,
+  type PostLedgerEntry,
+} from "./postFile.js";
 import { readStateFile, stateFilePathOf, type StateFile } from "./stateFile.js";
-import type { CardRenderer } from "../lark/card.js";
+import type { CardHandle, CardRenderer } from "../lark/card.js";
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -196,13 +201,7 @@ function mapFinalizeArgs(
   state: StateFile,
   success: boolean,
   stateFresh = true,
-): {
-  finalText: string;
-  success: boolean;
-  failureReason?: string;
-  titleOverride?: string;
-  colorOverride?: "success" | "failure" | "neutral";
-} {
+): Parameters<CardHandle["finalize"]>[0] {
   if (!stateFresh) {
     return {
       finalText: "⚠️ 本轮在处理中被 bridge 重启中断，未拿到 agent 的新回复。请再 @ 我一次继续。",
@@ -227,7 +226,99 @@ function mapFinalizeArgs(
     ...(failureReason !== undefined ? { failureReason } : {}),
     ...(state.card_title !== undefined ? { titleOverride: state.card_title } : {}),
     ...(state.card_color !== undefined ? { colorOverride: state.card_color } : {}),
+    ...(state.choices !== undefined ? { choices: state.choices } : {}),
+    ...(state.choice_prompt !== undefined ? { choicePrompt: state.choice_prompt } : {}),
+    ...(state.image_blocks !== undefined ? { imageBlocks: state.image_blocks } : {}),
+    ...(state.content_blocks !== undefined ? { contentBlocks: state.content_blocks } : {}),
   };
+}
+
+function postFallbackText(entry: PostLedgerEntry): string {
+  return (
+    "Bridge restarted while reconciling a post-only response. " +
+    "No post message id was recorded, so Larkway created this visible fallback card instead of resending the post.\n" +
+    `post_status: ${entry.status}\n` +
+    `idempotency_key: ${entry.idempotencyKey}`
+  );
+}
+
+async function finalizePostOnlyFallbackCard(input: {
+  deps: ReconcileDeps;
+  worktreePath: string;
+  entry: PostLedgerEntry;
+  existingCard: CardFile | null;
+  nowIso: string;
+  log: (msg: string) => void;
+}): Promise<void> {
+  const fallbackError =
+    input.entry.error ??
+    "orphaned post ledger entry reconciled after visible fallback card finalize";
+  const handle = input.existingCard
+    ? input.deps.cardRenderer.handleFor(input.existingCard.messageId)
+    : await input.deps.cardRenderer.start(input.entry.replyToMessageId, {
+        replyInThread: true,
+        threadId: input.entry.threadId,
+      });
+
+  if (!input.existingCard) {
+    await writeCardFile(input.worktreePath, {
+      messageId: handle.messageId,
+      chatId: input.entry.chatId,
+      threadId: input.entry.threadId,
+      botId: input.entry.botId,
+      retryCount: 0,
+      createdAt: input.nowIso,
+    });
+  }
+
+  await handle.finalize({
+    finalText: postFallbackText(input.entry),
+    success: false,
+    failureReason: fallbackError,
+    titleOverride: "Post fallback recovered",
+    colorOverride: "failure",
+  });
+  await markPostLedgerFallbackVisible(input.worktreePath, input.entry.idempotencyKey, {
+    fallbackCardMessageId: handle.messageId,
+    error: fallbackError,
+    now: () => input.nowIso,
+  });
+  await deleteCardFile(input.worktreePath);
+  input.log(
+    `[reconcile] post-only fallback card finalized for ${input.entry.idempotencyKey} as ${handle.messageId}`,
+  );
+}
+
+async function markVisiblePostFallbacksForCard(input: {
+  worktreePath: string;
+  botId: string;
+  minAgeMs: number;
+  nowIso: string;
+  fallbackCardMessageId: string;
+  log: (msg: string) => void;
+}): Promise<number> {
+  const postResult = await reconcilePostFileOrphans(input.worktreePath, {
+    botId: input.botId,
+    minAgeMs: input.minAgeMs,
+    now: () => input.nowIso,
+  });
+
+  if (postResult.visibleFallbackCandidates.length === 0) return 0;
+
+  for (const entry of postResult.visibleFallbackCandidates) {
+    const fallbackError =
+      entry.error ?? "orphaned post ledger entry reconciled after existing visible card finalize";
+    await markPostLedgerFallbackVisible(input.worktreePath, entry.idempotencyKey, {
+      fallbackCardMessageId: input.fallbackCardMessageId,
+      error: fallbackError,
+      now: () => input.nowIso,
+    });
+  }
+
+  input.log(
+    `[reconcile] marked ${postResult.visibleFallbackCandidates.length} post fallback candidate(s) visible via existing card ${input.fallbackCardMessageId}`,
+  );
+  return postResult.visibleFallbackCandidates.length;
 }
 
 // ---------------------------------------------------------------------------
@@ -243,7 +334,7 @@ export interface ReconcileDeps {
    * The bot's CardRenderer — reconcile uses handleFor(messageId) to rebuild a
    * handle on the SAME outbound transport / identity that created the card.
    */
-  cardRenderer: Pick<CardRenderer, "handleFor">;
+  cardRenderer: Pick<CardRenderer, "handleFor" | "start">;
   /** Minimum state.json age before a card is eligible. @default 60000 */
   minAgeMs?: number;
   /** Logger. @default console.log */
@@ -274,13 +365,12 @@ export async function reconcileOrphanedCards(deps: ReconcileDeps): Promise<void>
 
   // ── Gather per-worktree observations ──────────────────────────────────────
   const now = Date.now();
+  const nowIso = new Date(now).toISOString();
   const candidates: OrphanCandidate[] = [];
   for (const name of dirNames) {
     const wtPath = pathJoin(deps.worktreesDir, name);
     try {
       const card = await readCardFile(wtPath);
-      if (!card) continue; // fast path — no card.json, nothing to reconcile
-
       const state = await readStateFile(wtPath);
 
       // Liveness: any pid associated with the worktree still alive?
@@ -304,6 +394,48 @@ export async function reconcileOrphanedCards(deps: ReconcileDeps): Promise<void>
         ageMs = 0;
       }
 
+      if (!pidAlive) {
+        try {
+          const postResult = await reconcilePostFileOrphans(wtPath, {
+            botId: deps.botId,
+            minAgeMs,
+            now: () => nowIso,
+          });
+          if (postResult.changed) {
+            log(
+              `[reconcile] post ledger ${name}: sent=${postResult.sent}, fallback_visible=${postResult.fallbackVisible}`,
+            );
+          }
+          if (postResult.visibleFallbackCandidates.length > 0) {
+            if (card && state) {
+              log(
+                `[reconcile] post ledger ${name}: ${postResult.visibleFallbackCandidates.length} candidate(s) need visible fallback; existing card+state will reconcile separately`,
+              );
+            } else {
+              for (const entry of postResult.visibleFallbackCandidates) {
+                try {
+                  await finalizePostOnlyFallbackCard({
+                    deps,
+                    worktreePath: wtPath,
+                    entry,
+                    existingCard: state ? null : card,
+                    nowIso,
+                    log,
+                  });
+                } catch (err) {
+                  log(
+                    `[reconcile] post-only fallback failed for ${name}/${entry.idempotencyKey} (ledger left non-terminal): ${String(err)}`,
+                  );
+                }
+              }
+            }
+          }
+        } catch (err) {
+          log(`[reconcile] post ledger failed for ${name} (skipping): ${String(err)}`);
+        }
+      }
+
+      if (!card) continue; // no card.json → no card to finalize
       candidates.push({ name, card, state, pidAlive, ageMs });
     } catch (err) {
       // Per-worktree gather failure → log + skip this one, continue the sweep.
@@ -325,14 +457,10 @@ export async function reconcileOrphanedCards(deps: ReconcileDeps): Promise<void>
     const state = cand?.state;
     if (!state) continue; // defensive — selector already ensured this
 
+    let handle: CardHandle;
     try {
-      const handle = deps.cardRenderer.handleFor(orphan.card.messageId);
+      handle = deps.cardRenderer.handleFor(orphan.card.messageId);
       await handle.finalize(mapFinalizeArgs(state, orphan.success, orphan.stateFresh));
-      // Success → drop card.json so the next boot doesn't re-finalize.
-      await deleteCardFile(wtPath);
-      log(
-        `[reconcile] finalized ${orphan.name} as ${orphan.success ? "success" : "failure"} (${orphan.reason})`,
-      );
     } catch (err) {
       // Finalize PATCH rejected (e.g. message deleted, transient network).
       // Bump retryCount; if over the cap, delete card.json to stop looping.
@@ -350,6 +478,33 @@ export async function reconcileOrphanedCards(deps: ReconcileDeps): Promise<void>
           log(`[reconcile] could not bump retryCount for ${orphan.name} (ignoring): ${String(writeErr)}`);
         }
       }
+      continue;
+    }
+
+    try {
+      await markVisiblePostFallbacksForCard({
+        worktreePath: wtPath,
+        botId: deps.botId,
+        minAgeMs,
+        nowIso,
+        fallbackCardMessageId: handle.messageId,
+        log,
+      });
+    } catch (err) {
+      log(
+        `[reconcile] post ledger mark failed for ${orphan.name} after visible card finalize; keeping card.json for retry: ${String(err)}`,
+      );
+      continue;
+    }
+
+    try {
+      // Success → drop card.json so the next boot doesn't re-finalize.
+      await deleteCardFile(wtPath);
+      log(
+        `[reconcile] finalized ${orphan.name} as ${orphan.success ? "success" : "failure"} (${orphan.reason})`,
+      );
+    } catch (err) {
+      log(`[reconcile] could not delete card.json for ${orphan.name} after finalize (ignoring): ${String(err)}`);
     }
   }
 }

@@ -10,7 +10,7 @@
  *      and that a finalize rejection does NOT throw + bumps retryCount.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { mkdtemp, rm, mkdir, utimes } from "node:fs/promises";
+import { chmod, mkdtemp, rm, mkdir, utimes } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -22,6 +22,7 @@ import type { CardFile } from "./cardFile.js";
 import { writeCardFile, readCardFile } from "./cardFile.js";
 import type { StateFile } from "./stateFile.js";
 import type { CardHandle } from "../lark/card.js";
+import { readPostFile, writePostFile, type PostLedgerEntry } from "./postFile.js";
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -30,7 +31,7 @@ import type { CardHandle } from "../lark/card.js";
 function card(overrides: Partial<CardFile> = {}): CardFile {
   return {
     messageId: "om_card",
-    chatId: "oc_chat",
+    chatId: "chat-a",
     threadId: "om_thread",
     botId: "gitlab",
     retryCount: 0,
@@ -43,6 +44,25 @@ function state(status: StateFile["status"], overrides: Partial<StateFile> = {}):
   return {
     status,
     updated_at: "2026-05-29T12:00:00.000Z",
+    ...overrides,
+  };
+}
+
+function postEntry(overrides: Partial<PostLedgerEntry> = {}): PostLedgerEntry {
+  return {
+    idempotencyKey: "lw-p-orphan",
+    status: "pending",
+    botId: "gitlab",
+    chatId: "chat-a",
+    threadId: "om_thread",
+    replyToMessageId: "om_trigger",
+    role: "primary",
+    logicalIndex: 0,
+    contentDigest: "digest",
+    mentionCount: 0,
+    attempts: [],
+    createdAt: "2026-05-29T12:00:00.000Z",
+    updatedAt: "2026-05-29T12:00:00.000Z",
     ...overrides,
   };
 }
@@ -139,25 +159,51 @@ interface SpyHandle extends CardHandle {
   finalizeArgs: Parameters<CardHandle["finalize"]>[0][];
 }
 
-function makeFakeRenderer(opts?: { rejectFinalize?: boolean }) {
+function makeFakeRenderer(opts?: {
+  rejectFinalize?: boolean;
+  rejectStart?: boolean;
+  onFinalize?: (messageId: string) => Promise<void> | void;
+}) {
   const handlesByMessageId = new Map<string, SpyHandle>();
+  const startCalls: Array<{
+    replyToMessageId: string;
+    replyInThread?: boolean;
+    threadId?: string;
+  }> = [];
+  let nextStartedCard = 1;
+  function makeHandle(messageId: string): SpyHandle {
+    const finalizeArgs: Parameters<CardHandle["finalize"]>[0][] = [];
+    const handle: SpyHandle = {
+      messageId,
+      finalizeArgs,
+      handle: () => {},
+      finalize: vi.fn(async (a) => {
+        finalizeArgs.push(a);
+        if (opts?.rejectFinalize) throw new Error("PATCH 230001 not the sender");
+        await opts?.onFinalize?.(messageId);
+      }) as unknown as CardHandle["finalize"],
+    };
+    handlesByMessageId.set(messageId, handle);
+    return handle;
+  }
   const renderer = {
+    async start(
+      replyToMessageId: string,
+      startOpts?: { replyInThread?: boolean; threadId?: string },
+    ): Promise<CardHandle> {
+      startCalls.push({
+        replyToMessageId,
+        replyInThread: startOpts?.replyInThread,
+        threadId: startOpts?.threadId,
+      });
+      if (opts?.rejectStart) throw new Error("create card failed");
+      return makeHandle(`om_started_${nextStartedCard++}`);
+    },
     handleFor(messageId: string): CardHandle {
-      const finalizeArgs: Parameters<CardHandle["finalize"]>[0][] = [];
-      const handle: SpyHandle = {
-        messageId,
-        finalizeArgs,
-        handle: () => {},
-        finalize: vi.fn(async (a) => {
-          finalizeArgs.push(a);
-          if (opts?.rejectFinalize) throw new Error("PATCH 230001 not the sender");
-        }) as unknown as CardHandle["finalize"],
-      };
-      handlesByMessageId.set(messageId, handle);
-      return handle;
+      return makeHandle(messageId);
     },
   };
-  return { renderer, handlesByMessageId };
+  return { renderer, handlesByMessageId, startCalls };
 }
 
 let root: string;
@@ -222,6 +268,56 @@ describe("reconcileOrphanedCards — integration", () => {
     expect(await readCardFile(wt)).toBeNull();
   });
 
+  it("preserves rich state fields when finalizing a fresh orphan card", async () => {
+    await seedWorktree(
+      "om_rich",
+      card({ messageId: "om_msg_rich", threadId: "om_rich" }),
+      state("ready", {
+        last_message: "fallback body",
+        choices: [{ label: "继续", value: "继续处理" }],
+        choice_prompt: "下一步?",
+        image_blocks: [
+          { img_key: "img_v3_x", alt: "截图", mode: "fit_horizontal", preview: true },
+        ],
+        content_blocks: [
+          { type: "markdown", content: "正文" },
+          {
+            type: "image",
+            img_key: "img_v3_y",
+            alt: "图二",
+            mode: "fit_horizontal",
+            preview: true,
+          },
+        ],
+      }),
+    );
+    const { renderer, handlesByMessageId } = makeFakeRenderer();
+
+    await reconcileOrphanedCards({
+      botId: "gitlab",
+      worktreesDir: root,
+      cardRenderer: renderer,
+      log: () => {},
+    });
+
+    const args = handlesByMessageId.get("om_msg_rich")?.finalizeArgs[0];
+    expect(args?.choices).toEqual([{ label: "继续", value: "继续处理" }]);
+    expect(args?.choicePrompt).toBe("下一步?");
+    expect(args?.imageBlocks).toEqual([
+      { img_key: "img_v3_x", alt: "截图", mode: "fit_horizontal", preview: true },
+    ]);
+    expect(args?.contentBlocks).toEqual([
+      { type: "markdown", content: "正文" },
+      {
+        type: "image",
+        img_key: "img_v3_y",
+        alt: "图二",
+        mode: "fit_horizontal",
+        preview: true,
+      },
+    ]);
+  });
+
   it("finalizes a failed orphan as failure with the bot's error as failureReason", async () => {
     const wt = await seedWorktree(
       "om_t2",
@@ -272,7 +368,164 @@ describe("reconcileOrphanedCards — integration", () => {
     expect(args?.success).toBe(false);
     expect(args?.finalText).not.toContain("上一轮的成功回复");
     expect(args?.titleOverride).toBe("⚠️ 本轮被中断");
+    expect(args?.choices).toBeUndefined();
+    expect(args?.contentBlocks).toBeUndefined();
     expect(await readCardFile(wt)).toBeNull();
+  });
+
+  it("creates and finalizes a visible fallback card before marking a post-only orphan fallback_visible", async () => {
+    const wt = join(root, "om_post_only");
+    await mkdir(join(wt, ".larkway"), { recursive: true });
+    await writePostFile(wt, { version: 1, posts: [postEntry()] });
+    const { renderer, handlesByMessageId, startCalls } = makeFakeRenderer();
+
+    await reconcileOrphanedCards({
+      botId: "gitlab",
+      worktreesDir: root,
+      cardRenderer: renderer,
+      minAgeMs: 60_000,
+      log: () => {},
+    });
+
+    expect(startCalls).toEqual([
+      { replyToMessageId: "om_trigger", replyInThread: true, threadId: "om_thread" },
+    ]);
+    const handle = handlesByMessageId.get("om_started_1");
+    expect(handle?.finalizeArgs).toHaveLength(1);
+    expect(handle?.finalizeArgs[0]?.success).toBe(false);
+    expect(handle?.finalizeArgs[0]?.finalText).toContain("visible fallback card");
+    const ledger = await readPostFile(wt);
+    expect(ledger?.posts[0]?.status).toBe("fallback_visible");
+    expect(ledger?.posts[0]?.fallbackCardMessageId).toBe("om_started_1");
+    expect(ledger?.posts[0]?.attempts[0]?.code).toBe("orphan_reconcile");
+    expect(await readCardFile(wt)).toBeNull();
+  });
+
+  it("marks a card+state post orphan visible via the existing card and stays idempotent", async () => {
+    const wt = await seedWorktree(
+      "om_card_and_post",
+      card({ messageId: "om_existing_card", threadId: "om_card_and_post" }),
+      state("ready", { last_message: "existing card became visible" }),
+    );
+    await writePostFile(wt, {
+      version: 1,
+      posts: [postEntry({ threadId: "om_card_and_post" })],
+    });
+    const { renderer, handlesByMessageId, startCalls } = makeFakeRenderer();
+
+    await reconcileOrphanedCards({
+      botId: "gitlab",
+      worktreesDir: root,
+      cardRenderer: renderer,
+      minAgeMs: 60_000,
+      log: () => {},
+    });
+
+    expect(startCalls).toEqual([]);
+    const existingHandle = handlesByMessageId.get("om_existing_card");
+    expect(existingHandle?.finalizeArgs).toHaveLength(1);
+    const ledgerAfterFirst = await readPostFile(wt);
+    expect(ledgerAfterFirst?.posts[0]?.status).toBe("fallback_visible");
+    expect(ledgerAfterFirst?.posts[0]?.fallbackCardMessageId).toBe("om_existing_card");
+    expect(ledgerAfterFirst?.posts[0]?.attempts[0]?.code).toBe("orphan_reconcile");
+    expect(await readCardFile(wt)).toBeNull();
+
+    await reconcileOrphanedCards({
+      botId: "gitlab",
+      worktreesDir: root,
+      cardRenderer: renderer,
+      minAgeMs: 60_000,
+      log: () => {},
+    });
+
+    expect(startCalls).toEqual([]);
+    expect(handlesByMessageId.has("om_started_1")).toBe(false);
+    expect(handlesByMessageId.get("om_existing_card")?.finalizeArgs).toHaveLength(1);
+    const ledgerAfterSecond = await readPostFile(wt);
+    expect(ledgerAfterSecond?.posts[0]?.status).toBe("fallback_visible");
+    expect(ledgerAfterSecond?.posts[0]?.fallbackCardMessageId).toBe("om_existing_card");
+  });
+
+  it("keeps card.json when post ledger mark fails after finalize even past retry cap", async () => {
+    const wt = await seedWorktree(
+      "om_mark_fails_at_cap",
+      card({
+        messageId: "om_existing_card_cap",
+        threadId: "om_mark_fails_at_cap",
+        retryCount: 3,
+      }),
+      state("ready", { last_message: "existing card is visible" }),
+    );
+    await writePostFile(wt, {
+      version: 1,
+      posts: [postEntry({ threadId: "om_mark_fails_at_cap" })],
+    });
+    const larkwayDir = join(wt, ".larkway");
+    let failMarkOnce = true;
+    const logs: string[] = [];
+    const { renderer, startCalls, handlesByMessageId } = makeFakeRenderer({
+      onFinalize: async (messageId) => {
+        if (messageId !== "om_existing_card_cap" || !failMarkOnce) return;
+        failMarkOnce = false;
+        await chmod(larkwayDir, 0o500);
+      },
+    });
+
+    await expect(
+      reconcileOrphanedCards({
+        botId: "gitlab",
+        worktreesDir: root,
+        cardRenderer: renderer,
+        minAgeMs: 60_000,
+        log: (message) => logs.push(message),
+      }),
+    ).resolves.toBeUndefined();
+
+    const cardAfterMarkFailure = await readCardFile(wt);
+    expect(cardAfterMarkFailure).not.toBeNull();
+    expect(cardAfterMarkFailure?.retryCount).toBe(3);
+    const ledgerAfterMarkFailure = await readPostFile(wt);
+    expect(ledgerAfterMarkFailure?.posts[0]?.status).toBe("pending");
+    expect(ledgerAfterMarkFailure?.posts[0]?.fallbackCardMessageId).toBeUndefined();
+    expect(logs.some((message) => message.includes("post ledger mark failed"))).toBe(true);
+    expect(logs.some((message) => message.includes("finalize FAILED"))).toBe(false);
+
+    await chmod(larkwayDir, 0o700);
+
+    await reconcileOrphanedCards({
+      botId: "gitlab",
+      worktreesDir: root,
+      cardRenderer: renderer,
+      minAgeMs: 60_000,
+      log: () => {},
+    });
+
+    expect(startCalls).toEqual([]);
+    expect(handlesByMessageId.has("om_started_1")).toBe(false);
+    const ledgerAfterRetry = await readPostFile(wt);
+    expect(ledgerAfterRetry?.posts[0]?.status).toBe("fallback_visible");
+    expect(ledgerAfterRetry?.posts[0]?.fallbackCardMessageId).toBe("om_existing_card_cap");
+    expect(await readCardFile(wt)).toBeNull();
+  });
+
+  it("leaves a post-only orphan non-terminal when fallback card creation fails", async () => {
+    const wt = join(root, "om_post_only_start_fail");
+    await mkdir(join(wt, ".larkway"), { recursive: true });
+    await writePostFile(wt, { version: 1, posts: [postEntry()] });
+    const { renderer, handlesByMessageId } = makeFakeRenderer({ rejectStart: true });
+
+    await reconcileOrphanedCards({
+      botId: "gitlab",
+      worktreesDir: root,
+      cardRenderer: renderer,
+      minAgeMs: 60_000,
+      log: () => {},
+    });
+
+    expect(handlesByMessageId.size).toBe(0);
+    const ledger = await readPostFile(wt);
+    expect(ledger?.posts[0]?.status).toBe("pending");
+    expect(ledger?.posts[0]?.fallbackCardMessageId).toBeUndefined();
   });
 
   it("does NOT throw on finalize rejection and bumps retryCount in card.json", async () => {

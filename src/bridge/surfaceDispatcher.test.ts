@@ -7,7 +7,7 @@ import {
   type CardFinalizePayload,
   type SurfaceDispatchInput,
 } from "./surfaceDispatcher.js";
-import { readPostFile } from "./postFile.js";
+import { readPostFile, writePostFile } from "./postFile.js";
 import type { StateFile } from "./stateFile.js";
 import type { OutboundPostClient } from "../lark/outboundPostClient.js";
 
@@ -144,6 +144,78 @@ describe("dispatchResponseSurface", () => {
       expect(ledger?.posts).toHaveLength(1);
       expect(ledger?.posts[0]?.status).toBe("sent");
       expect(ledger?.posts[0]?.postMessageId).toBe("om_post");
+    }));
+
+  it("does not resend when the same logical post is already marked sent", async () =>
+    withTemp(async (dir) => {
+      const first = fakePostClient();
+      const firstResult = await dispatchResponseSurface(
+        baseInput({
+          worktreePath: dir,
+          cardStarted: false,
+          postClient: first.client,
+        }),
+      );
+      expect(firstResult.reason).toBe("post-sent");
+      expect(first.calls).toHaveLength(1);
+
+      const second = fakePostClient();
+      const secondResult = await dispatchResponseSurface(
+        baseInput({
+          worktreePath: dir,
+          cardStarted: false,
+          postClient: second.client,
+        }),
+      );
+
+      expect(secondResult.reason).toBe("post-ledger-already-sent");
+      expect(secondResult.visible).toBe(true);
+      expect(secondResult.post?.messageId).toBe("om_post");
+      expect(second.calls).toHaveLength(0);
+    }));
+
+  it("reconciles an existing pending ledger entry to visible fallback without resending", async () =>
+    withTemp(async (dir) => {
+      const first = fakePostClient();
+      await dispatchResponseSurface(
+        baseInput({
+          worktreePath: dir,
+          cardStarted: false,
+          postClient: first.client,
+        }),
+      );
+      const ledger = await readPostFile(dir);
+      expect(ledger?.posts[0]?.status).toBe("sent");
+      await writePostFile(dir, {
+        version: 1,
+        posts: [
+          {
+            ...ledger!.posts[0]!,
+            status: "pending",
+            postMessageId: undefined,
+            attempts: [],
+          },
+        ],
+      });
+
+      const second = fakePostClient();
+      const result = await dispatchResponseSurface(
+        baseInput({
+          worktreePath: dir,
+          cardStarted: false,
+          postClient: second.client,
+        }),
+      );
+
+      expect(result.reason).toBe("post-orphan-reconciled-fallback-card");
+      expect(result.visible).toBe(true);
+      expect(result.card?.success).toBe(false);
+      expect(result.card?.failureReason).toContain("visible card fallback used");
+      expect(second.calls).toHaveLength(0);
+
+      const after = await readPostFile(dir);
+      expect(after?.posts[0]?.status).toBe("fallback_visible");
+      expect(after?.posts[0]?.attempts[0]?.code).toBe("orphan_reconcile");
     }));
 
   it("uses a compact secondary card for hybrid without repeating the main post body", async () =>

@@ -1,14 +1,15 @@
 # Response Surface Prototype
 
-Status: PR1/PR4 foundation only. Default disabled.
+Status: PR1/PR5 foundation only. Default disabled.
 
 This document defines the dark-launch foundation for future `card` / `post` /
 `hybrid` response surfaces. PR3 added post transport, post payload construction,
-idempotency helpers, and `post.json` ledger primitives. PR4 adds the default-off
-surface dispatcher for `card` / `post` / `hybrid` planning, compact secondary
-cards, and fake-channel tests. Production wiring still keeps post outbound
-unavailable, so this does not enable real IM post outbound, peer `at`, Feishu
-E2E, deployment, or production enablement.
+idempotency helpers, and `post.json` ledger primitives. PR4 added the
+default-off surface dispatcher for `card` / `post` / `hybrid` planning,
+compact secondary cards, and fake-channel tests. PR5 adds rich boot reconcile
+for card fields plus post-ledger orphan reconciliation. Production wiring still
+keeps post outbound unavailable, so this does not enable real IM post outbound,
+peer `at`, Feishu E2E, deployment, or production enablement.
 
 ## Principles
 
@@ -171,11 +172,45 @@ Production wiring still passes `postOutboundAvailable: false` in
 `BridgeHandler`. PR4 therefore cannot create a live post unless a future PR
 explicitly connects the transport to production dispatch and enables the gates.
 
+## PR5 Rich Orphan Reconcile
+
+PR5 extends boot-time reconcile without enabling post outbound:
+
+- Fresh orphaned cards preserve rich state fields when finalized after a bridge
+  restart: `choices`, `choice_prompt`, `image_blocks`, and `content_blocks`.
+- Stale state remains suppressed. If `state.updated_at` is older than the
+  persisted `card.json`, reconcile finalizes a failure card and does not reuse
+  stale rich fields from a previous turn.
+- Old `post.json` entries for the current bot are reconciled when the worktree
+  has no live runner process:
+  - `pending` or `planned` with `postMessageId` -> `sent`
+  - `planned`, `pending`, or `failed` without `postMessageId` first require a
+    visible fallback card. Reconcile creates and finalizes that card, then marks
+    the ledger `fallback_visible` with `fallbackCardMessageId` and an
+    `orphan_reconcile` attempt.
+  - if the same worktree already has a recoverable `card.json` + `state.json`,
+    reconcile finalizes that existing card first, then marks the post ledger
+    `fallback_visible` with that existing card message id. A second boot must
+    not create another fallback card for the same orphan.
+  - if the fallback card cannot be created/finalized, the ledger stays
+    non-terminal and reconcile logs the failure; it must not silently mark
+    `fallback_visible`.
+  - terminal `sent`, `fallback_visible`, and `policy_blocked` entries are left
+    untouched
+- Dispatcher re-entry is also idempotent. If the same logical post key is
+  already `sent`, the dispatcher reuses the ledger message id and does not call
+  the post client. If it finds an orphaned non-terminal entry, it reconciles to
+  visible fallback instead of resending.
+
+This is a conservative reconcile policy. It never queries or sends real Feishu
+post messages in PR5, never repeats an outbound post during recovery, and never
+marks `fallback_visible` unless a visible fallback artifact exists.
+
 ## Non-Goals Until Later PRs
 
 - No production-wired real IM post outbound.
 - No production-wired real peer `at`.
-- No visible post failure fallback.
+- No production-wired visible post failure fallback.
 - No Feishu E2E or test cards.
 - No deployment, restart, or production bridge touch.
 - No expansion of dogfood surface.

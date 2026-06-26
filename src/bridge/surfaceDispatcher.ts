@@ -9,6 +9,7 @@ import {
   type PostSurfaceRole,
 } from "../lark/idempotency.js";
 import {
+  readPostFile,
   upsertPostLedgerEntry,
   type PostLedgerEntry,
 } from "./postFile.js";
@@ -36,6 +37,8 @@ export type SurfaceDispatchReason =
   | "visible-fallback-unavailable"
   | "card-capability-required"
   | "mention-policy-blocked"
+  | "post-ledger-already-sent"
+  | "post-orphan-reconciled-fallback-card"
   | "post-sent"
   | "hybrid-post-sent-compact-card"
   | "post-failed-fallback-card";
@@ -184,6 +187,45 @@ async function writeLedger(
   await upsertPostLedgerEntry(input.worktreePath, entry);
 }
 
+async function existingLedgerEntry(
+  input: SurfaceDispatchInput,
+  idempotencyKey: string,
+): Promise<PostLedgerEntry | null> {
+  if (!input.worktreePath) return null;
+  const ledger = await readPostFile(input.worktreePath);
+  return ledger?.posts.find((post) => post.idempotencyKey === idempotencyKey) ?? null;
+}
+
+function sentResult(
+  input: SurfaceDispatchInput,
+  surface: NonNullable<StateFile["response_surface"]>,
+  post: { idempotencyKey: string; messageId: string; role: PostSurfaceRole },
+  reason: Extract<
+    SurfaceDispatchReason,
+    "post-ledger-already-sent" | "post-sent"
+  >,
+): SurfaceDispatchResult {
+  if (surface.mode === "hybrid" || input.cardStarted) {
+    return {
+      card: compactAuditCard(input, post),
+      reason:
+        reason === "post-ledger-already-sent"
+          ? "post-ledger-already-sent"
+          : surface.mode === "hybrid"
+            ? "hybrid-post-sent-compact-card"
+            : "post-sent",
+      visible: true,
+      post,
+    };
+  }
+  return {
+    card: null,
+    reason,
+    visible: true,
+    post,
+  };
+}
+
 export async function dispatchResponseSurface(
   input: SurfaceDispatchInput,
 ): Promise<SurfaceDispatchResult> {
@@ -274,6 +316,66 @@ export async function dispatchResponseSurface(
     logicalIndex,
     contentDigest,
   });
+  const existing = await existingLedgerEntry(input, idempotencyKey);
+  if (existing?.status === "sent" && existing.postMessageId) {
+    return sentResult(
+      input,
+      surface,
+      { idempotencyKey, messageId: existing.postMessageId, role },
+      "post-ledger-already-sent",
+    );
+  }
+  if (existing?.status === "sent") {
+    return fullCard(input, "post-orphan-reconciled-fallback-card");
+  }
+  if (existing?.status === "fallback_visible") {
+    return {
+      card: fallbackFailureCard(
+        input,
+        existing.error ?? "post ledger already reconciled to visible fallback",
+      ),
+      reason: "post-orphan-reconciled-fallback-card",
+      visible: true,
+      post: { idempotencyKey, role },
+    };
+  }
+  if (existing?.status === "policy_blocked") {
+    return {
+      card: policyBlockedCard(input),
+      reason: "mention-policy-blocked",
+      visible: true,
+      post: { idempotencyKey, role },
+    };
+  }
+  if (existing) {
+    const reconciledAt = input.now?.() ?? new Date().toISOString();
+    const error =
+      existing.status === "failed" && existing.error
+        ? existing.error
+        : "orphaned post ledger entry reconciled without resend; visible card fallback used";
+    await writeLedger(input, {
+      ...existing,
+      status: "fallback_visible",
+      error,
+      updatedAt: reconciledAt,
+      attempts: [
+        ...existing.attempts,
+        {
+          attemptedAt: reconciledAt,
+          status: "failed",
+          retryable: false,
+          code: "orphan_reconcile",
+          error,
+        },
+      ],
+    });
+    return {
+      card: fallbackFailureCard(input, error),
+      reason: "post-orphan-reconciled-fallback-card",
+      visible: true,
+      post: { idempotencyKey, role },
+    };
+  }
 
   await writeLedger(
     input,
@@ -330,23 +432,7 @@ export async function dispatchResponseSurface(
     );
 
     const post = { idempotencyKey, messageId: sent.messageId, role };
-    if (surface.mode === "hybrid" || input.cardStarted) {
-      return {
-        card: compactAuditCard(input, post),
-        reason:
-          surface.mode === "hybrid"
-            ? "hybrid-post-sent-compact-card"
-            : "post-sent",
-        visible: true,
-        post,
-      };
-    }
-    return {
-      card: null,
-      reason: "post-sent",
-      visible: true,
-      post,
-    };
+    return sentResult(input, surface, post, "post-sent");
   } catch (err) {
     const failedAt = input.now?.() ?? new Date().toISOString();
     const error = err instanceof Error ? err.message : String(err);
