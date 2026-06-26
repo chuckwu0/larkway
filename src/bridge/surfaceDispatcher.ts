@@ -458,28 +458,6 @@ export async function dispatchResponseSurface(
         ],
       }),
     );
-    await writeLedger(
-      input,
-      newLedgerEntry({
-        status: "fallback_visible",
-        idempotencyKey,
-        now: input.now?.() ?? new Date().toISOString(),
-        facts: input.facts,
-        role,
-        logicalIndex,
-        contentDigest,
-        mentionCount: mentions.length,
-        error,
-        attempts: [
-          {
-            attemptedAt: failedAt,
-            status: "failed",
-            retryable: false,
-            error,
-          },
-        ],
-      }),
-    );
     return {
       card: fallbackFailureCard(input, err),
       reason: "post-failed-fallback-card",

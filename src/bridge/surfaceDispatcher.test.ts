@@ -264,7 +264,7 @@ describe("dispatchResponseSurface", () => {
     expect(calls).toHaveLength(0);
   });
 
-  it("falls back to a visible failure card and ledger status when post send fails", async () =>
+  it("returns a visible failure card and leaves ledger failed until the card is finalized", async () =>
     withTemp(async (dir) => {
       const { client } = fakePostClient({ fail: true });
       const result = await dispatchResponseSurface(
@@ -282,7 +282,7 @@ describe("dispatchResponseSurface", () => {
 
       const ledger = await readPostFile(dir);
       expect(ledger?.posts).toHaveLength(1);
-      expect(ledger?.posts[0]?.status).toBe("fallback_visible");
+      expect(ledger?.posts[0]?.status).toBe("failed");
       expect(ledger?.posts[0]?.attempts[0]?.status).toBe("failed");
     }));
 
