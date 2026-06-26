@@ -6,6 +6,8 @@ import {
   assertPostStatusTransition,
   postFilePathOf,
   readPostFile,
+  reconcilePostFileOrphans,
+  reconcilePostLedgerEntries,
   upsertPostLedgerEntry,
   writePostFile,
   type PostLedgerEntry,
@@ -24,7 +26,10 @@ async function tempWorktree(): Promise<string> {
   return dir;
 }
 
-function entry(status: PostLedgerEntry["status"]): PostLedgerEntry {
+function entry(
+  status: PostLedgerEntry["status"],
+  overrides: Partial<PostLedgerEntry> = {},
+): PostLedgerEntry {
   return {
     idempotencyKey: "lw-p-entry",
     status,
@@ -39,6 +44,7 @@ function entry(status: PostLedgerEntry["status"]): PostLedgerEntry {
     attempts: [],
     createdAt: "2026-06-26T00:00:00.000Z",
     updatedAt: "2026-06-26T00:00:00.000Z",
+    ...overrides,
   };
 }
 
@@ -82,8 +88,101 @@ describe("postFile ledger", () => {
     expect(read?.posts[0]?.status).toBe("pending");
     expect(read?.posts[0]?.attempts[0]?.retryable).toBe(true);
 
+    expect(() => assertPostStatusTransition("planned", "fallback_visible")).not.toThrow();
     expect(() => assertPostStatusTransition("sent", "pending")).toThrow(
       /invalid post ledger transition/,
     );
+  });
+
+  it("reconciles old planned or pending entries to visible fallback without resend", () => {
+    const { file, result } = reconcilePostLedgerEntries(
+      {
+        version: 1,
+        posts: [
+          entry("planned"),
+          entry("pending", { idempotencyKey: "lw-p-pending" }),
+        ],
+      },
+      {
+        botId: "bot-a",
+        minAgeMs: 60_000,
+        now: () => "2026-06-26T00:02:00.000Z",
+      },
+    );
+
+    expect(result).toEqual({
+      changed: true,
+      sent: 0,
+      fallbackVisible: 2,
+      skippedLive: 0,
+    });
+    expect(file.posts.map((post) => post.status)).toEqual([
+      "fallback_visible",
+      "fallback_visible",
+    ]);
+    expect(file.posts[0]?.attempts[0]?.code).toBe("orphan_reconcile");
+    expect(file.posts[1]?.error).toContain("without resend");
+  });
+
+  it("reconciles pending entries with a recorded postMessageId to sent", () => {
+    const { file, result } = reconcilePostLedgerEntries(
+      {
+        version: 1,
+        posts: [entry("pending", { postMessageId: "om_post" })],
+      },
+      {
+        botId: "bot-a",
+        now: () => "2026-06-26T00:02:00.000Z",
+      },
+    );
+
+    expect(result.sent).toBe(1);
+    expect(result.fallbackVisible).toBe(0);
+    expect(file.posts[0]?.status).toBe("sent");
+    expect(file.posts[0]?.postMessageId).toBe("om_post");
+    expect(file.posts[0]?.attempts[0]?.status).toBe("sent");
+  });
+
+  it("leaves young, terminal, and other-bot post entries untouched", () => {
+    const young = entry("pending", {
+      idempotencyKey: "lw-p-young",
+      updatedAt: "2026-06-26T00:01:30.000Z",
+    });
+    const sent = entry("sent", {
+      idempotencyKey: "lw-p-sent",
+      postMessageId: "om_post",
+    });
+    const otherBot = entry("pending", {
+      idempotencyKey: "lw-p-other",
+      botId: "bot-b",
+    });
+    const { file, result } = reconcilePostLedgerEntries(
+      { version: 1, posts: [young, sent, otherBot] },
+      {
+        botId: "bot-a",
+        minAgeMs: 60_000,
+        now: () => "2026-06-26T00:02:00.000Z",
+      },
+    );
+
+    expect(result.changed).toBe(false);
+    expect(result.skippedLive).toBe(1);
+    expect(file.posts).toEqual([young, sent, otherBot]);
+  });
+
+  it("reconciles post.json on disk atomically", async () => {
+    const wt = await tempWorktree();
+    await writePostFile(wt, { version: 1, posts: [entry("failed", { error: "crashed" })] });
+
+    const result = await reconcilePostFileOrphans(wt, {
+      botId: "bot-a",
+      now: () => "2026-06-26T00:02:00.000Z",
+    });
+
+    expect(result.changed).toBe(true);
+    expect(result.fallbackVisible).toBe(1);
+    const read = await readPostFile(wt);
+    expect(read?.posts[0]?.status).toBe("fallback_visible");
+    expect(read?.posts[0]?.error).toBe("crashed");
   });
 });

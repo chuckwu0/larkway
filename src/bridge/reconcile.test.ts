@@ -22,6 +22,7 @@ import type { CardFile } from "./cardFile.js";
 import { writeCardFile, readCardFile } from "./cardFile.js";
 import type { StateFile } from "./stateFile.js";
 import type { CardHandle } from "../lark/card.js";
+import { readPostFile, writePostFile, type PostLedgerEntry } from "./postFile.js";
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -30,7 +31,7 @@ import type { CardHandle } from "../lark/card.js";
 function card(overrides: Partial<CardFile> = {}): CardFile {
   return {
     messageId: "om_card",
-    chatId: "oc_chat",
+    chatId: "chat-a",
     threadId: "om_thread",
     botId: "gitlab",
     retryCount: 0,
@@ -43,6 +44,25 @@ function state(status: StateFile["status"], overrides: Partial<StateFile> = {}):
   return {
     status,
     updated_at: "2026-05-29T12:00:00.000Z",
+    ...overrides,
+  };
+}
+
+function postEntry(overrides: Partial<PostLedgerEntry> = {}): PostLedgerEntry {
+  return {
+    idempotencyKey: "lw-p-orphan",
+    status: "pending",
+    botId: "gitlab",
+    chatId: "chat-a",
+    threadId: "om_thread",
+    replyToMessageId: "om_trigger",
+    role: "primary",
+    logicalIndex: 0,
+    contentDigest: "digest",
+    mentionCount: 0,
+    attempts: [],
+    createdAt: "2026-05-29T12:00:00.000Z",
+    updatedAt: "2026-05-29T12:00:00.000Z",
     ...overrides,
   };
 }
@@ -222,6 +242,56 @@ describe("reconcileOrphanedCards — integration", () => {
     expect(await readCardFile(wt)).toBeNull();
   });
 
+  it("preserves rich state fields when finalizing a fresh orphan card", async () => {
+    await seedWorktree(
+      "om_rich",
+      card({ messageId: "om_msg_rich", threadId: "om_rich" }),
+      state("ready", {
+        last_message: "fallback body",
+        choices: [{ label: "继续", value: "继续处理" }],
+        choice_prompt: "下一步?",
+        image_blocks: [
+          { img_key: "img_v3_x", alt: "截图", mode: "fit_horizontal", preview: true },
+        ],
+        content_blocks: [
+          { type: "markdown", content: "正文" },
+          {
+            type: "image",
+            img_key: "img_v3_y",
+            alt: "图二",
+            mode: "fit_horizontal",
+            preview: true,
+          },
+        ],
+      }),
+    );
+    const { renderer, handlesByMessageId } = makeFakeRenderer();
+
+    await reconcileOrphanedCards({
+      botId: "gitlab",
+      worktreesDir: root,
+      cardRenderer: renderer,
+      log: () => {},
+    });
+
+    const args = handlesByMessageId.get("om_msg_rich")?.finalizeArgs[0];
+    expect(args?.choices).toEqual([{ label: "继续", value: "继续处理" }]);
+    expect(args?.choicePrompt).toBe("下一步?");
+    expect(args?.imageBlocks).toEqual([
+      { img_key: "img_v3_x", alt: "截图", mode: "fit_horizontal", preview: true },
+    ]);
+    expect(args?.contentBlocks).toEqual([
+      { type: "markdown", content: "正文" },
+      {
+        type: "image",
+        img_key: "img_v3_y",
+        alt: "图二",
+        mode: "fit_horizontal",
+        preview: true,
+      },
+    ]);
+  });
+
   it("finalizes a failed orphan as failure with the bot's error as failureReason", async () => {
     const wt = await seedWorktree(
       "om_t2",
@@ -272,7 +342,29 @@ describe("reconcileOrphanedCards — integration", () => {
     expect(args?.success).toBe(false);
     expect(args?.finalText).not.toContain("上一轮的成功回复");
     expect(args?.titleOverride).toBe("⚠️ 本轮被中断");
+    expect(args?.choices).toBeUndefined();
+    expect(args?.contentBlocks).toBeUndefined();
     expect(await readCardFile(wt)).toBeNull();
+  });
+
+  it("reconciles an old post ledger orphan even when no card.json exists", async () => {
+    const wt = join(root, "om_post_only");
+    await mkdir(join(wt, ".larkway"), { recursive: true });
+    await writePostFile(wt, { version: 1, posts: [postEntry()] });
+    const { renderer, handlesByMessageId } = makeFakeRenderer();
+
+    await reconcileOrphanedCards({
+      botId: "gitlab",
+      worktreesDir: root,
+      cardRenderer: renderer,
+      minAgeMs: 60_000,
+      log: () => {},
+    });
+
+    expect(handlesByMessageId.size).toBe(0);
+    const ledger = await readPostFile(wt);
+    expect(ledger?.posts[0]?.status).toBe("fallback_visible");
+    expect(ledger?.posts[0]?.attempts[0]?.code).toBe("orphan_reconcile");
   });
 
   it("does NOT throw on finalize rejection and bumps retryCount in card.json", async () => {

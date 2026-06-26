@@ -14,7 +14,7 @@ export const PostLedgerStatusSchema = z.enum([
 export type PostLedgerStatus = z.infer<typeof PostLedgerStatusSchema>;
 
 export const POST_LEDGER_TRANSITIONS: Record<PostLedgerStatus, PostLedgerStatus[]> = {
-  planned: ["pending", "policy_blocked"],
+  planned: ["pending", "fallback_visible", "policy_blocked"],
   pending: ["sent", "failed", "fallback_visible", "policy_blocked"],
   sent: [],
   failed: ["fallback_visible"],
@@ -148,4 +148,146 @@ export async function upsertPostLedgerEntry(
   const next = { version: 1 as const, posts: nextPosts };
   await writePostFile(worktreePath, next);
   return next;
+}
+
+export interface ReconcilePostLedgerOpts {
+  botId: string;
+  minAgeMs?: number;
+  now?: () => string;
+}
+
+export interface ReconcilePostLedgerResult {
+  changed: boolean;
+  sent: number;
+  fallbackVisible: number;
+  skippedLive: number;
+}
+
+const DEFAULT_POST_RECONCILE_MIN_AGE_MS = 60_000;
+
+function timestampAgeMs(iso: string, nowMs: number): number | null {
+  if (!Number.isFinite(nowMs)) return null;
+  const then = Date.parse(iso);
+  if (!Number.isFinite(then)) return null;
+  return nowMs - then;
+}
+
+function reconcilePostEntry(
+  entry: PostLedgerEntry,
+  opts: Required<ReconcilePostLedgerOpts>,
+): { entry: PostLedgerEntry; changed: boolean; sent: boolean; fallbackVisible: boolean } {
+  if (entry.botId !== opts.botId) {
+    return { entry, changed: false, sent: false, fallbackVisible: false };
+  }
+
+  if (
+    entry.status === "sent" ||
+    entry.status === "fallback_visible" ||
+    entry.status === "policy_blocked"
+  ) {
+    return { entry, changed: false, sent: false, fallbackVisible: false };
+  }
+
+  const now = opts.now();
+  const ageMs = timestampAgeMs(entry.updatedAt, Date.parse(now));
+  if (ageMs == null || ageMs < opts.minAgeMs) {
+    return { entry, changed: false, sent: false, fallbackVisible: false };
+  }
+
+  if (entry.postMessageId) {
+    return {
+      entry: {
+        ...entry,
+        status: "sent",
+        error: undefined,
+        updatedAt: now,
+        attempts: [
+          ...entry.attempts,
+          {
+            attemptedAt: now,
+            status: "sent",
+            retryable: false,
+          },
+        ],
+      },
+      changed: true,
+      sent: true,
+      fallbackVisible: false,
+    };
+  }
+
+  const error =
+    entry.status === "failed" && entry.error
+      ? entry.error
+      : "orphaned post ledger entry reconciled without resend; visible card fallback required";
+  return {
+    entry: {
+      ...entry,
+      status: "fallback_visible",
+      error,
+      updatedAt: now,
+      attempts: [
+        ...entry.attempts,
+        {
+          attemptedAt: now,
+          status: "failed",
+          retryable: false,
+          code: "orphan_reconcile",
+          error,
+        },
+      ],
+    },
+    changed: true,
+    sent: false,
+    fallbackVisible: true,
+  };
+}
+
+export function reconcilePostLedgerEntries(
+  data: PostFile,
+  opts: ReconcilePostLedgerOpts,
+): { file: PostFile; result: ReconcilePostLedgerResult } {
+  const normalizedOpts: Required<ReconcilePostLedgerOpts> = {
+    botId: opts.botId,
+    minAgeMs: opts.minAgeMs ?? DEFAULT_POST_RECONCILE_MIN_AGE_MS,
+    now: opts.now ?? (() => new Date().toISOString()),
+  };
+
+  let sent = 0;
+  let fallbackVisible = 0;
+  let skippedLive = 0;
+  const posts = data.posts.map((post) => {
+    const reconciled = reconcilePostEntry(post, normalizedOpts);
+    if (reconciled.changed) {
+      if (reconciled.sent) sent += 1;
+      if (reconciled.fallbackVisible) fallbackVisible += 1;
+    } else if (
+      post.botId === normalizedOpts.botId &&
+      (post.status === "planned" || post.status === "pending" || post.status === "failed")
+    ) {
+      skippedLive += 1;
+    }
+    return reconciled.entry;
+  });
+  const changed = sent > 0 || fallbackVisible > 0;
+  return {
+    file: changed ? { version: 1, posts } : data,
+    result: { changed, sent, fallbackVisible, skippedLive },
+  };
+}
+
+export async function reconcilePostFileOrphans(
+  worktreePath: string,
+  opts: ReconcilePostLedgerOpts,
+): Promise<ReconcilePostLedgerResult> {
+  const existing = await readPostFile(worktreePath);
+  if (!existing) {
+    return { changed: false, sent: 0, fallbackVisible: 0, skippedLive: 0 };
+  }
+
+  const { file, result } = reconcilePostLedgerEntries(existing, opts);
+  if (result.changed) {
+    await writePostFile(worktreePath, file);
+  }
+  return result;
 }

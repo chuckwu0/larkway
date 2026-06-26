@@ -43,8 +43,9 @@ import {
   deleteCardFile,
   type CardFile,
 } from "./cardFile.js";
+import { reconcilePostFileOrphans } from "./postFile.js";
 import { readStateFile, stateFilePathOf, type StateFile } from "./stateFile.js";
-import type { CardRenderer } from "../lark/card.js";
+import type { CardHandle, CardRenderer } from "../lark/card.js";
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -196,13 +197,7 @@ function mapFinalizeArgs(
   state: StateFile,
   success: boolean,
   stateFresh = true,
-): {
-  finalText: string;
-  success: boolean;
-  failureReason?: string;
-  titleOverride?: string;
-  colorOverride?: "success" | "failure" | "neutral";
-} {
+): Parameters<CardHandle["finalize"]>[0] {
   if (!stateFresh) {
     return {
       finalText: "⚠️ 本轮在处理中被 bridge 重启中断，未拿到 agent 的新回复。请再 @ 我一次继续。",
@@ -227,6 +222,10 @@ function mapFinalizeArgs(
     ...(failureReason !== undefined ? { failureReason } : {}),
     ...(state.card_title !== undefined ? { titleOverride: state.card_title } : {}),
     ...(state.card_color !== undefined ? { colorOverride: state.card_color } : {}),
+    ...(state.choices !== undefined ? { choices: state.choices } : {}),
+    ...(state.choice_prompt !== undefined ? { choicePrompt: state.choice_prompt } : {}),
+    ...(state.image_blocks !== undefined ? { imageBlocks: state.image_blocks } : {}),
+    ...(state.content_blocks !== undefined ? { contentBlocks: state.content_blocks } : {}),
   };
 }
 
@@ -274,13 +273,12 @@ export async function reconcileOrphanedCards(deps: ReconcileDeps): Promise<void>
 
   // ── Gather per-worktree observations ──────────────────────────────────────
   const now = Date.now();
+  const nowIso = new Date(now).toISOString();
   const candidates: OrphanCandidate[] = [];
   for (const name of dirNames) {
     const wtPath = pathJoin(deps.worktreesDir, name);
     try {
       const card = await readCardFile(wtPath);
-      if (!card) continue; // fast path — no card.json, nothing to reconcile
-
       const state = await readStateFile(wtPath);
 
       // Liveness: any pid associated with the worktree still alive?
@@ -304,6 +302,24 @@ export async function reconcileOrphanedCards(deps: ReconcileDeps): Promise<void>
         ageMs = 0;
       }
 
+      if (!pidAlive) {
+        try {
+          const postResult = await reconcilePostFileOrphans(wtPath, {
+            botId: deps.botId,
+            minAgeMs,
+            now: () => nowIso,
+          });
+          if (postResult.changed) {
+            log(
+              `[reconcile] post ledger ${name}: sent=${postResult.sent}, fallback_visible=${postResult.fallbackVisible}`,
+            );
+          }
+        } catch (err) {
+          log(`[reconcile] post ledger failed for ${name} (skipping): ${String(err)}`);
+        }
+      }
+
+      if (!card) continue; // no card.json → no card to finalize
       candidates.push({ name, card, state, pidAlive, ageMs });
     } catch (err) {
       // Per-worktree gather failure → log + skip this one, continue the sweep.
