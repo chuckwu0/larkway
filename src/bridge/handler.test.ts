@@ -481,6 +481,73 @@ describe("handleOne — thin-channel finalize", () => {
     expect(finalizeArgs[0]?.success).toBe(true);
   });
 
+  it("finalizes the legacy card when the agent declares post but production post outbound is unavailable", async () => {
+    const threadId = "om_msg";
+    const finalState = {
+      status: "ready",
+      last_message: "post 声明下的正文仍必须可见",
+      response_surface: {
+        mode: "post",
+        primary: "post",
+      },
+      updated_at: "2026-06-26T10:00:00.000Z",
+    };
+    const wt = await seedWorktree(threadId);
+    await seedRepoCachePath();
+
+    runClaudeImpl = () => ({
+      events: (async function* () {
+        yield { type: "system_init", sessionId: "sess_surface_post", raw: {} };
+        await writeFile(
+          stateFileMod.stateFilePathOf(wt),
+          JSON.stringify(finalState, null, 2),
+          "utf8",
+        );
+      })(),
+      done: Promise.resolve({ exitCode: 0, sessionId: "sess_surface_post" }),
+      kill: () => {},
+    });
+
+    const { renderer, startArgs, finalizeArgs, whenFinalized } = makeCardRenderer();
+    const { store } = makeSessionStore();
+    const { client } = makeClient(makeEvent());
+
+    const handler = new BridgeHandler({
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      client: client as any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      cardRenderer: renderer as any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      sessionStore: store as any,
+      conventions: makeConventions(),
+      botConfig: {
+        id: "frontend",
+        name: "Frontend",
+        turn_taking_limit: 10,
+        backend: "claude",
+        response_surface_prototype: {
+          enabled: true,
+          allowed_chats: ["oc_chat"],
+          allowed_threads: [],
+          lazy_card_creation: true,
+          post_outbound_enabled: true,
+          allowed_mention_open_ids: [],
+          max_posts_per_turn: 1,
+          max_post_attempts: 3,
+          text_threshold_chars: 900,
+        },
+      },
+    });
+
+    await handler.run();
+    await whenFinalized;
+
+    expect(startArgs).toHaveLength(1);
+    expect(finalizeArgs).toHaveLength(1);
+    expect(finalizeArgs[0]?.success).toBe(true);
+    expect(finalizeArgs[0]?.finalText).toBe("post 声明下的正文仍必须可见");
+  });
+
   it("late-stage state.json WITHOUT dev_url is NOT probed and NOT demoted (status=ready → success)", async () => {
     // parseMessage derives threadId from root_id || message_id; makeEvent() has
     // no root_id, so the per-thread worktree dir is named after message_id.

@@ -1,0 +1,258 @@
+import { describe, expect, it } from "vitest";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import {
+  dispatchResponseSurface,
+  type CardFinalizePayload,
+  type SurfaceDispatchInput,
+} from "./surfaceDispatcher.js";
+import { readPostFile } from "./postFile.js";
+import type { StateFile } from "./stateFile.js";
+import type { OutboundPostClient } from "../lark/outboundPostClient.js";
+
+const enabledConfig = {
+  enabled: true,
+  allowed_chats: ["chat_allowed"],
+  allowed_threads: [],
+  lazy_card_creation: true,
+  post_outbound_enabled: true,
+  allowed_mention_open_ids: ["user_allowed"],
+  max_posts_per_turn: 1,
+  max_post_attempts: 3,
+  text_threshold_chars: 1200,
+};
+
+const defaultOffConfig = {
+  ...enabledConfig,
+  enabled: false,
+  allowed_chats: [],
+  allowed_threads: [],
+  post_outbound_enabled: false,
+  allowed_mention_open_ids: [],
+};
+
+function baseCard(text = "主回复正文"): CardFinalizePayload {
+  return {
+    finalText: text,
+    success: true,
+    titleOverride: "完成",
+    colorOverride: "success",
+  };
+}
+
+function state(surface: NonNullable<StateFile["response_surface"]>, extra = {}): StateFile {
+  return {
+    status: "ready",
+    last_message: "主回复正文",
+    response_surface: surface,
+    updated_at: "2026-06-26T00:00:00.000Z",
+    ...extra,
+  };
+}
+
+function baseInput(overrides: Partial<SurfaceDispatchInput> = {}): SurfaceDispatchInput {
+  return {
+    state: state({ mode: "post", primary: "post" }),
+    prototypeConfig: enabledConfig,
+    facts: {
+      botId: "tech-lead",
+      chatId: "chat_allowed",
+      threadId: "om_thread",
+      triggerMessageId: "om_trigger",
+      replyToMessageId: "om_trigger",
+      replyInThread: true,
+    },
+    baseCard: baseCard(),
+    cardStarted: true,
+    postOutboundAvailable: true,
+    postLedgerAvailable: true,
+    visibleFallbackAvailable: true,
+    now: () => "2026-06-26T00:00:00.000Z",
+    ...overrides,
+  };
+}
+
+function fakePostClient(opts: { fail?: boolean } = {}) {
+  const calls: Array<{
+    replyToMessageId: string;
+    content: string;
+    idempotencyKey: string;
+    replyInThread: boolean;
+  }> = [];
+  const client: OutboundPostClient = {
+    async createPostReply(replyToMessageId, content, callOpts) {
+      calls.push({
+        replyToMessageId,
+        content,
+        idempotencyKey: callOpts.idempotencyKey,
+        replyInThread: callOpts.replyInThread,
+      });
+      if (opts.fail) throw new Error("fake transport failed");
+      return { messageId: "om_post" };
+    },
+  };
+  return { client, calls };
+}
+
+async function withTemp<T>(fn: (dir: string) => Promise<T>): Promise<T> {
+  const dir = await mkdtemp(path.join(tmpdir(), "larkway-surface-dispatch-"));
+  try {
+    return await fn(dir);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+}
+
+describe("dispatchResponseSurface", () => {
+  it("keeps mode=card on the legacy visible card path", async () => {
+    const { client, calls } = fakePostClient();
+    const result = await dispatchResponseSurface(
+      baseInput({
+        state: state({ mode: "card", primary: "card" }),
+        prototypeConfig: defaultOffConfig,
+        postClient: client,
+      }),
+    );
+
+    expect(result.reason).toBe("legacy-card-mode");
+    expect(result.card?.finalText).toBe("主回复正文");
+    expect(result.visible).toBe(true);
+    expect(calls).toHaveLength(0);
+  });
+
+  it("sends a post-only response through a fake post client when every PR4 gate is ready", async () =>
+    withTemp(async (dir) => {
+      const { client, calls } = fakePostClient();
+      const result = await dispatchResponseSurface(
+        baseInput({
+          worktreePath: dir,
+          cardStarted: false,
+          postClient: client,
+        }),
+      );
+
+      expect(result.reason).toBe("post-sent");
+      expect(result.card).toBeNull();
+      expect(result.visible).toBe(true);
+      expect(calls).toHaveLength(1);
+      expect(calls[0]?.content).toContain("主回复正文");
+      expect(calls[0]?.idempotencyKey).toMatch(/^lw-p-[A-Za-z0-9_-]+$/);
+      expect(calls[0]?.idempotencyKey.length).toBeLessThanOrEqual(64);
+
+      const ledger = await readPostFile(dir);
+      expect(ledger?.posts).toHaveLength(1);
+      expect(ledger?.posts[0]?.status).toBe("sent");
+      expect(ledger?.posts[0]?.postMessageId).toBe("om_post");
+    }));
+
+  it("uses a compact secondary card for hybrid without repeating the main post body", async () =>
+    withTemp(async (dir) => {
+      const { client } = fakePostClient();
+      const result = await dispatchResponseSurface(
+        baseInput({
+          worktreePath: dir,
+          postClient: client,
+          state: state({
+            mode: "hybrid",
+            primary: "post",
+            card: { compact: true, capabilities: ["audit", "fallback"] },
+          }),
+        }),
+      );
+
+      expect(result.reason).toBe("hybrid-post-sent-compact-card");
+      expect(result.visible).toBe(true);
+      expect(result.card?.finalText).toContain("主回复已通过 post 发出");
+      expect(result.card?.finalText).toContain("idempotency_key:");
+      expect(result.card?.finalText).not.toContain("主回复正文");
+      expect(result.card?.choices).toBeUndefined();
+      expect(result.card?.contentBlocks).toBeUndefined();
+    }));
+
+  it("degrades non-allowlisted topics to the legacy visible card and does not send post", async () => {
+    const { client, calls } = fakePostClient();
+    const result = await dispatchResponseSurface(
+      baseInput({
+        postClient: client,
+        facts: {
+          botId: "tech-lead",
+          chatId: "chat_other",
+          threadId: "om_thread",
+          triggerMessageId: "om_trigger",
+          replyToMessageId: "om_trigger",
+          replyInThread: true,
+        },
+      }),
+    );
+
+    expect(result.reason).toBe("not-allowlisted");
+    expect(result.card?.finalText).toBe("主回复正文");
+    expect(result.visible).toBe(true);
+    expect(calls).toHaveLength(0);
+  });
+
+  it("falls back to a visible failure card and ledger status when post send fails", async () =>
+    withTemp(async (dir) => {
+      const { client } = fakePostClient({ fail: true });
+      const result = await dispatchResponseSurface(
+        baseInput({
+          worktreePath: dir,
+          postClient: client,
+        }),
+      );
+
+      expect(result.reason).toBe("post-failed-fallback-card");
+      expect(result.visible).toBe(true);
+      expect(result.card?.success).toBe(false);
+      expect(result.card?.finalText).toBe("主回复正文");
+      expect(result.card?.failureReason).toContain("visible card fallback used");
+
+      const ledger = await readPostFile(dir);
+      expect(ledger?.posts).toHaveLength(1);
+      expect(ledger?.posts[0]?.status).toBe("fallback_visible");
+      expect(ledger?.posts[0]?.attempts[0]?.status).toBe("failed");
+    }));
+
+  it("keeps choices on the old card path instead of losing card-only capabilities to post", async () => {
+    const { client, calls } = fakePostClient();
+    const result = await dispatchResponseSurface(
+      baseInput({
+        postClient: client,
+        state: state(
+          { mode: "post", primary: "post" },
+          {
+            choices: [{ label: "继续", value: "继续处理" }],
+            choice_prompt: "选下一步",
+          },
+        ),
+        baseCard: {
+          ...baseCard(),
+          choices: [{ label: "继续", value: "继续处理" }],
+          choicePrompt: "选下一步",
+        },
+      }),
+    );
+
+    expect(result.reason).toBe("card-capability-required");
+    expect(result.visible).toBe(true);
+    expect(result.card?.choices).toEqual([{ label: "继续", value: "继续处理" }]);
+    expect(calls).toHaveLength(0);
+  });
+
+  it("refuses post and keeps the existing card visible when fallback readiness is missing", async () => {
+    const { client, calls } = fakePostClient();
+    const result = await dispatchResponseSurface(
+      baseInput({
+        cardStarted: true,
+        visibleFallbackAvailable: false,
+        postClient: client,
+      }),
+    );
+
+    expect(result.reason).toBe("visible-fallback-unavailable");
+    expect(result.card?.finalText).toBe("主回复正文");
+    expect(result.visible).toBe(true);
+    expect(calls).toHaveLength(0);
+  });
+});

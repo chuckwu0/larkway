@@ -8,16 +8,19 @@ export interface SurfaceControllerInput {
   chatId: string;
   threadId: string;
   /**
-   * PR3+ hook. This PR deliberately keeps it false in production wiring because
-   * real post outbound, ledger, and visible failure fallback are out of scope.
+   * PR4 dispatch hook. Production wiring deliberately keeps this false until a
+   * later, separately-authorized PR enables real post outbound.
    */
   postOutboundAvailable: boolean;
+  postLedgerAvailable?: boolean;
+  visibleFallbackAvailable?: boolean;
 }
 
 export interface SurfaceControllerDecision {
   /**
    * Whether handler must create the legacy processing card before running the
-   * agent. PR1/PR2 production wiring keeps this true in every path.
+   * agent. PR4 production wiring keeps this true because post outbound remains
+   * unavailable.
    */
   startCardImmediately: boolean;
   prototypeEnabled: boolean;
@@ -26,7 +29,10 @@ export interface SurfaceControllerDecision {
     | "prototype-disabled"
     | "not-allowlisted"
     | "lazy-card-disabled"
+    | "post-outbound-disabled"
     | "post-outbound-unavailable-card-fallback"
+    | "post-ledger-unavailable-card-fallback"
+    | "visible-fallback-unavailable-card-fallback"
     | "lazy-card-ready";
 }
 
@@ -71,12 +77,39 @@ export class SurfaceController {
       });
     }
 
+    if (!cfg.post_outbound_enabled) {
+      return new SurfaceController({
+        startCardImmediately: true,
+        prototypeEnabled: true,
+        lazyCardCreationEnabled: false,
+        reason: "post-outbound-disabled",
+      });
+    }
+
     if (!input.postOutboundAvailable) {
       return new SurfaceController({
         startCardImmediately: true,
         prototypeEnabled: true,
         lazyCardCreationEnabled: false,
         reason: "post-outbound-unavailable-card-fallback",
+      });
+    }
+
+    if (input.postLedgerAvailable === false) {
+      return new SurfaceController({
+        startCardImmediately: true,
+        prototypeEnabled: true,
+        lazyCardCreationEnabled: false,
+        reason: "post-ledger-unavailable-card-fallback",
+      });
+    }
+
+    if (input.visibleFallbackAvailable === false) {
+      return new SurfaceController({
+        startCardImmediately: true,
+        prototypeEnabled: true,
+        lazyCardCreationEnabled: false,
+        reason: "visible-fallback-unavailable-card-fallback",
       });
     }
 
