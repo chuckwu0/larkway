@@ -71,9 +71,12 @@ response_surface_prototype:
   allowed_threads:
     - <thread_id>
   lazy_card_creation: true
+  kill_switch: false
   post_outbound_enabled: false
   allowed_mention_open_ids: []
   max_posts_per_turn: 1
+  max_posts_per_window: 4
+  post_window_ms: 60000
   max_post_attempts: 3
   text_threshold_chars: 1200
 ```
@@ -84,9 +87,12 @@ Defaults:
 - `allowed_chats: []`
 - `allowed_threads: []`
 - `lazy_card_creation: false`
+- `kill_switch: false`
 - `post_outbound_enabled: false`
 - `allowed_mention_open_ids: []`
 - `max_posts_per_turn: 1`
+- `max_posts_per_window: 4`
+- `post_window_ms: 60000`
 - `max_post_attempts: 3`
 - `text_threshold_chars: 1200`
 
@@ -206,11 +212,35 @@ This is a conservative reconcile policy. It never queries or sends real Feishu
 post messages in PR5, never repeats an outbound post during recovery, and never
 marks `fallback_visible` unless a visible fallback artifact exists.
 
+## PR7 Production Hardening
+
+PR7 keeps the prototype default-off while making a future production grey
+release observable, bounded, and reversible.
+
+- `kill_switch: true` forces the runtime back to the legacy visible-card path
+  even if `enabled`, `post_outbound_enabled`, and allowlists are otherwise set.
+  This is the operator rollback switch when code rollback is too slow.
+- `max_posts_per_turn` remains a hard per-turn cap. The current dispatcher sends
+  at most one logical post per turn; setting this below `1` disables post
+  outbound and falls back to the visible card.
+- `max_posts_per_window` + `post_window_ms` add a runtime sliding-window cap per
+  bot/chat/thread in the bridge process. If the window is exhausted, the turn
+  falls back to a visible card before the post transport is called.
+- Dispatcher logs one structured line per surface decision:
+  `[response_surface.dispatch] { ... }`. The payload includes dispatch reason,
+  visibility, card/post presence, budget state, and `post.json` ledger status
+  distribution.
+- `post.json` ledger summaries count `planned`, `pending`, `sent`, `failed`,
+  `fallback_visible`, `policy_blocked`, `postMessageId`, and
+  `fallbackCardMessageId` entries. These are meant for operator dashboards/log
+  queries, not public evidence files.
+
+All PR7 safeguards are mechanical gates. They do not decide business workflow,
+do not expand the allowlist, and do not enable real post outbound by default.
+
 ## Non-Goals Until Later PRs
 
-- No production-wired real IM post outbound.
-- No production-wired real peer `at`.
-- No production-wired visible post failure fallback.
-- No Feishu E2E or test cards.
-- No deployment, restart, or production bridge touch.
-- No expansion of dogfood surface.
+- No production enablement in repo defaults.
+- No automatic allowlist expansion.
+- No real post/at or Feishu E2E during unit-test PRs.
+- No deployment, restart, or production bridge touch as part of code changes.

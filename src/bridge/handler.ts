@@ -43,6 +43,7 @@ import {
 } from "../responseSurface.js";
 import type { OutboundPostClient } from "../lark/outboundPostClient.js";
 import { markPostLedgerFallbackVisible } from "./postFile.js";
+import { ResponseSurfacePostBudget } from "./postBudget.js";
 
 // ---------------------------------------------------------------------------
 // Private helpers — worktree bootstrap
@@ -515,6 +516,7 @@ export interface BridgeHandlerDeps {
 
 export class BridgeHandler {
   private readonly deps: BridgeHandlerDeps;
+  private readonly responseSurfacePostBudget = new ResponseSurfacePostBudget();
   private closed = false;
 
   constructor(deps: BridgeHandlerDeps) {
@@ -1184,6 +1186,20 @@ export class BridgeHandler {
             postLedgerAvailable: true,
             visibleFallbackAvailable: true,
             postClient: this.deps.postClient,
+            postBudget: prototypeConfig
+              ? {
+                  reserve: () =>
+                    this.responseSurfacePostBudget.reserve({
+                      scope: {
+                        botId: this.deps.botConfig?.id ?? "v1-default",
+                        chatId: parsed.chatId,
+                        threadId,
+                      },
+                      maxPosts: prototypeConfig.max_posts_per_window,
+                      windowMs: prototypeConfig.post_window_ms,
+                    }),
+                }
+              : undefined,
           });
 
           if (surfaceDispatch.card) {

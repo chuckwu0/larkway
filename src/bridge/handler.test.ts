@@ -518,9 +518,12 @@ describe("handleOne — thin-channel finalize", () => {
           allowed_chats: [],
           allowed_threads: ["om_msg"],
           lazy_card_creation: true,
+          kill_switch: false,
           post_outbound_enabled: true,
           allowed_mention_open_ids: [],
           max_posts_per_turn: 1,
+          max_posts_per_window: 4,
+          post_window_ms: 60_000,
           max_post_attempts: 3,
           text_threshold_chars: 900,
         },
@@ -589,9 +592,12 @@ describe("handleOne — thin-channel finalize", () => {
           allowed_chats: [],
           allowed_threads: ["om_msg"],
           lazy_card_creation: true,
+          kill_switch: false,
           post_outbound_enabled: true,
           allowed_mention_open_ids: [],
           max_posts_per_turn: 1,
+          max_posts_per_window: 4,
+          post_window_ms: 60_000,
           max_post_attempts: 3,
           text_threshold_chars: 900,
         },
@@ -711,9 +717,12 @@ describe("handleOne — thin-channel finalize", () => {
           allowed_chats: [],
           allowed_threads: ["om_msg"],
           lazy_card_creation: true,
+          kill_switch: false,
           post_outbound_enabled: true,
           allowed_mention_open_ids: [],
           max_posts_per_turn: 1,
+          max_posts_per_window: 4,
+          post_window_ms: 60_000,
           max_post_attempts: 3,
           text_threshold_chars: 900,
         },
@@ -735,6 +744,80 @@ describe("handleOne — thin-channel finalize", () => {
     const ledger = await readPostFile(wt);
     expect(ledger?.posts[0]?.status).toBe("sent");
     expect(ledger?.posts[0]?.postMessageId).toBe("om_post");
+  });
+
+  it("honors the response-surface kill switch even when post outbound is otherwise configured", async () => {
+    const threadId = "om_msg";
+    const finalState = {
+      status: "ready",
+      last_message: "kill switch 下仍必须可见",
+      response_surface: {
+        mode: "post",
+        primary: "post",
+      },
+      updated_at: "2026-06-26T10:00:00.000Z",
+    };
+    const wt = await seedWorktree(threadId);
+    await seedRepoCachePath();
+    const { client: postClient, calls } = makePostClient();
+
+    runClaudeImpl = () => ({
+      events: (async function* () {
+        yield { type: "system_init", sessionId: "sess_surface_kill_switch", raw: {} };
+        await writeFile(
+          stateFileMod.stateFilePathOf(wt),
+          JSON.stringify(finalState, null, 2),
+          "utf8",
+        );
+      })(),
+      done: Promise.resolve({ exitCode: 0, sessionId: "sess_surface_kill_switch" }),
+      kill: () => {},
+    });
+
+    const { renderer, startArgs, finalizeArgs, whenFinalized } = makeCardRenderer();
+    const { store } = makeSessionStore();
+    const { client } = makeClient(makeEvent());
+
+    const handler = new BridgeHandler({
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      client: client as any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      cardRenderer: renderer as any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      sessionStore: store as any,
+      conventions: makeConventions(),
+      botConfig: {
+        id: "frontend",
+        name: "Frontend",
+        turn_taking_limit: 10,
+        backend: "claude",
+        response_surface_prototype: {
+          enabled: true,
+          allowed_chats: [],
+          allowed_threads: ["om_msg"],
+          lazy_card_creation: true,
+          kill_switch: true,
+          post_outbound_enabled: true,
+          allowed_mention_open_ids: [],
+          max_posts_per_turn: 1,
+          max_posts_per_window: 4,
+          post_window_ms: 60_000,
+          max_post_attempts: 3,
+          text_threshold_chars: 900,
+        },
+      },
+      postClient,
+    });
+
+    await handler.run();
+    await whenFinalized;
+
+    expect(startArgs).toHaveLength(1);
+    expect(finalizeArgs).toHaveLength(1);
+    expect(finalizeArgs[0]?.success).toBe(true);
+    expect(finalizeArgs[0]?.finalText).toBe("kill switch 下仍必须可见");
+    expect(calls).toHaveLength(0);
+    expect(await readPostFile(wt)).toBeNull();
   });
 
   it("late-starts a visible fallback card before marking a failed post ledger fallback_visible", async () => {
@@ -787,9 +870,12 @@ describe("handleOne — thin-channel finalize", () => {
           allowed_chats: [],
           allowed_threads: ["om_msg"],
           lazy_card_creation: true,
+          kill_switch: false,
           post_outbound_enabled: true,
           allowed_mention_open_ids: [],
           max_posts_per_turn: 1,
+          max_posts_per_window: 4,
+          post_window_ms: 60_000,
           max_post_attempts: 3,
           text_threshold_chars: 900,
         },
@@ -866,9 +952,12 @@ describe("handleOne — thin-channel finalize", () => {
           allowed_chats: [],
           allowed_threads: ["om_msg"],
           lazy_card_creation: true,
+          kill_switch: false,
           post_outbound_enabled: true,
           allowed_mention_open_ids: [],
           max_posts_per_turn: 1,
+          max_posts_per_window: 4,
+          post_window_ms: 60_000,
           max_post_attempts: 3,
           text_threshold_chars: 900,
         },

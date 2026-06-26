@@ -27,6 +27,7 @@ export interface SurfaceControllerDecision {
   lazyCardCreationEnabled: boolean;
   reason:
     | "prototype-disabled"
+    | "kill-switch-active"
     | "not-allowlisted"
     | "lazy-card-disabled"
     | "post-outbound-disabled"
@@ -51,6 +52,15 @@ export class SurfaceController {
         prototypeEnabled: false,
         lazyCardCreationEnabled: false,
         reason: "prototype-disabled",
+      });
+    }
+
+    if (cfg.kill_switch) {
+      return new SurfaceController({
+        startCardImmediately: true,
+        prototypeEnabled: false,
+        lazyCardCreationEnabled: false,
+        reason: "kill-switch-active",
       });
     }
 

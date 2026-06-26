@@ -74,8 +74,41 @@ export type PostAttempt = z.infer<typeof PostAttemptSchema>;
 export type PostLedgerEntry = z.infer<typeof PostLedgerEntrySchema>;
 export type PostFile = z.infer<typeof PostFileSchema>;
 
+export interface PostLedgerSummary {
+  total: number;
+  planned: number;
+  pending: number;
+  sent: number;
+  failed: number;
+  fallback_visible: number;
+  policy_blocked: number;
+  withPostMessageId: number;
+  withFallbackCardMessageId: number;
+}
+
 export function emptyPostFile(): PostFile {
   return { version: 1, posts: [] };
+}
+
+export function summarizePostLedger(data: PostFile | null | undefined): PostLedgerSummary {
+  const summary: PostLedgerSummary = {
+    total: 0,
+    planned: 0,
+    pending: 0,
+    sent: 0,
+    failed: 0,
+    fallback_visible: 0,
+    policy_blocked: 0,
+    withPostMessageId: 0,
+    withFallbackCardMessageId: 0,
+  };
+  for (const post of data?.posts ?? []) {
+    summary.total += 1;
+    summary[post.status] += 1;
+    if (post.postMessageId) summary.withPostMessageId += 1;
+    if (post.fallbackCardMessageId) summary.withFallbackCardMessageId += 1;
+  }
+  return summary;
 }
 
 export function postDirOf(worktreePath: string): string {

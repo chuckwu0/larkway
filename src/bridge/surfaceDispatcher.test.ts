@@ -16,9 +16,12 @@ const enabledConfig = {
   allowed_chats: ["chat_allowed"],
   allowed_threads: [],
   lazy_card_creation: true,
+  kill_switch: false,
   post_outbound_enabled: true,
   allowed_mention_open_ids: ["user_allowed"],
   max_posts_per_turn: 1,
+  max_posts_per_window: 4,
+  post_window_ms: 60_000,
   max_post_attempts: 3,
   text_threshold_chars: 1200,
 };
@@ -264,6 +267,34 @@ describe("dispatchResponseSurface", () => {
     expect(result.visible).toBe(true);
     expect(calls).toHaveLength(0);
   });
+
+  it("degrades to a visible card when the runtime post budget is exhausted", async () =>
+    withTemp(async (dir) => {
+      const { client, calls } = fakePostClient();
+      const result = await dispatchResponseSurface(
+        baseInput({
+          worktreePath: dir,
+          postClient: client,
+          postBudget: {
+            reserve: () => ({
+              allowed: false,
+              used: 4,
+              limit: 4,
+              windowMs: 60_000,
+              resetAt: "2026-06-26T00:01:00.000Z",
+              reason: "post-window-exhausted",
+            }),
+          },
+        }),
+      );
+
+      expect(result.reason).toBe("post-rate-limit-exhausted");
+      expect(result.visible).toBe(true);
+      expect(result.card?.finalText).toBe("主回复正文");
+      expect(result.budget?.allowed).toBe(false);
+      expect(calls).toHaveLength(0);
+      expect(await readPostFile(dir)).toBeNull();
+    }));
 
   it("returns a visible failure card and leaves ledger failed until the card is finalized", async () =>
     withTemp(async (dir) => {

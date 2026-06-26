@@ -10,9 +10,12 @@ import {
 } from "../lark/idempotency.js";
 import {
   readPostFile,
+  summarizePostLedger,
   upsertPostLedgerEntry,
+  type PostLedgerSummary,
   type PostLedgerEntry,
 } from "./postFile.js";
+import type { ResponseSurfacePostBudgetDecision } from "./postBudget.js";
 import type { Choice, ContentBlock, ImageBlock } from "../lark/card.js";
 
 export interface CardFinalizePayload {
@@ -30,8 +33,10 @@ export interface CardFinalizePayload {
 export type SurfaceDispatchReason =
   | "legacy-card-mode"
   | "prototype-disabled"
+  | "kill-switch-active"
   | "not-allowlisted"
   | "post-outbound-disabled"
+  | "post-rate-limit-exhausted"
   | "post-outbound-unavailable"
   | "post-ledger-unavailable"
   | "visible-fallback-unavailable"
@@ -61,6 +66,9 @@ export interface SurfaceDispatchInput {
   postLedgerAvailable: boolean;
   visibleFallbackAvailable: boolean;
   postClient?: OutboundPostClient;
+  postBudget?: {
+    reserve: () => ResponseSurfacePostBudgetDecision;
+  };
   now?: () => string;
 }
 
@@ -75,6 +83,7 @@ export interface SurfaceDispatchResult {
     requiresFallbackLedgerMark?: boolean;
     fallbackError?: string;
   };
+  budget?: ResponseSurfacePostBudgetDecision;
 }
 
 function fullCard(
@@ -228,7 +237,46 @@ function sentResult(
   };
 }
 
-export async function dispatchResponseSurface(
+async function ledgerSummaryFor(input: SurfaceDispatchInput): Promise<PostLedgerSummary> {
+  if (!input.worktreePath) return summarizePostLedger(null);
+  return summarizePostLedger(await readPostFile(input.worktreePath));
+}
+
+function emitSurfaceObservation(input: {
+  facts: SurfaceDispatchInput["facts"];
+  result: SurfaceDispatchResult;
+  ledger: PostLedgerSummary;
+  durationMs: number;
+}): void {
+  console.log(
+    "[response_surface.dispatch]",
+    JSON.stringify({
+      event: "response_surface.dispatch",
+      botId: input.facts.botId,
+      chatId: input.facts.chatId,
+      threadId: input.facts.threadId,
+      reason: input.result.reason,
+      visible: input.result.visible,
+      hasCard: !!input.result.card,
+      hasPost: !!input.result.post,
+      postMessageIdPresent: !!input.result.post?.messageId,
+      budget: input.result.budget
+        ? {
+            allowed: input.result.budget.allowed,
+            used: input.result.budget.used,
+            limit: input.result.budget.limit,
+            windowMs: input.result.budget.windowMs,
+            resetAt: input.result.budget.resetAt,
+            reason: input.result.budget.reason,
+          }
+        : undefined,
+      ledger: input.ledger,
+      durationMs: input.durationMs,
+    }),
+  );
+}
+
+async function dispatchResponseSurfaceInner(
   input: SurfaceDispatchInput,
 ): Promise<SurfaceDispatchResult> {
   const surface = input.state?.response_surface;
@@ -238,6 +286,7 @@ export async function dispatchResponseSurface(
 
   const cfg = input.prototypeConfig;
   if (!cfg?.enabled) return fullCard(input, "prototype-disabled");
+  if (cfg.kill_switch) return fullCard(input, "kill-switch-active");
   if (
     !isResponseSurfacePrototypeAllowlisted(cfg, {
       chatId: input.facts.chatId,
@@ -248,6 +297,7 @@ export async function dispatchResponseSurface(
   }
   if (!cfg.post_outbound_enabled) return fullCard(input, "post-outbound-disabled");
   if (cfg.max_posts_per_turn < 1) return fullCard(input, "post-outbound-disabled");
+  if (cfg.max_posts_per_window < 1) return fullCard(input, "post-rate-limit-exhausted");
   if (!input.postOutboundAvailable || !input.postClient) {
     return fullCard(input, "post-outbound-unavailable");
   }
@@ -367,6 +417,14 @@ export async function dispatchResponseSurface(
     };
   }
 
+  const budget = input.postBudget?.reserve();
+  if (budget && !budget.allowed) {
+    return {
+      ...fullCard(input, "post-rate-limit-exhausted"),
+      budget,
+    };
+  }
+
   await writeLedger(
     input,
     newLedgerEntry({
@@ -422,7 +480,7 @@ export async function dispatchResponseSurface(
     );
 
     const post = { idempotencyKey, messageId: sent.messageId, role };
-    return sentResult(input, surface, post, "post-sent");
+    return { ...sentResult(input, surface, post, "post-sent"), budget };
   } catch (err) {
     const failedAt = input.now?.() ?? new Date().toISOString();
     const error = err instanceof Error ? err.message : String(err);
@@ -458,6 +516,22 @@ export async function dispatchResponseSurface(
         requiresFallbackLedgerMark: true,
         fallbackError: error,
       },
+      budget,
     };
   }
+}
+
+export async function dispatchResponseSurface(
+  input: SurfaceDispatchInput,
+): Promise<SurfaceDispatchResult> {
+  const startedAt = Date.now();
+  const result = await dispatchResponseSurfaceInner(input);
+  const ledger = await ledgerSummaryFor(input);
+  emitSurfaceObservation({
+    facts: input.facts,
+    result,
+    ledger,
+    durationMs: Date.now() - startedAt,
+  });
+  return result;
 }
