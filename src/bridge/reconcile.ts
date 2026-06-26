@@ -289,6 +289,38 @@ async function finalizePostOnlyFallbackCard(input: {
   );
 }
 
+async function markVisiblePostFallbacksForCard(input: {
+  worktreePath: string;
+  botId: string;
+  minAgeMs: number;
+  nowIso: string;
+  fallbackCardMessageId: string;
+  log: (msg: string) => void;
+}): Promise<number> {
+  const postResult = await reconcilePostFileOrphans(input.worktreePath, {
+    botId: input.botId,
+    minAgeMs: input.minAgeMs,
+    now: () => input.nowIso,
+  });
+
+  if (postResult.visibleFallbackCandidates.length === 0) return 0;
+
+  for (const entry of postResult.visibleFallbackCandidates) {
+    const fallbackError =
+      entry.error ?? "orphaned post ledger entry reconciled after existing visible card finalize";
+    await markPostLedgerFallbackVisible(input.worktreePath, entry.idempotencyKey, {
+      fallbackCardMessageId: input.fallbackCardMessageId,
+      error: fallbackError,
+      now: () => input.nowIso,
+    });
+  }
+
+  input.log(
+    `[reconcile] marked ${postResult.visibleFallbackCandidates.length} post fallback candidate(s) visible via existing card ${input.fallbackCardMessageId}`,
+  );
+  return postResult.visibleFallbackCandidates.length;
+}
+
 // ---------------------------------------------------------------------------
 // Impure reconcile shell
 // ---------------------------------------------------------------------------
@@ -428,6 +460,14 @@ export async function reconcileOrphanedCards(deps: ReconcileDeps): Promise<void>
     try {
       const handle = deps.cardRenderer.handleFor(orphan.card.messageId);
       await handle.finalize(mapFinalizeArgs(state, orphan.success, orphan.stateFresh));
+      await markVisiblePostFallbacksForCard({
+        worktreePath: wtPath,
+        botId: deps.botId,
+        minAgeMs,
+        nowIso,
+        fallbackCardMessageId: handle.messageId,
+        log,
+      });
       // Success → drop card.json so the next boot doesn't re-finalize.
       await deleteCardFile(wtPath);
       log(

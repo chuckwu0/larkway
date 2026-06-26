@@ -188,6 +188,10 @@ PR5 extends boot-time reconcile without enabling post outbound:
     visible fallback card. Reconcile creates and finalizes that card, then marks
     the ledger `fallback_visible` with `fallbackCardMessageId` and an
     `orphan_reconcile` attempt.
+  - if the same worktree already has a recoverable `card.json` + `state.json`,
+    reconcile finalizes that existing card first, then marks the post ledger
+    `fallback_visible` with that existing card message id. A second boot must
+    not create another fallback card for the same orphan.
   - if the fallback card cannot be created/finalized, the ledger stays
     non-terminal and reconcile logs the failure; it must not silently mark
     `fallback_visible`.

@@ -396,6 +396,51 @@ describe("reconcileOrphanedCards — integration", () => {
     expect(await readCardFile(wt)).toBeNull();
   });
 
+  it("marks a card+state post orphan visible via the existing card and stays idempotent", async () => {
+    const wt = await seedWorktree(
+      "om_card_and_post",
+      card({ messageId: "om_existing_card", threadId: "om_card_and_post" }),
+      state("ready", { last_message: "existing card became visible" }),
+    );
+    await writePostFile(wt, {
+      version: 1,
+      posts: [postEntry({ threadId: "om_card_and_post" })],
+    });
+    const { renderer, handlesByMessageId, startCalls } = makeFakeRenderer();
+
+    await reconcileOrphanedCards({
+      botId: "gitlab",
+      worktreesDir: root,
+      cardRenderer: renderer,
+      minAgeMs: 60_000,
+      log: () => {},
+    });
+
+    expect(startCalls).toEqual([]);
+    const existingHandle = handlesByMessageId.get("om_existing_card");
+    expect(existingHandle?.finalizeArgs).toHaveLength(1);
+    const ledgerAfterFirst = await readPostFile(wt);
+    expect(ledgerAfterFirst?.posts[0]?.status).toBe("fallback_visible");
+    expect(ledgerAfterFirst?.posts[0]?.fallbackCardMessageId).toBe("om_existing_card");
+    expect(ledgerAfterFirst?.posts[0]?.attempts[0]?.code).toBe("orphan_reconcile");
+    expect(await readCardFile(wt)).toBeNull();
+
+    await reconcileOrphanedCards({
+      botId: "gitlab",
+      worktreesDir: root,
+      cardRenderer: renderer,
+      minAgeMs: 60_000,
+      log: () => {},
+    });
+
+    expect(startCalls).toEqual([]);
+    expect(handlesByMessageId.has("om_started_1")).toBe(false);
+    expect(handlesByMessageId.get("om_existing_card")?.finalizeArgs).toHaveLength(1);
+    const ledgerAfterSecond = await readPostFile(wt);
+    expect(ledgerAfterSecond?.posts[0]?.status).toBe("fallback_visible");
+    expect(ledgerAfterSecond?.posts[0]?.fallbackCardMessageId).toBe("om_existing_card");
+  });
+
   it("leaves a post-only orphan non-terminal when fallback card creation fails", async () => {
     const wt = join(root, "om_post_only_start_fail");
     await mkdir(join(wt, ".larkway"), { recursive: true });
