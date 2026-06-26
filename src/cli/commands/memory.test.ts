@@ -20,6 +20,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import type { BotConfig } from "../../config/botLoader.js";
 import type { CliContext, CommandRun } from "../types.js";
+import { DEFAULT_RESPONSE_SURFACE_PROTOTYPE } from "../../responseSurface.js";
 
 // ---------------------------------------------------------------------------
 // Shared test infrastructure
@@ -43,6 +44,7 @@ const sampleBot = (id = "test-bot"): BotConfig =>
     repos: [{ slug: "group/repo", branch: "master" }],
     turn_taking_limit: 10,
     read_only: false,
+    response_surface_prototype: DEFAULT_RESPONSE_SURFACE_PROTOTYPE,
     runtime: "legacy",
     backend: "claude",
   }) as BotConfig;

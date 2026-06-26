@@ -545,6 +545,64 @@ read_only: false
     expect(bots[0]?.read_only).toBe(false);
   });
 
+  it("response_surface_prototype defaults disabled for existing bot yamls", async () => {
+    await createBotsDir();
+    await writeYaml(
+      "surface-default.yaml",
+      `
+id: surface-default-bot
+name: Surface Default Bot
+description: response surface unset
+app_id: cli_surface_default
+app_secret_env: SURFACE_DEFAULT_SECRET
+bot_open_id: ou_surface_default
+`,
+    );
+
+    const bots = await loadBots(botsDir());
+    expect(bots).toHaveLength(1);
+    expect(bots[0]?.response_surface_prototype).toEqual({
+      enabled: false,
+      allowed_chats: [],
+      allowed_threads: [],
+      lazy_card_creation: false,
+      text_threshold_chars: 1200,
+    });
+  });
+
+  it("parses response_surface_prototype dark-launch config", async () => {
+    await createBotsDir();
+    await writeYaml(
+      "surface-prototype.yaml",
+      `
+id: surface-prototype-bot
+name: Surface Prototype Bot
+description: response surface dark launch
+app_id: cli_surface
+app_secret_env: SURFACE_SECRET
+bot_open_id: ou_surface
+response_surface_prototype:
+  enabled: true
+  allowed_chats:
+    - oc_test
+  allowed_threads:
+    - om_thread
+  lazy_card_creation: true
+  text_threshold_chars: 900
+`,
+    );
+
+    const bots = await loadBots(botsDir());
+    expect(bots).toHaveLength(1);
+    expect(bots[0]?.response_surface_prototype).toEqual({
+      enabled: true,
+      allowed_chats: ["oc_test"],
+      allowed_threads: ["om_thread"],
+      lazy_card_creation: true,
+      text_threshold_chars: 900,
+    });
+  });
+
   it("runtime 默认为 legacy,避免现有 bot yaml 改变行为", async () => {
     await createBotsDir();
     await writeYaml(

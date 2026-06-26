@@ -93,6 +93,9 @@ describe("renderPrompt — V2 mode (botName set)", () => {
     expect(prompt).toContain("<state-contract>");
     expect(prompt).toContain("status: in_progress / ready / failed");
     expect(prompt).toContain("content_blocks");
+    expect(prompt).toContain("response_surface");
+    expect(prompt).toContain("PR3 真实 post outbound/ledger 未实现前");
+    expect(prompt).toContain("不要写 raw Feishu post/card JSON");
     expect(prompt).toContain("markdown -> image -> markdown -> image");
     expect(prompt).toContain("若 `content_blocks` 非空");
     expect(prompt).toContain("scheduled reply / daily social ops review card");

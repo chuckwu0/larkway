@@ -16,6 +16,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { z } from "zod";
+import { ResponseSurfaceStateSchema } from "../responseSurface.js";
 
 // ---------------------------------------------------------------------------
 // Schema
@@ -188,6 +189,13 @@ export const StateFileSchema = z.object({
    * Rendered VERBATIM, bridge-opaque. Only meaningful alongside `choices`.
    */
   choice_prompt: z.string().optional(),
+  /**
+   * Prototype response-surface declaration. Soft-failed by schema design: a bad
+   * prototype field becomes undefined and must not discard status/last_message.
+   * Runtime behavior is gated by bot config; when disabled, this field is
+   * ignored and the legacy card path remains authoritative.
+   */
+  response_surface: ResponseSurfaceStateSchema.optional(),
   updated_at: z.string(),
 });
 

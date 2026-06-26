@@ -8,6 +8,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import type { BotConfig } from "../config/botLoader.js";
+import { DEFAULT_RESPONSE_SURFACE_PROTOTYPE } from "../responseSurface.js";
 
 let tmp: string;
 let store: typeof import("./botsStore.js");
@@ -25,6 +26,7 @@ const sampleBot = (): BotConfig =>
     repos: [{ slug: "group/repo", branch: "master" }],
     turn_taking_limit: 10,
     read_only: false,
+    response_surface_prototype: DEFAULT_RESPONSE_SURFACE_PROTOTYPE,
     runtime: "legacy",
     backend: "claude",
   }) as BotConfig;

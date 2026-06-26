@@ -350,6 +350,7 @@ async function runV2Mode({
         runtime: bot.runtime,
         git_token_env: bot.git_token_env,
         gitlab_token_env: bot.gitlab_token_env,
+        response_surface_prototype: bot.response_surface_prototype,
       },
       gitlabToken: effectiveGitlabToken,
       agentMemory: bot.agent_memory,
