@@ -18,6 +18,7 @@ const enabledConfig = {
   lazy_card_creation: true,
   kill_switch: false,
   post_outbound_enabled: true,
+  cardkit_streaming_enabled: false,
   allow_agent_mentions: true,
   allowed_mention_open_ids: ["user_allowed"],
   max_posts_per_turn: 1,
@@ -33,6 +34,7 @@ const defaultOffConfig = {
   allowed_chats: [],
   allowed_threads: [],
   post_outbound_enabled: false,
+  cardkit_streaming_enabled: false,
   allow_agent_mentions: true,
   allowed_mention_open_ids: [],
 };

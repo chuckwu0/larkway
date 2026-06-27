@@ -78,6 +78,7 @@ response_surface_prototype:
   lazy_card_creation: true
   kill_switch: false
   post_outbound_enabled: true
+  cardkit_streaming_enabled: false
   allow_agent_mentions: true
   allowed_mention_open_ids: []
   max_posts_per_turn: 1
@@ -95,6 +96,7 @@ Defaults:
 - `lazy_card_creation: true`
 - `kill_switch: false`
 - `post_outbound_enabled: true`
+- `cardkit_streaming_enabled: false`
 - `allow_agent_mentions: true`
 - `allowed_mention_open_ids: []`
 - `max_posts_per_turn: 1`
@@ -108,6 +110,10 @@ Set either list to one or more ids to narrow rollout scope. Mentions are
 separate: `allow_agent_mentions: false` disables all Agent-authored mentions;
 empty `allowed_mention_open_ids` allows the Agent to choose targets; non-empty
 `allowed_mention_open_ids` narrows mentions to that set. `@all` remains blocked.
+
+`cardkit_streaming_enabled` is reserved for the CardKit streaming response
+surface. It defaults to `false`, and the PR A foundation does not wire it into
+the handler start/finalize path; enabling CardKit requires a later rollout PR.
 
 ## Post-First Surface Controller
 

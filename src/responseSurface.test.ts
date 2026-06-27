@@ -20,6 +20,7 @@ describe("response surface production gates", () => {
     expect(cfg).toMatchObject({
       enabled: true,
       post_outbound_enabled: true,
+      cardkit_streaming_enabled: false,
       kill_switch: false,
       allow_agent_mentions: true,
       allowed_chats: [],

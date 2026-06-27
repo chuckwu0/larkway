@@ -568,6 +568,7 @@ bot_open_id: ou_surface_default
       lazy_card_creation: true,
       kill_switch: false,
       post_outbound_enabled: true,
+      cardkit_streaming_enabled: false,
       allow_agent_mentions: true,
       allowed_mention_open_ids: [],
       max_posts_per_turn: 1,
@@ -598,6 +599,7 @@ response_surface_prototype:
   lazy_card_creation: true
   kill_switch: true
   post_outbound_enabled: true
+  cardkit_streaming_enabled: false
   allow_agent_mentions: false
   allowed_mention_open_ids:
     - surface_peer
@@ -618,6 +620,7 @@ response_surface_prototype:
       lazy_card_creation: true,
       kill_switch: true,
       post_outbound_enabled: true,
+      cardkit_streaming_enabled: false,
       allow_agent_mentions: false,
       allowed_mention_open_ids: ["surface_peer"],
       max_posts_per_turn: 2,

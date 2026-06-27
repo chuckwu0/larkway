@@ -10,6 +10,7 @@ export function defaultResponseSurfacePrototypeConfig() {
     lazy_card_creation: true,
     kill_switch: false,
     post_outbound_enabled: true,
+    cardkit_streaming_enabled: false,
     allow_agent_mentions: true,
     allowed_mention_open_ids: [] as string[],
     max_posts_per_turn: 1,
@@ -29,6 +30,7 @@ const responseSurfacePrototypeConfigDefaults = () => ({
   lazy_card_creation: true,
   kill_switch: false,
   post_outbound_enabled: true,
+  cardkit_streaming_enabled: false,
   allow_agent_mentions: true,
   allowed_mention_open_ids: [] as string[],
   max_posts_per_turn: 1,
@@ -127,6 +129,12 @@ export const ResponseSurfacePrototypeConfigSchema = z
      * an injected post client and all safety gates before any post path.
      */
     post_outbound_enabled: z.boolean().default(true),
+    /**
+     * CardKit streaming response surface gate. PR A keeps this default-off and
+     * does not wire it into handler/main; later PRs may use it for test-chat
+     * rollout after screenshot and late-@ E2E gates pass.
+     */
+    cardkit_streaming_enabled: z.boolean().default(false),
     /**
      * Allows Agent-authored post mentions. This powers handoff to peer bots.
      * Keep this false only when the operator wants to suppress every real @.
