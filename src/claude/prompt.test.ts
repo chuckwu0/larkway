@@ -94,7 +94,8 @@ describe("renderPrompt — V2 mode (botName set)", () => {
     expect(prompt).toContain("status: in_progress / ready / failed");
     expect(prompt).toContain("content_blocks");
     expect(prompt).toContain("response_surface");
-    expect(prompt).toContain("PR3 真实 post outbound/ledger 未实现前");
+    expect(prompt).toContain("默认主回复面是 post/RichText");
+    expect(prompt).toContain("无显式 card 意图时 bridge 按 post-first 处理");
     expect(prompt).toContain("不要写 raw Feishu post/card JSON");
     expect(prompt).toContain("markdown -> image -> markdown -> image");
     expect(prompt).toContain("若 `content_blocks` 非空");
@@ -301,9 +302,10 @@ describe("renderPrompt — V2 mode (botName set)", () => {
     // forbids self-PATCH and mandates a clean exit. Lock it for ALL bots.
     const prompt = renderPrompt(makeInput({ botName: "Frontend" }));
     expect(prompt).toContain("thin-channel 外壳");
-    expect(prompt).toContain("你负责决定卡片里要告诉运营什么");
+    expect(prompt).toContain("你负责把最终给运营看的正文");
     expect(prompt).toContain("绝不自己");
-    expect(prompt).toContain("PATCH");
+    expect(prompt).toContain("PATCH/PUT");
+    expect(prompt).toContain("bridge 管理的 post/card");
     expect(prompt).toContain("干净结束本轮");
     // The old self-PATCH instruction must be gone.
     expect(prompt).not.toContain("PATCH 到卡片");
@@ -318,7 +320,8 @@ describe("renderPrompt — V2 mode (botName set)", () => {
 
   it("base contract: agent owns final card content, bridge does not infer business status", () => {
     const prompt = renderPrompt(makeInput({ botName: "Frontend" }));
-    expect(prompt).toContain("最终成功卡片以你的 `content_blocks`(若非空)或 `last_message` 为主");
+    expect(prompt).toContain("最终 post 以你的 `last_message` 为主");
+    expect(prompt).toContain("bridge 会在 post 之后补卡片");
     expect(prompt).toContain("不要依赖 bridge 从输出里解析业务阶段");
     expect(prompt).toContain("不要求固定格式");
   });

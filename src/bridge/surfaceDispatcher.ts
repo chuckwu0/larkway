@@ -48,6 +48,8 @@ export type SurfaceDispatchReason =
   | "post-ledger-already-sent"
   | "post-orphan-reconciled-fallback-card"
   | "post-sent"
+  | "post-updated"
+  | "post-sent-card-capability-required"
   | "hybrid-post-sent-compact-card"
   | "post-failed-fallback-card";
 
@@ -69,6 +71,11 @@ export interface SurfaceDispatchInput {
   postLedgerAvailable: boolean;
   visibleFallbackAvailable: boolean;
   postClient?: OutboundPostClient;
+  livePost?: {
+    messageId: string;
+    idempotencyKey: string;
+    role: PostSurfaceRole;
+  };
   postBudget?: {
     reserve: () => ResponseSurfacePostBudgetDecision;
   };
@@ -107,6 +114,15 @@ function hasCardOnlyPayload(state: StateFile | null): boolean {
     state?.choices?.length ||
     state?.image_blocks?.length ||
     state?.content_blocks?.length
+  );
+}
+
+function hasCardOnlyPayloadIn(input: SurfaceDispatchInput): boolean {
+  return !!(
+    hasCardOnlyPayload(input.state) ||
+    input.baseCard.choices?.length ||
+    input.baseCard.imageBlocks?.length ||
+    input.baseCard.contentBlocks?.length
   );
 }
 
@@ -218,9 +234,17 @@ function sentResult(
   post: { idempotencyKey: string; messageId: string; role: PostSurfaceRole },
   reason: Extract<
     SurfaceDispatchReason,
-    "post-ledger-already-sent" | "post-sent"
+    "post-ledger-already-sent" | "post-sent" | "post-updated"
   >,
 ): SurfaceDispatchResult {
+  if (hasCardOnlyPayloadIn(input)) {
+    return {
+      card: input.baseCard,
+      reason: "post-sent-card-capability-required",
+      visible: true,
+      post,
+    };
+  }
   if (surface.mode === "hybrid" || input.cardStarted) {
     return {
       card: compactAuditCard(input, post),
@@ -229,7 +253,7 @@ function sentResult(
           ? "post-ledger-already-sent"
           : surface.mode === "hybrid"
             ? "hybrid-post-sent-compact-card"
-            : "post-sent",
+            : reason,
       visible: true,
       post,
     };
@@ -284,10 +308,12 @@ function emitSurfaceObservation(input: {
 async function dispatchResponseSurfaceInner(
   input: SurfaceDispatchInput,
 ): Promise<SurfaceDispatchResult> {
-  const surface = input.state?.response_surface;
-  if (!surface || surface.mode === "card" || surface.primary === "card") {
+  const declaredSurface = input.state?.response_surface;
+  if (declaredSurface?.mode === "card" || declaredSurface?.primary === "card") {
     return fullCard(input, "legacy-card-mode");
   }
+  const surface: NonNullable<StateFile["response_surface"]> =
+    declaredSurface ?? { mode: "post", primary: "post" };
 
   const cfg = input.prototypeConfig;
   if (!cfg?.enabled) return fullCard(input, "prototype-disabled");
@@ -308,9 +334,6 @@ async function dispatchResponseSurfaceInner(
   }
   if (!input.visibleFallbackAvailable) {
     return fullCard(input, "visible-fallback-unavailable");
-  }
-  if (hasCardOnlyPayload(input.state)) {
-    return fullCard(input, "card-capability-required");
   }
   if (!input.postLedgerAvailable || !input.worktreePath) {
     return fullCard(input, "post-ledger-unavailable");
@@ -336,6 +359,16 @@ async function dispatchResponseSurfaceInner(
 
   if (blockedMention) {
     const policyError = `mention target is not allowed by response surface policy: ${blockedMention.user_id}`;
+    if (input.livePost) {
+      try {
+        await input.postClient.updatePost(input.livePost.messageId, buildPostContent({ text }));
+      } catch (err) {
+        console.warn(
+          "[surface_dispatch] live post policy-blocked cleanup update failed:",
+          err,
+        );
+      }
+    }
     await writeLedger(
       input,
       newLedgerEntry({
@@ -371,14 +404,16 @@ async function dispatchResponseSurfaceInner(
     })),
   });
   const contentDigest = digestPostContent(content);
-  const idempotencyKey = derivePostIdempotencyKey({
-    botId: input.facts.botId,
-    threadId: input.facts.threadId,
-    triggerMessageId: input.facts.triggerMessageId,
-    role,
-    logicalIndex,
-    contentDigest,
-  });
+  const idempotencyKey =
+    input.livePost?.idempotencyKey ??
+    derivePostIdempotencyKey({
+      botId: input.facts.botId,
+      threadId: input.facts.threadId,
+      triggerMessageId: input.facts.triggerMessageId,
+      role,
+      logicalIndex,
+      contentDigest,
+    });
   const existing = await existingLedgerEntry(input, idempotencyKey);
   if (existing?.status === "sent" && existing.postMessageId) {
     return sentResult(
@@ -428,7 +463,7 @@ async function dispatchResponseSurfaceInner(
     };
   }
 
-  const budget = input.postBudget?.reserve();
+  const budget = input.livePost ? undefined : input.postBudget?.reserve();
   if (budget && !budget.allowed) {
     return {
       ...fullCard(input, "post-rate-limit-exhausted"),
@@ -464,10 +499,12 @@ async function dispatchResponseSurfaceInner(
   );
 
   try {
-    const sent = await input.postClient.createPostReply(input.facts.replyToMessageId, content, {
-      replyInThread: input.facts.replyInThread,
-      idempotencyKey,
-    });
+    const sent = input.livePost
+      ? await input.postClient.updatePost(input.livePost.messageId, content)
+      : await input.postClient.createPostReply(input.facts.replyToMessageId, content, {
+          replyInThread: input.facts.replyInThread,
+          idempotencyKey,
+        });
     await writeLedger(
       input,
       newLedgerEntry({
@@ -491,7 +528,10 @@ async function dispatchResponseSurfaceInner(
     );
 
     const post = { idempotencyKey, messageId: sent.messageId, role };
-    return { ...sentResult(input, surface, post, "post-sent"), budget };
+    return {
+      ...sentResult(input, surface, post, input.livePost ? "post-updated" : "post-sent"),
+      budget,
+    };
   } catch (err) {
     const failedAt = input.now?.() ?? new Date().toISOString();
     const error = err instanceof Error ? err.message : String(err);

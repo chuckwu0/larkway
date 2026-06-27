@@ -35,6 +35,10 @@ import { ensureStateFile, readStateFile, stateFilePathOf } from "./stateFile.js"
 import { writeCardFile, deleteCardFile } from "./cardFile.js";
 import { SurfaceController } from "./surfaceController.js";
 import { dispatchResponseSurface } from "./surfaceDispatcher.js";
+import {
+  createPostProgressHandle,
+  type PostProgressHandle,
+} from "./postProgress.js";
 import type { RuntimeEventPatch } from "./eventLog.js";
 import type { RuntimeRequirement } from "../runtimeRequirements.js";
 import {
@@ -679,6 +683,8 @@ export class BridgeHandler {
       visibleFallbackAvailable: true,
     });
     let card: import("../lark/card.js").CardHandle | undefined;
+    let progressPost: PostProgressHandle | undefined;
+    let progressPostStartFailed = false;
     if (surfaceController.shouldStartCardImmediately()) {
       try {
         card = await this.deps.cardRenderer.start(messageId, { replyInThread, threadId });
@@ -917,6 +923,65 @@ export class BridgeHandler {
         console.warn("[bridge.handler] ensureStateFile failed (continuing):", err);
       }
 
+      // Post-first response surface: when the response-surface gates are open
+      // and the controller skipped the legacy processing card, create one
+      // lightweight post as the live main surface. It is edited a few times
+      // during the turn and finally edited into the clean result. If this
+      // creation fails, fall back to the visible card path rather than leaving
+      // the operator with no surface.
+      if (!card && postOutboundAvailable && this.deps.postClient) {
+        const budget = prototypeConfig
+          ? this.responseSurfacePostBudget.reserve({
+              scope: {
+                botId: this.deps.botConfig?.id ?? "v1-default",
+                chatId: parsed.chatId,
+                threadId,
+              },
+              maxPosts: prototypeConfig.max_posts_per_window,
+              windowMs: prototypeConfig.post_window_ms,
+            })
+          : undefined;
+        if (budget?.allowed === false) {
+          console.warn("[bridge.handler] post progress budget exhausted; using card fallback");
+          progressPostStartFailed = true;
+        } else {
+          try {
+            progressPost = await createPostProgressHandle({
+              postClient: this.deps.postClient,
+              replyToMessageId: messageId,
+              replyInThread,
+              facts: {
+                botId: this.deps.botConfig?.id ?? "v1-default",
+                threadId,
+                triggerMessageId: messageId,
+              },
+              initialText: "正在处理…",
+            });
+            await this.deps.client.removeProcessingReaction?.(messageId);
+            await recordEvent({
+              status: "running",
+              startedAt: new Date().toISOString(),
+              appendPath: "已创建 post",
+              reason: "response surface 使用 post 作为本轮主回复面。",
+            });
+          } catch (err) {
+            progressPostStartFailed = true;
+            console.warn("[bridge.handler] create progress post failed; using card fallback:", err);
+          }
+        }
+      }
+
+      if (!card && progressPostStartFailed) {
+        card = await this.deps.cardRenderer.start(messageId, { replyInThread, threadId });
+        await this.deps.client.removeProcessingReaction?.(messageId);
+        await recordEvent({
+          status: "running",
+          startedAt: new Date().toISOString(),
+          appendPath: "post 失败，已创建卡片",
+          reason: "post 主面创建失败，bridge 使用可见卡片兜底。",
+        });
+      }
+
       // Step 4a-v-bis: persist a card.json handle so boot reconcile can
       //   finalize this card if the bridge crashes before card.finalize().
       //   Gated on a live card handle. Best-effort: a write failure must not
@@ -1037,6 +1102,7 @@ export class BridgeHandler {
         try {
           for await (const ev of handle.events) {
             if (card) card.handle(ev);
+            else progressPost?.handle(ev);
             if (ev.type === "system_init") {
               sessionId = ev.sessionId;
             }
@@ -1168,6 +1234,7 @@ export class BridgeHandler {
             imageBlocks: reportedState?.image_blocks,
             contentBlocks: reportedState?.content_blocks,
           };
+          await progressPost?.drain();
           const surfaceDispatch = await dispatchResponseSurface({
             state: reportedState,
             prototypeConfig,
@@ -1182,10 +1249,17 @@ export class BridgeHandler {
             worktreePath,
             baseCard: baseCardPayload,
             cardStarted: !!card,
-            postOutboundAvailable,
+            postOutboundAvailable: postOutboundAvailable && !progressPostStartFailed,
             postLedgerAvailable: true,
             visibleFallbackAvailable: true,
             postClient: this.deps.postClient,
+            livePost: progressPost
+              ? {
+                  messageId: progressPost.messageId,
+                  idempotencyKey: progressPost.idempotencyKey,
+                  role: progressPost.role,
+                }
+              : undefined,
             postBudget: prototypeConfig
               ? {
                   reserve: () =>
@@ -1330,6 +1404,23 @@ export class BridgeHandler {
       settle(false);
 
       // Best-effort failure card — swallow any finalize error
+      if (!card && progressPost) {
+        try {
+          await progressPost.finalize({
+            text: `执行失败: ${String(err)}`,
+          });
+        } catch (postFinalizeErr) {
+          console.error(
+            "[bridge.handler] progress post failure update failed; creating card fallback:",
+            postFinalizeErr,
+          );
+          try {
+            card = await this.deps.cardRenderer.start(messageId, { replyInThread, threadId });
+          } catch (cardStartErr) {
+            console.error("[bridge.handler] failure card start also failed:", cardStartErr);
+          }
+        }
+      }
       if (card) {
         try {
           await card.finalize({
