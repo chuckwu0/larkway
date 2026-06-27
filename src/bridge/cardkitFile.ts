@@ -19,8 +19,9 @@ export const CardKitFileSchema = z.object({
   sequence: z.number().int().nonnegative().default(0),
   elements: z
     .object({
-      status: z.object({ elementId: z.string().min(1) }),
-      thinking: z.object({ elementId: z.string().min(1) }),
+      status: z.object({ elementId: z.string().min(1) }).optional(),
+      thinking: z.object({ elementId: z.string().min(1) }).optional(),
+      footer: z.object({ elementId: z.string().min(1) }).optional(),
       final: z.object({ elementId: z.string().min(1) }),
     })
     .optional(),

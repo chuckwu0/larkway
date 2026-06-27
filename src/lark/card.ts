@@ -101,29 +101,6 @@ export interface CardHandle {
 // Internal helpers
 // ---------------------------------------------------------------------------
 
-/** Truncate a string representation of tool input to ≤ 60 chars. */
-function summarizeInput(input: unknown): string {
-  if (input === null || input === undefined) return "";
-  let s: string;
-  if (typeof input === "string") {
-    s = input;
-  } else if (typeof input === "object") {
-    // Pick the most representative single-value fields:
-    //   command, path, file_path, description — in priority order.
-    const obj = input as Record<string, unknown>;
-    const snippet =
-      obj["command"] ??
-      obj["path"] ??
-      obj["file_path"] ??
-      obj["description"] ??
-      null;
-    s = snippet != null ? String(snippet) : JSON.stringify(input);
-  } else {
-    s = String(input);
-  }
-  return s.length > 60 ? s.slice(0, 57) + "…" : s;
-}
-
 // ---------------------------------------------------------------------------
 // Choice buttons (V2 dynamic-choice card)
 // ---------------------------------------------------------------------------
@@ -461,7 +438,7 @@ function buildCardJson(opts: {
   } else if (opts.status === "thinking") {
     pushElement(elements, {
       tag: "markdown",
-      content: "🤔 思考中…",
+      content: "努力回答中...",
     });
   }
 
@@ -518,9 +495,9 @@ function buildCardJson(opts: {
   // with [<botName>] duplicates the identity ("Lee-QA 机器人 | [Lee-QA] ❌ 出错了").
   const statusText =
     opts.status === "thinking"
-      ? "⏳ 处理中"
+      ? "处理中"
       : opts.status === "streaming"
-        ? "🔧 处理中"
+        ? "回答中"
         : opts.status === "success"
           ? "✅ 完成"
           : "❌ 出错了";
@@ -556,23 +533,13 @@ function atMentionMarkdown(userId: string | undefined): string {
 
 interface RenderState {
   /**
-   * Accumulated assistant text.
+   * Accumulated trusted answer text.
    *
-   * Text-delta strategy: REPLACE on same message, APPEND across messages.
-   *
-   * Rationale: `--include-partial-messages` means each `assistant` event
-   * carries the FULL text of the *current* assistant turn up to that point
-   * (it's a snapshot, not a delta despite the event name). However, a single
-   * session can contain multiple assistant turns (model multi-turn). We
-   * distinguish turns by tracking the message_id buried in `raw`. If the
-   * raw record has a different message-level id, it's a new turn and we
-   * append with a double-newline. This is best-effort — if raw parsing fails
-   * we conservatively append (may duplicate within a turn, but final caller
-   * passes `finalText` to correct it).
+   * Raw runner text (`text_delta`/`internal_text`) is not operator-visible:
+   * it may contain reasoning or tool narration. Only answer-channel events may
+   * update this buffer.
    */
   textBuffer: string;
-  /** The raw message_id of the *currently accumulating* assistant turn. */
-  currentRawMsgId: string | null;
   /** Tool-use summary lines: ['🔧 Edit src/foo.tsx', ...] */
   toolStatusLines: string[];
   /** ms timestamp of the last actual PATCH call. */
@@ -595,7 +562,6 @@ class CardHandleImpl implements CardHandle {
 
   private state: RenderState = {
     textBuffer: "",
-    currentRawMsgId: null,
     toolStatusLines: [],
     lastPatchAt: 0,
     pendingPatch: null,
@@ -609,7 +575,7 @@ class CardHandleImpl implements CardHandle {
    * before its own PATCH so the finalize is guaranteed to land LAST. Tracking
    * only "the latest" is insufficient: an older retry can still be in flight
    * after a newer live patch overwrote the pointer, then land after finalize and
-   * flip the Feishu card back to 🔧 处理中.
+   * flip the Feishu card back to the in-progress render.
    */
   private livePatchesInFlight = new Set<Promise<void>>();
 
@@ -630,8 +596,9 @@ class CardHandleImpl implements CardHandle {
   handle(event: ClaudeStreamEvent): void {
     if (this.finalized) return;
 
-    this.accumulate(event);
-    this.scheduleThrottledPatch();
+    if (this.accumulate(event)) {
+      this.scheduleThrottledPatch();
+    }
   }
 
   // ── Public: finalize ─────────────────────────────────────────────────────
@@ -709,50 +676,17 @@ class CardHandleImpl implements CardHandle {
 
   // ── Private: accumulate ───────────────────────────────────────────────────
 
-  private accumulate(event: ClaudeStreamEvent): void {
-    if (event.type === "text_delta") {
-      // Extract the message-level id from the raw event to detect turn changes.
-      const rawMsgId = extractRawMessageId(event.raw);
-
-      if (rawMsgId !== null && rawMsgId !== this.state.currentRawMsgId) {
-        // New assistant turn — append with separator
-        if (this.state.textBuffer.length > 0) {
-          this.state.textBuffer += "\n\n";
-        }
-        this.state.currentRawMsgId = rawMsgId;
-        this.state.textBuffer += event.text;
-      } else {
-        // Same turn (or unidentifiable) — replace with full snapshot
-        if (this.state.currentRawMsgId === null) {
-          this.state.currentRawMsgId = rawMsgId;
-        }
-        // Replace the accumulated text for the current turn by stripping the
-        // previous turn's contribution and replacing with the new snapshot.
-        const prevTurnEnd = this.findPrevTurnEnd();
-        this.state.textBuffer =
-          this.state.textBuffer.slice(0, prevTurnEnd) + event.text;
-      }
-    } else if (event.type === "tool_use" && this.showToolSummary) {
-      const summary = summarizeInput(event.toolInput);
-      const line = summary
-        ? `🔧 ${event.toolName} ${summary}`
-        : `🔧 ${event.toolName}`;
-      this.state.toolStatusLines.push(line);
+  private accumulate(event: ClaudeStreamEvent): boolean {
+    if (event.type === "answer_delta") {
+      this.state.textBuffer += event.text;
+      return true;
+    } else if (event.type === "answer_snapshot") {
+      this.state.textBuffer = event.text;
+      return true;
     }
-    // system_init / tool_result / result / raw — no card content contribution
-  }
-
-  /**
-   * Returns the character offset in textBuffer where the CURRENT turn's text
-   * starts. If there is only one turn, returns 0.
-   */
-  private findPrevTurnEnd(): number {
-    if (!this.state.textBuffer) return 0;
-    // We always append "\n\n" between turns.
-    const sep = "\n\n";
-    const lastSep = this.state.textBuffer.lastIndexOf(sep);
-    if (lastSep === -1) return 0;
-    return lastSep + sep.length;
+    // internal_text / text_delta / tool_use / system_init / tool_result / result:
+    // no visible contribution. This keeps fallback cards aligned with CardKit.
+    return false;
   }
 
   // ── Private: throttle ────────────────────────────────────────────────────
@@ -839,26 +773,6 @@ class CardHandleImpl implements CardHandle {
     });
     await this.livePatchWithRetry(cardJsonStr);
   }
-}
-
-// ---------------------------------------------------------------------------
-// Helpers for raw message id extraction
-// ---------------------------------------------------------------------------
-
-/**
- * Try to extract a message-level id from the raw event object emitted by
- * runner.ts. The `assistant` record shape is:
- *   { type: "assistant", message: { id: "msg_xxx", content: [...] } }
- *
- * Returns null if the shape doesn't match (best-effort, no crash).
- */
-function extractRawMessageId(raw: unknown): string | null {
-  if (typeof raw !== "object" || raw === null) return null;
-  const rec = raw as Record<string, unknown>;
-  const msg = rec["message"];
-  if (typeof msg !== "object" || msg === null) return null;
-  const id = (msg as Record<string, unknown>)["id"];
-  return typeof id === "string" ? id : null;
 }
 
 /**

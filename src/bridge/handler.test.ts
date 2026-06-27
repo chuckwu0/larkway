@@ -16,6 +16,7 @@ import { buildPostContent } from "../lark/postContent.js";
 import { derivePostIdempotencyKey, digestPostContent } from "../lark/idempotency.js";
 import type { OutboundPostClient } from "../lark/outboundPostClient.js";
 import type { OutboundCardKitClient } from "../lark/channelCardKitClient.js";
+import { CardKitReplyConversionError } from "../lark/channelCardKitClient.js";
 
 // ---------------------------------------------------------------------------
 // handler.ts calls createRunner("claude").run(...) from agent/runner.
@@ -147,6 +148,7 @@ interface FinalizeArgs {
 function makeCardRenderer(rendererOpts: { failStart?: boolean; failFinalize?: boolean } = {}) {
   const finalizeArgs: FinalizeArgs[] = [];
   const startArgs: Array<{ messageId: string; replyInThread?: boolean; threadId?: string }> = [];
+  const handleForArgs: string[] = [];
   let resolveFinalized!: () => void;
   const whenFinalized = new Promise<void>((r) => {
     resolveFinalized = r;
@@ -169,8 +171,22 @@ function makeCardRenderer(rendererOpts: { failStart?: boolean; failFinalize?: bo
         },
       };
     },
+    handleFor(messageId: string) {
+      handleForArgs.push(messageId);
+      return {
+        messageId,
+        handle: () => {},
+        finalize: async (a: FinalizeArgs) => {
+          if (rendererOpts.failFinalize) {
+            throw new Error("fake card finalize failed");
+          }
+          finalizeArgs.push(a);
+          resolveFinalized();
+        },
+      };
+    },
   };
-  return { renderer, finalizeArgs, startArgs, whenFinalized };
+  return { renderer, finalizeArgs, startArgs, handleForArgs, whenFinalized };
 }
 
 /** Minimal SessionStore fake — in-memory, records put() calls. */
@@ -451,7 +467,7 @@ describe("handleOne — thin-channel finalize", () => {
       return {
         events: (async function* () {
           yield { type: "system_init", sessionId: "sess_warn", raw: {} };
-          yield { type: "text_delta", text: "我会先基于当前消息处理。" };
+          yield { type: "answer_snapshot", text: "我会先基于当前消息处理。", raw: {} };
         })(),
         done: Promise.resolve({ exitCode: 0, sessionId: "sess_warn" }),
         kill: () => {},
@@ -829,11 +845,101 @@ describe("handleOne — thin-channel finalize", () => {
     expect(postCalls).toHaveLength(0);
     expect(cardKitCalls.map((c) => c.kind)).toContain("createCard");
     expect(cardKitCalls.map((c) => c.kind)).toContain("reply");
-    expect(cardKitCalls.some((c) => c.kind === "stream" && c.elementId === "thinking_md" && c.content?.includes("🔧 Read"))).toBe(true);
+    expect(cardKitCalls.some((c) => c.kind === "stream" && c.elementId === "thinking_md")).toBe(false);
     expect(cardKitCalls.some((c) => c.kind === "stream" && c.elementId === "final_md" && c.content?.includes("CardKit 最终正文"))).toBe(true);
     const finalUpdate = cardKitCalls.find((c) => c.kind === "updateCard");
     expect(JSON.stringify(finalUpdate?.payload)).toContain("继续");
     expect(JSON.stringify(finalUpdate?.payload)).toContain("<at id=peer_test></at>");
+  });
+
+  it("adopts the already-visible CardKit reply when idConvert fails instead of creating a second card", async () => {
+    const threadId = "om_msg";
+    const finalState = {
+      status: "ready",
+      last_message: "复用已发出的占位卡",
+      updated_at: "2026-06-26T10:00:00.000Z",
+    };
+    const wt = await seedWorktree(threadId);
+    await seedRepoCachePath();
+    const calls: string[] = [];
+    const cardKitClient: OutboundCardKitClient = {
+      async createCardReply() {
+        calls.push("createCardReply");
+        throw new CardKitReplyConversionError("om_existing_cardkit");
+      },
+      async createCardEntity() {
+        throw new Error("unused");
+      },
+      async replyCardEntity() {
+        throw new Error("unused");
+      },
+      async updateCardEntity() {},
+      async streamElementContent() {},
+      async createElements() {},
+      async deleteElement() {},
+      async patchElement() {},
+      async updateElement() {},
+      async updateCardSettings() {},
+    };
+
+    runClaudeImpl = () => ({
+      events: (async function* () {
+        yield { type: "system_init", sessionId: "sess_cardkit_convert", raw: {} };
+        yield { type: "answer_snapshot", text: "answer", raw: {} };
+        await writeFile(
+          stateFileMod.stateFilePathOf(wt),
+          JSON.stringify(finalState, null, 2),
+          "utf8",
+        );
+      })(),
+      done: Promise.resolve({ exitCode: 0, sessionId: "sess_cardkit_convert" }),
+      kill: () => {},
+    });
+
+    const { renderer, startArgs, handleForArgs, finalizeArgs, whenFinalized } = makeCardRenderer();
+    const { store } = makeSessionStore();
+    const { client } = makeClient(makeEvent());
+
+    const handler = new BridgeHandler({
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      client: client as any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      cardRenderer: renderer as any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      sessionStore: store as any,
+      conventions: makeConventions(),
+      botConfig: {
+        id: "frontend",
+        name: "Frontend",
+        turn_taking_limit: 10,
+        backend: "claude",
+        response_surface_prototype: {
+          enabled: true,
+          allowed_chats: [],
+          allowed_threads: ["om_msg"],
+          lazy_card_creation: true,
+          kill_switch: false,
+          post_outbound_enabled: false,
+          cardkit_streaming_enabled: true,
+          allow_agent_mentions: true,
+          allowed_mention_open_ids: [],
+          max_posts_per_turn: 1,
+          max_posts_per_window: 4,
+          post_window_ms: 60_000,
+          max_post_attempts: 3,
+          text_threshold_chars: 900,
+        },
+      },
+      cardKitClient,
+    });
+
+    await handler.run();
+    await whenFinalized;
+
+    expect(calls).toEqual(["createCardReply"]);
+    expect(startArgs).toHaveLength(0);
+    expect(handleForArgs).toEqual(["om_existing_cardkit"]);
+    expect(finalizeArgs[0]?.finalText).toBe("复用已发出的占位卡");
   });
 
   it("falls back to a visible legacy card if CardKit finalize fails", async () => {

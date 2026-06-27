@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  cardKitReplyConversionMessageId,
   ChannelCardKitClient,
   type OutboundCardKitLarkChannel,
 } from "./channelCardKitClient.js";
@@ -150,6 +151,35 @@ describe("ChannelCardKitClient", () => {
       },
     ]);
     expect(cardThreads.get("card_message")).toBe("thread_root");
+  });
+
+  it("throws a conversion error with the visible message_id when idConvert never returns card_id", async () => {
+    const { channel, calls } = fakeChannel();
+    channel.rawClient.cardkit.v1.card.idConvert = async (payload) => {
+      calls.push({ name: "card.idConvert", payload });
+      return { data: {} };
+    };
+    const client = new ChannelCardKitClient({
+      resolveChannel: () => channel,
+      cardThreads: new Map(),
+      maxAttempts: 2,
+      baseDelayMs: 0,
+    });
+
+    let caught: unknown;
+    try {
+      await client.createCardReply!("trigger_message", { schema: "2.0" }, {
+        replyInThread: true,
+        idempotencyKey: "stable-key",
+        threadId: "thread_root",
+      });
+    } catch (err) {
+      caught = err;
+    }
+
+    expect(cardKitReplyConversionMessageId(caught)).toBe("card_message");
+    expect(calls.filter((c) => c.name === "message.reply")).toHaveLength(1);
+    expect(calls.filter((c) => c.name === "card.idConvert")).toHaveLength(2);
   });
 
   it("wraps CardKit element and settings operations with sequence and uuid", async () => {

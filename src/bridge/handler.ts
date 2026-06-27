@@ -56,7 +56,10 @@ import {
   isResponseSurfacePostOutboundAvailable,
   type ResponseSurfacePrototypeConfig,
 } from "../responseSurface.js";
-import type { OutboundCardKitClient } from "../lark/channelCardKitClient.js";
+import {
+  cardKitReplyConversionMessageId,
+  type OutboundCardKitClient,
+} from "../lark/channelCardKitClient.js";
 import type { OutboundPostClient } from "../lark/outboundPostClient.js";
 import { markPostLedgerFallbackVisible, markPostLedgerPolicyBlockedVisible } from "./postFile.js";
 import { ResponseSurfacePostBudget } from "./postBudget.js";
@@ -1029,7 +1032,7 @@ export class BridgeHandler {
               threadId,
               triggerMessageId: messageId,
             },
-            initialStatusText: "正在处理…",
+            initialStatusText: "努力回答中...",
             onSequenceCommitted: async (sequence) => {
               await updateCardKitRecord({ status: "streaming", sequence });
             },
@@ -1048,8 +1051,7 @@ export class BridgeHandler {
             idempotencyKey: cardKitProgress.idempotencyKey,
             sequence: cardKitProgress.sequence,
             elements: {
-              status: { elementId: "status_md" },
-              thinking: { elementId: "thinking_md" },
+              footer: { elementId: "footer_md" },
               final: { elementId: "final_md" },
             },
             lastVisibleFallbackMessageId: null,
@@ -1066,8 +1068,20 @@ export class BridgeHandler {
             reason: "response surface 使用 CardKit 作为本轮主回复面。",
           });
         } catch (err) {
-          cardKitStartFailed = true;
-          console.warn("[bridge.handler] create CardKit progress surface failed; using card fallback:", err);
+          const existingMessageId = cardKitReplyConversionMessageId(err);
+          if (existingMessageId) {
+            card = this.deps.cardRenderer.handleFor(existingMessageId);
+            await this.deps.client.removeProcessingReaction?.(messageId);
+            await recordEvent({
+              status: "running",
+              startedAt: new Date().toISOString(),
+              appendPath: "已收编 CardKit 占位卡",
+              reason: "CardKit idConvert 失败但占位卡已发出，bridge 复用同一张卡做可见兜底。",
+            });
+          } else {
+            cardKitStartFailed = true;
+            console.warn("[bridge.handler] create CardKit progress surface failed; using card fallback:", err);
+          }
         }
       }
 
@@ -1103,7 +1117,7 @@ export class BridgeHandler {
                 threadId,
                 triggerMessageId: messageId,
               },
-              initialText: "正在处理…",
+              initialText: "努力回答中...",
             });
             await this.deps.client.removeProcessingReaction?.(messageId);
             await recordEvent({
@@ -1275,7 +1289,7 @@ export class BridgeHandler {
 
         // Step 4d: stream events
         let sessionId: string | undefined;
-        let lastText = "";
+        let trustedAnswerText = "";
 
         try {
           for await (const ev of handle.events) {
@@ -1285,8 +1299,10 @@ export class BridgeHandler {
             if (ev.type === "system_init") {
               sessionId = ev.sessionId;
             }
-            if (ev.type === "text_delta") {
-              lastText = ev.text;
+            if (ev.type === "answer_delta") {
+              trustedAnswerText += ev.text;
+            } else if (ev.type === "answer_snapshot") {
+              trustedAnswerText = ev.text;
             }
           }
 
@@ -1378,13 +1394,17 @@ export class BridgeHandler {
 
           // reportedState is null when the bot didn't rewrite state.json this
           // turn (stale-guard above), so this falls back to the agent's fresh
-          // streamed text instead of repeating the previous reply. If there's
-          // also no fresh text (e.g. run was interrupted before any output),
+          // trusted answer-channel text instead of repeating the previous reply.
+          // If there's also no fresh answer (e.g. run was interrupted before any output),
           // show an honest prompt to retry rather than a blank/stale card.
+          const fallbackAnswer =
+            trustedAnswerText.trim() ||
+            cardKitProgress?.answerText.trim() ||
+            "";
           const cardBody =
             reportedState?.last_message ??
-            (lastText.trim()
-              ? lastText
+            (fallbackAnswer
+              ? fallbackAnswer
               : "⚠️ 本轮没有拿到 agent 的新回复(可能被中断或未更新状态),再 @ 我一次重试。");
 
           // When the agent didn't report status this turn (reportedState null,

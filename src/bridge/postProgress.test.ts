@@ -36,7 +36,7 @@ describe("createPostProgressHandle", () => {
       },
     });
 
-    handle.handle({ type: "text_delta", text: "chunk-0", raw: {} });
+    handle.handle({ type: "answer_delta", text: "chunk-0", raw: {} });
     await vi.advanceTimersByTimeAsync(1_499);
     expect(calls.filter((call) => call.kind === "update")).toHaveLength(0);
 
@@ -44,7 +44,7 @@ describe("createPostProgressHandle", () => {
     expect(calls.filter((call) => call.kind === "update")).toHaveLength(1);
 
     for (let i = 1; i <= 20; i += 1) {
-      handle.handle({ type: "text_delta", text: ` chunk-${i}`, raw: {} });
+      handle.handle({ type: "answer_delta", text: ` chunk-${i}`, raw: {} });
       await vi.advanceTimersByTimeAsync(1_500);
     }
 

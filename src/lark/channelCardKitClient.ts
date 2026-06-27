@@ -19,6 +19,24 @@ interface EmptyResult {
   data?: Record<string, never>;
 }
 
+export class CardKitReplyConversionError extends Error {
+  readonly messageId: string;
+
+  constructor(messageId: string, cause?: unknown) {
+    super(
+      "[channel.cardkit] card.idConvert returned no card_id " +
+        `(messageId=${messageId})`,
+    );
+    this.name = "CardKitReplyConversionError";
+    this.messageId = messageId;
+    this.cause = cause;
+  }
+}
+
+export function cardKitReplyConversionMessageId(err: unknown): string | undefined {
+  return err instanceof CardKitReplyConversionError ? err.messageId : undefined;
+}
+
 export interface OutboundCardKitLarkChannel {
   rawClient: {
     cardkit: {
@@ -152,6 +170,7 @@ export interface OutboundCardKitClient {
 }
 
 function isRetryable(err: unknown): boolean {
+  if (err instanceof CardKitReplyConversionError) return true;
   if (!(err instanceof Error)) return false;
   const msg = err.message.toLowerCase();
   if (msg.includes("200810")) return true;
@@ -272,19 +291,19 @@ export class ChannelCardKitClient implements OutboundCardKitClient {
     }
     const converted = await withCardKitRetry(
       "idConvert",
-      () =>
-        this.channel().rawClient.cardkit.v1.card.idConvert({
+      async () => {
+        const converted = await this.channel().rawClient.cardkit.v1.card.idConvert({
           data: { message_id: messageId },
-        }),
+        });
+        if (!converted.data?.card_id) {
+          throw new CardKitReplyConversionError(messageId);
+        }
+        return converted;
+      },
       { maxAttempts: this.maxAttempts, baseDelayMs: this.baseDelayMs },
     );
     const cardId = converted.data?.card_id;
-    if (!cardId) {
-      throw new Error(
-        "[channel.cardkit] card.idConvert returned no card_id " +
-          `(messageId=${messageId})`,
-      );
-    }
+    if (!cardId) throw new CardKitReplyConversionError(messageId);
     this.cardThreads.set(messageId, opts.threadId ?? replyToMessageId);
     return { cardId, messageId };
   }

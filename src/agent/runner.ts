@@ -17,6 +17,19 @@
 
 export type AgentStreamEvent =
   | { type: "system_init"; sessionId: string; raw: unknown }
+  /**
+   * Untrusted assistant/progress prose from the backend. This can include
+   * thinking narration, tool-adjacent notes, or final text without channel
+   * proof. UI surfaces must not render it.
+   */
+  | { type: "internal_text"; text: string; raw: unknown }
+  /**
+   * Trusted final-answer text channel. `answer_delta` appends to the visible
+   * answer buffer; `answer_snapshot` replaces it. CardKit streams only these.
+   */
+  | { type: "answer_delta"; text: string; raw: unknown; seq?: number }
+  | { type: "answer_snapshot"; text: string; raw: unknown; seq?: number }
+  /** @deprecated Backend text without answer-channel proof. Treat as internal. */
   | { type: "text_delta"; text: string; raw: unknown }
   | { type: "tool_use"; toolName: string; toolInput: unknown; raw: unknown }
   | { type: "tool_result"; raw: unknown }

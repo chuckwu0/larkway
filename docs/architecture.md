@@ -108,7 +108,7 @@
    │ (4) is_new_thread = session_store.get(thread_id) is None
    ▼
 [lark.card]
-   │ (5) 立刻发"思考中"卡片 → 拿 card_message_id
+   │ (5) 立刻发 CardKit 单卡占位: "努力回答中..." → 拿 card_message_id
    ▼
 [claude.prompt]
    │ (6) 拼 thread-context prompt:
@@ -134,17 +134,18 @@
    │
    │ stream-json (NDJSON) 逐事件输出:
    │   - system_init  (含 session_id)        ──┐
-   │   - assistant message (text deltas)      │
-   │   - assistant message (tool_use)         │
+   │   - assistant message (internal text)    │
+   │   - assistant message (answer channel)   │
+   │   - assistant message (tool_use, hidden) │
    │   - tool_result (压缩,可丢)              │
    │   - assistant message (final text)       │
    │   - result (stop_reason)                ──┘
    │
    ▼ (8) runner 解析每行
 [lark.card]
-   │ (9) 节流(1.5s)PATCH 飞书卡片:
-   │     - text 增量 → markdown 渲染累积
-   │     - tool_use → 状态行(🔧 Edit src/foo.tsx)
+   │ (9) PATCH 同一张 CardKit 卡片:
+   │     - answer channel → final_md 真流式累积
+   │     - internal text / tool_use / tool_result → 不渲染到卡片
    ▼
 [session.store]
    │ (10) 子进程结束 → 持久化 session_id

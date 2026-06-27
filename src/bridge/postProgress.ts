@@ -7,7 +7,7 @@ import {
 import { buildPostContent, type PostMentionTarget } from "../lark/postContent.js";
 import type { OutboundPostClient } from "../lark/outboundPostClient.js";
 
-const DEFAULT_PLACEHOLDER_TEXT = "正在处理…";
+const DEFAULT_PLACEHOLDER_TEXT = "努力回答中...";
 // Feishu post edits replace the whole rich text message and each message can
 // be edited at most 20 times. Keep progress chunked enough to feel live while
 // reserving budget for finalization and cleanup/fallback edits.
@@ -83,8 +83,13 @@ class LivePostProgressHandle implements PostProgressHandle {
 
   handle(event: AgentStreamEvent): void {
     if (this.closed) return;
-    if (event.type !== "text_delta") return;
-    this.textBuffer += event.text;
+    if (event.type === "answer_delta") {
+      this.textBuffer += event.text;
+    } else if (event.type === "answer_snapshot") {
+      this.textBuffer = event.text;
+    } else {
+      return;
+    }
     this.schedulePatch();
   }
 

@@ -14,6 +14,7 @@
 import { readFileSync } from "node:fs";
 import type { ParsedMessage } from "../lark/message.js";
 import { deriveTriggerFacts } from "../agent/triggerFacts.js";
+import { ANSWER_BEGIN_MARKER, ANSWER_END_MARKER } from "../agent/answerChannel.js";
 
 /** Memory category files watched for the over-size hint (D9). */
 const MEMORY_CATEGORY_FILE_NAMES = [
@@ -231,11 +232,16 @@ function renderStateContract(stateFilePath?: string): string[] {
   return [
     "<state-contract>",
     "你和运营之间的界面是飞书话题里的 response surface,这是一个 thin-channel 外壳:",
-    "- 默认主回复面是 post/RichText:bridge 起手发一条轻量“正在处理…”post,执行中用分块级原地编辑模拟流式输出,结束时编辑成干净终稿。",
-    "- 卡片是例外补充面,只在需要离散选择/按钮(`choices`)或 post 表达不了的结构化内容(`content_blocks`/`image_blocks`,例如图片组、验收清单、dev 预览)时才补一张。",
-    "- bridge 负责创建/编辑 post、必要时创建/更新飞书卡片、节流、渲染正文、把 choices 转成按钮并把点击值回传给你。",
+    "- 默认主回复面是一张 CardKit 流式卡片:bridge 起手只显示一行“努力回答中...”,答案通道一产出就逐 token 流入同一张卡,完成后收敛成干净总结卡。",
+    "- 运行中绝不展示思考、工具详情、进度 list、本地路径或原始 runner text_delta;这些都属于内部通道。",
     "- 你负责把最终给运营看的正文、状态、下一步问题、是否需要 choices/结构化卡片写进 state.json。",
     `你不直接发/编辑 bridge 管理的 post 或卡片;你只写 ${stateTarget},bridge 读它来做安全渲染。`,
+    "",
+    "答案流通道:",
+    `- 只有真正要给用户看的答案正文,才包在独立行 marker 之间输出到 stdout: \`${ANSWER_BEGIN_MARKER}\` 到 \`${ANSWER_END_MARKER}\`。`,
+    "- marker 外的叙述、计划、工具说明、内部分析都会被 bridge 当作 internal_text,不会进入卡片。",
+    "- 当最终答案还没准备好时可以不输出答案 marker;卡片只保持“努力回答中...”。一旦开始输出答案 marker 内正文,bridge 会立即流式展示。",
+    "- 每轮结束前仍必须写 state.json;最终数据以 state.json 的 last_message/content_blocks/choices 等为准,答案流只是运行中可见的低延迟正文通道。",
     "**完成本次响应前必须**根据当前实际状态更新这个文件(原子写:写 .tmp 再 mv)。",
     "",
     "你能写的字段:",
@@ -257,8 +263,8 @@ function renderStateContract(stateFilePath?: string): string[] {
     "挂着不退出 = 话题永远卡在「正在处理…」)。",
     "",
     "卡片展示原则:",
-    "- 运行中主面是 post,bridge 通过整条富文本替换做分块刷新;它不是逐字 token streaming,不要依赖工具流/日志表达业务阶段。",
-    "- 最终 post 以你的 `last_message` 为主;若写了 `choices`、`content_blocks` 或 `image_blocks`,bridge 会在 post 之后补卡片承载这些能力。",
+    "- 运行中主面是 CardKit 真流式卡片;不要依赖工具流/日志表达业务阶段,它们不会显示。",
+    "- 最终卡片以你的 `last_message` 为主;若写了 `choices`、`content_blocks` 或 `image_blocks`,bridge 会在同一张最终卡片承载这些能力。",
     "- 不要依赖 bridge 从输出里解析业务阶段、MR、预览地址或下一步动作;需要展示的内容你自己写进 last_message。",
     "- 不要求固定格式。根据任务选择最清楚的表达:短结论、分点、表格、链接、下一步问题都可以。",
     "- 如果本轮涉及 repo / 代码 / 文档修改,last_message 应包含足够让运营验收的证据,例如你实际使用的 workspace/repo、关键 diff 或链接、运行过的测试/检查命令和结果。具体证据由任务决定;dogfood E2E 的严格清单只在 dogfood guide 中要求。",

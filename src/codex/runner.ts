@@ -23,6 +23,7 @@ import {
   type RunOptions,
   type RunHandle,
 } from "../agent/runner.js";
+import { splitAnswerChannelText } from "../agent/answerChannel.js";
 
 // ---------------------------------------------------------------------------
 // Internal constants
@@ -205,9 +206,8 @@ export function buildCodexCommand(
  *     → {type:"tool_result", raw}
  *
  *   {"type":"item.completed","item":{"type":"agent_message","text":"..."}}
- *     → {type:"text_delta", text: item.text, raw}
- *     Note: agent_message.text is the *full* turn text (not a delta), but
- *     downstream card accumulation is fine with receiving it as one chunk.
+ *     → internal_text by default, or answer_snapshot if the text contains the
+ *       explicit LARKWAY_ANSWER_BEGIN / LARKWAY_ANSWER_END markers.
  *
  *   {"type":"turn.completed","usage":{...}}
  *     → {type:"result", stopReason:"end_turn", raw}
@@ -270,7 +270,7 @@ export function* parseCodexLine(line: string): Generator<AgentStreamEvent> {
     return;
   }
 
-  // ── item.completed → tool_result | text_delta ───────────────────────────
+  // ── item.completed → tool_result | internal_text | answer_snapshot ──────
   if (topType === "item.completed") {
     const item = record["item"];
     if (typeof item === "object" && item !== null) {
@@ -285,7 +285,7 @@ export function* parseCodexLine(line: string): Generator<AgentStreamEvent> {
         itemRecord["type"] === "agent_message" &&
         typeof itemRecord["text"] === "string"
       ) {
-        yield { type: "text_delta", text: itemRecord["text"], raw: obj };
+        yield* splitAnswerChannelText(itemRecord["text"], obj);
         return;
       }
     }

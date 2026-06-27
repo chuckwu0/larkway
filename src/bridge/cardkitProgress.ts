@@ -7,20 +7,19 @@ import {
   buildCardKitFinalCard,
   buildCardKitFinalMarkdown,
   buildCardKitInitialCard,
-  buildCardKitProgressMarkdown,
   CARDKIT_FINAL_ELEMENT_ID,
-  summarizeCardKitToolInput,
   type BuildCardKitFinalCardOpts,
 } from "../lark/cardkitSurface.js";
 
-const DEFAULT_PATCH_INTERVAL_MS = 1_000;
-const DEFAULT_MAX_PROGRESS_UPDATES = 20;
+const DEFAULT_PATCH_INTERVAL_MS = 250;
+const DEFAULT_MAX_PROGRESS_UPDATES = 240;
 
 export interface CardKitProgressHandle {
   cardId: string;
   messageId: string;
   idempotencyKey: string;
   sequence: number;
+  answerText: string;
   handle(event: AgentStreamEvent): void;
   drain(): Promise<void>;
   finalize(opts: BuildCardKitFinalCardOpts): Promise<void>;
@@ -61,8 +60,7 @@ class LiveCardKitProgressHandle implements CardKitProgressHandle {
   private readonly patchIntervalMs: number;
   private readonly maxProgressUpdates: number;
   private readonly onSequenceCommitted?: (sequence: number) => Promise<void>;
-  private readonly statusLines: string[] = [];
-  private readonly toolLines: string[] = [];
+  private answerBuffer = "";
   private pendingPatch: ReturnType<typeof setTimeout> | null = null;
   private inFlight: Promise<void> = Promise.resolve();
   private closed = false;
@@ -76,7 +74,6 @@ class LiveCardKitProgressHandle implements CardKitProgressHandle {
     idempotencyKey: string;
     patchIntervalMs: number;
     maxProgressUpdates: number;
-    initialStatusText: string;
     onSequenceCommitted?: (sequence: number) => Promise<void>;
   }) {
     this.cardKitClient = opts.cardKitClient;
@@ -86,19 +83,21 @@ class LiveCardKitProgressHandle implements CardKitProgressHandle {
     this.patchIntervalMs = opts.patchIntervalMs;
     this.maxProgressUpdates = opts.maxProgressUpdates;
     this.onSequenceCommitted = opts.onSequenceCommitted;
-    this.statusLines.push(opts.initialStatusText);
+  }
+
+  get answerText(): string {
+    return this.answerBuffer;
   }
 
   handle(event: AgentStreamEvent): void {
     if (this.closed) return;
-    if (event.type === "system_init") {
-      this.statusLines.push("本地 agent 已启动。");
+    if (event.type === "answer_delta") {
+      this.answerBuffer += event.text;
       this.schedulePatch();
       return;
     }
-    if (event.type === "tool_use") {
-      const summary = summarizeCardKitToolInput(event.toolInput);
-      this.toolLines.push(`🔧 ${event.toolName}${summary ? ` ${summary}` : ""}`);
+    if (event.type === "answer_snapshot") {
+      this.answerBuffer = event.text;
       this.schedulePatch();
     }
   }
@@ -116,17 +115,20 @@ class LiveCardKitProgressHandle implements CardKitProgressHandle {
     await this.drain();
     this.closed = true;
     const finalMarkdown = buildCardKitFinalMarkdown(opts);
-    await this.next((sequence) =>
-      this.cardKitClient.streamElementContent(
-        this.cardId,
-        CARDKIT_FINAL_ELEMENT_ID,
-        finalMarkdown,
-        {
-          sequence,
-          uuid: sequenceUuid(this.cardId, "final-content", sequence),
-        },
-      ),
-    );
+    if (finalMarkdown !== this.answerBuffer) {
+      await this.next((sequence) =>
+        this.cardKitClient.streamElementContent(
+          this.cardId,
+          CARDKIT_FINAL_ELEMENT_ID,
+          finalMarkdown,
+          {
+            sequence,
+            uuid: sequenceUuid(this.cardId, "final-content", sequence),
+          },
+        ),
+      );
+      this.answerBuffer = finalMarkdown;
+    }
     await this.next((sequence) =>
       this.cardKitClient.updateCardEntity(this.cardId, buildCardKitFinalCard(opts), {
         sequence,
@@ -169,17 +171,14 @@ class LiveCardKitProgressHandle implements CardKitProgressHandle {
 
   private async patchProgress(): Promise<void> {
     if (this.closed || this.progressUpdates >= this.maxProgressUpdates) return;
-    const content = buildCardKitProgressMarkdown({
-      statusLines: this.statusLines,
-      toolLines: this.toolLines,
-    });
+    if (!this.answerBuffer) return;
     this.progressUpdates += 1;
     this.inFlight = this.inFlight
       .then(() =>
         this.next((sequence) =>
-          this.cardKitClient.streamElementContent(this.cardId, "thinking_md", content, {
+          this.cardKitClient.streamElementContent(this.cardId, CARDKIT_FINAL_ELEMENT_ID, this.answerBuffer, {
             sequence,
-            uuid: sequenceUuid(this.cardId, "thinking", sequence),
+            uuid: sequenceUuid(this.cardId, "answer", sequence),
           }),
         ),
       )
@@ -200,8 +199,8 @@ export async function createCardKitProgressHandle(
   opts: CreateCardKitProgressHandleOpts,
 ): Promise<CardKitProgressHandle> {
   const key = idempotencyKey(opts.facts);
-  const initialStatusText = opts.initialStatusText ?? "正在处理…";
-  const initialCard = buildCardKitInitialCard({ statusText: initialStatusText });
+  const initialStatusText = opts.initialStatusText ?? "努力回答中...";
+  const initialCard = buildCardKitInitialCard({ footerText: initialStatusText });
   const created = opts.cardKitClient.createCardReply
     ? await opts.cardKitClient.createCardReply(
         opts.replyToMessageId,
@@ -232,7 +231,6 @@ export async function createCardKitProgressHandle(
     idempotencyKey: key,
     patchIntervalMs: opts.patchIntervalMs ?? DEFAULT_PATCH_INTERVAL_MS,
     maxProgressUpdates: opts.maxProgressUpdates ?? DEFAULT_MAX_PROGRESS_UPDATES,
-    initialStatusText,
     onSequenceCommitted: opts.onSequenceCommitted,
   });
 }

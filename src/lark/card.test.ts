@@ -172,13 +172,13 @@ describe("CardRenderer.start() — replyInThread (Phase 4)", () => {
 });
 
 // ---------------------------------------------------------------------------
-// Direct buildCardJson tests — regression guard for V1 thinking/streaming
-// emoji strings (covered the success/failure branches above; these cover
-// the intermediate states that only ever fire during livePatch).
+// Direct buildCardJson tests — regression guard for V1 fallback running states
+// (covered the success/failure branches above; these cover the intermediate
+// states that only ever fire during livePatch).
 // ---------------------------------------------------------------------------
 
-describe("buildCardJson — thinking/streaming emoji (regression guard)", () => {
-  it("thinking title is '⏳ 处理中' (status=thinking)", async () => {
+describe("buildCardJson — thinking/streaming fallback copy", () => {
+  it("thinking title is neutral and body uses the single placeholder", async () => {
     const { _buildCardJson } = await import("./card.js");
     const jsonStr = _buildCardJson({
       bodyText: "",
@@ -187,10 +187,12 @@ describe("buildCardJson — thinking/streaming emoji (regression guard)", () => 
       status: "thinking",
     });
     const card = JSON.parse(jsonStr) as CardJson;
-    expect(card.header.title.content).toBe("⏳ 处理中");
+    expect(card.header.title.content).toBe("处理中");
+    expect(JSON.stringify(card)).toContain("努力回答中...");
+    expect(JSON.stringify(card)).not.toContain("思考中");
   });
 
-  it("streaming title is '🔧 处理中' (status=streaming)", async () => {
+  it("streaming title is answer-oriented instead of tool-oriented", async () => {
     const { _buildCardJson } = await import("./card.js");
     const jsonStr = _buildCardJson({
       bodyText: "partial text being streamed",
@@ -199,7 +201,7 @@ describe("buildCardJson — thinking/streaming emoji (regression guard)", () => 
       status: "streaming",
     });
     const card = JSON.parse(jsonStr) as CardJson;
-    expect(card.header.title.content).toBe("🔧 处理中");
+    expect(card.header.title.content).toBe("回答中");
   });
 });
 
@@ -338,7 +340,7 @@ describe("buildChoiceRow / dynamic choice card (V2)", () => {
     const renderer = new CardRenderer({ outbound: fake, patchIntervalMs: 0, botName: "Frontend" });
     const handle = await renderer.start("om_user_msg");
 
-    handle.handle({ type: "text_delta", text: "streaming…", raw: {} });
+    handle.handle({ type: "answer_delta", text: "streaming…", raw: {} });
     await new Promise<void>((r) => setTimeout(r, 0));
 
     // Every live patch so far must be choice-free — doLivePatch passes no choices.
@@ -692,7 +694,7 @@ describe("CardRenderer — injected OutboundCardClient (throttle + finalize)", (
 
     // Fire many handle() events within the same interval window.
     for (let i = 0; i < 20; i++) {
-      handle.handle({ type: "text_delta", text: `chunk ${i}`, raw: {} });
+      handle.handle({ type: "answer_delta", text: `chunk ${i}`, raw: {} });
     }
     // Let the leading immediate patch's promise settle.
     await new Promise<void>((r) => setTimeout(r, 0));
@@ -787,7 +789,7 @@ describe("CardRenderer — injected OutboundCardClient (throttle + finalize)", (
 // ---------------------------------------------------------------------------
 // Issue #3: finalize must land LAST — a still-in-flight (slow/retrying) live
 // PATCH must not arrive AFTER finalize and overwrite the ✅ ready card back to
-// 🔧 处理中.
+// the in-progress render.
 // ---------------------------------------------------------------------------
 
 describe("CardRenderer — finalize lands after in-flight live PATCH (issue #3)", () => {
@@ -816,7 +818,7 @@ describe("CardRenderer — finalize lands after in-flight live PATCH (issue #3)"
     });
     const handle = await renderer.start("om_user_msg");
     // Fire a live PATCH (immediate), then finalize while it's still in its 50ms delay.
-    handle.handle({ type: "text_delta", text: "干活中…", raw: {} });
+    handle.handle({ type: "answer_delta", text: "干活中…", raw: {} });
     await handle.finalize({ success: true });
     // Without the fix, the slow live PATCH would land AFTER finalize → last="live"
     // (ready overwritten back to 处理中). With finalize awaiting the in-flight
@@ -854,8 +856,8 @@ describe("CardRenderer — finalize lands after in-flight live PATCH (issue #3)"
     });
     const handle = await renderer.start("om_user_msg");
 
-    handle.handle({ type: "text_delta", text: "第一段进度…", raw: {} });
-    handle.handle({ type: "text_delta", text: "第二段进度…", raw: {} });
+    handle.handle({ type: "answer_delta", text: "第一段进度…", raw: {} });
+    handle.handle({ type: "answer_delta", text: "第二段进度…", raw: {} });
     await handle.finalize({ success: true });
 
     expect(landed).toEqual(["live2", "live1", "final"]);

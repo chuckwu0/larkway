@@ -56,6 +56,14 @@ const FIXTURE_ITEM_COMPLETED_AGENT_MESSAGE = JSON.stringify({
   },
 });
 
+const FIXTURE_ITEM_COMPLETED_AGENT_ANSWER = JSON.stringify({
+  type: "item.completed",
+  item: {
+    type: "agent_message",
+    text: "LARKWAY_ANSWER_BEGIN\nI found the following files in the directory.\nLARKWAY_ANSWER_END",
+  },
+});
+
 const FIXTURE_TURN_COMPLETED = JSON.stringify({
   type: "turn.completed",
   usage: { input_tokens: 100, output_tokens: 50 },
@@ -119,11 +127,20 @@ describe("parseCodexLine", () => {
     expect(events[0]!.type).toBe("tool_result");
   });
 
-  it("item.completed agent_message → text_delta with full text", () => {
+  it("item.completed agent_message without answer marker → internal_text", () => {
     const events = [...parseCodexLine(FIXTURE_ITEM_COMPLETED_AGENT_MESSAGE)];
     expect(events).toHaveLength(1);
     expect(events[0]).toMatchObject({
-      type: "text_delta",
+      type: "internal_text",
+      text: "I found the following files in the directory.",
+    });
+  });
+
+  it("item.completed agent_message with answer marker → answer_snapshot", () => {
+    const events = [...parseCodexLine(FIXTURE_ITEM_COMPLETED_AGENT_ANSWER)];
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({
+      type: "answer_snapshot",
       text: "I found the following files in the directory.",
     });
   });
@@ -479,7 +496,7 @@ describe("runCodex() — spawn-level integration", () => {
       fake.stdout.write(FIXTURE_TURN_STARTED + "\n");
       fake.stdout.write(FIXTURE_ITEM_STARTED_CMD + "\n");
       fake.stdout.write(FIXTURE_ITEM_COMPLETED_CMD + "\n");
-      fake.stdout.write(FIXTURE_ITEM_COMPLETED_AGENT_MESSAGE + "\n");
+      fake.stdout.write(FIXTURE_ITEM_COMPLETED_AGENT_ANSWER + "\n");
       fake.stdout.write(FIXTURE_TURN_COMPLETED + "\n");
       fake.stdout.end();
       fake.child.emit("exit", 0);
@@ -500,7 +517,7 @@ describe("runCodex() — spawn-level integration", () => {
     expect(types).toContain("raw"); // turn.started → raw
     expect(types).toContain("tool_use");
     expect(types).toContain("tool_result");
-    expect(types).toContain("text_delta");
+    expect(types).toContain("answer_snapshot");
     expect(types).toContain("result");
 
     // Validate specific events
@@ -510,8 +527,8 @@ describe("runCodex() — spawn-level integration", () => {
     const toolUse = events.find((e) => e["type"] === "tool_use");
     expect(toolUse).toMatchObject({ toolName: "shell", toolInput: { command: "ls -la" } });
 
-    const textDelta = events.find((e) => e["type"] === "text_delta");
-    expect(textDelta).toMatchObject({
+    const answerSnapshot = events.find((e) => e["type"] === "answer_snapshot");
+    expect(answerSnapshot).toMatchObject({
       text: "I found the following files in the directory.",
     });
 
