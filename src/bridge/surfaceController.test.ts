@@ -8,6 +8,7 @@ const allowlistedConfig = {
   lazy_card_creation: true,
   kill_switch: false,
   post_outbound_enabled: false,
+  cardkit_streaming_enabled: false,
   allow_agent_mentions: true,
   allowed_mention_open_ids: [],
   max_posts_per_turn: 1,
@@ -20,6 +21,7 @@ const allowlistedConfig = {
 const postEnabledConfig = {
   ...allowlistedConfig,
   post_outbound_enabled: true,
+  cardkit_streaming_enabled: false,
 };
 
 describe("SurfaceController", () => {
@@ -32,6 +34,7 @@ describe("SurfaceController", () => {
         lazy_card_creation: false,
         kill_switch: false,
         post_outbound_enabled: false,
+  cardkit_streaming_enabled: false,
         allow_agent_mentions: true,
         allowed_mention_open_ids: [],
         max_posts_per_turn: 1,

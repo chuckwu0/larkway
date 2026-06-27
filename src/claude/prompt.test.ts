@@ -95,7 +95,7 @@ describe("renderPrompt — V2 mode (botName set)", () => {
     expect(prompt).toContain("content_blocks");
     expect(prompt).toContain("response_surface");
     expect(prompt).toContain("默认主回复面是 post/RichText");
-    expect(prompt).toContain("无显式 card 意图时 bridge 按 post-first 处理");
+    expect(prompt).toContain("无显式 card 意图时 bridge 按 CardKit 流式卡片处理");
     expect(prompt).toContain("不要写 raw Feishu post/card JSON");
     expect(prompt).toContain("markdown -> image -> markdown -> image");
     expect(prompt).toContain("若 `content_blocks` 非空");

@@ -2,8 +2,10 @@ import { describe, expect, it } from "vitest";
 import {
   defaultResponseSurfacePrototypeConfig,
   isResponseSurfaceMentionAllowed,
+  isResponseSurfaceCardKitAvailable,
   isResponseSurfacePostOutboundAvailable,
   isResponseSurfacePrototypeAllowlisted,
+  shouldProvideResponseSurfaceCardKitClient,
   shouldProvideResponseSurfacePostClient,
 } from "./responseSurface.js";
 
@@ -14,12 +16,13 @@ const enabledConfig = {
 };
 
 describe("response surface production gates", () => {
-  it("enables post surfaces and agent-authored mentions by default", () => {
+  it("enables CardKit surfaces and agent-authored mentions by default", () => {
     const cfg = defaultResponseSurfacePrototypeConfig();
 
     expect(cfg).toMatchObject({
       enabled: true,
       post_outbound_enabled: true,
+      cardkit_streaming_enabled: true,
       kill_switch: false,
       allow_agent_mentions: true,
       allowed_chats: [],
@@ -31,6 +34,10 @@ describe("response surface production gates", () => {
     });
     expect(isResponseSurfacePrototypeAllowlisted(cfg, { chatId: "any_chat", threadId: "any_thread" }))
       .toBe(true);
+    expect(shouldProvideResponseSurfaceCardKitClient(cfg)).toBe(true);
+    expect(isResponseSurfaceCardKitAvailable(cfg, { chatId: "any_chat", threadId: "any_thread" }, {
+      cardKitClientAvailable: true,
+    })).toBe(true);
     expect(shouldProvideResponseSurfacePostClient(cfg)).toBe(true);
     expect(isResponseSurfaceMentionAllowed(cfg, "peer_bot")).toBe(true);
     expect(isResponseSurfaceMentionAllowed(cfg, "all")).toBe(false);

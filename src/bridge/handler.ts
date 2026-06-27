@@ -33,6 +33,15 @@ import { ensureSessionArtifacts } from "../agent/sessionArtifacts.js";
 import { ensureAgentWorkspace } from "../agent/workspaceStore.js";
 import { ensureStateFile, readStateFile, stateFilePathOf } from "./stateFile.js";
 import { writeCardFile, deleteCardFile } from "./cardFile.js";
+import {
+  writeCardKitFile,
+  deleteCardKitFile,
+  type CardKitFile,
+} from "./cardkitFile.js";
+import {
+  createCardKitProgressHandle,
+  type CardKitProgressHandle,
+} from "./cardkitProgress.js";
 import { SurfaceController } from "./surfaceController.js";
 import { dispatchResponseSurface } from "./surfaceDispatcher.js";
 import {
@@ -42,12 +51,17 @@ import {
 import type { RuntimeEventPatch } from "./eventLog.js";
 import type { RuntimeRequirement } from "../runtimeRequirements.js";
 import {
+  isResponseSurfaceCardKitAvailable,
+  isResponseSurfaceMentionAllowed,
   isResponseSurfacePostOutboundAvailable,
   type ResponseSurfacePrototypeConfig,
 } from "../responseSurface.js";
+import type { OutboundCardKitClient } from "../lark/channelCardKitClient.js";
 import type { OutboundPostClient } from "../lark/outboundPostClient.js";
 import { markPostLedgerFallbackVisible, markPostLedgerPolicyBlockedVisible } from "./postFile.js";
 import { ResponseSurfacePostBudget } from "./postBudget.js";
+import { buildPostContent } from "../lark/postContent.js";
+import { derivePostIdempotencyKey, digestPostContent } from "../lark/idempotency.js";
 
 // ---------------------------------------------------------------------------
 // Private helpers — worktree bootstrap
@@ -383,6 +397,56 @@ function execFile(
   });
 }
 
+async function createOnlyPostFallback(opts: {
+  postClient?: OutboundPostClient;
+  replyToMessageId: string;
+  replyInThread: boolean;
+  botId: string;
+  threadId: string;
+  triggerMessageId: string;
+  finalText: string;
+  failureReason: string;
+  title?: string;
+  logPrefix: string;
+}): Promise<{ messageId: string; idempotencyKey: string } | null> {
+  if (!opts.postClient) {
+    console.error(`${opts.logPrefix} create-only post fallback unavailable: no postClient`);
+    return null;
+  }
+
+  const text = [
+    opts.finalText.trim() || "执行结果无法通过卡片展示。",
+    "",
+    `fallback_reason: ${opts.failureReason}`,
+  ].join("\n");
+  const content = buildPostContent({
+    text,
+    title: opts.title ?? "Larkway fallback",
+  });
+  const idempotencyKey = derivePostIdempotencyKey({
+    botId: opts.botId,
+    threadId: opts.threadId,
+    triggerMessageId: opts.triggerMessageId,
+    role: "fallback",
+    logicalIndex: 0,
+    contentDigest: digestPostContent(content),
+  });
+
+  try {
+    const sent = await opts.postClient.createPostReply(opts.replyToMessageId, content, {
+      replyInThread: opts.replyInThread,
+      idempotencyKey,
+    });
+    console.warn(
+      `${opts.logPrefix} create-only post fallback sent as ${sent.messageId}`,
+    );
+    return { messageId: sent.messageId, idempotencyKey };
+  } catch (err) {
+    console.error(`${opts.logPrefix} create-only post fallback failed:`, err);
+    return null;
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Public types
 // ---------------------------------------------------------------------------
@@ -479,6 +543,12 @@ export interface BridgeHandlerDeps {
    * available.
    */
   postClient?: OutboundPostClient;
+  /**
+   * Optional CardKit streaming transport. When configured and allowlisted, this
+   * becomes the default response surface; legacy cards remain the visible
+   * fallback.
+   */
+  cardKitClient?: OutboundCardKitClient;
   /**
    * V2: L2 Agent Memory content (职能定义) — loaded from the bot's memory_file by
    * botLoader. Injected into the prompt as a `<agent-memory>` role preamble.
@@ -674,18 +744,26 @@ export class BridgeHandler {
       { chatId: parsed.chatId, threadId },
       { postClientAvailable: !!this.deps.postClient },
     );
+    const cardKitAvailable = isResponseSurfaceCardKitAvailable(
+      prototypeConfig,
+      { chatId: parsed.chatId, threadId },
+      { cardKitClientAvailable: !!this.deps.cardKitClient },
+    );
     const surfaceController = SurfaceController.create({
       prototypeConfig,
       chatId: parsed.chatId,
       threadId,
-      postOutboundAvailable,
+      postOutboundAvailable: false,
       postLedgerAvailable: true,
       visibleFallbackAvailable: true,
     });
     let card: import("../lark/card.js").CardHandle | undefined;
+    let cardKitProgress: CardKitProgressHandle | undefined;
+    let cardKitRecord: CardKitFile | undefined;
+    let cardKitStartFailed = false;
     let progressPost: PostProgressHandle | undefined;
     let progressPostStartFailed = false;
-    if (surfaceController.shouldStartCardImmediately()) {
+    if (!cardKitAvailable && surfaceController.shouldStartCardImmediately()) {
       try {
         card = await this.deps.cardRenderer.start(messageId, { replyInThread, threadId });
         await recordEvent({
@@ -923,13 +1001,83 @@ export class BridgeHandler {
         console.warn("[bridge.handler] ensureStateFile failed (continuing):", err);
       }
 
+      const updateCardKitRecord = async (
+        patch: Partial<CardKitFile> & Pick<CardKitFile, "status" | "sequence">,
+      ): Promise<void> => {
+        if (!cardKitRecord) return;
+        cardKitRecord = {
+          ...cardKitRecord,
+          ...patch,
+          updatedAt: new Date().toISOString(),
+        };
+        await writeCardKitFile(worktreePath, cardKitRecord);
+      };
+
+      // CardKit response surface: default main surface when the transport and
+      // rollout gates are available. It streams bounded progress into a
+      // thinking area during execution, then replaces the card entity with a
+      // clean final answer + interaction surface. Any failure here falls back
+      // to the legacy visible card path before the agent starts.
+      if (!card && cardKitAvailable && this.deps.cardKitClient) {
+        try {
+          cardKitProgress = await createCardKitProgressHandle({
+            cardKitClient: this.deps.cardKitClient,
+            replyToMessageId: messageId,
+            replyInThread,
+            facts: {
+              botId: this.deps.botConfig?.id ?? "v1-default",
+              threadId,
+              triggerMessageId: messageId,
+            },
+            initialStatusText: "正在处理…",
+            onSequenceCommitted: async (sequence) => {
+              await updateCardKitRecord({ status: "streaming", sequence });
+            },
+          });
+          cardKitRecord = {
+            surface: "cardkit_stream",
+            status: "message_sent",
+            cardId: cardKitProgress.cardId,
+            messageId: cardKitProgress.messageId,
+            replyToMessageId: messageId,
+            chatId: parsed.chatId,
+            threadId,
+            botId: this.deps.botConfig?.id ?? "",
+            larkCliProfile: this.deps.larkCliProfile,
+            replyInThread,
+            idempotencyKey: cardKitProgress.idempotencyKey,
+            sequence: cardKitProgress.sequence,
+            elements: {
+              status: { elementId: "status_md" },
+              thinking: { elementId: "thinking_md" },
+              final: { elementId: "final_md" },
+            },
+            lastVisibleFallbackMessageId: null,
+            retryCount: 0,
+            createdAt: new Date().toISOString(),
+            updatedAt: new Date().toISOString(),
+          };
+          await writeCardKitFile(worktreePath, cardKitRecord);
+          await this.deps.client.removeProcessingReaction?.(messageId);
+          await recordEvent({
+            status: "running",
+            startedAt: new Date().toISOString(),
+            appendPath: "已创建 CardKit 流式卡片",
+            reason: "response surface 使用 CardKit 作为本轮主回复面。",
+          });
+        } catch (err) {
+          cardKitStartFailed = true;
+          console.warn("[bridge.handler] create CardKit progress surface failed; using card fallback:", err);
+        }
+      }
+
       // Post-first response surface: when the response-surface gates are open
       // and the controller skipped the legacy processing card, create one
       // lightweight post as the live main surface. It is edited a few times
       // during the turn and finally edited into the clean result. If this
       // creation fails, fall back to the visible card path rather than leaving
       // the operator with no surface.
-      if (!card && postOutboundAvailable && this.deps.postClient) {
+      if (!card && !cardKitAvailable && postOutboundAvailable && this.deps.postClient) {
         const budget = prototypeConfig
           ? this.responseSurfacePostBudget.reserve({
               scope: {
@@ -971,15 +1119,45 @@ export class BridgeHandler {
         }
       }
 
-      if (!card && progressPostStartFailed) {
-        card = await this.deps.cardRenderer.start(messageId, { replyInThread, threadId });
-        await this.deps.client.removeProcessingReaction?.(messageId);
-        await recordEvent({
-          status: "running",
-          startedAt: new Date().toISOString(),
-          appendPath: "post 失败，已创建卡片",
-          reason: "post 主面创建失败，bridge 使用可见卡片兜底。",
-        });
+      if (!card && (progressPostStartFailed || cardKitStartFailed)) {
+        try {
+          card = await this.deps.cardRenderer.start(messageId, { replyInThread, threadId });
+          await this.deps.client.removeProcessingReaction?.(messageId);
+          await recordEvent({
+            status: "running",
+            startedAt: new Date().toISOString(),
+            appendPath: cardKitStartFailed ? "CardKit 失败，已创建卡片" : "post 失败，已创建卡片",
+            reason: cardKitStartFailed
+              ? "CardKit 主面创建失败，bridge 使用可见卡片兜底。"
+              : "post 主面创建失败，bridge 使用可见卡片兜底。",
+          });
+        } catch (err) {
+          console.error(
+            "[bridge.handler] visible card fallback start failed after primary surface start failure:",
+            err,
+          );
+          await createOnlyPostFallback({
+            postClient: this.deps.postClient,
+            replyToMessageId: messageId,
+            replyInThread,
+            botId: this.deps.botConfig?.id ?? "v1-default",
+            threadId,
+            triggerMessageId: messageId,
+            finalText: cardKitStartFailed
+              ? "CardKit 主回复面创建失败, legacy 可见卡片兜底也创建失败。"
+              : "post 主回复面创建失败, legacy 可见卡片兜底也创建失败。",
+            failureReason: String(err),
+            title: "Larkway fallback",
+            logPrefix: "[bridge.handler]",
+          });
+          await this.deps.client.removeProcessingReaction?.(messageId);
+          await recordEvent({
+            status: "running",
+            startedAt: new Date().toISOString(),
+            appendPath: "卡片兜底失败，已尝试 post 兜底",
+            reason: String(err),
+          });
+        }
       }
 
       // Step 4a-v-bis: persist a card.json handle so boot reconcile can
@@ -1101,7 +1279,8 @@ export class BridgeHandler {
 
         try {
           for await (const ev of handle.events) {
-            if (card) card.handle(ev);
+            if (cardKitProgress) cardKitProgress.handle(ev);
+            else if (card) card.handle(ev);
             else progressPost?.handle(ev);
             if (ev.type === "system_init") {
               sessionId = ev.sessionId;
@@ -1234,6 +1413,79 @@ export class BridgeHandler {
             imageBlocks: reportedState?.image_blocks,
             contentBlocks: reportedState?.content_blocks,
           };
+
+          if (cardKitProgress) {
+            const mentions = (reportedState?.response_surface?.post?.mentions ?? []).filter(
+              (mention) => isResponseSurfaceMentionAllowed(prototypeConfig, mention.user_id),
+            );
+            try {
+              await cardKitProgress.finalize({
+                title: baseCardPayload.titleOverride,
+                finalText: baseCardPayload.finalText,
+                mentions,
+                choices: baseCardPayload.choices,
+                choicePrompt: baseCardPayload.choicePrompt,
+                imageBlocks: baseCardPayload.imageBlocks,
+                contentBlocks: baseCardPayload.contentBlocks,
+              });
+              await updateCardKitRecord({
+                status: "finalized",
+                sequence: cardKitProgress.sequence,
+              });
+              await deleteCardKitFile(worktreePath);
+            } catch (err) {
+              const fallbackReason =
+                `CardKit finalize failed; visible legacy card fallback used: ${String(err)}`;
+              console.warn("[bridge.handler] CardKit finalize failed; using card fallback:", err);
+              cardKitProgress.close();
+              try {
+                card = await this.deps.cardRenderer.start(messageId, { replyInThread, threadId });
+                await writeCardFile(worktreePath, {
+                  messageId: card.messageId,
+                  chatId: parsed.chatId,
+                  threadId,
+                  botId: this.deps.botConfig?.id ?? "",
+                  replyInThread,
+                  createdAt: new Date().toISOString(),
+                }).catch((writeErr) => {
+                  console.warn("[bridge.handler] writeCardFile(cardkit fallback) failed:", writeErr);
+                });
+                await card.finalize({
+                  ...baseCardPayload,
+                  success: false,
+                  failureReason: fallbackReason,
+                });
+                await updateCardKitRecord({
+                  status: "fallback_visible",
+                  sequence: cardKitProgress.sequence,
+                  lastVisibleFallbackMessageId: card.messageId,
+                });
+                await deleteCardFile(worktreePath);
+              } catch (legacyErr) {
+                const postFallback = await createOnlyPostFallback({
+                  postClient: this.deps.postClient,
+                  replyToMessageId: messageId,
+                  replyInThread,
+                  botId: this.deps.botConfig?.id ?? "v1-default",
+                  threadId,
+                  triggerMessageId: messageId,
+                  finalText: baseCardPayload.finalText,
+                  failureReason: `${fallbackReason}; legacy visible card fallback also failed: ${String(legacyErr)}`,
+                  title: baseCardPayload.titleOverride ?? "Larkway fallback",
+                  logPrefix: "[bridge.handler]",
+                });
+                if (postFallback) {
+                  await updateCardKitRecord({
+                    status: "fallback_visible",
+                    sequence: cardKitProgress.sequence,
+                    lastVisibleFallbackMessageId: postFallback.messageId,
+                  });
+                  await deleteCardFile(worktreePath);
+                  await deleteCardKitFile(worktreePath);
+                }
+              }
+            }
+          } else {
           await progressPost?.drain();
           const surfaceDispatch = await dispatchResponseSurface({
             state: reportedState,
@@ -1249,7 +1501,7 @@ export class BridgeHandler {
             worktreePath,
             baseCard: baseCardPayload,
             cardStarted: !!card,
-            postOutboundAvailable: postOutboundAvailable && !progressPostStartFailed,
+            postOutboundAvailable: false,
             postLedgerAvailable: true,
             visibleFallbackAvailable: true,
             postClient: this.deps.postClient,
@@ -1347,6 +1599,7 @@ export class BridgeHandler {
               await deleteCardFile(worktreePath);
             }
           }
+          }
 
           // Terminal SUCCESS: promote the message out of in-flight into the
           // persisted seen set so it is never re-dispatched (live WS or gap-fill,
@@ -1404,6 +1657,28 @@ export class BridgeHandler {
       settle(false);
 
       // Best-effort failure card — swallow any finalize error
+      if (!card && cardKitProgress) {
+        try {
+          await cardKitProgress.finalize({
+            finalText: `执行失败: ${String(err)}`,
+          });
+          const wtPath = this.deps.conventions.runtime === "agent_workspace" &&
+            this.deps.conventions.workspaceSessionsDir
+            ? path.join(this.deps.conventions.workspaceSessionsDir, threadId)
+            : path.join(this.deps.conventions.worktreesDir, threadId);
+          await deleteCardKitFile(wtPath);
+        } catch (cardKitFinalizeErr) {
+          console.error(
+            "[bridge.handler] CardKit failure finalize failed; creating card fallback:",
+            cardKitFinalizeErr,
+          );
+          try {
+            card = await this.deps.cardRenderer.start(messageId, { replyInThread, threadId });
+          } catch (cardStartErr) {
+            console.error("[bridge.handler] failure card start also failed:", cardStartErr);
+          }
+        }
+      }
       if (!card && progressPost) {
         try {
           await progressPost.finalize({
