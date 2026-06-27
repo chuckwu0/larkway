@@ -54,8 +54,10 @@ Supported narrow fields:
 
 - `mode`: `card`, `post`, or `hybrid`.
 - `primary`: `card` or `post`.
-- `post.mentions[]`: future post mention targets. PR4 can validate/build these
-  in fake-channel tests, but production dispatch still does not send them.
+- `post.mentions[]`: Agent-authored post mention targets. Runtime dispatch
+  allows them by default when `allow_agent_mentions=true`, blocks `all`/`@all`,
+  counts them against post budgets, and still falls back to a visible card when
+  policy, budget, kill-switch, or transport checks prevent the post path.
 - `card.compact`: whether the card is intended as a compact secondary surface.
 - `card.capabilities[]`: `choices`, `image_blocks`, `content_blocks`,
   `fallback`, or `audit`.
