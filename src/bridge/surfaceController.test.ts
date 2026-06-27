@@ -75,8 +75,8 @@ describe("SurfaceController", () => {
       visibleFallbackAvailable: true,
     });
 
-    expect(controller.shouldStartCardImmediately()).toBe(false);
-    expect(controller.decision.reason).toBe("lazy-card-ready");
+    expect(controller.shouldStartCardImmediately()).toBe(true);
+    expect(controller.decision.reason).toBe("dynamic-progress-card");
   });
 
   it("keeps card fallback when post outbound is disabled by config", () => {
@@ -146,7 +146,7 @@ describe("SurfaceController", () => {
     expect(controller.decision.reason).toBe("visible-fallback-unavailable-card-fallback");
   });
 
-  it("has a future lazy-ready path only when post outbound is available", () => {
+  it("keeps a dynamic progress card even when post outbound is available", () => {
     const controller = SurfaceController.create({
       prototypeConfig: postEnabledConfig,
       chatId: "chat_allowed",
@@ -156,7 +156,8 @@ describe("SurfaceController", () => {
       visibleFallbackAvailable: true,
     });
 
-    expect(controller.shouldStartCardImmediately()).toBe(false);
-    expect(controller.decision.reason).toBe("lazy-card-ready");
+    expect(controller.shouldStartCardImmediately()).toBe(true);
+    expect(controller.decision.reason).toBe("dynamic-progress-card");
+    expect(controller.decision.lazyCardCreationEnabled).toBe(true);
   });
 });

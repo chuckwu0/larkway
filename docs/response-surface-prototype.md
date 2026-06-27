@@ -111,28 +111,16 @@ empty `allowed_mention_open_ids` allows the Agent to choose targets; non-empty
 
 ## PR2 / PR4 SurfaceController Foundation
 
-`SurfaceController` centralizes the card-start decision. Production wiring still
-passes `postOutboundAvailable: false`, so every production path creates the
-legacy visible card before the Agent runs.
+`SurfaceController` centralizes the card-start decision. The bridge creates a
+visible processing card before the Agent runs so streamed tool/progress events
+can update the in-progress card during the turn. Post/hybrid dispatch still runs
+at finalize time; when a post is sent, the already-visible card becomes the
+compact secondary/audit surface instead of suppressing mid-turn progress.
 
-The lazy branch is eligible only when all of these are true:
-
-- prototype enabled
-- chat/thread allowed by the allowlist gate; empty chat/thread allowlists allow all
-- `lazy_card_creation: true`
-- `post_outbound_enabled: true`
-- post outbound transport available
-- post ledger available
-- visible failure fallback available
-
-Otherwise the controller starts the legacy card immediately:
-
-- prototype disabled -> card immediately
-- not allowlisted -> card immediately
-- lazy card disabled -> card immediately
-- post outbound disabled/unavailable -> card immediately
-- post ledger unavailable -> card immediately
-- visible fallback unavailable -> card immediately
+`lazy_card_creation` is retained for config compatibility, but it no longer
+suppresses the initial processing card when post outbound is available. This
+keeps response surfaces compatible with the live progress-card UX and preserves
+the visible-card fallback invariant.
 
 ## PR3 Idempotency Reservation
 

@@ -18,9 +18,10 @@ export interface SurfaceControllerInput {
 
 export interface SurfaceControllerDecision {
   /**
-   * Whether handler must create the legacy processing card before running the
-   * agent. PR4 production wiring keeps this true because post outbound remains
-   * unavailable.
+   * Whether handler must create the processing card before running the Agent.
+   * This stays true for live progress updates even when post/hybrid dispatch is
+   * available; final dispatch can still turn the card into a compact audit
+   * surface after the post succeeds.
    */
   startCardImmediately: boolean;
   prototypeEnabled: boolean;
@@ -34,7 +35,7 @@ export interface SurfaceControllerDecision {
     | "post-outbound-unavailable-card-fallback"
     | "post-ledger-unavailable-card-fallback"
     | "visible-fallback-unavailable-card-fallback"
-    | "lazy-card-ready";
+    | "dynamic-progress-card";
 }
 
 export class SurfaceController {
@@ -124,10 +125,10 @@ export class SurfaceController {
     }
 
     return new SurfaceController({
-      startCardImmediately: false,
+      startCardImmediately: true,
       prototypeEnabled: true,
       lazyCardCreationEnabled: true,
-      reason: "lazy-card-ready",
+      reason: "dynamic-progress-card",
     });
   }
 

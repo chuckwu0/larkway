@@ -146,6 +146,7 @@ interface FinalizeArgs {
 function makeCardRenderer() {
   const finalizeArgs: FinalizeArgs[] = [];
   const startArgs: Array<{ messageId: string; replyInThread?: boolean; threadId?: string }> = [];
+  const handleEvents: unknown[] = [];
   let resolveFinalized!: () => void;
   const whenFinalized = new Promise<void>((r) => {
     resolveFinalized = r;
@@ -155,7 +156,9 @@ function makeCardRenderer() {
       startArgs.push({ messageId, ...opts });
       return {
         messageId: "om_card",
-        handle: () => {},
+        handle: (event: unknown) => {
+          handleEvents.push(event);
+        },
         finalize: async (a: FinalizeArgs) => {
           finalizeArgs.push(a);
           resolveFinalized();
@@ -163,7 +166,7 @@ function makeCardRenderer() {
       };
     },
   };
-  return { renderer, finalizeArgs, startArgs, whenFinalized };
+  return { renderer, finalizeArgs, startArgs, handleEvents, whenFinalized };
 }
 
 /** Minimal SessionStore fake — in-memory, records put() calls. */
@@ -670,7 +673,7 @@ describe("handleOne — thin-channel finalize", () => {
     expect(calls).toHaveLength(0);
   });
 
-  it("uses an injected post client for allowlisted post-only turns without starting a card", async () => {
+  it("keeps the in-progress card dynamic while using an injected post client for post-primary turns", async () => {
     const threadId = "om_msg";
     const finalState = {
       status: "ready",
@@ -688,6 +691,8 @@ describe("handleOne — thin-channel finalize", () => {
     runClaudeImpl = () => ({
       events: (async function* () {
         yield { type: "system_init", sessionId: "sess_surface_post_enabled", raw: {} };
+        yield { type: "tool_use", name: "exec_command", input: { cmd: "pnpm test" }, raw: {} };
+        yield { type: "text_delta", text: "正在跑测试", raw: {} };
         await writeFile(
           stateFileMod.stateFilePathOf(wt),
           JSON.stringify(finalState, null, 2),
@@ -698,7 +703,7 @@ describe("handleOne — thin-channel finalize", () => {
       kill: () => {},
     });
 
-    const { renderer, startArgs, finalizeArgs } = makeCardRenderer();
+    const { renderer, startArgs, finalizeArgs, handleEvents, whenFinalized } = makeCardRenderer();
     const { store } = makeSessionStore();
     const { client, acked } = makeClient(makeEvent());
 
@@ -735,13 +740,20 @@ describe("handleOne — thin-channel finalize", () => {
     });
 
     await handler.run();
+    await whenFinalized;
     for (let i = 0; i < 100 && acked.length === 0; i++) {
       await new Promise((r) => setTimeout(r, 10));
     }
 
     expect(acked).toEqual(["om_msg"]);
-    expect(startArgs).toHaveLength(0);
-    expect(finalizeArgs).toHaveLength(0);
+    expect(startArgs).toHaveLength(1);
+    expect(handleEvents.map((event) => (event as { type?: string }).type)).toEqual([
+      "system_init",
+      "tool_use",
+      "text_delta",
+    ]);
+    expect(finalizeArgs).toHaveLength(1);
+    expect(finalizeArgs[0]?.finalText).toContain("post_message_id: om_post");
     expect(calls).toHaveLength(1);
     expect(calls[0]?.replyToMessageId).toBe("om_msg");
     expect(calls[0]?.content).toContain("隔离配置走 post-only");
@@ -825,7 +837,7 @@ describe("handleOne — thin-channel finalize", () => {
     expect(await readPostFile(wt)).toBeNull();
   });
 
-  it("late-starts a visible fallback card before marking a failed post ledger fallback_visible", async () => {
+  it("finalizes a visible fallback card before marking a failed post ledger fallback_visible", async () => {
     const threadId = "om_msg";
     const finalState = {
       status: "ready",
@@ -907,7 +919,7 @@ describe("handleOne — thin-channel finalize", () => {
     expect(ledger?.posts[0]?.attempts[0]?.status).toBe("failed");
   });
 
-  it("late-starts a visible fallback card before marking an existing pending post ledger fallback_visible", async () => {
+  it("finalizes a visible fallback card before marking an existing pending post ledger fallback_visible", async () => {
     const threadId = "om_msg";
     const finalState = {
       status: "ready",
@@ -990,7 +1002,7 @@ describe("handleOne — thin-channel finalize", () => {
     expect(ledger?.posts[0]?.attempts[0]?.code).toBe("orphan_reconcile");
   });
 
-  it("late-starts a visible fallback card before marking a disallowed mention policy_blocked", async () => {
+  it("finalizes a visible fallback card before marking a disallowed mention policy_blocked", async () => {
     const threadId = "om_msg";
     const finalState = {
       status: "ready",
