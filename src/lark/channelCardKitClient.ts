@@ -1,9 +1,8 @@
 /**
  * Channel-SDK-backed CardKit client.
  *
- * PR A foundation only: this wraps the existing Channel SDK rawClient CardKit
- * v1 methods behind a tiny structural interface. Nothing in main/handler uses
- * it by default yet.
+ * Wraps the existing Channel SDK rawClient CardKit v1 methods behind a tiny
+ * structural interface used by the default CardKit response surface.
  */
 
 import { createHash } from "node:crypto";
@@ -147,6 +146,9 @@ export interface OutboundCardKitClient {
 function isRetryable(err: unknown): boolean {
   if (!(err instanceof Error)) return false;
   const msg = err.message.toLowerCase();
+  if (msg.includes("200810")) return true;
+  if (msg.includes("user callback")) return true;
+  if (msg.includes("interaction")) return true;
   if (msg.includes("socket hang up")) return true;
   if (msg.includes("econnreset")) return true;
   if (msg.includes("etimedout")) return true;
@@ -156,6 +158,15 @@ function isRetryable(err: unknown): boolean {
   const status = anyErr["status"];
   if (typeof status === "number" && status >= 500) return true;
   const code = anyErr["code"];
+  if (code === 200810 || code === "200810") return true;
+  const response = anyErr["response"];
+  if (response && typeof response === "object") {
+    const data = (response as Record<string, unknown>)["data"];
+    if (data && typeof data === "object") {
+      const responseCode = (data as Record<string, unknown>)["code"];
+      if (responseCode === 200810 || responseCode === "200810") return true;
+    }
+  }
   return code === "ECONNRESET" || code === "ETIMEDOUT";
 }
 

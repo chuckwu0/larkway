@@ -32,7 +32,10 @@ import { ensureLarkCliProfile, deriveLarkCliProfile } from "./lark/profileBootst
 import { checkWorkspacePermissionGrant } from "./agent/permissionGate.js";
 import { runtimeRequirementsForBots } from "./runtimeRequirements.js";
 import { registerCrashGuard } from "./crashGuard.js";
-import { shouldProvideResponseSurfacePostClient } from "./responseSurface.js";
+import {
+  shouldProvideResponseSurfaceCardKitClient,
+  shouldProvideResponseSurfacePostClient,
+} from "./responseSurface.js";
 
 /** How often the bridge rewrites each bot's status.json liveness heartbeat. */
 const STATUS_WRITE_INTERVAL_MS = 30_000;
@@ -334,6 +337,11 @@ async function runV2Mode({
     const postClient = shouldProvideResponseSurfacePostClient(bot.response_surface_prototype)
       ? client.outboundPostClient()
       : undefined;
+    const cardKitClient = shouldProvideResponseSurfaceCardKitClient(
+      bot.response_surface_prototype,
+    )
+      ? client.outboundCardKitClient()
+      : undefined;
 
     const handler = new BridgeHandler({
       client,
@@ -357,6 +365,7 @@ async function runV2Mode({
         gitlab_token_env: bot.gitlab_token_env,
         response_surface_prototype: bot.response_surface_prototype,
       },
+      cardKitClient,
       postClient,
       gitlabToken: effectiveGitlabToken,
       agentMemory: bot.agent_memory,
@@ -502,6 +511,11 @@ async function runV2Mode({
         ? resolveAgentWorkspaceSessionsDir(bot.id)
         : resolveWorktreesDir(bot.id),
       cardRenderer,
+      cardKitClient: shouldProvideResponseSurfaceCardKitClient(
+        bot.response_surface_prototype,
+      )
+        ? client.outboundCardKitClient()
+        : undefined,
       log: (m) => console.log(m),
     });
   }

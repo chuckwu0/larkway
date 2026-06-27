@@ -10,7 +10,7 @@ export function defaultResponseSurfacePrototypeConfig() {
     lazy_card_creation: true,
     kill_switch: false,
     post_outbound_enabled: true,
-    cardkit_streaming_enabled: false,
+    cardkit_streaming_enabled: true,
     allow_agent_mentions: true,
     allowed_mention_open_ids: [] as string[],
     max_posts_per_turn: 1,
@@ -30,7 +30,7 @@ const responseSurfacePrototypeConfigDefaults = () => ({
   lazy_card_creation: true,
   kill_switch: false,
   post_outbound_enabled: true,
-  cardkit_streaming_enabled: false,
+  cardkit_streaming_enabled: true,
   allow_agent_mentions: true,
   allowed_mention_open_ids: [] as string[],
   max_posts_per_turn: 1,
@@ -130,11 +130,12 @@ export const ResponseSurfacePrototypeConfigSchema = z
      */
     post_outbound_enabled: z.boolean().default(true),
     /**
-     * CardKit streaming response surface gate. PR A keeps this default-off and
-     * does not wire it into handler/main; later PRs may use it for test-chat
-     * rollout after screenshot and late-@ E2E gates pass.
+     * CardKit streaming response surface gate. Defaults on: normal turns use a
+     * streaming CardKit card during execution and finalize that same card into
+     * a clean answer + interaction surface. Disabling this gate rolls back to
+     * the legacy visible card path, not post in-place editing.
      */
-    cardkit_streaming_enabled: z.boolean().default(false),
+    cardkit_streaming_enabled: z.boolean().default(true),
     /**
      * Allows Agent-authored post mentions. This powers handoff to peer bots.
      * Keep this false only when the operator wants to suppress every real @.
@@ -214,6 +215,28 @@ export function shouldProvideResponseSurfacePostClient(
     config.post_outbound_enabled &&
     config.max_posts_per_turn >= 1 &&
     config.max_posts_per_window >= 1
+  );
+}
+
+export function shouldProvideResponseSurfaceCardKitClient(
+  config: ResponseSurfacePrototypeConfig | undefined,
+): boolean {
+  return !!(
+    config?.enabled &&
+    !config.kill_switch &&
+    config.cardkit_streaming_enabled
+  );
+}
+
+export function isResponseSurfaceCardKitAvailable(
+  config: ResponseSurfacePrototypeConfig | undefined,
+  facts: { chatId: string; threadId: string },
+  opts: { cardKitClientAvailable: boolean },
+): boolean {
+  return !!(
+    opts.cardKitClientAvailable &&
+    shouldProvideResponseSurfaceCardKitClient(config) &&
+    isResponseSurfacePrototypeAllowlisted(config, facts)
   );
 }
 

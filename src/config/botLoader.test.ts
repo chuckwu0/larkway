@@ -545,7 +545,7 @@ read_only: false
     expect(bots[0]?.read_only).toBe(false);
   });
 
-  it("response_surface_prototype defaults post surfaces on but mentions off", async () => {
+  it("response_surface_prototype defaults CardKit surfaces on with post fallback config retained", async () => {
     await createBotsDir();
     await writeYaml(
       "surface-default.yaml",
@@ -553,9 +553,9 @@ read_only: false
 id: surface-default-bot
 name: Surface Default Bot
 description: response surface unset
-app_id: cli_surface_default
+app_id: surface_default_app
 app_secret_env: SURFACE_DEFAULT_SECRET
-bot_open_id: ou_surface_default
+bot_open_id: surface_default_bot
 `,
     );
 
@@ -568,7 +568,7 @@ bot_open_id: ou_surface_default
       lazy_card_creation: true,
       kill_switch: false,
       post_outbound_enabled: true,
-      cardkit_streaming_enabled: false,
+      cardkit_streaming_enabled: true,
       allow_agent_mentions: true,
       allowed_mention_open_ids: [],
       max_posts_per_turn: 1,

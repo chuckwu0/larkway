@@ -39,6 +39,7 @@ export interface CreateCardKitProgressHandleOpts {
   initialStatusText?: string;
   patchIntervalMs?: number;
   maxProgressUpdates?: number;
+  onSequenceCommitted?: (sequence: number) => Promise<void>;
 }
 
 function idempotencyKey(facts: CreateCardKitProgressHandleOpts["facts"]): string {
@@ -59,6 +60,7 @@ class LiveCardKitProgressHandle implements CardKitProgressHandle {
   private readonly cardKitClient: OutboundCardKitClient;
   private readonly patchIntervalMs: number;
   private readonly maxProgressUpdates: number;
+  private readonly onSequenceCommitted?: (sequence: number) => Promise<void>;
   private readonly statusLines: string[] = [];
   private readonly toolLines: string[] = [];
   private pendingPatch: ReturnType<typeof setTimeout> | null = null;
@@ -75,6 +77,7 @@ class LiveCardKitProgressHandle implements CardKitProgressHandle {
     patchIntervalMs: number;
     maxProgressUpdates: number;
     initialStatusText: string;
+    onSequenceCommitted?: (sequence: number) => Promise<void>;
   }) {
     this.cardKitClient = opts.cardKitClient;
     this.cardId = opts.cardId;
@@ -82,6 +85,7 @@ class LiveCardKitProgressHandle implements CardKitProgressHandle {
     this.idempotencyKey = opts.idempotencyKey;
     this.patchIntervalMs = opts.patchIntervalMs;
     this.maxProgressUpdates = opts.maxProgressUpdates;
+    this.onSequenceCommitted = opts.onSequenceCommitted;
     this.statusLines.push(opts.initialStatusText);
   }
 
@@ -188,6 +192,7 @@ class LiveCardKitProgressHandle implements CardKitProgressHandle {
   private async next(fn: (sequence: number) => Promise<void>): Promise<void> {
     this.sequence += 1;
     await fn(this.sequence);
+    await this.onSequenceCommitted?.(this.sequence);
   }
 }
 
@@ -216,5 +221,53 @@ export async function createCardKitProgressHandle(
     patchIntervalMs: opts.patchIntervalMs ?? DEFAULT_PATCH_INTERVAL_MS,
     maxProgressUpdates: opts.maxProgressUpdates ?? DEFAULT_MAX_PROGRESS_UPDATES,
     initialStatusText,
+    onSequenceCommitted: opts.onSequenceCommitted,
   });
+}
+
+export async function finalizeExistingCardKitCard(opts: {
+  cardKitClient: OutboundCardKitClient;
+  cardId: string;
+  startingSequence: number;
+  final: BuildCardKitFinalCardOpts;
+  onSequenceCommitted?: (sequence: number) => Promise<void>;
+}): Promise<number> {
+  let sequence = opts.startingSequence;
+  const next = async (
+    role: string,
+    fn: (sequence: number, uuid: string) => Promise<void>,
+  ): Promise<void> => {
+    sequence += 1;
+    await fn(sequence, sequenceUuid(opts.cardId, role, sequence));
+    await opts.onSequenceCommitted?.(sequence);
+  };
+  const finalMarkdown = buildCardKitFinalMarkdown(opts.final);
+  await next("reconcile-final-content", (seq, uuid) =>
+    opts.cardKitClient.streamElementContent(
+      opts.cardId,
+      CARDKIT_FINAL_ELEMENT_ID,
+      finalMarkdown,
+      { sequence: seq, uuid },
+    ),
+  );
+  await next("reconcile-final-card", (seq, uuid) =>
+    opts.cardKitClient.updateCardEntity(
+      opts.cardId,
+      buildCardKitFinalCard(opts.final),
+      { sequence: seq, uuid },
+    ),
+  );
+  await next("reconcile-settings", (seq, uuid) =>
+    opts.cardKitClient.updateCardSettings(
+      opts.cardId,
+      {
+        config: {
+          streaming_mode: false,
+          summary: { content: opts.final.finalText.replace(/\s+/g, " ").trim().slice(0, 50) },
+        },
+      },
+      { sequence: seq, uuid },
+    ),
+  );
+  return sequence;
 }

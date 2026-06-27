@@ -44,12 +44,20 @@ import {
   type CardFile,
 } from "./cardFile.js";
 import {
+  readCardKitFile,
+  writeCardKitFile,
+  deleteCardKitFile,
+  type CardKitFile,
+} from "./cardkitFile.js";
+import { finalizeExistingCardKitCard } from "./cardkitProgress.js";
+import {
   markPostLedgerFallbackVisible,
   reconcilePostFileOrphans,
   type PostLedgerEntry,
 } from "./postFile.js";
 import { readStateFile, stateFilePathOf, type StateFile } from "./stateFile.js";
 import type { CardHandle, CardRenderer } from "../lark/card.js";
+import type { OutboundCardKitClient } from "../lark/channelCardKitClient.js";
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -233,6 +241,147 @@ function mapFinalizeArgs(
   };
 }
 
+function mapCardKitFinalizeArgs(
+  state: StateFile,
+  success: boolean,
+  stateFresh = true,
+): Parameters<typeof finalizeExistingCardKitCard>[0]["final"] {
+  const args = mapFinalizeArgs(state, success, stateFresh);
+  return {
+    finalText: args.finalText ?? "⚠️ 本轮在处理中被 bridge 重启中断，未拿到 agent 的新回复。",
+    ...(args.titleOverride !== undefined ? { title: args.titleOverride } : {}),
+    ...(args.choices !== undefined ? { choices: args.choices } : {}),
+    ...(args.choicePrompt !== undefined ? { choicePrompt: args.choicePrompt } : {}),
+    ...(args.imageBlocks !== undefined ? { imageBlocks: args.imageBlocks } : {}),
+    ...(args.contentBlocks !== undefined ? { contentBlocks: args.contentBlocks } : {}),
+    ...(state.response_surface?.post?.mentions !== undefined
+      ? { mentions: state.response_surface.post.mentions }
+      : {}),
+  };
+}
+
+function shouldReconcileCardKit(input: {
+  cardKit: CardKitFile;
+  state: StateFile | null;
+  botId: string;
+  pidAlive: boolean;
+  ageMs: number;
+  minAgeMs: number;
+}): { reconcile: boolean; success: boolean; stateFresh: boolean; reason: string } | null {
+  if (input.cardKit.botId !== input.botId) return null;
+  if (input.cardKit.status === "finalized" || input.cardKit.status === "fallback_visible") {
+    return null;
+  }
+  if (input.pidAlive) return null;
+  if (input.ageMs < input.minAgeMs) return null;
+  if (!input.state) return null;
+  const stateFresh = (() => {
+    if (input.state.updated_at == null) return false;
+    const stateMs = Date.parse(input.state.updated_at);
+    const cardMs = Date.parse(input.cardKit.createdAt);
+    return Number.isFinite(stateMs) && Number.isFinite(cardMs) && stateMs >= cardMs;
+  })();
+  if (!stateFresh) {
+    return {
+      reconcile: true,
+      success: false,
+      stateFresh,
+      reason: "state.updated_at older than cardkit.createdAt, pid dead, old",
+    };
+  }
+  if (input.state.status === "ready") {
+    return { reconcile: true, success: true, stateFresh, reason: "state.status=ready" };
+  }
+  if (input.state.status === "failed") {
+    return { reconcile: true, success: false, stateFresh, reason: "state.status=failed" };
+  }
+  if (input.state.status === "in_progress") {
+    return {
+      reconcile: true,
+      success: false,
+      stateFresh,
+      reason: "state.status=in_progress but pid dead + old",
+    };
+  }
+  return null;
+}
+
+async function reconcileCardKitRecord(input: {
+  deps: ReconcileDeps;
+  worktreePath: string;
+  name: string;
+  cardKit: CardKitFile;
+  state: StateFile;
+  success: boolean;
+  stateFresh: boolean;
+  reason: string;
+  nowIso: string;
+  log: (msg: string) => void;
+}): Promise<void> {
+  if (!input.deps.cardKitClient) {
+    input.log(`[reconcile] cardkit ${input.name}: no CardKit client; keeping ledger for next boot`);
+    return;
+  }
+  try {
+    const sequence = await finalizeExistingCardKitCard({
+      cardKitClient: input.deps.cardKitClient,
+      cardId: input.cardKit.cardId,
+      startingSequence: input.cardKit.sequence,
+      final: mapCardKitFinalizeArgs(input.state, input.success, input.stateFresh),
+      onSequenceCommitted: async (sequence) => {
+        await writeCardKitFile(input.worktreePath, {
+          ...input.cardKit,
+          status: "streaming",
+          sequence,
+          updatedAt: input.nowIso,
+        });
+      },
+    });
+    await writeCardKitFile(input.worktreePath, {
+      ...input.cardKit,
+      status: "finalized",
+      sequence,
+      updatedAt: input.nowIso,
+    });
+    await deleteCardKitFile(input.worktreePath);
+    input.log(
+      `[reconcile] finalized cardkit ${input.name} as ${input.success ? "success" : "failure"} (${input.reason})`,
+    );
+  } catch (err) {
+    const nextRetry = input.cardKit.retryCount + 1;
+    input.log(
+      `[reconcile] cardkit finalize FAILED for ${input.name} (retry ${nextRetry}/${RETRY_CAP}): ${String(err)}`,
+    );
+    if (nextRetry > RETRY_CAP) {
+      const fallback = await input.deps.cardRenderer.start(input.cardKit.replyToMessageId, {
+        replyInThread: input.cardKit.replyInThread,
+        threadId: input.cardKit.threadId,
+      });
+      await fallback.finalize({
+        finalText: mapFinalizeArgs(input.state, input.success, input.stateFresh).finalText,
+        success: false,
+        failureReason: `CardKit reconcile failed after retry cap; visible legacy card fallback used: ${String(err)}`,
+        titleOverride: "CardKit fallback recovered",
+        colorOverride: "failure",
+      });
+      await writeCardKitFile(input.worktreePath, {
+        ...input.cardKit,
+        status: "fallback_visible",
+        retryCount: nextRetry,
+        lastVisibleFallbackMessageId: fallback.messageId,
+        updatedAt: input.nowIso,
+      });
+      input.log(`[reconcile] cardkit ${input.name} exceeded retry cap; fallback card ${fallback.messageId} sent`);
+      return;
+    }
+    await writeCardKitFile(input.worktreePath, {
+      ...input.cardKit,
+      retryCount: nextRetry,
+      updatedAt: input.nowIso,
+    });
+  }
+}
+
 function postFallbackText(entry: PostLedgerEntry): string {
   return (
     "Bridge restarted while reconciling a post-only response. " +
@@ -335,6 +484,11 @@ export interface ReconcileDeps {
    * handle on the SAME outbound transport / identity that created the card.
    */
   cardRenderer: Pick<CardRenderer, "handleFor" | "start">;
+  /**
+   * Optional CardKit transport. When present, reconcile also finalizes
+   * cardkit.json records left by a crash during the streaming response path.
+   */
+  cardKitClient?: OutboundCardKitClient;
   /** Minimum state.json age before a card is eligible. @default 60000 */
   minAgeMs?: number;
   /** Logger. @default console.log */
@@ -371,6 +525,7 @@ export async function reconcileOrphanedCards(deps: ReconcileDeps): Promise<void>
     const wtPath = pathJoin(deps.worktreesDir, name);
     try {
       const card = await readCardFile(wtPath);
+      const cardKit = await readCardKitFile(wtPath);
       const state = await readStateFile(wtPath);
 
       // Liveness: any pid associated with the worktree still alive?
@@ -432,6 +587,35 @@ export async function reconcileOrphanedCards(deps: ReconcileDeps): Promise<void>
           }
         } catch (err) {
           log(`[reconcile] post ledger failed for ${name} (skipping): ${String(err)}`);
+        }
+      }
+
+      if (cardKit) {
+        const selectedCardKit = shouldReconcileCardKit({
+          cardKit,
+          state,
+          botId: deps.botId,
+          pidAlive,
+          ageMs,
+          minAgeMs,
+        });
+        if (selectedCardKit?.reconcile && state) {
+          try {
+            await reconcileCardKitRecord({
+              deps,
+              worktreePath: wtPath,
+              name,
+              cardKit,
+              state,
+              success: selectedCardKit.success,
+              stateFresh: selectedCardKit.stateFresh,
+              reason: selectedCardKit.reason,
+              nowIso,
+              log,
+            });
+          } catch (err) {
+            log(`[reconcile] cardkit failed for ${name} (skipping): ${String(err)}`);
+          }
         }
       }
 

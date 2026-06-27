@@ -15,6 +15,7 @@ import { reconcileOrphanedCards } from "./reconcile.js";
 import { buildPostContent } from "../lark/postContent.js";
 import { derivePostIdempotencyKey, digestPostContent } from "../lark/idempotency.js";
 import type { OutboundPostClient } from "../lark/outboundPostClient.js";
+import type { OutboundCardKitClient } from "../lark/channelCardKitClient.js";
 
 // ---------------------------------------------------------------------------
 // handler.ts calls createRunner("claude").run(...) from agent/runner.
@@ -278,6 +279,59 @@ function makePostClient(opts: { fail?: boolean; failCreate?: boolean; failUpdate
       });
       if (opts.fail || opts.failUpdate) throw new Error("fake post failed");
       return { messageId };
+    },
+  };
+  return { client, calls };
+}
+
+function makeCardKitClient(opts: { failFinalize?: boolean; failCreate?: boolean } = {}) {
+  const calls: Array<{
+    kind: "createCard" | "reply" | "stream" | "updateCard" | "settings";
+    cardId?: string;
+    elementId?: string;
+    content?: string;
+    sequence?: number;
+    payload?: unknown;
+  }> = [];
+  const client: OutboundCardKitClient = {
+    async createCardEntity(card) {
+      calls.push({ kind: "createCard", payload: card });
+      if (opts.failCreate) throw new Error("fake cardkit create failed");
+      return { cardId: "cardkit_card" };
+    },
+    async replyCardEntity(_replyToMessageId, cardId) {
+      calls.push({ kind: "reply", cardId });
+      return { messageId: "om_cardkit" };
+    },
+    async updateCardEntity(cardId, card, callOpts) {
+      calls.push({
+        kind: "updateCard",
+        cardId,
+        payload: card,
+        sequence: callOpts.sequence,
+      });
+      if (opts.failFinalize) throw new Error("fake cardkit finalize failed");
+    },
+    async streamElementContent(cardId, elementId, content, callOpts) {
+      calls.push({
+        kind: "stream",
+        cardId,
+        elementId,
+        content,
+        sequence: callOpts.sequence,
+      });
+    },
+    async createElements() {},
+    async deleteElement() {},
+    async patchElement() {},
+    async updateElement() {},
+    async updateCardSettings(cardId, settings, callOpts) {
+      calls.push({
+        kind: "settings",
+        cardId,
+        payload: settings,
+        sequence: callOpts.sequence,
+      });
     },
   };
   return { client, calls };
@@ -687,7 +741,166 @@ describe("handleOne — thin-channel finalize", () => {
     expect(calls).toHaveLength(0);
   });
 
-  it("uses an injected post client for allowlisted post-only turns without starting a card", async () => {
+  it("uses CardKit streaming as the default response surface and migrates choices into the final card", async () => {
+    const threadId = "om_msg";
+    const finalState = {
+      status: "ready",
+      last_message: "CardKit 最终正文",
+      choices: [{ label: "继续", value: "继续处理" }],
+      choice_prompt: "下一步?",
+      response_surface: {
+        mode: "post",
+        primary: "post",
+        post: { mentions: [{ user_id: "peer_test", label: "Peer" }] },
+      },
+      updated_at: "2026-06-26T10:00:00.000Z",
+    };
+    const wt = await seedWorktree(threadId);
+    await seedRepoCachePath();
+    const { client: postClient, calls: postCalls } = makePostClient();
+    const { client: cardKitClient, calls: cardKitCalls } = makeCardKitClient();
+
+    runClaudeImpl = () => ({
+      events: (async function* () {
+        yield { type: "system_init", sessionId: "sess_cardkit_default", raw: {} };
+        yield { type: "tool_use", toolName: "Read", toolInput: { path: "src/a.ts" } };
+        await writeFile(
+          stateFileMod.stateFilePathOf(wt),
+          JSON.stringify(finalState, null, 2),
+          "utf8",
+        );
+      })(),
+      done: Promise.resolve({ exitCode: 0, sessionId: "sess_cardkit_default" }),
+      kill: () => {},
+    });
+
+    const { renderer, startArgs, finalizeArgs, whenFinalized } = makeCardRenderer();
+    const { store } = makeSessionStore();
+    const { client, acked } = makeClient(makeEvent());
+
+    const handler = new BridgeHandler({
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      client: client as any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      cardRenderer: renderer as any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      sessionStore: store as any,
+      conventions: makeConventions(),
+      botConfig: {
+        id: "frontend",
+        name: "Frontend",
+        turn_taking_limit: 10,
+        backend: "claude",
+        response_surface_prototype: {
+          enabled: true,
+          allowed_chats: [],
+          allowed_threads: ["om_msg"],
+          lazy_card_creation: true,
+          kill_switch: false,
+          post_outbound_enabled: true,
+          cardkit_streaming_enabled: true,
+          allow_agent_mentions: true,
+          allowed_mention_open_ids: [],
+          max_posts_per_turn: 1,
+          max_posts_per_window: 4,
+          post_window_ms: 60_000,
+          max_post_attempts: 3,
+          text_threshold_chars: 900,
+        },
+      },
+      postClient,
+      cardKitClient,
+    });
+
+    await handler.run();
+    for (let i = 0; i < 100 && acked.length === 0; i++) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
+
+    expect(acked).toEqual(["om_msg"]);
+    expect(startArgs).toHaveLength(0);
+    expect(finalizeArgs).toHaveLength(0);
+    expect(postCalls).toHaveLength(0);
+    expect(cardKitCalls.map((c) => c.kind)).toContain("createCard");
+    expect(cardKitCalls.map((c) => c.kind)).toContain("reply");
+    expect(cardKitCalls.some((c) => c.kind === "stream" && c.elementId === "thinking_md" && c.content?.includes("🔧 Read"))).toBe(true);
+    expect(cardKitCalls.some((c) => c.kind === "stream" && c.elementId === "final_md" && c.content?.includes("CardKit 最终正文"))).toBe(true);
+    const finalUpdate = cardKitCalls.find((c) => c.kind === "updateCard");
+    expect(JSON.stringify(finalUpdate?.payload)).toContain("继续");
+    expect(JSON.stringify(finalUpdate?.payload)).toContain("<at id=peer_test></at>");
+  });
+
+  it("falls back to a visible legacy card if CardKit finalize fails", async () => {
+    const threadId = "om_msg";
+    const finalState = {
+      status: "ready",
+      last_message: "CardKit 失败也要可见",
+      updated_at: "2026-06-26T10:00:00.000Z",
+    };
+    const wt = await seedWorktree(threadId);
+    await seedRepoCachePath();
+    const { client: cardKitClient } = makeCardKitClient({ failFinalize: true });
+
+    runClaudeImpl = () => ({
+      events: (async function* () {
+        yield { type: "system_init", sessionId: "sess_cardkit_fallback", raw: {} };
+        await writeFile(
+          stateFileMod.stateFilePathOf(wt),
+          JSON.stringify(finalState, null, 2),
+          "utf8",
+        );
+      })(),
+      done: Promise.resolve({ exitCode: 0, sessionId: "sess_cardkit_fallback" }),
+      kill: () => {},
+    });
+
+    const { renderer, startArgs, finalizeArgs, whenFinalized } = makeCardRenderer();
+    const { store } = makeSessionStore();
+    const { client } = makeClient(makeEvent());
+
+    const handler = new BridgeHandler({
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      client: client as any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      cardRenderer: renderer as any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      sessionStore: store as any,
+      conventions: makeConventions(),
+      botConfig: {
+        id: "frontend",
+        name: "Frontend",
+        turn_taking_limit: 10,
+        backend: "claude",
+        response_surface_prototype: {
+          enabled: true,
+          allowed_chats: [],
+          allowed_threads: ["om_msg"],
+          lazy_card_creation: true,
+          kill_switch: false,
+          post_outbound_enabled: true,
+          cardkit_streaming_enabled: true,
+          allow_agent_mentions: true,
+          allowed_mention_open_ids: [],
+          max_posts_per_turn: 1,
+          max_posts_per_window: 4,
+          post_window_ms: 60_000,
+          max_post_attempts: 3,
+          text_threshold_chars: 900,
+        },
+      },
+      cardKitClient,
+    });
+
+    await handler.run();
+    await whenFinalized;
+
+    expect(startArgs).toHaveLength(1);
+    expect(finalizeArgs).toHaveLength(1);
+    expect(finalizeArgs[0]?.success).toBe(false);
+    expect(finalizeArgs[0]?.failureReason).toContain("CardKit finalize failed");
+  });
+
+  it("uses legacy card fallback instead of post editing when CardKit is disabled", async () => {
     const threadId = "om_msg";
     const finalState = {
       status: "ready",
@@ -715,9 +928,9 @@ describe("handleOne — thin-channel finalize", () => {
       kill: () => {},
     });
 
-    const { renderer, startArgs, finalizeArgs } = makeCardRenderer();
+    const { renderer, startArgs, finalizeArgs, whenFinalized } = makeCardRenderer();
     const { store } = makeSessionStore();
-    const { client, acked } = makeClient(makeEvent());
+    const { client } = makeClient(makeEvent());
 
     const handler = new BridgeHandler({
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -753,23 +966,14 @@ describe("handleOne — thin-channel finalize", () => {
     });
 
     await handler.run();
-    for (let i = 0; i < 100 && acked.length === 0; i++) {
-      await new Promise((r) => setTimeout(r, 10));
-    }
+    await whenFinalized;
 
-    expect(acked).toEqual(["om_msg"]);
-    expect(startArgs).toHaveLength(0);
-    expect(finalizeArgs).toHaveLength(0);
-    expect(calls).toHaveLength(2);
-    expect(calls[0]?.kind).toBe("create");
-    expect(calls[0]?.replyToMessageId).toBe("om_msg");
-    expect(calls[0]?.content).toContain("正在处理");
-    expect(calls[1]?.kind).toBe("update");
-    expect(calls[1]?.messageId).toBe("om_post");
-    expect(calls[1]?.content).toContain("隔离配置走 post-only");
+    expect(startArgs).toHaveLength(1);
+    expect(finalizeArgs).toHaveLength(1);
+    expect(finalizeArgs[0]?.finalText).toBe("隔离配置走 post-only");
+    expect(calls).toHaveLength(0);
     const ledger = await readPostFile(wt);
-    expect(ledger?.posts[0]?.status).toBe("sent");
-    expect(ledger?.posts[0]?.postMessageId).toBe("om_post");
+    expect(ledger).toBeNull();
   });
 
   it("honors the response-surface kill switch even when post outbound is otherwise configured", async () => {
@@ -848,7 +1052,7 @@ describe("handleOne — thin-channel finalize", () => {
     expect(await readPostFile(wt)).toBeNull();
   });
 
-  it("late-starts a visible fallback card before marking a failed post ledger fallback_visible", async () => {
+  it("uses legacy card directly when CardKit is disabled even if post update would fail", async () => {
     const threadId = "om_msg";
     const finalState = {
       status: "ready",
@@ -918,22 +1122,13 @@ describe("handleOne — thin-channel finalize", () => {
 
     expect(startArgs).toHaveLength(1);
     expect(finalizeArgs).toHaveLength(1);
-    expect(finalizeArgs[0]?.success).toBe(false);
-    expect(finalizeArgs[0]?.failureReason).toContain("visible card fallback used");
-    expect(calls).toHaveLength(2);
-    expect(calls[0]?.kind).toBe("create");
-    expect(calls[1]?.kind).toBe("update");
-    let ledger = await readPostFile(wt);
-    for (let i = 0; i < 100 && ledger?.posts[0]?.status !== "fallback_visible"; i++) {
-      await new Promise((r) => setTimeout(r, 10));
-      ledger = await readPostFile(wt);
-    }
-    expect(ledger?.posts[0]?.status).toBe("fallback_visible");
-    expect(ledger?.posts[0]?.fallbackCardMessageId).toBe("om_card");
-    expect(ledger?.posts[0]?.attempts[0]?.status).toBe("failed");
+    expect(finalizeArgs[0]?.success).toBe(true);
+    expect(finalizeArgs[0]?.finalText).toBe("post 失败必须有可见 fallback");
+    expect(calls).toHaveLength(0);
+    expect(await readPostFile(wt)).toBeNull();
   });
 
-  it("updates the live post even when an older pending ledger entry exists", async () => {
+  it("does not create a new post when an older pending ledger entry exists", async () => {
     const threadId = "om_msg";
     const finalState = {
       status: "ready",
@@ -962,9 +1157,9 @@ describe("handleOne — thin-channel finalize", () => {
       kill: () => {},
     });
 
-    const { renderer, startArgs, finalizeArgs } = makeCardRenderer();
+    const { renderer, startArgs, finalizeArgs, whenFinalized } = makeCardRenderer();
     const { store } = makeSessionStore();
-    const { client, acked } = makeClient(makeEvent());
+    const { client } = makeClient(makeEvent());
 
     const handler = new BridgeHandler({
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -1000,21 +1195,17 @@ describe("handleOne — thin-channel finalize", () => {
     });
 
     await handler.run();
-    for (let i = 0; i < 100 && acked.length === 0; i++) {
-      await new Promise((r) => setTimeout(r, 10));
-    }
+    await whenFinalized;
 
-    expect(acked).toEqual(["om_msg"]);
-    expect(startArgs).toHaveLength(0);
-    expect(finalizeArgs).toHaveLength(0);
-    expect(calls.map((c) => c.kind)).toEqual(["create", "update"]);
+    expect(startArgs).toHaveLength(1);
+    expect(finalizeArgs).toHaveLength(1);
+    expect(calls).toHaveLength(0);
     const ledger = await readPostFile(wt);
-    expect(ledger?.posts).toHaveLength(2);
+    expect(ledger?.posts).toHaveLength(1);
     expect(ledger?.posts.some((post) => post.status === "pending")).toBe(true);
-    expect(ledger?.posts.some((post) => post.status === "sent" && post.postMessageId === "om_post")).toBe(true);
   });
 
-  it("late-starts a visible fallback card before marking a disallowed mention policy_blocked", async () => {
+  it("uses legacy card directly for disallowed post mentions when CardKit is disabled", async () => {
     const threadId = "om_msg";
     const finalState = {
       status: "ready",
@@ -1085,22 +1276,10 @@ describe("handleOne — thin-channel finalize", () => {
 
     expect(startArgs).toHaveLength(1);
     expect(finalizeArgs).toHaveLength(1);
-    expect(finalizeArgs[0]?.success).toBe(false);
-    expect(finalizeArgs[0]?.failureReason).toContain("blocked by policy");
-    expect(calls).toHaveLength(2);
-    expect(calls[0]?.kind).toBe("create");
-    expect(calls[1]?.kind).toBe("update");
-    expect(calls[1]?.content).toContain("policy blocked 也必须先有可见卡");
-    expect(calls[1]?.content).not.toContain('"tag":"at"');
-    let ledger = await readPostFile(wt);
-    for (let i = 0; i < 100 && ledger?.posts[0]?.status !== "policy_blocked"; i++) {
-      await new Promise((r) => setTimeout(r, 10));
-      ledger = await readPostFile(wt);
-    }
-    expect(ledger?.posts[0]?.status).toBe("policy_blocked");
-    expect(ledger?.posts[0]?.fallbackCardMessageId).toBe("om_card");
-    expect(ledger?.posts[0]?.postMessageId).toBeUndefined();
-    expect(ledger?.posts[0]?.attempts[0]?.code).toBe("mention_policy_blocked");
+    expect(finalizeArgs[0]?.success).toBe(true);
+    expect(finalizeArgs[0]?.finalText).toBe("policy blocked 也必须先有可见卡");
+    expect(calls).toHaveLength(0);
+    expect(await readPostFile(wt)).toBeNull();
 
     await reconcileOrphanedCards({
       worktreesDir: root,
@@ -1110,7 +1289,7 @@ describe("handleOne — thin-channel finalize", () => {
       log: () => {},
     });
     expect(startArgs).toHaveLength(1);
-    expect((await readPostFile(wt))?.posts[0]?.status).toBe("policy_blocked");
+    expect(await readPostFile(wt)).toBeNull();
   });
 
   it("late-stage state.json WITHOUT dev_url is NOT probed and NOT demoted (status=ready → success)", async () => {

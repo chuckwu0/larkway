@@ -30,6 +30,10 @@ import { promisify } from "node:util";
 import type { LarkMessageEvent, LarkClientOptions } from "./transport.js";
 import { AsyncQueue } from "./transport.js";
 import { ChannelCardClient, type OutboundLarkChannel } from "./channelCardClient.js";
+import {
+  ChannelCardKitClient,
+  type OutboundCardKitLarkChannel,
+} from "./channelCardKitClient.js";
 import { ChannelPostClient, type OutboundPostLarkChannel } from "./channelPostClient.js";
 import type { OutboundCardClient } from "./outboundCardClient.js";
 import type { OutboundPostClient } from "./outboundPostClient.js";
@@ -480,6 +484,8 @@ export class ChannelClient {
   private readonly cardThreads = new Map<string, string>();
   /** Lazily built (after connect) so it can bind the live channel handle. */
   private cardClient: ChannelCardClient | null = null;
+  /** Lazily built CardKit client; shares cardThreads with interactive callbacks. */
+  private cardKitClient: ChannelCardKitClient | null = null;
   /** Lazily built and only requested by main.ts when post outbound gates are configured. */
   private postClient: ChannelPostClient | null = null;
 
@@ -711,6 +717,24 @@ export class ChannelClient {
       });
     }
     return this.cardClient;
+  }
+
+  /**
+   * Return an OutboundCardKitClient bound to this client's channel handle.
+   *
+   * CardKit messages share the same messageId -> threadId map as legacy cards,
+   * so final-area choice buttons synthesize normal turns in the originating
+   * Feishu topic.
+   */
+  outboundCardKitClient(): ChannelCardKitClient {
+    if (!this.cardKitClient) {
+      this.cardKitClient = new ChannelCardKitClient({
+        resolveChannel: () =>
+          this.channel as unknown as OutboundCardKitLarkChannel | null,
+        cardThreads: this.cardThreads,
+      });
+    }
+    return this.cardKitClient;
   }
 
   /**
