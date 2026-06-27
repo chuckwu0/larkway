@@ -8,7 +8,7 @@
 
 You @ the bot in a Feishu thread. It runs on your machine — reading your real codebase, executing commands, opening MRs — and posts the result back. You define what the agent knows and what it can do. Larkway just carries the messages.
 
-**Current release: v0.3.20**
+**Current release: v0.3.21**
 
 ---
 
