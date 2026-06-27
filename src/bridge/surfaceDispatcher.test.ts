@@ -58,6 +58,15 @@ function state(surface: NonNullable<StateFile["response_surface"]>, extra = {}):
   };
 }
 
+function stateWithoutSurface(extra = {}): StateFile {
+  return {
+    status: "ready",
+    last_message: "主回复正文",
+    updated_at: "2026-06-26T00:00:00.000Z",
+    ...extra,
+  };
+}
+
 function baseInput(overrides: Partial<SurfaceDispatchInput> = {}): SurfaceDispatchInput {
   return {
     state: state({ mode: "post", primary: "post" }),
@@ -152,6 +161,76 @@ describe("dispatchResponseSurface", () => {
       expect(ledger?.posts[0]?.status).toBe("sent");
       expect(ledger?.posts[0]?.postMessageId).toBe("om_post");
     }));
+
+  it("defaults an undeclared plain-text response to post when the prototype is enabled", async () =>
+    withTemp(async (dir) => {
+      const { client, calls } = fakePostClient();
+      const result = await dispatchResponseSurface(
+        baseInput({
+          worktreePath: dir,
+          state: stateWithoutSurface(),
+          cardStarted: true,
+          postClient: client,
+        }),
+      );
+
+      expect(result.reason).toBe("post-sent");
+      expect(result.visible).toBe(true);
+      expect(result.card?.finalText).toContain("post_message_id: om_post");
+      expect(result.post?.messageId).toBe("om_post");
+      expect(calls).toHaveLength(1);
+      expect(calls[0]?.content).toContain("主回复正文");
+
+      const ledger = await readPostFile(dir);
+      expect(ledger?.posts[0]?.status).toBe("sent");
+      expect(ledger?.posts[0]?.postMessageId).toBe("om_post");
+    }));
+
+  it("keeps undeclared card-only capabilities on the visible card path", async () =>
+    withTemp(async (dir) => {
+      const { client, calls } = fakePostClient();
+      const result = await dispatchResponseSurface(
+        baseInput({
+          worktreePath: dir,
+          state: stateWithoutSurface({
+            choices: [{ label: "继续", value: "继续处理" }],
+            image_blocks: [{ img_key: "img_fake", alt: "preview" }],
+            content_blocks: [{ type: "markdown", content: "富排版正文" }],
+          }),
+          baseCard: {
+            ...baseCard(),
+            choices: [{ label: "继续", value: "继续处理" }],
+            imageBlocks: [{ img_key: "img_fake", alt: "preview", mode: "fit_horizontal", preview: true }],
+            contentBlocks: [{ type: "markdown", content: "富排版正文" }],
+          },
+          cardStarted: true,
+          postClient: client,
+        }),
+      );
+
+      expect(result.reason).toBe("card-capability-required");
+      expect(result.visible).toBe(true);
+      expect(result.card?.choices).toEqual([{ label: "继续", value: "继续处理" }]);
+      expect(result.card?.contentBlocks).toEqual([{ type: "markdown", content: "富排版正文" }]);
+      expect(calls).toHaveLength(0);
+      expect(await readPostFile(dir)).toBeNull();
+    }));
+
+  it("keeps the visible card when an undeclared default post is unavailable", async () => {
+    const { client, calls } = fakePostClient();
+    const result = await dispatchResponseSurface(
+      baseInput({
+        state: stateWithoutSurface(),
+        postClient: client,
+        postOutboundAvailable: false,
+      }),
+    );
+
+    expect(result.reason).toBe("post-outbound-unavailable");
+    expect(result.card?.finalText).toBe("主回复正文");
+    expect(result.visible).toBe(true);
+    expect(calls).toHaveLength(0);
+  });
 
   it("does not resend when the same logical post is already marked sent", async () =>
     withTemp(async (dir) => {

@@ -116,6 +116,8 @@ interface FinalizeArgs {
   mentionOpenId?: string;
   titleOverride?: string;
   colorOverride?: string;
+  choices?: Array<{ label: string; value: string }>;
+  choicePrompt?: string;
   imageBlocks?: Array<{
     img_key: string;
     alt: string;
@@ -681,15 +683,11 @@ describe("handleOne — thin-channel finalize", () => {
     expect(calls).toHaveLength(0);
   });
 
-  it("keeps the in-progress card dynamic while using an injected post client for post-primary turns", async () => {
+  it("defaults undeclared plain replies to post while keeping the in-progress card dynamic", async () => {
     const threadId = "om_msg";
     const finalState = {
       status: "ready",
-      last_message: "隔离配置走 post-only",
-      response_surface: {
-        mode: "post",
-        primary: "post",
-      },
+      last_message: "默认开启后纯文本走 post",
       updated_at: "2026-06-26T10:00:00.000Z",
     };
     const wt = await seedWorktree(threadId);
@@ -764,10 +762,85 @@ describe("handleOne — thin-channel finalize", () => {
     expect(finalizeArgs).toHaveLength(0);
     expect(calls).toHaveLength(1);
     expect(calls[0]?.replyToMessageId).toBe("om_msg");
-    expect(calls[0]?.content).toContain("隔离配置走 post-only");
+    expect(calls[0]?.content).toContain("默认开启后纯文本走 post");
     const ledger = await readPostFile(wt);
     expect(ledger?.posts[0]?.status).toBe("sent");
     expect(ledger?.posts[0]?.postMessageId).toBe("om_post");
+  });
+
+  it("keeps undeclared choice replies on the card path even when default post is enabled", async () => {
+    const threadId = "om_msg";
+    const finalState = {
+      status: "ready",
+      last_message: "需要按钮所以保留卡片",
+      choices: [{ label: "继续", value: "继续处理" }],
+      choice_prompt: "下一步?",
+      updated_at: "2026-06-26T10:00:00.000Z",
+    };
+    const wt = await seedWorktree(threadId);
+    await seedRepoCachePath();
+    const { client: postClient, calls } = makePostClient();
+
+    runClaudeImpl = () => ({
+      events: (async function* () {
+        yield { type: "system_init", sessionId: "sess_surface_default_card_capability", raw: {} };
+        await writeFile(
+          stateFileMod.stateFilePathOf(wt),
+          JSON.stringify(finalState, null, 2),
+          "utf8",
+        );
+      })(),
+      done: Promise.resolve({ exitCode: 0, sessionId: "sess_surface_default_card_capability" }),
+      kill: () => {},
+    });
+
+    const { renderer, finalizeArgs, recallArgs, whenFinalized } = makeCardRenderer();
+    const { store } = makeSessionStore();
+    const { client } = makeClient(makeEvent());
+
+    const handler = new BridgeHandler({
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      client: client as any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      cardRenderer: renderer as any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      sessionStore: store as any,
+      conventions: makeConventions(),
+      botConfig: {
+        id: "frontend",
+        name: "Frontend",
+        turn_taking_limit: 10,
+        backend: "claude",
+        response_surface_prototype: {
+          ...defaultResponseSurfacePrototypeConfig(),
+          enabled: true,
+          allowed_chats: [],
+          allowed_threads: ["om_msg"],
+          lazy_card_creation: true,
+          kill_switch: false,
+          post_outbound_enabled: true,
+          allow_agent_mentions: true,
+          allowed_mention_open_ids: [],
+          max_posts_per_turn: 1,
+          max_posts_per_window: 4,
+          post_window_ms: 60_000,
+          max_post_attempts: 3,
+          text_threshold_chars: 900,
+        },
+      },
+      postClient,
+    });
+
+    await handler.run();
+    await whenFinalized;
+
+    expect(calls).toHaveLength(0);
+    expect(recallArgs).toHaveLength(0);
+    expect(finalizeArgs).toHaveLength(1);
+    expect(finalizeArgs[0]?.finalText).toBe("需要按钮所以保留卡片");
+    expect(finalizeArgs[0]?.choices).toEqual([{ label: "继续", value: "继续处理" }]);
+    expect(finalizeArgs[0]?.choicePrompt).toBe("下一步?");
+    expect(await readPostFile(wt)).toBeNull();
   });
 
   it("falls back to a compact card when post succeeds but processing-card recall fails", async () => {

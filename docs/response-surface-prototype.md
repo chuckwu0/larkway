@@ -13,7 +13,8 @@ post outbound behind runtime gates and production safeguards.
 ## Principles
 
 - The Agent chooses the response surface by writing `response_surface` in
-  `state.json`.
+  `state.json`. When it omits `response_surface`, the default-on runtime treats
+  plain text as `post` and still keeps card-only payloads on the card path.
 - The bridge provides channel infrastructure only: validation, mechanical
   degradation, idempotency/fallback/reconcile plumbing, and safe rendering.
 - The bridge must not encode business rules such as "short task = post" or
@@ -65,6 +66,14 @@ Supported narrow fields:
 The schema soft-fails this prototype field. A malformed `response_surface`
 becomes `undefined` and must not discard `status`, `last_message`, choices, or
 other legacy card fields needed to finalize the existing card.
+
+When `response_surface` is absent and the prototype is enabled, a plain text
+reply defaults to the primary post path. This is the default-on user experience:
+the bridge creates and dynamically updates the processing card during the turn,
+sends the final reply as a post, then recalls the transient processing card after
+the post is visible. Agent-declared `choices`, `image_blocks`, or
+`content_blocks` remain card-only by default because posts cannot render those
+interactive/rich card controls.
 
 ## Bot Config Gate
 

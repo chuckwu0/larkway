@@ -110,6 +110,15 @@ function hasCardOnlyPayload(state: StateFile | null): boolean {
   );
 }
 
+function hasCardOnlyPayloadIn(input: SurfaceDispatchInput): boolean {
+  return !!(
+    hasCardOnlyPayload(input.state) ||
+    input.baseCard.choices?.length ||
+    input.baseCard.imageBlocks?.length ||
+    input.baseCard.contentBlocks?.length
+  );
+}
+
 function compactAuditCard(
   input: SurfaceDispatchInput,
   post: { idempotencyKey: string; messageId: string },
@@ -284,10 +293,15 @@ function emitSurfaceObservation(input: {
 async function dispatchResponseSurfaceInner(
   input: SurfaceDispatchInput,
 ): Promise<SurfaceDispatchResult> {
-  const surface = input.state?.response_surface;
-  if (!surface || surface.mode === "card" || surface.primary === "card") {
+  const declaredSurface = input.state?.response_surface;
+  if (declaredSurface?.mode === "card" || declaredSurface?.primary === "card") {
     return fullCard(input, "legacy-card-mode");
   }
+  if (!declaredSurface && hasCardOnlyPayloadIn(input)) {
+    return fullCard(input, "card-capability-required");
+  }
+  const surface: NonNullable<StateFile["response_surface"]> =
+    declaredSurface ?? { mode: "post", primary: "post" };
 
   const cfg = input.prototypeConfig;
   if (!cfg?.enabled) return fullCard(input, "prototype-disabled");
@@ -309,7 +323,7 @@ async function dispatchResponseSurfaceInner(
   if (!input.visibleFallbackAvailable) {
     return fullCard(input, "visible-fallback-unavailable");
   }
-  if (hasCardOnlyPayload(input.state)) {
+  if (hasCardOnlyPayloadIn(input)) {
     return fullCard(input, "card-capability-required");
   }
   if (!input.postLedgerAvailable || !input.worktreePath) {
