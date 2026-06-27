@@ -1,6 +1,9 @@
 import type { StateFile } from "./stateFile.js";
 import type { ResponseSurfacePrototypeConfig } from "../responseSurface.js";
-import { isResponseSurfacePrototypeAllowlisted } from "../responseSurface.js";
+import {
+  isResponseSurfaceMentionAllowed,
+  isResponseSurfacePrototypeAllowlisted,
+} from "../responseSurface.js";
 import { buildPostContent } from "../lark/postContent.js";
 import type { OutboundPostClient } from "../lark/outboundPostClient.js";
 import {
@@ -143,7 +146,7 @@ function policyBlockedCard(input: SurfaceDispatchInput): CardFinalizePayload {
     ...input.baseCard,
     success: false,
     failureReason:
-      "response_surface post mention target is not in allowed_mention_open_ids; visible card fallback used",
+      "response_surface post mention target is blocked by policy; visible card fallback used",
   };
 }
 
@@ -315,7 +318,7 @@ async function dispatchResponseSurfaceInner(
 
   const mentions = surface.post?.mentions ?? [];
   const blockedMention = mentions.find(
-    (mention) => !cfg.allowed_mention_open_ids.includes(mention.user_id),
+    (mention) => !isResponseSurfaceMentionAllowed(cfg, mention.user_id),
   );
   const text = postText(input);
   const policyDigest = digestPostContent(text);
@@ -332,7 +335,7 @@ async function dispatchResponseSurfaceInner(
   const now = input.now?.() ?? new Date().toISOString();
 
   if (blockedMention) {
-    const policyError = `mention target is not allowed: ${blockedMention.user_id}`;
+    const policyError = `mention target is not allowed by response surface policy: ${blockedMention.user_id}`;
     await writeLedger(
       input,
       newLedgerEntry({

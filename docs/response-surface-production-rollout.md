@@ -1,9 +1,9 @@
 # Response Surface Production Rollout
 
 This runbook is for production rollout and rollback after explicit owner
-approval. Current code defaults response surfaces on for post/hybrid-capable
-bots; operators should use `kill_switch` and optional chat/thread allowlists to
-control blast radius.
+approval. Current code defaults response surfaces and Agent-authored handoff
+mentions on for post/hybrid-capable bots; operators should use `kill_switch`,
+budgets, and optional chat/thread/mention gates to control blast radius.
 
 ## Safety Invariants
 
@@ -12,12 +12,14 @@ control blast radius.
   - `post_outbound_enabled: true`
   - `allowed_chats: []` means all chats allowed
   - `allowed_threads: []` means all threads allowed
+  - `allow_agent_mentions: true`
   - `allowed_mention_open_ids: []`
 - Use `kill_switch: true` for immediate rollback to legacy visible cards.
 - To narrow rollout, set one chat or one thread in the allowlist. Empty
   chat/thread allowlists are intentionally broad.
-- Auto-mentions remain opt-in. Empty `allowed_mention_open_ids` means no
-  Agent-authored `@` target is authorized.
+- Agent-authored mentions are on by default for peer handoff. Empty
+  `allowed_mention_open_ids` means the Agent may choose mention targets;
+  non-empty lists narrow mentions to that exact private set.
 - Never use `@all`.
 - A turn must always produce a visible card or a visible post. If the post path
   is unavailable, over budget, policy-blocked, or fails, the handler must fall
@@ -37,6 +39,7 @@ control blast radius.
      enabled: true
      kill_switch: false
      post_outbound_enabled: true
+     allow_agent_mentions: true
      allowed_chats: []
      allowed_threads: []
      allowed_mention_open_ids: []
@@ -48,6 +51,7 @@ control blast radius.
      enabled: false
      kill_switch: true
      post_outbound_enabled: false
+     allow_agent_mentions: false
      allowed_chats: []
      allowed_threads: []
      allowed_mention_open_ids: []
@@ -56,8 +60,10 @@ control blast radius.
    logs.
 4. If using a narrowed rollout, prepare a private rollout config with:
    - one test or grey chat in `allowed_chats`, or one topic in `allowed_threads`;
-   - `allowed_mention_open_ids: []` unless automatic `@` has separately been
-     approved; if approved, include only confirmed members;
+   - `allow_agent_mentions: true` for Agent-directed handoff, or false to
+     suppress every real `@`;
+   - optional `allowed_mention_open_ids` containing only confirmed members when
+     the rollout should narrow mention targets;
    - `max_posts_per_turn: 1`;
    - a conservative `max_posts_per_window` and `post_window_ms`;
    - `kill_switch: false` only for the rollout window.
@@ -74,9 +80,9 @@ control blast radius.
 
 ## Enable / Narrowing Order
 
-Default install is broad for chats/threads, but automatic mentions are still
-off. If the operator wants a smaller first rollout, narrow before enabling the
-post path.
+Default install is broad for chats/threads and allows Agent-authored mentions.
+If the operator wants a smaller first rollout, narrow before enabling the post
+path.
 
 1. Apply optional `allowed_chats` / `allowed_threads` narrowing before clearing
    `kill_switch`.
@@ -84,8 +90,8 @@ post path.
    - `max_posts_per_turn: 1`
    - `max_posts_per_window: <small integer>`
    - `post_window_ms: <window in ms>`
-3. Keep `allowed_mention_open_ids: []` unless automatic `@` is separately
-   approved.
+3. Keep `allow_agent_mentions: true` for default peer handoff, or set a
+   non-empty `allowed_mention_open_ids` to narrow targets.
 4. Set `post_outbound_enabled: true`.
 5. Set `enabled: true` and `kill_switch: false`.
 6. Confirm the runtime log shows the post client is provided only when the
@@ -117,7 +123,8 @@ For each grey turn, confirm:
 Immediately rollback if any of these occur:
 
 - any send targets a chat or thread outside a non-empty rollout allowlist
-- any mention target is not in `allowed_mention_open_ids`
+- any mention target violates `allow_agent_mentions`,
+  `allowed_mention_open_ids`, or `@all` policy
 - a turn has no visible card and no visible post
 - a ledger entry becomes `fallback_visible` without `fallbackCardMessageId`
 - duplicate recovery cards are created for the same orphan
@@ -137,6 +144,7 @@ Prefer config rollback over code rollback for response surface incidents.
      enabled: false
      kill_switch: true
      post_outbound_enabled: false
+     allow_agent_mentions: false
      allowed_chats: []
      allowed_threads: []
      allowed_mention_open_ids: []

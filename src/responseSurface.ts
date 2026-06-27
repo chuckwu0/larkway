@@ -10,6 +10,7 @@ export function defaultResponseSurfacePrototypeConfig() {
     lazy_card_creation: false,
     kill_switch: false,
     post_outbound_enabled: true,
+    allow_agent_mentions: true,
     allowed_mention_open_ids: [] as string[],
     max_posts_per_turn: 1,
     max_posts_per_window: 4,
@@ -28,6 +29,7 @@ const responseSurfacePrototypeConfigDefaults = () => ({
   lazy_card_creation: false,
   kill_switch: false,
   post_outbound_enabled: true,
+  allow_agent_mentions: true,
   allowed_mention_open_ids: [] as string[],
   max_posts_per_turn: 1,
   max_posts_per_window: 4,
@@ -126,9 +128,14 @@ export const ResponseSurfacePrototypeConfigSchema = z
      */
     post_outbound_enabled: z.boolean().default(true),
     /**
-     * Explicit target allowlist for future real post @ mentions. Empty means no
-     * mention target is authorized. Keep real IDs in private bot config, never
-     * in public docs/tests.
+     * Allows Agent-authored post mentions. This powers handoff to peer bots.
+     * Keep this false only when the operator wants to suppress every real @.
+     */
+    allow_agent_mentions: z.boolean().default(true),
+    /**
+     * Optional target allowlist for real post @ mentions. Empty means the Agent
+     * may choose mention targets; non-empty narrows mentions to this exact set.
+     * Keep real IDs in private bot config, never in public docs/tests.
      */
     allowed_mention_open_ids: z.array(z.string().min(1)).default([]),
     /**
@@ -177,6 +184,17 @@ export function isResponseSurfacePrototypeAllowlisted(
   const threadAllowed =
     config.allowed_threads.length > 0 && config.allowed_threads.includes(facts.threadId);
   return chatAllowed || threadAllowed;
+}
+
+export function isResponseSurfaceMentionAllowed(
+  config: ResponseSurfacePrototypeConfig | undefined,
+  userId: string,
+): boolean {
+  if (!config?.allow_agent_mentions) return false;
+  const normalized = userId.trim().toLowerCase();
+  if (normalized === "all" || normalized === "@all") return false;
+  if (config.allowed_mention_open_ids.length === 0) return true;
+  return config.allowed_mention_open_ids.includes(userId);
 }
 
 export function shouldProvideResponseSurfacePostClient(

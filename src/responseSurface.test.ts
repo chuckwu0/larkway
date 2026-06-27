@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   defaultResponseSurfacePrototypeConfig,
+  isResponseSurfaceMentionAllowed,
   isResponseSurfacePostOutboundAvailable,
   isResponseSurfacePrototypeAllowlisted,
   shouldProvideResponseSurfacePostClient,
@@ -13,13 +14,14 @@ const enabledConfig = {
 };
 
 describe("response surface production gates", () => {
-  it("enables post surfaces by default while keeping auto-mentions off", () => {
+  it("enables post surfaces and agent-authored mentions by default", () => {
     const cfg = defaultResponseSurfacePrototypeConfig();
 
     expect(cfg).toMatchObject({
       enabled: true,
       post_outbound_enabled: true,
       kill_switch: false,
+      allow_agent_mentions: true,
       allowed_chats: [],
       allowed_threads: [],
       allowed_mention_open_ids: [],
@@ -30,6 +32,9 @@ describe("response surface production gates", () => {
     expect(isResponseSurfacePrototypeAllowlisted(cfg, { chatId: "any_chat", threadId: "any_thread" }))
       .toBe(true);
     expect(shouldProvideResponseSurfacePostClient(cfg)).toBe(true);
+    expect(isResponseSurfaceMentionAllowed(cfg, "peer_bot")).toBe(true);
+    expect(isResponseSurfaceMentionAllowed(cfg, "all")).toBe(false);
+    expect(isResponseSurfaceMentionAllowed(cfg, "@all")).toBe(false);
   });
 
   it("treats non-empty chat or thread allowlists as scoped rollout gates", () => {
@@ -60,5 +65,14 @@ describe("response surface production gates", () => {
     const cfg = { ...enabledConfig, max_posts_per_window: 0 };
 
     expect(shouldProvideResponseSurfacePostClient(cfg)).toBe(false);
+  });
+
+  it("can narrow or disable agent-authored mentions without hardcoded default ids", () => {
+    const narrowed = { ...enabledConfig, allowed_mention_open_ids: ["peer_a"] };
+    expect(isResponseSurfaceMentionAllowed(narrowed, "peer_a")).toBe(true);
+    expect(isResponseSurfaceMentionAllowed(narrowed, "peer_b")).toBe(false);
+
+    const disabled = { ...enabledConfig, allow_agent_mentions: false };
+    expect(isResponseSurfaceMentionAllowed(disabled, "peer_a")).toBe(false);
   });
 });

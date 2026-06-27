@@ -521,6 +521,7 @@ describe("handleOne — thin-channel finalize", () => {
           lazy_card_creation: true,
           kill_switch: false,
           post_outbound_enabled: true,
+          allow_agent_mentions: true,
           allowed_mention_open_ids: [],
           max_posts_per_turn: 1,
           max_posts_per_window: 4,
@@ -595,6 +596,7 @@ describe("handleOne — thin-channel finalize", () => {
           lazy_card_creation: true,
           kill_switch: false,
           post_outbound_enabled: true,
+          allow_agent_mentions: true,
           allowed_mention_open_ids: [],
           max_posts_per_turn: 1,
           max_posts_per_window: 4,
@@ -720,6 +722,7 @@ describe("handleOne — thin-channel finalize", () => {
           lazy_card_creation: true,
           kill_switch: false,
           post_outbound_enabled: true,
+          allow_agent_mentions: true,
           allowed_mention_open_ids: [],
           max_posts_per_turn: 1,
           max_posts_per_window: 4,
@@ -799,6 +802,7 @@ describe("handleOne — thin-channel finalize", () => {
           lazy_card_creation: true,
           kill_switch: true,
           post_outbound_enabled: true,
+          allow_agent_mentions: true,
           allowed_mention_open_ids: [],
           max_posts_per_turn: 1,
           max_posts_per_window: 4,
@@ -873,6 +877,7 @@ describe("handleOne — thin-channel finalize", () => {
           lazy_card_creation: true,
           kill_switch: false,
           post_outbound_enabled: true,
+          allow_agent_mentions: true,
           allowed_mention_open_ids: [],
           max_posts_per_turn: 1,
           max_posts_per_window: 4,
@@ -955,6 +960,7 @@ describe("handleOne — thin-channel finalize", () => {
           lazy_card_creation: true,
           kill_switch: false,
           post_outbound_enabled: true,
+          allow_agent_mentions: true,
           allowed_mention_open_ids: [],
           max_posts_per_turn: 1,
           max_posts_per_window: 4,
@@ -1037,6 +1043,7 @@ describe("handleOne — thin-channel finalize", () => {
           lazy_card_creation: true,
           kill_switch: false,
           post_outbound_enabled: true,
+          allow_agent_mentions: true,
           allowed_mention_open_ids: ["user_allowed"],
           max_posts_per_turn: 1,
           max_posts_per_window: 4,
@@ -1054,7 +1061,7 @@ describe("handleOne — thin-channel finalize", () => {
     expect(startArgs).toHaveLength(1);
     expect(finalizeArgs).toHaveLength(1);
     expect(finalizeArgs[0]?.success).toBe(false);
-    expect(finalizeArgs[0]?.failureReason).toContain("allowed_mention_open_ids");
+    expect(finalizeArgs[0]?.failureReason).toContain("blocked by policy");
     expect(calls).toHaveLength(0);
     let ledger = await readPostFile(wt);
     for (let i = 0; i < 100 && ledger?.posts[0]?.status !== "policy_blocked"; i++) {

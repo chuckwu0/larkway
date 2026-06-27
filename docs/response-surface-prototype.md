@@ -1,7 +1,7 @@
 # Response Surface Prototype
 
-Status: production foundation. Response surface is enabled by default; auto-@
-mentions stay opt-in.
+Status: production foundation. Response surface and Agent-authored handoff
+mentions are enabled by default.
 
 This document defines the `card` / `post` / `hybrid` response surface runtime.
 PR3 added post transport, post payload construction, idempotency helpers, and
@@ -20,10 +20,12 @@ post outbound behind runtime gates and production safeguards.
   "long task = card".
 - Existing bots default to response surfaces. Empty chat/thread allowlists mean
   all chats/threads are eligible; non-empty allowlists narrow rollout scope.
-- `allowed_mention_open_ids: []` means no automatic `@` target is authorized.
-  A post may still be sent, but the bridge strips no policy: any Agent-authored
-  mention outside the explicit allowlist is policy-blocked and falls back to a
-  visible card.
+- Agent-authored mentions are enabled by default so one bot can hand work to the
+  next peer. The package defaults do not hardcode any real open ids; the Agent
+  chooses concrete mention targets in `state.json`.
+- `@all` is always blocked.
+- `allowed_mention_open_ids: []` means unrestricted Agent-authored mentions.
+  Non-empty lists narrow mentions to that exact private operator-configured set.
 
 ## State Protocol
 
@@ -74,6 +76,7 @@ response_surface_prototype:
   lazy_card_creation: true
   kill_switch: false
   post_outbound_enabled: true
+  allow_agent_mentions: true
   allowed_mention_open_ids: []
   max_posts_per_turn: 1
   max_posts_per_window: 4
@@ -90,6 +93,7 @@ Defaults:
 - `lazy_card_creation: false`
 - `kill_switch: false`
 - `post_outbound_enabled: true`
+- `allow_agent_mentions: true`
 - `allowed_mention_open_ids: []`
 - `max_posts_per_turn: 1`
 - `max_posts_per_window: 4`
@@ -99,7 +103,9 @@ Defaults:
 
 Empty `allowed_chats` and `allowed_threads` mean all chats/threads are allowed.
 Set either list to one or more ids to narrow rollout scope. Mentions are
-separate: empty `allowed_mention_open_ids` is deny-all for automatic `@`.
+separate: `allow_agent_mentions: false` disables all Agent-authored mentions;
+empty `allowed_mention_open_ids` allows the Agent to choose targets; non-empty
+`allowed_mention_open_ids` narrows mentions to that set. `@all` remains blocked.
 
 ## PR2 / PR4 SurfaceController Foundation
 
@@ -238,11 +244,11 @@ post budgets.
   `fallbackCardMessageId` entries. These are meant for operator dashboards/log
   queries, not public evidence files.
 
-All PR7 safeguards are mechanical gates. They do not decide business workflow
-and do not authorize automatic `@` targets by default.
+All PR7 safeguards are mechanical gates. They do not decide business workflow,
+and they do not hardcode mention targets in package defaults.
 
 ## Non-Goals Until Later PRs
 
-- No automatic `@` mention enablement in repo defaults.
+- No hardcoded real open ids in repo defaults.
 - No real post/at or Feishu E2E during unit-test PRs.
 - No deployment, restart, or production bridge touch as part of code changes.

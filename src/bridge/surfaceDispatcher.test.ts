@@ -18,6 +18,7 @@ const enabledConfig = {
   lazy_card_creation: true,
   kill_switch: false,
   post_outbound_enabled: true,
+  allow_agent_mentions: true,
   allowed_mention_open_ids: ["user_allowed"],
   max_posts_per_turn: 1,
   max_posts_per_window: 4,
@@ -32,6 +33,7 @@ const defaultOffConfig = {
   allowed_chats: [],
   allowed_threads: [],
   post_outbound_enabled: false,
+  allow_agent_mentions: true,
   allowed_mention_open_ids: [],
 };
 
@@ -251,7 +253,7 @@ describe("dispatchResponseSurface", () => {
       expect(after?.posts[0]?.attempts).toEqual([]);
     }));
 
-  it("keeps auto-mentions blocked by default even when chat allowlists are empty", async () =>
+  it("allows agent-authored mentions by default when mention allowlists are empty", async () =>
     withTemp(async (dir) => {
       const { client, calls } = fakePostClient();
       const result = await dispatchResponseSurface(
@@ -277,6 +279,32 @@ describe("dispatchResponseSurface", () => {
             mode: "post",
             primary: "post",
             post: { mentions: [{ user_id: "user_blocked", label: "Blocked" }] },
+          }),
+        }),
+      );
+
+      expect(result.reason).toBe("post-sent");
+      expect(result.visible).toBe(true);
+      expect(calls).toHaveLength(1);
+      expect(calls[0]?.content).toContain("user_blocked");
+
+      const after = await readPostFile(dir);
+      expect(after?.posts[0]?.status).toBe("sent");
+      expect(after?.posts[0]?.mentionCount).toBe(1);
+    }));
+
+  it("blocks @all even when agent-authored mentions are enabled", async () =>
+    withTemp(async (dir) => {
+      const { client, calls } = fakePostClient();
+      const result = await dispatchResponseSurface(
+        baseInput({
+          worktreePath: dir,
+          cardStarted: false,
+          postClient: client,
+          state: state({
+            mode: "post",
+            primary: "post",
+            post: { mentions: [{ user_id: "all", label: "All" }] },
           }),
         }),
       );
