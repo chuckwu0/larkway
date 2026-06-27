@@ -10,8 +10,10 @@ import {
 import { readPostFile, writePostFile } from "./postFile.js";
 import type { StateFile } from "./stateFile.js";
 import type { OutboundPostClient } from "../lark/outboundPostClient.js";
+import { defaultResponseSurfacePrototypeConfig } from "../responseSurface.js";
 
 const enabledConfig = {
+  ...defaultResponseSurfacePrototypeConfig(),
   enabled: true,
   allowed_chats: ["chat_allowed"],
   allowed_threads: [],

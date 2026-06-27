@@ -95,6 +95,13 @@ export interface CardHandle {
      */
     contentBlocks?: ContentBlock[];
   }): Promise<void>;
+
+  /**
+   * Recall the card message. Used after a primary post succeeds so the transient
+   * progress card does not remain as a duplicate response. May throw; callers
+   * must treat this as best-effort because the post is already visible.
+   */
+  recall(): Promise<void>;
 }
 
 // ---------------------------------------------------------------------------
@@ -705,6 +712,21 @@ class CardHandleImpl implements CardHandle {
     // the final exception to the caller after maxAttempts so handler.ts
     // can surface it. Reused logic mirrors live patches.
     await this.livePatchWithRetry(cardJsonStr, /*throwOnFinalFail*/ true);
+  }
+
+  async recall(): Promise<void> {
+    this.finalized = true;
+
+    if (this.state.pendingPatch !== null) {
+      clearTimeout(this.state.pendingPatch);
+      this.state.pendingPatch = null;
+    }
+
+    await this.drainLivePatches();
+    if (!this.outbound.recallCard) {
+      throw new Error("[lark.card] outbound client does not support recallCard");
+    }
+    await this.outbound.recallCard(this.messageId);
   }
 
   // ── Private: accumulate ───────────────────────────────────────────────────

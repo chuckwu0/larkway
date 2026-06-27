@@ -124,6 +124,9 @@ export interface OutboundLarkChannel {
             path: { message_id: string };
             data: { content: string; msg_type: string; reply_in_thread?: boolean; uuid?: string };
           }): Promise<RawReplyResult>;
+          delete(payload: {
+            path: { message_id: string };
+          }): Promise<void>;
         };
         messageReaction: {
           create(payload: {
@@ -295,5 +298,19 @@ export class ChannelCardClient implements OutboundCardClient {
     // so retrying on transient transport errors (socket hang up / ETIMEDOUT) is
     // always safe. Wrap in withRetry before calling the SDK's updateCard.
     await withRetry("patchCard", () => this.channel().updateCard(messageId, card));
+  }
+
+  /**
+   * Recall an interactive card message. This is used after a primary post reply
+   * has already been sent successfully; callers treat failures as best-effort so
+   * recall never creates an invisible reply.
+   */
+  async recallCard(messageId: string): Promise<void> {
+    await withRetry("recallCard", () =>
+      this.channel().rawClient.im.v1.message.delete({
+        path: { message_id: messageId },
+      }),
+    );
+    this.cardThreads.delete(messageId);
   }
 }

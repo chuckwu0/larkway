@@ -177,6 +177,7 @@ function makeFakeRenderer(opts?: {
       messageId,
       finalizeArgs,
       handle: () => {},
+      recall: vi.fn(async () => {}) as unknown as CardHandle["recall"],
       finalize: vi.fn(async (a) => {
         finalizeArgs.push(a);
         if (opts?.rejectFinalize) throw new Error("PATCH 230001 not the sender");

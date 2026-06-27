@@ -545,7 +545,7 @@ read_only: false
     expect(bots[0]?.read_only).toBe(false);
   });
 
-  it("response_surface_prototype defaults post surfaces on but mentions off", async () => {
+  it("response_surface_prototype defaults post surfaces and agent-authored mentions on", async () => {
     await createBotsDir();
     await writeYaml(
       "surface-default.yaml",
@@ -570,6 +570,8 @@ bot_open_id: ou_surface_default
       post_outbound_enabled: true,
       allow_agent_mentions: true,
       allowed_mention_open_ids: [],
+      recall_processing_card_on_post_success: true,
+      retain_hybrid_audit_card: true,
       max_posts_per_turn: 1,
       max_posts_per_window: 4,
       post_window_ms: 60_000,
@@ -605,6 +607,8 @@ response_surface_prototype:
   max_posts_per_window: 7
   post_window_ms: 30000
   max_post_attempts: 2
+  recall_processing_card_on_post_success: false
+  retain_hybrid_audit_card: false
   text_threshold_chars: 900
 `,
     );
@@ -620,6 +624,8 @@ response_surface_prototype:
       post_outbound_enabled: true,
       allow_agent_mentions: false,
       allowed_mention_open_ids: ["surface_peer"],
+      recall_processing_card_on_post_success: false,
+      retain_hybrid_audit_card: false,
       max_posts_per_turn: 2,
       max_posts_per_window: 7,
       post_window_ms: 30_000,

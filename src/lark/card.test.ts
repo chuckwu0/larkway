@@ -17,6 +17,7 @@ import { describe, it, expect, vi } from "vitest";
 
 class FakeOutbound {
   readonly patchCalls: Array<{ messageId: string; cardJson: string }> = [];
+  readonly recallCalls: string[] = [];
   createCalls: Array<{ replyTo: string; cardJson: string; replyInThread: boolean }> = [];
   /** When set, patchCard rejects with this error (simulates a failing send). */
   patchError: Error | null = null;
@@ -37,6 +38,10 @@ class FakeOutbound {
   async patchCard(messageId: string, cardJson: string): Promise<void> {
     if (this.patchError) throw this.patchError;
     this.patchCalls.push({ messageId, cardJson });
+  }
+
+  async recallCard(messageId: string): Promise<void> {
+    this.recallCalls.push(messageId);
   }
 }
 
@@ -168,6 +173,53 @@ describe("CardRenderer.start() — replyInThread (Phase 4)", () => {
     await renderer.start("om_user_msg", { replyInThread: false });
 
     expect(fake.createCalls[0]!.replyInThread).toBe(false);
+  });
+});
+
+describe("CardHandle.recall()", () => {
+  it("recalls the created card message and suppresses later live patches", async () => {
+    const { CardRenderer } = await import("./card.js");
+    const fake = new FakeOutbound();
+    const renderer = new CardRenderer({
+      outbound: fake,
+      patchIntervalMs: 10_000,
+      botName: "Frontend",
+    });
+    const handle = await renderer.start("om_user_msg");
+
+    handle.handle({
+      type: "text_delta",
+      text: "partial answer",
+      raw: { message: { id: "msg_1" } },
+    });
+    await handle.recall();
+    handle.handle({
+      type: "text_delta",
+      text: "should not patch after recall",
+      raw: { message: { id: "msg_1" } },
+    });
+
+    expect(fake.recallCalls).toEqual(["om_test123"]);
+    expect(fake.patchCalls.length).toBeGreaterThanOrEqual(1);
+    const lastPatch = lastPatchedCard(fake);
+    expect(lastPatch?.header?.title?.content).toBe("🔧 处理中");
+  });
+
+  it("throws when the outbound transport cannot recall cards", async () => {
+    const { CardRenderer } = await import("./card.js");
+    const outboundWithoutRecall = {
+      async createCard() {
+        return { messageId: "om_test123" };
+      },
+      async patchCard() {},
+    };
+    const renderer = new CardRenderer({
+      outbound: outboundWithoutRecall,
+      patchIntervalMs: 10_000,
+    });
+    const handle = await renderer.start("om_user_msg");
+
+    await expect(handle.recall()).rejects.toThrow(/does not support recallCard/);
   });
 });
 

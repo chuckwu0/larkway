@@ -1,7 +1,9 @@
 import { describe, expect, it } from "vitest";
 import { SurfaceController } from "./surfaceController.js";
+import { defaultResponseSurfacePrototypeConfig } from "../responseSurface.js";
 
 const allowlistedConfig = {
+  ...defaultResponseSurfacePrototypeConfig(),
   enabled: true,
   allowed_chats: ["chat_allowed"],
   allowed_threads: [],
@@ -26,6 +28,7 @@ describe("SurfaceController", () => {
   it("keeps legacy eager card creation when the prototype is disabled", () => {
     const controller = SurfaceController.create({
       prototypeConfig: {
+        ...defaultResponseSurfacePrototypeConfig(),
         enabled: false,
         allowed_chats: [],
         allowed_threads: [],

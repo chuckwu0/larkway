@@ -1202,6 +1202,15 @@ export class BridgeHandler {
               : undefined,
           });
 
+          const postMessageId = surfaceDispatch.post?.messageId;
+          const shouldRecallProcessingCard =
+            !!postMessageId &&
+            prototypeConfig?.recall_processing_card_on_post_success !== false &&
+            !(
+              reportedState?.response_surface?.mode === "hybrid" &&
+              prototypeConfig?.retain_hybrid_audit_card !== false
+            );
+
           if (surfaceDispatch.card) {
             if (!card) {
               card = await this.deps.cardRenderer.start(messageId, { replyInThread, threadId });
@@ -1219,58 +1228,84 @@ export class BridgeHandler {
               }
             }
 
-            await card.finalize(surfaceDispatch.card);
-
-            let keepCardFileForRetry = false;
-            if (surfaceDispatch.post?.requiresFallbackLedgerMark) {
+            if (shouldRecallProcessingCard) {
+              let cardResolved = false;
               try {
-                await markPostLedgerFallbackVisible(
-                  worktreePath,
-                  surfaceDispatch.post.idempotencyKey,
-                  {
-                    fallbackCardMessageId: card.messageId,
-                    error:
-                      surfaceDispatch.post.fallbackError ??
-                      surfaceDispatch.card.failureReason ??
-                      "post outbound failed; visible card fallback used",
-                  },
-                );
+                await card.recall();
+                cardResolved = true;
               } catch (err) {
-                keepCardFileForRetry = true;
                 console.warn(
-                  "[bridge.handler] fallback ledger mark failed after visible card finalize; keeping card.json for retry:",
+                  "[bridge.handler] recall processing card after post success failed; keeping/finalizing card as fallback:",
                   err,
                 );
+                try {
+                  await card.finalize(surfaceDispatch.card);
+                  cardResolved = true;
+                } catch (finalizeErr) {
+                  console.warn(
+                    "[bridge.handler] finalize fallback after recall failure also failed; keeping card.json for retry:",
+                    finalizeErr,
+                  );
+                }
               }
-            }
-            if (surfaceDispatch.post?.requiresPolicyLedgerMark) {
-              try {
-                await markPostLedgerPolicyBlockedVisible(
-                  worktreePath,
-                  surfaceDispatch.post.idempotencyKey,
-                  {
-                    fallbackCardMessageId: card.messageId,
-                    error:
-                      surfaceDispatch.post.policyError ??
-                      surfaceDispatch.card.failureReason ??
-                      "mention policy blocked; visible card fallback used",
-                  },
-                );
-              } catch (err) {
-                keepCardFileForRetry = true;
-                console.warn(
-                  "[bridge.handler] policy-blocked ledger mark failed after visible card finalize; keeping card.json for retry:",
-                  err,
-                );
-              }
-            }
 
-            // Card was finalized successfully — drop its card.json so boot
-            // reconcile doesn't re-finalize an already-finalized card. If the
-            // post fallback/policy ledger mark failed, keep card.json so boot
-            // reconcile can retry association with the existing visible card.
-            if (!keepCardFileForRetry) {
-              await deleteCardFile(worktreePath);
+              if (cardResolved) {
+                await deleteCardFile(worktreePath);
+              }
+            } else {
+              await card.finalize(surfaceDispatch.card);
+
+              let keepCardFileForRetry = false;
+              if (surfaceDispatch.post?.requiresFallbackLedgerMark) {
+                try {
+                  await markPostLedgerFallbackVisible(
+                    worktreePath,
+                    surfaceDispatch.post.idempotencyKey,
+                    {
+                      fallbackCardMessageId: card.messageId,
+                      error:
+                        surfaceDispatch.post.fallbackError ??
+                        surfaceDispatch.card.failureReason ??
+                        "post outbound failed; visible card fallback used",
+                    },
+                  );
+                } catch (err) {
+                  keepCardFileForRetry = true;
+                  console.warn(
+                    "[bridge.handler] fallback ledger mark failed after visible card finalize; keeping card.json for retry:",
+                    err,
+                  );
+                }
+              }
+              if (surfaceDispatch.post?.requiresPolicyLedgerMark) {
+                try {
+                  await markPostLedgerPolicyBlockedVisible(
+                    worktreePath,
+                    surfaceDispatch.post.idempotencyKey,
+                    {
+                      fallbackCardMessageId: card.messageId,
+                      error:
+                        surfaceDispatch.post.policyError ??
+                        surfaceDispatch.card.failureReason ??
+                        "mention policy blocked; visible card fallback used",
+                    },
+                  );
+                } catch (err) {
+                  keepCardFileForRetry = true;
+                  console.warn(
+                    "[bridge.handler] policy-blocked ledger mark failed after visible card finalize; keeping card.json for retry:",
+                    err,
+                  );
+                }
+              }
+
+              // Card was finalized successfully — drop its card.json so boot
+              // reconcile doesn't re-finalize an already-finalized card. If the
+              // post fallback/policy ledger mark failed, keep card.json so boot
+              // reconcile can retry association with the existing visible card.
+              if (!keepCardFileForRetry) {
+                await deleteCardFile(worktreePath);
+              }
             }
           }
 

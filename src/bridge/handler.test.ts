@@ -15,6 +15,7 @@ import { reconcileOrphanedCards } from "./reconcile.js";
 import { buildPostContent } from "../lark/postContent.js";
 import { derivePostIdempotencyKey, digestPostContent } from "../lark/idempotency.js";
 import type { OutboundPostClient } from "../lark/outboundPostClient.js";
+import { defaultResponseSurfacePrototypeConfig } from "../responseSurface.js";
 
 // ---------------------------------------------------------------------------
 // handler.ts calls createRunner("claude").run(...) from agent/runner.
@@ -143,10 +144,11 @@ interface FinalizeArgs {
  * fire-and-forget (it sets up a per-thread promise chain and returns without
  * awaiting handleOne), so tests await whenFinalized to know the turn finished.
  */
-function makeCardRenderer() {
+function makeCardRenderer(rendererOpts: { recallFails?: boolean } = {}) {
   const finalizeArgs: FinalizeArgs[] = [];
   const startArgs: Array<{ messageId: string; replyInThread?: boolean; threadId?: string }> = [];
   const handleEvents: unknown[] = [];
+  const recallArgs: string[] = [];
   let resolveFinalized!: () => void;
   const whenFinalized = new Promise<void>((r) => {
     resolveFinalized = r;
@@ -163,10 +165,14 @@ function makeCardRenderer() {
           finalizeArgs.push(a);
           resolveFinalized();
         },
+        recall: async () => {
+          recallArgs.push("om_card");
+          if (rendererOpts.recallFails) throw new Error("fake recall failed");
+        },
       };
     },
   };
-  return { renderer, finalizeArgs, startArgs, handleEvents, whenFinalized };
+  return { renderer, finalizeArgs, startArgs, handleEvents, recallArgs, whenFinalized };
 }
 
 /** Minimal SessionStore fake — in-memory, records put() calls. */
@@ -499,7 +505,7 @@ describe("handleOne — thin-channel finalize", () => {
   });
 
   it("keeps visible card fallback when response surface is enabled before post outbound exists", async () => {
-    const { renderer, startArgs, finalizeArgs, whenFinalized } = makeCardRenderer();
+    const { renderer, startArgs, finalizeArgs, recallArgs, whenFinalized } = makeCardRenderer();
     const { store } = makeSessionStore();
     const { client } = makeClient(makeEvent());
     stubRunClaude("sess_surface", 0);
@@ -518,6 +524,7 @@ describe("handleOne — thin-channel finalize", () => {
         turn_taking_limit: 10,
         backend: "claude",
         response_surface_prototype: {
+          ...defaultResponseSurfacePrototypeConfig(),
           enabled: true,
           allowed_chats: [],
           allowed_threads: ["om_msg"],
@@ -575,7 +582,7 @@ describe("handleOne — thin-channel finalize", () => {
       kill: () => {},
     });
 
-    const { renderer, startArgs, finalizeArgs, whenFinalized } = makeCardRenderer();
+    const { renderer, startArgs, finalizeArgs, recallArgs, whenFinalized } = makeCardRenderer();
     const { store } = makeSessionStore();
     const { client } = makeClient(makeEvent());
 
@@ -593,6 +600,7 @@ describe("handleOne — thin-channel finalize", () => {
         turn_taking_limit: 10,
         backend: "claude",
         response_surface_prototype: {
+          ...defaultResponseSurfacePrototypeConfig(),
           enabled: true,
           allowed_chats: [],
           allowed_threads: ["om_msg"],
@@ -647,7 +655,7 @@ describe("handleOne — thin-channel finalize", () => {
       kill: () => {},
     });
 
-    const { renderer, startArgs, finalizeArgs, whenFinalized } = makeCardRenderer();
+    const { renderer, startArgs, finalizeArgs, recallArgs, whenFinalized } = makeCardRenderer();
     const { store } = makeSessionStore();
     const { client } = makeClient(makeEvent());
 
@@ -703,7 +711,7 @@ describe("handleOne — thin-channel finalize", () => {
       kill: () => {},
     });
 
-    const { renderer, startArgs, finalizeArgs, handleEvents, whenFinalized } = makeCardRenderer();
+    const { renderer, startArgs, finalizeArgs, handleEvents, recallArgs } = makeCardRenderer();
     const { store } = makeSessionStore();
     const { client, acked } = makeClient(makeEvent());
 
@@ -721,6 +729,96 @@ describe("handleOne — thin-channel finalize", () => {
         turn_taking_limit: 10,
         backend: "claude",
         response_surface_prototype: {
+          ...defaultResponseSurfacePrototypeConfig(),
+          enabled: true,
+          allowed_chats: [],
+          allowed_threads: ["om_msg"],
+          lazy_card_creation: true,
+          kill_switch: false,
+          post_outbound_enabled: true,
+          allow_agent_mentions: true,
+          allowed_mention_open_ids: [],
+          max_posts_per_turn: 1,
+          max_posts_per_window: 4,
+          post_window_ms: 60_000,
+          max_post_attempts: 3,
+          text_threshold_chars: 900,
+        },
+      },
+      postClient,
+    });
+
+    await handler.run();
+    for (let i = 0; i < 100 && acked.length === 0; i++) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
+
+    expect(acked).toEqual(["om_msg"]);
+    expect(startArgs).toHaveLength(1);
+    expect(handleEvents.map((event) => (event as { type?: string }).type)).toEqual([
+      "system_init",
+      "tool_use",
+      "text_delta",
+    ]);
+    expect(recallArgs).toEqual(["om_card"]);
+    expect(finalizeArgs).toHaveLength(0);
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.replyToMessageId).toBe("om_msg");
+    expect(calls[0]?.content).toContain("隔离配置走 post-only");
+    const ledger = await readPostFile(wt);
+    expect(ledger?.posts[0]?.status).toBe("sent");
+    expect(ledger?.posts[0]?.postMessageId).toBe("om_post");
+  });
+
+  it("falls back to a compact card when post succeeds but processing-card recall fails", async () => {
+    const threadId = "om_msg";
+    const finalState = {
+      status: "ready",
+      last_message: "post 已发但撤卡失败",
+      response_surface: {
+        mode: "post",
+        primary: "post",
+      },
+      updated_at: "2026-06-26T10:00:00.000Z",
+    };
+    const wt = await seedWorktree(threadId);
+    await seedRepoCachePath();
+    const { client: postClient, calls } = makePostClient();
+
+    runClaudeImpl = () => ({
+      events: (async function* () {
+        yield { type: "system_init", sessionId: "sess_surface_recall_failed", raw: {} };
+        await writeFile(
+          stateFileMod.stateFilePathOf(wt),
+          JSON.stringify(finalState, null, 2),
+          "utf8",
+        );
+      })(),
+      done: Promise.resolve({ exitCode: 0, sessionId: "sess_surface_recall_failed" }),
+      kill: () => {},
+    });
+
+    const { renderer, finalizeArgs, recallArgs, whenFinalized } = makeCardRenderer({
+      recallFails: true,
+    });
+    const { store } = makeSessionStore();
+    const { client, acked } = makeClient(makeEvent());
+
+    const handler = new BridgeHandler({
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      client: client as any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      cardRenderer: renderer as any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      sessionStore: store as any,
+      conventions: makeConventions(),
+      botConfig: {
+        id: "frontend",
+        name: "Frontend",
+        turn_taking_limit: 10,
+        backend: "claude",
+        response_surface_prototype: {
+          ...defaultResponseSurfacePrototypeConfig(),
           enabled: true,
           allowed_chats: [],
           allowed_threads: ["om_msg"],
@@ -745,21 +843,89 @@ describe("handleOne — thin-channel finalize", () => {
       await new Promise((r) => setTimeout(r, 10));
     }
 
-    expect(acked).toEqual(["om_msg"]);
-    expect(startArgs).toHaveLength(1);
-    expect(handleEvents.map((event) => (event as { type?: string }).type)).toEqual([
-      "system_init",
-      "tool_use",
-      "text_delta",
-    ]);
+    expect(calls).toHaveLength(1);
+    expect(recallArgs).toEqual(["om_card"]);
     expect(finalizeArgs).toHaveLength(1);
     expect(finalizeArgs[0]?.finalText).toContain("post_message_id: om_post");
-    expect(calls).toHaveLength(1);
-    expect(calls[0]?.replyToMessageId).toBe("om_msg");
-    expect(calls[0]?.content).toContain("隔离配置走 post-only");
+    expect(acked).toEqual(["om_msg"]);
     const ledger = await readPostFile(wt);
     expect(ledger?.posts[0]?.status).toBe("sent");
     expect(ledger?.posts[0]?.postMessageId).toBe("om_post");
+  });
+
+  it("keeps the hybrid compact audit card by default after a primary post succeeds", async () => {
+    const threadId = "om_msg";
+    const finalState = {
+      status: "ready",
+      last_message: "hybrid 主 post + 审计卡",
+      response_surface: {
+        mode: "hybrid",
+        primary: "post",
+      },
+      updated_at: "2026-06-26T10:00:00.000Z",
+    };
+    const wt = await seedWorktree(threadId);
+    await seedRepoCachePath();
+    const { client: postClient, calls } = makePostClient();
+
+    runClaudeImpl = () => ({
+      events: (async function* () {
+        yield { type: "system_init", sessionId: "sess_surface_hybrid", raw: {} };
+        await writeFile(
+          stateFileMod.stateFilePathOf(wt),
+          JSON.stringify(finalState, null, 2),
+          "utf8",
+        );
+      })(),
+      done: Promise.resolve({ exitCode: 0, sessionId: "sess_surface_hybrid" }),
+      kill: () => {},
+    });
+
+    const { renderer, finalizeArgs, recallArgs, whenFinalized } = makeCardRenderer();
+    const { store } = makeSessionStore();
+    const { client } = makeClient(makeEvent());
+
+    const handler = new BridgeHandler({
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      client: client as any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      cardRenderer: renderer as any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      sessionStore: store as any,
+      conventions: makeConventions(),
+      botConfig: {
+        id: "frontend",
+        name: "Frontend",
+        turn_taking_limit: 10,
+        backend: "claude",
+        response_surface_prototype: {
+          ...defaultResponseSurfacePrototypeConfig(),
+          enabled: true,
+          allowed_chats: [],
+          allowed_threads: ["om_msg"],
+          lazy_card_creation: true,
+          kill_switch: false,
+          post_outbound_enabled: true,
+          allow_agent_mentions: true,
+          allowed_mention_open_ids: [],
+          max_posts_per_turn: 1,
+          max_posts_per_window: 4,
+          post_window_ms: 60_000,
+          max_post_attempts: 3,
+          text_threshold_chars: 900,
+        },
+      },
+      postClient,
+    });
+
+    await handler.run();
+    await whenFinalized;
+
+    expect(calls).toHaveLength(1);
+    expect(recallArgs).toHaveLength(0);
+    expect(finalizeArgs).toHaveLength(1);
+    expect(finalizeArgs[0]?.finalText).toContain("post_message_id: om_post");
+    expect((await readPostFile(wt))?.posts[0]?.status).toBe("sent");
   });
 
   it("honors the response-surface kill switch even when post outbound is otherwise configured", async () => {
@@ -790,7 +956,7 @@ describe("handleOne — thin-channel finalize", () => {
       kill: () => {},
     });
 
-    const { renderer, startArgs, finalizeArgs, whenFinalized } = makeCardRenderer();
+    const { renderer, startArgs, finalizeArgs, recallArgs, whenFinalized } = makeCardRenderer();
     const { store } = makeSessionStore();
     const { client } = makeClient(makeEvent());
 
@@ -808,6 +974,7 @@ describe("handleOne — thin-channel finalize", () => {
         turn_taking_limit: 10,
         backend: "claude",
         response_surface_prototype: {
+          ...defaultResponseSurfacePrototypeConfig(),
           enabled: true,
           allowed_chats: [],
           allowed_threads: ["om_msg"],
@@ -865,7 +1032,7 @@ describe("handleOne — thin-channel finalize", () => {
       kill: () => {},
     });
 
-    const { renderer, startArgs, finalizeArgs, whenFinalized } = makeCardRenderer();
+    const { renderer, startArgs, finalizeArgs, recallArgs, whenFinalized } = makeCardRenderer();
     const { store } = makeSessionStore();
     const { client } = makeClient(makeEvent());
 
@@ -883,6 +1050,7 @@ describe("handleOne — thin-channel finalize", () => {
         turn_taking_limit: 10,
         backend: "claude",
         response_surface_prototype: {
+          ...defaultResponseSurfacePrototypeConfig(),
           enabled: true,
           allowed_chats: [],
           allowed_threads: ["om_msg"],
@@ -908,6 +1076,7 @@ describe("handleOne — thin-channel finalize", () => {
     expect(finalizeArgs).toHaveLength(1);
     expect(finalizeArgs[0]?.success).toBe(false);
     expect(finalizeArgs[0]?.failureReason).toContain("visible card fallback used");
+    expect(recallArgs).toHaveLength(0);
     expect(calls).toHaveLength(1);
     let ledger = await readPostFile(wt);
     for (let i = 0; i < 100 && ledger?.posts[0]?.status !== "fallback_visible"; i++) {
@@ -948,7 +1117,7 @@ describe("handleOne — thin-channel finalize", () => {
       kill: () => {},
     });
 
-    const { renderer, startArgs, finalizeArgs, whenFinalized } = makeCardRenderer();
+    const { renderer, startArgs, finalizeArgs, recallArgs, whenFinalized } = makeCardRenderer();
     const { store } = makeSessionStore();
     const { client } = makeClient(makeEvent());
 
@@ -966,6 +1135,7 @@ describe("handleOne — thin-channel finalize", () => {
         turn_taking_limit: 10,
         backend: "claude",
         response_surface_prototype: {
+          ...defaultResponseSurfacePrototypeConfig(),
           enabled: true,
           allowed_chats: [],
           allowed_threads: ["om_msg"],
@@ -991,6 +1161,7 @@ describe("handleOne — thin-channel finalize", () => {
     expect(finalizeArgs).toHaveLength(1);
     expect(finalizeArgs[0]?.success).toBe(false);
     expect(finalizeArgs[0]?.failureReason).toContain("visible card fallback used");
+    expect(recallArgs).toHaveLength(0);
     expect(calls).toHaveLength(0);
     let ledger = await readPostFile(wt);
     for (let i = 0; i < 100 && ledger?.posts[0]?.status !== "fallback_visible"; i++) {
@@ -1031,7 +1202,7 @@ describe("handleOne — thin-channel finalize", () => {
       kill: () => {},
     });
 
-    const { renderer, startArgs, finalizeArgs, whenFinalized } = makeCardRenderer();
+    const { renderer, startArgs, finalizeArgs, recallArgs, whenFinalized } = makeCardRenderer();
     const { store } = makeSessionStore();
     const { client } = makeClient(makeEvent());
 
@@ -1049,6 +1220,7 @@ describe("handleOne — thin-channel finalize", () => {
         turn_taking_limit: 10,
         backend: "claude",
         response_surface_prototype: {
+          ...defaultResponseSurfacePrototypeConfig(),
           enabled: true,
           allowed_chats: [],
           allowed_threads: ["om_msg"],
@@ -1074,6 +1246,7 @@ describe("handleOne — thin-channel finalize", () => {
     expect(finalizeArgs).toHaveLength(1);
     expect(finalizeArgs[0]?.success).toBe(false);
     expect(finalizeArgs[0]?.failureReason).toContain("blocked by policy");
+    expect(recallArgs).toHaveLength(0);
     expect(calls).toHaveLength(0);
     let ledger = await readPostFile(wt);
     for (let i = 0; i < 100 && ledger?.posts[0]?.status !== "policy_blocked"; i++) {

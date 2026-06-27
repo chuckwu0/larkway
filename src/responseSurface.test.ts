@@ -25,6 +25,8 @@ describe("response surface production gates", () => {
       allowed_chats: [],
       allowed_threads: [],
       allowed_mention_open_ids: [],
+      recall_processing_card_on_post_success: true,
+      retain_hybrid_audit_card: true,
       max_posts_per_turn: 1,
       max_posts_per_window: 4,
       post_window_ms: 60_000,

@@ -1,9 +1,10 @@
 /**
  * src/lark/outboundCardClient.ts
  *
- * Transport-neutral abstraction for the two OUTBOUND card network calls:
+ * Transport-neutral abstraction for the OUTBOUND card network calls:
  *   - createCard  → create the initial interactive card (reply to user msg)
  *   - patchCard   → update an existing card's content
+ *   - recallCard  → best-effort revoke of a card message after a post succeeds
  *
  * card.ts owns all card-JSON building + throttle/retry orchestration; it only
  * delegates the leaf network call to an OutboundCardClient. The sole
@@ -39,4 +40,10 @@ export interface OutboundCardClient {
    * @param cardJson   Stringified Card JSON 2.0 (already built by card.ts).
    */
   patchCard(messageId: string, cardJson: string): Promise<void>;
+
+  /**
+   * Recall/delete a card message. Used only after a primary post has been sent
+   * successfully, so failure is handled by the caller as a best-effort cleanup.
+   */
+  recallCard?(messageId: string): Promise<void>;
 }

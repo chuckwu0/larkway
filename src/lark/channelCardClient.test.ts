@@ -10,6 +10,7 @@
  *  - createCard records messageId -> replyTo(threadId) in the shared map.
  *  - BL-16: createCard retries on socket hang up (with same uuid for idempotency).
  *  - BL-16: patchCard retries on socket hang up (PATCH is idempotent).
+ *  - recallCard recalls the created card message and removes its thread route.
  */
 import { describe, it, expect } from "vitest";
 import { ChannelCardClient, type OutboundLarkChannel } from "./channelCardClient.js";
@@ -24,6 +25,9 @@ interface ReplyCall {
   msg_type: string;
   reply_in_thread?: boolean;
 }
+interface DeleteCall {
+  message_id: string;
+}
 
 const messageReactionStub = {
   async create() {
@@ -36,6 +40,7 @@ const messageReactionStub = {
 function fakeChannel(replyMessageId: string | undefined) {
   const updateCardCalls: UpdateCardCall[] = [];
   const replyCalls: (ReplyCall & { uuid?: string })[] = [];
+  const deleteCalls: DeleteCall[] = [];
   const channel: OutboundLarkChannel = {
     async updateCard(messageId, card) {
       updateCardCalls.push({ messageId, card });
@@ -54,13 +59,16 @@ function fakeChannel(replyMessageId: string | undefined) {
               });
               return { data: replyMessageId ? { message_id: replyMessageId } : {} };
             },
+            async delete(payload) {
+              deleteCalls.push({ message_id: payload.path.message_id });
+            },
           },
           messageReaction: messageReactionStub,
         },
       },
     },
   };
-  return { channel, updateCardCalls, replyCalls };
+  return { channel, updateCardCalls, replyCalls, deleteCalls };
 }
 
 /**
@@ -73,6 +81,7 @@ function flakyChannel(
   const { replyMessageId = "om_created", replyFailCount = 1, updateCardFailCount = 1 } = opts;
   const replyCalls: (ReplyCall & { uuid?: string })[] = [];
   const updateCardCalls: UpdateCardCall[] = [];
+  const deleteCalls: DeleteCall[] = [];
   let replyAttempts = 0;
   let updateAttempts = 0;
 
@@ -104,13 +113,16 @@ function flakyChannel(
               });
               return { data: { message_id: replyMessageId } };
             },
+            async delete(payload) {
+              deleteCalls.push({ message_id: payload.path.message_id });
+            },
           },
           messageReaction: messageReactionStub,
         },
       },
     },
   };
-  return { channel, replyCalls, updateCardCalls, get replyAttempts() { return replyAttempts; }, get updateAttempts() { return updateAttempts; } };
+  return { channel, replyCalls, updateCardCalls, deleteCalls, get replyAttempts() { return replyAttempts; }, get updateAttempts() { return updateAttempts; } };
 }
 
 describe("ChannelCardClient.patchCard", () => {
@@ -238,6 +250,30 @@ describe("ChannelCardClient.createCard", () => {
   });
 });
 
+describe("ChannelCardClient.recallCard", () => {
+  it("recalls the card message and removes its card-thread route", async () => {
+    const { channel, deleteCalls } = fakeChannel("om_created");
+    const cardThreads = new Map<string, string>([["om_created", "om_root"]]);
+    const client = new ChannelCardClient({ resolveChannel: () => channel, cardThreads });
+
+    await client.recallCard("om_created");
+
+    expect(deleteCalls).toEqual([{ message_id: "om_created" }]);
+    expect(cardThreads.has("om_created")).toBe(false);
+  });
+
+  it("throws when called before the channel is connected", async () => {
+    const client = new ChannelCardClient({
+      resolveChannel: () => null,
+      cardThreads: new Map(),
+    });
+
+    await expect(client.recallCard("om_card")).rejects.toThrow(
+      /before the Channel SDK connected/,
+    );
+  });
+});
+
 // ---------------------------------------------------------------------------
 // BL-16: retry tests for createCard and patchCard
 // ---------------------------------------------------------------------------
@@ -276,7 +312,7 @@ describe("ChannelCardClient.createCard — retry on socket hang up (BL-16)", () 
             attempts++;
             if (attempts < 3) throw new Error("socket hang up");
             return { data: { message_id: "om_created" } };
-          } },
+          }, async delete() {} },
           messageReaction: messageReactionStub,
         } },
       },

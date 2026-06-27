@@ -80,6 +80,8 @@ response_surface_prototype:
   post_outbound_enabled: true
   allow_agent_mentions: true
   allowed_mention_open_ids: []
+  recall_processing_card_on_post_success: true
+  retain_hybrid_audit_card: true
   max_posts_per_turn: 1
   max_posts_per_window: 4
   post_window_ms: 60000
@@ -97,6 +99,8 @@ Defaults:
 - `post_outbound_enabled: true`
 - `allow_agent_mentions: true`
 - `allowed_mention_open_ids: []`
+- `recall_processing_card_on_post_success: true`
+- `retain_hybrid_audit_card: true`
 - `max_posts_per_turn: 1`
 - `max_posts_per_window: 4`
 - `post_window_ms: 60000`
@@ -109,13 +113,23 @@ separate: `allow_agent_mentions: false` disables all Agent-authored mentions;
 empty `allowed_mention_open_ids` allows the Agent to choose targets; non-empty
 `allowed_mention_open_ids` narrows mentions to that set. `@all` remains blocked.
 
+When a primary post succeeds, `recall_processing_card_on_post_success: true`
+recalls the already-visible processing card after the post is confirmed visible,
+so the final view is not duplicated as "card + post". Recall is best-effort:
+if recall fails, the bridge keeps/finalizes the card instead of risking an
+invisible reply. Hybrid mode keeps the compact audit card by default through
+`retain_hybrid_audit_card: true`; operators can set it false to recall that
+card after a successful primary post too.
+
 ## PR2 / PR4 SurfaceController Foundation
 
 `SurfaceController` centralizes the card-start decision. The bridge creates a
 visible processing card before the Agent runs so streamed tool/progress events
 can update the in-progress card during the turn. Post/hybrid dispatch still runs
-at finalize time; when a post is sent, the already-visible card becomes the
-compact secondary/audit surface instead of suppressing mid-turn progress.
+at finalize time. When a primary post is sent successfully, the bridge recalls
+the transient processing card unless the card is intentionally retained as a
+hybrid compact audit surface. Card-only turns and post failure/policy fallbacks
+keep the card because it is the visible reply.
 
 `lazy_card_creation` is retained for config compatibility, but it no longer
 suppresses the initial processing card when post outbound is available. This

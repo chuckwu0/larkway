@@ -12,6 +12,8 @@ export function defaultResponseSurfacePrototypeConfig() {
     post_outbound_enabled: true,
     allow_agent_mentions: true,
     allowed_mention_open_ids: [] as string[],
+    recall_processing_card_on_post_success: true,
+    retain_hybrid_audit_card: true,
     max_posts_per_turn: 1,
     max_posts_per_window: 4,
     post_window_ms: 60_000,
@@ -31,6 +33,8 @@ const responseSurfacePrototypeConfigDefaults = () => ({
   post_outbound_enabled: true,
   allow_agent_mentions: true,
   allowed_mention_open_ids: [] as string[],
+  recall_processing_card_on_post_success: true,
+  retain_hybrid_audit_card: true,
   max_posts_per_turn: 1,
   max_posts_per_window: 4,
   post_window_ms: 60_000,
@@ -138,6 +142,18 @@ export const ResponseSurfacePrototypeConfigSchema = z
      * Keep real IDs in private bot config, never in public docs/tests.
      */
     allowed_mention_open_ids: z.array(z.string().min(1)).default([]),
+    /**
+     * When a primary post has been sent successfully, recall the live processing
+     * card so the final visible surface is the post rather than post + duplicate
+     * card. Recall is best-effort; failure leaves/finalizes the card.
+     */
+    recall_processing_card_on_post_success: z.boolean().default(true),
+    /**
+     * Hybrid mode may keep the already-visible card as a compact audit surface
+     * after the primary post succeeds. Operators can turn this off to recall that
+     * card as well, leaving only the post.
+     */
+    retain_hybrid_audit_card: z.boolean().default(true),
     /**
      * Hard cap for surface dispatch. PR4 still keeps production post outbound
      * unavailable, but fake-channel dispatch tests enforce this bounded shape.
