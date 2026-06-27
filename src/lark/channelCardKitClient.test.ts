@@ -15,6 +15,10 @@ function fakeChannel() {
               calls.push({ name: "card.create", payload });
               return { data: { card_id: "card_entity" } };
             },
+            async idConvert(payload) {
+              calls.push({ name: "card.idConvert", payload });
+              return { data: { card_id: "converted_card_entity" } };
+            },
             async update(payload) {
               calls.push({ name: "card.update", payload });
               return { data: {} };
@@ -109,6 +113,42 @@ describe("ChannelCardKitClient", () => {
       ((calls[0]!.payload as { data: { content: string } }).data.content),
     );
     expect(content).toEqual({ type: "card", data: { card_id: "card_entity" } });
+    expect(cardThreads.get("card_message")).toBe("thread_root");
+  });
+
+  it("creates a threaded CardKit reply by sending full card JSON then converting message_id", async () => {
+    const { channel, calls } = fakeChannel();
+    const cardThreads = new Map<string, string>();
+    const client = new ChannelCardKitClient({
+      resolveChannel: () => channel,
+      cardThreads,
+    });
+
+    const res = await client.createCardReply!("trigger_message", { schema: "2.0" }, {
+      replyInThread: true,
+      idempotencyKey: "stable-key",
+      threadId: "thread_root",
+    });
+
+    expect(res).toEqual({ cardId: "converted_card_entity", messageId: "card_message" });
+    expect(calls).toEqual([
+      {
+        name: "message.reply",
+        payload: {
+          path: { message_id: "trigger_message" },
+          data: {
+            content: JSON.stringify({ schema: "2.0" }),
+            msg_type: "interactive",
+            reply_in_thread: true,
+            uuid: "stable-key",
+          },
+        },
+      },
+      {
+        name: "card.idConvert",
+        payload: { data: { message_id: "card_message" } },
+      },
+    ]);
     expect(cardThreads.get("card_message")).toBe("thread_root");
   });
 

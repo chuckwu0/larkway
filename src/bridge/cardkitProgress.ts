@@ -201,22 +201,34 @@ export async function createCardKitProgressHandle(
 ): Promise<CardKitProgressHandle> {
   const key = idempotencyKey(opts.facts);
   const initialStatusText = opts.initialStatusText ?? "正在处理…";
-  const created = await opts.cardKitClient.createCardEntity(
-    buildCardKitInitialCard({ statusText: initialStatusText }),
-  );
-  const sent = await opts.cardKitClient.replyCardEntity(
-    opts.replyToMessageId,
-    created.cardId,
-    {
-      replyInThread: opts.replyInThread,
-      idempotencyKey: key,
-      threadId: opts.facts.threadId,
-    },
-  );
+  const initialCard = buildCardKitInitialCard({ statusText: initialStatusText });
+  const created = opts.cardKitClient.createCardReply
+    ? await opts.cardKitClient.createCardReply(
+        opts.replyToMessageId,
+        initialCard,
+        {
+          replyInThread: opts.replyInThread,
+          idempotencyKey: key,
+          threadId: opts.facts.threadId,
+        },
+      )
+    : await (async () => {
+        const entity = await opts.cardKitClient.createCardEntity(initialCard);
+        const sent = await opts.cardKitClient.replyCardEntity(
+          opts.replyToMessageId,
+          entity.cardId,
+          {
+            replyInThread: opts.replyInThread,
+            idempotencyKey: key,
+            threadId: opts.facts.threadId,
+          },
+        );
+        return { cardId: entity.cardId, messageId: sent.messageId };
+      })();
   return new LiveCardKitProgressHandle({
     cardKitClient: opts.cardKitClient,
     cardId: created.cardId,
-    messageId: sent.messageId,
+    messageId: created.messageId,
     idempotencyKey: key,
     patchIntervalMs: opts.patchIntervalMs ?? DEFAULT_PATCH_INTERVAL_MS,
     maxProgressUpdates: opts.maxProgressUpdates ?? DEFAULT_MAX_PROGRESS_UPDATES,

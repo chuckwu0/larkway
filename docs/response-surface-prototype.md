@@ -110,10 +110,13 @@ Mention policy:
 
 Normal turn:
 
-1. `cardkit.v1.card.create` creates a Card JSON 2.0 entity with stable element
-   ids: `status_md`, `thinking_md`, `final_md`, and `choices_slot`.
-2. `im.v1.message.reply` sends an interactive message by card reference with a
-   deterministic idempotency key.
+1. `im.v1.message.reply` sends the initial Card JSON 2.0 interactive message
+   with stable element ids: `status_md`, `thinking_md`, `final_md`, and
+   `choices_slot`.
+2. `cardkit.v1.card.idConvert` converts the reply `message_id` into a CardKit
+   `card_id` for later element streaming. This keeps the response in the
+   Feishu thread while avoiding the platform limitation observed when replying
+   with a pre-created CardKit `card_id`.
 3. Runner events update only progress:
    - `system_init` becomes a short status line.
    - `tool_use` becomes a summarized tool line.

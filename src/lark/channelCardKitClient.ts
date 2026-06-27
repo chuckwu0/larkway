@@ -27,6 +27,9 @@ export interface OutboundCardKitLarkChannel {
           create(payload: {
             data: { type: string; data: string };
           }): Promise<RawCardCreateResult>;
+          idConvert(payload: {
+            data: { message_id: string };
+          }): Promise<RawCardCreateResult>;
           update(payload: {
             path: { card_id: string };
             data: {
@@ -94,6 +97,11 @@ export interface CardKitElementMutationOpts {
 }
 
 export interface OutboundCardKitClient {
+  createCardReply?(
+    replyToMessageId: string,
+    card: object,
+    opts: { replyInThread: boolean; idempotencyKey: string; threadId?: string },
+  ): Promise<{ cardId: string; messageId: string }>;
   createCardEntity(card: object): Promise<{ cardId: string }>;
   replyCardEntity(
     replyToMessageId: string,
@@ -234,6 +242,51 @@ export class ChannelCardKitClient implements OutboundCardKitClient {
     const cardId = res.data?.card_id;
     if (!cardId) throw new Error("[channel.cardkit] card.create returned no card_id");
     return { cardId };
+  }
+
+  async createCardReply(
+    replyToMessageId: string,
+    card: object,
+    opts: { replyInThread: boolean; idempotencyKey: string; threadId?: string },
+  ): Promise<{ cardId: string; messageId: string }> {
+    const res = await withCardKitRetry(
+      "createCardReply",
+      () =>
+        this.channel().rawClient.im.v1.message.reply({
+          path: { message_id: replyToMessageId },
+          data: {
+            content: JSON.stringify(card),
+            msg_type: "interactive",
+            reply_in_thread: opts.replyInThread,
+            uuid: opts.idempotencyKey,
+          },
+        }),
+      { maxAttempts: this.maxAttempts, baseDelayMs: this.baseDelayMs },
+    );
+    const messageId = res.data?.message_id;
+    if (!messageId) {
+      throw new Error(
+        "[channel.cardkit] im.v1.message.reply returned no message_id " +
+          `(replyTo=${replyToMessageId})`,
+      );
+    }
+    const converted = await withCardKitRetry(
+      "idConvert",
+      () =>
+        this.channel().rawClient.cardkit.v1.card.idConvert({
+          data: { message_id: messageId },
+        }),
+      { maxAttempts: this.maxAttempts, baseDelayMs: this.baseDelayMs },
+    );
+    const cardId = converted.data?.card_id;
+    if (!cardId) {
+      throw new Error(
+        "[channel.cardkit] card.idConvert returned no card_id " +
+          `(messageId=${messageId})`,
+      );
+    }
+    this.cardThreads.set(messageId, opts.threadId ?? replyToMessageId);
+    return { cardId, messageId };
   }
 
   async replyCardEntity(
