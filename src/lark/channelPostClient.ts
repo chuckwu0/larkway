@@ -7,6 +7,10 @@ interface RawReplyResult {
   data?: { message_id?: string };
 }
 
+interface RawUpdateResult {
+  data?: { message_id?: string };
+}
+
 export interface OutboundPostLarkChannel {
   rawClient: {
     im: {
@@ -21,6 +25,13 @@ export interface OutboundPostLarkChannel {
               uuid?: string;
             };
           }): Promise<RawReplyResult>;
+          update(payload: {
+            path: { message_id: string };
+            data: {
+              content: string;
+              msg_type: "post";
+            };
+          }): Promise<RawUpdateResult>;
         };
       };
     };
@@ -78,5 +89,22 @@ export class ChannelPostClient implements OutboundPostClient {
       );
     }
     return { messageId };
+  }
+
+  async updatePost(messageId: string, content: string): Promise<{ messageId: string }> {
+    const res = await withPostRetry(
+      "updatePost",
+      () =>
+        this.channel().rawClient.im.v1.message.update({
+          path: { message_id: messageId },
+          data: {
+            content,
+            msg_type: "post",
+          },
+        }),
+      { maxAttempts: this.maxAttempts, baseDelayMs: this.baseDelayMs },
+    );
+
+    return { messageId: res.data?.message_id ?? messageId };
   }
 }

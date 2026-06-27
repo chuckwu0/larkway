@@ -3,22 +3,22 @@
 Status: production foundation. Response surface and Agent-authored handoff
 mentions are enabled by default.
 
-This document defines the `card` / `post` / `hybrid` response surface runtime.
-PR3 added post transport, post payload construction, idempotency helpers, and
-`post.json` ledger primitives. PR4 added the surface dispatcher for response
-planning, compact secondary cards, and fake-channel tests. PR5 adds rich boot
-reconcile for card fields plus post-ledger orphan reconciliation. PR6a/PR7 wire
-post outbound behind runtime gates and production safeguards.
+This document defines the post-first response surface runtime. The default
+surface is a Feishu `post`/RichText reply that is edited in place during the
+turn and finalized as a clean text result. Cards are exception surfaces used
+only for fallback or capabilities that post cannot represent well, such as
+choice buttons and structured image/content blocks.
 
 ## Principles
 
-- The Agent chooses the response surface by writing `response_surface` in
-  `state.json`.
+- Ordinary Agent replies do not need to write `response_surface`; absent an
+  explicit card preference, the bridge treats the turn as post-first.
 - The bridge provides channel infrastructure only: validation, mechanical
   degradation, idempotency/fallback/reconcile plumbing, and safe rendering.
-- The bridge must not encode business rules such as "short task = post" or
-  "long task = card".
-- Existing bots default to response surfaces. Empty chat/thread allowlists mean
+- The bridge must not encode business workflow rules. It only decides channel
+  mechanics: post by default, card when card-only capabilities or fallback are
+  required.
+- Existing bots default to post-first response surfaces. Empty chat/thread allowlists mean
   all chats/threads are eligible; non-empty allowlists narrow rollout scope.
 - Agent-authored mentions are enabled by default so one bot can hand work to the
   next peer. The package defaults do not hardcode any real open ids; the Agent
@@ -34,7 +34,7 @@ Agents may write:
 ```json
 {
   "status": "ready",
-  "last_message": "Operator-facing fallback body.",
+  "last_message": "Operator-facing final post body.",
   "response_surface": {
     "mode": "card",
     "primary": "card",
@@ -64,7 +64,7 @@ Supported narrow fields:
 
 The schema soft-fails this prototype field. A malformed `response_surface`
 becomes `undefined` and must not discard `status`, `last_message`, choices, or
-other legacy card fields needed to finalize the existing card.
+other fields needed to finalize the post/card surface.
 
 ## Bot Config Gate
 
@@ -92,7 +92,7 @@ Defaults:
 - `enabled: true`
 - `allowed_chats: []`
 - `allowed_threads: []`
-- `lazy_card_creation: false`
+- `lazy_card_creation: true`
 - `kill_switch: false`
 - `post_outbound_enabled: true`
 - `allow_agent_mentions: true`
@@ -109,11 +109,11 @@ separate: `allow_agent_mentions: false` disables all Agent-authored mentions;
 empty `allowed_mention_open_ids` allows the Agent to choose targets; non-empty
 `allowed_mention_open_ids` narrows mentions to that set. `@all` remains blocked.
 
-## PR2 / PR4 SurfaceController Foundation
+## Post-First Surface Controller
 
-`SurfaceController` centralizes the card-start decision. Production wiring still
-passes `postOutboundAvailable: false`, so every production path creates the
-legacy visible card before the Agent runs.
+`SurfaceController` centralizes the start-surface decision. When post outbound,
+ledger, fallback, and allowlist gates are all available, the handler skips the
+legacy processing card and creates a lightweight "正在处理…" post instead.
 
 The lazy branch is eligible only when all of these are true:
 
@@ -152,11 +152,12 @@ Reason: live dogfood found that overly long Feishu idempotency keys can trigger
 `99992402 field validation failed`. The card path already uses compact derived
 UUIDs for card replies; PR3 should follow that shape.
 
-## PR3 Post Foundation
+## Post Foundation
 
-PR3 added the post primitives:
+The post primitives are:
 
 - `OutboundPostClient` / `ChannelPostClient` for Feishu `msg_type=post` replies.
+- In-place post edit support for Feishu text/post message updates.
 - A pure post content builder that can construct Feishu text and real `at` tag
   payloads.
 - `post.json` ledger IO with atomic writes and the status machine:
@@ -164,29 +165,50 @@ PR3 added the post primitives:
 - Retry classification for future post sends: only 5xx responses are retryable.
 - Config gates for post outbound and mention target allowlisting.
 
-## PR4 Surface Dispatcher Foundation
+## Post Streaming Capability
 
-PR4 adds `SurfaceDispatcher` and wires `BridgeHandler` finalization through it.
-The handler still passes `postOutboundAvailable: false` and no production post
-client, so live runs continue to finalize the legacy visible card.
+Feishu post/RichText does not expose a token-streaming API. The available
+runtime primitive is whole-message editing through the text/post message update
+API:
 
-The dispatcher is covered with unit/fake-channel tests for:
+- supported message types: `text` and `post`;
+- update shape: replace the whole serialized message content;
+- per-message edit cap: 20 edits;
+- API limit: 1000 calls/minute and 50 calls/second;
+- content limits: text 150 KB, post/RichText 30 KB;
+- edit response and later message reads expose `updated=true` and `update_time`.
 
-- `mode=card`: legacy card finalization.
-- `mode=post`: fake post send when every gate is explicitly ready.
-- `mode=hybrid`: fake post primary plus compact secondary card.
-- non-allowlisted or disabled gates: mechanical fallback to the visible card.
-- post failure: ledger marks `fallback_visible` and a visible failure card is
-  returned.
-- choices/content/image card-only capabilities: keep the legacy card path so
-  interaction controls are not lost.
+This means post can support chunked, near-live progress, but not true
+character-by-character streaming. The bridge therefore uses a bounded chunked
+strategy: create one lightweight placeholder post, edit it at most once every
+~1.5 seconds while stream text accumulates, cap progress edits at 16, and
+reserve the remaining edit budget for finalization and cleanup/fallback edits.
 
-The compact secondary card is intentionally audit-only. It records status,
-post message id, and idempotency key; it does not repeat the primary post body.
+Compared with cards, post has a stricter edit-count ceiling and must replace
+the entire RichText body on each update. Cards are still better for long-lived
+high-frequency surfaces because card patch supports 5 QPS per card and does not
+have the post message's 20-edit cap. For the post-first UX, the practical
+recommendation is:
 
-Production wiring still passes `postOutboundAvailable: false` in
-`BridgeHandler`. PR4 therefore cannot create a live post unless a future PR
-explicitly connects the transport to production dispatch and enables the gates.
+- default to post-first with chunked live updates for normal Agent turns;
+- avoid per-token typing effects because they can exhaust the 20-edit cap and
+make the message visibly churn;
+- keep card streaming/progress cards only as fallback or for structured
+capabilities that post cannot represent.
+
+## Surface Dispatcher
+
+`SurfaceDispatcher` finalizes the channel decision:
+
+- no explicit `response_surface` -> post-first by default;
+- `mode=card` / `primary=card` -> card-only override;
+- `choices`, `image_blocks`, or `content_blocks` -> send/update the primary post,
+  then return a card for the card-only capability;
+- disabled gates, kill switch, policy blocks, or transport failures -> visible
+  card fallback.
+
+When the handler has already created a live progress post, finalization edits
+that same message into the final result instead of sending a second post.
 
 ## PR5 Rich Orphan Reconcile
 

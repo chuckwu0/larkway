@@ -13,6 +13,15 @@ export interface OutboundPostClient {
       idempotencyKey: string;
     },
   ): Promise<{ messageId: string }>;
+
+  /**
+   * Edit an existing msg_type=post message in place.
+   *
+   * `content` must already be the stringified Feishu post JSON. The caller must
+   * only pass message IDs created by this same bot/app identity; Feishu rejects
+   * edits by non-senders and caps each message at 20 edits.
+   */
+  updatePost(messageId: string, content: string): Promise<{ messageId: string }>;
 }
 
 function numericStatus(err: unknown): number | undefined {

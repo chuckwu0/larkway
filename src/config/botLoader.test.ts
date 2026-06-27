@@ -565,7 +565,7 @@ bot_open_id: ou_surface_default
       enabled: true,
       allowed_chats: [],
       allowed_threads: [],
-      lazy_card_creation: false,
+      lazy_card_creation: true,
       kill_switch: false,
       post_outbound_enabled: true,
       allow_agent_mentions: true,

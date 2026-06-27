@@ -7,7 +7,7 @@ export function defaultResponseSurfacePrototypeConfig() {
     enabled: true,
     allowed_chats: [] as string[],
     allowed_threads: [] as string[],
-    lazy_card_creation: false,
+    lazy_card_creation: true,
     kill_switch: false,
     post_outbound_enabled: true,
     allow_agent_mentions: true,
@@ -26,7 +26,7 @@ const responseSurfacePrototypeConfigDefaults = () => ({
   enabled: true,
   allowed_chats: [] as string[],
   allowed_threads: [] as string[],
-  lazy_card_creation: false,
+  lazy_card_creation: true,
   kill_switch: false,
   post_outbound_enabled: true,
   allow_agent_mentions: true,
@@ -111,11 +111,11 @@ export const ResponseSurfacePrototypeConfigSchema = z
      */
     allowed_threads: z.array(z.string().min(1)).default([]),
     /**
-     * Dark-launch hook for PR2. This does not enable post-only output by itself;
-     * the bridge still requires a visible card fallback until post outbound
-     * exists and is explicitly enabled in a later PR.
+     * Post-first gate. Default true means the bridge starts a lightweight post
+     * as the live main surface when post outbound is available, and creates a
+     * card only for fallback or card-only capabilities.
      */
-    lazy_card_creation: z.boolean().default(false),
+    lazy_card_creation: z.boolean().default(true),
     /**
      * Runtime kill switch for emergency rollback. When true, every response
      * surface post path is treated as disabled even if enabled/allowlists are

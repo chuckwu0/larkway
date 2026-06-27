@@ -20,6 +20,10 @@ describe("ChannelPostClient", () => {
                 calls.push(payload);
                 return { data: { message_id: "om_post" } };
               },
+              async update(payload) {
+                calls.push(payload);
+                return { data: { message_id: payload.path.message_id } };
+              },
             },
           },
         },
@@ -50,6 +54,46 @@ describe("ChannelPostClient", () => {
     ]);
   });
 
+  it("edits an existing post message through fake channel", async () => {
+    const calls: unknown[] = [];
+    const channel: OutboundPostLarkChannel = {
+      rawClient: {
+        im: {
+          v1: {
+            message: {
+              async reply(payload) {
+                calls.push(payload);
+                return { data: { message_id: "om_post" } };
+              },
+              async update(payload) {
+                calls.push(payload);
+                return { data: { message_id: payload.path.message_id } };
+              },
+            },
+          },
+        },
+      },
+    };
+    const client = new ChannelPostClient({
+      resolveChannel: () => channel,
+      maxAttempts: 3,
+      baseDelayMs: 0,
+    });
+
+    await expect(client.updatePost("om_post", "{\"zh_cn\":{}}")).resolves.toEqual({
+      messageId: "om_post",
+    });
+    expect(calls).toEqual([
+      {
+        path: { message_id: "om_post" },
+        data: {
+          content: "{\"zh_cn\":{}}",
+          msg_type: "post",
+        },
+      },
+    ]);
+  });
+
   it("retries only 5xx errors", async () => {
     const calls: unknown[] = [];
     const channel: OutboundPostLarkChannel = {
@@ -61,6 +105,11 @@ describe("ChannelPostClient", () => {
                 calls.push(payload);
                 if (calls.length < 3) throw errorWithStatus(503);
                 return { data: { message_id: "om_post" } };
+              },
+              async update(payload) {
+                calls.push(payload);
+                if (calls.length < 3) throw errorWithStatus(503);
+                return { data: { message_id: payload.path.message_id } };
               },
             },
           },
@@ -98,6 +147,10 @@ describe("ChannelPostClient", () => {
           v1: {
             message: {
               async reply() {
+                calls += 1;
+                throw errorWithStatus(400);
+              },
+              async update() {
                 calls += 1;
                 throw errorWithStatus(400);
               },

@@ -30,7 +30,7 @@ import { promisify } from "node:util";
 import type { LarkMessageEvent, LarkClientOptions } from "./transport.js";
 import { AsyncQueue } from "./transport.js";
 import { ChannelCardClient, type OutboundLarkChannel } from "./channelCardClient.js";
-import { ChannelPostClient } from "./channelPostClient.js";
+import { ChannelPostClient, type OutboundPostLarkChannel } from "./channelPostClient.js";
 import type { OutboundCardClient } from "./outboundCardClient.js";
 import type { OutboundPostClient } from "./outboundPostClient.js";
 
@@ -724,7 +724,7 @@ export class ChannelClient {
   outboundPostClient(): OutboundPostClient {
     if (!this.postClient) {
       this.postClient = new ChannelPostClient({
-        resolveChannel: () => this.channel,
+        resolveChannel: () => this.channel as unknown as OutboundPostLarkChannel | null,
       });
     }
     return this.postClient;

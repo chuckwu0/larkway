@@ -80,7 +80,9 @@ function baseInput(overrides: Partial<SurfaceDispatchInput> = {}): SurfaceDispat
 
 function fakePostClient(opts: { fail?: boolean } = {}) {
   const calls: Array<{
+    kind: "create" | "update";
     replyToMessageId: string;
+    messageId?: string;
     content: string;
     idempotencyKey: string;
     replyInThread: boolean;
@@ -88,6 +90,7 @@ function fakePostClient(opts: { fail?: boolean } = {}) {
   const client: OutboundPostClient = {
     async createPostReply(replyToMessageId, content, callOpts) {
       calls.push({
+        kind: "create",
         replyToMessageId,
         content,
         idempotencyKey: callOpts.idempotencyKey,
@@ -95,6 +98,18 @@ function fakePostClient(opts: { fail?: boolean } = {}) {
       });
       if (opts.fail) throw new Error("fake transport failed");
       return { messageId: "om_post" };
+    },
+    async updatePost(messageId, content) {
+      calls.push({
+        kind: "update",
+        replyToMessageId: "",
+        messageId,
+        content,
+        idempotencyKey: "",
+        replyInThread: false,
+      });
+      if (opts.fail) throw new Error("fake transport failed");
+      return { messageId };
     },
   };
   return { client, calls };
@@ -251,6 +266,39 @@ describe("dispatchResponseSurface", () => {
       expect(after?.posts[0]?.fallbackCardMessageId).toBeUndefined();
       expect(after?.posts[0]?.postMessageId).toBeUndefined();
       expect(after?.posts[0]?.attempts).toEqual([]);
+    }));
+
+  it("cleans up a live placeholder post when mention policy requires a fallback card", async () =>
+    withTemp(async (dir) => {
+      const { client, calls } = fakePostClient();
+      const result = await dispatchResponseSurface(
+        baseInput({
+          worktreePath: dir,
+          cardStarted: false,
+          postClient: client,
+          livePost: {
+            messageId: "om_live",
+            idempotencyKey: "live-key",
+            role: "primary",
+          },
+          state: state({
+            mode: "post",
+            primary: "post",
+            post: { mentions: [{ user_id: "all", label: "All" }] },
+          }),
+        }),
+      );
+
+      expect(result.reason).toBe("mention-policy-blocked");
+      expect(result.visible).toBe(true);
+      expect(calls).toHaveLength(1);
+      expect(calls[0]).toMatchObject({ kind: "update", messageId: "om_live" });
+      expect(calls[0]?.content).toContain("主回复正文");
+      expect(calls[0]?.content).not.toContain("\"tag\":\"at\"");
+
+      const after = await readPostFile(dir);
+      expect(after?.posts[0]?.status).toBe("planned");
+      expect(after?.posts[0]?.mentionCount).toBe(1);
     }));
 
   it("allows agent-authored mentions by default when mention allowlists are empty", async () =>
@@ -415,31 +463,34 @@ describe("dispatchResponseSurface", () => {
       expect(ledger?.posts[0]?.attempts[0]?.status).toBe("failed");
     }));
 
-  it("keeps choices on the old card path instead of losing card-only capabilities to post", async () => {
-    const { client, calls } = fakePostClient();
-    const result = await dispatchResponseSurface(
-      baseInput({
-        postClient: client,
-        state: state(
-          { mode: "post", primary: "post" },
-          {
+  it("sends the primary post and returns a card when choices require buttons", async () =>
+    withTemp(async (dir) => {
+      const { client, calls } = fakePostClient();
+      const result = await dispatchResponseSurface(
+        baseInput({
+          worktreePath: dir,
+          postClient: client,
+          state: state(
+            { mode: "post", primary: "post" },
+            {
+              choices: [{ label: "继续", value: "继续处理" }],
+              choice_prompt: "选下一步",
+            },
+          ),
+          baseCard: {
+            ...baseCard(),
             choices: [{ label: "继续", value: "继续处理" }],
-            choice_prompt: "选下一步",
+            choicePrompt: "选下一步",
           },
-        ),
-        baseCard: {
-          ...baseCard(),
-          choices: [{ label: "继续", value: "继续处理" }],
-          choicePrompt: "选下一步",
-        },
-      }),
-    );
+        }),
+      );
 
-    expect(result.reason).toBe("card-capability-required");
-    expect(result.visible).toBe(true);
-    expect(result.card?.choices).toEqual([{ label: "继续", value: "继续处理" }]);
-    expect(calls).toHaveLength(0);
-  });
+      expect(result.reason).toBe("post-sent-card-capability-required");
+      expect(result.visible).toBe(true);
+      expect(result.card?.choices).toEqual([{ label: "继续", value: "继续处理" }]);
+      expect(calls).toHaveLength(1);
+      expect(calls[0]?.kind).toBe("create");
+    }));
 
   it("refuses post and keeps the existing card visible when fallback readiness is missing", async () => {
     const { client, calls } = fakePostClient();

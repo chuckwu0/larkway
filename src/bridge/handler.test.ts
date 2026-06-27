@@ -246,9 +246,11 @@ function makeClient(event: Record<string, unknown>) {
   return { client, acked, unhandled, reactionCalls };
 }
 
-function makePostClient(opts: { fail?: boolean } = {}) {
+function makePostClient(opts: { fail?: boolean; failCreate?: boolean; failUpdate?: boolean } = {}) {
   const calls: Array<{
+    kind: "create" | "update";
     replyToMessageId: string;
+    messageId?: string;
     content: string;
     idempotencyKey: string;
     replyInThread: boolean;
@@ -256,13 +258,26 @@ function makePostClient(opts: { fail?: boolean } = {}) {
   const client: OutboundPostClient = {
     async createPostReply(replyToMessageId, content, callOpts) {
       calls.push({
+        kind: "create",
         replyToMessageId,
         content,
         idempotencyKey: callOpts.idempotencyKey,
         replyInThread: callOpts.replyInThread,
       });
-      if (opts.fail) throw new Error("fake post failed");
+      if (opts.fail || opts.failCreate) throw new Error("fake post failed");
       return { messageId: "om_post" };
+    },
+    async updatePost(messageId, content) {
+      calls.push({
+        kind: "update",
+        replyToMessageId: "",
+        messageId,
+        content,
+        idempotencyKey: "",
+        replyInThread: false,
+      });
+      if (opts.fail || opts.failUpdate) throw new Error("fake post failed");
+      return { messageId };
     },
   };
   return { client, calls };
@@ -742,9 +757,13 @@ describe("handleOne — thin-channel finalize", () => {
     expect(acked).toEqual(["om_msg"]);
     expect(startArgs).toHaveLength(0);
     expect(finalizeArgs).toHaveLength(0);
-    expect(calls).toHaveLength(1);
+    expect(calls).toHaveLength(2);
+    expect(calls[0]?.kind).toBe("create");
     expect(calls[0]?.replyToMessageId).toBe("om_msg");
-    expect(calls[0]?.content).toContain("隔离配置走 post-only");
+    expect(calls[0]?.content).toContain("正在处理");
+    expect(calls[1]?.kind).toBe("update");
+    expect(calls[1]?.messageId).toBe("om_post");
+    expect(calls[1]?.content).toContain("隔离配置走 post-only");
     const ledger = await readPostFile(wt);
     expect(ledger?.posts[0]?.status).toBe("sent");
     expect(ledger?.posts[0]?.postMessageId).toBe("om_post");
@@ -838,7 +857,7 @@ describe("handleOne — thin-channel finalize", () => {
     };
     const wt = await seedWorktree(threadId);
     await seedRepoCachePath();
-    const { client: postClient, calls } = makePostClient({ fail: true });
+    const { client: postClient, calls } = makePostClient({ failUpdate: true });
 
     runClaudeImpl = () => ({
       events: (async function* () {
@@ -896,7 +915,9 @@ describe("handleOne — thin-channel finalize", () => {
     expect(finalizeArgs).toHaveLength(1);
     expect(finalizeArgs[0]?.success).toBe(false);
     expect(finalizeArgs[0]?.failureReason).toContain("visible card fallback used");
-    expect(calls).toHaveLength(1);
+    expect(calls).toHaveLength(2);
+    expect(calls[0]?.kind).toBe("create");
+    expect(calls[1]?.kind).toBe("update");
     let ledger = await readPostFile(wt);
     for (let i = 0; i < 100 && ledger?.posts[0]?.status !== "fallback_visible"; i++) {
       await new Promise((r) => setTimeout(r, 10));
@@ -907,7 +928,7 @@ describe("handleOne — thin-channel finalize", () => {
     expect(ledger?.posts[0]?.attempts[0]?.status).toBe("failed");
   });
 
-  it("late-starts a visible fallback card before marking an existing pending post ledger fallback_visible", async () => {
+  it("updates the live post even when an older pending ledger entry exists", async () => {
     const threadId = "om_msg";
     const finalState = {
       status: "ready",
@@ -936,9 +957,9 @@ describe("handleOne — thin-channel finalize", () => {
       kill: () => {},
     });
 
-    const { renderer, startArgs, finalizeArgs, whenFinalized } = makeCardRenderer();
+    const { renderer, startArgs, finalizeArgs } = makeCardRenderer();
     const { store } = makeSessionStore();
-    const { client } = makeClient(makeEvent());
+    const { client, acked } = makeClient(makeEvent());
 
     const handler = new BridgeHandler({
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -973,21 +994,18 @@ describe("handleOne — thin-channel finalize", () => {
     });
 
     await handler.run();
-    await whenFinalized;
-
-    expect(startArgs).toHaveLength(1);
-    expect(finalizeArgs).toHaveLength(1);
-    expect(finalizeArgs[0]?.success).toBe(false);
-    expect(finalizeArgs[0]?.failureReason).toContain("visible card fallback used");
-    expect(calls).toHaveLength(0);
-    let ledger = await readPostFile(wt);
-    for (let i = 0; i < 100 && ledger?.posts[0]?.status !== "fallback_visible"; i++) {
+    for (let i = 0; i < 100 && acked.length === 0; i++) {
       await new Promise((r) => setTimeout(r, 10));
-      ledger = await readPostFile(wt);
     }
-    expect(ledger?.posts[0]?.status).toBe("fallback_visible");
-    expect(ledger?.posts[0]?.fallbackCardMessageId).toBe("om_card");
-    expect(ledger?.posts[0]?.attempts[0]?.code).toBe("orphan_reconcile");
+
+    expect(acked).toEqual(["om_msg"]);
+    expect(startArgs).toHaveLength(0);
+    expect(finalizeArgs).toHaveLength(0);
+    expect(calls.map((c) => c.kind)).toEqual(["create", "update"]);
+    const ledger = await readPostFile(wt);
+    expect(ledger?.posts).toHaveLength(2);
+    expect(ledger?.posts.some((post) => post.status === "pending")).toBe(true);
+    expect(ledger?.posts.some((post) => post.status === "sent" && post.postMessageId === "om_post")).toBe(true);
   });
 
   it("late-starts a visible fallback card before marking a disallowed mention policy_blocked", async () => {
@@ -1062,7 +1080,11 @@ describe("handleOne — thin-channel finalize", () => {
     expect(finalizeArgs).toHaveLength(1);
     expect(finalizeArgs[0]?.success).toBe(false);
     expect(finalizeArgs[0]?.failureReason).toContain("blocked by policy");
-    expect(calls).toHaveLength(0);
+    expect(calls).toHaveLength(2);
+    expect(calls[0]?.kind).toBe("create");
+    expect(calls[1]?.kind).toBe("update");
+    expect(calls[1]?.content).toContain("policy blocked 也必须先有可见卡");
+    expect(calls[1]?.content).not.toContain('"tag":"at"');
     let ledger = await readPostFile(wt);
     for (let i = 0; i < 100 && ledger?.posts[0]?.status !== "policy_blocked"; i++) {
       await new Promise((r) => setTimeout(r, 10));
