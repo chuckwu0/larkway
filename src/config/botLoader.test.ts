@@ -545,7 +545,7 @@ read_only: false
     expect(bots[0]?.read_only).toBe(false);
   });
 
-  it("response_surface_prototype defaults disabled for existing bot yamls", async () => {
+  it("response_surface_prototype defaults post surfaces on but mentions off", async () => {
     await createBotsDir();
     await writeYaml(
       "surface-default.yaml",
@@ -562,12 +562,13 @@ bot_open_id: ou_surface_default
     const bots = await loadBots(botsDir());
     expect(bots).toHaveLength(1);
     expect(bots[0]?.response_surface_prototype).toEqual({
-      enabled: false,
+      enabled: true,
       allowed_chats: [],
       allowed_threads: [],
       lazy_card_creation: false,
       kill_switch: false,
-      post_outbound_enabled: false,
+      post_outbound_enabled: true,
+      allow_agent_mentions: true,
       allowed_mention_open_ids: [],
       max_posts_per_turn: 1,
       max_posts_per_window: 4,
@@ -577,14 +578,14 @@ bot_open_id: ou_surface_default
     });
   });
 
-  it("parses response_surface_prototype dark-launch config", async () => {
+  it("parses response_surface_prototype scoped rollout config", async () => {
     await createBotsDir();
     await writeYaml(
       "surface-prototype.yaml",
       `
 id: surface-prototype-bot
 name: Surface Prototype Bot
-description: response surface dark launch
+description: response surface scoped rollout
 app_id: cli_surface
 app_secret_env: SURFACE_SECRET
 bot_open_id: ou_surface
@@ -597,6 +598,7 @@ response_surface_prototype:
   lazy_card_creation: true
   kill_switch: true
   post_outbound_enabled: true
+  allow_agent_mentions: false
   allowed_mention_open_ids:
     - surface_peer
   max_posts_per_turn: 2
@@ -616,6 +618,7 @@ response_surface_prototype:
       lazy_card_creation: true,
       kill_switch: true,
       post_outbound_enabled: true,
+      allow_agent_mentions: false,
       allowed_mention_open_ids: ["surface_peer"],
       max_posts_per_turn: 2,
       max_posts_per_window: 7,

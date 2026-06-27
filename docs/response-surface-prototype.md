@@ -1,15 +1,14 @@
 # Response Surface Prototype
 
-Status: PR1/PR5 foundation only. Default disabled.
+Status: production foundation. Response surface and Agent-authored handoff
+mentions are enabled by default.
 
-This document defines the dark-launch foundation for future `card` / `post` /
-`hybrid` response surfaces. PR3 added post transport, post payload construction,
-idempotency helpers, and `post.json` ledger primitives. PR4 added the
-default-off surface dispatcher for `card` / `post` / `hybrid` planning,
-compact secondary cards, and fake-channel tests. PR5 adds rich boot reconcile
-for card fields plus post-ledger orphan reconciliation. Production wiring still
-keeps post outbound unavailable, so this does not enable real IM post outbound,
-peer `at`, Feishu E2E, deployment, or production enablement.
+This document defines the `card` / `post` / `hybrid` response surface runtime.
+PR3 added post transport, post payload construction, idempotency helpers, and
+`post.json` ledger primitives. PR4 added the surface dispatcher for response
+planning, compact secondary cards, and fake-channel tests. PR5 adds rich boot
+reconcile for card fields plus post-ledger orphan reconciliation. PR6a/PR7 wire
+post outbound behind runtime gates and production safeguards.
 
 ## Principles
 
@@ -19,8 +18,14 @@ peer `at`, Feishu E2E, deployment, or production enablement.
   degradation, idempotency/fallback/reconcile plumbing, and safe rendering.
 - The bridge must not encode business rules such as "short task = post" or
   "long task = card".
-- Existing bots keep the legacy visible card path unless a bot is explicitly
-  configured for this prototype and the current chat/thread is allowlisted.
+- Existing bots default to response surfaces. Empty chat/thread allowlists mean
+  all chats/threads are eligible; non-empty allowlists narrow rollout scope.
+- Agent-authored mentions are enabled by default so one bot can hand work to the
+  next peer. The package defaults do not hardcode any real open ids; the Agent
+  chooses concrete mention targets in `state.json`.
+- `@all` is always blocked.
+- `allowed_mention_open_ids: []` means unrestricted Agent-authored mentions.
+  Non-empty lists narrow mentions to that exact private operator-configured set.
 
 ## State Protocol
 
@@ -49,8 +54,10 @@ Supported narrow fields:
 
 - `mode`: `card`, `post`, or `hybrid`.
 - `primary`: `card` or `post`.
-- `post.mentions[]`: future post mention targets. PR4 can validate/build these
-  in fake-channel tests, but production dispatch still does not send them.
+- `post.mentions[]`: Agent-authored post mention targets. Runtime dispatch
+  allows them by default when `allow_agent_mentions=true`, blocks `all`/`@all`,
+  counts them against post budgets, and still falls back to a visible card when
+  policy, budget, kill-switch, or transport checks prevent the post path.
 - `card.compact`: whether the card is intended as a compact secondary surface.
 - `card.capabilities[]`: `choices`, `image_blocks`, `content_blocks`,
   `fallback`, or `audit`.
@@ -61,18 +68,17 @@ other legacy card fields needed to finalize the existing card.
 
 ## Bot Config Gate
 
-Per-bot YAML may opt into the prototype:
+Per-bot YAML may override the runtime:
 
 ```yaml
 response_surface_prototype:
   enabled: true
-  allowed_chats:
-    - <chat_id>
-  allowed_threads:
-    - <thread_id>
+  allowed_chats: []
+  allowed_threads: []
   lazy_card_creation: true
   kill_switch: false
-  post_outbound_enabled: false
+  post_outbound_enabled: true
+  allow_agent_mentions: true
   allowed_mention_open_ids: []
   max_posts_per_turn: 1
   max_posts_per_window: 4
@@ -83,12 +89,13 @@ response_surface_prototype:
 
 Defaults:
 
-- `enabled: false`
+- `enabled: true`
 - `allowed_chats: []`
 - `allowed_threads: []`
 - `lazy_card_creation: false`
 - `kill_switch: false`
-- `post_outbound_enabled: false`
+- `post_outbound_enabled: true`
+- `allow_agent_mentions: true`
 - `allowed_mention_open_ids: []`
 - `max_posts_per_turn: 1`
 - `max_posts_per_window: 4`
@@ -96,8 +103,11 @@ Defaults:
 - `max_post_attempts: 3`
 - `text_threshold_chars: 1200`
 
-`enabled: true` alone is insufficient. A current chat or thread must match the
-allowlist before the prototype can affect runtime behavior.
+Empty `allowed_chats` and `allowed_threads` mean all chats/threads are allowed.
+Set either list to one or more ids to narrow rollout scope. Mentions are
+separate: `allow_agent_mentions: false` disables all Agent-authored mentions;
+empty `allowed_mention_open_ids` allows the Agent to choose targets; non-empty
+`allowed_mention_open_ids` narrows mentions to that set. `@all` remains blocked.
 
 ## PR2 / PR4 SurfaceController Foundation
 
@@ -108,7 +118,7 @@ legacy visible card before the Agent runs.
 The lazy branch is eligible only when all of these are true:
 
 - prototype enabled
-- chat/thread allowlisted
+- chat/thread allowed by the allowlist gate; empty chat/thread allowlists allow all
 - `lazy_card_creation: true`
 - `post_outbound_enabled: true`
 - post outbound transport available
@@ -144,7 +154,7 @@ UUIDs for card replies; PR3 should follow that shape.
 
 ## PR3 Post Foundation
 
-PR3 adds default-off primitives only:
+PR3 added the post primitives:
 
 - `OutboundPostClient` / `ChannelPostClient` for Feishu `msg_type=post` replies.
 - A pure post content builder that can construct Feishu text and real `at` tag
@@ -214,8 +224,9 @@ marks `fallback_visible` unless a visible fallback artifact exists.
 
 ## PR7 Production Hardening
 
-PR7 keeps the prototype default-off while making a future production grey
-release observable, bounded, and reversible.
+PR7 makes production release observable, bounded, and reversible. The current
+default is on for post/hybrid surfaces, with kill-switch rollback and bounded
+post budgets.
 
 - `kill_switch: true` forces the runtime back to the legacy visible-card path
   even if `enabled`, `post_outbound_enabled`, and allowlists are otherwise set.
@@ -236,11 +247,10 @@ release observable, bounded, and reversible.
   queries, not public evidence files.
 
 All PR7 safeguards are mechanical gates. They do not decide business workflow,
-do not expand the allowlist, and do not enable real post outbound by default.
+and they do not hardcode mention targets in package defaults.
 
 ## Non-Goals Until Later PRs
 
-- No production enablement in repo defaults.
-- No automatic allowlist expansion.
+- No hardcoded real open ids in repo defaults.
 - No real post/at or Feishu E2E during unit-test PRs.
 - No deployment, restart, or production bridge touch as part of code changes.

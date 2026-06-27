@@ -4,12 +4,13 @@ const NonEmptyString = z.string().trim().min(1);
 
 export function defaultResponseSurfacePrototypeConfig() {
   return {
-    enabled: false,
+    enabled: true,
     allowed_chats: [] as string[],
     allowed_threads: [] as string[],
     lazy_card_creation: false,
     kill_switch: false,
-    post_outbound_enabled: false,
+    post_outbound_enabled: true,
+    allow_agent_mentions: true,
     allowed_mention_open_ids: [] as string[],
     max_posts_per_turn: 1,
     max_posts_per_window: 4,
@@ -22,12 +23,13 @@ export function defaultResponseSurfacePrototypeConfig() {
 export const DEFAULT_RESPONSE_SURFACE_PROTOTYPE = defaultResponseSurfacePrototypeConfig();
 
 const responseSurfacePrototypeConfigDefaults = () => ({
-  enabled: false,
+  enabled: true,
   allowed_chats: [] as string[],
   allowed_threads: [] as string[],
   lazy_card_creation: false,
   kill_switch: false,
-  post_outbound_enabled: false,
+  post_outbound_enabled: true,
+  allow_agent_mentions: true,
   allowed_mention_open_ids: [] as string[],
   max_posts_per_turn: 1,
   max_posts_per_window: 4,
@@ -94,17 +96,18 @@ export type ResponseSurfaceState = z.infer<typeof StrictResponseSurfaceStateSche
 export const ResponseSurfacePrototypeConfigSchema = z
   .object({
     /**
-     * Master gate. Default false keeps the legacy card-only response path.
+     * Master gate. Default true makes response surfaces available unless the
+     * runtime kill switch disables them.
      */
-    enabled: z.boolean().default(false),
+    enabled: z.boolean().default(true),
     /**
-     * Optional chat allowlist for dark-launch experiments. Empty means no chat
-     * is allowlisted by this gate.
+     * Optional chat allowlist for staged rollout. Empty means all chats are
+     * allowed by this gate.
      */
     allowed_chats: z.array(z.string().min(1)).default([]),
     /**
-     * Optional Larkway session/thread allowlist for narrow dogfood topics.
-     * Empty means no thread is allowlisted by this gate.
+     * Optional Larkway session/thread allowlist for staged rollout. Empty means
+     * all threads are allowed by this gate.
      */
     allowed_threads: z.array(z.string().min(1)).default([]),
     /**
@@ -116,18 +119,23 @@ export const ResponseSurfacePrototypeConfigSchema = z
     /**
      * Runtime kill switch for emergency rollback. When true, every response
      * surface post path is treated as disabled even if enabled/allowlists are
-     * otherwise configured. Default false preserves current default-off behavior.
+     * otherwise configured.
      */
     kill_switch: z.boolean().default(false),
     /**
-     * PR3 dark-launch gate for real post outbound. This must stay false by
-     * default. PR4's dispatcher also requires this gate before any post path.
+     * Gate for real post outbound. Defaults on, but the runtime still requires
+     * an injected post client and all safety gates before any post path.
      */
-    post_outbound_enabled: z.boolean().default(false),
+    post_outbound_enabled: z.boolean().default(true),
     /**
-     * Explicit target allowlist for future real post @ mentions. Empty means no
-     * mention target is authorized. Keep real IDs in private bot config, never
-     * in public docs/tests.
+     * Allows Agent-authored post mentions. This powers handoff to peer bots.
+     * Keep this false only when the operator wants to suppress every real @.
+     */
+    allow_agent_mentions: z.boolean().default(true),
+    /**
+     * Optional target allowlist for real post @ mentions. Empty means the Agent
+     * may choose mention targets; non-empty narrows mentions to this exact set.
+     * Keep real IDs in private bot config, never in public docs/tests.
      */
     allowed_mention_open_ids: z.array(z.string().min(1)).default([]),
     /**
@@ -168,11 +176,25 @@ export function isResponseSurfacePrototypeAllowlisted(
 ): boolean {
   if (!config?.enabled) return false;
   if (config.kill_switch) return false;
+  const hasScopedAllowlist =
+    config.allowed_chats.length > 0 || config.allowed_threads.length > 0;
+  if (!hasScopedAllowlist) return true;
   const chatAllowed =
     config.allowed_chats.length > 0 && config.allowed_chats.includes(facts.chatId);
   const threadAllowed =
     config.allowed_threads.length > 0 && config.allowed_threads.includes(facts.threadId);
   return chatAllowed || threadAllowed;
+}
+
+export function isResponseSurfaceMentionAllowed(
+  config: ResponseSurfacePrototypeConfig | undefined,
+  userId: string,
+): boolean {
+  if (!config?.allow_agent_mentions) return false;
+  const normalized = userId.trim().toLowerCase();
+  if (normalized === "all" || normalized === "@all") return false;
+  if (config.allowed_mention_open_ids.length === 0) return true;
+  return config.allowed_mention_open_ids.includes(userId);
 }
 
 export function shouldProvideResponseSurfacePostClient(
@@ -183,8 +205,7 @@ export function shouldProvideResponseSurfacePostClient(
     !config.kill_switch &&
     config.post_outbound_enabled &&
     config.max_posts_per_turn >= 1 &&
-    config.max_posts_per_window >= 1 &&
-    (config.allowed_chats.length > 0 || config.allowed_threads.length > 0)
+    config.max_posts_per_window >= 1
   );
 }
 
