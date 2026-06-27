@@ -8,19 +8,17 @@ import {
 
 const enabledConfig = {
   ...defaultResponseSurfacePrototypeConfig(),
-  enabled: true,
   allowed_chats: ["chat"],
   lazy_card_creation: true,
-  post_outbound_enabled: true,
 };
 
 describe("response surface production gates", () => {
-  it("keeps the default config fully off", () => {
+  it("enables post surfaces by default while keeping auto-mentions off", () => {
     const cfg = defaultResponseSurfacePrototypeConfig();
 
     expect(cfg).toMatchObject({
-      enabled: false,
-      post_outbound_enabled: false,
+      enabled: true,
+      post_outbound_enabled: true,
       kill_switch: false,
       allowed_chats: [],
       allowed_threads: [],
@@ -29,7 +27,20 @@ describe("response surface production gates", () => {
       max_posts_per_window: 4,
       post_window_ms: 60_000,
     });
-    expect(shouldProvideResponseSurfacePostClient(cfg)).toBe(false);
+    expect(isResponseSurfacePrototypeAllowlisted(cfg, { chatId: "any_chat", threadId: "any_thread" }))
+      .toBe(true);
+    expect(shouldProvideResponseSurfacePostClient(cfg)).toBe(true);
+  });
+
+  it("treats non-empty chat or thread allowlists as scoped rollout gates", () => {
+    const cfg = { ...enabledConfig, allowed_chats: ["chat_a"], allowed_threads: ["thread_b"] };
+
+    expect(isResponseSurfacePrototypeAllowlisted(cfg, { chatId: "chat_a", threadId: "thread_x" }))
+      .toBe(true);
+    expect(isResponseSurfacePrototypeAllowlisted(cfg, { chatId: "chat_x", threadId: "thread_b" }))
+      .toBe(true);
+    expect(isResponseSurfacePrototypeAllowlisted(cfg, { chatId: "chat_x", threadId: "thread_x" }))
+      .toBe(false);
   });
 
   it("uses kill_switch as an emergency post-client gate", () => {

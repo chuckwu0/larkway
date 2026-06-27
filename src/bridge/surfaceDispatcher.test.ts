@@ -251,6 +251,46 @@ describe("dispatchResponseSurface", () => {
       expect(after?.posts[0]?.attempts).toEqual([]);
     }));
 
+  it("keeps auto-mentions blocked by default even when chat allowlists are empty", async () =>
+    withTemp(async (dir) => {
+      const { client, calls } = fakePostClient();
+      const result = await dispatchResponseSurface(
+        baseInput({
+          worktreePath: dir,
+          cardStarted: false,
+          postClient: client,
+          prototypeConfig: {
+            ...enabledConfig,
+            allowed_chats: [],
+            allowed_threads: [],
+            allowed_mention_open_ids: [],
+          },
+          facts: {
+            botId: "tech-lead",
+            chatId: "chat_any",
+            threadId: "om_thread_any",
+            triggerMessageId: "om_trigger",
+            replyToMessageId: "om_trigger",
+            replyInThread: true,
+          },
+          state: state({
+            mode: "post",
+            primary: "post",
+            post: { mentions: [{ user_id: "user_blocked", label: "Blocked" }] },
+          }),
+        }),
+      );
+
+      expect(result.reason).toBe("mention-policy-blocked");
+      expect(result.visible).toBe(true);
+      expect(result.post?.requiresPolicyLedgerMark).toBe(true);
+      expect(calls).toHaveLength(0);
+
+      const after = await readPostFile(dir);
+      expect(after?.posts[0]?.status).toBe("planned");
+      expect(after?.posts[0]?.mentionCount).toBe(1);
+    }));
+
   it("uses a compact secondary card for hybrid without repeating the main post body", async () =>
     withTemp(async (dir) => {
       const { client } = fakePostClient();

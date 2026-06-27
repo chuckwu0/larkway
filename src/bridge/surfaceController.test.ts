@@ -47,7 +47,7 @@ describe("SurfaceController", () => {
     expect(controller.decision.reason).toBe("prototype-disabled");
   });
 
-  it("keeps legacy card creation outside the dark-launch allowlist", () => {
+  it("keeps legacy card creation outside a scoped rollout allowlist", () => {
     const controller = SurfaceController.create({
       prototypeConfig: allowlistedConfig,
       chatId: "chat_other",
@@ -57,6 +57,24 @@ describe("SurfaceController", () => {
 
     expect(controller.shouldStartCardImmediately()).toBe(true);
     expect(controller.decision.reason).toBe("not-allowlisted");
+  });
+
+  it("treats empty chat/thread allowlists as all chats allowed by default", () => {
+    const controller = SurfaceController.create({
+      prototypeConfig: {
+        ...postEnabledConfig,
+        allowed_chats: [],
+        allowed_threads: [],
+      },
+      chatId: "chat_any",
+      threadId: "om_thread_any",
+      postOutboundAvailable: true,
+      postLedgerAvailable: true,
+      visibleFallbackAvailable: true,
+    });
+
+    expect(controller.shouldStartCardImmediately()).toBe(false);
+    expect(controller.decision.reason).toBe("lazy-card-ready");
   });
 
   it("keeps card fallback when post outbound is disabled by config", () => {

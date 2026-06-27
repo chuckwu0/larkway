@@ -1,18 +1,23 @@
-# Response Surface Production Grey Rollout
+# Response Surface Production Rollout
 
-This runbook is for a future production grey release after explicit owner
-approval. It assumes the code is already deployed with response surface defaults
-still off.
+This runbook is for production rollout and rollback after explicit owner
+approval. Current code defaults response surfaces on for post/hybrid-capable
+bots; operators should use `kill_switch` and optional chat/thread allowlists to
+control blast radius.
 
 ## Safety Invariants
 
-- Default config must stay off until the rollout step:
-  - `enabled: false`
-  - `post_outbound_enabled: false`
-  - `allowed_chats: []`
-  - `allowed_threads: []`
+- Default config enables response surfaces:
+  - `enabled: true`
+  - `post_outbound_enabled: true`
+  - `allowed_chats: []` means all chats allowed
+  - `allowed_threads: []` means all threads allowed
   - `allowed_mention_open_ids: []`
-- Never start with a broad allowlist. Use one chat or one thread first.
+- Use `kill_switch: true` for immediate rollback to legacy visible cards.
+- To narrow rollout, set one chat or one thread in the allowlist. Empty
+  chat/thread allowlists are intentionally broad.
+- Auto-mentions remain opt-in. Empty `allowed_mention_open_ids` means no
+  Agent-authored `@` target is authorized.
 - Never use `@all`.
 - A turn must always produce a visible card or a visible post. If the post path
   is unavailable, over budget, policy-blocked, or fails, the handler must fall
@@ -23,11 +28,25 @@ still off.
 ## Preflight
 
 1. Confirm the target release commit and installed package version.
-2. Confirm no production bot config has response surface enabled:
+2. Confirm the production bot config has either the intended default-on state or
+   the rollback kill-switch state.
+
+   Default-on:
+   ```yaml
+   response_surface_prototype:
+     enabled: true
+     kill_switch: false
+     post_outbound_enabled: true
+     allowed_chats: []
+     allowed_threads: []
+     allowed_mention_open_ids: []
+   ```
+
+   Rollback:
    ```yaml
    response_surface_prototype:
      enabled: false
-     kill_switch: false
+     kill_switch: true
      post_outbound_enabled: false
      allowed_chats: []
      allowed_threads: []
@@ -35,13 +54,13 @@ still off.
    ```
 3. Confirm the production bridge has no response-surface error spike in recent
    logs.
-4. Prepare a private rollout config with:
-   - one test or grey chat in `allowed_chats`, or one topic in
-     `allowed_threads`;
-   - `allowed_mention_open_ids` containing only confirmed members;
+4. If using a narrowed rollout, prepare a private rollout config with:
+   - one test or grey chat in `allowed_chats`, or one topic in `allowed_threads`;
+   - `allowed_mention_open_ids: []` unless automatic `@` has separately been
+     approved; if approved, include only confirmed members;
    - `max_posts_per_turn: 1`;
    - a conservative `max_posts_per_window` and `post_window_ms`;
-   - `kill_switch: false` only for the grey window.
+   - `kill_switch: false` only for the rollout window.
 5. Prepare rollback config before changing anything:
    ```yaml
    response_surface_prototype:
@@ -53,19 +72,24 @@ still off.
      allowed_mention_open_ids: []
    ```
 
-## Enable Order
+## Enable / Narrowing Order
 
-Use the smallest possible grey scope.
+Default install is broad for chats/threads, but automatic mentions are still
+off. If the operator wants a smaller first rollout, narrow before enabling the
+post path.
 
-1. Set allowlists first while `enabled: false`.
+1. Apply optional `allowed_chats` / `allowed_threads` narrowing before clearing
+   `kill_switch`.
 2. Set budget fields:
    - `max_posts_per_turn: 1`
    - `max_posts_per_window: <small integer>`
    - `post_window_ms: <window in ms>`
-3. Set `post_outbound_enabled: true`.
-4. Set `enabled: true`.
-5. Confirm the runtime log shows the post client is provided only for the
-   allowlisted bot config.
+3. Keep `allowed_mention_open_ids: []` unless automatic `@` is separately
+   approved.
+4. Set `post_outbound_enabled: true`.
+5. Set `enabled: true` and `kill_switch: false`.
+6. Confirm the runtime log shows the post client is provided only when the
+   effective config gates allow it.
 
 ## Observability
 
@@ -92,7 +116,7 @@ For each grey turn, confirm:
 
 Immediately rollback if any of these occur:
 
-- any send targets a non-allowlisted chat or thread
+- any send targets a chat or thread outside a non-empty rollout allowlist
 - any mention target is not in `allowed_mention_open_ids`
 - a turn has no visible card and no visible post
 - a ledger entry becomes `fallback_visible` without `fallbackCardMessageId`

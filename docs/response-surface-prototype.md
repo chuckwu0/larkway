@@ -1,15 +1,14 @@
 # Response Surface Prototype
 
-Status: PR1/PR5 foundation only. Default disabled.
+Status: production foundation. Response surface is enabled by default; auto-@
+mentions stay opt-in.
 
-This document defines the dark-launch foundation for future `card` / `post` /
-`hybrid` response surfaces. PR3 added post transport, post payload construction,
-idempotency helpers, and `post.json` ledger primitives. PR4 added the
-default-off surface dispatcher for `card` / `post` / `hybrid` planning,
-compact secondary cards, and fake-channel tests. PR5 adds rich boot reconcile
-for card fields plus post-ledger orphan reconciliation. Production wiring still
-keeps post outbound unavailable, so this does not enable real IM post outbound,
-peer `at`, Feishu E2E, deployment, or production enablement.
+This document defines the `card` / `post` / `hybrid` response surface runtime.
+PR3 added post transport, post payload construction, idempotency helpers, and
+`post.json` ledger primitives. PR4 added the surface dispatcher for response
+planning, compact secondary cards, and fake-channel tests. PR5 adds rich boot
+reconcile for card fields plus post-ledger orphan reconciliation. PR6a/PR7 wire
+post outbound behind runtime gates and production safeguards.
 
 ## Principles
 
@@ -19,8 +18,12 @@ peer `at`, Feishu E2E, deployment, or production enablement.
   degradation, idempotency/fallback/reconcile plumbing, and safe rendering.
 - The bridge must not encode business rules such as "short task = post" or
   "long task = card".
-- Existing bots keep the legacy visible card path unless a bot is explicitly
-  configured for this prototype and the current chat/thread is allowlisted.
+- Existing bots default to response surfaces. Empty chat/thread allowlists mean
+  all chats/threads are eligible; non-empty allowlists narrow rollout scope.
+- `allowed_mention_open_ids: []` means no automatic `@` target is authorized.
+  A post may still be sent, but the bridge strips no policy: any Agent-authored
+  mention outside the explicit allowlist is policy-blocked and falls back to a
+  visible card.
 
 ## State Protocol
 
@@ -61,18 +64,16 @@ other legacy card fields needed to finalize the existing card.
 
 ## Bot Config Gate
 
-Per-bot YAML may opt into the prototype:
+Per-bot YAML may override the runtime:
 
 ```yaml
 response_surface_prototype:
   enabled: true
-  allowed_chats:
-    - <chat_id>
-  allowed_threads:
-    - <thread_id>
+  allowed_chats: []
+  allowed_threads: []
   lazy_card_creation: true
   kill_switch: false
-  post_outbound_enabled: false
+  post_outbound_enabled: true
   allowed_mention_open_ids: []
   max_posts_per_turn: 1
   max_posts_per_window: 4
@@ -83,12 +84,12 @@ response_surface_prototype:
 
 Defaults:
 
-- `enabled: false`
+- `enabled: true`
 - `allowed_chats: []`
 - `allowed_threads: []`
 - `lazy_card_creation: false`
 - `kill_switch: false`
-- `post_outbound_enabled: false`
+- `post_outbound_enabled: true`
 - `allowed_mention_open_ids: []`
 - `max_posts_per_turn: 1`
 - `max_posts_per_window: 4`
@@ -96,8 +97,9 @@ Defaults:
 - `max_post_attempts: 3`
 - `text_threshold_chars: 1200`
 
-`enabled: true` alone is insufficient. A current chat or thread must match the
-allowlist before the prototype can affect runtime behavior.
+Empty `allowed_chats` and `allowed_threads` mean all chats/threads are allowed.
+Set either list to one or more ids to narrow rollout scope. Mentions are
+separate: empty `allowed_mention_open_ids` is deny-all for automatic `@`.
 
 ## PR2 / PR4 SurfaceController Foundation
 
@@ -108,7 +110,7 @@ legacy visible card before the Agent runs.
 The lazy branch is eligible only when all of these are true:
 
 - prototype enabled
-- chat/thread allowlisted
+- chat/thread allowed by the allowlist gate; empty chat/thread allowlists allow all
 - `lazy_card_creation: true`
 - `post_outbound_enabled: true`
 - post outbound transport available
@@ -144,7 +146,7 @@ UUIDs for card replies; PR3 should follow that shape.
 
 ## PR3 Post Foundation
 
-PR3 adds default-off primitives only:
+PR3 added the post primitives:
 
 - `OutboundPostClient` / `ChannelPostClient` for Feishu `msg_type=post` replies.
 - A pure post content builder that can construct Feishu text and real `at` tag
@@ -214,8 +216,9 @@ marks `fallback_visible` unless a visible fallback artifact exists.
 
 ## PR7 Production Hardening
 
-PR7 keeps the prototype default-off while making a future production grey
-release observable, bounded, and reversible.
+PR7 makes production release observable, bounded, and reversible. The current
+default is on for post/hybrid surfaces, with kill-switch rollback and bounded
+post budgets.
 
 - `kill_switch: true` forces the runtime back to the legacy visible-card path
   even if `enabled`, `post_outbound_enabled`, and allowlists are otherwise set.
@@ -235,12 +238,11 @@ release observable, bounded, and reversible.
   `fallbackCardMessageId` entries. These are meant for operator dashboards/log
   queries, not public evidence files.
 
-All PR7 safeguards are mechanical gates. They do not decide business workflow,
-do not expand the allowlist, and do not enable real post outbound by default.
+All PR7 safeguards are mechanical gates. They do not decide business workflow
+and do not authorize automatic `@` targets by default.
 
 ## Non-Goals Until Later PRs
 
-- No production enablement in repo defaults.
-- No automatic allowlist expansion.
+- No automatic `@` mention enablement in repo defaults.
 - No real post/at or Feishu E2E during unit-test PRs.
 - No deployment, restart, or production bridge touch as part of code changes.

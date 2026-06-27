@@ -495,7 +495,7 @@ describe("handleOne — thin-channel finalize", () => {
     expect(callOrder.at(-1)).toBe("ack:om_msg");
   });
 
-  it("keeps visible card fallback when response-surface prototype is dark-launched before post outbound exists", async () => {
+  it("keeps visible card fallback when response surface is enabled before post outbound exists", async () => {
     const { renderer, startArgs, finalizeArgs, whenFinalized } = makeCardRenderer();
     const { store } = makeSessionStore();
     const { client } = makeClient(makeEvent());

@@ -153,14 +153,14 @@ Agent 通过工作区里的 `.larkway/state.json` 或 v0.3 session state artifac
 - `card_title` / `card_color`: 可选的标题和色彩语义。
 - `choices` / `choice_prompt`: 可选的离散选择。按钮点击只把 value 作为新一轮文本交回 Agent。
 - `content_blocks`: 可选的有序 markdown/image 正文块。需要平台正文与匹配图片在同一 review card 里相邻展示时使用;优先级和示例见 [Review Card Content Blocks](review-card-content-blocks.md)。
-- `response_surface`: 可选原型声明,用于未来 `card` / `post` / `hybrid` surface。PR1/PR2 只提供默认关闭的 schema/config/controller 基础层;真实 post outbound、ledger、peer at 和 E2E 不在此阶段。协议和门禁见 [Response Surface Prototype](response-surface-prototype.md)。
+- `response_surface`: 可选声明,用于 `card` / `post` / `hybrid` surface。协议和门禁见 [Response Surface Prototype](response-surface-prototype.md)。
 
 关键边界:
 
 - Agent **绝不**自己 `lark-cli api PATCH .../im/v1/messages/...` 改卡片。
 - bridge 不从 Agent 输出里正则抓 MR URL、预览 URL、业务阶段或下一步动作。
 - bridge 不规定正文必须分成固定几个业务区块;它只提供稳定外壳和安全渲染。
-- 在 `response_surface` prototype 中,surface 选择仍由 Agent 声明;bridge 只做门禁、机械降级和可见 fallback。PR3 真实 post outbound/ledger 未实现前,即使命中 dark-launch 配置,也必须保留现有 card 可见路径,不得制造“无 card、无 post”的不可见回复。
+- 在 `response_surface` 中,surface 选择仍由 Agent 声明;bridge 只做门禁、机械降级和可见 fallback。无论 post outbound 是否可用,都不得制造“无 card、无 post”的不可见回复。
 - 如果 Agent 需要用户补充多字段信息,默认让用户在话题里文字回复;按钮只适合一次点击能完整表达的单选。
 
 最终消息建议清楚,但不是强格式:
