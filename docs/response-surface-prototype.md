@@ -142,14 +142,18 @@ therefore inserted/enabled in the final card after final content is written.
 Fallback rules:
 
 - CardKit create/reply failure before the agent starts -> create a legacy
-  visible card and continue.
+  visible card and continue; if that legacy card cannot be created, send a
+  create-only fallback post so the operator still sees a reply.
 - CardKit finalization failure -> create/finalize a legacy visible card with an
-  explicit CardKit fallback failure reason.
+  explicit CardKit fallback failure reason; if that legacy card also fails,
+  send a create-only fallback post.
 - Hard crash after CardKit message creation -> boot reconcile reads
   `cardkit.json` and fresh `state.json`; it finalizes the existing CardKit card
   when possible.
 - Reconcile retry cap exceeded -> send a legacy visible fallback card and mark
-  the CardKit ledger `fallback_visible`.
+  the CardKit ledger `fallback_visible`; if that fallback card also fails,
+  send a create-only fallback post and mark the ledger visible with that post
+  message id.
 
 Legacy `card.json` and `post.json` reconcile paths remain for existing or
 rollback artifacts. The normal default path should not create or update post
@@ -164,7 +168,8 @@ Required automated coverage:
 - CardKit surface renders progress, final body, mentions, choices, images, and
   content blocks.
 - Handler uses CardKit by default, suppresses post editing, and falls back to a
-  visible legacy card on CardKit failure.
+  visible legacy card on CardKit failure, then a create-only fallback post if
+  the legacy card path also fails.
 - Reconcile finalizes orphaned `cardkit.json` records and deletes terminal
   ledgers.
 - Config gates and kill switch roll back to legacy card.

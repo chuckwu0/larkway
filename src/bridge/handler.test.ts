@@ -144,7 +144,7 @@ interface FinalizeArgs {
  * fire-and-forget (it sets up a per-thread promise chain and returns without
  * awaiting handleOne), so tests await whenFinalized to know the turn finished.
  */
-function makeCardRenderer() {
+function makeCardRenderer(rendererOpts: { failStart?: boolean; failFinalize?: boolean } = {}) {
   const finalizeArgs: FinalizeArgs[] = [];
   const startArgs: Array<{ messageId: string; replyInThread?: boolean; threadId?: string }> = [];
   let resolveFinalized!: () => void;
@@ -152,12 +152,18 @@ function makeCardRenderer() {
     resolveFinalized = r;
   });
   const renderer = {
-    async start(messageId: string, opts?: { replyInThread?: boolean; threadId?: string }) {
-      startArgs.push({ messageId, ...opts });
+    async start(messageId: string, startOpts?: { replyInThread?: boolean; threadId?: string }) {
+      startArgs.push({ messageId, ...startOpts });
+      if (rendererOpts.failStart) {
+        throw new Error("fake card start failed");
+      }
       return {
         messageId: "om_card",
         handle: () => {},
         finalize: async (a: FinalizeArgs) => {
+          if (rendererOpts.failFinalize) {
+            throw new Error("fake card finalize failed");
+          }
           finalizeArgs.push(a);
           resolveFinalized();
         },
@@ -898,6 +904,85 @@ describe("handleOne — thin-channel finalize", () => {
     expect(finalizeArgs).toHaveLength(1);
     expect(finalizeArgs[0]?.success).toBe(false);
     expect(finalizeArgs[0]?.failureReason).toContain("CardKit finalize failed");
+  });
+
+  it("sends a create-only post if CardKit finalize and legacy card fallback both fail", async () => {
+    const threadId = "om_msg";
+    const finalState = {
+      status: "ready",
+      last_message: "双失败仍要可见",
+      updated_at: "2026-06-26T10:00:00.000Z",
+    };
+    const wt = await seedWorktree(threadId);
+    await seedRepoCachePath();
+    const { client: cardKitClient } = makeCardKitClient({ failFinalize: true });
+    const { client: postClient, calls: postCalls } = makePostClient();
+
+    runClaudeImpl = () => ({
+      events: (async function* () {
+        yield { type: "system_init", sessionId: "sess_cardkit_post_fallback", raw: {} };
+        await writeFile(
+          stateFileMod.stateFilePathOf(wt),
+          JSON.stringify(finalState, null, 2),
+          "utf8",
+        );
+      })(),
+      done: Promise.resolve({ exitCode: 0, sessionId: "sess_cardkit_post_fallback" }),
+      kill: () => {},
+    });
+
+    const { renderer, startArgs } = makeCardRenderer({ failStart: true });
+    const { store } = makeSessionStore();
+    const { client, acked } = makeClient(makeEvent());
+
+    const handler = new BridgeHandler({
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      client: client as any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      cardRenderer: renderer as any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      sessionStore: store as any,
+      conventions: makeConventions(),
+      botConfig: {
+        id: "frontend",
+        name: "Frontend",
+        turn_taking_limit: 10,
+        backend: "claude",
+        response_surface_prototype: {
+          enabled: true,
+          allowed_chats: [],
+          allowed_threads: ["om_msg"],
+          lazy_card_creation: true,
+          kill_switch: false,
+          post_outbound_enabled: true,
+          cardkit_streaming_enabled: true,
+          allow_agent_mentions: true,
+          allowed_mention_open_ids: [],
+          max_posts_per_turn: 1,
+          max_posts_per_window: 4,
+          post_window_ms: 60_000,
+          max_post_attempts: 3,
+          text_threshold_chars: 900,
+        },
+      },
+      cardKitClient,
+      postClient,
+    });
+
+    await handler.run();
+    for (let i = 0; i < 100 && acked.length === 0; i++) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
+
+    expect(acked).toEqual(["om_msg"]);
+    expect(startArgs).toHaveLength(1);
+    expect(postCalls).toHaveLength(1);
+    expect(postCalls[0]?.kind).toBe("create");
+    expect(postCalls[0]?.replyToMessageId).toBe("om_msg");
+    expect(postCalls[0]?.replyInThread).toBe(true);
+    expect(postCalls[0]?.idempotencyKey).toMatch(/^lw-p-/);
+    expect(postCalls[0]?.content).toContain("双失败仍要可见");
+    expect(postCalls[0]?.content).toContain("legacy visible card fallback also failed");
   });
 
   it("uses legacy card fallback instead of post editing when CardKit is disabled", async () => {

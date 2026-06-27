@@ -60,6 +60,8 @@ import type { OutboundCardKitClient } from "../lark/channelCardKitClient.js";
 import type { OutboundPostClient } from "../lark/outboundPostClient.js";
 import { markPostLedgerFallbackVisible, markPostLedgerPolicyBlockedVisible } from "./postFile.js";
 import { ResponseSurfacePostBudget } from "./postBudget.js";
+import { buildPostContent } from "../lark/postContent.js";
+import { derivePostIdempotencyKey, digestPostContent } from "../lark/idempotency.js";
 
 // ---------------------------------------------------------------------------
 // Private helpers — worktree bootstrap
@@ -393,6 +395,56 @@ function execFile(
       reject(err);
     });
   });
+}
+
+async function createOnlyPostFallback(opts: {
+  postClient?: OutboundPostClient;
+  replyToMessageId: string;
+  replyInThread: boolean;
+  botId: string;
+  threadId: string;
+  triggerMessageId: string;
+  finalText: string;
+  failureReason: string;
+  title?: string;
+  logPrefix: string;
+}): Promise<{ messageId: string; idempotencyKey: string } | null> {
+  if (!opts.postClient) {
+    console.error(`${opts.logPrefix} create-only post fallback unavailable: no postClient`);
+    return null;
+  }
+
+  const text = [
+    opts.finalText.trim() || "执行结果无法通过卡片展示。",
+    "",
+    `fallback_reason: ${opts.failureReason}`,
+  ].join("\n");
+  const content = buildPostContent({
+    text,
+    title: opts.title ?? "Larkway fallback",
+  });
+  const idempotencyKey = derivePostIdempotencyKey({
+    botId: opts.botId,
+    threadId: opts.threadId,
+    triggerMessageId: opts.triggerMessageId,
+    role: "fallback",
+    logicalIndex: 0,
+    contentDigest: digestPostContent(content),
+  });
+
+  try {
+    const sent = await opts.postClient.createPostReply(opts.replyToMessageId, content, {
+      replyInThread: opts.replyInThread,
+      idempotencyKey,
+    });
+    console.warn(
+      `${opts.logPrefix} create-only post fallback sent as ${sent.messageId}`,
+    );
+    return { messageId: sent.messageId, idempotencyKey };
+  } catch (err) {
+    console.error(`${opts.logPrefix} create-only post fallback failed:`, err);
+    return null;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -1068,16 +1120,44 @@ export class BridgeHandler {
       }
 
       if (!card && (progressPostStartFailed || cardKitStartFailed)) {
-        card = await this.deps.cardRenderer.start(messageId, { replyInThread, threadId });
-        await this.deps.client.removeProcessingReaction?.(messageId);
-        await recordEvent({
-          status: "running",
-          startedAt: new Date().toISOString(),
-          appendPath: cardKitStartFailed ? "CardKit 失败，已创建卡片" : "post 失败，已创建卡片",
-          reason: cardKitStartFailed
-            ? "CardKit 主面创建失败，bridge 使用可见卡片兜底。"
-            : "post 主面创建失败，bridge 使用可见卡片兜底。",
-        });
+        try {
+          card = await this.deps.cardRenderer.start(messageId, { replyInThread, threadId });
+          await this.deps.client.removeProcessingReaction?.(messageId);
+          await recordEvent({
+            status: "running",
+            startedAt: new Date().toISOString(),
+            appendPath: cardKitStartFailed ? "CardKit 失败，已创建卡片" : "post 失败，已创建卡片",
+            reason: cardKitStartFailed
+              ? "CardKit 主面创建失败，bridge 使用可见卡片兜底。"
+              : "post 主面创建失败，bridge 使用可见卡片兜底。",
+          });
+        } catch (err) {
+          console.error(
+            "[bridge.handler] visible card fallback start failed after primary surface start failure:",
+            err,
+          );
+          await createOnlyPostFallback({
+            postClient: this.deps.postClient,
+            replyToMessageId: messageId,
+            replyInThread,
+            botId: this.deps.botConfig?.id ?? "v1-default",
+            threadId,
+            triggerMessageId: messageId,
+            finalText: cardKitStartFailed
+              ? "CardKit 主回复面创建失败, legacy 可见卡片兜底也创建失败。"
+              : "post 主回复面创建失败, legacy 可见卡片兜底也创建失败。",
+            failureReason: String(err),
+            title: "Larkway fallback",
+            logPrefix: "[bridge.handler]",
+          });
+          await this.deps.client.removeProcessingReaction?.(messageId);
+          await recordEvent({
+            status: "running",
+            startedAt: new Date().toISOString(),
+            appendPath: "卡片兜底失败，已尝试 post 兜底",
+            reason: String(err),
+          });
+        }
       }
 
       // Step 4a-v-bis: persist a card.json handle so boot reconcile can
@@ -1358,28 +1438,52 @@ export class BridgeHandler {
                 `CardKit finalize failed; visible legacy card fallback used: ${String(err)}`;
               console.warn("[bridge.handler] CardKit finalize failed; using card fallback:", err);
               cardKitProgress.close();
-              card = await this.deps.cardRenderer.start(messageId, { replyInThread, threadId });
-              await writeCardFile(worktreePath, {
-                messageId: card.messageId,
-                chatId: parsed.chatId,
-                threadId,
-                botId: this.deps.botConfig?.id ?? "",
-                replyInThread,
-                createdAt: new Date().toISOString(),
-              }).catch((writeErr) => {
-                console.warn("[bridge.handler] writeCardFile(cardkit fallback) failed:", writeErr);
-              });
-              await card.finalize({
-                ...baseCardPayload,
-                success: false,
-                failureReason: fallbackReason,
-              });
-              await updateCardKitRecord({
-                status: "fallback_visible",
-                sequence: cardKitProgress.sequence,
-                lastVisibleFallbackMessageId: card.messageId,
-              });
-              await deleteCardFile(worktreePath);
+              try {
+                card = await this.deps.cardRenderer.start(messageId, { replyInThread, threadId });
+                await writeCardFile(worktreePath, {
+                  messageId: card.messageId,
+                  chatId: parsed.chatId,
+                  threadId,
+                  botId: this.deps.botConfig?.id ?? "",
+                  replyInThread,
+                  createdAt: new Date().toISOString(),
+                }).catch((writeErr) => {
+                  console.warn("[bridge.handler] writeCardFile(cardkit fallback) failed:", writeErr);
+                });
+                await card.finalize({
+                  ...baseCardPayload,
+                  success: false,
+                  failureReason: fallbackReason,
+                });
+                await updateCardKitRecord({
+                  status: "fallback_visible",
+                  sequence: cardKitProgress.sequence,
+                  lastVisibleFallbackMessageId: card.messageId,
+                });
+                await deleteCardFile(worktreePath);
+              } catch (legacyErr) {
+                const postFallback = await createOnlyPostFallback({
+                  postClient: this.deps.postClient,
+                  replyToMessageId: messageId,
+                  replyInThread,
+                  botId: this.deps.botConfig?.id ?? "v1-default",
+                  threadId,
+                  triggerMessageId: messageId,
+                  finalText: baseCardPayload.finalText,
+                  failureReason: `${fallbackReason}; legacy visible card fallback also failed: ${String(legacyErr)}`,
+                  title: baseCardPayload.titleOverride ?? "Larkway fallback",
+                  logPrefix: "[bridge.handler]",
+                });
+                if (postFallback) {
+                  await updateCardKitRecord({
+                    status: "fallback_visible",
+                    sequence: cardKitProgress.sequence,
+                    lastVisibleFallbackMessageId: postFallback.messageId,
+                  });
+                  await deleteCardFile(worktreePath);
+                  await deleteCardKitFile(worktreePath);
+                }
+              }
             }
           } else {
           await progressPost?.drain();

@@ -58,6 +58,9 @@ import {
 import { readStateFile, stateFilePathOf, type StateFile } from "./stateFile.js";
 import type { CardHandle, CardRenderer } from "../lark/card.js";
 import type { OutboundCardKitClient } from "../lark/channelCardKitClient.js";
+import type { OutboundPostClient } from "../lark/outboundPostClient.js";
+import { buildPostContent } from "../lark/postContent.js";
+import { derivePostIdempotencyKey, digestPostContent } from "../lark/idempotency.js";
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -353,25 +356,55 @@ async function reconcileCardKitRecord(input: {
       `[reconcile] cardkit finalize FAILED for ${input.name} (retry ${nextRetry}/${RETRY_CAP}): ${String(err)}`,
     );
     if (nextRetry > RETRY_CAP) {
-      const fallback = await input.deps.cardRenderer.start(input.cardKit.replyToMessageId, {
-        replyInThread: input.cardKit.replyInThread,
-        threadId: input.cardKit.threadId,
-      });
-      await fallback.finalize({
-        finalText: mapFinalizeArgs(input.state, input.success, input.stateFresh).finalText,
-        success: false,
-        failureReason: `CardKit reconcile failed after retry cap; visible legacy card fallback used: ${String(err)}`,
-        titleOverride: "CardKit fallback recovered",
-        colorOverride: "failure",
-      });
-      await writeCardKitFile(input.worktreePath, {
-        ...input.cardKit,
-        status: "fallback_visible",
-        retryCount: nextRetry,
-        lastVisibleFallbackMessageId: fallback.messageId,
-        updatedAt: input.nowIso,
-      });
-      input.log(`[reconcile] cardkit ${input.name} exceeded retry cap; fallback card ${fallback.messageId} sent`);
+      const fallbackText =
+        mapFinalizeArgs(input.state, input.success, input.stateFresh).finalText ??
+        "CardKit reconcile failed and no final text was available.";
+      try {
+        const fallback = await input.deps.cardRenderer.start(input.cardKit.replyToMessageId, {
+          replyInThread: input.cardKit.replyInThread,
+          threadId: input.cardKit.threadId,
+        });
+        await fallback.finalize({
+          finalText: fallbackText,
+          success: false,
+          failureReason: `CardKit reconcile failed after retry cap; visible legacy card fallback used: ${String(err)}`,
+          titleOverride: "CardKit fallback recovered",
+          colorOverride: "failure",
+        });
+        await writeCardKitFile(input.worktreePath, {
+          ...input.cardKit,
+          status: "fallback_visible",
+          retryCount: nextRetry,
+          lastVisibleFallbackMessageId: fallback.messageId,
+          updatedAt: input.nowIso,
+        });
+        input.log(`[reconcile] cardkit ${input.name} exceeded retry cap; fallback card ${fallback.messageId} sent`);
+      } catch (legacyErr) {
+        const postFallback = await createOnlyPostFallback({
+          deps: input.deps,
+          replyToMessageId: input.cardKit.replyToMessageId,
+          replyInThread: input.cardKit.replyInThread,
+          botId: input.cardKit.botId,
+          threadId: input.cardKit.threadId,
+          triggerMessageId: input.cardKit.replyToMessageId,
+          finalText: fallbackText,
+          failureReason:
+            `CardKit reconcile failed after retry cap and legacy fallback card failed: ${String(legacyErr)}`,
+          title: "CardKit fallback recovered",
+          log: input.log,
+        });
+        if (!postFallback) return;
+        await writeCardKitFile(input.worktreePath, {
+          ...input.cardKit,
+          status: "fallback_visible",
+          retryCount: nextRetry,
+          lastVisibleFallbackMessageId: postFallback.messageId,
+          updatedAt: input.nowIso,
+        });
+        input.log(
+          `[reconcile] cardkit ${input.name} exceeded retry cap; create-only post fallback ${postFallback.messageId} sent`,
+        );
+      }
       return;
     }
     await writeCardKitFile(input.worktreePath, {
@@ -391,6 +424,57 @@ function postFallbackText(entry: PostLedgerEntry): string {
   );
 }
 
+async function createOnlyPostFallback(input: {
+  deps: ReconcileDeps;
+  replyToMessageId: string;
+  replyInThread: boolean;
+  botId: string;
+  threadId: string;
+  triggerMessageId: string;
+  finalText: string;
+  failureReason: string;
+  title: string;
+  log: (msg: string) => void;
+}): Promise<{ messageId: string; idempotencyKey: string } | null> {
+  if (!input.deps.postClient) {
+    input.log("[reconcile] create-only post fallback unavailable: no postClient");
+    return null;
+  }
+
+  const content = buildPostContent({
+    title: input.title,
+    text: [
+      input.finalText.trim() || "Reconcile could not make the fallback card visible.",
+      "",
+      `fallback_reason: ${input.failureReason}`,
+    ].join("\n"),
+  });
+  const idempotencyKey = derivePostIdempotencyKey({
+    botId: input.botId,
+    threadId: input.threadId,
+    triggerMessageId: input.triggerMessageId,
+    role: "fallback",
+    logicalIndex: 0,
+    contentDigest: digestPostContent(content),
+  });
+
+  try {
+    const sent = await input.deps.postClient.createPostReply(
+      input.replyToMessageId,
+      content,
+      {
+        replyInThread: input.replyInThread,
+        idempotencyKey,
+      },
+    );
+    input.log(`[reconcile] create-only post fallback sent as ${sent.messageId}`);
+    return { messageId: sent.messageId, idempotencyKey };
+  } catch (err) {
+    input.log(`[reconcile] create-only post fallback failed: ${String(err)}`);
+    return null;
+  }
+}
+
 async function finalizePostOnlyFallbackCard(input: {
   deps: ReconcileDeps;
   worktreePath: string;
@@ -402,12 +486,29 @@ async function finalizePostOnlyFallbackCard(input: {
   const fallbackError =
     input.entry.error ??
     "orphaned post ledger entry reconciled after visible fallback card finalize";
-  const handle = input.existingCard
-    ? input.deps.cardRenderer.handleFor(input.existingCard.messageId)
-    : await input.deps.cardRenderer.start(input.entry.replyToMessageId, {
-        replyInThread: true,
-        threadId: input.entry.threadId,
-      });
+  let handle: CardHandle;
+  try {
+    handle = input.existingCard
+      ? input.deps.cardRenderer.handleFor(input.existingCard.messageId)
+      : await input.deps.cardRenderer.start(input.entry.replyToMessageId, {
+          replyInThread: true,
+          threadId: input.entry.threadId,
+        });
+  } catch (err) {
+    await createOnlyPostFallback({
+      deps: input.deps,
+      replyToMessageId: input.entry.replyToMessageId,
+      replyInThread: true,
+      botId: input.entry.botId,
+      threadId: input.entry.threadId,
+      triggerMessageId: input.entry.replyToMessageId,
+      finalText: postFallbackText(input.entry),
+      failureReason: `legacy fallback card creation failed during reconcile: ${String(err)}`,
+      title: "Post fallback recovered",
+      log: input.log,
+    });
+    throw err;
+  }
 
   if (!input.existingCard) {
     await writeCardFile(input.worktreePath, {
@@ -420,13 +521,29 @@ async function finalizePostOnlyFallbackCard(input: {
     });
   }
 
-  await handle.finalize({
-    finalText: postFallbackText(input.entry),
-    success: false,
-    failureReason: fallbackError,
-    titleOverride: "Post fallback recovered",
-    colorOverride: "failure",
-  });
+  try {
+    await handle.finalize({
+      finalText: postFallbackText(input.entry),
+      success: false,
+      failureReason: fallbackError,
+      titleOverride: "Post fallback recovered",
+      colorOverride: "failure",
+    });
+  } catch (err) {
+    await createOnlyPostFallback({
+      deps: input.deps,
+      replyToMessageId: input.entry.replyToMessageId,
+      replyInThread: true,
+      botId: input.entry.botId,
+      threadId: input.entry.threadId,
+      triggerMessageId: input.entry.replyToMessageId,
+      finalText: postFallbackText(input.entry),
+      failureReason: `legacy fallback card finalize failed during reconcile: ${String(err)}`,
+      title: "Post fallback recovered",
+      log: input.log,
+    });
+    throw err;
+  }
   await markPostLedgerFallbackVisible(input.worktreePath, input.entry.idempotencyKey, {
     fallbackCardMessageId: handle.messageId,
     error: fallbackError,
@@ -489,6 +606,11 @@ export interface ReconcileDeps {
    * cardkit.json records left by a crash during the streaming response path.
    */
   cardKitClient?: OutboundCardKitClient;
+  /**
+   * Optional create-only post transport. Used only as the final visible
+   * fallback when CardKit and the legacy interactive card fallback both fail.
+   */
+  postClient?: OutboundPostClient;
   /** Minimum state.json age before a card is eligible. @default 60000 */
   minAgeMs?: number;
   /** Logger. @default console.log */

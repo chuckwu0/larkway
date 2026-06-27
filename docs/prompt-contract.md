@@ -143,7 +143,7 @@ legacy 卡片只作为 CardKit 不可用/失败时的可见 fallback:
 |---|---|---|
 | 主面 | 创建 CardKit 流式卡片,运行中更新进度区,完成后 finalize 为干净总结卡 | 写 `last_message`,决定最终给运营看的正文 |
 | 结构化内容 | 在同一张 final CardKit 卡里渲染 choices / image_blocks / content_blocks | 只在确实需要按钮或结构化排版时声明这些字段 |
-| 失败兜底 | CardKit 不可用或更新失败时创建 legacy 可见卡片 fallback,避免不可见回复 | 不自行发第二条消息绕过 bridge |
+| 失败兜底 | CardKit 不可用或更新失败时创建 legacy 可见卡片 fallback;若 legacy 卡片也失败,再发 create-only post,避免不可见回复 | 不自行发第二条消息绕过 bridge |
 | 底部动作 | 把 `choices` 渲染成 final 区按钮,点击后把 value 原样回传 | 只在单个离散选择时声明 `choices` |
 
 Agent 通过工作区里的 `.larkway/state.json` 或 v0.3 session state artifact 表达卡片意图:
@@ -161,7 +161,7 @@ Agent 通过工作区里的 `.larkway/state.json` 或 v0.3 session state artifac
 - Agent **绝不**自己 `lark-cli api PATCH/PUT .../im/v1/messages/...` 改 bridge 管理的 post/card。
 - bridge 不从 Agent 输出里正则抓 MR URL、预览 URL、业务阶段或下一步动作。
 - bridge 不规定正文必须分成固定几个业务区块;它只提供稳定外壳和安全渲染。
-- 无论 CardKit 是否可用,都不得制造“无 card、无消息”的不可见回复。CardKit 不可用或失败时必须降级为 legacy 可见卡片。
+- 无论 CardKit 是否可用,都不得制造“无 card、无消息”的不可见回复。CardKit 不可用或失败时必须先降级为 legacy 可见卡片;legacy 卡片也失败时必须再用 create-only post 兜底。
 - 如果 Agent 需要用户补充多字段信息,默认让用户在话题里文字回复;按钮只适合一次点击能完整表达的单选。
 
 最终消息建议清楚,但不是强格式:

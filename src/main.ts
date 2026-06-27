@@ -516,6 +516,9 @@ async function runV2Mode({
       )
         ? client.outboundCardKitClient()
         : undefined,
+      postClient: shouldProvideResponseSurfacePostClient(bot.response_surface_prototype)
+        ? client.outboundPostClient()
+        : undefined,
       log: (m) => console.log(m),
     });
   }

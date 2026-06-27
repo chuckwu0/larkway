@@ -24,6 +24,7 @@ import { writeCardKitFile, readCardKitFile, type CardKitFile } from "./cardkitFi
 import type { StateFile } from "./stateFile.js";
 import type { CardHandle } from "../lark/card.js";
 import type { OutboundCardKitClient } from "../lark/channelCardKitClient.js";
+import type { OutboundPostClient } from "../lark/outboundPostClient.js";
 import { readPostFile, writePostFile, type PostLedgerEntry } from "./postFile.js";
 
 // ---------------------------------------------------------------------------
@@ -268,6 +269,31 @@ function makeFakeCardKitClient(opts?: { rejectUpdate?: boolean }) {
   return { client, calls };
 }
 
+function makeFakePostClient(opts?: { rejectCreate?: boolean }) {
+  const calls: Array<{
+    replyToMessageId: string;
+    content: string;
+    idempotencyKey: string;
+    replyInThread: boolean;
+  }> = [];
+  const client: OutboundPostClient = {
+    async createPostReply(replyToMessageId, content, callOpts) {
+      calls.push({
+        replyToMessageId,
+        content,
+        idempotencyKey: callOpts.idempotencyKey,
+        replyInThread: callOpts.replyInThread,
+      });
+      if (opts?.rejectCreate) throw new Error("post create failed");
+      return { messageId: "om_post_fallback" };
+    },
+    async updatePost(messageId) {
+      return { messageId };
+    },
+  };
+  return { client, calls };
+}
+
 let root: string;
 
 beforeEach(async () => {
@@ -411,6 +437,44 @@ describe("reconcileOrphanedCards — integration", () => {
     expect(JSON.stringify(calls[1]?.payload)).toContain("继续");
     expect(JSON.stringify(calls[1]?.payload)).toContain("<at id=peer_test></at>");
     expect(await readCardKitFile(wt)).toBeNull();
+  });
+
+  it("sends a create-only post when CardKit reconcile exceeds retry cap and legacy card fallback fails", async () => {
+    const wt = await seedWorktree(
+      "om_cardkit_post_fallback",
+      null,
+      state("ready", { last_message: "Recovered by post fallback" }),
+    );
+    await writeCardKitFile(
+      wt,
+      cardKit({
+        threadId: "om_cardkit_post_fallback",
+        retryCount: 3,
+        replyToMessageId: "om_trigger_cardkit",
+      }),
+    );
+    const { renderer } = makeFakeRenderer({ rejectStart: true });
+    const { client: cardKitClient } = makeFakeCardKitClient({ rejectUpdate: true });
+    const { client: postClient, calls: postCalls } = makeFakePostClient();
+
+    await reconcileOrphanedCards({
+      botId: "gitlab",
+      worktreesDir: root,
+      cardRenderer: renderer,
+      cardKitClient,
+      postClient,
+      log: () => {},
+    });
+
+    expect(postCalls).toHaveLength(1);
+    expect(postCalls[0]?.replyToMessageId).toBe("om_trigger_cardkit");
+    expect(postCalls[0]?.replyInThread).toBe(true);
+    expect(postCalls[0]?.idempotencyKey).toMatch(/^lw-p-/);
+    expect(postCalls[0]?.content).toContain("Recovered by post fallback");
+    expect(postCalls[0]?.content).toContain("legacy fallback card failed");
+    const ledger = await readCardKitFile(wt);
+    expect(ledger?.status).toBe("fallback_visible");
+    expect(ledger?.lastVisibleFallbackMessageId).toBe("om_post_fallback");
   });
 
   it("finalizes a failed orphan as failure with the bot's error as failureReason", async () => {
