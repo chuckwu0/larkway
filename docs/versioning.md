@@ -27,7 +27,8 @@
 | v0.3.16 | v0.3.16 | patch / 已发布 | render ordered content_blocks in review cards |
 | v0.3.17 | v0.3.17 | patch / 已发布 | resilience: bridge no longer dies on a WebSocket transport error (process-level uncaughtException/unhandledRejection guard); gap-fill now retries with backoff and replays windows missed during a disconnect (per-chat tracking) so @-mentions landing during a reconnect are recovered instead of silently dropped |
 | v0.3.18 | v0.3.18 | patch / 已发布 | permissions: claude backend now defaults to bypassPermissions, aligning it with the codex backend's existing full-host posture — fixes headless acceptEdits silently blocking lark-cli and other commands (claude-backend bots going unresponsive to @-mentions); add a permissions.mode config knob (acceptEdits|ask|bypassPermissions) to opt into stricter host-level command gating |
-| v0.3.19 | v0.3.19 | 当前 patch / 已发布 | response surface prototype (default-off): post/hybrid reply surfaces, surface dispatch, rich orphan reconcile, gated post-client wiring, production hardening (kill-switch, rate-limit, observability) |
+| v0.3.19 | v0.3.19 | patch / 已发布 | response surface prototype (default-off): post/hybrid reply surfaces, surface dispatch, rich orphan reconcile, gated post-client wiring, production hardening (kill-switch, rate-limit, observability) |
+| v0.3.20 | v0.3.20 | 当前 patch / 已发布 | response surface default-on: post/hybrid replies and agent-authored @ enabled by default (baton handoff), bounded by send budget, kill-switch, and visible-card fallback |
 
 ## 使用原则
 
@@ -59,4 +60,5 @@ v0.3.16       = render ordered content_blocks in review cards
 v0.3.17       = resilience: bridge no longer dies on a WebSocket transport error (process-level uncaughtException/unhandledRejection guard); gap-fill now retries with backoff and replays windows missed during a disconnect (per-chat tracking) so @-mentions landing during a reconnect are recovered instead of silently dropped
 v0.3.18       = permissions: claude backend now defaults to bypassPermissions, aligning it with the codex backend's existing full-host posture — fixes headless acceptEdits silently blocking lark-cli and other commands (claude-backend bots going unresponsive to @-mentions); add a permissions.mode config knob (acceptEdits|ask|bypassPermissions) to opt into stricter host-level command gating
 v0.3.19       = response surface prototype (default-off): post/hybrid reply surfaces, surface dispatch, rich orphan reconcile, gated post-client wiring, production hardening (kill-switch, rate-limit, observability)
+v0.3.20       = response surface default-on: post/hybrid replies and agent-authored @ enabled by default (baton handoff), bounded by send budget, kill-switch, and visible-card fallback
 ```
