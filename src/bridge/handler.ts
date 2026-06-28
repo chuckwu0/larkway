@@ -51,7 +51,6 @@ import {
 } from "./postProgress.js";
 import type { RuntimeEventPatch } from "./eventLog.js";
 import type { RuntimeRequirement } from "../runtimeRequirements.js";
-import type { PeerBotResolver } from "./peerResolver.js";
 import {
   isResponseSurfaceCardKitAvailable,
   isResponseSurfaceMentionAllowed,
@@ -537,11 +536,6 @@ export interface BridgeHandlerDeps {
    */
   peers?: PeerBot[];
   /**
-   * Resolve peer bot open_ids from the current chat roster. Static bot yaml
-   * ids are only a fallback because Feishu @ needs the chat's real bot open_id.
-   */
-  resolvePeersForChat?: PeerBotResolver;
-  /**
    * V2: sourced from BotConfig — passed to renderPrompt + createRunner().run.
    * When absent (V1), renderPrompt and the runner fall back to V1 behavior.
    */
@@ -622,18 +616,6 @@ export class BridgeHandler {
     return (this.deps.runtimeRequirements ?? []).filter((req) =>
       !req.ok && (req.severity === "required" || req.kind === "secret")
     );
-  }
-
-  private async peerBotsForPrompt(chatId: string): Promise<PeerBot[] | undefined> {
-    const peers = this.deps.peers;
-    if (!peers || peers.length === 0) return peers;
-    if (!this.deps.resolvePeersForChat) return peers;
-    try {
-      return await this.deps.resolvePeersForChat({ chatId, peers });
-    } catch (err) {
-      console.warn("[bridge.handler] peer roster resolution failed; using configured peers:", err);
-      return peers;
-    }
   }
 
   /**
@@ -1272,7 +1254,6 @@ export class BridgeHandler {
 
         // Step 4b: render prompt — isNewThread reflects current attempt's state.
         const currentIsNewThread = currentExisting === undefined;
-        const promptPeers = await this.peerBotsForPrompt(parsed.chatId);
         const prompt = renderPrompt({
           parsed,
           isNewThread: currentIsNewThread,
@@ -1294,7 +1275,7 @@ export class BridgeHandler {
             readOnly: conventions.readOnly,
             gitlabTokenEnvName: conventions.gitlabTokenEnvName,
           },
-          peers: promptPeers,
+          peers: this.deps.peers,
           turn_taking_limit: this.deps.botConfig?.turn_taking_limit,
           botName: this.deps.botConfig?.name,
           backend: this.deps.botConfig?.backend,
