@@ -20,11 +20,13 @@ describe("cardkitSurface", () => {
     expect(card["schema"]).toBe("2.0");
     expect((card["config"] as Record<string, unknown>)["streaming_mode"]).toBe(true);
     const ids = elements(card).map((e) => e["element_id"]).filter(Boolean);
-    expect(ids).toEqual([
-      CARDKIT_FINAL_ELEMENT_ID,
-      CARDKIT_FOOTER_ELEMENT_ID,
+    expect(ids).toEqual([CARDKIT_FOOTER_ELEMENT_ID]);
+    expect(elements(card)).toEqual([
+      { tag: "markdown", content: "努力回答中...", element_id: CARDKIT_FOOTER_ELEMENT_ID },
     ]);
+    expect(card).not.toHaveProperty("header");
     expect(JSON.stringify(card)).toContain("努力回答中...");
+    expect(JSON.stringify(card)).not.toContain(CARDKIT_FINAL_ELEMENT_ID);
     expect(JSON.stringify(card)).not.toContain("工具调用");
   });
 

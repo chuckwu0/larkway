@@ -81,6 +81,14 @@ describe("CardKitProgressHandle", () => {
     expect(contentCalls[0]!.args[2]).not.toContain("rg cardkit src");
     expect(contentCalls[0]!.args[2]).not.toContain("raw assistant prose");
     expect(contentCalls[0]!.args[2]).not.toContain("raw thinking");
+    const createCall = calls.find((c) => c.name === "createElements");
+    expect(createCall?.args[1]).toEqual([
+      { tag: "markdown", content: "用户可见答案", element_id: "final_md" },
+    ]);
+    expect(createCall?.args[2]).toMatchObject({
+      type: "insert_before",
+      targetElementId: "footer_md",
+    });
   });
 
   it("finalizes by writing final content, replacing with a clean card, and closing streaming", async () => {
@@ -103,20 +111,29 @@ describe("CardKitProgressHandle", () => {
     expect(names).toEqual([
       "createCardEntity",
       "replyCardEntity",
+      "createElements",
       "streamElementContent",
       "updateCardEntity",
       "updateCardSettings",
     ]);
-    expect(calls[2]!.args[1]).toBe("final_md");
-    expect(calls[2]!.args[2]).toContain("最终结论");
-    const finalCard = calls[3]!.args[1] as Record<string, unknown>;
+    expect(calls[2]!.args[2]).toMatchObject({
+      type: "insert_before",
+      targetElementId: "footer_md",
+    });
+    expect(calls[2]!.args[1]).toEqual([
+      { tag: "markdown", content: "<at id=peer_bot></at>\n\n最终结论", element_id: "final_md" },
+    ]);
+    expect(calls[3]!.args[1]).toBe("final_md");
+    expect(calls[3]!.args[2]).toContain("最终结论");
+    const finalCard = calls[4]!.args[1] as Record<string, unknown>;
     expect(JSON.stringify(finalCard)).not.toContain("thinking_md");
     expect(JSON.stringify(finalCard)).toContain("larkway_choice");
-    expect(calls[4]!.args[1]).toEqual({
+    expect(calls[5]!.args[1]).toEqual({
       config: { streaming_mode: false, summary: { content: "最终结论" } },
     });
-    expect((calls[2]!.args[3] as { sequence: number }).sequence).toBe(1);
-    expect((calls[3]!.args[2] as { sequence: number }).sequence).toBe(2);
+    expect((calls[2]!.args[2] as { sequence: number }).sequence).toBe(1);
+    expect((calls[3]!.args[3] as { sequence: number }).sequence).toBe(2);
     expect((calls[4]!.args[2] as { sequence: number }).sequence).toBe(3);
+    expect((calls[5]!.args[2] as { sequence: number }).sequence).toBe(4);
   });
 });

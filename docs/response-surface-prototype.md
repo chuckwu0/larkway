@@ -112,13 +112,15 @@ Mention policy:
 Normal turn:
 
 1. `im.v1.message.reply` sends one initial Card JSON 2.0 interactive message
-   with stable element ids: `final_md` and `footer_md`. The only running text
-   is the footer placeholder `努力回答中...`.
+   with only the stable `footer_md` element. The only running text is the footer
+   placeholder `努力回答中...`; there is no empty answer/header slot above it.
 2. `cardkit.v1.card.idConvert` converts the reply `message_id` into a CardKit
    `card_id` for later element streaming. This keeps the response in the
    Feishu thread while avoiding the platform limitation observed when replying
    with a pre-created CardKit `card_id`.
 3. Runner events update only the trusted answer channel:
+   - The first `answer_delta` / `answer_snapshot` creates `final_md` immediately
+     before `footer_md`.
    - `answer_delta` appends to `final_md`.
    - `answer_snapshot` replaces `final_md`.
    - `reasoning`, raw events, `tool_result`, `tool_use`, `internal_text`, and

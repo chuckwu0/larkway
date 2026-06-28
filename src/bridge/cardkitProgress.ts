@@ -4,9 +4,11 @@ import {
   type OutboundCardKitClient,
 } from "../lark/channelCardKitClient.js";
 import {
+  buildCardKitAnswerElement,
   buildCardKitFinalCard,
   buildCardKitFinalMarkdown,
   buildCardKitInitialCard,
+  CARDKIT_FOOTER_ELEMENT_ID,
   CARDKIT_FINAL_ELEMENT_ID,
   type BuildCardKitFinalCardOpts,
 } from "../lark/cardkitSurface.js";
@@ -65,6 +67,7 @@ class LiveCardKitProgressHandle implements CardKitProgressHandle {
   private inFlight: Promise<void> = Promise.resolve();
   private closed = false;
   private progressUpdates = 0;
+  private answerElementCreated = false;
   sequence = 0;
 
   constructor(opts: {
@@ -116,6 +119,7 @@ class LiveCardKitProgressHandle implements CardKitProgressHandle {
     this.closed = true;
     const finalMarkdown = buildCardKitFinalMarkdown(opts);
     if (finalMarkdown !== this.answerBuffer) {
+      await this.withAnswerElement(finalMarkdown);
       await this.next((sequence) =>
         this.cardKitClient.streamElementContent(
           this.cardId,
@@ -175,17 +179,36 @@ class LiveCardKitProgressHandle implements CardKitProgressHandle {
     this.progressUpdates += 1;
     this.inFlight = this.inFlight
       .then(() =>
-        this.next((sequence) =>
-          this.cardKitClient.streamElementContent(this.cardId, CARDKIT_FINAL_ELEMENT_ID, this.answerBuffer, {
-            sequence,
-            uuid: sequenceUuid(this.cardId, "answer", sequence),
-          }),
+        this.withAnswerElement(this.answerBuffer).then(() =>
+          this.next((sequence) =>
+            this.cardKitClient.streamElementContent(this.cardId, CARDKIT_FINAL_ELEMENT_ID, this.answerBuffer, {
+              sequence,
+              uuid: sequenceUuid(this.cardId, "answer", sequence),
+            }),
+          ),
         ),
       )
       .catch((err) => {
         console.warn("[cardkit_progress] progress update failed (continuing):", err);
       });
     await this.inFlight;
+  }
+
+  private async withAnswerElement(initialContent: string): Promise<void> {
+    if (this.answerElementCreated) return;
+    await this.next((sequence) =>
+      this.cardKitClient.createElements(
+        this.cardId,
+        [buildCardKitAnswerElement(initialContent)],
+        {
+          sequence,
+          uuid: sequenceUuid(this.cardId, "answer-element", sequence),
+          type: "insert_before",
+          targetElementId: CARDKIT_FOOTER_ELEMENT_ID,
+        },
+      ),
+    );
+    this.answerElementCreated = true;
   }
 
   private async next(fn: (sequence: number) => Promise<void>): Promise<void> {
