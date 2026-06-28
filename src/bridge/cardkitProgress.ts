@@ -22,6 +22,10 @@ export interface CardKitLiveMetrics {
   firstAnswerAt: string | null;
   lastAnswerAt: string | null;
   visibleAnswerLength: number;
+  toolUseCount: number;
+  lastToolUseAt: string | null;
+  statusPatchCount: number;
+  lastStatusPatchAt: string | null;
   progressUpdateCount: number;
   lastProgressPatchAt: string | null;
   lastPatchError: string | null;
@@ -84,6 +88,10 @@ function initialLiveMetrics(): CardKitLiveMetrics {
     firstAnswerAt: null,
     lastAnswerAt: null,
     visibleAnswerLength: 0,
+    toolUseCount: 0,
+    lastToolUseAt: null,
+    statusPatchCount: 0,
+    lastStatusPatchAt: null,
     progressUpdateCount: 0,
     lastProgressPatchAt: null,
     lastPatchError: null,
@@ -93,6 +101,12 @@ function initialLiveMetrics(): CardKitLiveMetrics {
 function summarizeError(err: unknown): string {
   const message = err instanceof Error ? err.message : String(err);
   return message.replace(/\s+/g, " ").trim().slice(0, 240) || "unknown error";
+}
+
+function toolStatusText(toolUseCount: number): string {
+  return toolUseCount > 0
+    ? `努力回答中... · 已用 ${toolUseCount} 个工具`
+    : "努力回答中...";
 }
 
 class LiveCardKitProgressHandle implements CardKitProgressHandle {
@@ -146,6 +160,11 @@ class LiveCardKitProgressHandle implements CardKitProgressHandle {
 
   handle(event: AgentStreamEvent): void {
     if (this.closed) return;
+    if (event.type === "tool_use") {
+      this.recordToolUse();
+      this.patchStatus(toolStatusText(this.metrics.toolUseCount));
+      return;
+    }
     if (event.type === "answer_delta") {
       this.answerBuffer += event.text;
       this.recordAnswerEvent("answer_delta");
@@ -237,6 +256,49 @@ class LiveCardKitProgressHandle implements CardKitProgressHandle {
       `visible_length=${this.metrics.visibleAnswerLength}`,
       `sequence=${this.sequence}`,
     );
+  }
+
+  private recordToolUse(): void {
+    this.metrics.toolUseCount += 1;
+    this.metrics.lastToolUseAt = new Date().toISOString();
+    this.emitLiveMetrics();
+    console.info(
+      "[cardkit_progress] tool event",
+      `tool_use_count=${this.metrics.toolUseCount}`,
+      `sequence=${this.sequence}`,
+    );
+  }
+
+  private patchStatus(content: string): void {
+    this.inFlight = this.inFlight
+      .then(() =>
+        this.next((sequence) =>
+          this.cardKitClient.updateElement(
+            this.cardId,
+            CARDKIT_FOOTER_ELEMENT_ID,
+            {
+              tag: "markdown",
+              content,
+              element_id: CARDKIT_FOOTER_ELEMENT_ID,
+            },
+            {
+              sequence,
+              uuid: sequenceUuid(this.cardId, "status", sequence),
+            },
+          ),
+        ),
+      )
+      .then(() => {
+        this.metrics.statusPatchCount += 1;
+        this.metrics.lastStatusPatchAt = new Date().toISOString();
+        this.metrics.lastPatchError = null;
+        this.emitLiveMetrics();
+      })
+      .catch((err) => {
+        this.metrics.lastPatchError = summarizeError(err);
+        this.emitLiveMetrics();
+        console.warn("[cardkit_progress] status update failed (continuing):", err);
+      });
   }
 
   private schedulePatch(opts: { immediate?: boolean } = {}): void {
