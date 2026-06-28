@@ -30,7 +30,8 @@
 | v0.3.19 | v0.3.19 | patch / 已发布 | response surface prototype (default-off): post/hybrid reply surfaces, surface dispatch, rich orphan reconcile, gated post-client wiring, production hardening (kill-switch, rate-limit, observability) |
 | v0.3.20 | v0.3.20 | patch / 已发布 | response surface default-on: post/hybrid replies and agent-authored @ enabled by default (baton handoff), bounded by send budget, kill-switch, and visible-card fallback |
 | v0.3.21 | v0.3.21 | patch / 已发布 | make response surface post-first with bounded live post edits |
-| v0.3.22 | v0.3.22 | 当前 patch / 已发布 | make CardKit streaming the default response surface |
+| v0.3.22 | v0.3.22 | patch / 已发布 | make CardKit streaming the default response surface |
+| v0.3.23 | v0.3.23 | 当前 patch / 已发布 | ship CardKit answer streaming and hard-failure fallback |
 
 ## 使用原则
 
@@ -65,4 +66,5 @@ v0.3.19       = response surface prototype (default-off): post/hybrid reply surf
 v0.3.20       = response surface default-on: post/hybrid replies and agent-authored @ enabled by default (baton handoff), bounded by send budget, kill-switch, and visible-card fallback
 v0.3.21       = make response surface post-first with bounded live post edits
 v0.3.22       = make CardKit streaming the default response surface
+v0.3.23       = ship CardKit answer streaming and hard-failure fallback
 ```
