@@ -33,7 +33,8 @@
 | v0.3.22 | v0.3.22 | patch / 已发布 | make CardKit streaming the default response surface |
 | v0.3.23 | v0.3.23 | patch / 已发布 | ship CardKit answer streaming and hard-failure fallback |
 | v0.3.24 | v0.3.24 | patch / 已发布 | restore CardKit live streaming polish; harden orphan reconcile fallback |
-| v0.3.25 | v0.3.25 | 当前 patch / 已发布 | harden CardKit live diagnostics and running-card fallback |
+| v0.3.25 | v0.3.25 | patch / 已发布 | harden CardKit live diagnostics and running-card fallback |
+| v0.3.26 | v0.3.26 | 当前 patch / 已发布 | stream marker-gated Claude and Codex answers as CardKit deltas |
 
 ## 使用原则
 
@@ -71,4 +72,5 @@ v0.3.22       = make CardKit streaming the default response surface
 v0.3.23       = ship CardKit answer streaming and hard-failure fallback
 v0.3.24       = restore CardKit live streaming polish; harden orphan reconcile fallback
 v0.3.25       = harden CardKit live diagnostics and running-card fallback
+v0.3.26       = stream marker-gated Claude and Codex answers as CardKit deltas
 ```
