@@ -52,6 +52,9 @@ const AT_PLACEHOLDER_RE = /@_\w+\s*/g;
 const FEISHU_DOC_RE =
   /https?:\/\/[\w-]+\.(?:feishu\.cn|larkoffice\.com)\/(?:docs|wiki|sheets|space)\/[\w%-]+(?:\/[\w%-]*)?/gi;
 
+const CLIENT_UPGRADE_PLACEHOLDER_RE =
+  /请升级至最新版本客户端[，,]?\s*以查看内容/;
+
 // ---------------------------------------------------------------------------
 // Text extraction helpers
 // ---------------------------------------------------------------------------
@@ -84,6 +87,81 @@ function extractPostText(value: unknown): string {
 }
 
 /**
+ * Recursively collect user-visible text from Feishu interactive card payloads.
+ *
+ * CardKit/Card JSON 2.0 messages arrive as msg_type=interactive. The Lark API can
+ * expose either the real card JSON (schema/body/elements/header) or, on older
+ * clients/APIs, only a fallback "please upgrade client" body. We extract from
+ * real card structures and deliberately drop the upgrade placeholder so agents
+ * do not mistake it for the user's actual instruction.
+ */
+function extractInteractiveCardText(value: unknown): string {
+  const parts = collectInteractiveCardText(value)
+    .map((part) => part.replace(/\s+/g, " ").trim())
+    .filter((part) => part.length > 0)
+    .filter((part) => !CLIENT_UPGRADE_PLACEHOLDER_RE.test(part));
+  return parts.join(" ").trim();
+}
+
+function collectInteractiveCardText(value: unknown): string[] {
+  if (typeof value === "string") return [];
+  if (Array.isArray(value)) return value.flatMap(collectInteractiveCardText);
+  if (value === null || typeof value !== "object") return [];
+
+  const obj = value as Record<string, unknown>;
+  const tag = typeof obj["tag"] === "string" ? obj["tag"] : "";
+
+  // Avoid leaking ids/image keys or treating decorative fallback images as text.
+  if (tag === "at" || tag === "img" || tag === "image") {
+    const titled = obj["title"] !== undefined
+      ? collectInteractiveCardText(obj["title"])
+      : [];
+    return titled;
+  }
+
+  const direct: string[] = [];
+  if (typeof obj["text"] === "string") direct.push(obj["text"]);
+  if (
+    typeof obj["content"] === "string" &&
+    ["markdown", "plain_text", "lark_md", "text", ""].includes(tag)
+  ) {
+    direct.push(obj["content"]);
+  }
+
+  const childKeys = [
+    "header",
+    "body",
+    "elements",
+    "columns",
+    "fields",
+    "title",
+    "subtitle",
+    "text",
+    "content",
+  ];
+  const nested: string[] = [];
+  for (const key of childKeys) {
+    if (key in obj && typeof obj[key] !== "string") {
+      nested.push(...collectInteractiveCardText(obj[key]));
+    }
+  }
+
+  return [...direct, ...nested];
+}
+
+function looksLikeInteractiveCard(
+  event: LarkMessageEvent,
+  parsed: Record<string, unknown>,
+): boolean {
+  return (
+    event["message_type"] === "interactive" ||
+    parsed["schema"] === "2.0" ||
+    parsed["body"] !== undefined ||
+    parsed["elements"] !== undefined
+  );
+}
+
+/**
  * Parse event.content (a JSON string) and extract plain text.
  * Falls back to the raw content string and emits a console.warn on parse error.
  */
@@ -108,6 +186,10 @@ function extractText(event: LarkMessageEvent): string {
   // message_type = "post": { "title": "...", "content": [[{tag, text}]] }
   else if (parsed["content"] !== undefined) {
     raw = extractPostText(parsed["content"]);
+  }
+  // message_type = "interactive": CardKit/Card JSON 2.0 or legacy card payload.
+  else if (looksLikeInteractiveCard(event, parsed)) {
+    raw = extractInteractiveCardText(parsed);
   }
   // message_type = "post" with a top-level zh_cn / en_us locale key
   else {

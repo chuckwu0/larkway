@@ -36,6 +36,10 @@ import {
   shouldProvideResponseSurfaceCardKitClient,
   shouldProvideResponseSurfacePostClient,
 } from "./responseSurface.js";
+import {
+  buildSessionHeartbeatEvent,
+  selectDueSessionHeartbeats,
+} from "./bridge/sessionHeartbeat.js";
 
 /** How often the bridge rewrites each bot's status.json liveness heartbeat. */
 const STATUS_WRITE_INTERVAL_MS = 30_000;
@@ -177,6 +181,8 @@ async function runV2Mode({
     housekeeping: Housekeeping;
     /** Liveness heartbeat interval (status.json). Armed after wiring; unref()-ed. */
     statusTimer: ReturnType<typeof setInterval> | null;
+    /** Optional session heartbeat interval. Armed only when bot config enables it. */
+    sessionHeartbeatTimer: ReturnType<typeof setInterval> | null;
     /**
      * Bot avatar URL — filled in by a best-effort fire-and-forget fetch at boot
      * (fetchBotAvatar). undefined until/unless it resolves; the heartbeat reads
@@ -380,7 +386,7 @@ async function runV2Mode({
 
     const inst: BotInstance = {
       bot, client, sessionStore, cardRenderer, handler, housekeeping,
-      statusTimer: null, avatar: undefined,
+      statusTimer: null, sessionHeartbeatTimer: null, avatar: undefined,
     };
     instances.push(inst);
 
@@ -434,12 +440,41 @@ async function runV2Mode({
     inst.statusTimer.unref();
   }
 
+  function startSessionHeartbeat(inst: BotInstance): void {
+    const cfg = inst.bot.session_heartbeat;
+    if (!cfg.enabled) return;
+    const tick = (): void => {
+      const now = Date.now();
+      const due = selectDueSessionHeartbeats(
+        inst.sessionStore.list(),
+        cfg,
+        now,
+        inst.bot.id,
+      );
+      for (const record of due) {
+        const event = buildSessionHeartbeatEvent({
+          record,
+          botOpenId: inst.bot.bot_open_id,
+          nowMs: now,
+        });
+        if (!event) continue;
+        console.log(
+          `[larkway] bot "${inst.bot.id}" session heartbeat enqueued thread=${record.threadId}`,
+        );
+        inst.client.pushInternalEvent(event);
+      }
+    };
+    inst.sessionHeartbeatTimer = setInterval(tick, cfg.interval_ms);
+    inst.sessionHeartbeatTimer.unref();
+  }
+
   // ── Graceful shutdown ────────────────────────────────────────────────────
   async function shutdown(signal: string): Promise<void> {
     console.log(`\n[larkway] Received ${signal}, shutting down V2 bots…`);
     await Promise.all(
-      instances.map(async ({ bot, statusTimer, housekeeping, handler, sessionStore, client, avatar }) => {
+      instances.map(async ({ bot, statusTimer, sessionHeartbeatTimer, housekeeping, handler, sessionStore, client, avatar }) => {
         if (statusTimer) clearInterval(statusTimer);
+        if (sessionHeartbeatTimer) clearInterval(sessionHeartbeatTimer);
         // Mark this bot as no-longer-serving on the way out (ws:false). The Web
         // 管理面 will then show 🟡 degraded briefly, then 🔴 offline once the
         // file goes stale. Best-effort — never block shutdown on it. Preserve the
@@ -528,6 +563,7 @@ async function runV2Mode({
   // heartbeat. First write is immediate so the Web 管理面 reflects the bot at boot.
   for (const inst of instances) {
     startStatusHeartbeat(inst);
+    startSessionHeartbeat(inst);
   }
 
   // ── Enter main loop — all bots run concurrently ───────────────────────────

@@ -52,6 +52,7 @@ describe("v1 → v2 migration", () => {
         sessionId: "sess-aaa",
         createdTs: 1000,
         lastActiveTs: 2000,
+        chatId: "oc_chat1",
         senderOpenId: "ou_sender1",
         stage: "developing",
       },
@@ -83,6 +84,7 @@ describe("v1 → v2 migration", () => {
     expect(rec1["botId"]).toBe("v1-default");
     expect(rec1["threadId"]).toBe("om_thread001");
     expect(rec1["sessionId"]).toBe("sess-aaa");
+    expect(rec1["chatId"]).toBe("oc_chat1");
     expect(rec1["senderOpenId"]).toBe("ou_sender1");
 
     const rec2 = records["om_thread002::v1-default"] as Record<string, unknown>;
@@ -181,6 +183,7 @@ describe("v2 normal load", () => {
         botId: "my-bot",
         createdTs: 1000,
         lastActiveTs: 2000,
+        chatId: "oc_chat",
         senderOpenId: "ou_sender",
       },
     });
@@ -190,6 +193,7 @@ describe("v2 normal load", () => {
     expect(rec).toBeDefined();
     expect(rec?.sessionId).toBe("sess-v2");
     expect(rec?.botId).toBe("my-bot");
+    expect(rec?.chatId).toBe("oc_chat");
 
     // No backup file created (no migration ran)
     const files = await readdir(tmpDir);
@@ -234,9 +238,11 @@ describe("double-key CRUD", () => {
       botId: "my-bot",
       createdTs: 100,
       lastActiveTs: 200,
+      chatId: "oc_put",
     });
 
     expect(store.get("om_t1", "my-bot")).toBeDefined();
+    expect(store.get("om_t1", "my-bot")?.chatId).toBe("oc_put");
     expect(store.get("om_t1", "other-bot")).toBeUndefined();
     expect(store.getLegacy("om_t1")).toBeUndefined();
   });

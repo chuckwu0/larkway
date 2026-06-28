@@ -701,6 +701,16 @@ export class ChannelClient {
   }
 
   /**
+   * Inject a bridge-internal turn into the same queue as real Feishu events.
+   * Used for session heartbeat wake-ups; the handler still owns all prompt,
+   * state, and response-surface behavior.
+   */
+  pushInternalEvent(event: LarkMessageEvent): void {
+    if (this.closed) return;
+    this.queue.push(event);
+  }
+
+  /**
    * Return an OutboundCardClient bound to this client's channel handle.
    *
    * Safe to call before connect: the returned client resolves the live channel

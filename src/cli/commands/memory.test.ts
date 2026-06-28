@@ -21,6 +21,7 @@ import path from "node:path";
 import type { BotConfig } from "../../config/botLoader.js";
 import type { CliContext, CommandRun } from "../types.js";
 import { DEFAULT_RESPONSE_SURFACE_PROTOTYPE } from "../../responseSurface.js";
+import { DEFAULT_SESSION_HEARTBEAT_CONFIG } from "../../bridge/sessionHeartbeat.js";
 
 // ---------------------------------------------------------------------------
 // Shared test infrastructure
@@ -45,6 +46,7 @@ const sampleBot = (id = "test-bot"): BotConfig =>
     turn_taking_limit: 10,
     read_only: false,
     response_surface_prototype: DEFAULT_RESPONSE_SURFACE_PROTOTYPE,
+    session_heartbeat: DEFAULT_SESSION_HEARTBEAT_CONFIG,
     runtime: "legacy",
     backend: "claude",
   }) as BotConfig;

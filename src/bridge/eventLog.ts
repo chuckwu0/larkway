@@ -20,6 +20,7 @@ export type RuntimeEventTrigger =
   | "mention"
   | "thread_reply"
   | "card_action"
+  | "session_heartbeat"
   | "gap_fill"
   | "unknown";
 

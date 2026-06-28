@@ -37,6 +37,7 @@ import { ensureAgentWorkspace, resetAgentWorkspacePermissions } from "../../agen
 import { permissionItemsFromCapabilities } from "../../agent/permissionPlan.js";
 import { resolveAgentWorkspacePathFromHome } from "../../config/paths.js";
 import { DEFAULT_RESPONSE_SURFACE_PROTOTYPE } from "../../responseSurface.js";
+import { DEFAULT_SESSION_HEARTBEAT_CONFIG } from "../../bridge/sessionHeartbeat.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -633,6 +634,7 @@ async function runCreateBot(
     turn_taking_limit: basics.turnLimit ?? 10,
     read_only: false,
     response_surface_prototype: DEFAULT_RESPONSE_SURFACE_PROTOTYPE,
+    session_heartbeat: DEFAULT_SESSION_HEARTBEAT_CONFIG,
     runtime: "agent_workspace",
     backend: basics.backend,
     memory_file: memoryFile,

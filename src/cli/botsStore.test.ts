@@ -9,6 +9,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import type { BotConfig } from "../config/botLoader.js";
 import { DEFAULT_RESPONSE_SURFACE_PROTOTYPE } from "../responseSurface.js";
+import { DEFAULT_SESSION_HEARTBEAT_CONFIG } from "../bridge/sessionHeartbeat.js";
 
 let tmp: string;
 let store: typeof import("./botsStore.js");
@@ -27,6 +28,7 @@ const sampleBot = (): BotConfig =>
     turn_taking_limit: 10,
     read_only: false,
     response_surface_prototype: DEFAULT_RESPONSE_SURFACE_PROTOTYPE,
+    session_heartbeat: DEFAULT_SESSION_HEARTBEAT_CONFIG,
     runtime: "legacy",
     backend: "claude",
   }) as BotConfig;
