@@ -84,8 +84,7 @@ function cardKit(overrides: Partial<CardKitFile> = {}): CardKitFile {
     idempotencyKey: "lw-ck-reconcile",
     sequence: 2,
     elements: {
-      status: { elementId: "status_md" },
-      thinking: { elementId: "thinking_md" },
+      footer: { elementId: "footer_md" },
       final: { elementId: "final_md" },
     },
     lastVisibleFallbackMessageId: null,

@@ -5,14 +5,15 @@ Status: CardKit streaming response surface is the default runtime.
 Larkway uses one Feishu interactive CardKit card as the normal reply surface:
 
 - During execution, the card runs with `streaming_mode=true` and shows bounded
-  progress: stage/status lines plus summarized tool calls.
-- Raw reasoning and assistant `text_delta` are not rendered into the visible
-  progress area.
+  noise: a one-line `努力回答中...` footer until trusted answer text starts,
+  then the answer channel streams into the same card.
+- Raw reasoning, assistant `text_delta`, tool calls, local paths, and progress
+  lists are not rendered into the visible card.
 - On completion, the same card is finalized into a clean summary card: final
   answer, optional images/content blocks, optional late peer mentions, and
   optional `choices` buttons.
-- The progress/thinking area is removed from the final card. It is not left
-  expanded or collapsed.
+- The running footer is removed from the final card. It is not left expanded,
+  collapsed, or separated by an empty divider.
 - The bridge does not use post/RichText in-place editing as the normal path.
   This avoids the edited-message experience and keeps final mentions in the
   final CardKit update.
@@ -110,20 +111,20 @@ Mention policy:
 
 Normal turn:
 
-1. `im.v1.message.reply` sends the initial Card JSON 2.0 interactive message
-   with stable element ids: `status_md`, `thinking_md`, `final_md`, and
-   `choices_slot`.
+1. `im.v1.message.reply` sends one initial Card JSON 2.0 interactive message
+   with stable element ids: `final_md` and `footer_md`. The only running text
+   is the footer placeholder `努力回答中...`.
 2. `cardkit.v1.card.idConvert` converts the reply `message_id` into a CardKit
    `card_id` for later element streaming. This keeps the response in the
    Feishu thread while avoiding the platform limitation observed when replying
    with a pre-created CardKit `card_id`.
-3. Runner events update only progress:
-   - `system_init` becomes a short status line.
-   - `tool_use` becomes a summarized tool line.
-   - `reasoning`, raw events, `tool_result`, and assistant `text_delta` are not
-     displayed as progress.
-4. Finalization writes final markdown into `final_md`, updates the card entity
-   to remove progress elements and include choices/images/content, then calls
+3. Runner events update only the trusted answer channel:
+   - `answer_delta` appends to `final_md`.
+   - `answer_snapshot` replaces `final_md`.
+   - `reasoning`, raw events, `tool_result`, `tool_use`, `internal_text`, and
+     assistant `text_delta` are not displayed.
+4. Finalization writes canonical final markdown into `final_md`, updates the
+   card entity to remove the footer and include choices/images/content, then calls
    `card.settings` with `streaming_mode=false`.
 
 The handler persists `.larkway/cardkit.json` with `cardId`, `messageId`,
@@ -168,19 +169,26 @@ Required automated coverage:
 
 - CardKit client wraps SDK CardKit operations and retries transient / `200810`
   failures.
-- CardKit surface renders progress, final body, mentions, choices, images, and
-  content blocks.
-- Handler uses CardKit by default, suppresses post editing, and falls back to a
-  visible legacy card on CardKit failure, then a create-only fallback post if
-  the legacy card path also fails.
+- CardKit surface renders the running footer, answer stream target, final body,
+  mentions, choices, images, and content blocks without status/thinking/tool
+  slots.
+- Handler uses CardKit by default, suppresses post editing, adopts an already
+  visible CardKit reply if `idConvert` fails, and falls back to a visible legacy
+  card on CardKit failure, then a create-only fallback post if the legacy card
+  path also fails.
+- Runner tests prove marker-wrapped answer text becomes `answer_snapshot` /
+  `answer_delta`, while unmarked assistant text remains internal.
 - Reconcile finalizes orphaned `cardkit.json` records and deletes terminal
   ledgers.
 - Config gates and kill switch roll back to legacy card.
 
 Required manual/E2E gates before merge/deploy:
 
+- Isolated true-agent UI screenshot proves one card only: placeholder first,
+  visible answer streaming when answer tokens start, no raw reasoning, no tool
+  dump, no residual divider, and no `已编辑` marker.
 - Isolated Feishu test environment screenshot proves there is no `已编辑` marker.
 - Isolated late-@ CardKit final update triggers the peer bot receive event.
-- Failure fallback E2E proves no invisible reply.
+- Failure fallback E2E proves no invisible reply and no duplicate visible card.
 - Crash recovery E2E proves `cardkit.json` can be reconciled.
 - Independent Turing review receives PR diff, tests, and E2E artifacts.

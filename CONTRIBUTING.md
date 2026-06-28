@@ -128,8 +128,9 @@ export interface RunHandle {
 ```
 
 - `events` — yield `AgentStreamEvent` values as they arrive from the
-  subprocess stdout. The bridge accumulates `text_delta` for card rendering and
-  uses `system_init` to capture the session ID.
+  subprocess stdout. The bridge uses `system_init` to capture the session ID,
+  treats raw backend prose as `internal_text`, and renders only the explicit
+  answer channel (`answer_delta` / `answer_snapshot`).
 - `done` — resolves (or rejects on non-zero exit) once the subprocess has fully
   finished. **Must always settle** — use a total-timeout fallback if the
   subprocess may hold stdout open after exit.
@@ -140,6 +141,10 @@ export interface RunHandle {
 ```ts
 export type AgentStreamEvent =
   | { type: "system_init"; sessionId: string; raw: unknown }
+  | { type: "internal_text"; text: string; raw: unknown }
+  | { type: "answer_delta"; text: string; raw: unknown; seq?: number }
+  | { type: "answer_snapshot"; text: string; raw: unknown; seq?: number }
+  /** @deprecated Treat as internal; UI surfaces must not render it. */
   | { type: "text_delta"; text: string; raw: unknown }
   | { type: "tool_use"; toolName: string; toolInput: unknown; raw: unknown }
   | { type: "tool_result"; raw: unknown }

@@ -2,10 +2,8 @@ import { describe, expect, it } from "vitest";
 import {
   buildCardKitFinalCard,
   buildCardKitInitialCard,
-  buildCardKitProgressMarkdown,
+  CARDKIT_FOOTER_ELEMENT_ID,
   CARDKIT_FINAL_ELEMENT_ID,
-  CARDKIT_STATUS_ELEMENT_ID,
-  CARDKIT_THINKING_ELEMENT_ID,
 } from "./cardkitSurface.js";
 
 function elements(card: Record<string, unknown>): Record<string, unknown>[] {
@@ -17,16 +15,17 @@ function elements(card: Record<string, unknown>): Record<string, unknown>[] {
 
 describe("cardkitSurface", () => {
   it("builds a streaming initial CardKit card with stable element ids", () => {
-    const card = buildCardKitInitialCard({ statusText: "正在调研" });
+    const card = buildCardKitInitialCard({ footerText: "努力回答中..." });
 
     expect(card["schema"]).toBe("2.0");
     expect((card["config"] as Record<string, unknown>)["streaming_mode"]).toBe(true);
     const ids = elements(card).map((e) => e["element_id"]).filter(Boolean);
     expect(ids).toEqual([
-      CARDKIT_STATUS_ELEMENT_ID,
-      CARDKIT_THINKING_ELEMENT_ID,
       CARDKIT_FINAL_ELEMENT_ID,
+      CARDKIT_FOOTER_ELEMENT_ID,
     ]);
+    expect(JSON.stringify(card)).toContain("努力回答中...");
+    expect(JSON.stringify(card)).not.toContain("工具调用");
   });
 
   it("renders final card without status/thinking elements", () => {
@@ -38,8 +37,8 @@ describe("cardkitSurface", () => {
     expect((card["config"] as Record<string, unknown>)["streaming_mode"]).toBe(false);
     const ids = elements(card).map((e) => e["element_id"]).filter(Boolean);
     expect(ids).toContain(CARDKIT_FINAL_ELEMENT_ID);
-    expect(ids).not.toContain(CARDKIT_STATUS_ELEMENT_ID);
-    expect(ids).not.toContain(CARDKIT_THINKING_ELEMENT_ID);
+    expect(ids).not.toContain("status_md");
+    expect(ids).not.toContain("thinking_md");
     expect(JSON.stringify(card)).toContain("<at id=peer_bot></at>");
   });
 
@@ -58,14 +57,9 @@ describe("cardkitSurface", () => {
     expect(raw).toContain("**A.** 批准方案");
   });
 
-  it("uses only stage and tool summaries for progress markdown", () => {
-    const md = buildCardKitProgressMarkdown({
-      statusLines: ["正在读取上下文"],
-      toolLines: ["🔧 rg cardkit src"],
-    });
-
-    expect(md).toContain("正在读取上下文");
-    expect(md).toContain("rg cardkit src");
-    expect(md).not.toContain("reasoning");
+  it("renders final card without a trailing divider when no tail content exists", () => {
+    const card = buildCardKitFinalCard({ finalText: "最终结论" });
+    const tags = elements(card).map((e) => e["tag"]);
+    expect(tags).toEqual(["markdown"]);
   });
 });

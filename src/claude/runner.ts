@@ -21,6 +21,7 @@ import {
   type RunOptions,
   type RunHandle,
 } from "../agent/runner.js";
+import { splitAnswerChannelText } from "../agent/answerChannel.js";
 
 // ---------------------------------------------------------------------------
 // Public types — re-exported for backward compatibility
@@ -163,7 +164,7 @@ function* parseLinesMulti(line: string): Generator<AgentStreamEvent> {
         const block = item as Record<string, unknown>;
 
         if (block["type"] === "text" && typeof block["text"] === "string") {
-          yield { type: "text_delta", text: block["text"], raw: obj };
+          yield* splitAnswerChannelText(block["text"], obj);
           emitted = true;
         } else if (block["type"] === "tool_use") {
           yield {

@@ -54,7 +54,7 @@ describe("CardKitProgressHandle", () => {
     expect(calls.map((c) => c.name)).toEqual(["createCardEntity", "replyCardEntity"]);
   });
 
-  it("streams only status/tool summaries and ignores assistant text deltas", async () => {
+  it("streams only trusted answer-channel text", async () => {
     const { client, calls } = fakeCardKitClient();
     const handle = await createCardKitProgressHandle({
       cardKitClient: client,
@@ -64,15 +64,23 @@ describe("CardKitProgressHandle", () => {
       patchIntervalMs: 0,
     });
 
+    handle.handle({ type: "internal_text", text: "raw thinking", raw: {} });
     handle.handle({ type: "text_delta", text: "raw assistant prose", raw: {} });
     handle.handle({ type: "tool_use", toolName: "rg", toolInput: { command: "rg cardkit src" }, raw: {} });
     await handle.drain();
 
+    expect(calls.filter((c) => c.name === "streamElementContent")).toHaveLength(0);
+
+    handle.handle({ type: "answer_snapshot", text: "用户可见答案", raw: {} });
+    await handle.drain();
+
     const contentCalls = calls.filter((c) => c.name === "streamElementContent");
     expect(contentCalls).toHaveLength(1);
-    expect(contentCalls[0]!.args[1]).toBe("thinking_md");
-    expect(contentCalls[0]!.args[2]).toContain("rg cardkit src");
+    expect(contentCalls[0]!.args[1]).toBe("final_md");
+    expect(contentCalls[0]!.args[2]).toContain("用户可见答案");
+    expect(contentCalls[0]!.args[2]).not.toContain("rg cardkit src");
     expect(contentCalls[0]!.args[2]).not.toContain("raw assistant prose");
+    expect(contentCalls[0]!.args[2]).not.toContain("raw thinking");
   });
 
   it("finalizes by writing final content, replacing with a clean card, and closing streaming", async () => {

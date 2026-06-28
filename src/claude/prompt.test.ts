@@ -94,7 +94,9 @@ describe("renderPrompt — V2 mode (botName set)", () => {
     expect(prompt).toContain("status: in_progress / ready / failed");
     expect(prompt).toContain("content_blocks");
     expect(prompt).toContain("response_surface");
-    expect(prompt).toContain("默认主回复面是 post/RichText");
+    expect(prompt).toContain("默认主回复面是一张 CardKit 流式卡片");
+    expect(prompt).toContain("LARKWAY_ANSWER_BEGIN");
+    expect(prompt).toContain("LARKWAY_ANSWER_END");
     expect(prompt).toContain("无显式 card 意图时 bridge 按 CardKit 流式卡片处理");
     expect(prompt).toContain("不要写 raw Feishu post/card JSON");
     expect(prompt).toContain("markdown -> image -> markdown -> image");
@@ -320,8 +322,8 @@ describe("renderPrompt — V2 mode (botName set)", () => {
 
   it("base contract: agent owns final card content, bridge does not infer business status", () => {
     const prompt = renderPrompt(makeInput({ botName: "Frontend" }));
-    expect(prompt).toContain("最终 post 以你的 `last_message` 为主");
-    expect(prompt).toContain("bridge 会在 post 之后补卡片");
+    expect(prompt).toContain("最终卡片以你的 `last_message` 为主");
+    expect(prompt).toContain("bridge 会在同一张最终卡片承载这些能力");
     expect(prompt).toContain("不要依赖 bridge 从输出里解析业务阶段");
     expect(prompt).toContain("不要求固定格式");
   });

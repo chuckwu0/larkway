@@ -1,7 +1,7 @@
 /**
  * hostConfig tests — config.json round-trip + schema failure + .env secret
- * write with 0600 perms. Isolated by pointing HOME at a temp dir (homedir()
- * honors $HOME on POSIX) and re-importing the module fresh.
+ * write with 0600 perms. Isolated by pointing HOME and LARKWAY_HOME at a temp
+ * dir and re-importing the module fresh.
  */
 
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
@@ -12,6 +12,7 @@ import type { ConfigJsonType } from "../config.js";
 
 let home: string;
 let originalHome: string | undefined;
+let originalLarkwayHome: string | undefined;
 let hc: typeof import("./hostConfig.js");
 
 const sampleConfig = (): ConfigJsonType =>
@@ -24,13 +25,17 @@ const sampleConfig = (): ConfigJsonType =>
 beforeEach(async () => {
   home = await mkdtemp(path.join(tmpdir(), "larkway-home-"));
   originalHome = process.env.HOME;
+  originalLarkwayHome = process.env.LARKWAY_HOME;
   process.env.HOME = home;
+  process.env.LARKWAY_HOME = path.join(home, ".larkway");
   hc = await import("./hostConfig.js");
 });
 
 afterEach(async () => {
   if (originalHome === undefined) delete process.env.HOME;
   else process.env.HOME = originalHome;
+  if (originalLarkwayHome === undefined) delete process.env.LARKWAY_HOME;
+  else process.env.LARKWAY_HOME = originalLarkwayHome;
   await rm(home, { recursive: true, force: true });
 });
 

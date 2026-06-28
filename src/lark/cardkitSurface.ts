@@ -1,13 +1,11 @@
 import type { Choice, ContentBlock, ImageBlock } from "./card.js";
 
-export const CARDKIT_STATUS_ELEMENT_ID = "status_md";
-export const CARDKIT_THINKING_ELEMENT_ID = "thinking_md";
 export const CARDKIT_FINAL_ELEMENT_ID = "final_md";
+export const CARDKIT_FOOTER_ELEMENT_ID = "footer_md";
 export const CARDKIT_CHOICES_ELEMENT_ID = "choices_slot";
 
 const MAX_CARD_BYTES = 30 * 1024;
 const FINAL_BUDGET_CHARS = 22_000;
-const THINKING_BUDGET_CHARS = 6_000;
 const CHOICE_MARKERS = ["A", "B", "C", "D", "E"] as const;
 
 export interface CardKitMentionTarget {
@@ -18,7 +16,7 @@ export interface CardKitMentionTarget {
 export interface BuildCardKitInitialCardOpts {
   title?: string;
   statusText?: string;
-  thinkingText?: string;
+  footerText?: string;
 }
 
 export interface BuildCardKitFinalCardOpts {
@@ -29,11 +27,6 @@ export interface BuildCardKitFinalCardOpts {
   choicePrompt?: string;
   imageBlocks?: ImageBlock[];
   contentBlocks?: ContentBlock[];
-}
-
-export interface CardKitProgressSnapshot {
-  statusLines: string[];
-  toolLines: string[];
 }
 
 function plainText(content: string): { tag: "plain_text"; content: string } {
@@ -93,8 +86,7 @@ function truncateCardToBudget(card: Record<string, unknown>): Record<string, unk
 export function buildCardKitInitialCard(
   opts: BuildCardKitInitialCardOpts = {},
 ): Record<string, unknown> {
-  const statusText = opts.statusText ?? "正在处理…";
-  const thinkingText = opts.thinkingText ?? "准备启动本地 agent。";
+  const footerText = opts.footerText ?? opts.statusText ?? "努力回答中...";
   return {
     schema: "2.0",
     config: {
@@ -107,50 +99,13 @@ export function buildCardKitInitialCard(
         print_strategy: "fast",
       },
     },
-    header: {
-      title: plainText(opts.title ?? "处理中"),
-      template: "blue",
-    },
     body: {
       elements: [
-        markdown(statusText, CARDKIT_STATUS_ELEMENT_ID),
-        markdown(thinkingText, CARDKIT_THINKING_ELEMENT_ID),
-        { tag: "hr" },
         markdown(" ", CARDKIT_FINAL_ELEMENT_ID),
+        markdown(footerText, CARDKIT_FOOTER_ELEMENT_ID),
       ],
     },
   };
-}
-
-export function summarizeCardKitToolInput(input: unknown): string {
-  if (input === null || input === undefined) return "";
-  let raw: string;
-  if (typeof input === "string") {
-    raw = input;
-  } else if (typeof input === "object") {
-    const obj = input as Record<string, unknown>;
-    const snippet =
-      obj["command"] ??
-      obj["path"] ??
-      obj["file_path"] ??
-      obj["description"] ??
-      obj["cmd"] ??
-      null;
-    raw = snippet != null ? String(snippet) : JSON.stringify(input);
-  } else {
-    raw = String(input);
-  }
-  return raw.length > 80 ? `${raw.slice(0, 77)}...` : raw;
-}
-
-export function buildCardKitProgressMarkdown(snapshot: CardKitProgressSnapshot): string {
-  const status = snapshot.statusLines.slice(-3).map((line) => `- ${line.trim()}`);
-  const tools = snapshot.toolLines.slice(-5).map((line) => `- ${line.trim()}`);
-  const sections: string[] = [];
-  if (status.length) sections.push(`**进度**\n${status.join("\n")}`);
-  if (tools.length) sections.push(`**工具调用**\n${tools.join("\n")}`);
-  const body = sections.join("\n\n") || "正在处理…";
-  return truncateChars(body, THINKING_BUDGET_CHARS, "\n\n_进度较长,已截断。_");
 }
 
 function choiceMarker(index: number): string {
