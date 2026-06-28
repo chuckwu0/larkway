@@ -101,6 +101,56 @@ describe("CardKitProgressHandle", () => {
     });
   });
 
+  it("commits the first answer delta immediately and exposes live counters", async () => {
+    const { client, calls } = fakeCardKitClient();
+    const metrics: Array<{
+      answerDeltaCount: number;
+      answerSnapshotCount: number;
+      firstAnswerAt: string | null;
+      visibleAnswerLength: number;
+      progressUpdateCount: number;
+      sequence: number;
+    }> = [];
+    const handle = await createCardKitProgressHandle({
+      cardKitClient: client,
+      replyToMessageId: "trigger_message",
+      replyInThread: true,
+      facts: { botId: "bot", threadId: "thread", triggerMessageId: "trigger_message" },
+      patchIntervalMs: 60_000,
+      onLiveMetricsChanged: (live) => metrics.push(live),
+    });
+
+    handle.handle({ type: "answer_delta", text: "visible", raw: {} });
+    await handle.drain();
+
+    const contentCalls = calls.filter((c) => c.name === "streamElementContent");
+    expect(contentCalls).toHaveLength(1);
+    expect(contentCalls[0]!.args[1]).toBe("final_md");
+    expect(contentCalls[0]!.args[2]).toBe("visible");
+    expect(handle.liveMetrics).toMatchObject({
+      answerDeltaCount: 1,
+      answerSnapshotCount: 0,
+      visibleAnswerLength: 7,
+      progressUpdateCount: 1,
+      lastPatchError: null,
+    });
+    expect(handle.liveMetrics.firstAnswerAt).toEqual(expect.any(String));
+    expect(handle.liveMetrics.lastProgressPatchAt).toEqual(expect.any(String));
+    expect(metrics[0]).toMatchObject({
+      answerDeltaCount: 1,
+      answerSnapshotCount: 0,
+      visibleAnswerLength: 7,
+      progressUpdateCount: 0,
+      sequence: 0,
+    });
+    expect(metrics.at(-1)).toMatchObject({
+      answerDeltaCount: 1,
+      visibleAnswerLength: 7,
+      progressUpdateCount: 1,
+      sequence: 2,
+    });
+  });
+
   it("finalizes by writing final content, replacing with a clean card, and closing streaming", async () => {
     const { client, calls } = fakeCardKitClient();
     const handle = await createCardKitProgressHandle({

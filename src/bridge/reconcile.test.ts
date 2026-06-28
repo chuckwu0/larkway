@@ -83,6 +83,16 @@ function cardKit(overrides: Partial<CardKitFile> = {}): CardKitFile {
     replyInThread: true,
     idempotencyKey: "lw-ck-reconcile",
     sequence: 2,
+    live: {
+      answerDeltaCount: 0,
+      answerSnapshotCount: 0,
+      firstAnswerAt: null,
+      lastAnswerAt: null,
+      visibleAnswerLength: 0,
+      progressUpdateCount: 0,
+      lastProgressPatchAt: null,
+      lastPatchError: null,
+    },
     elements: {
       footer: { elementId: "footer_md" },
       final: { elementId: "final_md" },

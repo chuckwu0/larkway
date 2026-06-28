@@ -16,12 +16,24 @@ import {
 const DEFAULT_PATCH_INTERVAL_MS = 250;
 const DEFAULT_MAX_PROGRESS_UPDATES = 240;
 
+export interface CardKitLiveMetrics {
+  answerDeltaCount: number;
+  answerSnapshotCount: number;
+  firstAnswerAt: string | null;
+  lastAnswerAt: string | null;
+  visibleAnswerLength: number;
+  progressUpdateCount: number;
+  lastProgressPatchAt: string | null;
+  lastPatchError: string | null;
+}
+
 export interface CardKitProgressHandle {
   cardId: string;
   messageId: string;
   idempotencyKey: string;
   sequence: number;
   answerText: string;
+  liveMetrics: CardKitLiveMetrics;
   handle(event: AgentStreamEvent): void;
   drain(): Promise<void>;
   finalize(opts: BuildCardKitFinalCardOpts): Promise<void>;
@@ -41,6 +53,7 @@ export interface CreateCardKitProgressHandleOpts {
   patchIntervalMs?: number;
   maxProgressUpdates?: number;
   onSequenceCommitted?: (sequence: number) => Promise<void>;
+  onLiveMetricsChanged?: (metrics: CardKitLiveMetrics & { sequence: number }) => void;
 }
 
 function idempotencyKey(facts: CreateCardKitProgressHandleOpts["facts"]): string {
@@ -64,6 +77,24 @@ function isMissingCardKitElementError(err: unknown): boolean {
   );
 }
 
+function initialLiveMetrics(): CardKitLiveMetrics {
+  return {
+    answerDeltaCount: 0,
+    answerSnapshotCount: 0,
+    firstAnswerAt: null,
+    lastAnswerAt: null,
+    visibleAnswerLength: 0,
+    progressUpdateCount: 0,
+    lastProgressPatchAt: null,
+    lastPatchError: null,
+  };
+}
+
+function summarizeError(err: unknown): string {
+  const message = err instanceof Error ? err.message : String(err);
+  return message.replace(/\s+/g, " ").trim().slice(0, 240) || "unknown error";
+}
+
 class LiveCardKitProgressHandle implements CardKitProgressHandle {
   readonly cardId: string;
   readonly messageId: string;
@@ -73,12 +104,16 @@ class LiveCardKitProgressHandle implements CardKitProgressHandle {
   private readonly patchIntervalMs: number;
   private readonly maxProgressUpdates: number;
   private readonly onSequenceCommitted?: (sequence: number) => Promise<void>;
+  private readonly onLiveMetricsChanged?: (
+    metrics: CardKitLiveMetrics & { sequence: number },
+  ) => void;
   private answerBuffer = "";
   private pendingPatch: ReturnType<typeof setTimeout> | null = null;
   private inFlight: Promise<void> = Promise.resolve();
   private closed = false;
-  private progressUpdates = 0;
   private answerElementCreated = false;
+  private immediatePatchStarted = false;
+  private metrics: CardKitLiveMetrics = initialLiveMetrics();
   sequence = 0;
 
   constructor(opts: {
@@ -89,6 +124,7 @@ class LiveCardKitProgressHandle implements CardKitProgressHandle {
     patchIntervalMs: number;
     maxProgressUpdates: number;
     onSequenceCommitted?: (sequence: number) => Promise<void>;
+    onLiveMetricsChanged?: (metrics: CardKitLiveMetrics & { sequence: number }) => void;
   }) {
     this.cardKitClient = opts.cardKitClient;
     this.cardId = opts.cardId;
@@ -97,22 +133,29 @@ class LiveCardKitProgressHandle implements CardKitProgressHandle {
     this.patchIntervalMs = opts.patchIntervalMs;
     this.maxProgressUpdates = opts.maxProgressUpdates;
     this.onSequenceCommitted = opts.onSequenceCommitted;
+    this.onLiveMetricsChanged = opts.onLiveMetricsChanged;
   }
 
   get answerText(): string {
     return this.answerBuffer;
   }
 
+  get liveMetrics(): CardKitLiveMetrics {
+    return { ...this.metrics };
+  }
+
   handle(event: AgentStreamEvent): void {
     if (this.closed) return;
     if (event.type === "answer_delta") {
       this.answerBuffer += event.text;
-      this.schedulePatch();
+      this.recordAnswerEvent("answer_delta");
+      this.schedulePatch({ immediate: !this.immediatePatchStarted });
       return;
     }
     if (event.type === "answer_snapshot") {
       this.answerBuffer = event.text;
-      this.schedulePatch();
+      this.recordAnswerEvent("answer_snapshot");
+      this.schedulePatch({ immediate: !this.immediatePatchStarted });
     }
   }
 
@@ -175,8 +218,34 @@ class LiveCardKitProgressHandle implements CardKitProgressHandle {
     }
   }
 
-  private schedulePatch(): void {
-    if (this.pendingPatch || this.progressUpdates >= this.maxProgressUpdates) return;
+  private recordAnswerEvent(type: "answer_delta" | "answer_snapshot"): void {
+    const now = new Date().toISOString();
+    if (type === "answer_delta") {
+      this.metrics.answerDeltaCount += 1;
+    } else {
+      this.metrics.answerSnapshotCount += 1;
+    }
+    this.metrics.firstAnswerAt ??= now;
+    this.metrics.lastAnswerAt = now;
+    this.metrics.visibleAnswerLength = this.answerBuffer.length;
+    this.emitLiveMetrics();
+    console.info(
+      "[cardkit_progress] answer event",
+      `type=${type}`,
+      `delta_count=${this.metrics.answerDeltaCount}`,
+      `snapshot_count=${this.metrics.answerSnapshotCount}`,
+      `visible_length=${this.metrics.visibleAnswerLength}`,
+      `sequence=${this.sequence}`,
+    );
+  }
+
+  private schedulePatch(opts: { immediate?: boolean } = {}): void {
+    if (this.pendingPatch || this.metrics.progressUpdateCount >= this.maxProgressUpdates) return;
+    if (opts.immediate) {
+      this.immediatePatchStarted = true;
+      void this.patchProgress();
+      return;
+    }
     this.pendingPatch = setTimeout(() => {
       this.pendingPatch = null;
       void this.patchProgress();
@@ -185,9 +254,8 @@ class LiveCardKitProgressHandle implements CardKitProgressHandle {
   }
 
   private async patchProgress(): Promise<void> {
-    if (this.closed || this.progressUpdates >= this.maxProgressUpdates) return;
+    if (this.closed || this.metrics.progressUpdateCount >= this.maxProgressUpdates) return;
     if (!this.answerBuffer) return;
-    this.progressUpdates += 1;
     this.inFlight = this.inFlight
       .then(() =>
         this.withAnswerElement(this.answerBuffer).then(() =>
@@ -199,7 +267,22 @@ class LiveCardKitProgressHandle implements CardKitProgressHandle {
           ),
         ),
       )
+      .then(() => {
+        this.metrics.progressUpdateCount += 1;
+        this.metrics.visibleAnswerLength = this.answerBuffer.length;
+        this.metrics.lastProgressPatchAt = new Date().toISOString();
+        this.metrics.lastPatchError = null;
+        this.emitLiveMetrics();
+        console.info(
+          "[cardkit_progress] progress committed",
+          `progress_update_count=${this.metrics.progressUpdateCount}`,
+          `visible_length=${this.metrics.visibleAnswerLength}`,
+          `sequence=${this.sequence}`,
+        );
+      })
       .catch((err) => {
+        this.metrics.lastPatchError = summarizeError(err);
+        this.emitLiveMetrics();
         console.warn("[cardkit_progress] progress update failed (continuing):", err);
       });
     await this.inFlight;
@@ -226,6 +309,10 @@ class LiveCardKitProgressHandle implements CardKitProgressHandle {
     this.sequence += 1;
     await fn(this.sequence);
     await this.onSequenceCommitted?.(this.sequence);
+  }
+
+  private emitLiveMetrics(): void {
+    this.onLiveMetricsChanged?.({ ...this.metrics, sequence: this.sequence });
   }
 }
 
@@ -266,6 +353,7 @@ export async function createCardKitProgressHandle(
     patchIntervalMs: opts.patchIntervalMs ?? DEFAULT_PATCH_INTERVAL_MS,
     maxProgressUpdates: opts.maxProgressUpdates ?? DEFAULT_MAX_PROGRESS_UPDATES,
     onSequenceCommitted: opts.onSequenceCommitted,
+    onLiveMetricsChanged: opts.onLiveMetricsChanged,
   });
 }
 

@@ -41,6 +41,7 @@ import {
 import {
   createCardKitProgressHandle,
   type CardKitProgressHandle,
+  type CardKitLiveMetrics,
 } from "./cardkitProgress.js";
 import { SurfaceController } from "./surfaceController.js";
 import { dispatchResponseSurface } from "./surfaceDispatcher.js";
@@ -1004,16 +1005,27 @@ export class BridgeHandler {
         console.warn("[bridge.handler] ensureStateFile failed (continuing):", err);
       }
 
-      const updateCardKitRecord = async (
-        patch: Partial<CardKitFile> & Pick<CardKitFile, "status" | "sequence">,
-      ): Promise<void> => {
+      let cardKitRecordWrite: Promise<void> = Promise.resolve();
+      const updateCardKitRecord = async (patch: Partial<CardKitFile>): Promise<void> => {
         if (!cardKitRecord) return;
         cardKitRecord = {
           ...cardKitRecord,
           ...patch,
           updatedAt: new Date().toISOString(),
         };
-        await writeCardKitFile(worktreePath, cardKitRecord);
+        const record = cardKitRecord;
+        cardKitRecordWrite = cardKitRecordWrite
+          .catch(() => {})
+          .then(() => writeCardKitFile(worktreePath, record));
+        await cardKitRecordWrite;
+      };
+      const updateCardKitLiveMetrics = (
+        metrics: CardKitLiveMetrics & { sequence: number },
+      ): void => {
+        const { sequence, ...live } = metrics;
+        void updateCardKitRecord({ sequence, live }).catch((err) => {
+          console.warn("[bridge.handler] write CardKit live metrics failed:", err);
+        });
       };
 
       // CardKit response surface: default main surface when the transport and
@@ -1036,6 +1048,7 @@ export class BridgeHandler {
             onSequenceCommitted: async (sequence) => {
               await updateCardKitRecord({ status: "streaming", sequence });
             },
+            onLiveMetricsChanged: updateCardKitLiveMetrics,
           });
           cardKitRecord = {
             surface: "cardkit_stream",
@@ -1050,6 +1063,7 @@ export class BridgeHandler {
             replyInThread,
             idempotencyKey: cardKitProgress.idempotencyKey,
             sequence: cardKitProgress.sequence,
+            live: cardKitProgress.liveMetrics,
             elements: {
               footer: { elementId: "footer_md" },
               final: { elementId: "final_md" },
