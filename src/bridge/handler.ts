@@ -1677,15 +1677,35 @@ export class BridgeHandler {
       settle(false);
 
       // Best-effort failure card — swallow any finalize error
+      const wtPath = this.deps.conventions.runtime === "agent_workspace" &&
+        this.deps.conventions.workspaceSessionsDir
+        ? path.join(this.deps.conventions.workspaceSessionsDir, threadId)
+        : path.join(this.deps.conventions.worktreesDir, threadId);
+      const hardFailureText = `执行失败: ${String(err)}`;
+      const createHardFailurePostFallback = async (failureReason: string) => {
+        const fallback = await createOnlyPostFallback({
+          postClient: this.deps.postClient,
+          replyToMessageId: messageId,
+          replyInThread,
+          botId: this.deps.botConfig?.id ?? "v1-default",
+          threadId,
+          triggerMessageId: messageId,
+          finalText: hardFailureText,
+          failureReason,
+          title: "Larkway failure fallback",
+          logPrefix: "[bridge.handler]",
+        });
+        if (fallback) {
+          await deleteCardFile(wtPath);
+          await deleteCardKitFile(wtPath);
+        }
+        return fallback;
+      };
       if (!card && cardKitProgress) {
         try {
           await cardKitProgress.finalize({
-            finalText: `执行失败: ${String(err)}`,
+            finalText: hardFailureText,
           });
-          const wtPath = this.deps.conventions.runtime === "agent_workspace" &&
-            this.deps.conventions.workspaceSessionsDir
-            ? path.join(this.deps.conventions.workspaceSessionsDir, threadId)
-            : path.join(this.deps.conventions.worktreesDir, threadId);
           await deleteCardKitFile(wtPath);
         } catch (cardKitFinalizeErr) {
           console.error(
@@ -1696,6 +1716,10 @@ export class BridgeHandler {
             card = await this.deps.cardRenderer.start(messageId, { replyInThread, threadId });
           } catch (cardStartErr) {
             console.error("[bridge.handler] failure card start also failed:", cardStartErr);
+            await createHardFailurePostFallback(
+              `CardKit failure finalize failed: ${String(cardKitFinalizeErr)}; ` +
+              `legacy visible card fallback also failed: ${String(cardStartErr)}`,
+            );
           }
         }
       }
@@ -1713,6 +1737,10 @@ export class BridgeHandler {
             card = await this.deps.cardRenderer.start(messageId, { replyInThread, threadId });
           } catch (cardStartErr) {
             console.error("[bridge.handler] failure card start also failed:", cardStartErr);
+            await createHardFailurePostFallback(
+              `progress post failure update failed: ${String(postFinalizeErr)}; ` +
+              `legacy visible card fallback also failed: ${String(cardStartErr)}`,
+            );
           }
         }
       }
@@ -1726,16 +1754,15 @@ export class BridgeHandler {
           });
         } catch (finalizeErr) {
           console.error("[bridge.handler] finalize(failure) also failed:", finalizeErr);
+          await createHardFailurePostFallback(
+            `legacy visible failure card finalize failed: ${String(finalizeErr)}`,
+          );
         }
 
         // Drop card.json now the card is finalized (even on failure), so boot
         // reconcile doesn't re-finalize it. worktreePath is recomputed here
         // because it's scoped to the inner try; this catch can't see it.
         // Best-effort (deleteCardFile never throws).
-        const wtPath = this.deps.conventions.runtime === "agent_workspace" &&
-          this.deps.conventions.workspaceSessionsDir
-          ? path.join(this.deps.conventions.workspaceSessionsDir, threadId)
-          : path.join(this.deps.conventions.worktreesDir, threadId);
         await deleteCardFile(wtPath);
       }
     }
