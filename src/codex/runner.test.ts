@@ -624,6 +624,63 @@ describe("runCodex() — spawn-level integration", () => {
     expect(types).toContain("result");
   });
 
+  it("sends cwd and policy fields through app-server JSON-RPC params", async () => {
+    const fake = makeFakeCodexChild();
+    __nextFakeCodexChild = fake;
+
+    const { runCodex } = await import("./runner.js");
+    const handle = runCodex({
+      prompt: "continue the task",
+      cwd: "/repo/worktree",
+      permissionMode: "ask",
+    });
+
+    const eventsPromise = collectEvents(handle.events);
+    await new Promise<void>((res) => setImmediate(() => {
+      fake.stdout.write(APP_INIT_RESPONSE + "\n");
+      fake.stdout.write(APP_THREAD_RESPONSE + "\n");
+      fake.stdout.write(APP_TURN_RESPONSE + "\n");
+      fake.stdout.write(APP_TURN_COMPLETED + "\n");
+      res();
+    }));
+
+    await eventsPromise;
+    await handle.done;
+
+    expect(__lastSpawnArgs).not.toBeNull();
+    expect(__lastSpawnArgs!.args).toEqual(["app-server", "--stdio"]);
+
+    const stdinText: string = fake.child.stdin.read()?.toString("utf8") ?? "";
+    const requests: Array<{
+      method?: string;
+      params?: Record<string, unknown>;
+    }> = stdinText
+      .trim()
+      .split("\n")
+      .filter(Boolean)
+      .map((line: string) => JSON.parse(line) as {
+        method?: string;
+        params?: Record<string, unknown>;
+      });
+
+    const threadStart = requests.find((request) => request.method === "thread/start");
+    expect(threadStart?.params).toMatchObject({
+      cwd: "/repo/worktree",
+      approvalPolicy: "on-request",
+      sandbox: "read-only",
+      ephemeral: false,
+      sessionStartSource: "startup",
+    });
+
+    const turnStart = requests.find((request) => request.method === "turn/start");
+    expect(turnStart?.params).toMatchObject({
+      threadId: APP_THREAD_ID,
+      cwd: "/repo/worktree",
+      approvalPolicy: "on-request",
+      sandboxPolicy: { type: "readOnly", networkAccess: false },
+    });
+  });
+
   it("resume: app-server receives thread/resume over JSON-RPC", async () => {
     const fake = makeFakeCodexChild();
     __nextFakeCodexChild = fake;
