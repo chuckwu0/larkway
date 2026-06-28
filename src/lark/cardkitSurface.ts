@@ -39,6 +39,10 @@ function markdown(content: string, elementId?: string): Record<string, unknown> 
   return element;
 }
 
+export function buildCardKitAnswerElement(content = ""): Record<string, unknown> {
+  return markdown(content, CARDKIT_FINAL_ELEMENT_ID);
+}
+
 function safeAtMention(target: CardKitMentionTarget): string {
   const id = target.user_id.trim();
   if (!/^[A-Za-z0-9_:-]+$/.test(id)) return "";
@@ -100,10 +104,7 @@ export function buildCardKitInitialCard(
       },
     },
     body: {
-      elements: [
-        markdown(" ", CARDKIT_FINAL_ELEMENT_ID),
-        markdown(footerText, CARDKIT_FOOTER_ELEMENT_ID),
-      ],
+      elements: [markdown(footerText, CARDKIT_FOOTER_ELEMENT_ID)],
     },
   };
 }
@@ -160,7 +161,7 @@ function finalMarkdown(opts: BuildCardKitFinalCardOpts): string {
 export function buildCardKitFinalCard(
   opts: BuildCardKitFinalCardOpts,
 ): Record<string, unknown> {
-  const elements: unknown[] = [markdown(finalMarkdown(opts), CARDKIT_FINAL_ELEMENT_ID)];
+  const elements: unknown[] = [buildCardKitAnswerElement(finalMarkdown(opts))];
   const images: ImageBlock[] = [];
   if (opts.contentBlocks?.length) {
     for (const block of opts.contentBlocks) {
@@ -185,10 +186,6 @@ export function buildCardKitFinalCard(
       update_multi: true,
       streaming_mode: false,
       summary: { content: truncateChars(opts.finalText.replace(/\s+/g, " ").trim(), 50, "...") },
-    },
-    header: {
-      title: plainText(opts.title ?? "完成"),
-      template: "green",
     },
     body: { elements },
   });

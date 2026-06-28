@@ -9,9 +9,9 @@ Larkway uses one Feishu interactive CardKit card as the normal reply surface:
   then the answer channel streams into the same card.
 - Raw reasoning, assistant `text_delta`, tool calls, local paths, and progress
   lists are not rendered into the visible card.
-- On completion, the same card is finalized into a clean summary card: final
-  answer, optional images/content blocks, optional late peer mentions, and
-  optional `choices` buttons.
+- On completion, the same card is finalized into a clean, headerless summary
+  card: final answer, optional images/content blocks, optional late peer
+  mentions, and optional `choices` buttons.
 - The running footer is removed from the final card. It is not left expanded,
   collapsed, or separated by an empty divider.
 - The bridge does not use post/RichText in-place editing as the normal path.
@@ -45,7 +45,9 @@ Supported fields:
 - `status`: `in_progress`, `ready`, or `failed`.
 - `last_message`: the final answer body.
 - `error`: failure reason when `status=failed`.
-- `card_title` / `card_color`: optional final card title/color override.
+- `card_title` / `card_color`: compatibility fields. The default CardKit
+  surface does not render a colored header band; legacy/fallback card paths may
+  still use these fields.
 - `choices` / `choice_prompt`: rendered as final-area CardKit buttons. Button
   callbacks still emit `larkway_choice` and reuse the existing card action
   synthesized-turn flow.
@@ -112,20 +114,22 @@ Mention policy:
 Normal turn:
 
 1. `im.v1.message.reply` sends one initial Card JSON 2.0 interactive message
-   with stable element ids: `final_md` and `footer_md`. The only running text
-   is the footer placeholder `努力回答中...`.
+   with only the stable `footer_md` element. The only running text is the footer
+   placeholder `努力回答中...`; there is no empty answer/header slot above it.
 2. `cardkit.v1.card.idConvert` converts the reply `message_id` into a CardKit
    `card_id` for later element streaming. This keeps the response in the
    Feishu thread while avoiding the platform limitation observed when replying
    with a pre-created CardKit `card_id`.
 3. Runner events update only the trusted answer channel:
+   - The first `answer_delta` / `answer_snapshot` creates `final_md` immediately
+     before `footer_md`.
    - `answer_delta` appends to `final_md`.
    - `answer_snapshot` replaces `final_md`.
    - `reasoning`, raw events, `tool_result`, `tool_use`, `internal_text`, and
      assistant `text_delta` are not displayed.
 4. Finalization writes canonical final markdown into `final_md`, updates the
-   card entity to remove the footer and include choices/images/content, then calls
-   `card.settings` with `streaming_mode=false`.
+   card entity to remove the footer and include choices/images/content without a
+   colored header band, then calls `card.settings` with `streaming_mode=false`.
 
 The handler persists `.larkway/cardkit.json` with `cardId`, `messageId`,
 `sequence`, stable element ids, and status. Every successful CardKit mutation
@@ -170,8 +174,8 @@ Required automated coverage:
 - CardKit client wraps SDK CardKit operations and retries transient / `200810`
   failures.
 - CardKit surface renders the running footer, answer stream target, final body,
-  mentions, choices, images, and content blocks without status/thinking/tool
-  slots.
+  mentions, choices, images, and content blocks without a header band or
+  status/thinking/tool slots.
 - Handler uses CardKit by default, suppresses post editing, adopts an already
   visible CardKit reply if `idConvert` fails, and falls back to a visible legacy
   card on CardKit failure, then a create-only fallback post if the legacy card

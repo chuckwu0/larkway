@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  AnswerChannelExtractor,
   ANSWER_BEGIN_MARKER,
   ANSWER_END_MARKER,
   splitAnswerChannelText,
@@ -47,5 +48,58 @@ describe("splitAnswerChannelText", () => {
     expect(events).toEqual([
       { type: "answer_snapshot", text: "Partial visible answer", raw: { id: 3 } },
     ]);
+  });
+});
+
+describe("AnswerChannelExtractor", () => {
+  it("extracts answer deltas when markers are split across chunks", () => {
+    const extractor = new AnswerChannelExtractor();
+    const raw = { id: "chunked" };
+
+    const chunks = [
+      "internal thinking that must stay hidden\nL",
+      "ARKWAY_ANSWER_BEGIN\nVisible answer starts here and keeps going for a while",
+      " until the final sentence.\nLARKWAY_ANSWER_END\ninternal trailing text",
+    ];
+    const events = chunks.flatMap((chunk) => extractor.ingestDelta(chunk, raw));
+    const answer = events
+      .filter((event) => event.type === "answer_delta")
+      .map((event) => event.text)
+      .join("");
+
+    expect(answer).toBe("Visible answer starts here and keeps going for a while until the final sentence.");
+    expect(JSON.stringify(events)).not.toContain(ANSWER_BEGIN_MARKER);
+    expect(JSON.stringify(events)).not.toContain(ANSWER_END_MARKER);
+    expect(JSON.stringify(events.filter((event) => event.type === "answer_delta")))
+      .not.toContain("internal thinking");
+    expect(JSON.stringify(events.filter((event) => event.type === "answer_delta")))
+      .not.toContain("internal trailing text");
+  });
+
+  it("does not expose unmarked streaming text", () => {
+    const extractor = new AnswerChannelExtractor();
+
+    const events = [
+      ...extractor.ingestDelta("thinking chunk one", { id: 1 }),
+      ...extractor.ingestDelta(" thinking chunk two", { id: 2 }),
+    ];
+
+    expect(events.filter((event) => event.type === "answer_delta")).toHaveLength(0);
+  });
+
+  it("deduplicates a final snapshot after streamed deltas already reached the same answer", () => {
+    const extractor = new AnswerChannelExtractor();
+    const answer = "Visible answer starts here and keeps going for a while until complete.";
+
+    const deltaEvents = [
+      ...extractor.ingestDelta(`${ANSWER_BEGIN_MARKER}\n${answer}\n${ANSWER_END_MARKER}`, { id: 1 }),
+    ];
+    const snapshotEvents = extractor.ingestSnapshot(
+      `${ANSWER_BEGIN_MARKER}\n${answer}\n${ANSWER_END_MARKER}`,
+      { id: 2 },
+    );
+
+    expect(deltaEvents.some((event) => event.type === "answer_delta")).toBe(true);
+    expect(snapshotEvents.filter((event) => event.type === "answer_snapshot")).toHaveLength(0);
   });
 });

@@ -116,7 +116,7 @@ Larkway 传给 Agent 的核心信息应是:
 | 层 | Larkway bridge | Agent |
 |---|---|---|
 | 外壳 | 创建卡片、PATCH、节流、失败兜底、崩溃恢复 | 不直接 PATCH 卡片 |
-| 头部 | 通用状态:处理中 / 已回复 / 完成 / 出错 | 可用 `card_title` / `card_color` 覆盖语义 |
+| 头部 | 默认 CardKit 不渲染顶部标题色条;legacy/fallback 卡片保留可见状态语义 | `card_title` / `card_color` 仅作兼容字段 |
 | 正文 | 安全渲染 markdown、分片、只渲染可信答案通道 | 用 `last_message` 决定展示内容 |
 | 内部诊断 | 记录工具/runner 事件,但运行中不展示工具 dump 或思考 | 不依赖工具摘要表达业务阶段 |
 | 底部动作 | 把 `choices` 渲染成按钮并回传 value | 只在单个离散选择时声明 `choices` |

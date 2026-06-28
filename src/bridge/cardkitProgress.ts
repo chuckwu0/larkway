@@ -4,9 +4,11 @@ import {
   type OutboundCardKitClient,
 } from "../lark/channelCardKitClient.js";
 import {
+  buildCardKitAnswerElement,
   buildCardKitFinalCard,
   buildCardKitFinalMarkdown,
   buildCardKitInitialCard,
+  CARDKIT_FOOTER_ELEMENT_ID,
   CARDKIT_FINAL_ELEMENT_ID,
   type BuildCardKitFinalCardOpts,
 } from "../lark/cardkitSurface.js";
@@ -51,6 +53,17 @@ function sequenceUuid(cardId: string, role: string, sequence: number): string {
   return deriveCardKitUuid([cardId, role, String(sequence)].join("\0"));
 }
 
+function isMissingCardKitElementError(err: unknown): boolean {
+  if (!(err instanceof Error)) return false;
+  const message = err.message.toLowerCase();
+  return (
+    message.includes("element") &&
+    (message.includes("not found") ||
+      message.includes("not exist") ||
+      message.includes("不存在"))
+  );
+}
+
 class LiveCardKitProgressHandle implements CardKitProgressHandle {
   readonly cardId: string;
   readonly messageId: string;
@@ -65,6 +78,7 @@ class LiveCardKitProgressHandle implements CardKitProgressHandle {
   private inFlight: Promise<void> = Promise.resolve();
   private closed = false;
   private progressUpdates = 0;
+  private answerElementCreated = false;
   sequence = 0;
 
   constructor(opts: {
@@ -116,6 +130,7 @@ class LiveCardKitProgressHandle implements CardKitProgressHandle {
     this.closed = true;
     const finalMarkdown = buildCardKitFinalMarkdown(opts);
     if (finalMarkdown !== this.answerBuffer) {
+      await this.withAnswerElement(finalMarkdown);
       await this.next((sequence) =>
         this.cardKitClient.streamElementContent(
           this.cardId,
@@ -175,17 +190,36 @@ class LiveCardKitProgressHandle implements CardKitProgressHandle {
     this.progressUpdates += 1;
     this.inFlight = this.inFlight
       .then(() =>
-        this.next((sequence) =>
-          this.cardKitClient.streamElementContent(this.cardId, CARDKIT_FINAL_ELEMENT_ID, this.answerBuffer, {
-            sequence,
-            uuid: sequenceUuid(this.cardId, "answer", sequence),
-          }),
+        this.withAnswerElement(this.answerBuffer).then(() =>
+          this.next((sequence) =>
+            this.cardKitClient.streamElementContent(this.cardId, CARDKIT_FINAL_ELEMENT_ID, this.answerBuffer, {
+              sequence,
+              uuid: sequenceUuid(this.cardId, "answer", sequence),
+            }),
+          ),
         ),
       )
       .catch((err) => {
         console.warn("[cardkit_progress] progress update failed (continuing):", err);
       });
     await this.inFlight;
+  }
+
+  private async withAnswerElement(initialContent: string): Promise<void> {
+    if (this.answerElementCreated) return;
+    await this.next((sequence) =>
+      this.cardKitClient.createElements(
+        this.cardId,
+        [buildCardKitAnswerElement(initialContent)],
+        {
+          sequence,
+          uuid: sequenceUuid(this.cardId, "answer-element", sequence),
+          type: "insert_before",
+          targetElementId: CARDKIT_FOOTER_ELEMENT_ID,
+        },
+      ),
+    );
+    this.answerElementCreated = true;
   }
 
   private async next(fn: (sequence: number) => Promise<void>): Promise<void> {
@@ -252,14 +286,33 @@ export async function finalizeExistingCardKitCard(opts: {
     await opts.onSequenceCommitted?.(sequence);
   };
   const finalMarkdown = buildCardKitFinalMarkdown(opts.final);
-  await next("reconcile-final-content", (seq, uuid) =>
-    opts.cardKitClient.streamElementContent(
-      opts.cardId,
-      CARDKIT_FINAL_ELEMENT_ID,
-      finalMarkdown,
-      { sequence: seq, uuid },
-    ),
-  );
+  const streamFinalContent = () =>
+    next("reconcile-final-content", (seq, uuid) =>
+      opts.cardKitClient.streamElementContent(
+        opts.cardId,
+        CARDKIT_FINAL_ELEMENT_ID,
+        finalMarkdown,
+        { sequence: seq, uuid },
+      ),
+    );
+  try {
+    await streamFinalContent();
+  } catch (err) {
+    if (!isMissingCardKitElementError(err)) throw err;
+    await next("reconcile-final-element", (seq, uuid) =>
+      opts.cardKitClient.createElements(
+        opts.cardId,
+        [buildCardKitAnswerElement(finalMarkdown)],
+        {
+          sequence: seq,
+          uuid,
+          type: "insert_before",
+          targetElementId: CARDKIT_FOOTER_ELEMENT_ID,
+        },
+      ),
+    );
+    await streamFinalContent();
+  }
   await next("reconcile-final-card", (seq, uuid) =>
     opts.cardKitClient.updateCardEntity(
       opts.cardId,

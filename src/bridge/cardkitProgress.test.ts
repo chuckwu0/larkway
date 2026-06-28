@@ -1,9 +1,10 @@
 import { describe, expect, it } from "vitest";
 import type { OutboundCardKitClient } from "../lark/channelCardKitClient.js";
-import { createCardKitProgressHandle } from "./cardkitProgress.js";
+import { createCardKitProgressHandle, finalizeExistingCardKitCard } from "./cardkitProgress.js";
 
-function fakeCardKitClient() {
+function fakeCardKitClient(opts?: { initialElements?: string[] }) {
   const calls: { name: string; args: unknown[] }[] = [];
+  const elements = opts?.initialElements ? new Set(opts.initialElements) : null;
   const client: OutboundCardKitClient = {
     async createCardEntity(card) {
       calls.push({ name: "createCardEntity", args: [card] });
@@ -17,10 +18,19 @@ function fakeCardKitClient() {
       calls.push({ name: "updateCardEntity", args: [cardId, card, opts] });
     },
     async streamElementContent(cardId, elementId, content, opts) {
+      if (elements && !elements.has(elementId)) {
+        throw new Error(`element not found: ${elementId}`);
+      }
       calls.push({ name: "streamElementContent", args: [cardId, elementId, content, opts] });
     },
-    async createElements(cardId, elements, opts) {
-      calls.push({ name: "createElements", args: [cardId, elements, opts] });
+    async createElements(cardId, newElements, mutationOpts) {
+      calls.push({ name: "createElements", args: [cardId, newElements, mutationOpts] });
+      if (elements) {
+        for (const element of newElements) {
+          const elementId = (element as { element_id?: unknown }).element_id;
+          if (typeof elementId === "string") elements.add(elementId);
+        }
+      }
     },
     async deleteElement(cardId, elementId, opts) {
       calls.push({ name: "deleteElement", args: [cardId, elementId, opts] });
@@ -81,6 +91,14 @@ describe("CardKitProgressHandle", () => {
     expect(contentCalls[0]!.args[2]).not.toContain("rg cardkit src");
     expect(contentCalls[0]!.args[2]).not.toContain("raw assistant prose");
     expect(contentCalls[0]!.args[2]).not.toContain("raw thinking");
+    const createCall = calls.find((c) => c.name === "createElements");
+    expect(createCall?.args[1]).toEqual([
+      { tag: "markdown", content: "用户可见答案", element_id: "final_md" },
+    ]);
+    expect(createCall?.args[2]).toMatchObject({
+      type: "insert_before",
+      targetElementId: "footer_md",
+    });
   });
 
   it("finalizes by writing final content, replacing with a clean card, and closing streaming", async () => {
@@ -103,20 +121,80 @@ describe("CardKitProgressHandle", () => {
     expect(names).toEqual([
       "createCardEntity",
       "replyCardEntity",
+      "createElements",
       "streamElementContent",
       "updateCardEntity",
       "updateCardSettings",
     ]);
-    expect(calls[2]!.args[1]).toBe("final_md");
-    expect(calls[2]!.args[2]).toContain("最终结论");
-    const finalCard = calls[3]!.args[1] as Record<string, unknown>;
+    expect(calls[2]!.args[2]).toMatchObject({
+      type: "insert_before",
+      targetElementId: "footer_md",
+    });
+    expect(calls[2]!.args[1]).toEqual([
+      { tag: "markdown", content: "<at id=peer_bot></at>\n\n最终结论", element_id: "final_md" },
+    ]);
+    expect(calls[3]!.args[1]).toBe("final_md");
+    expect(calls[3]!.args[2]).toContain("最终结论");
+    const finalCard = calls[4]!.args[1] as Record<string, unknown>;
     expect(JSON.stringify(finalCard)).not.toContain("thinking_md");
     expect(JSON.stringify(finalCard)).toContain("larkway_choice");
-    expect(calls[4]!.args[1]).toEqual({
+    expect(calls[5]!.args[1]).toEqual({
       config: { streaming_mode: false, summary: { content: "最终结论" } },
     });
-    expect((calls[2]!.args[3] as { sequence: number }).sequence).toBe(1);
-    expect((calls[3]!.args[2] as { sequence: number }).sequence).toBe(2);
+    expect((calls[2]!.args[2] as { sequence: number }).sequence).toBe(1);
+    expect((calls[3]!.args[3] as { sequence: number }).sequence).toBe(2);
     expect((calls[4]!.args[2] as { sequence: number }).sequence).toBe(3);
+    expect((calls[5]!.args[2] as { sequence: number }).sequence).toBe(4);
+  });
+
+  it("ensures the answer element before reconciling an existing CardKit card when final_md is missing", async () => {
+    const { client, calls } = fakeCardKitClient({ initialElements: ["footer_md"] });
+    const committed: number[] = [];
+
+    const sequence = await finalizeExistingCardKitCard({
+      cardKitClient: client,
+      cardId: "card_entity",
+      startingSequence: 2,
+      final: { finalText: "恢复完成" },
+      onSequenceCommitted: async (seq) => {
+        committed.push(seq);
+      },
+    });
+
+    expect(calls.map((c) => c.name)).toEqual([
+      "createElements",
+      "streamElementContent",
+      "updateCardEntity",
+      "updateCardSettings",
+    ]);
+    expect(calls[0]!.args[1]).toEqual([
+      { tag: "markdown", content: "恢复完成", element_id: "final_md" },
+    ]);
+    expect(calls[0]!.args[2]).toMatchObject({
+      type: "insert_before",
+      targetElementId: "footer_md",
+    });
+    expect(calls[1]!.args[1]).toBe("final_md");
+    expect(calls[1]!.args[2]).toBe("恢复完成");
+    expect(committed).toEqual([4, 5, 6, 7]);
+    expect(sequence).toBe(7);
+  });
+
+  it("does not recreate final_md when reconciling an existing CardKit card that already has it", async () => {
+    const { client, calls } = fakeCardKitClient({ initialElements: ["footer_md", "final_md"] });
+
+    await finalizeExistingCardKitCard({
+      cardKitClient: client,
+      cardId: "card_entity",
+      startingSequence: 2,
+      final: { finalText: "已存在答案元素" },
+    });
+
+    expect(calls.map((c) => c.name)).toEqual([
+      "streamElementContent",
+      "updateCardEntity",
+      "updateCardSettings",
+    ]);
+    expect(calls[0]!.args[1]).toBe("final_md");
   });
 });
