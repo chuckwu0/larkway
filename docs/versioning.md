@@ -32,7 +32,8 @@
 | v0.3.21 | v0.3.21 | patch / 已发布 | make response surface post-first with bounded live post edits |
 | v0.3.22 | v0.3.22 | patch / 已发布 | make CardKit streaming the default response surface |
 | v0.3.23 | v0.3.23 | patch / 已发布 | ship CardKit answer streaming and hard-failure fallback |
-| v0.3.24 | v0.3.24 | 当前 patch / 已发布 | restore CardKit live streaming polish; harden orphan reconcile fallback |
+| v0.3.24 | v0.3.24 | patch / 已发布 | restore CardKit live streaming polish; harden orphan reconcile fallback |
+| v0.3.25 | v0.3.25 | 当前 patch / 已发布 | harden CardKit live diagnostics and running-card fallback |
 
 ## 使用原则
 
@@ -69,4 +70,5 @@ v0.3.21       = make response surface post-first with bounded live post edits
 v0.3.22       = make CardKit streaming the default response surface
 v0.3.23       = ship CardKit answer streaming and hard-failure fallback
 v0.3.24       = restore CardKit live streaming polish; harden orphan reconcile fallback
+v0.3.25       = harden CardKit live diagnostics and running-card fallback
 ```
