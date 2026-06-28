@@ -1436,6 +1436,160 @@ describe("handleOne — thin-channel finalize", () => {
     expect(ledger).toBeNull();
   });
 
+  it("sends a create-only post when CardKit is disabled and legacy card start fails", async () => {
+    const threadId = "om_msg";
+    const finalState = {
+      status: "ready",
+      last_message: "非 CardKit 路径也必须有最终可见面",
+      response_surface: {
+        mode: "post",
+        primary: "post",
+      },
+      updated_at: "2026-06-26T10:00:00.000Z",
+    };
+    const wt = await seedWorktree(threadId);
+    await seedRepoCachePath();
+    const { client: postClient, calls: postCalls } = makePostClient();
+
+    runClaudeImpl = () => ({
+      events: (async function* () {
+        yield { type: "system_init", sessionId: "sess_cardkit_disabled_card_start_failed", raw: {} };
+        await writeFile(
+          stateFileMod.stateFilePathOf(wt),
+          JSON.stringify(finalState, null, 2),
+          "utf8",
+        );
+      })(),
+      done: Promise.resolve({ exitCode: 0, sessionId: "sess_cardkit_disabled_card_start_failed" }),
+      kill: () => {},
+    });
+
+    const { renderer, startArgs } = makeCardRenderer({ failStart: true });
+    const { store } = makeSessionStore();
+    const { client, acked } = makeClient(makeEvent());
+
+    const handler = new BridgeHandler({
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      client: client as any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      cardRenderer: renderer as any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      sessionStore: store as any,
+      conventions: makeConventions(),
+      botConfig: {
+        id: "frontend",
+        name: "Frontend",
+        turn_taking_limit: 10,
+        backend: "claude",
+        response_surface_prototype: {
+          enabled: true,
+          allowed_chats: [],
+          allowed_threads: ["om_msg"],
+          lazy_card_creation: true,
+          kill_switch: false,
+          post_outbound_enabled: true,
+          cardkit_streaming_enabled: false,
+          allow_agent_mentions: true,
+          allowed_mention_open_ids: [],
+          max_posts_per_turn: 1,
+          max_posts_per_window: 4,
+          post_window_ms: 60_000,
+          max_post_attempts: 3,
+          text_threshold_chars: 900,
+        },
+      },
+      postClient,
+    });
+
+    await handler.run();
+    for (let i = 0; i < 100 && acked.length === 0; i++) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
+
+    expect(acked).toEqual(["om_msg"]);
+    expect(startArgs).toHaveLength(2);
+    expect(postCalls).toHaveLength(1);
+    expect(postCalls[0]?.kind).toBe("create");
+    expect(postCalls[0]?.replyToMessageId).toBe("om_msg");
+    expect(postCalls[0]?.replyInThread).toBe(true);
+    expect(postCalls[0]?.idempotencyKey).toMatch(/^lw-p-/);
+    expect(postCalls[0]?.content).toContain("非 CardKit 路径也必须有最终可见面");
+    expect(postCalls[0]?.content).toContain("initial legacy visible card start failed");
+    expect(postCalls[0]?.content).toContain("late legacy visible card fallback start failed");
+    expect(await readPostFile(wt)).toBeNull();
+  });
+
+  it("sends a create-only post on hard failure when no CardKit or legacy card surface exists", async () => {
+    const threadId = "om_msg";
+    const wt = await seedWorktree(threadId);
+    await seedRepoCachePath();
+    const { client: postClient, calls: postCalls } = makePostClient();
+
+    runClaudeImpl = () => ({
+      events: (async function* () {
+        yield { type: "system_init", sessionId: "sess_no_surface_hard_failure", raw: {} };
+      })(),
+      done: new Promise((_, reject) => {
+        setTimeout(() => reject(new Error("agent crashed before visible surface")), 0);
+      }),
+      kill: () => {},
+    });
+
+    const { renderer, startArgs } = makeCardRenderer({ failStart: true });
+    const { store } = makeSessionStore();
+    const { client, acked, unhandled } = makeClient(makeEvent());
+
+    const handler = new BridgeHandler({
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      client: client as any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      cardRenderer: renderer as any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      sessionStore: store as any,
+      conventions: makeConventions(),
+      botConfig: {
+        id: "frontend",
+        name: "Frontend",
+        turn_taking_limit: 10,
+        backend: "claude",
+        response_surface_prototype: {
+          enabled: true,
+          allowed_chats: [],
+          allowed_threads: ["om_msg"],
+          lazy_card_creation: true,
+          kill_switch: false,
+          post_outbound_enabled: true,
+          cardkit_streaming_enabled: false,
+          allow_agent_mentions: true,
+          allowed_mention_open_ids: [],
+          max_posts_per_turn: 1,
+          max_posts_per_window: 4,
+          post_window_ms: 60_000,
+          max_post_attempts: 3,
+          text_threshold_chars: 900,
+        },
+      },
+      postClient,
+    });
+
+    await handler.run();
+    for (let i = 0; i < 100 && unhandled.length === 0; i++) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
+
+    expect(acked).toEqual([]);
+    expect(unhandled).toEqual(["om_msg"]);
+    expect(startArgs).toHaveLength(1);
+    expect(postCalls).toHaveLength(1);
+    expect(postCalls[0]?.kind).toBe("create");
+    expect(postCalls[0]?.replyToMessageId).toBe("om_msg");
+    expect(postCalls[0]?.replyInThread).toBe(true);
+    expect(postCalls[0]?.idempotencyKey).toMatch(/^lw-p-/);
+    expect(postCalls[0]?.content).toContain("执行失败: Error: agent crashed before visible surface");
+    expect(postCalls[0]?.content).toContain("legacy visible card was unavailable before agent failure");
+    expect(await readPostFile(wt)).toBeNull();
+  });
+
   it("honors the response-surface kill switch even when post outbound is otherwise configured", async () => {
     const threadId = "om_msg";
     const finalState = {
