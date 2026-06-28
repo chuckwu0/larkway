@@ -177,6 +177,20 @@ describe("buildCommand", () => {
 });
 
 describe("parseLinesMulti", () => {
+  function assistantText(text: string): string {
+    return JSON.stringify({
+      type: "assistant",
+      message: {
+        content: [
+          {
+            type: "text",
+            text,
+          },
+        ],
+      },
+    });
+  }
+
   function streamTextDelta(text: string): string {
     return JSON.stringify({
       type: "stream_event",
@@ -205,6 +219,24 @@ describe("parseLinesMulti", () => {
     expect(answer).toBe("Visible answer text that is long enough to stream before the end marker.");
     expect(answer).not.toContain("hidden reasoning");
     expect(answer).not.toContain("hidden trailing");
+  });
+
+  it("turns marker-gated Claude growing assistant snapshots into answer deltas", () => {
+    const extractor = new AnswerChannelExtractor();
+    const events = [
+      ...parseLinesMulti(assistantText("LARKWAY_ANSWER_BEGIN\nHel"), extractor),
+      ...parseLinesMulti(assistantText("LARKWAY_ANSWER_BEGIN\nHello wor"), extractor),
+      ...parseLinesMulti(
+        assistantText("LARKWAY_ANSWER_BEGIN\nHello world\nLARKWAY_ANSWER_END"),
+        extractor,
+      ),
+    ];
+
+    const deltas = events.filter((event) => event.type === "answer_delta");
+    expect(deltas.map((event) => event.text).join("")).toBe("Hello world");
+    expect(events.some((event) => event.type === "answer_snapshot")).toBe(false);
+    expect(deltas.map((event) => event.text).join("")).not.toContain("LARKWAY_ANSWER_BEGIN");
+    expect(deltas.map((event) => event.text).join("")).not.toContain("LARKWAY_ANSWER_END");
   });
 
   it("does not duplicate the final assistant snapshot after stream_event deltas", () => {

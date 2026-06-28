@@ -23,7 +23,9 @@ import {
   type RunOptions,
   type RunHandle,
 } from "../agent/runner.js";
-import { splitAnswerChannelText } from "../agent/answerChannel.js";
+import {
+  AnswerChannelExtractor,
+} from "../agent/answerChannel.js";
 
 // ---------------------------------------------------------------------------
 // Internal constants
@@ -215,7 +217,10 @@ export function buildCodexCommand(
  *   Everything else (turn.started, unknown item types, error events, etc.)
  *     → {type:"raw", raw}  — never throws
  */
-export function* parseCodexLine(line: string): Generator<AgentStreamEvent> {
+class CodexLineParser {
+  private readonly answerExtractor = new AnswerChannelExtractor();
+
+  *parseLine(line: string): Generator<AgentStreamEvent> {
   const trimmed = line.trim();
   if (trimmed === "") return;
 
@@ -247,6 +252,17 @@ export function* parseCodexLine(line: string): Generator<AgentStreamEvent> {
     return;
   }
 
+  const agentMessageText = agentMessageTextFrom(record);
+  if (agentMessageText !== undefined) {
+    if (topType === "item.completed") {
+      yield* this.answerExtractor.ingestSnapshot(agentMessageText, obj);
+      return;
+    }
+
+    yield* this.answerExtractor.ingestGrowingSnapshot(agentMessageText, obj);
+    return;
+  }
+
   // ── item.started → tool_use (command_execution only) ────────────────────
   if (topType === "item.started") {
     const item = record["item"];
@@ -270,7 +286,7 @@ export function* parseCodexLine(line: string): Generator<AgentStreamEvent> {
     return;
   }
 
-  // ── item.completed → tool_result | internal_text | answer_snapshot ──────
+  // ── item.completed → tool_result ────────────────────────────────────────
   if (topType === "item.completed") {
     const item = record["item"];
     if (typeof item === "object" && item !== null) {
@@ -281,13 +297,6 @@ export function* parseCodexLine(line: string): Generator<AgentStreamEvent> {
         return;
       }
 
-      if (
-        itemRecord["type"] === "agent_message" &&
-        typeof itemRecord["text"] === "string"
-      ) {
-        yield* splitAnswerChannelText(itemRecord["text"], obj);
-        return;
-      }
     }
     // Unknown item.completed — degrade to raw
     yield { type: "raw", raw: obj };
@@ -296,6 +305,21 @@ export function* parseCodexLine(line: string): Generator<AgentStreamEvent> {
 
   // ── everything else (turn.started, error, reasoning, file_change, …) ────
   yield { type: "raw", raw: obj };
+  }
+
+}
+
+function agentMessageTextFrom(record: Record<string, unknown>): string | undefined {
+  const item = record["item"];
+  if (typeof item !== "object" || item === null) return undefined;
+  const itemRecord = item as Record<string, unknown>;
+  if (itemRecord["type"] !== "agent_message") return undefined;
+  const text = itemRecord["text"];
+  return typeof text === "string" ? text : undefined;
+}
+
+export function* parseCodexLine(line: string): Generator<AgentStreamEvent> {
+  yield* new CodexLineParser().parseLine(line);
 }
 
 // ---------------------------------------------------------------------------
@@ -485,10 +509,11 @@ export function runCodex(opts: RunOptions, codexBinPath = "codex"): RunHandle {
       crlfDelay: Infinity,
       signal: rlAbortController.signal,
     });
+    const parser = new CodexLineParser();
 
     try {
       for await (const line of rl) {
-        for (const event of parseCodexLine(line)) {
+        for (const event of parser.parseLine(line)) {
           if (event.type === "system_init") {
             discoveredSessionId = event.sessionId;
           }
@@ -536,5 +561,6 @@ export class CodexRunner implements AgentRunner {
 export {
   buildCodexEnv as _buildCodexEnv,
   buildCodexCommand as _buildCodexCommand,
+  CodexLineParser as _CodexLineParser,
   parseCodexLine as _parseCodexLine,
 };

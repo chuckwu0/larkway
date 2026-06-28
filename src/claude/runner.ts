@@ -167,7 +167,7 @@ function* parseLinesMulti(
         const block = item as Record<string, unknown>;
 
         if (block["type"] === "text" && typeof block["text"] === "string") {
-          yield* answerExtractor.ingestSnapshot(block["text"], obj);
+          yield* answerExtractor.ingestGrowingSnapshot(block["text"], obj);
           emitted = true;
         } else if (block["type"] === "tool_use") {
           yield {

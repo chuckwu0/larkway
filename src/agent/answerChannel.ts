@@ -47,6 +47,7 @@ export class AnswerChannelExtractor {
   private mode: "waiting" | "answer" | "closed" = "waiting";
   private buffer = "";
   private visibleText = "";
+  private lastSnapshotText = "";
 
   ingestDelta(text: string, raw: unknown): AgentStreamEvent[] {
     if (!text || this.mode === "closed") return [];
@@ -55,6 +56,7 @@ export class AnswerChannelExtractor {
   }
 
   ingestSnapshot(text: string, raw: unknown): AgentStreamEvent[] {
+    this.lastSnapshotText = text;
     const events = splitAnswerChannelText(text, raw);
     const out: AgentStreamEvent[] = [];
     for (const event of events) {
@@ -62,12 +64,30 @@ export class AnswerChannelExtractor {
         out.push(event);
         continue;
       }
-      if (event.text === this.visibleText) continue;
+      if (event.text === this.visibleText) {
+        if (text.includes(ANSWER_END_MARKER)) this.mode = "closed";
+        continue;
+      }
       this.visibleText = event.text;
       out.push(event);
       if (text.includes(ANSWER_END_MARKER)) this.mode = "closed";
     }
     return out;
+  }
+
+  ingestGrowingSnapshot(text: string, raw: unknown): AgentStreamEvent[] {
+    if (!text || this.mode === "closed") return [];
+    if (this.lastSnapshotText && text.startsWith(this.lastSnapshotText)) {
+      const delta = text.slice(this.lastSnapshotText.length);
+      this.lastSnapshotText = text;
+      return delta ? this.ingestDelta(delta, raw) : [];
+    }
+    if (this.lastSnapshotText === "") {
+      this.lastSnapshotText = text;
+      return this.ingestDelta(text, raw);
+    }
+    this.lastSnapshotText = text;
+    return this.ingestSnapshot(text, raw);
   }
 
   private drain(raw: unknown): AgentStreamEvent[] {

@@ -14,6 +14,7 @@ import {
   _parseCodexLine as parseCodexLine,
   _buildCodexCommand as buildCodexCommand,
   _buildCodexEnv as buildCodexEnv,
+  _CodexLineParser as CodexLineParser,
   productizeCodexFailure,
 } from "./runner.js";
 
@@ -143,6 +144,26 @@ describe("parseCodexLine", () => {
       type: "answer_snapshot",
       text: "I found the following files in the directory.",
     });
+  });
+
+  it("turns monotonic agent_message snapshots into marker-gated answer deltas", () => {
+    const parser = new CodexLineParser();
+    const line = (text: string) => JSON.stringify({
+      type: "item.updated",
+      item: { type: "agent_message", text },
+    });
+
+    const events = [
+      ...parser.parseLine(line("LARKWAY_ANSWER_BEGIN\nHel")),
+      ...parser.parseLine(line("LARKWAY_ANSWER_BEGIN\nHello wor")),
+      ...parser.parseLine(line("LARKWAY_ANSWER_BEGIN\nHello world\nLARKWAY_ANSWER_END")),
+    ];
+
+    const deltas = events.filter((event) => event.type === "answer_delta");
+    expect(deltas.map((event) => event.text).join("")).toBe("Hello world");
+    expect(events.some((event) => event.type === "answer_snapshot")).toBe(false);
+    expect(deltas.map((event) => event.text).join("")).not.toContain("LARKWAY_ANSWER_BEGIN");
+    expect(deltas.map((event) => event.text).join("")).not.toContain("LARKWAY_ANSWER_END");
   });
 
   it("turn.completed → result with stopReason end_turn", () => {
