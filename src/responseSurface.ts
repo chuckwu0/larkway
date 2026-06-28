@@ -113,9 +113,9 @@ export const ResponseSurfacePrototypeConfigSchema = z
      */
     allowed_threads: z.array(z.string().min(1)).default([]),
     /**
-     * Post-first gate. Default true means the bridge starts a lightweight post
-     * as the live main surface when post outbound is available, and creates a
-     * card only for fallback or card-only capabilities.
+     * Historical post-first gate retained for config compatibility. The default
+     * runtime no longer uses post-first lazy card creation; CardKit is the main
+     * surface and legacy cards remain the visible fallback.
      */
     lazy_card_creation: z.boolean().default(true),
     /**
@@ -125,8 +125,8 @@ export const ResponseSurfacePrototypeConfigSchema = z
      */
     kill_switch: z.boolean().default(false),
     /**
-     * Gate for real post outbound. Defaults on, but the runtime still requires
-     * an injected post client and all safety gates before any post path.
+     * Gate for real post outbound. Defaults on so create-only visible fallback
+     * posts remain available when CardKit and legacy card rendering both fail.
      */
     post_outbound_enabled: z.boolean().default(true),
     /**
@@ -148,8 +148,8 @@ export const ResponseSurfacePrototypeConfigSchema = z
      */
     allowed_mention_open_ids: z.array(z.string().min(1)).default([]),
     /**
-     * Hard cap for surface dispatch. PR4 still keeps production post outbound
-     * unavailable, but fake-channel dispatch tests enforce this bounded shape.
+     * Historical post dispatch cap retained for schema compatibility and
+     * isolated dispatcher tests.
      */
     max_posts_per_turn: z.number().int().min(0).max(10).default(1),
     /**
@@ -168,8 +168,8 @@ export const ResponseSurfacePrototypeConfigSchema = z
      */
     max_post_attempts: z.number().int().min(1).max(5).default(3),
     /**
-     * Future channel threshold for lazy card creation. Bounded so config cannot
-     * grow unbounded or encode business rules.
+     * Historical threshold for removed lazy card creation experiments. Bounded
+     * so older config remains parseable without growing arbitrary business rules.
      */
     text_threshold_chars: z.number().int().min(1).max(20_000).default(1200),
   })
