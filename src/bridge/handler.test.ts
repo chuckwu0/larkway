@@ -523,7 +523,7 @@ describe("handleOne — thin-channel finalize", () => {
     expect(runOpts?.prompt).not.toContain("ou_configured_or_relay");
   });
 
-  it("schedules a topic monitor turn when the agent leaves state in_progress", async () => {
+  it("schedules a topic tick turn when the agent leaves state in_progress", async () => {
     const threadId = "om_msg";
     const wt = await seedWorktree(threadId);
     await seedRepoCachePath();
@@ -535,18 +535,18 @@ describe("handleOne — thin-channel finalize", () => {
       const n = invocations;
       return {
         events: (async function* () {
-          yield { type: "system_init", sessionId: `sess_monitor_${n}`, raw: {} };
+          yield { type: "system_init", sessionId: `sess_tick_${n}`, raw: {} };
           await writeFile(
             stateFileMod.stateFilePathOf(wt),
             JSON.stringify({
               status: n === 1 ? "in_progress" : "ready",
-              last_message: n === 1 ? "等待下一棒" : "监控已处理",
+              last_message: n === 1 ? "等待下一次触发" : "tick 已处理",
               updated_at: `2026-06-26T10:00:0${n}.000Z`,
             }, null, 2),
             "utf8",
           );
         })(),
-        done: Promise.resolve({ exitCode: 0, sessionId: `sess_monitor_${n}` }),
+        done: Promise.resolve({ exitCode: 0, sessionId: `sess_tick_${n}` }),
         kill: () => {},
       };
     };
@@ -563,7 +563,7 @@ describe("handleOne — thin-channel finalize", () => {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       sessionStore: store as any,
       conventions: makeConventions(),
-      topicMonitorIntervalMs: 5,
+      topicTickIntervalMs: 5,
       botConfig: { id: "frontend", name: "Frontend", turn_taking_limit: 10, backend: "claude" },
     });
 
@@ -576,8 +576,9 @@ describe("handleOne — thin-channel finalize", () => {
 
     expect(invocations).toBe(2);
     expect(finalizeArgs).toHaveLength(2);
-    expect(prompts[1]).toContain("Larkway 自主监控");
-    expect(finalizeArgs.at(-1)?.finalText).toBe("监控已处理");
+    expect(prompts[1]).toContain("Larkway 定时唤起 tick");
+    expect(prompts[1]).toContain("Bridge 不判断是否 block");
+    expect(finalizeArgs.at(-1)?.finalText).toBe("tick 已处理");
   });
 
   it("passes missing lark-cli as an advisory runtime warning without blocking the agent", async () => {

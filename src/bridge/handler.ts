@@ -69,7 +69,7 @@ import { buildPostContent } from "../lark/postContent.js";
 import { derivePostIdempotencyKey, digestPostContent } from "../lark/idempotency.js";
 
 const DEFAULT_CARDKIT_RESPONSE_SURFACE_TIMEOUT_MS = 20 * 60 * 1000;
-const DEFAULT_TOPIC_MONITOR_INTERVAL_MS = 10 * 60 * 1000;
+const DEFAULT_TOPIC_TICK_INTERVAL_MS = 10 * 60 * 1000;
 
 // ---------------------------------------------------------------------------
 // Private helpers — worktree bootstrap
@@ -532,13 +532,13 @@ export interface BridgeHandlerDeps {
    */
   responseSurfaceTimeoutMs?: number;
   /**
-   * When an agent leaves a topic in status=in_progress, schedule a synthetic
-   * follow-up turn so the agent can inspect the Feishu topic and unblock or @
-   * the next actor without relying on a human poke.
+   * Content-agnostic scheduled tick for active topics. When an agent leaves a
+   * topic in status=in_progress, the bridge re-invokes the same topic after this
+   * interval. The bridge does not decide what is blocked or who should act.
    *
    * @default 10 * 60 * 1000
    */
-  topicMonitorIntervalMs?: number;
+  topicTickIntervalMs?: number;
   /**
    * V2: fully-resolved peer bot list for this bot.
    * Pre-resolved by runV2Mode: each entry has the peer bot's open_id, name, description.
@@ -621,7 +621,7 @@ export interface BridgeHandlerDeps {
 export class BridgeHandler {
   private readonly deps: BridgeHandlerDeps;
   private readonly responseSurfacePostBudget = new ResponseSurfacePostBudget();
-  private readonly topicMonitorTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  private readonly topicTickTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private closed = false;
 
   constructor(deps: BridgeHandlerDeps) {
@@ -646,14 +646,14 @@ export class BridgeHandler {
     }
   }
 
-  private clearTopicMonitor(threadId: string): void {
-    const timer = this.topicMonitorTimers.get(threadId);
+  private clearTopicTick(threadId: string): void {
+    const timer = this.topicTickTimers.get(threadId);
     if (!timer) return;
     clearTimeout(timer);
-    this.topicMonitorTimers.delete(threadId);
+    this.topicTickTimers.delete(threadId);
   }
 
-  private scheduleTopicMonitor(opts: {
+  private scheduleTopicTick(opts: {
     sourceEvent: import("../lark/transport.js").LarkMessageEvent;
     threadId: string;
     messageId: string;
@@ -662,12 +662,12 @@ export class BridgeHandler {
     senderOpenId: string;
   }): void {
     if (this.closed) return;
-    this.clearTopicMonitor(opts.threadId);
-    const intervalMs = this.deps.topicMonitorIntervalMs ?? DEFAULT_TOPIC_MONITOR_INTERVAL_MS;
+    this.clearTopicTick(opts.threadId);
+    const intervalMs = this.deps.topicTickIntervalMs ?? DEFAULT_TOPIC_TICK_INTERVAL_MS;
     if (!Number.isFinite(intervalMs) || intervalMs <= 0) return;
 
     const timer = setTimeout(() => {
-      this.topicMonitorTimers.delete(opts.threadId);
+      this.topicTickTimers.delete(opts.threadId);
       if (this.closed) return;
       const syntheticEvent: import("../lark/transport.js").LarkMessageEvent = {
         ...opts.sourceEvent,
@@ -679,19 +679,18 @@ export class BridgeHandler {
         sender_id: opts.senderOpenId,
         content: JSON.stringify({
           text:
-            "Larkway 自主监控: 这个话题已保持 in_progress 约 10 分钟。请先读取完整话题历史,判断是否 block; " +
-            "如果能推进就继续推进,如果需要下一棒或人类动作,请用 post + at tag 真 @ 对方并说明要做什么; " +
-            "如果任务已完成,请写 ready 总结并结束。",
+            "Larkway 定时唤起 tick: 这是同一话题的 content-agnostic 定时触发,等同于一条新的同话题触发消息。 " +
+            "Bridge 不判断是否 block、下一步是谁或该怎么推进; 请按你的 agent 侧 workflow 自行处理并更新 state。",
         }),
         create_time: String(Date.now()),
-        larkway_trigger_type: "topic_monitor",
+        larkway_trigger_type: "topic_tick",
       };
       void this.handleOne(syntheticEvent).catch((err) => {
-        console.error("[bridge.handler] topic monitor turn failed:", err);
+        console.error("[bridge.handler] topic tick turn failed:", err);
       });
     }, intervalMs);
     timer.unref?.();
-    this.topicMonitorTimers.set(opts.threadId, timer);
+    this.topicTickTimers.set(opts.threadId, timer);
   }
 
   /**
@@ -759,8 +758,8 @@ export class BridgeHandler {
    */
   async close(): Promise<void> {
     this.closed = true;
-    for (const timer of this.topicMonitorTimers.values()) clearTimeout(timer);
-    this.topicMonitorTimers.clear();
+    for (const timer of this.topicTickTimers.values()) clearTimeout(timer);
+    this.topicTickTimers.clear();
   }
 
   // ---------------------------------------------------------------------------
@@ -791,8 +790,8 @@ export class BridgeHandler {
     // Step 1: parse
     const parsed = parseMessage(event);
     const { threadId, messageId, senderOpenId } = parsed;
-    const isSyntheticTopicMonitor = event["larkway_trigger_type"] === "topic_monitor";
-    this.clearTopicMonitor(threadId);
+    const isSyntheticTopicTick = event["larkway_trigger_type"] === "topic_tick";
+    this.clearTopicTick(threadId);
     const botId = this.deps.botConfig?.id;
     const eventLogId = messageId;
     const eventStartedAt = Date.now();
@@ -822,7 +821,7 @@ export class BridgeHandler {
       statusPath: ["已收到"],
       reason: "已进入 bridge，准备创建处理卡片。",
     });
-    if (!isSyntheticTopicMonitor) {
+    if (!isSyntheticTopicTick) {
       await this.deps.client.addProcessingReaction?.(messageId);
     }
 
@@ -1761,7 +1760,7 @@ export class BridgeHandler {
             reason: "Agent 已结束，消息已确认。",
           });
           if (reportedStatus === "in_progress") {
-            this.scheduleTopicMonitor({
+            this.scheduleTopicTick({
               sourceEvent: event,
               threadId,
               messageId,
