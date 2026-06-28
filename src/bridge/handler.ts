@@ -69,7 +69,6 @@ import { buildPostContent } from "../lark/postContent.js";
 import { derivePostIdempotencyKey, digestPostContent } from "../lark/idempotency.js";
 
 const DEFAULT_CARDKIT_RESPONSE_SURFACE_TIMEOUT_MS = 20 * 60 * 1000;
-const DEFAULT_TOPIC_TICK_INTERVAL_MS = 10 * 60 * 1000;
 
 // ---------------------------------------------------------------------------
 // Private helpers — worktree bootstrap
@@ -532,14 +531,6 @@ export interface BridgeHandlerDeps {
    */
   responseSurfaceTimeoutMs?: number;
   /**
-   * Content-agnostic scheduled tick for active topics. When an agent leaves a
-   * topic in status=in_progress, the bridge re-invokes the same topic after this
-   * interval. The bridge does not decide what is blocked or who should act.
-   *
-   * @default 10 * 60 * 1000
-   */
-  topicTickIntervalMs?: number;
-  /**
    * V2: fully-resolved peer bot list for this bot.
    * Pre-resolved by runV2Mode: each entry has the peer bot's open_id, name, description.
    * When absent (V1), no peer block is rendered in the prompt.
@@ -621,7 +612,6 @@ export interface BridgeHandlerDeps {
 export class BridgeHandler {
   private readonly deps: BridgeHandlerDeps;
   private readonly responseSurfacePostBudget = new ResponseSurfacePostBudget();
-  private readonly topicTickTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private closed = false;
 
   constructor(deps: BridgeHandlerDeps) {
@@ -644,53 +634,6 @@ export class BridgeHandler {
       console.warn("[bridge.handler] peer roster resolution failed; using configured peers:", err);
       return peers;
     }
-  }
-
-  private clearTopicTick(threadId: string): void {
-    const timer = this.topicTickTimers.get(threadId);
-    if (!timer) return;
-    clearTimeout(timer);
-    this.topicTickTimers.delete(threadId);
-  }
-
-  private scheduleTopicTick(opts: {
-    sourceEvent: import("../lark/transport.js").LarkMessageEvent;
-    threadId: string;
-    messageId: string;
-    chatId: string;
-    chatType: unknown;
-    senderOpenId: string;
-  }): void {
-    if (this.closed) return;
-    this.clearTopicTick(opts.threadId);
-    const intervalMs = this.deps.topicTickIntervalMs ?? DEFAULT_TOPIC_TICK_INTERVAL_MS;
-    if (!Number.isFinite(intervalMs) || intervalMs <= 0) return;
-
-    const timer = setTimeout(() => {
-      this.topicTickTimers.delete(opts.threadId);
-      if (this.closed) return;
-      const syntheticEvent: import("../lark/transport.js").LarkMessageEvent = {
-        ...opts.sourceEvent,
-        message_id: opts.messageId,
-        chat_id: opts.chatId,
-        chat_type: typeof opts.chatType === "string" ? opts.chatType : "group",
-        thread_id: opts.threadId,
-        root_id: opts.threadId,
-        sender_id: opts.senderOpenId,
-        content: JSON.stringify({
-          text:
-            "Larkway 定时唤起 tick: 这是同一话题的 content-agnostic 定时触发,等同于一条新的同话题触发消息。 " +
-            "Bridge 不判断是否 block、下一步是谁或该怎么推进; 请按你的 agent 侧 workflow 自行处理并更新 state。",
-        }),
-        create_time: String(Date.now()),
-        larkway_trigger_type: "topic_tick",
-      };
-      void this.handleOne(syntheticEvent).catch((err) => {
-        console.error("[bridge.handler] topic tick turn failed:", err);
-      });
-    }, intervalMs);
-    timer.unref?.();
-    this.topicTickTimers.set(opts.threadId, timer);
   }
 
   /**
@@ -758,8 +701,6 @@ export class BridgeHandler {
    */
   async close(): Promise<void> {
     this.closed = true;
-    for (const timer of this.topicTickTimers.values()) clearTimeout(timer);
-    this.topicTickTimers.clear();
   }
 
   // ---------------------------------------------------------------------------
@@ -790,8 +731,6 @@ export class BridgeHandler {
     // Step 1: parse
     const parsed = parseMessage(event);
     const { threadId, messageId, senderOpenId } = parsed;
-    const isSyntheticTopicTick = event["larkway_trigger_type"] === "topic_tick";
-    this.clearTopicTick(threadId);
     const botId = this.deps.botConfig?.id;
     const eventLogId = messageId;
     const eventStartedAt = Date.now();
@@ -821,9 +760,7 @@ export class BridgeHandler {
       statusPath: ["已收到"],
       reason: "已进入 bridge，准备创建处理卡片。",
     });
-    if (!isSyntheticTopicTick) {
-      await this.deps.client.addProcessingReaction?.(messageId);
-    }
+    await this.deps.client.addProcessingReaction?.(messageId);
 
     // Step 2: session lookup — determines is_new_thread.
     const existing = this.deps.sessionStore.get(threadId, botId);
@@ -1759,16 +1696,6 @@ export class BridgeHandler {
             appendPath: "已完成",
             reason: "Agent 已结束，消息已确认。",
           });
-          if (reportedStatus === "in_progress") {
-            this.scheduleTopicTick({
-              sourceEvent: event,
-              threadId,
-              messageId,
-              chatId: parsed.chatId,
-              chatType: parsed.raw.chat_type,
-              senderOpenId,
-            });
-          }
 
           // Success — exit the retry loop
           break;
