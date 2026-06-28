@@ -43,18 +43,12 @@ import {
   type CardKitProgressHandle,
   type CardKitLiveMetrics,
 } from "./cardkitProgress.js";
-import { SurfaceController } from "./surfaceController.js";
 import { dispatchResponseSurface } from "./surfaceDispatcher.js";
-import {
-  createPostProgressHandle,
-  type PostProgressHandle,
-} from "./postProgress.js";
 import type { RuntimeEventPatch } from "./eventLog.js";
 import type { RuntimeRequirement } from "../runtimeRequirements.js";
 import {
   isResponseSurfaceCardKitAvailable,
   isResponseSurfaceMentionAllowed,
-  isResponseSurfacePostOutboundAvailable,
   type ResponseSurfacePrototypeConfig,
 } from "../responseSurface.js";
 import {
@@ -63,7 +57,6 @@ import {
 } from "../lark/channelCardKitClient.js";
 import type { OutboundPostClient } from "../lark/outboundPostClient.js";
 import { markPostLedgerFallbackVisible, markPostLedgerPolicyBlockedVisible } from "./postFile.js";
-import { ResponseSurfacePostBudget } from "./postBudget.js";
 import { buildPostContent } from "../lark/postContent.js";
 import { derivePostIdempotencyKey, digestPostContent } from "../lark/idempotency.js";
 
@@ -605,7 +598,6 @@ export interface BridgeHandlerDeps {
 
 export class BridgeHandler {
   private readonly deps: BridgeHandlerDeps;
-  private readonly responseSurfacePostBudget = new ResponseSurfacePostBudget();
   private closed = false;
 
   constructor(deps: BridgeHandlerDeps) {
@@ -754,31 +746,16 @@ export class BridgeHandler {
     const isTopLevel = !(typeof parsed.raw.root_id === "string" && parsed.raw.root_id);
     const replyInThread = isTopLevel;
     const prototypeConfig = this.deps.botConfig?.response_surface_prototype;
-    const postOutboundAvailable = isResponseSurfacePostOutboundAvailable(
-      prototypeConfig,
-      { chatId: parsed.chatId, threadId },
-      { postClientAvailable: !!this.deps.postClient },
-    );
     const cardKitAvailable = isResponseSurfaceCardKitAvailable(
       prototypeConfig,
       { chatId: parsed.chatId, threadId },
       { cardKitClientAvailable: !!this.deps.cardKitClient },
     );
-    const surfaceController = SurfaceController.create({
-      prototypeConfig,
-      chatId: parsed.chatId,
-      threadId,
-      postOutboundAvailable: false,
-      postLedgerAvailable: true,
-      visibleFallbackAvailable: true,
-    });
     let card: import("../lark/card.js").CardHandle | undefined;
     let cardKitProgress: CardKitProgressHandle | undefined;
     let cardKitRecord: CardKitFile | undefined;
     let cardKitStartFailed = false;
-    let progressPost: PostProgressHandle | undefined;
-    let progressPostStartFailed = false;
-    if (!cardKitAvailable && surfaceController.shouldStartCardImmediately()) {
+    if (!cardKitAvailable) {
       try {
         card = await this.deps.cardRenderer.start(messageId, { replyInThread, threadId });
         await recordEvent({
@@ -805,7 +782,7 @@ export class BridgeHandler {
         status: "running",
         startedAt: new Date().toISOString(),
         appendPath: "延迟创建卡片",
-        reason: "response_surface prototype lazy card creation is enabled.",
+        reason: "CardKit response surface is available; legacy card is reserved for fallback.",
       });
     }
 
@@ -1110,65 +1087,15 @@ export class BridgeHandler {
         }
       }
 
-      // Post-first response surface: when the response-surface gates are open
-      // and the controller skipped the legacy processing card, create one
-      // lightweight post as the live main surface. It is edited a few times
-      // during the turn and finally edited into the clean result. If this
-      // creation fails, fall back to the visible card path rather than leaving
-      // the operator with no surface.
-      if (!card && !cardKitAvailable && postOutboundAvailable && this.deps.postClient) {
-        const budget = prototypeConfig
-          ? this.responseSurfacePostBudget.reserve({
-              scope: {
-                botId: this.deps.botConfig?.id ?? "v1-default",
-                chatId: parsed.chatId,
-                threadId,
-              },
-              maxPosts: prototypeConfig.max_posts_per_window,
-              windowMs: prototypeConfig.post_window_ms,
-            })
-          : undefined;
-        if (budget?.allowed === false) {
-          console.warn("[bridge.handler] post progress budget exhausted; using card fallback");
-          progressPostStartFailed = true;
-        } else {
-          try {
-            progressPost = await createPostProgressHandle({
-              postClient: this.deps.postClient,
-              replyToMessageId: messageId,
-              replyInThread,
-              facts: {
-                botId: this.deps.botConfig?.id ?? "v1-default",
-                threadId,
-                triggerMessageId: messageId,
-              },
-              initialText: "努力回答中...",
-            });
-            await this.deps.client.removeProcessingReaction?.(messageId);
-            await recordEvent({
-              status: "running",
-              startedAt: new Date().toISOString(),
-              appendPath: "已创建 post",
-              reason: "response surface 使用 post 作为本轮主回复面。",
-            });
-          } catch (err) {
-            progressPostStartFailed = true;
-            console.warn("[bridge.handler] create progress post failed; using card fallback:", err);
-          }
-        }
-      }
-
-      if (!card && (progressPostStartFailed || cardKitStartFailed)) {
+      if (!card && cardKitStartFailed) {
         try {
           card = await this.deps.cardRenderer.start(messageId, { replyInThread, threadId });
           await this.deps.client.removeProcessingReaction?.(messageId);
           await recordEvent({
             status: "running",
             startedAt: new Date().toISOString(),
-            appendPath: cardKitStartFailed ? "CardKit 失败，已创建卡片" : "post 失败，已创建卡片",
-            reason: cardKitStartFailed
-              ? "CardKit 主面创建失败，bridge 使用可见卡片兜底。"
-              : "post 主面创建失败，bridge 使用可见卡片兜底。",
+            appendPath: "CardKit 失败，已创建卡片",
+            reason: "CardKit 主面创建失败，bridge 使用可见卡片兜底。",
           });
         } catch (err) {
           console.error(
@@ -1182,9 +1109,7 @@ export class BridgeHandler {
             botId: this.deps.botConfig?.id ?? "v1-default",
             threadId,
             triggerMessageId: messageId,
-            finalText: cardKitStartFailed
-              ? "CardKit 主回复面创建失败, legacy 可见卡片兜底也创建失败。"
-              : "post 主回复面创建失败, legacy 可见卡片兜底也创建失败。",
+            finalText: "CardKit 主回复面创建失败, legacy 可见卡片兜底也创建失败。",
             failureReason: String(err),
             title: "Larkway fallback",
             logPrefix: "[bridge.handler]",
@@ -1327,7 +1252,6 @@ export class BridgeHandler {
           for await (const ev of handle.events) {
             if (cardKitProgress) cardKitProgress.handle(ev);
             else if (card) card.handle(ev);
-            else progressPost?.handle(ev);
             if (ev.type === "system_init") {
               sessionId = ev.sessionId;
             }
@@ -1550,47 +1474,25 @@ export class BridgeHandler {
               }
             }
           } else {
-          await progressPost?.drain();
-          const surfaceDispatch = await dispatchResponseSurface({
-            state: reportedState,
-            prototypeConfig,
-            facts: {
-              botId: this.deps.botConfig?.id ?? "v1-default",
-              chatId: parsed.chatId,
-              threadId,
-              triggerMessageId: messageId,
-              replyToMessageId: messageId,
-              replyInThread,
-            },
-            worktreePath,
-            baseCard: baseCardPayload,
-            cardStarted: !!card,
-            postOutboundAvailable: false,
-            postLedgerAvailable: true,
-            visibleFallbackAvailable: true,
-            postClient: this.deps.postClient,
-            livePost: progressPost
-              ? {
-                  messageId: progressPost.messageId,
-                  idempotencyKey: progressPost.idempotencyKey,
-                  role: progressPost.role,
-                }
-              : undefined,
-            postBudget: prototypeConfig
-              ? {
-                  reserve: () =>
-                    this.responseSurfacePostBudget.reserve({
-                      scope: {
-                        botId: this.deps.botConfig?.id ?? "v1-default",
-                        chatId: parsed.chatId,
-                        threadId,
-                      },
-                      maxPosts: prototypeConfig.max_posts_per_window,
-                      windowMs: prototypeConfig.post_window_ms,
-                    }),
-                }
-              : undefined,
-          });
+            const surfaceDispatch = await dispatchResponseSurface({
+              state: reportedState,
+              prototypeConfig,
+              facts: {
+                botId: this.deps.botConfig?.id ?? "v1-default",
+                chatId: parsed.chatId,
+                threadId,
+                triggerMessageId: messageId,
+                replyToMessageId: messageId,
+                replyInThread,
+              },
+              worktreePath,
+              baseCard: baseCardPayload,
+              cardStarted: !!card,
+              postOutboundAvailable: false,
+              postLedgerAvailable: true,
+              visibleFallbackAvailable: true,
+              postClient: this.deps.postClient,
+            });
 
           if (surfaceDispatch.card) {
             if (!card) {
@@ -1762,27 +1664,6 @@ export class BridgeHandler {
             console.error("[bridge.handler] failure card start also failed:", cardStartErr);
             await createHardFailurePostFallback(
               `CardKit failure finalize failed: ${String(cardKitFinalizeErr)}; ` +
-              `legacy visible card fallback also failed: ${String(cardStartErr)}`,
-            );
-          }
-        }
-      }
-      if (!card && progressPost) {
-        try {
-          await progressPost.finalize({
-            text: `执行失败: ${String(err)}`,
-          });
-        } catch (postFinalizeErr) {
-          console.error(
-            "[bridge.handler] progress post failure update failed; creating card fallback:",
-            postFinalizeErr,
-          );
-          try {
-            card = await this.deps.cardRenderer.start(messageId, { replyInThread, threadId });
-          } catch (cardStartErr) {
-            console.error("[bridge.handler] failure card start also failed:", cardStartErr);
-            await createHardFailurePostFallback(
-              `progress post failure update failed: ${String(postFinalizeErr)}; ` +
               `legacy visible card fallback also failed: ${String(cardStartErr)}`,
             );
           }
