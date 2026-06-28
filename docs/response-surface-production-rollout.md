@@ -1,9 +1,9 @@
 # Response Surface Production Rollout
 
 This runbook is for production rollout and rollback after explicit owner
-approval. Current code defaults response surfaces and Agent-authored handoff
-mentions on for post/hybrid-capable bots; operators should use `kill_switch`,
-budgets, and optional chat/thread/mention gates to control blast radius.
+approval. Current code uses CardKit streaming as the only normal response
+surface. Operators should use `kill_switch`, optional chat/thread gates, and
+mention policy to control blast radius.
 
 ## Safety Invariants
 
@@ -21,9 +21,9 @@ budgets, and optional chat/thread/mention gates to control blast radius.
   `allowed_mention_open_ids` means the Agent may choose mention targets;
   non-empty lists narrow mentions to that exact private set.
 - Never use `@all`.
-- A turn must always produce a visible card or a visible post. If the post path
-  is unavailable, over budget, policy-blocked, or fails, the handler must fall
-  back to a visible card.
+- A turn must always produce a visible CardKit card, legacy fallback card, or
+  final create-only fallback post. No code path may produce a no-card/no-message
+  invisible reply.
 - Real chat ids, open ids, app ids, and secrets belong only in private operator
   config and private evidence, not in public docs, PRs, or logs copied to PRs.
 
@@ -64,8 +64,6 @@ budgets, and optional chat/thread/mention gates to control blast radius.
      suppress every real `@`;
    - optional `allowed_mention_open_ids` containing only confirmed members when
      the rollout should narrow mention targets;
-   - `max_posts_per_turn: 1`;
-   - a conservative `max_posts_per_window` and `post_window_ms`;
    - `kill_switch: false` only for the rollout window.
 5. Prepare rollback config before changing anything:
    ```yaml
@@ -81,42 +79,34 @@ budgets, and optional chat/thread/mention gates to control blast radius.
 ## Enable / Narrowing Order
 
 Default install is broad for chats/threads and allows Agent-authored mentions.
-If the operator wants a smaller first rollout, narrow before enabling the post
-path.
+If the operator wants a smaller first rollout, narrow before clearing the
+kill switch.
 
 1. Apply optional `allowed_chats` / `allowed_threads` narrowing before clearing
    `kill_switch`.
-2. Set budget fields:
-   - `max_posts_per_turn: 1`
-   - `max_posts_per_window: <small integer>`
-   - `post_window_ms: <window in ms>`
-3. Keep `allow_agent_mentions: true` for default peer handoff, or set a
+2. Keep `allow_agent_mentions: true` for default peer handoff, or set a
    non-empty `allowed_mention_open_ids` to narrow targets.
-4. Set `post_outbound_enabled: true`.
-5. Set `enabled: true` and `kill_switch: false`.
-6. Confirm the runtime log shows the post client is provided only when the
-   effective config gates allow it.
+3. Keep `post_outbound_enabled: true` when final create-only fallback posts are
+   allowed.
+4. Set `enabled: true` and `kill_switch: false`.
+5. Confirm the runtime uses CardKit as the normal surface and legacy card /
+   create-only post only as fallbacks.
 
 ## Observability
 
-Watch structured bridge logs for:
+Watch structured bridge logs and session artifacts for:
 
-- `[response_surface.dispatch]` counts by `reason`.
-- `reason=post-sent`
-- `reason=hybrid-post-sent-compact-card`
-- `reason=post-failed-fallback-card`
-- `reason=post-rate-limit-exhausted`
-- `reason=mention-policy-blocked`
-- `reason=post-orphan-reconciled-fallback-card`
+- CardKit progress file transitions from `message_sent` to `finalized`, or to
+  `fallback_visible` only when CardKit finalization fails.
+- Legacy card fallback creation when CardKit is unavailable or disabled.
+- Create-only post fallback only when both CardKit and legacy card surfaces are
+  unavailable or failed.
 
 For each grey turn, confirm:
 
-- `visible=true`
-- `hasCard=true` or `postMessageIdPresent=true`
-- no `fallback_visible` ledger entry lacks `fallbackCardMessageId`
-- ledger distribution has no stale `planned` or `pending` entries after the
-  recovery window unless a visible fallback retry is pending
-- budget `used <= limit`
+- one visible CardKit card in the thread for the normal path
+- no unhandled turn with no visible card/message
+- any create-only fallback post includes a clear `fallback_reason`
 
 ## Stop Conditions
 

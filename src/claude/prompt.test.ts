@@ -97,7 +97,7 @@ describe("renderPrompt — V2 mode (botName set)", () => {
     expect(prompt).toContain("默认主回复面是一张 CardKit 流式卡片");
     expect(prompt).toContain("LARKWAY_ANSWER_BEGIN");
     expect(prompt).toContain("LARKWAY_ANSWER_END");
-    expect(prompt).toContain("无显式 card 意图时 bridge 按 CardKit 流式卡片处理");
+    expect(prompt).toContain("旧 `mode`/`primary` 仅兼容解析");
     expect(prompt).toContain("不要写 raw Feishu post/card JSON");
     expect(prompt).toContain("markdown -> image -> markdown -> image");
     expect(prompt).toContain("若 `content_blocks` 非空");

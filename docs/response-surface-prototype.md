@@ -31,7 +31,7 @@ Agents continue to write `.larkway/state.json`:
   "choices": [{ "label": "Continue", "value": "Continue with this option" }],
   "choice_prompt": "Choose next step?",
   "response_surface": {
-    "mode": "post",
+    "mode": "card",
     "post": {
       "mentions": [{ "user_id": "<open_id>", "label": "Peer bot" }]
     }
@@ -54,6 +54,9 @@ Supported fields:
 - `image_blocks` / `content_blocks`: rendered in the final card.
 - `response_surface.post.mentions`: late peer mention targets. In CardKit they
   render as final-card `<at id=...></at>` mentions after passing mention policy.
+- `response_surface.mode` / `primary` are accepted for compatibility with older
+  agents, but no longer select a post-only or hybrid main surface. CardKit is the
+  only normal response surface; legacy cards and create-only posts are fallbacks.
 
 The schema soft-fails malformed `response_surface`; a typo there must not drop
 `status`, `last_message`, or final rendering fields.
@@ -67,17 +70,11 @@ response_surface_prototype:
   enabled: true
   allowed_chats: []
   allowed_threads: []
-  lazy_card_creation: true
   kill_switch: false
   post_outbound_enabled: true
   cardkit_streaming_enabled: true
   allow_agent_mentions: true
   allowed_mention_open_ids: []
-  max_posts_per_turn: 1
-  max_posts_per_window: 4
-  post_window_ms: 60000
-  max_post_attempts: 3
-  text_threshold_chars: 1200
 ```
 
 Defaults:
@@ -85,22 +82,19 @@ Defaults:
 - `enabled: true`
 - `allowed_chats: []`
 - `allowed_threads: []`
-- `lazy_card_creation: true`
 - `kill_switch: false`
 - `post_outbound_enabled: true`
 - `cardkit_streaming_enabled: true`
 - `allow_agent_mentions: true`
 - `allowed_mention_open_ids: []`
-- `max_posts_per_turn: 1`
-- `max_posts_per_window: 4`
-- `post_window_ms: 60000`
-- `max_post_attempts: 3`
-- `text_threshold_chars: 1200`
 
 Empty `allowed_chats` and `allowed_threads` mean all chats/threads are allowed.
 Non-empty lists narrow rollout. `kill_switch: true`, `enabled: false`,
 `cardkit_streaming_enabled: false`, missing CardKit transport, or allowlist miss
 rolls the runtime back to the legacy visible card path, not post editing.
+`post_outbound_enabled: false` disables the final create-only post fallback
+transport; operators should keep it true unless they intentionally prefer card
+fallback only.
 
 Mention policy:
 
