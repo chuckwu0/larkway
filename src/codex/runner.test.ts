@@ -14,6 +14,7 @@ import {
   _parseCodexLine as parseCodexLine,
   _buildCodexCommand as buildCodexCommand,
   _buildCodexEnv as buildCodexEnv,
+  _CodexAppServerLineParser as CodexAppServerLineParser,
   _CodexLineParser as CodexLineParser,
   productizeCodexFailure,
 } from "./runner.js";
@@ -89,6 +90,93 @@ const FIXTURE_ITEM_COMPLETED_FILE_CHANGE = JSON.stringify({
     type: "file_change",
     path: "src/foo.ts",
     diff: "@@ -1 +1 @@ ...",
+  },
+});
+
+const APP_THREAD_ID = "019f0d76-a0c4-7771-b0aa-933b653ce99e";
+
+const APP_INIT_RESPONSE = JSON.stringify({
+  id: 1,
+  result: {
+    userAgent: "larkway/0.142.0",
+    codexHome: "/tmp/codex",
+    platformFamily: "unix",
+    platformOs: "macos",
+  },
+});
+
+const APP_THREAD_RESPONSE = JSON.stringify({
+  id: 2,
+  result: {
+    thread: {
+      id: APP_THREAD_ID,
+      sessionId: APP_THREAD_ID,
+      cwd: "/wt",
+      turns: [],
+    },
+  },
+});
+
+const APP_TURN_RESPONSE = JSON.stringify({
+  id: 3,
+  result: {
+    turn: {
+      id: "turn-1",
+      items: [],
+      itemsView: "notLoaded",
+      status: "inProgress",
+      error: null,
+      startedAt: null,
+      completedAt: null,
+      durationMs: null,
+    },
+  },
+});
+
+function appAgentDelta(delta: string): string {
+  return JSON.stringify({
+    method: "item/agentMessage/delta",
+    params: {
+      threadId: APP_THREAD_ID,
+      turnId: "turn-1",
+      itemId: "msg-1",
+      delta,
+    },
+  });
+}
+
+function appAgentCompleted(text: string): string {
+  return JSON.stringify({
+    method: "item/completed",
+    params: {
+      item: {
+        type: "agentMessage",
+        id: "msg-1",
+        text,
+        phase: "final_answer",
+        memoryCitation: null,
+      },
+      threadId: APP_THREAD_ID,
+      turnId: "turn-1",
+      completedAtMs: 1,
+    },
+  });
+}
+
+const APP_TURN_COMPLETED = JSON.stringify({
+  method: "turn/completed",
+  params: {
+    threadId: APP_THREAD_ID,
+    turn: {
+      id: "turn-1",
+      items: [],
+      itemsView: "notLoaded",
+      status: "completed",
+      error: null,
+      startedAt: 1,
+      completedAt: 2,
+      durationMs: 1,
+    },
   },
 });
 
@@ -215,109 +303,64 @@ describe("parseCodexLine", () => {
   });
 });
 
+describe("CodexAppServerLineParser", () => {
+  it("turns app-server agentMessage deltas into marker-gated answer deltas", () => {
+    const parser = new CodexAppServerLineParser();
+    const events = [
+      ...parser.parseMessage(JSON.parse(appAgentDelta("LARKWAY_ANSWER_BEGIN\nHel"))),
+      ...parser.parseMessage(JSON.parse(appAgentDelta("lo wor"))),
+      ...parser.parseMessage(JSON.parse(appAgentDelta("ld\nLARKWAY_ANSWER_END"))),
+    ];
+
+    const deltas = events.filter((event) => event.type === "answer_delta");
+    expect(deltas.map((event) => event.text).join("")).toBe("Hello world");
+    expect(events.some((event) => event.type === "answer_snapshot")).toBe(false);
+  });
+
+  it("uses completed agentMessage as a final snapshot fallback without duplicating prior deltas", () => {
+    const parser = new CodexAppServerLineParser();
+    const answer = "LARKWAY_ANSWER_BEGIN\nHello world\nLARKWAY_ANSWER_END";
+    const events = [
+      ...parser.parseMessage(JSON.parse(appAgentDelta(answer))),
+      ...parser.parseMessage(JSON.parse(appAgentCompleted(answer))),
+    ];
+
+    expect(events.filter((event) => event.type === "answer_delta")).not.toHaveLength(0);
+    expect(events.filter((event) => event.type === "answer_snapshot")).toHaveLength(0);
+  });
+});
+
 // ---------------------------------------------------------------------------
 // buildCodexCommand — unit tests
 // ---------------------------------------------------------------------------
 
 describe("buildCodexCommand", () => {
-  it("fresh session: codex exec --json --skip-git-repo-check + host workspace mode by default", () => {
+  it("fresh session: runs codex app-server over stdio", () => {
     const [bin, args] = buildCodexCommand({ prompt: "hello" });
     expect(bin).toBe("codex");
-    expect(args[0]).toBe("exec");
-    expect(args).toContain("--json");
-    expect(args).toContain("--skip-git-repo-check");
-    expect(args).toContain("--dangerously-bypass-approvals-and-sandbox");
-    expect(args).not.toContain("--sandbox");
-    expect(args).not.toContain("workspace-write");
-    // No 'resume' subcommand
-    expect(args).not.toContain("resume");
+    expect(args).toEqual(["app-server", "--stdio"]);
   });
 
-  it("resume session: includes 'exec resume <sessionId>'", () => {
+  it("resume session: still uses app-server; resume is a JSON-RPC request", () => {
     const [bin, args] = buildCodexCommand({
       prompt: "continue",
       resumeSessionId: "019eabc123def456",
     });
     expect(bin).toBe("codex");
-    expect(args[0]).toBe("exec");
-    expect(args[1]).toBe("resume");
-    expect(args[2]).toBe("019eabc123def456");
-    expect(args).toContain("--json");
-    expect(args).toContain("--skip-git-repo-check");
-    expect(args).toContain("--dangerously-bypass-approvals-and-sandbox");
-    expect(args).not.toContain("--sandbox");
-    expect(args).not.toContain("workspace-write");
-    expect(args.at(-1)).toBe("-");
+    expect(args).toEqual(["app-server", "--stdio"]);
   });
 
-  it("fresh session WITH cwd: includes -C <cwd>", () => {
+  it("cwd is not encoded in argv; it is sent through app-server params", () => {
     const [, args] = buildCodexCommand({ prompt: "hello", cwd: "/wt" });
-    expect(args).toContain("-C");
-    expect(args[args.indexOf("-C") + 1]).toBe("/wt");
+    expect(args).toEqual(["app-server", "--stdio"]);
   });
 
-  it("resume session WITH cwd: does NOT pass -C (codex exec resume rejects it → exit 2)", () => {
-    // Regression: `codex exec resume` has no -C/--cd flag. Passing it broke every
-    // 2nd+ turn ("unexpected argument '-C' found"). cwd is set via the spawn cwd.
-    const [, args] = buildCodexCommand({
-      prompt: "continue",
-      resumeSessionId: "019eabc123def456",
-      cwd: "/wt",
-    });
-    expect(args).not.toContain("-C");
-    expect(args).not.toContain("/wt");
-  });
-
-  it("permissionMode acceptEdits → host-level workspace mode for Codex", () => {
+  it("permission mode is not encoded in argv; it is sent through app-server params", () => {
     const [, args] = buildCodexCommand({
       prompt: "hello",
       permissionMode: "acceptEdits",
     });
-    expect(args).toContain("--dangerously-bypass-approvals-and-sandbox");
-    expect(args).not.toContain("--sandbox");
-    expect(args).not.toContain("workspace-write");
-  });
-
-  it("permissionMode ask → --sandbox read-only (non-interactive fallback)", () => {
-    const [, args] = buildCodexCommand({
-      prompt: "hello",
-      permissionMode: "ask",
-    });
-    expect(args).toContain("--sandbox");
-    expect(args).toContain("read-only");
-  });
-
-  it("permissionMode bypassPermissions → --dangerously-bypass-approvals-and-sandbox", () => {
-    const [, args] = buildCodexCommand({
-      prompt: "hello",
-      permissionMode: "bypassPermissions",
-    });
-    expect(args).toContain("--dangerously-bypass-approvals-and-sandbox");
-  });
-
-  it("resume session with bypassPermissions keeps the explicit dangerous bypass flag", () => {
-    const [, args] = buildCodexCommand({
-      prompt: "continue",
-      resumeSessionId: "019eabc123def456",
-      permissionMode: "bypassPermissions",
-    });
-    expect(args).toContain("--dangerously-bypass-approvals-and-sandbox");
-    expect(args.at(-1)).toBe("-");
-  });
-
-  it("cwd → -C <cwd> prepended before other flags", () => {
-    const [, args] = buildCodexCommand({
-      prompt: "hello",
-      cwd: "/repo/worktree",
-    });
-    const idx = args.indexOf("-C");
-    expect(idx).toBeGreaterThanOrEqual(0);
-    expect(args[idx + 1]).toBe("/repo/worktree");
-  });
-
-  it("no cwd → -C flag absent", () => {
-    const [, args] = buildCodexCommand({ prompt: "hello" });
-    expect(args).not.toContain("-C");
+    expect(args).toEqual(["app-server", "--stdio"]);
   });
 
   it("custom codexBinPath overrides default 'codex'", () => {
@@ -490,7 +533,7 @@ describe("runCodex() — spawn-level integration", () => {
     return result;
   }
 
-  it("full happy path: thread.started→system_init, cmd, result, done resolves", async () => {
+  it("full happy path: app-server agentMessage deltas stream through answer_delta", async () => {
     const fake = makeFakeCodexChild();
     __nextFakeCodexChild = fake;
 
@@ -513,14 +556,13 @@ describe("runCodex() — spawn-level integration", () => {
     })();
 
     await new Promise<void>((res) => setImmediate(() => {
-      fake.stdout.write(FIXTURE_THREAD_STARTED + "\n");
-      fake.stdout.write(FIXTURE_TURN_STARTED + "\n");
-      fake.stdout.write(FIXTURE_ITEM_STARTED_CMD + "\n");
-      fake.stdout.write(FIXTURE_ITEM_COMPLETED_CMD + "\n");
-      fake.stdout.write(FIXTURE_ITEM_COMPLETED_AGENT_ANSWER + "\n");
-      fake.stdout.write(FIXTURE_TURN_COMPLETED + "\n");
-      fake.stdout.end();
-      fake.child.emit("exit", 0);
+      fake.stdout.write(APP_INIT_RESPONSE + "\n");
+      fake.stdout.write(APP_THREAD_RESPONSE + "\n");
+      fake.stdout.write(APP_TURN_RESPONSE + "\n");
+      fake.stdout.write(appAgentDelta("LARKWAY_ANSWER_BEGIN\nHel") + "\n");
+      fake.stdout.write(appAgentDelta("lo world\nLARKWAY_ANSWER_END") + "\n");
+      fake.stdout.write(appAgentCompleted("LARKWAY_ANSWER_BEGIN\nHello world\nLARKWAY_ANSWER_END") + "\n");
+      fake.stdout.write(APP_TURN_COMPLETED + "\n");
       // Wait for events loop to observe system_init before emitting close,
       // so discoveredSessionId is populated in runner.ts before done resolves.
       void firstEventSeen.then(() => {
@@ -535,30 +577,26 @@ describe("runCodex() — spawn-level integration", () => {
     // Check event sequence
     const types = events.map((e) => e["type"]);
     expect(types).toContain("system_init");
-    expect(types).toContain("raw"); // turn.started → raw
-    expect(types).toContain("tool_use");
-    expect(types).toContain("tool_result");
-    expect(types).toContain("answer_snapshot");
+    expect(types).toContain("answer_delta");
     expect(types).toContain("result");
 
     // Validate specific events
     const systemInit = events.find((e) => e["type"] === "system_init");
-    expect(systemInit).toMatchObject({ sessionId: "019eabc123def456" });
+    expect(systemInit).toMatchObject({ sessionId: APP_THREAD_ID });
 
-    const toolUse = events.find((e) => e["type"] === "tool_use");
-    expect(toolUse).toMatchObject({ toolName: "shell", toolInput: { command: "ls -la" } });
-
-    const answerSnapshot = events.find((e) => e["type"] === "answer_snapshot");
-    expect(answerSnapshot).toMatchObject({
-      text: "I found the following files in the directory.",
-    });
+    const answerText = events
+      .filter((e) => e["type"] === "answer_delta")
+      .map((e) => e["text"])
+      .join("");
+    expect(answerText).toBe("Hello world");
+    expect(events.some((e) => e["type"] === "answer_snapshot")).toBe(false);
 
     const resultEvent = events.find((e) => e["type"] === "result");
     expect(resultEvent).toMatchObject({ stopReason: "end_turn" });
 
     // done resolves with sessionId captured from thread.started
     expect(result.exitCode).toBe(0);
-    expect(result.sessionId).toBe("019eabc123def456");
+    expect(result.sessionId).toBe(APP_THREAD_ID);
   });
 
   it("unknown events degrade to raw — no throw", async () => {
@@ -570,22 +608,23 @@ describe("runCodex() — spawn-level integration", () => {
 
     const eventsPromise = collectEvents(handle.events);
     await new Promise<void>((res) => setImmediate(() => {
-      fake.stdout.write(FIXTURE_UNKNOWN_TOP_TYPE + "\n");
-      fake.stdout.write(FIXTURE_ITEM_STARTED_REASONING + "\n");
-      fake.stdout.write(FIXTURE_ITEM_COMPLETED_FILE_CHANGE + "\n");
-      fake.stdout.write(FIXTURE_TURN_COMPLETED + "\n");
-      fake.triggerClose(0);
+      fake.stdout.write(APP_INIT_RESPONSE + "\n");
+      fake.stdout.write(APP_THREAD_RESPONSE + "\n");
+      fake.stdout.write(APP_TURN_RESPONSE + "\n");
+      fake.stdout.write(JSON.stringify({ method: "some/futureEvent", params: { x: 1 } }) + "\n");
+      fake.stdout.write(JSON.stringify({ method: "another/futureEvent", params: { x: 2 } }) + "\n");
+      fake.stdout.write(APP_TURN_COMPLETED + "\n");
       res();
     }));
 
     const events = await eventsPromise;
     const types = events.map((e) => e["type"]);
-    // All unknown lines become raw; turn.completed still emits result
-    expect(types.filter((t) => t === "raw")).toHaveLength(3);
+    // Unknown notifications become raw; turn/completed still emits result
+    expect(types.filter((t) => t === "raw")).toHaveLength(2);
     expect(types).toContain("result");
   });
 
-  it("resume: spawn receives 'exec resume <sessionId>' in args", async () => {
+  it("resume: app-server receives thread/resume over JSON-RPC", async () => {
     const fake = makeFakeCodexChild();
     __nextFakeCodexChild = fake;
 
@@ -597,8 +636,10 @@ describe("runCodex() — spawn-level integration", () => {
 
     const eventsPromise = collectEvents(handle.events);
     await new Promise<void>((res) => setImmediate(() => {
-      fake.stdout.write(FIXTURE_TURN_COMPLETED + "\n");
-      fake.triggerClose(0);
+      fake.stdout.write(APP_INIT_RESPONSE + "\n");
+      fake.stdout.write(APP_THREAD_RESPONSE + "\n");
+      fake.stdout.write(APP_TURN_RESPONSE + "\n");
+      fake.stdout.write(APP_TURN_COMPLETED + "\n");
       res();
     }));
 
@@ -607,11 +648,10 @@ describe("runCodex() — spawn-level integration", () => {
 
     // Verify spawn received correct argv for resume
     expect(__lastSpawnArgs).not.toBeNull();
-    expect(__lastSpawnArgs!.args[0]).toBe("exec");
-    expect(__lastSpawnArgs!.args[1]).toBe("resume");
-    expect(__lastSpawnArgs!.args[2]).toBe("019eabc123def456");
-    expect(__lastSpawnArgs!.args).toContain("--json");
-    expect(__lastSpawnArgs!.args).toContain("--skip-git-repo-check");
+    expect(__lastSpawnArgs!.args).toEqual(["app-server", "--stdio"]);
+    const stdinText = fake.child.stdin.read()?.toString("utf8") ?? "";
+    expect(stdinText).toContain('"method":"thread/resume"');
+    expect(stdinText).toContain('"threadId":"019eabc123def456"');
   });
 
   it("done resolves even when child exits with code 1 (killed path)", async () => {
@@ -733,8 +773,9 @@ describe("runCodex() — spawn-level integration", () => {
 
     const fake = makeFakeCodexChild({
       initialLines: [
-        FIXTURE_THREAD_STARTED,
-        FIXTURE_TURN_COMPLETED,
+        APP_INIT_RESPONSE,
+        APP_THREAD_RESPONSE,
+        APP_TURN_RESPONSE,
       ],
     });
     __nextFakeCodexChild = fake;
@@ -776,7 +817,7 @@ describe("runCodex() — spawn-level integration", () => {
     expect(eventsLoopResolved).toBe(true);
     expect(doneResolved).toBe(true);
     expect(result.exitCode).toBe(0);
-    expect(result.sessionId).toBe("019eabc123def456");
+    expect(result.sessionId).toBe(APP_THREAD_ID);
 
     vi.useRealTimers();
   }, 15_000);
