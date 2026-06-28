@@ -53,6 +53,17 @@ function sequenceUuid(cardId: string, role: string, sequence: number): string {
   return deriveCardKitUuid([cardId, role, String(sequence)].join("\0"));
 }
 
+function isMissingCardKitElementError(err: unknown): boolean {
+  if (!(err instanceof Error)) return false;
+  const message = err.message.toLowerCase();
+  return (
+    message.includes("element") &&
+    (message.includes("not found") ||
+      message.includes("not exist") ||
+      message.includes("不存在"))
+  );
+}
+
 class LiveCardKitProgressHandle implements CardKitProgressHandle {
   readonly cardId: string;
   readonly messageId: string;
@@ -275,14 +286,33 @@ export async function finalizeExistingCardKitCard(opts: {
     await opts.onSequenceCommitted?.(sequence);
   };
   const finalMarkdown = buildCardKitFinalMarkdown(opts.final);
-  await next("reconcile-final-content", (seq, uuid) =>
-    opts.cardKitClient.streamElementContent(
-      opts.cardId,
-      CARDKIT_FINAL_ELEMENT_ID,
-      finalMarkdown,
-      { sequence: seq, uuid },
-    ),
-  );
+  const streamFinalContent = () =>
+    next("reconcile-final-content", (seq, uuid) =>
+      opts.cardKitClient.streamElementContent(
+        opts.cardId,
+        CARDKIT_FINAL_ELEMENT_ID,
+        finalMarkdown,
+        { sequence: seq, uuid },
+      ),
+    );
+  try {
+    await streamFinalContent();
+  } catch (err) {
+    if (!isMissingCardKitElementError(err)) throw err;
+    await next("reconcile-final-element", (seq, uuid) =>
+      opts.cardKitClient.createElements(
+        opts.cardId,
+        [buildCardKitAnswerElement(finalMarkdown)],
+        {
+          sequence: seq,
+          uuid,
+          type: "insert_before",
+          targetElementId: CARDKIT_FOOTER_ELEMENT_ID,
+        },
+      ),
+    );
+    await streamFinalContent();
+  }
   await next("reconcile-final-card", (seq, uuid) =>
     opts.cardKitClient.updateCardEntity(
       opts.cardId,

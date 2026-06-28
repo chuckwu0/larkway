@@ -234,9 +234,10 @@ function makeFakeRenderer(opts?: {
   return { renderer, handlesByMessageId, startCalls };
 }
 
-function makeFakeCardKitClient(opts?: { rejectUpdate?: boolean }) {
+function makeFakeCardKitClient(opts?: { rejectUpdate?: boolean; initialElements?: string[] }) {
+  const elements = opts?.initialElements ? new Set(opts.initialElements) : null;
   const calls: Array<{
-    kind: "stream" | "update" | "settings";
+    kind: "stream" | "create" | "update" | "settings";
     cardId: string;
     elementId?: string;
     content?: string;
@@ -251,6 +252,9 @@ function makeFakeCardKitClient(opts?: { rejectUpdate?: boolean }) {
       throw new Error("not used by reconcile");
     },
     async streamElementContent(cardId, elementId, content, callOpts) {
+      if (elements && !elements.has(elementId)) {
+        throw new Error(`element not found: ${elementId}`);
+      }
       calls.push({ kind: "stream", cardId, elementId, content, sequence: callOpts.sequence });
     },
     async updateCardEntity(cardId, card, callOpts) {
@@ -260,7 +264,15 @@ function makeFakeCardKitClient(opts?: { rejectUpdate?: boolean }) {
     async updateCardSettings(cardId, settings, callOpts) {
       calls.push({ kind: "settings", cardId, payload: settings, sequence: callOpts.sequence });
     },
-    async createElements() {},
+    async createElements(cardId, newElements, callOpts) {
+      calls.push({ kind: "create", cardId, payload: newElements, sequence: callOpts.sequence });
+      if (elements) {
+        for (const element of newElements) {
+          const elementId = (element as { element_id?: unknown }).element_id;
+          if (typeof elementId === "string") elements.add(elementId);
+        }
+      }
+    },
     async deleteElement() {},
     async patchElement() {},
     async updateElement() {},
@@ -435,6 +447,71 @@ describe("reconcileOrphanedCards — integration", () => {
     expect(calls[0]?.content).toContain("CardKit recovered");
     expect(JSON.stringify(calls[1]?.payload)).toContain("继续");
     expect(JSON.stringify(calls[1]?.payload)).toContain("<at id=peer_test></at>");
+    expect(await readCardKitFile(wt)).toBeNull();
+  });
+
+  it("creates missing final_md before finalizing an orphaned CardKit stream", async () => {
+    const wt = await seedWorktree(
+      "om_cardkit_missing_final",
+      null,
+      state("ready", {
+        last_message: "CardKit recovered after missing final element",
+      }),
+    );
+    await writeCardKitFile(wt, cardKit({ threadId: "om_cardkit_missing_final" }));
+    const { renderer } = makeFakeRenderer();
+    const { client: cardKitClient, calls } = makeFakeCardKitClient({
+      initialElements: ["footer_md"],
+    });
+
+    await reconcileOrphanedCards({
+      botId: "gitlab",
+      worktreesDir: root,
+      cardRenderer: renderer,
+      cardKitClient,
+      log: () => {},
+    });
+
+    expect(calls.map((c) => c.kind)).toEqual(["create", "stream", "update", "settings"]);
+    expect(calls[0]?.sequence).toBe(4);
+    expect(calls[0]?.payload).toEqual([
+      {
+        tag: "markdown",
+        content: "CardKit recovered after missing final element",
+        element_id: "final_md",
+      },
+    ]);
+    expect(calls[1]?.sequence).toBe(5);
+    expect(calls[1]?.elementId).toBe("final_md");
+    expect(calls[1]?.content).toContain("CardKit recovered after missing final element");
+    expect(await readCardKitFile(wt)).toBeNull();
+  });
+
+  it("does not recreate final_md when finalizing an orphaned CardKit stream that already has it", async () => {
+    const wt = await seedWorktree(
+      "om_cardkit_existing_final",
+      null,
+      state("ready", {
+        last_message: "CardKit recovered with existing final element",
+      }),
+    );
+    await writeCardKitFile(wt, cardKit({ threadId: "om_cardkit_existing_final" }));
+    const { renderer } = makeFakeRenderer();
+    const { client: cardKitClient, calls } = makeFakeCardKitClient({
+      initialElements: ["footer_md", "final_md"],
+    });
+
+    await reconcileOrphanedCards({
+      botId: "gitlab",
+      worktreesDir: root,
+      cardRenderer: renderer,
+      cardKitClient,
+      log: () => {},
+    });
+
+    expect(calls.map((c) => c.kind)).toEqual(["stream", "update", "settings"]);
+    expect(calls[0]?.sequence).toBe(3);
+    expect(calls[0]?.elementId).toBe("final_md");
     expect(await readCardKitFile(wt)).toBeNull();
   });
 
