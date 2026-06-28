@@ -713,6 +713,17 @@ export class BridgeHandler {
     // Step 1: parse
     const parsed = parseMessage(event);
     const { threadId, messageId, senderOpenId } = parsed;
+    const isInternalHeartbeat =
+      parsed.raw["larkway_internal_trigger"] === "session_heartbeat";
+    const replyTargetMessageId =
+      typeof parsed.raw["reply_to_message_id"] === "string" &&
+      parsed.raw["reply_to_message_id"].length > 0
+        ? parsed.raw["reply_to_message_id"]
+        : messageId;
+    const removeProcessingReaction = async (): Promise<void> => {
+      if (isInternalHeartbeat) return;
+      await this.deps.client.removeProcessingReaction?.(messageId);
+    };
     const botId = this.deps.botConfig?.id;
     const eventLogId = messageId;
     const eventStartedAt = Date.now();
@@ -724,8 +735,9 @@ export class BridgeHandler {
         console.warn("[bridge.handler] recordRuntimeEvent failed (continuing):", err);
       }
     };
-    const triggerType =
-      typeof parsed.raw.root_id === "string" && parsed.raw.root_id
+    const triggerType = isInternalHeartbeat
+      ? "session_heartbeat"
+      : typeof parsed.raw.root_id === "string" && parsed.raw.root_id
         ? "thread_reply"
         : "mention";
     await recordEvent({
@@ -742,7 +754,9 @@ export class BridgeHandler {
       statusPath: ["已收到"],
       reason: "已进入 bridge，准备创建处理卡片。",
     });
-    await this.deps.client.addProcessingReaction?.(messageId);
+    if (!isInternalHeartbeat) {
+      await this.deps.client.addProcessingReaction?.(messageId);
+    }
 
     // Step 2: session lookup — determines is_new_thread.
     const existing = this.deps.sessionStore.get(threadId, botId);
@@ -780,7 +794,7 @@ export class BridgeHandler {
     let progressPostStartFailed = false;
     if (!cardKitAvailable && surfaceController.shouldStartCardImmediately()) {
       try {
-        card = await this.deps.cardRenderer.start(messageId, { replyInThread, threadId });
+        card = await this.deps.cardRenderer.start(replyTargetMessageId, { replyInThread, threadId });
         await recordEvent({
           status: "running",
           startedAt: new Date().toISOString(),
@@ -798,7 +812,7 @@ export class BridgeHandler {
         // Without a card we can still run Claude, but operator won't see output.
         // Proceed — sessionStore still needs updating.
       } finally {
-        await this.deps.client.removeProcessingReaction?.(messageId);
+        await removeProcessingReaction();
       }
     } else {
       await recordEvent({
@@ -1048,7 +1062,7 @@ export class BridgeHandler {
         try {
           cardKitProgress = await createCardKitProgressHandle({
             cardKitClient: this.deps.cardKitClient,
-            replyToMessageId: messageId,
+            replyToMessageId: replyTargetMessageId,
             replyInThread,
             facts: {
               botId: this.deps.botConfig?.id ?? "v1-default",
@@ -1066,7 +1080,7 @@ export class BridgeHandler {
             status: "message_sent",
             cardId: cardKitProgress.cardId,
             messageId: cardKitProgress.messageId,
-            replyToMessageId: messageId,
+            replyToMessageId: replyTargetMessageId,
             chatId: parsed.chatId,
             threadId,
             botId: this.deps.botConfig?.id ?? "",
@@ -1085,7 +1099,7 @@ export class BridgeHandler {
             updatedAt: new Date().toISOString(),
           };
           await writeCardKitFile(worktreePath, cardKitRecord);
-          await this.deps.client.removeProcessingReaction?.(messageId);
+          await removeProcessingReaction();
           await recordEvent({
             status: "running",
             startedAt: new Date().toISOString(),
@@ -1096,7 +1110,7 @@ export class BridgeHandler {
           const existingMessageId = cardKitReplyConversionMessageId(err);
           if (existingMessageId) {
             card = this.deps.cardRenderer.handleFor(existingMessageId);
-            await this.deps.client.removeProcessingReaction?.(messageId);
+            await removeProcessingReaction();
             await recordEvent({
               status: "running",
               startedAt: new Date().toISOString(),
@@ -1135,7 +1149,7 @@ export class BridgeHandler {
           try {
             progressPost = await createPostProgressHandle({
               postClient: this.deps.postClient,
-              replyToMessageId: messageId,
+              replyToMessageId: replyTargetMessageId,
               replyInThread,
               facts: {
                 botId: this.deps.botConfig?.id ?? "v1-default",
@@ -1144,7 +1158,7 @@ export class BridgeHandler {
               },
               initialText: "努力回答中...",
             });
-            await this.deps.client.removeProcessingReaction?.(messageId);
+            await removeProcessingReaction();
             await recordEvent({
               status: "running",
               startedAt: new Date().toISOString(),
@@ -1160,8 +1174,8 @@ export class BridgeHandler {
 
       if (!card && (progressPostStartFailed || cardKitStartFailed)) {
         try {
-          card = await this.deps.cardRenderer.start(messageId, { replyInThread, threadId });
-          await this.deps.client.removeProcessingReaction?.(messageId);
+          card = await this.deps.cardRenderer.start(replyTargetMessageId, { replyInThread, threadId });
+          await removeProcessingReaction();
           await recordEvent({
             status: "running",
             startedAt: new Date().toISOString(),
@@ -1177,7 +1191,7 @@ export class BridgeHandler {
           );
           await createOnlyPostFallback({
             postClient: this.deps.postClient,
-            replyToMessageId: messageId,
+            replyToMessageId: replyTargetMessageId,
             replyInThread,
             botId: this.deps.botConfig?.id ?? "v1-default",
             threadId,
@@ -1189,7 +1203,7 @@ export class BridgeHandler {
             title: "Larkway fallback",
             logPrefix: "[bridge.handler]",
           });
-          await this.deps.client.removeProcessingReaction?.(messageId);
+          await removeProcessingReaction();
           await recordEvent({
             status: "running",
             startedAt: new Date().toISOString(),
@@ -1374,6 +1388,7 @@ export class BridgeHandler {
               botId,
               createdTs: now,
               lastActiveTs: now,
+              chatId: parsed.chatId,
               senderOpenId,
             });
           } else if (sessionId !== undefined && currentExisting !== undefined) {
@@ -1384,6 +1399,7 @@ export class BridgeHandler {
               botId,
               createdTs: currentExisting.createdTs,
               lastActiveTs: now,
+              chatId: parsed.chatId,
               senderOpenId,
             });
           } else if (currentExisting !== undefined && sessionId === undefined) {
@@ -1391,6 +1407,7 @@ export class BridgeHandler {
             await this.deps.sessionStore.put({
               ...currentExisting,
               lastActiveTs: now,
+              chatId: parsed.chatId,
             });
           }
 
@@ -1503,7 +1520,7 @@ export class BridgeHandler {
               console.warn("[bridge.handler] CardKit finalize failed; using card fallback:", err);
               cardKitProgress.close();
               try {
-                card = await this.deps.cardRenderer.start(messageId, { replyInThread, threadId });
+                card = await this.deps.cardRenderer.start(replyTargetMessageId, { replyInThread, threadId });
                 await writeCardFile(worktreePath, {
                   messageId: card.messageId,
                   chatId: parsed.chatId,
@@ -1528,7 +1545,7 @@ export class BridgeHandler {
               } catch (legacyErr) {
                 const postFallback = await createOnlyPostFallback({
                   postClient: this.deps.postClient,
-                  replyToMessageId: messageId,
+                  replyToMessageId: replyTargetMessageId,
                   replyInThread,
                   botId: this.deps.botConfig?.id ?? "v1-default",
                   threadId,
@@ -1559,7 +1576,7 @@ export class BridgeHandler {
               chatId: parsed.chatId,
               threadId,
               triggerMessageId: messageId,
-              replyToMessageId: messageId,
+              replyToMessageId: replyTargetMessageId,
               replyInThread,
             },
             worktreePath,
@@ -1594,7 +1611,7 @@ export class BridgeHandler {
 
           if (surfaceDispatch.card) {
             if (!card) {
-              card = await this.deps.cardRenderer.start(messageId, { replyInThread, threadId });
+              card = await this.deps.cardRenderer.start(replyTargetMessageId, { replyInThread, threadId });
               try {
                 await writeCardFile(worktreePath, {
                   messageId: card.messageId,
@@ -1703,7 +1720,7 @@ export class BridgeHandler {
       }
     } catch (err) {
       console.error("[bridge.handler] handleOne failed for thread", threadId, err);
-      await this.deps.client.removeProcessingReaction?.(messageId);
+      await removeProcessingReaction();
       await recordEvent({
         status: "failed",
         finishedAt: new Date().toISOString(),
@@ -1729,7 +1746,7 @@ export class BridgeHandler {
       const createHardFailurePostFallback = async (failureReason: string) => {
         const fallback = await createOnlyPostFallback({
           postClient: this.deps.postClient,
-          replyToMessageId: messageId,
+          replyToMessageId: replyTargetMessageId,
           replyInThread,
           botId: this.deps.botConfig?.id ?? "v1-default",
           threadId,
@@ -1757,7 +1774,7 @@ export class BridgeHandler {
             cardKitFinalizeErr,
           );
           try {
-            card = await this.deps.cardRenderer.start(messageId, { replyInThread, threadId });
+            card = await this.deps.cardRenderer.start(replyTargetMessageId, { replyInThread, threadId });
           } catch (cardStartErr) {
             console.error("[bridge.handler] failure card start also failed:", cardStartErr);
             await createHardFailurePostFallback(
@@ -1778,7 +1795,7 @@ export class BridgeHandler {
             postFinalizeErr,
           );
           try {
-            card = await this.deps.cardRenderer.start(messageId, { replyInThread, threadId });
+            card = await this.deps.cardRenderer.start(replyTargetMessageId, { replyInThread, threadId });
           } catch (cardStartErr) {
             console.error("[bridge.handler] failure card start also failed:", cardStartErr);
             await createHardFailurePostFallback(

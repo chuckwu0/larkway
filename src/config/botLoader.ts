@@ -18,6 +18,7 @@ import path from "node:path";
 import { z } from "zod";
 import yaml from "js-yaml";
 import { ResponseSurfacePrototypeConfigSchema } from "../responseSurface.js";
+import { DEFAULT_SESSION_HEARTBEAT_CONFIG } from "../bridge/sessionHeartbeat.js";
 
 // ---------------------------------------------------------------------------
 // Zod schema
@@ -36,6 +37,14 @@ const GitCloneUrlSchema = z.string().min(1).refine(
   },
   "url must be an http(s), ssh://, or scp-like Git clone URL",
 );
+
+const SessionHeartbeatConfigSchema = z.object({
+  enabled: z.boolean().default(DEFAULT_SESSION_HEARTBEAT_CONFIG.enabled),
+  interval_ms: z.number().int().min(60_000).default(DEFAULT_SESSION_HEARTBEAT_CONFIG.interval_ms),
+  idle_after_ms: z.number().int().min(60_000).default(DEFAULT_SESSION_HEARTBEAT_CONFIG.idle_after_ms),
+  active_within_ms: z.number().int().min(60_000).default(DEFAULT_SESSION_HEARTBEAT_CONFIG.active_within_ms),
+  max_sessions_per_tick: z.number().int().min(1).max(20).default(DEFAULT_SESSION_HEARTBEAT_CONFIG.max_sessions_per_tick),
+}).default(DEFAULT_SESSION_HEARTBEAT_CONFIG);
 
 export const BotConfigSchema = z.object({
   /** Unique identifier, kebab-case. Used as key in sessionStore. */
@@ -210,6 +219,16 @@ export const BotConfigSchema = z.object({
    * outbound is not implemented here, so handler keeps a visible card fallback.
    */
   response_surface_prototype: ResponseSurfacePrototypeConfigSchema,
+
+  /**
+   * Optional bridge-side session heartbeat.
+   *
+   * When enabled, the bridge periodically re-enqueues recently active, idle
+   * sessions for this bot as an internal turn. This gives non-resident agents a
+   * wall-clock wake-up hook while keeping workflow decisions inside the agent.
+   * Default is disabled to avoid surprise background replies for existing bots.
+   */
+  session_heartbeat: SessionHeartbeatConfigSchema,
 
   /**
    * Runtime layout used by the bridge.

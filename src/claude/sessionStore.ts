@@ -57,6 +57,7 @@ export interface SessionRecord {
   /** ms epoch */
   createdTs: number;
   lastActiveTs: number;
+  chatId?: string;
   senderOpenId?: string;
 }
 
@@ -67,6 +68,7 @@ interface StoredRecord {
   botId: string;
   createdTs: number;
   lastActiveTs: number;
+  chatId?: string;
   senderOpenId?: string;
 }
 
@@ -227,6 +229,9 @@ export class SessionStore {
         createdTs: typeof old["createdTs"] === "number" ? old["createdTs"] : Date.now(),
         lastActiveTs:
           typeof old["lastActiveTs"] === "number" ? old["lastActiveTs"] : Date.now(),
+        ...(typeof old["chatId"] === "string"
+          ? { chatId: old["chatId"] }
+          : {}),
         ...(typeof old["senderOpenId"] === "string"
           ? { senderOpenId: old["senderOpenId"] }
           : {}),
@@ -272,6 +277,7 @@ export class SessionStore {
       botId: effectiveBotId,
       createdTs: record.createdTs,
       lastActiveTs: record.lastActiveTs,
+      ...(record.chatId !== undefined ? { chatId: record.chatId } : {}),
       ...(record.senderOpenId !== undefined ? { senderOpenId: record.senderOpenId } : {}),
     };
     this.#map.set(key, stored);
@@ -381,6 +387,7 @@ function isStoredRecord(value: unknown): value is StoredRecord {
     typeof v["botId"] === "string" &&
     typeof v["createdTs"] === "number" &&
     typeof v["lastActiveTs"] === "number" &&
+    (v["chatId"] === undefined || typeof v["chatId"] === "string") &&
     (v["senderOpenId"] === undefined || typeof v["senderOpenId"] === "string")
   );
 }

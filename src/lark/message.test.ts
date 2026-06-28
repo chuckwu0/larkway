@@ -231,3 +231,74 @@ describe("parseMessage — sender id normalization", () => {
     expect(parsed.senderOpenId).toBe("ou_sender_from_object");
   });
 });
+
+describe("parseMessage — interactive CardKit text extraction", () => {
+  it("extracts visible markdown from CardKit 2.0 body elements", () => {
+    const event = makeEvent(
+      {
+        schema: "2.0",
+        config: {
+          summary: { content: "summary only" },
+        },
+        body: {
+          elements: [
+            { tag: "markdown", content: "**完成**\n\n@Elon 已修复读卡问题。" },
+            {
+              tag: "column_set",
+              columns: [
+                {
+                  tag: "column",
+                  elements: [
+                    {
+                      tag: "button",
+                      text: { tag: "plain_text", content: "确认" },
+                    },
+                  ],
+                },
+              ],
+            },
+          ],
+        },
+      },
+      { message_type: "interactive" },
+    );
+
+    const parsed = parseMessage(event);
+
+    expect(parsed.text).toContain("完成");
+    expect(parsed.text).toContain("@Elon 已修复读卡问题。");
+    expect(parsed.text).toContain("确认");
+    expect(parsed.text).not.toContain("summary only");
+  });
+
+  it("extracts legacy interactive card top-level elements", () => {
+    const event = makeEvent(
+      {
+        elements: [
+          [{ tag: "text", text: "请 Turing 复验" }],
+          [{ tag: "markdown", content: "结论: 通过" }],
+        ],
+      },
+      { message_type: "interactive" },
+    );
+
+    expect(parseMessage(event).text).toBe("请 Turing 复验 结论: 通过");
+  });
+
+  it("drops client-upgrade placeholder-only interactive card content", () => {
+    const event = makeEvent(
+      {
+        title: null,
+        elements: [
+          [
+            { tag: "img", image_key: "img_placeholder" },
+            { tag: "text", text: "请升级至最新版本客户端，以查看内容" },
+          ],
+        ],
+      },
+      { message_type: "interactive" },
+    );
+
+    expect(parseMessage(event).text).toBe("");
+  });
+});

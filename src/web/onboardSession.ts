@@ -39,6 +39,7 @@ import { ensureAgentWorkspace } from "../agent/workspaceStore.js";
 import { permissionItemsFromCapabilities } from "../agent/permissionPlan.js";
 import { resolveAgentWorkspacePathFromHome } from "../config/paths.js";
 import { DEFAULT_RESPONSE_SURFACE_PROTOTYPE } from "../responseSurface.js";
+import { DEFAULT_SESSION_HEARTBEAT_CONFIG } from "../bridge/sessionHeartbeat.js";
 
 // ---------------------------------------------------------------------------
 // registerApp SDK slice (Lark SDK has no bundled .d.ts for registerApp;
@@ -455,6 +456,7 @@ export async function createBotFromCreds(
     memory_file: memoryFile,
     read_only: false,
     response_surface_prototype: DEFAULT_RESPONSE_SURFACE_PROTOTYPE,
+    session_heartbeat: DEFAULT_SESSION_HEARTBEAT_CONFIG,
     runtime: "agent_workspace",
     backend: form.backend && form.backend.trim() ? form.backend.trim() : "codex",
     // Persist the Feishu avatar URL so the Web 管理面 can show an avatar before
