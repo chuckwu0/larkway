@@ -36,6 +36,7 @@ import {
   shouldProvideResponseSurfaceCardKitClient,
   shouldProvideResponseSurfacePostClient,
 } from "./responseSurface.js";
+import { createLarkCliPeerBotResolver } from "./bridge/peerResolver.js";
 
 /** How often the bridge rewrites each bot's status.json liveness heartbeat. */
 const STATUS_WRITE_INTERVAL_MS = 30_000;
@@ -333,6 +334,10 @@ async function runV2Mode({
       if (!peer) return []; // should not happen (botLoader cross-validates), but guard
       return [{ id: peer.bot_open_id, name: peer.name, description: peer.description ?? "" }];
     });
+    const resolvePeersForChat = createLarkCliPeerBotResolver({
+      larkCliProfile,
+      log: (message) => console.warn(message),
+    });
 
     const postClient = shouldProvideResponseSurfacePostClient(bot.response_surface_prototype)
       ? client.outboundPostClient()
@@ -353,6 +358,7 @@ async function runV2Mode({
       // full-host posture); set to acceptEdits/ask to tighten via config.
       permissionMode: configJson.permissions.mode,
       peers: resolvedPeers,
+      resolvePeersForChat,
       botConfig: {
         id: bot.id,
         name: bot.name,

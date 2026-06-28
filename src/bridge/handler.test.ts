@@ -475,6 +475,111 @@ async function seedRepoCachePath(): Promise<void> {
 }
 
 describe("handleOne — thin-channel finalize", () => {
+  it("renders peer prompts with current chat roster open_ids", async () => {
+    let runOpts: { prompt?: string } | undefined;
+    runClaudeImpl = (opts: unknown) => {
+      runOpts = opts as { prompt?: string };
+      return {
+        events: (async function* () {
+          yield { type: "system_init", sessionId: "sess_peer_roster", raw: {} };
+          yield { type: "answer_snapshot", text: "ok", raw: {} };
+        })(),
+        done: Promise.resolve({ exitCode: 0, sessionId: "sess_peer_roster" }),
+        kill: () => {},
+      };
+    };
+
+    const { renderer, whenFinalized } = makeCardRenderer();
+    const { store } = makeSessionStore();
+    const { client } = makeClient(makeEvent());
+    await seedRepoCachePath();
+
+    const handler = new BridgeHandler({
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      client: client as any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      cardRenderer: renderer as any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      sessionStore: store as any,
+      conventions: makeConventions(),
+      peers: [
+        {
+          id: "ou_configured_or_relay",
+          name: "Peer Bot",
+          description: "Handles peer work",
+        },
+      ],
+      resolvePeersForChat: async ({ chatId, peers }) => {
+        expect(chatId).toBe("oc_chat");
+        return peers.map((peer) => ({ ...peer, id: "ou_current_chat_peer" }));
+      },
+      botConfig: { id: "frontend", name: "Frontend", turn_taking_limit: 10, backend: "claude" },
+    });
+
+    await handler.run();
+    await whenFinalized;
+
+    expect(runOpts?.prompt).toContain("@Peer Bot (open_id: ou_current_chat_peer)");
+    expect(runOpts?.prompt).not.toContain("ou_configured_or_relay");
+  });
+
+  it("schedules a topic monitor turn when the agent leaves state in_progress", async () => {
+    const threadId = "om_msg";
+    const wt = await seedWorktree(threadId);
+    await seedRepoCachePath();
+    let invocations = 0;
+    const prompts: string[] = [];
+    runClaudeImpl = (opts: unknown) => {
+      prompts.push((opts as { prompt?: string }).prompt ?? "");
+      invocations += 1;
+      const n = invocations;
+      return {
+        events: (async function* () {
+          yield { type: "system_init", sessionId: `sess_monitor_${n}`, raw: {} };
+          await writeFile(
+            stateFileMod.stateFilePathOf(wt),
+            JSON.stringify({
+              status: n === 1 ? "in_progress" : "ready",
+              last_message: n === 1 ? "等待下一棒" : "监控已处理",
+              updated_at: `2026-06-26T10:00:0${n}.000Z`,
+            }, null, 2),
+            "utf8",
+          );
+        })(),
+        done: Promise.resolve({ exitCode: 0, sessionId: `sess_monitor_${n}` }),
+        kill: () => {},
+      };
+    };
+
+    const { renderer, finalizeArgs, whenFinalized } = makeCardRenderer();
+    const { store } = makeSessionStore();
+    const { client } = makeClient(makeEvent());
+
+    const handler = new BridgeHandler({
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      client: client as any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      cardRenderer: renderer as any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      sessionStore: store as any,
+      conventions: makeConventions(),
+      topicMonitorIntervalMs: 5,
+      botConfig: { id: "frontend", name: "Frontend", turn_taking_limit: 10, backend: "claude" },
+    });
+
+    await handler.run();
+    await whenFinalized;
+    for (let i = 0; i < 100 && finalizeArgs.length < 2; i++) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    await handler.close();
+
+    expect(invocations).toBe(2);
+    expect(finalizeArgs).toHaveLength(2);
+    expect(prompts[1]).toContain("Larkway 自主监控");
+    expect(finalizeArgs.at(-1)?.finalText).toBe("监控已处理");
+  });
+
   it("passes missing lark-cli as an advisory runtime warning without blocking the agent", async () => {
     let runOpts: { prompt?: string } | undefined;
     runClaudeImpl = (opts: unknown) => {

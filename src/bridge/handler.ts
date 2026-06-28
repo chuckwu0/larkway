@@ -51,6 +51,7 @@ import {
 } from "./postProgress.js";
 import type { RuntimeEventPatch } from "./eventLog.js";
 import type { RuntimeRequirement } from "../runtimeRequirements.js";
+import type { PeerBotResolver } from "./peerResolver.js";
 import {
   isResponseSurfaceCardKitAvailable,
   isResponseSurfaceMentionAllowed,
@@ -68,6 +69,7 @@ import { buildPostContent } from "../lark/postContent.js";
 import { derivePostIdempotencyKey, digestPostContent } from "../lark/idempotency.js";
 
 const DEFAULT_CARDKIT_RESPONSE_SURFACE_TIMEOUT_MS = 20 * 60 * 1000;
+const DEFAULT_TOPIC_MONITOR_INTERVAL_MS = 10 * 60 * 1000;
 
 // ---------------------------------------------------------------------------
 // Private helpers — worktree bootstrap
@@ -530,11 +532,24 @@ export interface BridgeHandlerDeps {
    */
   responseSurfaceTimeoutMs?: number;
   /**
+   * When an agent leaves a topic in status=in_progress, schedule a synthetic
+   * follow-up turn so the agent can inspect the Feishu topic and unblock or @
+   * the next actor without relying on a human poke.
+   *
+   * @default 10 * 60 * 1000
+   */
+  topicMonitorIntervalMs?: number;
+  /**
    * V2: fully-resolved peer bot list for this bot.
    * Pre-resolved by runV2Mode: each entry has the peer bot's open_id, name, description.
    * When absent (V1), no peer block is rendered in the prompt.
    */
   peers?: PeerBot[];
+  /**
+   * Resolve peer bot open_ids from the current chat roster. Static bot yaml
+   * ids are only a fallback because Feishu @ needs the chat's real bot open_id.
+   */
+  resolvePeersForChat?: PeerBotResolver;
   /**
    * V2: sourced from BotConfig — passed to renderPrompt + createRunner().run.
    * When absent (V1), renderPrompt and the runner fall back to V1 behavior.
@@ -606,6 +621,7 @@ export interface BridgeHandlerDeps {
 export class BridgeHandler {
   private readonly deps: BridgeHandlerDeps;
   private readonly responseSurfacePostBudget = new ResponseSurfacePostBudget();
+  private readonly topicMonitorTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private closed = false;
 
   constructor(deps: BridgeHandlerDeps) {
@@ -616,6 +632,66 @@ export class BridgeHandler {
     return (this.deps.runtimeRequirements ?? []).filter((req) =>
       !req.ok && (req.severity === "required" || req.kind === "secret")
     );
+  }
+
+  private async peerBotsForPrompt(chatId: string): Promise<PeerBot[] | undefined> {
+    const peers = this.deps.peers;
+    if (!peers || peers.length === 0) return peers;
+    if (!this.deps.resolvePeersForChat) return peers;
+    try {
+      return await this.deps.resolvePeersForChat({ chatId, peers });
+    } catch (err) {
+      console.warn("[bridge.handler] peer roster resolution failed; using configured peers:", err);
+      return peers;
+    }
+  }
+
+  private clearTopicMonitor(threadId: string): void {
+    const timer = this.topicMonitorTimers.get(threadId);
+    if (!timer) return;
+    clearTimeout(timer);
+    this.topicMonitorTimers.delete(threadId);
+  }
+
+  private scheduleTopicMonitor(opts: {
+    sourceEvent: import("../lark/transport.js").LarkMessageEvent;
+    threadId: string;
+    messageId: string;
+    chatId: string;
+    chatType: unknown;
+    senderOpenId: string;
+  }): void {
+    if (this.closed) return;
+    this.clearTopicMonitor(opts.threadId);
+    const intervalMs = this.deps.topicMonitorIntervalMs ?? DEFAULT_TOPIC_MONITOR_INTERVAL_MS;
+    if (!Number.isFinite(intervalMs) || intervalMs <= 0) return;
+
+    const timer = setTimeout(() => {
+      this.topicMonitorTimers.delete(opts.threadId);
+      if (this.closed) return;
+      const syntheticEvent: import("../lark/transport.js").LarkMessageEvent = {
+        ...opts.sourceEvent,
+        message_id: opts.messageId,
+        chat_id: opts.chatId,
+        chat_type: typeof opts.chatType === "string" ? opts.chatType : "group",
+        thread_id: opts.threadId,
+        root_id: opts.threadId,
+        sender_id: opts.senderOpenId,
+        content: JSON.stringify({
+          text:
+            "Larkway 自主监控: 这个话题已保持 in_progress 约 10 分钟。请先读取完整话题历史,判断是否 block; " +
+            "如果能推进就继续推进,如果需要下一棒或人类动作,请用 post + at tag 真 @ 对方并说明要做什么; " +
+            "如果任务已完成,请写 ready 总结并结束。",
+        }),
+        create_time: String(Date.now()),
+        larkway_trigger_type: "topic_monitor",
+      };
+      void this.handleOne(syntheticEvent).catch((err) => {
+        console.error("[bridge.handler] topic monitor turn failed:", err);
+      });
+    }, intervalMs);
+    timer.unref?.();
+    this.topicMonitorTimers.set(opts.threadId, timer);
   }
 
   /**
@@ -683,6 +759,8 @@ export class BridgeHandler {
    */
   async close(): Promise<void> {
     this.closed = true;
+    for (const timer of this.topicMonitorTimers.values()) clearTimeout(timer);
+    this.topicMonitorTimers.clear();
   }
 
   // ---------------------------------------------------------------------------
@@ -713,6 +791,8 @@ export class BridgeHandler {
     // Step 1: parse
     const parsed = parseMessage(event);
     const { threadId, messageId, senderOpenId } = parsed;
+    const isSyntheticTopicMonitor = event["larkway_trigger_type"] === "topic_monitor";
+    this.clearTopicMonitor(threadId);
     const botId = this.deps.botConfig?.id;
     const eventLogId = messageId;
     const eventStartedAt = Date.now();
@@ -742,7 +822,9 @@ export class BridgeHandler {
       statusPath: ["已收到"],
       reason: "已进入 bridge，准备创建处理卡片。",
     });
-    await this.deps.client.addProcessingReaction?.(messageId);
+    if (!isSyntheticTopicMonitor) {
+      await this.deps.client.addProcessingReaction?.(messageId);
+    }
 
     // Step 2: session lookup — determines is_new_thread.
     const existing = this.deps.sessionStore.get(threadId, botId);
@@ -1254,6 +1336,7 @@ export class BridgeHandler {
 
         // Step 4b: render prompt — isNewThread reflects current attempt's state.
         const currentIsNewThread = currentExisting === undefined;
+        const promptPeers = await this.peerBotsForPrompt(parsed.chatId);
         const prompt = renderPrompt({
           parsed,
           isNewThread: currentIsNewThread,
@@ -1275,7 +1358,7 @@ export class BridgeHandler {
             readOnly: conventions.readOnly,
             gitlabTokenEnvName: conventions.gitlabTokenEnvName,
           },
-          peers: this.deps.peers,
+          peers: promptPeers,
           turn_taking_limit: this.deps.botConfig?.turn_taking_limit,
           botName: this.deps.botConfig?.name,
           backend: this.deps.botConfig?.backend,
@@ -1677,6 +1760,16 @@ export class BridgeHandler {
             appendPath: "已完成",
             reason: "Agent 已结束，消息已确认。",
           });
+          if (reportedStatus === "in_progress") {
+            this.scheduleTopicMonitor({
+              sourceEvent: event,
+              threadId,
+              messageId,
+              chatId: parsed.chatId,
+              chatType: parsed.raw.chat_type,
+              senderOpenId,
+            });
+          }
 
           // Success — exit the retry loop
           break;
