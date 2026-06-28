@@ -219,7 +219,6 @@ export function buildCodexCommand(
  */
 class CodexLineParser {
   private readonly answerExtractor = new AnswerChannelExtractor();
-  private lastAgentMessageText = "";
 
   *parseLine(line: string): Generator<AgentStreamEvent> {
   const trimmed = line.trim();
@@ -256,16 +255,12 @@ class CodexLineParser {
   const agentMessageText = agentMessageTextFrom(record);
   if (agentMessageText !== undefined) {
     if (topType === "item.completed") {
-      this.lastAgentMessageText = agentMessageText;
       yield* this.answerExtractor.ingestSnapshot(agentMessageText, obj);
       return;
     }
 
-    const delta = this.growingAgentMessageDelta(agentMessageText);
-    if (delta !== null) {
-      yield* this.answerExtractor.ingestDelta(delta, obj);
-      return;
-    }
+    yield* this.answerExtractor.ingestGrowingSnapshot(agentMessageText, obj);
+    return;
   }
 
   // ── item.started → tool_use (command_execution only) ────────────────────
@@ -312,20 +307,6 @@ class CodexLineParser {
   yield { type: "raw", raw: obj };
   }
 
-  private growingAgentMessageDelta(text: string): string | null {
-    if (text.length === 0) return null;
-    if (this.lastAgentMessageText && text.startsWith(this.lastAgentMessageText)) {
-      const delta = text.slice(this.lastAgentMessageText.length);
-      this.lastAgentMessageText = text;
-      return delta.length > 0 ? delta : null;
-    }
-    if (this.lastAgentMessageText === "") {
-      this.lastAgentMessageText = text;
-      return text;
-    }
-    this.lastAgentMessageText = text;
-    return null;
-  }
 }
 
 function agentMessageTextFrom(record: Record<string, unknown>): string | undefined {
