@@ -41,6 +41,7 @@ import {
 import {
   createCardKitProgressHandle,
   type CardKitProgressHandle,
+  type CardKitLiveMetrics,
 } from "./cardkitProgress.js";
 import { SurfaceController } from "./surfaceController.js";
 import { dispatchResponseSurface } from "./surfaceDispatcher.js";
@@ -65,6 +66,8 @@ import { markPostLedgerFallbackVisible, markPostLedgerPolicyBlockedVisible } fro
 import { ResponseSurfacePostBudget } from "./postBudget.js";
 import { buildPostContent } from "../lark/postContent.js";
 import { derivePostIdempotencyKey, digestPostContent } from "../lark/idempotency.js";
+
+const DEFAULT_CARDKIT_RESPONSE_SURFACE_TIMEOUT_MS = 20 * 60 * 1000;
 
 // ---------------------------------------------------------------------------
 // Private helpers — worktree bootstrap
@@ -517,6 +520,15 @@ export interface BridgeHandlerDeps {
   permissionMode?: "acceptEdits" | "ask" | "bypassPermissions";
   /** @default 60 * 60 * 1000 (60 min — real D1-D3 with Agent subagent easily exceeds 15min) */
   subprocessTimeoutMs?: number;
+  /**
+   * CardKit running-card watchdog. CardKit has a visible response surface, so
+   * it gets a shorter cap than long-running backend subprocesses: if the
+   * agent has not produced a fresh terminal state before this cap, the same
+   * CardKit card finalizes as a clean timeout instead of hanging forever.
+   *
+   * @default 20 * 60 * 1000
+   */
+  responseSurfaceTimeoutMs?: number;
   /**
    * V2: fully-resolved peer bot list for this bot.
    * Pre-resolved by runV2Mode: each entry has the peer bot's open_id, name, description.
@@ -1004,16 +1016,27 @@ export class BridgeHandler {
         console.warn("[bridge.handler] ensureStateFile failed (continuing):", err);
       }
 
-      const updateCardKitRecord = async (
-        patch: Partial<CardKitFile> & Pick<CardKitFile, "status" | "sequence">,
-      ): Promise<void> => {
+      let cardKitRecordWrite: Promise<void> = Promise.resolve();
+      const updateCardKitRecord = async (patch: Partial<CardKitFile>): Promise<void> => {
         if (!cardKitRecord) return;
         cardKitRecord = {
           ...cardKitRecord,
           ...patch,
           updatedAt: new Date().toISOString(),
         };
-        await writeCardKitFile(worktreePath, cardKitRecord);
+        const record = cardKitRecord;
+        cardKitRecordWrite = cardKitRecordWrite
+          .catch(() => {})
+          .then(() => writeCardKitFile(worktreePath, record));
+        await cardKitRecordWrite;
+      };
+      const updateCardKitLiveMetrics = (
+        metrics: CardKitLiveMetrics & { sequence: number },
+      ): void => {
+        const { sequence, ...live } = metrics;
+        void updateCardKitRecord({ sequence, live }).catch((err) => {
+          console.warn("[bridge.handler] write CardKit live metrics failed:", err);
+        });
       };
 
       // CardKit response surface: default main surface when the transport and
@@ -1036,6 +1059,7 @@ export class BridgeHandler {
             onSequenceCommitted: async (sequence) => {
               await updateCardKitRecord({ status: "streaming", sequence });
             },
+            onLiveMetricsChanged: updateCardKitLiveMetrics,
           });
           cardKitRecord = {
             surface: "cardkit_stream",
@@ -1050,6 +1074,7 @@ export class BridgeHandler {
             replyInThread,
             idempotencyKey: cardKitProgress.idempotencyKey,
             sequence: cardKitProgress.sequence,
+            live: cardKitProgress.liveMetrics,
             elements: {
               footer: { elementId: "footer_md" },
               final: { elementId: "final_md" },
@@ -1274,7 +1299,14 @@ export class BridgeHandler {
         // Default 60min — real-business prompts (D1-D3 multi-file write +
         // Agent-tool subagent spawn) easily exceed 15min. Per-spawn timeout
         // is just a runaway guard, not a UX choice.
-        const timeoutMs = this.deps.subprocessTimeoutMs ?? 60 * 60 * 1000;
+        const baseTimeoutMs = this.deps.subprocessTimeoutMs ?? 60 * 60 * 1000;
+        const timeoutMs = cardKitProgress
+          ? Math.min(
+              baseTimeoutMs,
+              this.deps.responseSurfaceTimeoutMs ?? DEFAULT_CARDKIT_RESPONSE_SURFACE_TIMEOUT_MS,
+            )
+          : baseTimeoutMs;
+        const runnerStartedAt = Date.now();
 
         const handle = createRunner(backend).run({
           prompt,
@@ -1307,6 +1339,10 @@ export class BridgeHandler {
           }
 
           const result = await handle.done;
+          const cardKitTurnTimedOut =
+            cardKitProgress != null &&
+            result.exitCode !== 0 &&
+            Date.now() - runnerStartedAt >= timeoutMs;
 
           // Step 4d-ii: read state.json the bot wrote during the response.
           const rawReportedState = await readStateFile(worktreePath);
@@ -1377,6 +1413,8 @@ export class BridgeHandler {
           // falling back to streamed text only when bot didn't write one.
           const reportedStatus = reportedState?.status;
           const reportedError = reportedState?.error;
+          const cardKitTimeoutFailure =
+            cardKitTurnTimedOut && reportedStatus !== "ready" && reportedStatus !== "failed";
           let success: boolean;
           let failureReason: string | undefined;
 
@@ -1385,6 +1423,9 @@ export class BridgeHandler {
             failureReason = reportedError ?? "bot 报告 failed (无 error 字段)";
           } else if (reportedStatus === "ready") {
             success = true;
+          } else if (cardKitTimeoutFailure) {
+            success = false;
+            failureReason = `agent turn timed out after ${timeoutMs}ms; CardKit running card was finalized as interrupted`;
           } else if (result.exitCode === 0) {
             success = true;
           } else {
@@ -1402,10 +1443,12 @@ export class BridgeHandler {
             cardKitProgress?.answerText.trim() ||
             "";
           const cardBody =
-            reportedState?.last_message ??
-            (fallbackAnswer
-              ? fallbackAnswer
-              : "⚠️ 本轮没有拿到 agent 的新回复(可能被中断或未更新状态),再 @ 我一次重试。");
+            cardKitTimeoutFailure
+              ? "⚠️ 本轮处理超时，已中断。请再 @ 我一次重试。"
+              : reportedState?.last_message ??
+                (fallbackAnswer
+                  ? fallbackAnswer
+                  : "⚠️ 本轮没有拿到 agent 的新回复(可能被中断或未更新状态),再 @ 我一次重试。");
 
           // When the agent didn't report status this turn (reportedState null,
           // per stale-guard) but exited cleanly, don't let the card default to
@@ -1422,7 +1465,8 @@ export class BridgeHandler {
             finalText: cardBody,
             success,
             failureReason,
-            titleOverride: reportedState?.card_title ?? neutralTitle,
+            titleOverride:
+              reportedState?.card_title ?? (cardKitTimeoutFailure ? "已中断" : neutralTitle),
             colorOverride:
               reportedState?.card_color ?? (neutralTitle ? "neutral" : undefined),
             // V2 dynamic-choice buttons — agent-declared, rendered verbatim.

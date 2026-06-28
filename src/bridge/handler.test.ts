@@ -308,7 +308,7 @@ function makePostClient(opts: { fail?: boolean; failCreate?: boolean; failUpdate
 
 function makeCardKitClient(opts: { failFinalize?: boolean; failCreate?: boolean } = {}) {
   const calls: Array<{
-    kind: "createCard" | "reply" | "stream" | "updateCard" | "settings";
+    kind: "createCard" | "reply" | "stream" | "createElements" | "updateElement" | "updateCard" | "settings";
     cardId?: string;
     elementId?: string;
     content?: string;
@@ -343,10 +343,25 @@ function makeCardKitClient(opts: { failFinalize?: boolean; failCreate?: boolean 
         sequence: callOpts.sequence,
       });
     },
-    async createElements() {},
+    async createElements(cardId, newElements, callOpts) {
+      calls.push({
+        kind: "createElements",
+        cardId,
+        payload: newElements,
+        sequence: callOpts.sequence,
+      });
+    },
     async deleteElement() {},
     async patchElement() {},
-    async updateElement() {},
+    async updateElement(cardId, elementId, element, callOpts) {
+      calls.push({
+        kind: "updateElement",
+        cardId,
+        elementId,
+        payload: element,
+        sequence: callOpts.sequence,
+      });
+    },
     async updateCardSettings(cardId, settings, callOpts) {
       calls.push({
         kind: "settings",
@@ -850,6 +865,186 @@ describe("handleOne — thin-channel finalize", () => {
     const finalUpdate = cardKitCalls.find((c) => c.kind === "updateCard");
     expect(JSON.stringify(finalUpdate?.payload)).toContain("继续");
     expect(JSON.stringify(finalUpdate?.payload)).toContain("<at id=peer_test></at>");
+  });
+
+  it("updates the CardKit running footer with count-only tool usage", async () => {
+    const threadId = "om_msg";
+    const finalState = {
+      status: "ready",
+      last_message: "工具计数完成",
+      updated_at: "2026-06-26T10:00:00.000Z",
+    };
+    const wt = await seedWorktree(threadId);
+    await seedRepoCachePath();
+    const { client: cardKitClient, calls: cardKitCalls } = makeCardKitClient();
+
+    runClaudeImpl = () => ({
+      events: (async function* () {
+        yield { type: "system_init", sessionId: "sess_cardkit_tools", raw: {} };
+        yield {
+          type: "tool_use",
+          toolName: "Bash",
+          toolInput: {
+            command: "cat /Users/example/.larkway/agents/bot/workspace/secret.txt",
+          },
+          raw: {},
+        };
+        yield {
+          type: "tool_use",
+          toolName: "Read",
+          toolInput: { path: "/Users/example/.larkway/state.json" },
+          raw: {},
+        };
+        await writeFile(
+          stateFileMod.stateFilePathOf(wt),
+          JSON.stringify(finalState, null, 2),
+          "utf8",
+        );
+      })(),
+      done: Promise.resolve({ exitCode: 0, sessionId: "sess_cardkit_tools" }),
+      kill: () => {},
+    });
+
+    const { renderer, startArgs, finalizeArgs } = makeCardRenderer();
+    const { store } = makeSessionStore();
+    const { client, acked } = makeClient(makeEvent());
+
+    const handler = new BridgeHandler({
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      client: client as any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      cardRenderer: renderer as any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      sessionStore: store as any,
+      conventions: makeConventions(),
+      botConfig: {
+        id: "frontend",
+        name: "Frontend",
+        turn_taking_limit: 10,
+        backend: "claude",
+        response_surface_prototype: {
+          enabled: true,
+          allowed_chats: [],
+          allowed_threads: ["om_msg"],
+          lazy_card_creation: true,
+          kill_switch: false,
+          post_outbound_enabled: false,
+          cardkit_streaming_enabled: true,
+          allow_agent_mentions: true,
+          allowed_mention_open_ids: [],
+          max_posts_per_turn: 1,
+          max_posts_per_window: 4,
+          post_window_ms: 60_000,
+          max_post_attempts: 3,
+          text_threshold_chars: 900,
+        },
+      },
+      cardKitClient,
+    });
+
+    await handler.run();
+    for (let i = 0; i < 100 && acked.length === 0; i++) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
+
+    expect(acked).toEqual(["om_msg"]);
+    expect(startArgs).toHaveLength(0);
+    expect(finalizeArgs).toHaveLength(0);
+    const statusUpdates = cardKitCalls.filter((c) => c.kind === "updateElement");
+    expect(statusUpdates).toHaveLength(2);
+    expect(statusUpdates[0]?.elementId).toBe("footer_md");
+    expect(statusUpdates[0]?.payload).toMatchObject({
+      content: "努力回答中... · 已用 1 个工具",
+    });
+    expect(statusUpdates[1]?.payload).toMatchObject({
+      content: "努力回答中... · 已用 2 个工具",
+    });
+    const rendered = JSON.stringify(statusUpdates);
+    expect(rendered).not.toContain("Bash");
+    expect(rendered).not.toContain("Read");
+    expect(rendered).not.toContain("/Users/example");
+    expect(rendered).not.toContain(".larkway");
+    const finalUpdate = cardKitCalls.find((c) => c.kind === "updateCard");
+    expect(JSON.stringify(finalUpdate?.payload)).toContain("工具计数完成");
+  });
+
+  it("finalizes the same CardKit card as interrupted when the turn reaches the response-surface timeout", async () => {
+    const threadId = "om_msg";
+    const wt = await seedWorktree(threadId);
+    await seedRepoCachePath();
+    const { client: cardKitClient, calls: cardKitCalls } = makeCardKitClient();
+    let runOpts: { timeoutMs?: number } | undefined;
+
+    runClaudeImpl = (opts: unknown) => {
+      runOpts = opts as { timeoutMs?: number };
+      return {
+        events: (async function* () {
+          yield { type: "system_init", sessionId: "sess_cardkit_timeout", raw: {} };
+        })(),
+        done: Promise.resolve({ exitCode: 1, sessionId: "sess_cardkit_timeout" }),
+        kill: () => {},
+      };
+    };
+
+    const { renderer, startArgs, finalizeArgs } = makeCardRenderer();
+    const { store } = makeSessionStore();
+    const { client, acked } = makeClient(makeEvent());
+
+    const handler = new BridgeHandler({
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      client: client as any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      cardRenderer: renderer as any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      sessionStore: store as any,
+      conventions: makeConventions(),
+      botConfig: {
+        id: "frontend",
+        name: "Frontend",
+        turn_taking_limit: 10,
+        backend: "claude",
+        response_surface_prototype: {
+          enabled: true,
+          allowed_chats: [],
+          allowed_threads: ["om_msg"],
+          lazy_card_creation: true,
+          kill_switch: false,
+          post_outbound_enabled: false,
+          cardkit_streaming_enabled: true,
+          allow_agent_mentions: true,
+          allowed_mention_open_ids: [],
+          max_posts_per_turn: 1,
+          max_posts_per_window: 4,
+          post_window_ms: 60_000,
+          max_post_attempts: 3,
+          text_threshold_chars: 900,
+        },
+      },
+      cardKitClient,
+      responseSurfaceTimeoutMs: 0,
+    });
+
+    await handler.run();
+    for (let i = 0; i < 100 && acked.length === 0; i++) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
+
+    expect(runOpts?.timeoutMs).toBe(0);
+    expect(acked).toEqual(["om_msg"]);
+    expect(startArgs).toHaveLength(0);
+    expect(finalizeArgs).toHaveLength(0);
+    expect(await readFile(stateFileMod.stateFilePathOf(wt), "utf8")).toContain("in_progress");
+    const stream = cardKitCalls.find((c) => c.kind === "stream" && c.elementId === "final_md");
+    expect(stream?.content).toContain("已中断");
+    const finalUpdate = cardKitCalls.find((c) => c.kind === "updateCard");
+    expect(JSON.stringify(finalUpdate?.payload)).toContain("已中断");
+    const settings = cardKitCalls.find((c) => c.kind === "settings");
+    expect(settings?.payload).toEqual({
+      config: {
+        streaming_mode: false,
+        summary: { content: "⚠️ 本轮处理超时，已中断。请再 @ 我一次重试。" },
+      },
+    });
   });
 
   it("adopts the already-visible CardKit reply when idConvert fails instead of creating a second card", async () => {

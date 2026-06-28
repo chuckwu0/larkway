@@ -45,6 +45,20 @@ describe("cardkitFile", () => {
     expect(got).toMatchObject(base);
     expect(got?.retryCount).toBe(0);
     expect(got?.lastVisibleFallbackMessageId).toBeNull();
+    expect(got?.live).toEqual({
+      answerDeltaCount: 0,
+      answerSnapshotCount: 0,
+      firstAnswerAt: null,
+      lastAnswerAt: null,
+      visibleAnswerLength: 0,
+      toolUseCount: 0,
+      lastToolUseAt: null,
+      statusPatchCount: 0,
+      lastStatusPatchAt: null,
+      progressUpdateCount: 0,
+      lastProgressPatchAt: null,
+      lastPatchError: null,
+    });
   });
 
   it("creates the .larkway dir and leaves no temp files", async () => {

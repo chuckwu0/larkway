@@ -2,6 +2,21 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { z } from "zod";
 
+const defaultCardKitLiveMetrics = () => ({
+  answerDeltaCount: 0,
+  answerSnapshotCount: 0,
+  firstAnswerAt: null,
+  lastAnswerAt: null,
+  visibleAnswerLength: 0,
+  toolUseCount: 0,
+  lastToolUseAt: null,
+  statusPatchCount: 0,
+  lastStatusPatchAt: null,
+  progressUpdateCount: 0,
+  lastProgressPatchAt: null,
+  lastPatchError: null,
+});
+
 export const CardKitFileSchema = z.object({
   surface: z.literal("cardkit_stream"),
   status: z
@@ -17,6 +32,22 @@ export const CardKitFileSchema = z.object({
   replyInThread: z.boolean().default(true),
   idempotencyKey: z.string().min(1),
   sequence: z.number().int().nonnegative().default(0),
+  live: z
+    .object({
+      answerDeltaCount: z.number().int().nonnegative().default(0),
+      answerSnapshotCount: z.number().int().nonnegative().default(0),
+      firstAnswerAt: z.string().min(1).nullable().default(null),
+      lastAnswerAt: z.string().min(1).nullable().default(null),
+      visibleAnswerLength: z.number().int().nonnegative().default(0),
+      toolUseCount: z.number().int().nonnegative().default(0),
+      lastToolUseAt: z.string().min(1).nullable().default(null),
+      statusPatchCount: z.number().int().nonnegative().default(0),
+      lastStatusPatchAt: z.string().min(1).nullable().default(null),
+      progressUpdateCount: z.number().int().nonnegative().default(0),
+      lastProgressPatchAt: z.string().min(1).nullable().default(null),
+      lastPatchError: z.string().min(1).nullable().default(null),
+    })
+    .default(defaultCardKitLiveMetrics),
   elements: z
     .object({
       status: z.object({ elementId: z.string().min(1) }).optional(),

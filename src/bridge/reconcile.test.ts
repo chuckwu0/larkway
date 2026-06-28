@@ -83,6 +83,20 @@ function cardKit(overrides: Partial<CardKitFile> = {}): CardKitFile {
     replyInThread: true,
     idempotencyKey: "lw-ck-reconcile",
     sequence: 2,
+    live: {
+      answerDeltaCount: 0,
+      answerSnapshotCount: 0,
+      firstAnswerAt: null,
+      lastAnswerAt: null,
+      visibleAnswerLength: 0,
+      toolUseCount: 0,
+      lastToolUseAt: null,
+      statusPatchCount: 0,
+      lastStatusPatchAt: null,
+      progressUpdateCount: 0,
+      lastProgressPatchAt: null,
+      lastPatchError: null,
+    },
     elements: {
       footer: { elementId: "footer_md" },
       final: { elementId: "final_md" },
@@ -447,6 +461,32 @@ describe("reconcileOrphanedCards — integration", () => {
     expect(calls[0]?.content).toContain("CardKit recovered");
     expect(JSON.stringify(calls[1]?.payload)).toContain("继续");
     expect(JSON.stringify(calls[1]?.payload)).toContain("<at id=peer_test></at>");
+    expect(await readCardKitFile(wt)).toBeNull();
+  });
+
+  it("finalizes an old in-progress CardKit stream as interrupted failure", async () => {
+    const wt = await seedWorktree(
+      "om_cardkit_interrupted",
+      null,
+      state("in_progress", {
+        updated_at: "2026-05-29T12:00:30.000Z",
+      }),
+    );
+    await writeCardKitFile(wt, cardKit({ threadId: "om_cardkit_interrupted" }));
+    const { renderer } = makeFakeRenderer();
+    const { client: cardKitClient, calls } = makeFakeCardKitClient();
+
+    await reconcileOrphanedCards({
+      botId: "gitlab",
+      worktreesDir: root,
+      cardRenderer: renderer,
+      cardKitClient,
+      log: () => {},
+    });
+
+    expect(calls.map((c) => c.kind)).toEqual(["stream", "update", "settings"]);
+    expect(calls[0]?.content).toContain("处理中被中断");
+    expect(JSON.stringify(calls[1]?.payload)).toContain("处理中被中断");
     expect(await readCardKitFile(wt)).toBeNull();
   });
 

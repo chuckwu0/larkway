@@ -101,6 +101,109 @@ describe("CardKitProgressHandle", () => {
     });
   });
 
+  it("patches only count-only tool usage status without leaking tool details", async () => {
+    const { client, calls } = fakeCardKitClient();
+    const handle = await createCardKitProgressHandle({
+      cardKitClient: client,
+      replyToMessageId: "trigger_message",
+      replyInThread: true,
+      facts: { botId: "bot", threadId: "thread", triggerMessageId: "trigger_message" },
+      patchIntervalMs: 0,
+    });
+
+    handle.handle({
+      type: "tool_use",
+      toolName: "Bash",
+      toolInput: {
+        command: "cat /Users/example/.larkway/agents/bot/workspace/secret.txt",
+        token: "LARKWAY_SECRET_TOKEN",
+      },
+      raw: {},
+    });
+    handle.handle({
+      type: "tool_use",
+      toolName: "Read",
+      toolInput: { path: "/Users/example/.larkway/state.json" },
+      raw: {},
+    });
+    await handle.drain();
+
+    const statusCalls = calls.filter((c) => c.name === "updateElement");
+    expect(statusCalls).toHaveLength(2);
+    expect(statusCalls[0]?.args[1]).toBe("footer_md");
+    expect(statusCalls[0]?.args[2]).toMatchObject({
+      tag: "markdown",
+      element_id: "footer_md",
+      content: "努力回答中... · 已用 1 个工具",
+    });
+    expect(statusCalls[1]?.args[2]).toMatchObject({
+      content: "努力回答中... · 已用 2 个工具",
+    });
+    const rendered = JSON.stringify(statusCalls);
+    expect(rendered).not.toContain("Bash");
+    expect(rendered).not.toContain("Read");
+    expect(rendered).not.toContain("/Users/example");
+    expect(rendered).not.toContain(".larkway");
+    expect(rendered).not.toContain("LARKWAY_SECRET_TOKEN");
+    expect(handle.liveMetrics).toMatchObject({
+      toolUseCount: 2,
+      statusPatchCount: 2,
+      lastPatchError: null,
+    });
+    expect(handle.liveMetrics.lastToolUseAt).toEqual(expect.any(String));
+    expect(handle.liveMetrics.lastStatusPatchAt).toEqual(expect.any(String));
+  });
+
+  it("commits the first answer delta immediately and exposes live counters", async () => {
+    const { client, calls } = fakeCardKitClient();
+    const metrics: Array<{
+      answerDeltaCount: number;
+      answerSnapshotCount: number;
+      firstAnswerAt: string | null;
+      visibleAnswerLength: number;
+      progressUpdateCount: number;
+      sequence: number;
+    }> = [];
+    const handle = await createCardKitProgressHandle({
+      cardKitClient: client,
+      replyToMessageId: "trigger_message",
+      replyInThread: true,
+      facts: { botId: "bot", threadId: "thread", triggerMessageId: "trigger_message" },
+      patchIntervalMs: 60_000,
+      onLiveMetricsChanged: (live) => metrics.push(live),
+    });
+
+    handle.handle({ type: "answer_delta", text: "visible", raw: {} });
+    await handle.drain();
+
+    const contentCalls = calls.filter((c) => c.name === "streamElementContent");
+    expect(contentCalls).toHaveLength(1);
+    expect(contentCalls[0]!.args[1]).toBe("final_md");
+    expect(contentCalls[0]!.args[2]).toBe("visible");
+    expect(handle.liveMetrics).toMatchObject({
+      answerDeltaCount: 1,
+      answerSnapshotCount: 0,
+      visibleAnswerLength: 7,
+      progressUpdateCount: 1,
+      lastPatchError: null,
+    });
+    expect(handle.liveMetrics.firstAnswerAt).toEqual(expect.any(String));
+    expect(handle.liveMetrics.lastProgressPatchAt).toEqual(expect.any(String));
+    expect(metrics[0]).toMatchObject({
+      answerDeltaCount: 1,
+      answerSnapshotCount: 0,
+      visibleAnswerLength: 7,
+      progressUpdateCount: 0,
+      sequence: 0,
+    });
+    expect(metrics.at(-1)).toMatchObject({
+      answerDeltaCount: 1,
+      visibleAnswerLength: 7,
+      progressUpdateCount: 1,
+      sequence: 2,
+    });
+  });
+
   it("finalizes by writing final content, replacing with a clean card, and closing streaming", async () => {
     const { client, calls } = fakeCardKitClient();
     const handle = await createCardKitProgressHandle({
