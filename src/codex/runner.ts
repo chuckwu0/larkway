@@ -206,8 +206,8 @@ export function buildCodexCommand(
  *     → {type:"tool_result", raw}
  *
  *   {"type":"item.completed","item":{"type":"agent_message","text":"..."}}
- *     → internal_text by default, or answer_snapshot if the text contains the
- *       explicit LARKWAY_ANSWER_BEGIN / LARKWAY_ANSWER_END markers.
+ *     → answer_snapshot by default. Explicit LARKWAY_ANSWER_BEGIN /
+ *       LARKWAY_ANSWER_END markers can narrow the visible answer segment.
  *
  *   {"type":"turn.completed","usage":{...}}
  *     → {type:"result", stopReason:"end_turn", raw}

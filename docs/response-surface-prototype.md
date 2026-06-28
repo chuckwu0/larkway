@@ -180,8 +180,9 @@ Required automated coverage:
   visible CardKit reply if `idConvert` fails, and falls back to a visible legacy
   card on CardKit failure, then a create-only fallback post if the legacy card
   path also fails.
-- Runner tests prove marker-wrapped answer text becomes `answer_snapshot` /
-  `answer_delta`, while unmarked assistant text remains internal.
+- Runner tests prove unmarked assistant text becomes live `answer_delta` /
+  `answer_snapshot` by default, while explicit markers can narrow the visible
+  answer segment.
 - Reconcile finalizes orphaned `cardkit.json` records and deletes terminal
   ledgers.
 - Config gates and kill switch roll back to legacy card.

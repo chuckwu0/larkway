@@ -127,11 +127,11 @@ describe("parseCodexLine", () => {
     expect(events[0]!.type).toBe("tool_result");
   });
 
-  it("item.completed agent_message without answer marker → internal_text", () => {
+  it("item.completed agent_message without answer marker → auto answer_snapshot", () => {
     const events = [...parseCodexLine(FIXTURE_ITEM_COMPLETED_AGENT_MESSAGE)];
     expect(events).toHaveLength(1);
     expect(events[0]).toMatchObject({
-      type: "internal_text",
+      type: "answer_snapshot",
       text: "I found the following files in the directory.",
     });
   });

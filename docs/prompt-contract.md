@@ -156,11 +156,12 @@ Agent 通过工作区里的 `.larkway/state.json` 或 v0.3 session state artifac
 - `content_blocks`: 可选的有序 markdown/image 正文块。需要平台正文与匹配图片在同一 review card 里相邻展示时使用;优先级和示例见 [Review Card Content Blocks](review-card-content-blocks.md)。
 - `response_surface`: 可选覆盖,用于显式声明 `card` / `post` / `hybrid` surface 或 mentions。普通回复可不写;无显式 card 意图时默认 CardKit 流式卡片。协议和门禁见 [Response Surface Prototype](response-surface-prototype.md)。
 
-运行中答案流另有一个显式通道:Agent stdout 里只有包在独立行
-`LARKWAY_ANSWER_BEGIN` 和 `LARKWAY_ANSWER_END` 之间的正文会被 bridge
-当作可见答案流。marker 外的计划、思考、工具叙述、原始 runner
-`text_delta` 都按 internal text 处理,不会进入卡片。最终数据仍以
-`state.json` 的 `last_message` / `content_blocks` / `choices` 等字段为准。
+运行中答案流默认来自 Agent 普通 assistant 文本增量;bridge 会在入卡前
+对本地路径、token/secret/env 形态做保守脱敏,并且不裸流 raw
+`tool_use` / `tool_result`。Agent 如需精确限定“只流这一段”,可把该段包在
+独立行 `LARKWAY_ANSWER_BEGIN` 和 `LARKWAY_ANSWER_END` 之间;marker 是可选
+override,不是每个 bot 必须手写的格式。最终数据仍以 `state.json` 的
+`last_message` / `content_blocks` / `choices` 等字段为准。
 
 关键边界:
 

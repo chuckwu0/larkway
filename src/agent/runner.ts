@@ -29,7 +29,7 @@ export type AgentStreamEvent =
    */
   | { type: "answer_delta"; text: string; raw: unknown; seq?: number }
   | { type: "answer_snapshot"; text: string; raw: unknown; seq?: number }
-  /** @deprecated Backend text without answer-channel proof. Treat as internal. */
+  /** @deprecated Legacy backend text event. Modern runners emit answer events. */
   | { type: "text_delta"; text: string; raw: unknown }
   | { type: "tool_use"; toolName: string; toolInput: unknown; raw: unknown }
   | { type: "tool_result"; raw: unknown }

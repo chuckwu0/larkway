@@ -18,6 +18,7 @@ import {
   _buildEnv as buildEnv,
   _parseLinesMulti as parseLinesMulti,
 } from "./runner.js";
+import type { AgentStreamEvent } from "../agent/runner.js";
 
 // ---------------------------------------------------------------------------
 // Helpers for spawn-level integration tests (no real claude CLI)
@@ -70,6 +71,15 @@ function makeFakeChild(opts: { initialLines?: string[] } = {}) {
   };
 
   return { child, stdout, stderr, triggerExit, triggerClose };
+}
+
+function visibleAnswer(events: AgentStreamEvent[]): string {
+  let text = "";
+  for (const event of events) {
+    if (event.type === "answer_delta") text += event.text;
+    if (event.type === "answer_snapshot") text = event.text;
+  }
+  return text;
 }
 
 describe("buildEnv", () => {
@@ -188,6 +198,55 @@ describe("parseLinesMulti", () => {
     });
   }
 
+  it("turns unmarked Claude stream_event text deltas into auto-answer deltas", () => {
+    const extractor = new AnswerChannelExtractor();
+    const text = "真实 bot 没有 marker 时，这段 assistant text 也应该在运行中逐步进入卡片。";
+
+    const events = [
+      ...parseLinesMulti(streamTextDelta(text), extractor),
+      ...parseLinesMulti(
+        JSON.stringify({
+          type: "assistant",
+          message: { content: [{ type: "text", text }] },
+        }),
+        extractor,
+      ),
+    ];
+
+    expect(events.some((event) => event.type === "answer_delta")).toBe(true);
+    expect(events.at(-1)).toMatchObject({ type: "answer_snapshot", text });
+  });
+
+  it("redacts local paths and secret-looking values from unmarked Claude live deltas", () => {
+    const extractor = new AnswerChannelExtractor();
+    const events = [
+      ...parseLinesMulti(
+        streamTextDelta("I checked /Users/alice/.larkway/session and FEISHU_APPSECRET=abc123456789."),
+        extractor,
+      ),
+      ...parseLinesMulti(
+        JSON.stringify({
+          type: "assistant",
+          message: {
+            content: [
+              {
+                type: "text",
+                text: "I checked /Users/alice/.larkway/session and FEISHU_APPSECRET=abc123456789.",
+              },
+            ],
+          },
+        }),
+        extractor,
+      ),
+    ];
+    const streamed = visibleAnswer(events);
+
+    expect(streamed).not.toContain("/Users/alice");
+    expect(streamed).not.toContain("abc123456789");
+    expect(streamed).toContain("[local-path]");
+    expect(streamed).toContain("FEISHU_APPSECRET=[redacted]");
+  });
+
   it("turns marker-gated Claude stream_event text deltas into answer deltas", () => {
     const extractor = new AnswerChannelExtractor();
     const lines = [
@@ -197,10 +256,7 @@ describe("parseLinesMulti", () => {
     ];
 
     const events = lines.flatMap((line) => [...parseLinesMulti(line, extractor)]);
-    const answer = events
-      .filter((event) => event.type === "answer_delta")
-      .map((event) => event.text)
-      .join("");
+    const answer = visibleAnswer(events);
 
     expect(answer).toBe("Visible answer text that is long enough to stream before the end marker.");
     expect(answer).not.toContain("hidden reasoning");
