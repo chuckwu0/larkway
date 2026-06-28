@@ -1,15 +1,15 @@
 /**
  * src/codex/runner.ts
  *
- * Spawns `codex exec --json` as a child process, parses its NDJSON output
- * line-by-line, and yields normalised AgentStreamEvents — same contract as
- * ClaudeRunner in src/claude/runner.ts.
+ * Spawns `codex app-server --stdio` as a child process, speaks the JSON-RPC
+ * app-server protocol, and yields normalised AgentStreamEvents — same contract
+ * as ClaudeRunner in src/claude/runner.ts.
  *
  * Design constraints (mirroring ClaudeRunner):
  *  - No Codex SDK — only Node built-ins + the `codex` CLI binary
  *  - OPENAI_API_KEY is stripped from env (subscription mode, not API key)
  *  - ANTHROPIC_API_KEY is also stripped (belt-and-suspenders)
- *  - --cwd/-C is passed as both a spawn option AND a CLI flag when provided
+ *  - cwd is passed as the spawn cwd and as app-server thread/turn params
  *  - done Promise resolves on any exit path (normal / error / kill / timeout)
  *  - Grandchild-holds-stdout handled identically to ClaudeRunner via
  *    rlAbortController + 5 s exit fallback
@@ -109,81 +109,31 @@ export function buildCodexEnv(
 // ---------------------------------------------------------------------------
 
 /**
- * Map RunOptions.permissionMode to the --sandbox / bypass flag for codex exec.
- */
-function sandboxFlag(mode: NonNullable<RunOptions["permissionMode"]>): string[] {
-  switch (mode) {
-    case "bypassPermissions":
-      return ["--dangerously-bypass-approvals-and-sandbox"];
-    case "acceptEdits":
-      // agent_workspace must let Codex use the host's normal developer surface:
-      // network/DNS for git remotes and macOS Keychain for lark-cli/user auth.
-      // Codex workspace-write sandbox blocks those in real dogfood runs, so the
-      // safety boundary for this mode is Larkway's human-confirmed workspace
-      // permissions + the host account/token scopes, not Codex's OS sandbox.
-      return ["--dangerously-bypass-approvals-and-sandbox"];
-    case "ask":
-      // Non-interactive; can't truly "ask" — degrade to read-only sandbox
-      return ["--sandbox", "read-only"];
-  }
-}
-
-function resumePermissionFlag(mode: NonNullable<RunOptions["permissionMode"]>): string[] {
-  // Current Codex `exec resume` does not accept `--sandbox`, so workspace-write
-  // / read-only cannot be restated on later turns. It does accept the explicit
-  // dangerous bypass flag. Agent-workspace acceptEdits also needs host-level
-  // DNS/network and local credential access on every resumed turn.
-  return mode === "bypassPermissions" || mode === "acceptEdits"
-    ? ["--dangerously-bypass-approvals-and-sandbox"]
-    : [];
-}
-
-/**
  * Build [bin, args] for spawning codex.
  *
- * Fresh session:
- *   codex exec --json [-C <cwd>] --skip-git-repo-check <sandbox flags>
- *   prompt → stdin
- *
- * Resume session:
- *   codex exec resume <sessionId> --json --skip-git-repo-check -
- *   prompt → stdin (`-` is required for resume to read stdin)
+ * Session lifecycle and the user prompt are sent over JSON-RPC after startup.
  */
 export function buildCodexCommand(
   opts: RunOptions,
   codexBinPath = "codex",
 ): [string, string[]] {
-  const mode = opts.permissionMode ?? "acceptEdits";
-  const commonFlags: string[] = [
-    "--json",
-    "--skip-git-repo-check",
-    ...sandboxFlag(mode),
-  ];
+  void opts;
+  return [codexBinPath, ["app-server", "--stdio"]];
+}
 
-  if (opts.resumeSessionId != null) {
-    // `codex exec resume` does NOT accept -C/--cd (only fresh `codex exec` does) —
-    // passing it makes codex exit 2 "unexpected argument '-C' found", breaking EVERY
-    // 2nd+ turn (resume). The working dir is set via the spawn cwd (process cwd)
-    // instead. GitLab issue: codex 多轮第二句就挂。
-    // Current `codex exec resume` also rejects `--sandbox`; for agent_workspace
-    // sessions the sandbox boundary is the original session + spawn cwd.
-    // Resume also needs an explicit `-` prompt argument to read this turn's
-    // instructions from stdin; without it the resumed topic may receive no new
-    // user message.
-    const resumeFlags = [
-      "--json",
-      "--skip-git-repo-check",
-      ...resumePermissionFlag(mode),
-    ];
-    return [
-      codexBinPath,
-      ["exec", "resume", opts.resumeSessionId, ...resumeFlags, "-"],
-    ];
-  }
+type JsonRecord = Record<string, unknown>;
 
-  // Fresh `codex exec` supports -C/--cd (cwd is also set as the spawn cwd).
-  const freshFlags = opts.cwd != null ? ["-C", opts.cwd, ...commonFlags] : commonFlags;
-  return [codexBinPath, ["exec", ...freshFlags]];
+function codexThreadSandboxMode(mode: NonNullable<RunOptions["permissionMode"]>): string {
+  return mode === "ask" ? "read-only" : "danger-full-access";
+}
+
+function codexTurnSandboxPolicy(mode: NonNullable<RunOptions["permissionMode"]>): JsonRecord {
+  if (mode === "ask") return { type: "readOnly", networkAccess: false };
+  return { type: "dangerFullAccess" };
+}
+
+function codexApprovalPolicy(mode: NonNullable<RunOptions["permissionMode"]>): string {
+  return mode === "ask" ? "on-request" : "never";
 }
 
 // ---------------------------------------------------------------------------
@@ -309,6 +259,85 @@ class CodexLineParser {
 
 }
 
+class CodexAppServerLineParser {
+  private readonly answerExtractor = new AnswerChannelExtractor();
+
+  *parseMessage(obj: unknown): Generator<AgentStreamEvent> {
+    if (typeof obj !== "object" || obj === null) {
+      yield { type: "raw", raw: obj };
+      return;
+    }
+
+    const record = obj as JsonRecord;
+    const method = record["method"];
+    if (typeof method !== "string") {
+      yield { type: "raw", raw: obj };
+      return;
+    }
+
+    const params = asRecord(record["params"]);
+
+    if (method === "thread/started") {
+      const thread = asRecord(params?.["thread"]);
+      const threadId = typeof thread?.["id"] === "string" ? thread["id"] : undefined;
+      if (threadId) yield { type: "system_init", sessionId: threadId, raw: obj };
+      return;
+    }
+
+    if (method === "turn/completed") {
+      yield { type: "result", stopReason: "end_turn", raw: obj };
+      return;
+    }
+
+    if (method === "item/agentMessage/delta") {
+      const delta = typeof params?.["delta"] === "string" ? params["delta"] : "";
+      yield* this.answerExtractor.ingestDelta(delta, obj);
+      return;
+    }
+
+    if (method === "item/started") {
+      const item = asRecord(params?.["item"]);
+      if (item?.["type"] === "commandExecution" && typeof item["command"] === "string") {
+        yield {
+          type: "tool_use",
+          toolName: "shell",
+          toolInput: { command: item["command"] },
+          raw: obj,
+        };
+        return;
+      }
+      return;
+    }
+
+    if (method === "item/completed") {
+      const item = asRecord(params?.["item"]);
+      if (item?.["type"] === "commandExecution") {
+        yield { type: "tool_result", raw: obj };
+        return;
+      }
+      if (item?.["type"] === "agentMessage" && typeof item["text"] === "string") {
+        yield* this.answerExtractor.ingestSnapshot(item["text"], obj);
+        return;
+      }
+      return;
+    }
+
+    yield { type: "raw", raw: obj };
+  }
+}
+
+function asRecord(value: unknown): JsonRecord | undefined {
+  return typeof value === "object" && value !== null ? value as JsonRecord : undefined;
+}
+
+function extractThreadIdFromThreadResponse(obj: unknown): string | undefined {
+  const record = asRecord(obj);
+  const result = asRecord(record?.["result"]);
+  const thread = asRecord(result?.["thread"]);
+  const threadId = thread?.["id"];
+  return typeof threadId === "string" ? threadId : undefined;
+}
+
 function agentMessageTextFrom(record: Record<string, unknown>): string | undefined {
   const item = record["item"];
   if (typeof item !== "object" || item === null) return undefined;
@@ -330,22 +359,25 @@ export function runCodex(opts: RunOptions, codexBinPath = "codex"): RunHandle {
   const timeoutMs = opts.timeoutMs ?? 15 * 60 * 1000;
   const [bin, args] = buildCodexCommand(opts, codexBinPath);
   const env = buildCodexEnv(opts.botGitIdentity, opts.gitlabToken);
+  const mode = opts.permissionMode ?? "acceptEdits";
+  const requestById = new Map<number, string>();
+  let nextRequestId = 1;
 
   // ── spawn ─────────────────────────────────────────────────────────────────
-  // stdin is "pipe" so we can write the prompt then end it.
-  // codex exec reads the prompt from stdin when run non-interactively.
+  // stdin/stdout carry app-server JSON-RPC. This is the Codex surface that
+  // emits item/agentMessage/delta during generation; `codex exec --json`
+  // only emits the completed agent message at the end.
   const child = spawn(bin, args, {
     env,
     stdio: ["pipe", "pipe", "pipe"],
     ...(opts.cwd != null ? { cwd: opts.cwd } : {}),
   });
 
-  // Write prompt to stdin, then close stdin to signal EOF to codex.
-  // This must be fire-and-forget (errors go to child.stdin 'error' event
-  // which we ignore — the process will fail with a non-zero exit code).
-  if (child.stdin != null) {
-    child.stdin.write(opts.prompt, "utf8");
-    child.stdin.end();
+  function sendRequest(method: string, params: unknown): number {
+    const id = nextRequestId++;
+    requestById.set(id, method);
+    child.stdin?.write(JSON.stringify({ jsonrpc: "2.0", id, method, params }) + "\n");
+    return id;
   }
 
   // Track discovered sessionId for done promise
@@ -363,6 +395,11 @@ export function runCodex(opts: RunOptions, codexBinPath = "codex"): RunHandle {
       if (!child.killed) child.kill("SIGKILL");
     }, SIGKILL_GRACE_MS);
     killTimer.unref();
+  }
+
+  function stopAppServerAfterTurn(): void {
+    if (child.killed || killScheduled) return;
+    child.kill("SIGTERM");
   }
 
   // ── timeout ───────────────────────────────────────────────────────────────
@@ -410,6 +447,8 @@ export function runCodex(opts: RunOptions, codexBinPath = "codex"): RunHandle {
   // to unblock the `for await (line of rl)` loop even when stdout hasn't drained
   // (grandchild holding stdio pipe). This ensures handler.ts reaches finalize().
   const rlAbortController = new AbortController();
+  let finishAppServerTurn: ((exitCode: number) => void) | undefined;
+  let failAppServerTurn: ((err: Error) => void) | undefined;
 
   // ── done promise ──────────────────────────────────────────────────────────
   const done = new Promise<{ exitCode: number; sessionId?: string }>(
@@ -446,6 +485,19 @@ export function runCodex(opts: RunOptions, codexBinPath = "codex"): RunHandle {
         }
         resolve({ exitCode, sessionId: discoveredSessionId });
       };
+
+      const finalizeReject = (err: Error): void => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timeoutHandle);
+        clearTimeout(killTimer);
+        clearTimeout(totalTimeoutFallbackHandle);
+        rlAbortController.abort();
+        reject(err);
+      };
+
+      finishAppServerTurn = finalizeResolve;
+      failAppServerTurn = finalizeReject;
 
       // Wire the Stage-2 total-timeout fallback.  Called by the setTimeout above
       // (after the full kill grace) to force-resolve done when the child is silent.
@@ -509,15 +561,89 @@ export function runCodex(opts: RunOptions, codexBinPath = "codex"): RunHandle {
       crlfDelay: Infinity,
       signal: rlAbortController.signal,
     });
-    const parser = new CodexLineParser();
+    const parser = new CodexAppServerLineParser();
+    let turnCompleted = false;
+
+    sendRequest("initialize", {
+      clientInfo: { name: "larkway", version: "0.3" },
+      capabilities: {},
+    });
 
     try {
       for await (const line of rl) {
-        for (const event of parser.parseLine(line)) {
+        const trimmed = line.trim();
+        if (!trimmed) continue;
+
+        let obj: unknown;
+        try {
+          obj = JSON.parse(trimmed);
+        } catch {
+          yield { type: "raw", raw: trimmed };
+          continue;
+        }
+
+        const response = asRecord(obj);
+        if (typeof response?.["id"] === "number") {
+          const id = response["id"];
+          const method = requestById.get(id);
+          requestById.delete(id);
+
+          const error = asRecord(response["error"]);
+          if (error) {
+            const message = typeof error["message"] === "string"
+              ? error["message"]
+              : JSON.stringify(error);
+            failAppServerTurn?.(new Error(`codex app-server ${method ?? "request"} failed: ${message}`));
+            stopAppServerAfterTurn();
+            return;
+          }
+
+          if (method === "initialize") {
+            const threadMethod = opts.resumeSessionId != null ? "thread/resume" : "thread/start";
+            const threadParams: JsonRecord = opts.resumeSessionId != null
+              ? { threadId: opts.resumeSessionId }
+              : { ephemeral: false, sessionStartSource: "startup" };
+            if (opts.cwd != null) threadParams["cwd"] = opts.cwd;
+            threadParams["approvalPolicy"] = codexApprovalPolicy(mode);
+            threadParams["sandbox"] = codexThreadSandboxMode(mode);
+            sendRequest(threadMethod, threadParams);
+            continue;
+          }
+
+          if (method === "thread/start" || method === "thread/resume") {
+            const threadId = extractThreadIdFromThreadResponse(obj);
+            if (threadId) {
+              discoveredSessionId = threadId;
+              yield { type: "system_init", sessionId: threadId, raw: obj };
+              const turnParams: JsonRecord = {
+                threadId,
+                input: [{ type: "text", text: opts.prompt, text_elements: [] }],
+                approvalPolicy: codexApprovalPolicy(mode),
+                sandboxPolicy: codexTurnSandboxPolicy(mode),
+              };
+              if (opts.cwd != null) turnParams["cwd"] = opts.cwd;
+              sendRequest("turn/start", turnParams);
+            }
+            continue;
+          }
+
+          continue;
+        }
+
+        for (const event of parser.parseMessage(obj)) {
           if (event.type === "system_init") {
             discoveredSessionId = event.sessionId;
           }
+          if (event.type === "result") {
+            turnCompleted = true;
+          }
           yield event;
+        }
+
+        if (turnCompleted) {
+          stopAppServerAfterTurn();
+          finishAppServerTurn?.(0);
+          return;
         }
       }
     } catch (err) {
@@ -561,6 +687,7 @@ export class CodexRunner implements AgentRunner {
 export {
   buildCodexEnv as _buildCodexEnv,
   buildCodexCommand as _buildCodexCommand,
+  CodexAppServerLineParser as _CodexAppServerLineParser,
   CodexLineParser as _CodexLineParser,
   parseCodexLine as _parseCodexLine,
 };
