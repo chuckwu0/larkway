@@ -7,17 +7,11 @@ export function defaultResponseSurfacePrototypeConfig() {
     enabled: true,
     allowed_chats: [] as string[],
     allowed_threads: [] as string[],
-    lazy_card_creation: true,
     kill_switch: false,
     post_outbound_enabled: true,
     cardkit_streaming_enabled: true,
     allow_agent_mentions: true,
     allowed_mention_open_ids: [] as string[],
-    max_posts_per_turn: 1,
-    max_posts_per_window: 4,
-    post_window_ms: 60_000,
-    max_post_attempts: 3,
-    text_threshold_chars: 1200,
   };
 }
 
@@ -27,17 +21,11 @@ const responseSurfacePrototypeConfigDefaults = () => ({
   enabled: true,
   allowed_chats: [] as string[],
   allowed_threads: [] as string[],
-  lazy_card_creation: true,
   kill_switch: false,
   post_outbound_enabled: true,
   cardkit_streaming_enabled: true,
   allow_agent_mentions: true,
   allowed_mention_open_ids: [] as string[],
-  max_posts_per_turn: 1,
-  max_posts_per_window: 4,
-  post_window_ms: 60_000,
-  max_post_attempts: 3,
-  text_threshold_chars: 1200,
 });
 
 export const ResponseSurfaceModeSchema = z.enum(["card", "post", "hybrid"]);
@@ -113,12 +101,6 @@ export const ResponseSurfacePrototypeConfigSchema = z
      */
     allowed_threads: z.array(z.string().min(1)).default([]),
     /**
-     * Historical post-first gate retained for config compatibility. The default
-     * runtime no longer uses post-first lazy card creation; CardKit is the main
-     * surface and legacy cards remain the visible fallback.
-     */
-    lazy_card_creation: z.boolean().default(true),
-    /**
      * Runtime kill switch for emergency rollback. When true, every response
      * surface post path is treated as disabled even if enabled/allowlists are
      * otherwise configured.
@@ -147,31 +129,6 @@ export const ResponseSurfacePrototypeConfigSchema = z
      * Keep real IDs in private bot config, never in public docs/tests.
      */
     allowed_mention_open_ids: z.array(z.string().min(1)).default([]),
-    /**
-     * Historical post dispatch cap retained for schema compatibility and
-     * isolated dispatcher tests.
-     */
-    max_posts_per_turn: z.number().int().min(0).max(10).default(1),
-    /**
-     * Sliding-window hard cap for real post sends within one bot/chat/thread
-     * runtime scope. This is enforced in the production handler before a post
-     * transport call is attempted; exhausted windows degrade to visible cards.
-     */
-    max_posts_per_window: z.number().int().min(0).max(100).default(4),
-    /**
-     * Sliding-window duration for max_posts_per_window.
-     */
-    post_window_ms: z.number().int().min(1_000).max(86_400_000).default(60_000),
-    /**
-     * Max attempts for one logical post. Retry classification is intentionally
-     * narrow in PR3: only 5xx errors are retryable.
-     */
-    max_post_attempts: z.number().int().min(1).max(5).default(3),
-    /**
-     * Historical threshold for removed lazy card creation experiments. Bounded
-     * so older config remains parseable without growing arbitrary business rules.
-     */
-    text_threshold_chars: z.number().int().min(1).max(20_000).default(1200),
   })
   .default(responseSurfacePrototypeConfigDefaults);
 
@@ -212,9 +169,7 @@ export function shouldProvideResponseSurfacePostClient(
   return !!(
     config?.enabled &&
     !config.kill_switch &&
-    config.post_outbound_enabled &&
-    config.max_posts_per_turn >= 1 &&
-    config.max_posts_per_window >= 1
+    config.post_outbound_enabled
   );
 }
 

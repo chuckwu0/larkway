@@ -545,7 +545,7 @@ read_only: false
     expect(bots[0]?.read_only).toBe(false);
   });
 
-  it("response_surface_prototype defaults CardKit surfaces on with post fallback config retained", async () => {
+  it("response_surface_prototype defaults CardKit surfaces on with post fallback transport retained", async () => {
     await createBotsDir();
     await writeYaml(
       "surface-default.yaml",
@@ -565,21 +565,15 @@ bot_open_id: surface_default_bot
       enabled: true,
       allowed_chats: [],
       allowed_threads: [],
-      lazy_card_creation: true,
       kill_switch: false,
       post_outbound_enabled: true,
       cardkit_streaming_enabled: true,
       allow_agent_mentions: true,
       allowed_mention_open_ids: [],
-      max_posts_per_turn: 1,
-      max_posts_per_window: 4,
-      post_window_ms: 60_000,
-      max_post_attempts: 3,
-      text_threshold_chars: 1200,
     });
   });
 
-  it("parses response_surface_prototype scoped rollout config", async () => {
+  it("parses response_surface_prototype scoped rollout config and strips retired post-only fields", async () => {
     await createBotsDir();
     await writeYaml(
       "surface-prototype.yaml",
@@ -617,17 +611,11 @@ response_surface_prototype:
       enabled: true,
       allowed_chats: ["oc_test"],
       allowed_threads: ["om_thread"],
-      lazy_card_creation: true,
       kill_switch: true,
       post_outbound_enabled: true,
       cardkit_streaming_enabled: false,
       allow_agent_mentions: false,
       allowed_mention_open_ids: ["surface_peer"],
-      max_posts_per_turn: 2,
-      max_posts_per_window: 7,
-      post_window_ms: 30_000,
-      max_post_attempts: 2,
-      text_threshold_chars: 900,
     });
   });
 

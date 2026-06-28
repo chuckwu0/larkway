@@ -12,7 +12,6 @@ import {
 const enabledConfig = {
   ...defaultResponseSurfacePrototypeConfig(),
   allowed_chats: ["chat"],
-  lazy_card_creation: true,
 };
 
 describe("response surface production gates", () => {
@@ -28,9 +27,6 @@ describe("response surface production gates", () => {
       allowed_chats: [],
       allowed_threads: [],
       allowed_mention_open_ids: [],
-      max_posts_per_turn: 1,
-      max_posts_per_window: 4,
-      post_window_ms: 60_000,
     });
     expect(isResponseSurfacePrototypeAllowlisted(cfg, { chatId: "any_chat", threadId: "any_thread" }))
       .toBe(true);
@@ -68,8 +64,8 @@ describe("response surface production gates", () => {
     ).toBe(false);
   });
 
-  it("does not provide a post client when the runtime window cap is zero", () => {
-    const cfg = { ...enabledConfig, max_posts_per_window: 0 };
+  it("does not provide a post client when post outbound is disabled", () => {
+    const cfg = { ...enabledConfig, post_outbound_enabled: false };
 
     expect(shouldProvideResponseSurfacePostClient(cfg)).toBe(false);
   });

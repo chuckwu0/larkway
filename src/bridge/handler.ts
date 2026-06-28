@@ -43,7 +43,6 @@ import {
   type CardKitProgressHandle,
   type CardKitLiveMetrics,
 } from "./cardkitProgress.js";
-import { dispatchResponseSurface } from "./surfaceDispatcher.js";
 import type { RuntimeEventPatch } from "./eventLog.js";
 import type { RuntimeRequirement } from "../runtimeRequirements.js";
 import {
@@ -56,7 +55,6 @@ import {
   type OutboundCardKitClient,
 } from "../lark/channelCardKitClient.js";
 import type { OutboundPostClient } from "../lark/outboundPostClient.js";
-import { markPostLedgerFallbackVisible, markPostLedgerPolicyBlockedVisible } from "./postFile.js";
 import { buildPostContent } from "../lark/postContent.js";
 import { derivePostIdempotencyKey, digestPostContent } from "../lark/idempotency.js";
 
@@ -1480,27 +1478,6 @@ export class BridgeHandler {
               }
             }
           } else {
-            const surfaceDispatch = await dispatchResponseSurface({
-              state: reportedState,
-              prototypeConfig,
-              facts: {
-                botId: this.deps.botConfig?.id ?? "v1-default",
-                chatId: parsed.chatId,
-                threadId,
-                triggerMessageId: messageId,
-                replyToMessageId: messageId,
-                replyInThread,
-              },
-              worktreePath,
-              baseCard: baseCardPayload,
-              cardStarted: !!card,
-              postOutboundAvailable: false,
-              postLedgerAvailable: true,
-              visibleFallbackAvailable: true,
-              postClient: this.deps.postClient,
-            });
-
-          if (surfaceDispatch.card) {
             if (!card) {
               try {
                 card = await this.deps.cardRenderer.start(messageId, { replyInThread, threadId });
@@ -1536,9 +1513,9 @@ export class BridgeHandler {
                   botId: this.deps.botConfig?.id ?? "v1-default",
                   threadId,
                   triggerMessageId: messageId,
-                  finalText: surfaceDispatch.card.finalText ?? "Larkway completed but no visible card was available.",
+                  finalText: baseCardPayload.finalText,
                   failureReason,
-                  title: surfaceDispatch.card.titleOverride ?? "Larkway fallback",
+                  title: baseCardPayload.titleOverride ?? "Larkway fallback",
                   logPrefix: "[bridge.handler]",
                 });
                 if (!postFallback) throw err;
@@ -1546,61 +1523,12 @@ export class BridgeHandler {
             }
 
             if (card) {
-              await card.finalize(surfaceDispatch.card);
-
-              let keepCardFileForRetry = false;
-              if (surfaceDispatch.post?.requiresFallbackLedgerMark) {
-                try {
-                  await markPostLedgerFallbackVisible(
-                    worktreePath,
-                    surfaceDispatch.post.idempotencyKey,
-                    {
-                      fallbackCardMessageId: card.messageId,
-                      error:
-                        surfaceDispatch.post.fallbackError ??
-                        surfaceDispatch.card.failureReason ??
-                        "post outbound failed; visible card fallback used",
-                    },
-                  );
-                } catch (err) {
-                  keepCardFileForRetry = true;
-                  console.warn(
-                    "[bridge.handler] fallback ledger mark failed after visible card finalize; keeping card.json for retry:",
-                    err,
-                  );
-                }
-              }
-              if (surfaceDispatch.post?.requiresPolicyLedgerMark) {
-                try {
-                  await markPostLedgerPolicyBlockedVisible(
-                    worktreePath,
-                    surfaceDispatch.post.idempotencyKey,
-                    {
-                      fallbackCardMessageId: card.messageId,
-                      error:
-                        surfaceDispatch.post.policyError ??
-                        surfaceDispatch.card.failureReason ??
-                        "mention policy blocked; visible card fallback used",
-                    },
-                  );
-                } catch (err) {
-                  keepCardFileForRetry = true;
-                  console.warn(
-                    "[bridge.handler] policy-blocked ledger mark failed after visible card finalize; keeping card.json for retry:",
-                    err,
-                  );
-                }
-              }
+              await card.finalize(baseCardPayload);
 
               // Card was finalized successfully — drop its card.json so boot
-              // reconcile doesn't re-finalize an already-finalized card. If the
-              // post fallback/policy ledger mark failed, keep card.json so boot
-              // reconcile can retry association with the existing visible card.
-              if (!keepCardFileForRetry) {
-                await deleteCardFile(worktreePath);
-              }
+              // reconcile doesn't re-finalize an already-finalized card.
+              await deleteCardFile(worktreePath);
             }
-          }
           }
 
           // Terminal SUCCESS: promote the message out of in-flight into the
