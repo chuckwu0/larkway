@@ -12,7 +12,12 @@
 
 import { describe, it, expect, afterEach, vi } from "vitest";
 import { EventEmitter, PassThrough } from "node:stream";
-import { _buildCommand as buildCommand, _buildEnv as buildEnv } from "./runner.js";
+import { AnswerChannelExtractor } from "../agent/answerChannel.js";
+import {
+  _buildCommand as buildCommand,
+  _buildEnv as buildEnv,
+  _parseLinesMulti as parseLinesMulti,
+} from "./runner.js";
 
 // ---------------------------------------------------------------------------
 // Helpers for spawn-level integration tests (no real claude CLI)
@@ -168,6 +173,65 @@ describe("buildCommand", () => {
     });
 
     expect(args[args.indexOf("--permission-mode") + 1]).toBe("bypassPermissions");
+  });
+});
+
+describe("parseLinesMulti", () => {
+  function streamTextDelta(text: string): string {
+    return JSON.stringify({
+      type: "stream_event",
+      event: {
+        type: "content_block_delta",
+        index: 0,
+        delta: { type: "text_delta", text },
+      },
+    });
+  }
+
+  it("turns marker-gated Claude stream_event text deltas into answer deltas", () => {
+    const extractor = new AnswerChannelExtractor();
+    const lines = [
+      streamTextDelta("hidden reasoning\nL"),
+      streamTextDelta("ARKWAY_ANSWER_BEGIN\nVisible answer text that is long enough to stream"),
+      streamTextDelta(" before the end marker.\nLARKWAY_ANSWER_END\nhidden trailing"),
+    ];
+
+    const events = lines.flatMap((line) => [...parseLinesMulti(line, extractor)]);
+    const answer = events
+      .filter((event) => event.type === "answer_delta")
+      .map((event) => event.text)
+      .join("");
+
+    expect(answer).toBe("Visible answer text that is long enough to stream before the end marker.");
+    expect(answer).not.toContain("hidden reasoning");
+    expect(answer).not.toContain("hidden trailing");
+  });
+
+  it("does not duplicate the final assistant snapshot after stream_event deltas", () => {
+    const extractor = new AnswerChannelExtractor();
+    const answer = "Visible answer text that is long enough to stream before completion.";
+    const streamEvents = [
+      ...parseLinesMulti(streamTextDelta(`LARKWAY_ANSWER_BEGIN\n${answer}\nLARKWAY_ANSWER_END`), extractor),
+    ];
+    const finalEvents = [
+      ...parseLinesMulti(
+        JSON.stringify({
+          type: "assistant",
+          message: {
+            content: [
+              {
+                type: "text",
+                text: `LARKWAY_ANSWER_BEGIN\n${answer}\nLARKWAY_ANSWER_END`,
+              },
+            ],
+          },
+        }),
+        extractor,
+      ),
+    ];
+
+    expect(streamEvents.some((event) => event.type === "answer_delta")).toBe(true);
+    expect(finalEvents.filter((event) => event.type === "answer_snapshot")).toHaveLength(0);
   });
 });
 

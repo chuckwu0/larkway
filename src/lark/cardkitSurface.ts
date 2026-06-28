@@ -187,10 +187,6 @@ export function buildCardKitFinalCard(
       streaming_mode: false,
       summary: { content: truncateChars(opts.finalText.replace(/\s+/g, " ").trim(), 50, "...") },
     },
-    header: {
-      title: plainText(opts.title ?? "完成"),
-      template: "green",
-    },
     body: { elements },
   });
 }

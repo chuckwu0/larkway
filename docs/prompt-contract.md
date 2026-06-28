@@ -151,7 +151,7 @@ Agent 通过工作区里的 `.larkway/state.json` 或 v0.3 session state artifac
 - `status`: `in_progress / ready / failed`,bridge 唯一强依赖字段。
 - `last_message`: 最终或当前要给运营看的正文。Agent 自己决定结构,不需要固定格式。
 - `error`: 失败原因。
-- `card_title` / `card_color`: 可选的标题和色彩语义。
+- `card_title` / `card_color`: 兼容字段。默认 CardKit 不渲染顶部标题色条;legacy/fallback 卡片路径可继续使用。
 - `choices` / `choice_prompt`: 可选的离散选择。按钮点击只把 value 作为新一轮文本交回 Agent。
 - `content_blocks`: 可选的有序 markdown/image 正文块。需要平台正文与匹配图片在同一 review card 里相邻展示时使用;优先级和示例见 [Review Card Content Blocks](review-card-content-blocks.md)。
 - `response_surface`: 可选覆盖,用于显式声明 `card` / `post` / `hybrid` surface 或 mentions。普通回复可不写;无显式 card 意图时默认 CardKit 流式卡片。协议和门禁见 [Response Surface Prototype](response-surface-prototype.md)。

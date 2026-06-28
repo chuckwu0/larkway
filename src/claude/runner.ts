@@ -21,7 +21,7 @@ import {
   type RunOptions,
   type RunHandle,
 } from "../agent/runner.js";
-import { splitAnswerChannelText } from "../agent/answerChannel.js";
+import { AnswerChannelExtractor } from "../agent/answerChannel.js";
 
 // ---------------------------------------------------------------------------
 // Public types — re-exported for backward compatibility
@@ -113,7 +113,10 @@ function buildCommand(opts: RunOptions): [string, string[]] {
  * An `assistant` message with multiple content blocks (e.g. text + tool_use)
  * would emit one event per block.
  */
-function* parseLinesMulti(line: string): Generator<AgentStreamEvent> {
+function* parseLinesMulti(
+  line: string,
+  answerExtractor = new AnswerChannelExtractor(),
+): Generator<AgentStreamEvent> {
   const trimmed = line.trim();
   if (trimmed === "") return;
 
@@ -164,7 +167,7 @@ function* parseLinesMulti(line: string): Generator<AgentStreamEvent> {
         const block = item as Record<string, unknown>;
 
         if (block["type"] === "text" && typeof block["text"] === "string") {
-          yield* splitAnswerChannelText(block["text"], obj);
+          yield* answerExtractor.ingestSnapshot(block["text"], obj);
           emitted = true;
         } else if (block["type"] === "tool_use") {
           yield {
@@ -179,6 +182,27 @@ function* parseLinesMulti(line: string): Generator<AgentStreamEvent> {
 
       if (!emitted) yield { type: "raw", raw: obj };
       return;
+    }
+    yield { type: "raw", raw: obj };
+    return;
+  }
+
+  if (eventType === "stream_event") {
+    const event = record["event"];
+    if (typeof event === "object" && event !== null) {
+      const streamEvent = event as Record<string, unknown>;
+      const delta = streamEvent["delta"];
+      if (typeof delta === "object" && delta !== null) {
+        const deltaRecord = delta as Record<string, unknown>;
+        if (
+          streamEvent["type"] === "content_block_delta" &&
+          deltaRecord["type"] === "text_delta" &&
+          typeof deltaRecord["text"] === "string"
+        ) {
+          yield* answerExtractor.ingestDelta(deltaRecord["text"], obj);
+          return;
+        }
+      }
     }
     yield { type: "raw", raw: obj };
     return;
@@ -493,9 +517,11 @@ export function runClaude(opts: RunOptions): RunHandle {
     // but a grandchild is holding stdout open — rlAbortController.abort() is
     // called by finalizeResolve() so this loop exits and handler.ts can
     // proceed to card.finalize() without waiting for stdout to drain).
+    const answerExtractor = new AnswerChannelExtractor();
+
     try {
       for await (const line of rl) {
-        for (const event of parseLinesMulti(line)) {
+        for (const event of parseLinesMulti(line, answerExtractor)) {
           // Track sessionId as we see it
           if (event.type === "system_init") {
             discoveredSessionId = event.sessionId;
