@@ -1941,10 +1941,10 @@ describe("ChannelClient — gap-fill retry + failed-window replay (0.3.17)", () 
 });
 
 // ---------------------------------------------------------------------------
-// 0.3.28 multi-bot storm + idle pingTimeout watchdog + atomic state writes.
+// 0.3.28 multi-bot storm + half-open detection + atomic state writes.
 // ---------------------------------------------------------------------------
 
-describe("ChannelClient — drop idle pingTimeout watchdog (0.3.28)", () => {
+describe("ChannelClient — keep half-open WS detection (0.3.28)", () => {
   function makeFakeChannel() {
     return {
       botIdentity: { openId: "ou_bot", name: "test-bot" },
@@ -1956,10 +1956,15 @@ describe("ChannelClient — drop idle pingTimeout watchdog (0.3.28)", () => {
     };
   }
 
-  // REGRESSION GUARD: if someone re-adds `wsConfig: { pingTimeout: ... }` (the
-  // idle-killing watchdog), the first assertion goes RED. The handshakeTimeoutMs
-  // assertion guards that we DIDN'T also drop the harmless abort timeout.
-  it("does NOT pass wsConfig.pingTimeout but KEEPS handshakeTimeoutMs", async () => {
+  // REGRESSION GUARD: pingTimeout is the SDK's half-open detection (verified in
+  // node-sdk 1.67.0 source: clearLiveness runs on every inbound frame → never
+  // mis-fires on healthy idle connections; armLiveness is a no-op when unset →
+  // unsetting removes half-open detection entirely). Removing it would let a
+  // silently-half-open WS on a KNOWN chat drop an @ that neither reconnect-gap-fill
+  // nor the (now targeted) steady-state discovery could recover. If someone drops
+  // `wsConfig.pingTimeout`, the first assertion goes RED. The handshakeTimeoutMs
+  // assertion guards the harmless abort timeout stays too.
+  it("passes wsConfig.pingTimeout=60 (half-open detection) AND handshakeTimeoutMs=15000", async () => {
     let captured: Record<string, unknown> | undefined;
     vi.resetModules();
     vi.doMock("@larksuiteoapi/node-sdk", () => ({
@@ -1981,7 +1986,8 @@ describe("ChannelClient — drop idle pingTimeout watchdog (0.3.28)", () => {
 
     await client.connect();
     expect(captured).toBeDefined();
-    expect(captured).not.toHaveProperty("wsConfig"); // idle watchdog removed
+    const wsConfig = captured!["wsConfig"] as { pingTimeout?: number } | undefined;
+    expect(wsConfig?.pingTimeout).toBe(60); // half-open detection kept
     expect(captured!["handshakeTimeoutMs"]).toBe(15_000); // abort timeout kept
 
     await client.close();
@@ -2092,9 +2098,15 @@ describe("ChannelClient — open-chat discovery storm controls (0.3.28)", () => 
    * still be gap-filled — this is the correctness invariant the storm fix must
    * not break. If the targeting wrongly excluded new chats, this goes RED.
    */
-  it("a newly-discovered chat on a later cycle IS gap-filled", async () => {
+  it("a newly-discovered chat on a later cycle IS gap-filled with a look-back covering the interval", async () => {
     let knownChats = [{ chat_id: "oc_old" }] as Array<{ chat_id: string }>;
     const pulledChatIds: string[] = [];
+    const newChatStarts: number[] = []; // captured `--start` (ms) for oc_new pulls
+    // Interval deliberately ABOVE the gapFill 5-min (300s) normal clamp so the
+    // look-back assertion below truly exercises BOTH the widened lookback and the
+    // clamp floor (minWindowMs). The explicit discoverOpenChatsForTest() seam runs
+    // a cycle on demand and does NOT wait this interval, so the big value is free.
+    const discoveryIntervalMs = 400_000;
     const gapMessageId = "om_new_group";
     vi.resetModules();
     vi.doMock("node:child_process", () => ({
@@ -2117,6 +2129,10 @@ describe("ChannelClient — open-chat discovery storm controls (0.3.28)", () => 
           const i = args.indexOf("--chat-id");
           const chatId = i >= 0 ? args[i + 1]! : "";
           pulledChatIds.push(chatId);
+          if (chatId === "oc_new") {
+            const si = args.indexOf("--start");
+            if (si >= 0) newChatStarts.push(Date.parse(args[si + 1]!));
+          }
           const items =
             chatId === "oc_new"
               ? [
@@ -2148,7 +2164,7 @@ describe("ChannelClient — open-chat discovery storm controls (0.3.28)", () => 
       appSecret: "secret",
       connectGraceMs: 0,
       channelStaleMs: 0,
-      openChatDiscoveryMs: 5_000,
+      openChatDiscoveryMs: discoveryIntervalMs,
     });
     client.setOpenChatDiscoveryJitterForTest(0);
 
@@ -2164,6 +2180,7 @@ describe("ChannelClient — open-chat discovery storm controls (0.3.28)", () => 
 
     // A new group joins → appears on the next discovery cycle.
     knownChats = [{ chat_id: "oc_old" }, { chat_id: "oc_new" }];
+    const cycleAt = Date.now();
     await client.discoverOpenChatsForTest();
 
     for (let i = 0; i < 100 && !dispatched.includes(gapMessageId); i++) {
@@ -2171,6 +2188,16 @@ describe("ChannelClient — open-chat discovery storm controls (0.3.28)", () => 
     }
     expect(pulledChatIds).toContain("oc_new"); // the new group WAS pulled
     expect(dispatched).toContain(gapMessageId); // its pending @ recovered
+
+    // LOOK-BACK GUARD: the new chat's pull `--start` must reach back AT LEAST one
+    // discovery interval before the cycle (a group joined+@'d anytime since the
+    // previous cycle, up to `interval` ago, must be inside the window). Interval
+    // (400s) > the 5-min normal clamp, so this is RED if EITHER the lookback is
+    // reverted to a fixed value below the interval OR the clamp floor (minWindowMs)
+    // is dropped and truncates the window back to 5 min.
+    expect(newChatStarts.length).toBeGreaterThanOrEqual(1);
+    const earliestNewStart = Math.min(...newChatStarts);
+    expect(earliestNewStart).toBeLessThanOrEqual(cycleAt - discoveryIntervalMs);
 
     await client.close();
     cleanup();

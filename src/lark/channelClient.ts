@@ -49,17 +49,24 @@ const SEEN_MESSAGES_LIMIT = 1000;
  * warning so the drop is visible, not silent.
  */
 const MAX_MESSAGE_ATTEMPTS = 5;
-const OPEN_CHAT_DISCOVERY_LOOKBACK_MS = 90_000;
+/**
+ * Buffer added on top of the discovery interval for the non-bootstrap targeted
+ * look-back, so a chat first seen between two cycles (up to one interval apart)
+ * plus any near-boundary @ is always inside the recovered window — no hole
+ * between cycles. (The effective look-back is `interval + this`.)
+ */
+const OPEN_CHAT_DISCOVERY_LOOKBACK_BUFFER_MS = 30_000;
 const OPEN_CHAT_DISCOVERY_BOOTSTRAP_LOOKBACK_MS = 30 * 60 * 1000;
 const PROCESSING_REACTION_EMOJI = "Typing";
 
 // ── open-chat discovery storm controls (root cause: multi-bot, chats:[]) ──────
 /**
- * Default discovery cadence. Was 60s; periodic discovery re-pulls history for
- * EVERY bot-joined chat each cycle, so at 60s a fleet of N bots each in M chats
- * issues N×M history pulls/min — observed driving Feishu's auth endpoint into TLS
- * timeouts (~30× the steady-state gap-fill rate at 4 bots). 5 min keeps "discover
- * newly-invited groups" working while cutting periodic pulls ~5×. Override via
+ * Default discovery cadence. Was 60s. Combined with the targeted-gap-fill change
+ * (a steady-state cycle pulls history for ZERO already-known chats, not all of
+ * them), the periodic history-pull load at steady state drops to ~0 — far more
+ * than a constant-factor reduction. The longer cadence additionally lowers the
+ * cost of the chats-LIST call itself. We still discover newly-invited groups
+ * within one interval (and gap-fill them on first sight). Override via
  * LARKWAY_OPEN_CHAT_DISCOVERY_MS.
  */
 const DEFAULT_OPEN_CHAT_DISCOVERY_MS = 300_000;
@@ -687,17 +694,27 @@ export class ChannelClient {
       //     real network flap. If a future node-sdk / @larksuite/channel exposes
       //     the ws or attaches its own listener, prefer that and drop the guard.
       handshakeTimeoutMs: 15_000,
-      // NOTE — intentionally NO `wsConfig: { pingTimeout: 60 }` here.
-      // A 60s ping-timeout watchdog mis-fires on a perfectly healthy IDLE
-      // connection: Feishu's server-side WS pingInterval is ~120s, so on a quiet
-      // bot the gap between inbound frames routinely exceeds a 60s timeout and the
-      // watchdog tears the socket down + reconnects for no reason (measured ~2% of
-      // all disconnects, with zero recovered messages to show for it). Dropping it
-      // returns to the SDK's native policy — reconnect only on a real WS close —
-      // which already covers the genuinely-dead cases via autoReconnect. The
-      // half-open case the 60s timeout was meant to catch is rare and far cheaper
-      // to absorb (next real frame / server ping closes it) than to chase with a
-      // watchdog that误杀 idle connections.
+      // HALF-OPEN DETECTION (SECONDS) — keep this on. It terminates a socket that
+      // has gone half-open (server stopped responding but never sent a FIN/close),
+      // so the SDK's 'close' handler runs the normal reconnect → our gap-fill
+      // recovers anything missed during the dead window.
+      //
+      // This does NOT mis-fire on healthy idle connections. Verified against
+      // node-sdk 1.67.0 source (WSClient liveness):
+      //   - clearLiveness() is called on EVERY inbound frame (incl. the server's
+      //     pong) — a live connection cancels the watchdog within ms, so an
+      //     idle-but-healthy socket that still answers the ~120s server ping is
+      //     never killed.
+      //   - armLiveness() only (re)arms for pingTimeout SECONDS after each ping and
+      //     is a NO-OP when pingTimeout is unset → unsetting it removes half-open
+      //     detection ENTIRELY (no 'close' event → no reconnect → no gap-fill).
+      //     A silently-half-open WS on a KNOWN chat would then drop an @ that
+      //     neither reconnect-gap-fill nor the (now targeted) steady-state
+      //     discovery — which pulls 0 for already-known chats — could recover.
+      //
+      // So this stays as the half-open safety net; the discovery-storm fix is
+      // orthogonal and SAFE precisely because this net still triggers reconnect.
+      wsConfig: { pingTimeout: 60 },
     } as Parameters<typeof createLarkChannel>[0]) as unknown as LarkChannel;
 
     channel.on("message", (msg) => {
@@ -859,8 +876,17 @@ export class ChannelClient {
     disconnectAt: number,
     log: (s: string) => void,
     chatIdsOverride?: ReadonlySet<string>,
+    minWindowMs?: number,
   ): Promise<void> {
-    const MAX_GAP_FILL_WINDOW_MS = 5 * 60 * 1000; // 5 minutes
+    // Normal clamp ceiling. `minWindowMs` (used by periodic discovery) raises it
+    // so a requested look-back of "discovery interval + buffer" isn't truncated
+    // below the interval — otherwise a chat first seen BETWEEN two cycles (up to
+    // `interval` apart) whose @ was also dropped live would fall outside the
+    // window and never be recovered. Bounded by the replay max age either way.
+    const MAX_GAP_FILL_WINDOW_MS = Math.min(
+      Math.max(5 * 60 * 1000, minWindowMs ?? 0), // ≥5 minutes, or the caller's floor
+      UNRESOLVED_WINDOW_MAX_AGE_MS,
+    );
     const BUFFER_MS = 30_000; // 30 s overlap to catch near-boundary messages
     const now = Date.now();
     const larkCli = this.opts.larkCliPath ?? "lark-cli";
@@ -1260,13 +1286,22 @@ export class ChannelClient {
       this.openChatDiscoveryBootstrapped = true;
 
       if (targetChatIds.size > 0) {
+        // Non-bootstrap look-back must cover the FULL gap between two discovery
+        // cycles (+ buffer): a chat first seen on THIS cycle could have been
+        // joined — and @'d — anytime since the previous cycle, up to `intervalMs`
+        // ago. interval + 30s buffer guarantees no hole. (Bootstrap uses the wider
+        // cold-start look-back.) We pass this as the gapFill clamp floor too, so
+        // the default 5-min clamp can't truncate it back below the interval.
+        const intervalMs = resolveOpenChatDiscoveryMs(this.opts.openChatDiscoveryMs);
+        const targetedLookbackMs = intervalMs + OPEN_CHAT_DISCOVERY_LOOKBACK_BUFFER_MS;
         const lookbackMs = isBootstrap
           ? OPEN_CHAT_DISCOVERY_BOOTSTRAP_LOOKBACK_MS
-          : OPEN_CHAT_DISCOVERY_LOOKBACK_MS;
+          : targetedLookbackMs;
         await this.gapFill(
           Date.now() - lookbackMs,
           log,
           targetChatIds,
+          isBootstrap ? undefined : targetedLookbackMs,
         );
       }
       // Clean cycle → reset the failure backoff.
