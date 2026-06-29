@@ -24,7 +24,7 @@
 
 import { createLarkChannel } from "@larksuiteoapi/node-sdk";
 import { execFile as execFileCallback } from "node:child_process";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile, rename, unlink } from "node:fs/promises";
 import path from "node:path";
 import { promisify } from "node:util";
 import type { LarkMessageEvent, LarkClientOptions } from "./transport.js";
@@ -52,6 +52,33 @@ const MAX_MESSAGE_ATTEMPTS = 5;
 const OPEN_CHAT_DISCOVERY_LOOKBACK_MS = 90_000;
 const OPEN_CHAT_DISCOVERY_BOOTSTRAP_LOOKBACK_MS = 30 * 60 * 1000;
 const PROCESSING_REACTION_EMOJI = "Typing";
+
+// ── open-chat discovery storm controls (root cause: multi-bot, chats:[]) ──────
+/**
+ * Default discovery cadence. Was 60s; periodic discovery re-pulls history for
+ * EVERY bot-joined chat each cycle, so at 60s a fleet of N bots each in M chats
+ * issues N×M history pulls/min — observed driving Feishu's auth endpoint into TLS
+ * timeouts (~30× the steady-state gap-fill rate at 4 bots). 5 min keeps "discover
+ * newly-invited groups" working while cutting periodic pulls ~5×. Override via
+ * LARKWAY_OPEN_CHAT_DISCOVERY_MS.
+ */
+const DEFAULT_OPEN_CHAT_DISCOVERY_MS = 300_000;
+/**
+ * Per-instance startup jitter (ms) added before the FIRST discovery run and
+ * baked into the interval phase, so multiple bots on the same host don't fire
+ * their discovery (and the history-pull burst it triggers) in lockstep. Spread
+ * is a random fraction of the interval, capped here so even a long interval
+ * doesn't delay first discovery by more than ~30s.
+ */
+const OPEN_CHAT_DISCOVERY_JITTER_CAP_MS = 30_000;
+/**
+ * Consecutive-failure backoff for discovery. When a discovery cycle throws
+ * (e.g. +chat-list / gap-fill撞 TLS timeout under storm), we SKIP cycles with
+ * exponential backoff (2^failures, capped) instead of hammering the same failing
+ * endpoint every interval — the storm's own feedback loop. Reset to 0 on the
+ * first clean cycle.
+ */
+const OPEN_CHAT_DISCOVERY_MAX_BACKOFF_CYCLES = 8;
 
 // ── gap-fill resilience knobs (root cause B: lark-cli history pull撞 TLS timeout) ──
 /**
@@ -142,7 +169,7 @@ function resolveOpenChatDiscoveryMs(ctorValue: number | undefined): number {
   } else {
     const env = process.env["LARKWAY_OPEN_CHAT_DISCOVERY_MS"];
     const parsed = env !== undefined ? Number(env) : Number.NaN;
-    raw = Number.isFinite(parsed) ? parsed : 60_000;
+    raw = Number.isFinite(parsed) ? parsed : DEFAULT_OPEN_CHAT_DISCOVERY_MS;
   }
   return Number.isFinite(raw) && raw > 0 ? raw : 0;
 }
@@ -474,6 +501,25 @@ export class ChannelClient {
   private openChatDiscoveryTimer: NodeJS.Timeout | null = null;
   private openChatDiscoveryRunning = false;
   private openChatDiscoveryBootstrapped = false;
+  /**
+   * Consecutive discovery-cycle failures. Used to SKIP cycles with exponential
+   * backoff (storm: a failing +chat-list/gap-fill shouldn't re-fire every
+   * interval). Reset to 0 on the first clean cycle. {@link openChatDiscoverySkips}
+   * counts how many remaining cycles to skip before the next real attempt.
+   */
+  private openChatDiscoveryFailures = 0;
+  private openChatDiscoverySkips = 0;
+  /**
+   * Per-instance jitter offset (ms) applied to discovery scheduling so multiple
+   * bots on one host don't run discovery (and its history-pull burst) in
+   * lockstep. Computed once at startup. `Math.random` is fine here — this is
+   * runtime scheduling code, not a determinism-sensitive workflow script.
+   */
+  private openChatDiscoveryJitterMs = Math.floor(
+    Math.random() * OPEN_CHAT_DISCOVERY_JITTER_CAP_MS,
+  );
+  /** Monotonic suffix so overlapping atomic writes get distinct temp files. */
+  private atomicWriteSeq = 0;
   private readonly processingReactions = new Map<string, string>();
   /**
    * Shared messageId -> threadId map. Populated by ChannelCardClient.createCard
@@ -509,9 +555,34 @@ export class ChannelClient {
     this.gapFillSleep = fn;
   }
 
+  /**
+   * TEST SEAM (deletable): override the per-instance open-chat discovery startup
+   * jitter so tests can make the FIRST discovery run fire deterministically
+   * (jitter=0) instead of waiting up to {@link OPEN_CHAT_DISCOVERY_JITTER_CAP_MS}.
+   * Must be called before connect()/startOpenChatDiscovery(). No-op in production.
+   */
+  setOpenChatDiscoveryJitterForTest(ms: number): void {
+    this.openChatDiscoveryJitterMs = Math.max(0, ms);
+  }
+
   /** TEST-ONLY read of the per-chat unresolved-window replay map (chatId → windowStart). */
   unresolvedGapWindowsForTest(): ReadonlyMap<string, number> {
     return new Map(this.unresolvedGapWindowByChat);
+  }
+
+  /**
+   * TEST-ONLY: run exactly ONE open-chat discovery cycle (same code path the
+   * interval timer invokes), awaited to completion. Lets tests assert the
+   * storm-control behaviour (steady-state no-pull, new-chat pull, failure
+   * backoff skip) deterministically without standing up real timers.
+   */
+  async discoverOpenChatsForTest(): Promise<void> {
+    // Wait out any in-flight (e.g. bootstrap) cycle first so the explicit run we
+    // want to assert on isn't swallowed by the openChatDiscoveryRunning guard.
+    for (let i = 0; i < 200 && this.openChatDiscoveryRunning; i++) {
+      await sleep(5);
+    }
+    await this.discoverOpenChatsAndGapFill((s) => console.log(`[channel.client] ${s}`));
   }
 
   /**
@@ -616,13 +687,17 @@ export class ChannelClient {
       //     real network flap. If a future node-sdk / @larksuite/channel exposes
       //     the ws or attaches its own listener, prefer that and drop the guard.
       handshakeTimeoutMs: 15_000,
-      // Liveness watchdog (SECONDS): if no inbound frame arrives within this
-      // window after the last ping, treat the socket as dead and reconnect —
-      // catches silently half-open connections that never emit a close event.
-      // This IS the 1.64 keepalive fix; the app-level `keepalive` watchdog
-      // option only exists in the split-out @larksuite/channel package, not in
-      // node-sdk's bundled createLarkChannel, so we don't pass it here.
-      wsConfig: { pingTimeout: 60 },
+      // NOTE — intentionally NO `wsConfig: { pingTimeout: 60 }` here.
+      // A 60s ping-timeout watchdog mis-fires on a perfectly healthy IDLE
+      // connection: Feishu's server-side WS pingInterval is ~120s, so on a quiet
+      // bot the gap between inbound frames routinely exceeds a 60s timeout and the
+      // watchdog tears the socket down + reconnects for no reason (measured ~2% of
+      // all disconnects, with zero recovered messages to show for it). Dropping it
+      // returns to the SDK's native policy — reconnect only on a real WS close —
+      // which already covers the genuinely-dead cases via autoReconnect. The
+      // half-open case the 60s timeout was meant to catch is rare and far cheaper
+      // to absorb (next real frame / server ping closes it) than to chase with a
+      // watchdog that误杀 idle connections.
     } as Parameters<typeof createLarkChannel>[0]) as unknown as LarkChannel;
 
     channel.on("message", (msg) => {
@@ -1074,15 +1149,33 @@ export class ChannelClient {
     const intervalMs = resolveOpenChatDiscoveryMs(this.opts.openChatDiscoveryMs);
     if (intervalMs <= 0) return;
 
-    void this.discoverOpenChatsAndGapFill(log);
-    this.openChatDiscoveryTimer = setInterval(() => {
+    // Per-instance jitter on the FIRST run so a fleet of bots booting together
+    // doesn't fire their cold-start chat-list + history-pull burst in lockstep.
+    // (Subsequent runs are naturally spread because each bot's interval phase is
+    // offset by when its jittered first run landed.) Jitter is clamped to the
+    // interval so a small override interval can't be pushed past its own period.
+    const firstDelay = Math.min(this.openChatDiscoveryJitterMs, intervalMs);
+    const startTimer = setTimeout(() => {
       void this.discoverOpenChatsAndGapFill(log);
-    }, intervalMs);
-    this.openChatDiscoveryTimer.unref?.();
+      this.openChatDiscoveryTimer = setInterval(() => {
+        void this.discoverOpenChatsAndGapFill(log);
+      }, intervalMs);
+      this.openChatDiscoveryTimer.unref?.();
+    }, firstDelay);
+    startTimer.unref?.();
+    // Park the startup timer in the same handle close() clears, so a close()
+    // before the first run still cancels it (and start() stays idempotent).
+    this.openChatDiscoveryTimer = startTimer;
   }
 
   private async discoverOpenChatsAndGapFill(log: (s: string) => void): Promise<void> {
     if (this.closed || this.openChatDiscoveryRunning) return;
+    // Consecutive-failure backoff: skip this cycle if we're still backing off
+    // from a prior failure, so a failing endpoint isn't hammered every interval.
+    if (this.openChatDiscoverySkips > 0) {
+      this.openChatDiscoverySkips--;
+      return;
+    }
     this.openChatDiscoveryRunning = true;
     try {
       const larkCli = this.opts.larkCliPath ?? "lark-cli";
@@ -1091,6 +1184,9 @@ export class ChannelClient {
       let fetched = 0;
       let newlyLearned = 0;
       const discoveredChatIds = new Set<string>();
+      // Chats genuinely seen for the FIRST time this cycle (not already known).
+      // Only these need a fresh catch-up pull on a steady-state cycle.
+      const newChatIds = new Set<string>();
 
       for (let page = 0; page < 10 && !this.closed; page++) {
         const args = [
@@ -1113,7 +1209,10 @@ export class ChannelClient {
           discoveredChatIds.add(chatId);
           const before = this.recentlySeenChatIds.size;
           this.noteSeenChat(chatId);
-          if (this.recentlySeenChatIds.size > before) newlyLearned++;
+          if (this.recentlySeenChatIds.size > before) {
+            newlyLearned++;
+            newChatIds.add(chatId);
+          }
         }
 
         const data = parsed && typeof parsed === "object"
@@ -1137,19 +1236,55 @@ export class ChannelClient {
         );
       }
 
-      if (discoveredChatIds.size > 0) {
-        const lookbackMs = this.openChatDiscoveryBootstrapped
-          ? OPEN_CHAT_DISCOVERY_LOOKBACK_MS
-          : OPEN_CHAT_DISCOVERY_BOOTSTRAP_LOOKBACK_MS;
-        this.openChatDiscoveryBootstrapped = true;
+      // Decide which chats actually need a history pull THIS cycle.
+      //
+      // STORM FIX: previously every cycle gap-filled EVERY discovered chat — at
+      // 60s × N bots × M chats that hammered Feishu's auth endpoint into TLS
+      // timeouts. gap-fill's real job is "catch up a window we might have
+      // missed", which only applies to:
+      //   1. the BOOTSTRAP (first) cycle — cold start, pull all known chats once.
+      //   2. a chat seen for the FIRST time this cycle — a newly-invited group we
+      //      haven't pulled yet (preserves "newly-discovered groups work").
+      //   3. a chat with a PENDING unresolved gap window — a prior pull failed and
+      //      is queued for replay (preserves failed-window recovery).
+      // A steady-state cycle with no new chats and no pending windows pulls
+      // NOTHING — collapsing the periodic storm to ~0. Reconnect-driven gap-fill
+      // (the `reconnected` handler) is untouched and still covers real outages.
+      const isBootstrap = !this.openChatDiscoveryBootstrapped;
+      const targetChatIds = isBootstrap
+        ? new Set(discoveredChatIds)
+        : new Set<string>([
+            ...newChatIds,
+            ...[...discoveredChatIds].filter((c) => this.unresolvedGapWindowByChat.has(c)),
+          ]);
+      this.openChatDiscoveryBootstrapped = true;
+
+      if (targetChatIds.size > 0) {
+        const lookbackMs = isBootstrap
+          ? OPEN_CHAT_DISCOVERY_BOOTSTRAP_LOOKBACK_MS
+          : OPEN_CHAT_DISCOVERY_LOOKBACK_MS;
         await this.gapFill(
           Date.now() - lookbackMs,
           log,
-          discoveredChatIds,
+          targetChatIds,
         );
       }
+      // Clean cycle → reset the failure backoff.
+      this.openChatDiscoveryFailures = 0;
+      this.openChatDiscoverySkips = 0;
     } catch (e) {
-      log(`open-chat discovery failed: ${e instanceof Error ? e.message : String(e)}`);
+      // Failure backoff: a failing +chat-list / gap-fill shouldn't re-fire every
+      // interval (that feedback loop is part of the storm). Skip an exponentially
+      // growing number of subsequent cycles (2^failures, capped) before retrying.
+      this.openChatDiscoveryFailures = Math.min(
+        this.openChatDiscoveryFailures + 1,
+        OPEN_CHAT_DISCOVERY_MAX_BACKOFF_CYCLES,
+      );
+      this.openChatDiscoverySkips = 2 ** (this.openChatDiscoveryFailures - 1);
+      log(
+        `open-chat discovery failed (backing off ${this.openChatDiscoverySkips} cycle(s)): ` +
+          `${e instanceof Error ? e.message : String(e)}`,
+      );
     } finally {
       this.openChatDiscoveryRunning = false;
     }
@@ -1232,28 +1367,50 @@ export class ChannelClient {
     void this.persistSeenMessageIds();
   }
 
+  /**
+   * Atomic JSON write: serialize to a UNIQUE temp file, then `rename` over the
+   * destination. Two concerns motivate this:
+   *   1. Atomicity — `rename` is atomic on a POSIX filesystem, so a reader (or a
+   *      crash) never observes a half-written file. The persist methods are
+   *      fire-and-forget (`void persist…`), so under a multi-bot storm several
+   *      writes to the SAME path can overlap; a plain `writeFile` interleaves
+   *      their bytes → the "Bad control character in string literal" JSON
+   *      corruption we saw. With tmp+rename each write lands whole-or-not-at-all.
+   *   2. Per-write unique tmp name — a fixed `${file}.tmp` would itself be raced
+   *      by two concurrent writers. The pid + monotonic counter suffix gives each
+   *      in-flight write its own tmp so they can't clobber each other before the
+   *      rename. Best-effort cleanup on failure; losing the cache is non-fatal.
+   */
+  private async atomicWriteJson(file: string, value: unknown): Promise<void> {
+    const tmp = `${file}.${process.pid}.${this.atomicWriteSeq++}.tmp`;
+    try {
+      await mkdir(path.dirname(file), { recursive: true });
+      await writeFile(tmp, JSON.stringify(value, null, 2), "utf8");
+      await rename(tmp, file);
+    } catch {
+      // Best effort only; try to not leave a stray tmp behind.
+      try {
+        await unlink(tmp);
+      } catch {
+        // ignore — nothing more we can do
+      }
+    }
+  }
+
   private async persistSeenMessageIds(): Promise<void> {
     const file = this.seenMessagesPath();
     if (!file) return;
     const messages = [...this.seenMessageIds].slice(-SEEN_MESSAGES_LIMIT);
-    try {
-      await mkdir(path.dirname(file), { recursive: true });
-      await writeFile(file, JSON.stringify(messages, null, 2), "utf8");
-    } catch {
-      // Best effort only: losing the cache can at worst replay recent @ messages.
-    }
+    // Best effort only: losing the cache can at worst replay recent @ messages.
+    await this.atomicWriteJson(file, messages);
   }
 
   private async persistRecentlySeenChatIds(): Promise<void> {
     const file = this.learnedChatsPath();
     if (!file) return;
     const chats = [...this.recentlySeenChatIds].sort().slice(-LEARNED_CHATS_LIMIT);
-    try {
-      await mkdir(path.dirname(file), { recursive: true });
-      await writeFile(file, JSON.stringify(chats, null, 2), "utf8");
-    } catch {
-      // Best effort only: losing the cache can at worst reduce reconnect recovery.
-    }
+    // Best effort only: losing the cache can at worst reduce reconnect recovery.
+    await this.atomicWriteJson(file, chats);
   }
 
   async addProcessingReaction(messageId: string): Promise<void> {

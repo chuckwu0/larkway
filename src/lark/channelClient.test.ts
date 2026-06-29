@@ -1047,6 +1047,9 @@ describe("ChannelClient — gap-fill after reconnect (BL-15)", () => {
       channelStaleMs: 0,
       openChatDiscoveryMs: 60_000,
     });
+    // Fire the first discovery run immediately (no startup jitter) so the poll
+    // below doesn't race the per-instance jitter delay.
+    client.setOpenChatDiscoveryJitterForTest(0);
 
     const dispatched: string[] = [];
     void (async () => {
@@ -1934,5 +1937,407 @@ describe("ChannelClient — gap-fill retry + failed-window replay (0.3.17)", () 
 
     await client.close();
     cleanup();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 0.3.28 multi-bot storm + idle pingTimeout watchdog + atomic state writes.
+// ---------------------------------------------------------------------------
+
+describe("ChannelClient — drop idle pingTimeout watchdog (0.3.28)", () => {
+  function makeFakeChannel() {
+    return {
+      botIdentity: { openId: "ou_bot", name: "test-bot" },
+      on() {},
+      async connect() {},
+      async disconnect() {},
+      async updateCard() {},
+      rawClient: { im: { v1: { message: { async reply() { return { data: {} }; } } } } },
+    };
+  }
+
+  // REGRESSION GUARD: if someone re-adds `wsConfig: { pingTimeout: ... }` (the
+  // idle-killing watchdog), the first assertion goes RED. The handshakeTimeoutMs
+  // assertion guards that we DIDN'T also drop the harmless abort timeout.
+  it("does NOT pass wsConfig.pingTimeout but KEEPS handshakeTimeoutMs", async () => {
+    let captured: Record<string, unknown> | undefined;
+    vi.resetModules();
+    vi.doMock("@larksuiteoapi/node-sdk", () => ({
+      createLarkChannel: (opts: Record<string, unknown>) => {
+        captured = opts;
+        return makeFakeChannel();
+      },
+    }));
+    const { ChannelClient } = await import("./channelClient.js");
+    const client = new ChannelClient({
+      allowedChatIds: new Set(["oc_1"]),
+      botOpenId: "ou_bot",
+      appId: "cli_x",
+      appSecret: "secret",
+      connectGraceMs: 0,
+      channelStaleMs: 0,
+      openChatDiscoveryMs: 0,
+    });
+
+    await client.connect();
+    expect(captured).toBeDefined();
+    expect(captured).not.toHaveProperty("wsConfig"); // idle watchdog removed
+    expect(captured!["handshakeTimeoutMs"]).toBe(15_000); // abort timeout kept
+
+    await client.close();
+    vi.doUnmock("@larksuiteoapi/node-sdk");
+    vi.resetModules();
+  });
+});
+
+describe("ChannelClient — open-chat discovery storm controls (0.3.28)", () => {
+  function makeFakeChannelWithHandlers() {
+    const handlers: Record<string, ((arg: unknown) => void) | undefined> = {};
+    const ch = {
+      botIdentity: { openId: "ou_bot", name: "test-bot" },
+      on(event: string, handler: (arg: unknown) => void) {
+        handlers[event] = handler;
+      },
+      async connect() {},
+      async disconnect() {},
+    };
+    return { ch, handlers };
+  }
+
+  function cleanup() {
+    vi.doUnmock("@larksuiteoapi/node-sdk");
+    vi.doUnmock("node:child_process");
+    vi.resetModules();
+  }
+
+  /**
+   * STORM FIX: at steady state (no newly-joined chats, no pending windows) a
+   * discovery cycle must list chats but issue ZERO +chat-messages-list history
+   * pulls. Reverting the targeting (gap-fill ALL discovered chats every cycle)
+   * makes the second-cycle pull count > 0 → this test goes RED.
+   */
+  it("steady-state cycle lists chats but issues NO history pull when nothing is new", async () => {
+    const chatListCalls: number[] = [];
+    const messageListCalls: string[] = [];
+    vi.resetModules();
+    vi.doMock("node:child_process", () => ({
+      execFile: (
+        _cmd: string,
+        args: string[],
+        cb: (err: null, result: { stdout: string; stderr: string }) => void,
+      ) => {
+        if (args.includes("+chat-list")) {
+          chatListCalls.push(Date.now());
+          cb(null, {
+            stdout: JSON.stringify({
+              ok: true,
+              data: { chats: [{ chat_id: "oc_known" }], has_more: false, page_token: "" },
+            }),
+            stderr: "",
+          });
+          return;
+        }
+        if (args.includes("+chat-messages-list")) {
+          messageListCalls.push("pull");
+          cb(null, { stdout: JSON.stringify({ ok: true, data: { messages: [] } }), stderr: "" });
+          return;
+        }
+        cb(null, { stdout: "{}", stderr: "" });
+      },
+    }));
+    const chObj = makeFakeChannelWithHandlers();
+    vi.doMock("@larksuiteoapi/node-sdk", () => ({ createLarkChannel: () => chObj.ch }));
+
+    const { ChannelClient } = await import("./channelClient.js");
+    const client = new ChannelClient({
+      allowedChatIds: new Set(),
+      botOpenId: "ou_bot",
+      appId: "cli_x",
+      appSecret: "secret",
+      connectGraceMs: 0,
+      channelStaleMs: 0,
+      openChatDiscoveryMs: 5_000,
+    });
+    client.setOpenChatDiscoveryJitterForTest(0);
+
+    void (async () => {
+      for await (const _ev of client.events()) {
+        // drain
+      }
+    })();
+
+    // Wait for the BOOTSTRAP cycle (cycle 1): it pulls history for oc_known once.
+    for (let i = 0; i < 100 && chatListCalls.length < 1; i++) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    for (let i = 0; i < 100 && messageListCalls.length < 1; i++) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    expect(chatListCalls.length).toBeGreaterThanOrEqual(1);
+    expect(messageListCalls.length).toBe(1); // bootstrap pulled the known chat once
+    const pullsAfterBootstrap = messageListCalls.length;
+
+    // Run a STEADY-STATE cycle directly (same chat, already known, no pending
+    // window). It must list chats again but pull NO history.
+    await client.discoverOpenChatsForTest();
+    expect(chatListCalls.length).toBeGreaterThanOrEqual(2); // listed again
+    expect(messageListCalls.length).toBe(pullsAfterBootstrap); // but NO new pull
+
+    await client.close();
+    cleanup();
+  });
+
+  /**
+   * A chat seen for the FIRST time on a later cycle (newly-invited group) MUST
+   * still be gap-filled — this is the correctness invariant the storm fix must
+   * not break. If the targeting wrongly excluded new chats, this goes RED.
+   */
+  it("a newly-discovered chat on a later cycle IS gap-filled", async () => {
+    let knownChats = [{ chat_id: "oc_old" }] as Array<{ chat_id: string }>;
+    const pulledChatIds: string[] = [];
+    const gapMessageId = "om_new_group";
+    vi.resetModules();
+    vi.doMock("node:child_process", () => ({
+      execFile: (
+        _cmd: string,
+        args: string[],
+        cb: (err: null, result: { stdout: string; stderr: string }) => void,
+      ) => {
+        if (args.includes("+chat-list")) {
+          cb(null, {
+            stdout: JSON.stringify({
+              ok: true,
+              data: { chats: knownChats, has_more: false, page_token: "" },
+            }),
+            stderr: "",
+          });
+          return;
+        }
+        if (args.includes("+chat-messages-list")) {
+          const i = args.indexOf("--chat-id");
+          const chatId = i >= 0 ? args[i + 1]! : "";
+          pulledChatIds.push(chatId);
+          const items =
+            chatId === "oc_new"
+              ? [
+                  {
+                    message_id: gapMessageId,
+                    chat_id: "oc_new",
+                    chat_type: "group",
+                    content: JSON.stringify({ text: "@bot 新群里第一次叫你" }),
+                    sender: { id: "ou_sender" },
+                    create_time: String(Date.now()),
+                    mentions: [{ id: { open_id: "ou_bot" } }],
+                  },
+                ]
+              : [];
+          cb(null, { stdout: JSON.stringify({ ok: true, data: { messages: items } }), stderr: "" });
+          return;
+        }
+        cb(null, { stdout: "{}", stderr: "" });
+      },
+    }));
+    const chObj = makeFakeChannelWithHandlers();
+    vi.doMock("@larksuiteoapi/node-sdk", () => ({ createLarkChannel: () => chObj.ch }));
+
+    const { ChannelClient } = await import("./channelClient.js");
+    const client = new ChannelClient({
+      allowedChatIds: new Set(),
+      botOpenId: "ou_bot",
+      appId: "cli_x",
+      appSecret: "secret",
+      connectGraceMs: 0,
+      channelStaleMs: 0,
+      openChatDiscoveryMs: 5_000,
+    });
+    client.setOpenChatDiscoveryJitterForTest(0);
+
+    const dispatched: string[] = [];
+    void (async () => {
+      for await (const ev of client.events()) dispatched.push(ev.message_id);
+    })();
+
+    // Bootstrap cycle over the old chat only.
+    for (let i = 0; i < 100 && !pulledChatIds.includes("oc_old"); i++) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
+
+    // A new group joins → appears on the next discovery cycle.
+    knownChats = [{ chat_id: "oc_old" }, { chat_id: "oc_new" }];
+    await client.discoverOpenChatsForTest();
+
+    for (let i = 0; i < 100 && !dispatched.includes(gapMessageId); i++) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    expect(pulledChatIds).toContain("oc_new"); // the new group WAS pulled
+    expect(dispatched).toContain(gapMessageId); // its pending @ recovered
+
+    await client.close();
+    cleanup();
+  });
+
+  /**
+   * FAILURE BACKOFF: a cycle that throws must cause the NEXT cycle to be skipped
+   * (no +chat-list call), instead of re-hammering a failing endpoint every
+   * interval. Reverting the skip logic makes the post-failure cycle list again →
+   * RED.
+   */
+  it("skips the next cycle after a failed cycle (backoff)", async () => {
+    let failNext = false;
+    const chatListCalls: number[] = [];
+    vi.resetModules();
+    vi.doMock("node:child_process", () => ({
+      execFile: (
+        _cmd: string,
+        args: string[],
+        cb: (err: Error | null, result?: { stdout: string; stderr: string }) => void,
+      ) => {
+        if (args.includes("+chat-list")) {
+          chatListCalls.push(Date.now());
+          if (failNext) {
+            cb(new Error("TLS handshake timeout"));
+            return;
+          }
+          cb(null, {
+            stdout: JSON.stringify({
+              ok: true,
+              data: { chats: [{ chat_id: "oc_known" }], has_more: false, page_token: "" },
+            }),
+            stderr: "",
+          });
+          return;
+        }
+        cb(null, { stdout: JSON.stringify({ ok: true, data: { messages: [] } }), stderr: "" });
+      },
+    }));
+    const chObj = makeFakeChannelWithHandlers();
+    vi.doMock("@larksuiteoapi/node-sdk", () => ({ createLarkChannel: () => chObj.ch }));
+
+    const { ChannelClient } = await import("./channelClient.js");
+    const client = new ChannelClient({
+      allowedChatIds: new Set(),
+      botOpenId: "ou_bot",
+      appId: "cli_x",
+      appSecret: "secret",
+      connectGraceMs: 0,
+      channelStaleMs: 0,
+      openChatDiscoveryMs: 5_000,
+    });
+    client.setOpenChatDiscoveryJitterForTest(0);
+
+    void (async () => {
+      for await (const _ev of client.events()) {
+        // drain
+      }
+    })();
+    for (let i = 0; i < 100 && chatListCalls.length < 1; i++) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    const afterBootstrap = chatListCalls.length;
+
+    // A failing cycle → records a backoff that skips ≥1 subsequent cycle.
+    failNext = true;
+    await client.discoverOpenChatsForTest();
+    const afterFailure = chatListCalls.length;
+    expect(afterFailure).toBe(afterBootstrap + 1); // the failed cycle did list
+
+    // The very next cycle must be SKIPPED (no new +chat-list) due to backoff.
+    failNext = false;
+    await client.discoverOpenChatsForTest();
+    expect(chatListCalls.length).toBe(afterFailure); // skipped: no extra list call
+
+    await client.close();
+    cleanup();
+  });
+});
+
+describe("ChannelClient — atomic seen-state writes (0.3.28)", () => {
+  function makeFakeChannelWithHandlers() {
+    const handlers: Record<string, ((arg: unknown) => void) | undefined> = {};
+    const ch = {
+      botIdentity: { openId: "ou_bot", name: "test-bot" },
+      on(event: string, handler: (arg: unknown) => void) {
+        handlers[event] = handler;
+      },
+      async connect() {},
+      async disconnect() {},
+    };
+    return { ch, handlers };
+  }
+
+  /**
+   * Concurrent fire-and-forget persists to the SAME path must never leave a
+   * half-written / corrupt file (the "Bad control character" failure). With
+   * tmp+rename every write lands atomically, so the file always parses and
+   * contains a complete message set, and no stray .tmp survives. Reverting to a
+   * direct writeFile re-introduces the interleave risk this test pins.
+   */
+  it("many overlapping seen-message persists keep the file valid JSON + leave no .tmp", async () => {
+    const larkwayDir = await mkdtemp(path.join(tmpdir(), "larkway-atomic-"));
+    vi.resetModules();
+    const chObj = makeFakeChannelWithHandlers();
+    vi.doMock("@larksuiteoapi/node-sdk", () => ({ createLarkChannel: () => chObj.ch }));
+
+    const { ChannelClient } = await import("./channelClient.js");
+    const client = new ChannelClient({
+      allowedChatIds: new Set(["oc_1"]),
+      botOpenId: "ou_bot",
+      appId: "cli_x",
+      appSecret: "secret",
+      larkwayDir,
+      connectGraceMs: 0,
+      channelStaleMs: 0,
+      openChatDiscoveryMs: 0,
+    });
+    await client.connect();
+
+    // markHandled triggers persistSeenMessageIds (fire-and-forget). Fire a burst
+    // so multiple writes to the same path overlap in time.
+    const ids: string[] = [];
+    for (let i = 0; i < 80; i++) {
+      const id = `om_atomic_${i}`;
+      ids.push(id);
+      client.markHandled(id);
+    }
+
+    const dir = path.join(larkwayDir, "runtime", "channel-seen-messages");
+    const file = path.join(dir, "cli_x.json");
+    const idSet = new Set(ids);
+
+    // Let all the overlapping fire-and-forget writes drain. On EVERY read the
+    // file MUST parse cleanly — a single SyntaxError is the exact "Bad control
+    // character" corruption this fix prevents. (We intentionally do NOT require
+    // last-writer-wins: concurrent atomic writes can land in any rename order, so
+    // the file may reflect any one COMPLETE snapshot — never a torn one.)
+    let parsed: unknown = [];
+    for (let i = 0; i < 200; i++) {
+      try {
+        const raw = await readFile(file, "utf8");
+        parsed = JSON.parse(raw); // MUST never throw on a half-written file
+      } catch (err) {
+        if (err instanceof SyntaxError) {
+          throw new Error(`seen-messages file was corrupt mid-write: ${err.message}`);
+        }
+        // ENOENT before first rename → keep waiting.
+      }
+      await new Promise((r) => setTimeout(r, 10));
+    }
+
+    // Whatever snapshot landed is a COMPLETE, valid one: an array whose every
+    // entry is one of our full ids (no truncated/garbage element from a torn
+    // write). At least one id is present (a real snapshot, not the empty seed).
+    expect(Array.isArray(parsed)).toBe(true);
+    const arr = parsed as string[];
+    expect(arr.length).toBeGreaterThan(0);
+    for (const entry of arr) expect(idSet.has(entry)).toBe(true);
+
+    // No stray temp files left behind by the atomic write.
+    const { readdir } = await import("node:fs/promises");
+    const entries = await readdir(dir);
+    expect(entries.filter((e) => e.includes(".tmp"))).toEqual([]);
+
+    await client.close();
+    vi.doUnmock("@larksuiteoapi/node-sdk");
+    vi.resetModules();
   });
 });
