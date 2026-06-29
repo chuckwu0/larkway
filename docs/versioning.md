@@ -73,4 +73,5 @@ v0.3.23       = ship CardKit answer streaming and hard-failure fallback
 v0.3.24       = restore CardKit live streaming polish; harden orphan reconcile fallback
 v0.3.25       = harden CardKit live diagnostics and running-card fallback
 v0.3.26       = stream marker-gated Claude and Codex answers as CardKit deltas
+v0.3.27       = retire post-only response surfaces; CardKit streaming surface stabilization
 ```
