@@ -318,6 +318,40 @@ describe("StateFileSchema — response_surface prototype declaration", () => {
       await rm(dir, { recursive: true, force: true });
     }
   });
+
+  it("soft-fails invalid mention user_id with diagnostics instead of letting CardKit drop it later", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "larkway-state-"));
+    try {
+      await mkdir(join(dir, ".larkway"), { recursive: true });
+      await writeFile(
+        stateFilePathOf(dir),
+        JSON.stringify(
+          {
+            status: "ready",
+            last_message: "invalid mention id should be diagnosed",
+            response_surface: {
+              post: {
+                mentions: [{ user_id: "bad<script>", label: "Bad" }],
+              },
+            },
+            updated_at: "2026-06-26T09:00:00.000Z",
+          },
+          null,
+          2,
+        ),
+        "utf8",
+      );
+
+      const result = await readStateFileDetailed(dir);
+      expect(result.state?.status).toBe("ready");
+      expect(result.state?.last_message).toBe("invalid mention id should be diagnosed");
+      expect(result.state?.response_surface).toBeUndefined();
+      expect(result.diagnostics.join("\n")).toContain("response_surface ignored");
+      expect(result.diagnostics.join("\n")).toContain("post.mentions.0.user_id");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
 });
 
 describe("StateFileSchema — V2 image blocks (agent-declared, bridge-opaque)", () => {

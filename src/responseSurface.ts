@@ -1,6 +1,9 @@
 import { z } from "zod";
 
 const NonEmptyString = z.string().trim().min(1);
+const CardKitMentionUserIdSchema = NonEmptyString.max(128).regex(/^[A-Za-z0-9_:-]+$/, {
+  message: "mention user_id must contain only letters, numbers, underscore, colon, or hyphen",
+});
 
 export function defaultResponseSurfacePrototypeConfig() {
   return {
@@ -40,7 +43,7 @@ export const ResponseSurfaceCapabilitySchema = z.enum([
 ]);
 
 const MentionTargetSchema = z.object({
-  user_id: NonEmptyString.max(128),
+  user_id: CardKitMentionUserIdSchema,
   label: z.string().trim().min(1).max(80).optional(),
 });
 

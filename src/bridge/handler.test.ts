@@ -929,6 +929,88 @@ describe("handleOne — thin-channel finalize", () => {
     expect(runtimeEvents.some((e) => e.reason?.includes("0/1 allowed"))).toBe(true);
   });
 
+  it("records a state diagnostic instead of silently dropping invalid CardKit mention IDs", async () => {
+    const threadId = "om_msg";
+    const finalState = {
+      status: "ready",
+      last_message: "CardKit 最终正文",
+      response_surface: {
+        post: { mentions: [{ user_id: "bad<script>", label: "Bad" }] },
+      },
+      updated_at: "2026-06-26T10:00:00.000Z",
+    };
+    const wt = await seedWorktree(threadId);
+    await seedRepoCachePath();
+    const { client: cardKitClient, calls: cardKitCalls } = makeCardKitClient();
+    const runtimeEvents: Array<{ statusPath?: string[]; reason?: string }> = [];
+
+    runClaudeImpl = () => ({
+      events: (async function* () {
+        yield { type: "system_init", sessionId: "sess_cardkit_invalid_mention", raw: {} };
+        await writeFile(
+          stateFileMod.stateFilePathOf(wt),
+          JSON.stringify(finalState, null, 2),
+          "utf8",
+        );
+      })(),
+      done: Promise.resolve({ exitCode: 0, sessionId: "sess_cardkit_invalid_mention" }),
+      kill: () => {},
+    });
+
+    const { renderer, startArgs, finalizeArgs } = makeCardRenderer();
+    const { store } = makeSessionStore();
+    const { client, acked } = makeClient(makeEvent());
+
+    const handler = new BridgeHandler({
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      client: client as any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      cardRenderer: renderer as any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      sessionStore: store as any,
+      conventions: makeConventions(),
+      botConfig: {
+        id: "frontend",
+        name: "Frontend",
+        turn_taking_limit: 10,
+        backend: "claude",
+        response_surface_prototype: {
+          enabled: true,
+          allowed_chats: [],
+          allowed_threads: ["om_msg"],
+          kill_switch: false,
+          post_outbound_enabled: true,
+          cardkit_streaming_enabled: true,
+          allow_agent_mentions: true,
+          allowed_mention_open_ids: [],
+        },
+      },
+      cardKitClient,
+      recordRuntimeEvent: async (patch) => {
+        runtimeEvents.push({
+          statusPath: patch.appendPath
+            ? Array.isArray(patch.appendPath)
+              ? patch.appendPath
+              : [patch.appendPath]
+            : patch.statusPath,
+          reason: patch.reason ?? undefined,
+        });
+      },
+    });
+
+    await handler.run();
+    for (let i = 0; i < 100 && acked.length === 0; i++) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
+
+    expect(startArgs).toHaveLength(0);
+    expect(finalizeArgs).toHaveLength(0);
+    const finalUpdate = cardKitCalls.find((c) => c.kind === "updateCard");
+    expect(JSON.stringify(finalUpdate?.payload)).not.toContain("<at id=");
+    expect(runtimeEvents.some((e) => e.statusPath?.includes("state 诊断"))).toBe(true);
+    expect(runtimeEvents.some((e) => e.reason?.includes("post.mentions.0.user_id"))).toBe(true);
+  });
+
   it("updates the CardKit running footer with count-only tool usage", async () => {
     const threadId = "om_msg";
     const finalState = {

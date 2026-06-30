@@ -53,6 +53,8 @@ Supported fields:
 - `image_blocks` / `content_blocks`: rendered in the final card.
 - `response_surface.post.mentions`: late peer mention targets. In CardKit they
   render as final-card `<at id=...></at>` mentions after passing mention policy.
+  Mention `user_id` values must use the CardKit-renderable character set:
+  letters, numbers, `_`, `:`, and `-`.
 - `response_surface.mode` / `primary` are accepted for compatibility with older
   agents and `mode` may be omitted; omitted `mode` parses as `card`. These fields
   no longer select a post-only or hybrid main surface. CardKit is the only normal
