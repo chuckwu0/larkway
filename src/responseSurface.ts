@@ -1,6 +1,9 @@
 import { z } from "zod";
 
 const NonEmptyString = z.string().trim().min(1);
+const CardKitMentionUserIdSchema = NonEmptyString.max(128).regex(/^[A-Za-z0-9_:-]+$/, {
+  message: "mention user_id must contain only letters, numbers, underscore, colon, or hyphen",
+});
 
 export function defaultResponseSurfacePrototypeConfig() {
   return {
@@ -40,7 +43,7 @@ export const ResponseSurfaceCapabilitySchema = z.enum([
 ]);
 
 const MentionTargetSchema = z.object({
-  user_id: NonEmptyString.max(128),
+  user_id: CardKitMentionUserIdSchema,
   label: z.string().trim().min(1).max(80).optional(),
 });
 
@@ -55,7 +58,7 @@ const ResponseSurfaceCardSchema = z.object({
 
 const StrictResponseSurfaceStateSchema = z
   .object({
-    mode: ResponseSurfaceModeSchema,
+    mode: ResponseSurfaceModeSchema.optional().default("card"),
     primary: ResponseSurfacePrimarySchema.optional(),
     post: ResponseSurfacePostSchema.optional(),
     card: ResponseSurfaceCardSchema.optional(),
@@ -77,11 +80,26 @@ const StrictResponseSurfaceStateSchema = z
  */
 export const ResponseSurfaceStateSchema = z.preprocess((value) => {
   if (value === undefined) return undefined;
-  const result = StrictResponseSurfaceStateSchema.safeParse(value);
-  return result.success ? result.data : undefined;
+  return parseResponseSurfaceState(value).state;
 }, StrictResponseSurfaceStateSchema.optional());
 
 export type ResponseSurfaceState = z.infer<typeof StrictResponseSurfaceStateSchema>;
+
+export interface ResponseSurfaceParseResult {
+  state?: ResponseSurfaceState;
+  diagnostics: string[];
+}
+
+export function parseResponseSurfaceState(value: unknown): ResponseSurfaceParseResult {
+  const result = StrictResponseSurfaceStateSchema.safeParse(value);
+  if (result.success) return { state: result.data, diagnostics: [] };
+  return {
+    diagnostics: result.error.issues.map((issue) => {
+      const path = issue.path.length > 0 ? issue.path.join(".") : "<root>";
+      return `${path}: ${issue.message}`;
+    }),
+  };
+}
 
 export const ResponseSurfacePrototypeConfigSchema = z
   .object({
