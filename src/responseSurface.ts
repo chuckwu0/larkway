@@ -14,6 +14,7 @@ export function defaultResponseSurfacePrototypeConfig() {
     post_outbound_enabled: true,
     cardkit_streaming_enabled: true,
     allow_agent_mentions: true,
+    denied_mention_open_ids: [] as string[],
     allowed_mention_open_ids: [] as string[],
   };
 }
@@ -28,6 +29,7 @@ const responseSurfacePrototypeConfigDefaults = () => ({
   post_outbound_enabled: true,
   cardkit_streaming_enabled: true,
   allow_agent_mentions: true,
+  denied_mention_open_ids: [] as string[],
   allowed_mention_open_ids: [] as string[],
 });
 
@@ -142,9 +144,15 @@ export const ResponseSurfacePrototypeConfigSchema = z
      */
     allow_agent_mentions: z.boolean().default(true),
     /**
-     * Optional target allowlist for real post @ mentions. Empty means the Agent
-     * may choose mention targets; non-empty narrows mentions to this exact set.
+     * Optional deny-list for Agent-authored @ mentions. Empty means the Agent
+     * may choose mention targets, except broadcast aliases such as @all.
      * Keep real IDs in private bot config, never in public docs/tests.
+     */
+    denied_mention_open_ids: z.array(z.string().min(1)).default([]),
+    /**
+     * Deprecated compatibility field. It is still parsed so older private
+     * configs do not fail, but mention policy is deny-list/default-allow.
+     * Use denied_mention_open_ids for new restrictions.
      */
     allowed_mention_open_ids: z.array(z.string().min(1)).default([]),
   })
@@ -153,6 +161,18 @@ export const ResponseSurfacePrototypeConfigSchema = z
 export type ResponseSurfacePrototypeConfig = z.infer<
   typeof ResponseSurfacePrototypeConfigSchema
 >;
+
+export type MentionPolicyRule =
+  | "allowed"
+  | "agent_mentions_disabled"
+  | "broadcast_blocked"
+  | "denied_target";
+
+export interface MentionPolicyResult {
+  allowed: boolean;
+  rule: MentionPolicyRule;
+  reason?: string;
+}
 
 export function isResponseSurfacePrototypeAllowlisted(
   config: ResponseSurfacePrototypeConfig | undefined,
@@ -174,11 +194,36 @@ export function isResponseSurfaceMentionAllowed(
   config: ResponseSurfacePrototypeConfig | undefined,
   userId: string,
 ): boolean {
-  if (!config?.allow_agent_mentions) return false;
+  return evaluateResponseSurfaceMentionPolicy(config, userId).allowed;
+}
+
+export function evaluateResponseSurfaceMentionPolicy(
+  config: ResponseSurfacePrototypeConfig | undefined,
+  userId: string,
+): MentionPolicyResult {
+  if (!config?.allow_agent_mentions) {
+    return {
+      allowed: false,
+      rule: "agent_mentions_disabled",
+      reason: "Agent-authored mentions are disabled by allow_agent_mentions=false.",
+    };
+  }
   const normalized = userId.trim().toLowerCase();
-  if (normalized === "all" || normalized === "@all") return false;
-  if (config.allowed_mention_open_ids.length === 0) return true;
-  return config.allowed_mention_open_ids.includes(userId);
+  if (normalized === "all" || normalized === "@all") {
+    return {
+      allowed: false,
+      rule: "broadcast_blocked",
+      reason: "Broadcast mentions such as @all are blocked.",
+    };
+  }
+  if (config.denied_mention_open_ids.includes(userId)) {
+    return {
+      allowed: false,
+      rule: "denied_target",
+      reason: "Mention target is denied by denied_mention_open_ids.",
+    };
+  }
+  return { allowed: true, rule: "allowed" };
 }
 
 export function shouldProvideResponseSurfacePostClient(

@@ -154,7 +154,7 @@ Agent 通过工作区里的 `.larkway/state.json` 或 v0.3 session state artifac
 - `card_title` / `card_color`: 兼容字段。默认 CardKit 不渲染顶部标题色条;legacy/fallback 卡片路径可继续使用。
 - `choices` / `choice_prompt`: 可选的离散选择。按钮点击只把 value 作为新一轮文本交回 Agent。
 - `content_blocks`: 可选的有序 markdown/image 正文块。需要平台正文与匹配图片在同一 review card 里相邻展示时使用;优先级和示例见 [Review Card Content Blocks](review-card-content-blocks.md)。
-- `response_surface`: 可选覆盖,主要用于声明 `post.mentions` late peer @。普通回复可不写;CardKit 流式卡片是唯一正常响应面。旧 `card` / `post` / `hybrid` mode 字段仅兼容解析,不再选择 post-only/hybrid 主响应面。协议和门禁见 [Response Surface Prototype](response-surface-prototype.md)。
+- `response_surface`: 可选覆盖,主要用于声明 `post.mentions` late peer @。普通回复可不写;CardKit 流式卡片是唯一正常响应面。旧 `card` / `post` / `hybrid` mode 字段仅兼容解析,不再选择 post-only/hybrid 主响应面。这里的 late @ 是最终卡片里的视觉提示;需要 peer bot 消费正文的 handoff 必须由 Agent/团队工作流发送真实 Feishu post + at 标签。协议和门禁见 [Response Surface Prototype](response-surface-prototype.md)。
 
 运行中答案流另有一个显式通道:Agent stdout 里只有包在独立行
 `LARKWAY_ANSWER_BEGIN` 和 `LARKWAY_ANSWER_END` 之间的正文会被 bridge

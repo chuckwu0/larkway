@@ -569,6 +569,7 @@ bot_open_id: surface_default_bot
       post_outbound_enabled: true,
       cardkit_streaming_enabled: true,
       allow_agent_mentions: true,
+      denied_mention_open_ids: [],
       allowed_mention_open_ids: [],
     });
   });
@@ -595,6 +596,8 @@ response_surface_prototype:
   post_outbound_enabled: true
   cardkit_streaming_enabled: false
   allow_agent_mentions: false
+  denied_mention_open_ids:
+    - surface_denied_peer
   allowed_mention_open_ids:
     - surface_peer
   max_posts_per_turn: 2
@@ -615,6 +618,7 @@ response_surface_prototype:
       post_outbound_enabled: true,
       cardkit_streaming_enabled: false,
       allow_agent_mentions: false,
+      denied_mention_open_ids: ["surface_denied_peer"],
       allowed_mention_open_ids: ["surface_peer"],
     });
   });

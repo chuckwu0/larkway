@@ -287,6 +287,32 @@ describe("StateFileSchema — response_surface prototype declaration", () => {
     }
   });
 
+  it("keeps response_surface soft-fail separate from strict final-card fields", () => {
+    const soft = StateFileSchema.safeParse({
+      status: "ready",
+      last_message: "bad prototype should not drop the answer",
+      response_surface: {
+        post: {
+          mentions: [{ user_id: "bad<script>", label: "Bad" }],
+        },
+      },
+      updated_at: "2026-06-26T09:00:00.000Z",
+    });
+    expect(soft.success).toBe(true);
+    if (soft.success) {
+      expect(soft.data.status).toBe("ready");
+      expect(soft.data.response_surface).toBeUndefined();
+    }
+
+    const strict = StateFileSchema.safeParse({
+      status: "ready",
+      last_message: "bad choices should reject callback state",
+      choices: [{ label: "Missing value", value: "" }],
+      updated_at: "2026-06-26T09:00:00.000Z",
+    });
+    expect(strict.success).toBe(false);
+  });
+
   it("reports diagnostics when response_surface soft-fails", async () => {
     const dir = await mkdtemp(join(tmpdir(), "larkway-state-"));
     try {
