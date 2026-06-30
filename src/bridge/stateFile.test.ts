@@ -6,7 +6,10 @@
  * drop the `status` the bridge actually needs. See stateFile.ts `optionalUrl`.
  */
 import { describe, it, expect } from "vitest";
-import { StateFileSchema } from "./stateFile.js";
+import { mkdtemp, rm, mkdir, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { StateFileSchema, readStateFileDetailed, stateFilePathOf } from "./stateFile.js";
 
 describe("StateFileSchema — thin-channel URL leniency", () => {
   it("accepts a relative mr_url and still surfaces status (the bridge's only hard need)", () => {
@@ -242,6 +245,29 @@ describe("StateFileSchema — response_surface prototype declaration", () => {
     }
   });
 
+  it("defaults a mode-less response_surface to card so peer mentions survive", () => {
+    const r = StateFileSchema.safeParse({
+      status: "ready",
+      last_message: "handoff",
+      response_surface: {
+        post: {
+          mentions: [{ user_id: "peer_test", label: "Peer" }],
+        },
+      },
+      updated_at: "2026-06-26T09:00:00.000Z",
+    });
+
+    expect(r.success).toBe(true);
+    if (r.success) {
+      expect(r.data.response_surface).toEqual({
+        mode: "card",
+        post: {
+          mentions: [{ user_id: "peer_test", label: "Peer" }],
+        },
+      });
+    }
+  });
+
   it("soft-fails malformed response_surface so status is still usable", () => {
     const r = StateFileSchema.safeParse({
       status: "ready",
@@ -258,6 +284,38 @@ describe("StateFileSchema — response_surface prototype declaration", () => {
       expect(r.data.status).toBe("ready");
       expect(r.data.last_message).toBe("must survive a bad prototype field");
       expect(r.data.response_surface).toBeUndefined();
+    }
+  });
+
+  it("reports diagnostics when response_surface soft-fails", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "larkway-state-"));
+    try {
+      await mkdir(join(dir, ".larkway"), { recursive: true });
+      await writeFile(
+        stateFilePathOf(dir),
+        JSON.stringify(
+          {
+            status: "ready",
+            last_message: "must survive a bad prototype field",
+            response_surface: {
+              mode: "card",
+              primary: "post",
+            },
+            updated_at: "2026-06-26T09:00:00.000Z",
+          },
+          null,
+          2,
+        ),
+        "utf8",
+      );
+
+      const result = await readStateFileDetailed(dir);
+      expect(result.state?.status).toBe("ready");
+      expect(result.state?.response_surface).toBeUndefined();
+      expect(result.diagnostics.join("\n")).toContain("response_surface ignored");
+      expect(result.diagnostics.join("\n")).toContain("primary");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
     }
   });
 });

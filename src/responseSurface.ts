@@ -55,7 +55,7 @@ const ResponseSurfaceCardSchema = z.object({
 
 const StrictResponseSurfaceStateSchema = z
   .object({
-    mode: ResponseSurfaceModeSchema,
+    mode: ResponseSurfaceModeSchema.optional().default("card"),
     primary: ResponseSurfacePrimarySchema.optional(),
     post: ResponseSurfacePostSchema.optional(),
     card: ResponseSurfaceCardSchema.optional(),
@@ -77,11 +77,26 @@ const StrictResponseSurfaceStateSchema = z
  */
 export const ResponseSurfaceStateSchema = z.preprocess((value) => {
   if (value === undefined) return undefined;
-  const result = StrictResponseSurfaceStateSchema.safeParse(value);
-  return result.success ? result.data : undefined;
+  return parseResponseSurfaceState(value).state;
 }, StrictResponseSurfaceStateSchema.optional());
 
 export type ResponseSurfaceState = z.infer<typeof StrictResponseSurfaceStateSchema>;
+
+export interface ResponseSurfaceParseResult {
+  state?: ResponseSurfaceState;
+  diagnostics: string[];
+}
+
+export function parseResponseSurfaceState(value: unknown): ResponseSurfaceParseResult {
+  const result = StrictResponseSurfaceStateSchema.safeParse(value);
+  if (result.success) return { state: result.data, diagnostics: [] };
+  return {
+    diagnostics: result.error.issues.map((issue) => {
+      const path = issue.path.length > 0 ? issue.path.join(".") : "<root>";
+      return `${path}: ${issue.message}`;
+    }),
+  };
+}
 
 export const ResponseSurfacePrototypeConfigSchema = z
   .object({

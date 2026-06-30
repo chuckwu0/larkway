@@ -774,8 +774,6 @@ describe("handleOne — thin-channel finalize", () => {
       choices: [{ label: "继续", value: "继续处理" }],
       choice_prompt: "下一步?",
       response_surface: {
-        mode: "post",
-        primary: "post",
         post: { mentions: [{ user_id: "peer_test", label: "Peer" }] },
       },
       updated_at: "2026-06-26T10:00:00.000Z",
@@ -847,6 +845,88 @@ describe("handleOne — thin-channel finalize", () => {
     const finalUpdate = cardKitCalls.find((c) => c.kind === "updateCard");
     expect(JSON.stringify(finalUpdate?.payload)).toContain("继续");
     expect(JSON.stringify(finalUpdate?.payload)).toContain("<at id=peer_test></at>");
+  });
+
+  it("records a runtime diagnostic when CardKit mentions are policy-filtered", async () => {
+    const threadId = "om_msg";
+    const finalState = {
+      status: "ready",
+      last_message: "CardKit 最终正文",
+      response_surface: {
+        post: { mentions: [{ user_id: "peer_blocked", label: "Peer" }] },
+      },
+      updated_at: "2026-06-26T10:00:00.000Z",
+    };
+    const wt = await seedWorktree(threadId);
+    await seedRepoCachePath();
+    const { client: cardKitClient, calls: cardKitCalls } = makeCardKitClient();
+    const runtimeEvents: Array<{ statusPath?: string[]; reason?: string }> = [];
+
+    runClaudeImpl = () => ({
+      events: (async function* () {
+        yield { type: "system_init", sessionId: "sess_cardkit_policy", raw: {} };
+        await writeFile(
+          stateFileMod.stateFilePathOf(wt),
+          JSON.stringify(finalState, null, 2),
+          "utf8",
+        );
+      })(),
+      done: Promise.resolve({ exitCode: 0, sessionId: "sess_cardkit_policy" }),
+      kill: () => {},
+    });
+
+    const { renderer, startArgs, finalizeArgs } = makeCardRenderer();
+    const { store } = makeSessionStore();
+    const { client, acked } = makeClient(makeEvent());
+
+    const handler = new BridgeHandler({
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      client: client as any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      cardRenderer: renderer as any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      sessionStore: store as any,
+      conventions: makeConventions(),
+      botConfig: {
+        id: "frontend",
+        name: "Frontend",
+        turn_taking_limit: 10,
+        backend: "claude",
+        response_surface_prototype: {
+          enabled: true,
+          allowed_chats: [],
+          allowed_threads: ["om_msg"],
+          kill_switch: false,
+          post_outbound_enabled: true,
+          cardkit_streaming_enabled: true,
+          allow_agent_mentions: true,
+          allowed_mention_open_ids: ["peer_allowed"],
+        },
+      },
+      cardKitClient,
+      recordRuntimeEvent: async (patch) => {
+        runtimeEvents.push({
+          statusPath: patch.appendPath
+            ? Array.isArray(patch.appendPath)
+              ? patch.appendPath
+              : [patch.appendPath]
+            : patch.statusPath,
+          reason: patch.reason ?? undefined,
+        });
+      },
+    });
+
+    await handler.run();
+    for (let i = 0; i < 100 && acked.length === 0; i++) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
+
+    expect(startArgs).toHaveLength(0);
+    expect(finalizeArgs).toHaveLength(0);
+    const finalUpdate = cardKitCalls.find((c) => c.kind === "updateCard");
+    expect(JSON.stringify(finalUpdate?.payload)).not.toContain("<at id=peer_blocked></at>");
+    expect(runtimeEvents.some((e) => e.statusPath?.includes("mention 诊断"))).toBe(true);
+    expect(runtimeEvents.some((e) => e.reason?.includes("0/1 allowed"))).toBe(true);
   });
 
   it("updates the CardKit running footer with count-only tool usage", async () => {

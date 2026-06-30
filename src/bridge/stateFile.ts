@@ -16,7 +16,10 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { z } from "zod";
-import { ResponseSurfaceStateSchema } from "../responseSurface.js";
+import {
+  ResponseSurfaceStateSchema,
+  parseResponseSurfaceState,
+} from "../responseSurface.js";
 
 // ---------------------------------------------------------------------------
 // Schema
@@ -201,6 +204,11 @@ export const StateFileSchema = z.object({
 
 export type StateFile = z.infer<typeof StateFileSchema>;
 
+export interface StateFileReadResult {
+  state: StateFile | null;
+  diagnostics: string[];
+}
+
 // ---------------------------------------------------------------------------
 // Paths
 // ---------------------------------------------------------------------------
@@ -250,14 +258,22 @@ export async function ensureStateFile(worktreePath: string): Promise<void> {
 export async function readStateFile(
   worktreePath: string,
 ): Promise<StateFile | null> {
+  return (await readStateFileDetailed(worktreePath)).state;
+}
+
+export async function readStateFileDetailed(
+  worktreePath: string,
+): Promise<StateFileReadResult> {
   const file = stateFilePathOf(worktreePath);
   let raw: string;
   try {
     raw = await fs.readFile(file, "utf8");
   } catch (err) {
-    if ((err as NodeJS.ErrnoException).code === "ENOENT") return null;
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+      return { state: null, diagnostics: [] };
+    }
     console.warn(`[stateFile] read ${file} failed:`, err);
-    return null;
+    return { state: null, diagnostics: [] };
   }
 
   let parsed: unknown;
@@ -280,11 +296,11 @@ export async function readStateFile(
           `[stateFile] ${file} not valid JSON (repair also failed):`,
           err2,
         );
-        return null;
+        return { state: null, diagnostics: [] };
       }
     } else {
       console.warn(`[stateFile] ${file} not valid JSON:`, err);
-      return null;
+      return { state: null, diagnostics: [] };
     }
   }
 
@@ -294,9 +310,26 @@ export async function readStateFile(
       `[stateFile] ${file} failed schema validation:`,
       result.error.issues,
     );
-    return null;
+    return { state: null, diagnostics: [] };
   }
-  return result.data;
+  const diagnostics = diagnoseStateFile(parsed, result.data);
+  for (const diagnostic of diagnostics) {
+    console.warn(`[stateFile] ${file}: ${diagnostic}`);
+  }
+  return { state: result.data, diagnostics };
+}
+
+function diagnoseStateFile(parsed: unknown, state: StateFile): string[] {
+  if (parsed === null || typeof parsed !== "object") return [];
+  if (!Object.prototype.hasOwnProperty.call(parsed, "response_surface")) return [];
+  const rawSurface = (parsed as { response_surface?: unknown }).response_surface;
+  if (rawSurface === undefined || state.response_surface !== undefined) return [];
+  const parsedSurface = parseResponseSurfaceState(rawSurface);
+  const details =
+    parsedSurface.diagnostics.length > 0
+      ? parsedSurface.diagnostics.join("; ")
+      : "unknown parse failure";
+  return [`response_surface ignored: ${details}`];
 }
 
 // ---------------------------------------------------------------------------

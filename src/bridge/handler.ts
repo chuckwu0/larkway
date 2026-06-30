@@ -31,7 +31,12 @@ import { createRunner } from "../agent/runner.js";
 import type { BotConfig } from "../config/botLoader.js";
 import { ensureSessionArtifacts } from "../agent/sessionArtifacts.js";
 import { ensureAgentWorkspace } from "../agent/workspaceStore.js";
-import { ensureStateFile, readStateFile, stateFilePathOf } from "./stateFile.js";
+import {
+  ensureStateFile,
+  readStateFile,
+  readStateFileDetailed,
+  stateFilePathOf,
+} from "./stateFile.js";
 import { writeCardFile, deleteCardFile } from "./cardFile.js";
 import {
   writeCardKitFile,
@@ -1273,7 +1278,8 @@ export class BridgeHandler {
             Date.now() - runnerStartedAt >= timeoutMs;
 
           // Step 4d-ii: read state.json the bot wrote during the response.
-          const rawReportedState = await readStateFile(worktreePath);
+          const reportedStateRead = await readStateFileDetailed(worktreePath);
+          const rawReportedState = reportedStateRead.state;
           // Stale-guard: only trust state.json if the bot actually rewrote it this
           // turn (updated_at advanced past the pre-run snapshot). A stale file =
           // "no report this turn" → treat as null, which the downstream code already
@@ -1285,6 +1291,25 @@ export class BridgeHandler {
             rawReportedState.updated_at !== preRunUpdatedAt
               ? rawReportedState
               : null;
+
+          if (reportedStateRead.diagnostics.length > 0 && reportedState !== null) {
+            await recordEvent({
+              status: "running",
+              appendPath: "state 诊断",
+              reason: reportedStateRead.diagnostics.join("; "),
+            });
+          }
+
+          if (reportedState === null) {
+            await recordEvent({
+              status: "running",
+              appendPath: "未更新 state.json",
+              reason:
+                rawReportedState === null
+                  ? "本轮结束时未读取到 state.json。"
+                  : "本轮 state.json 没有 fresh updated_at，已忽略旧状态。",
+            });
+          }
 
           // Thin-channel: NO dev_url HTTP probe, NO stage state-machine, NO
           // demotion. The finalize truth-ordering below reduces to status/exitCode
@@ -1354,11 +1379,21 @@ export class BridgeHandler {
           } else if (cardKitTimeoutFailure) {
             success = false;
             failureReason = `agent turn timed out after ${timeoutMs}ms; CardKit running card was finalized as interrupted`;
+            await recordEvent({
+              status: "running",
+              appendPath: "Agent 超时",
+              reason: failureReason,
+            });
           } else if (result.exitCode === 0) {
             success = true;
           } else {
             success = false;
             failureReason = `claude exited ${result.exitCode} 且 bot 未更新 state.json status — 可能崩溃`;
+            await recordEvent({
+              status: "running",
+              appendPath: "Agent 异常退出",
+              reason: failureReason,
+            });
           }
 
           // reportedState is null when the bot didn't rewrite state.json this
@@ -1407,9 +1442,30 @@ export class BridgeHandler {
           };
 
           if (cardKitProgress) {
-            const mentions = (reportedState?.response_surface?.post?.mentions ?? []).filter(
-              (mention) => isResponseSurfaceMentionAllowed(prototypeConfig, mention.user_id),
+            const declaredMentions = reportedState?.response_surface?.post?.mentions ?? [];
+            const responseSurfacePostDeclared = reportedState?.response_surface?.post !== undefined;
+            const mentions = declaredMentions.filter((mention) =>
+              isResponseSurfaceMentionAllowed(prototypeConfig, mention.user_id),
             );
+            if (responseSurfacePostDeclared && declaredMentions.length === 0) {
+              const reason = "response_surface.post was declared with an empty mentions array.";
+              console.warn("[bridge.handler] response_surface post has no mentions");
+              await recordEvent({
+                status: "running",
+                appendPath: "mention 诊断",
+                reason,
+              });
+            } else if (declaredMentions.length > mentions.length) {
+              const reason =
+                `response_surface mentions filtered by policy: ` +
+                `${mentions.length}/${declaredMentions.length} allowed.`;
+              console.warn("[bridge.handler] response_surface mention policy filtered targets");
+              await recordEvent({
+                status: "running",
+                appendPath: "mention 诊断",
+                reason,
+              });
+            }
             try {
               await cardKitProgress.finalize({
                 title: baseCardPayload.titleOverride,
