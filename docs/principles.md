@@ -141,6 +141,8 @@ Larkway 传给 Agent 的核心信息应是:
 
 以后讨论出的产品和技术原则,优先落到本文;阶段性实现和验收落到对应版本文档(见 [versioning.md](versioning.md))。不要把长期理念散落在一次性聊天记录、临时设计稿或代码注释里。
 
+产品原则与 Agent Team 设计基线的精简北极星版见 [product-principles.md](product-principles.md)(owner × Elon 对齐基线,收录 Agent Team 作为一等核心功能、状态与通知分离、同时复用飞书服务端与 Agent 底座等要点);本文是其详细展开,二者理念一致,如有冲突以本文为准。
+
 判断一个新文档是否应该成为权威源:
 
 - 中长期不会随版本频繁变化的理念,写进本文。
