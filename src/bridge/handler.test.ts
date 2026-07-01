@@ -107,33 +107,8 @@ afterEach(async () => {
   runnerBackends = [];
   spawnCalls = [];
   spawnShouldFail = null;
-  await rmWithRetry(root);
+  await rm(root, { recursive: true, force: true });
 });
-
-/**
- * handler.run() dispatches handleOne fire-and-forget, so a turn keeps writing
- * ledger files into <worktree>/.larkway (updateCardKitRecord / deleteCardFile)
- * AFTER the visible card.finalize that tests sync on via `whenFinalized`, and
- * only then settles. Removing `root` at that mid-turn point can race a trailing
- * write landing between rm's unlink pass and its rmdir → ENOTEMPTY. This is a
- * cleanup-ordering artifact, not a product bug (write-ledger-then-settle is
- * correct): retry the removal until those in-flight writes have landed and the
- * tree is fully removable. Deterministic — the writes complete within ms.
- */
-async function rmWithRetry(dir: string): Promise<void> {
-  for (let attempt = 0; ; attempt++) {
-    try {
-      await rm(dir, { recursive: true, force: true });
-      return;
-    } catch (err) {
-      if ((err as NodeJS.ErrnoException).code === "ENOTEMPTY" && attempt < 50) {
-        await new Promise((r) => setTimeout(r, 20));
-        continue;
-      }
-      throw err;
-    }
-  }
-}
 
 interface FinalizeArgs {
   finalText?: string;
@@ -1429,6 +1404,10 @@ describe("handleOne — thin-channel finalize", () => {
 
     await handler.run();
     await whenFinalized;
+    // whenFinalized fires at card.finalize; the turn then writes trailing ledger
+    // files (updateCardKitRecord / deleteCardFile) before it settles. Wait for
+    // the real turn boundary so assertions + afterEach cleanup don't race them.
+    await handler.whenAllTurnsSettled();
 
     expect(startArgs).toHaveLength(1);
     expect(finalizeArgs).toHaveLength(1);
@@ -1561,9 +1540,13 @@ describe("handleOne — thin-channel finalize", () => {
     });
 
     await handler.run();
-    for (let i = 0; i < 100 && unhandled.length === 0; i++) {
-      await new Promise((r) => setTimeout(r, 10));
-    }
+    // Sync on the REAL turn boundary: the failure path settles (markUnhandled)
+    // EARLY to release the @ for re-dispatch, then still renders the fallback
+    // card + create-only post. Polling `unhandled` raced those trailing renders
+    // (startArgs / postCalls not yet populated → flaky) and cleanup raced the
+    // cardkit.json.tmp→final rename (ENOENT). whenAllTurnsSettled() waits until
+    // handleOne fully returned and all trailing I/O drained.
+    await handler.whenAllTurnsSettled();
 
     expect(acked).toEqual([]);
     expect(unhandled).toEqual(["om_msg"]);
@@ -1777,9 +1760,13 @@ describe("handleOne — thin-channel finalize", () => {
     });
 
     await handler.run();
-    for (let i = 0; i < 100 && unhandled.length === 0; i++) {
-      await new Promise((r) => setTimeout(r, 10));
-    }
+    // Sync on the REAL turn boundary: the failure path settles (markUnhandled)
+    // EARLY to release the @ for re-dispatch, then still renders the fallback
+    // card + create-only post. Polling `unhandled` raced those trailing renders
+    // (startArgs / postCalls not yet populated → flaky) and cleanup raced the
+    // cardkit.json.tmp→final rename (ENOENT). whenAllTurnsSettled() waits until
+    // handleOne fully returned and all trailing I/O drained.
+    await handler.whenAllTurnsSettled();
 
     expect(acked).toEqual([]);
     expect(unhandled).toEqual(["om_msg"]);

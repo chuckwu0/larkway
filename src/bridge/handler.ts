@@ -649,8 +649,31 @@ export class BridgeHandler {
   private readonly deps: BridgeHandlerDeps;
   private closed = false;
 
+  /**
+   * In-flight per-turn completion promises. run() dispatches handleOne
+   * fire-and-forget (thread-serialized), so run() returning does NOT mean the
+   * turn finished. Each entry resolves only when its handleOne AND all trailing
+   * work (terminal render + ledger writes, incl. the failure-path fallback that
+   * runs after the early settle) have completed. {@link whenAllTurnsSettled}
+   * awaits these — the real turn boundary tests must sync assertions/cleanup on.
+   */
+  private readonly inFlightTurns = new Set<Promise<void>>();
+
   constructor(deps: BridgeHandlerDeps) {
     this.deps = deps;
+  }
+
+  /**
+   * Resolves when every dispatched turn has fully completed (handleOne returned
+   * and its trailing render/ledger I/O drained). Test-facing sync point; a bridge
+   * that keeps receiving events would keep finding work, so callers use this
+   * after the event source is exhausted (e.g. right after `await run()` in a
+   * single-message test).
+   */
+  async whenAllTurnsSettled(): Promise<void> {
+    while (this.inFlightTurns.size > 0) {
+      await Promise.all([...this.inFlightTurns]);
+    }
   }
 
   private runtimeWarnings(): RuntimeRequirement[] {
@@ -713,7 +736,11 @@ export class BridgeHandler {
         .finally(() => {
           release();
           if (threadQueues.get(key) === next) threadQueues.delete(key);
+          this.inFlightTurns.delete(next);
         });
+      // Track the true completion of this turn (handleOne + all trailing I/O) so
+      // whenAllTurnsSettled() can await it.
+      this.inFlightTurns.add(next);
       threadQueues.set(key, next);
     }
   }
