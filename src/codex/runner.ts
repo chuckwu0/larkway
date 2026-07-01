@@ -665,6 +665,7 @@ export function runCodex(opts: RunOptions, codexBinPath = "codex"): RunHandle {
     events: generateEvents(),
     done,
     kill: doKill,
+    pid: child.pid ?? undefined,
   };
 }
 

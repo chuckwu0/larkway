@@ -481,3 +481,90 @@ describe("selectOrphanWorktreeNames", () => {
     expect(selectOrphanWorktreeNames(["x", "y"], new Set()).sort()).toEqual(["x", "y"]);
   });
 });
+
+// ---------------------------------------------------------------------------
+// isReclaimableSessionPath — safety guard for the agent_workspace rm -rf.
+// This predicate is the last line of defence against recurse-deleting a parent
+// dir, so it is tested exhaustively.
+// ---------------------------------------------------------------------------
+
+describe("isReclaimableSessionPath", () => {
+  it("accepts a real agent_workspace session dir path", async () => {
+    const { isReclaimableSessionPath } = await import("./gc.js");
+    expect(
+      isReclaimableSessionPath(
+        "/Users/x/.larkway/agents/turing/workspace/sessions/om_x100b6b0a7e58f8a",
+      ),
+    ).toBe(true);
+  });
+
+  it("accepts a path with a trailing slash", async () => {
+    const { isReclaimableSessionPath } = await import("./gc.js");
+    expect(
+      isReclaimableSessionPath(
+        "/Users/x/.larkway/agents/turing/workspace/sessions/om_x1/",
+      ),
+    ).toBe(true);
+  });
+
+  it("REJECTS the sessions root itself (would nuke every session)", async () => {
+    const { isReclaimableSessionPath } = await import("./gc.js");
+    expect(
+      isReclaimableSessionPath(
+        "/Users/x/.larkway/agents/turing/workspace/sessions",
+      ),
+    ).toBe(false);
+  });
+
+  it("REJECTS parent / unrelated / root paths", async () => {
+    const { isReclaimableSessionPath } = await import("./gc.js");
+    for (const p of [
+      "/Users/x/.larkway/agents/turing/workspace",
+      "/Users/x/.larkway/agents/turing",
+      "/Users/x/.larkway",
+      "/Users/x",
+      "/",
+      "",
+      "/tmp/something/else",
+    ]) {
+      expect(isReclaimableSessionPath(p)).toBe(false);
+    }
+  });
+
+  it("REJECTS traversal segments (.. escapes to workspace, . to sessions root)", async () => {
+    const { isReclaimableSessionPath } = await import("./gc.js");
+    for (const p of [
+      "/Users/x/.larkway/agents/turing/workspace/sessions/..",
+      "/Users/x/.larkway/agents/turing/workspace/sessions/../",
+      "/Users/x/.larkway/agents/turing/workspace/sessions/.",
+      "/Users/x/.larkway/agents/turing/workspace/sessions/./",
+    ]) {
+      expect(isReclaimableSessionPath(p)).toBe(false);
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// isPidAlive — the primitive behind the cleanupAgentSession liveness gate that
+// stops the GC from rm -rf-ing an in-flight session.
+// ---------------------------------------------------------------------------
+
+describe("isPidAlive", () => {
+  it("returns true for this live test process", async () => {
+    const { isPidAlive } = await import("./gc.js");
+    expect(isPidAlive(process.pid)).toBe(true);
+  });
+
+  it("returns false for a pid that (almost certainly) does not exist", async () => {
+    const { isPidAlive } = await import("./gc.js");
+    // 2^30 is far above any real pid on the test host.
+    expect(isPidAlive(1 << 30)).toBe(false);
+  });
+
+  it("returns false for invalid pids", async () => {
+    const { isPidAlive } = await import("./gc.js");
+    for (const bad of [0, -1, 1.5, Number.NaN]) {
+      expect(isPidAlive(bad)).toBe(false);
+    }
+  });
+});

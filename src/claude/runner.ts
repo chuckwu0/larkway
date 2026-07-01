@@ -554,6 +554,7 @@ export function runClaude(opts: RunOptions): RunHandle {
     events: generateEvents(),
     done,
     kill: doKill,
+    pid: child.pid ?? undefined,
   };
 }
 

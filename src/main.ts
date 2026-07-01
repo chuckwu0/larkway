@@ -376,7 +376,11 @@ async function runV2Mode({
       },
     });
 
-    const housekeeping = new Housekeeping({ sessionStore, botId: bot.id });
+    const housekeeping = new Housekeeping({
+      sessionStore,
+      botId: bot.id,
+      runtime: bot.runtime,
+    });
 
     const inst: BotInstance = {
       bot, client, sessionStore, cardRenderer, handler, housekeeping,

@@ -74,6 +74,14 @@ export interface RunHandle {
   events: AsyncIterable<AgentStreamEvent>;
   done: Promise<{ exitCode: number; sessionId?: string }>;
   kill(): void;
+  /**
+   * OS pid of the spawned agent CLI child, when available. The bridge writes a
+   * session-scoped pid file from this so housekeeping GC can detect an
+   * in-flight turn (liveness) regardless of backend — codex sends its prompt
+   * over stdin, so the session path never appears in its argv and pgrep alone
+   * cannot find it.
+   */
+  pid?: number;
 }
 
 // ---------------------------------------------------------------------------

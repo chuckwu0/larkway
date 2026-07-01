@@ -14,9 +14,11 @@
  */
 
 import { spawn } from "node:child_process";
-import { readFile, readdir, stat } from "node:fs/promises";
+import { readFile, readdir, rm, stat } from "node:fs/promises";
 import { join as pathJoin } from "node:path";
 import {
+  resolveAgentSessionPath,
+  resolveAgentWorkspaceSessionsDir,
   resolveWorktreePath as pathsResolveWorktreePath,
   resolveWorktreesDir,
 } from "../config/paths.js";
@@ -46,6 +48,13 @@ export class Housekeeping {
   readonly #idleCleanupMs: number;
   /** This housekeeping's bot scope — resolves which worktrees dir to sweep. */
   readonly #botId: string | undefined;
+  /**
+   * Bot runtime. "agent_workspace" reclaims per-thread session dirs under
+   * agents/<id>/workspace/sessions/ via rm -rf (they are plain dirs / full
+   * clones, not git worktrees). Anything else (legacy) reclaims git worktrees
+   * under <botId>/worktrees/ via `git worktree remove`.
+   */
+  readonly #runtime: string | undefined;
 
   /** thread_ids that have already received an idle-notify warn this session */
   readonly #notified = new Set<string>();
@@ -53,11 +62,12 @@ export class Housekeeping {
   #timer: ReturnType<typeof setInterval> | undefined;
 
   constructor(
-    deps: { sessionStore: SessionStore; botId?: string },
+    deps: { sessionStore: SessionStore; botId?: string; runtime?: string },
     opts?: HousekeepingOptions,
   ) {
     this.#sessionStore = deps.sessionStore;
     this.#botId = deps.botId;
+    this.#runtime = deps.runtime;
     this.#scanIntervalMs = opts?.scanIntervalMs ?? DEFAULT_SCAN_INTERVAL_MS;
     this.#idleNotifyMs = opts?.idleNotifyMs ?? DEFAULT_IDLE_NOTIFY_MS;
     this.#idleCleanupMs = opts?.idleCleanupMs ?? DEFAULT_IDLE_CLEANUP_MS;
@@ -115,12 +125,12 @@ export class Housekeeping {
       if (idleMs >= this.#idleCleanupMs) {
         const idleHours = Math.floor(idleMs / (60 * 60 * 1000));
         console.warn(
-          `[housekeeping] 话题 ${tid} idle ${idleHours}h+,worktree 可清理`,
+          `[housekeeping] 话题 ${tid} idle ${idleHours}h+,工作目录可清理`,
         );
         // Fire real cleanup (async — don't block scan loop). Passes botId
         // from the session record so V2 worktrees at ~/.larkway/<botId>/...
         // are resolved correctly (V1 records have botId="v1-default" → V1 path).
-        void cleanupWorktree(tid, record.botId, dryRun);
+        void this.#cleanupThread(tid, record.botId, dryRun);
         // Remove from notify-dedup set: if lastActiveTs ever updates,
         // the notify threshold fires again.
         this.#notified.delete(tid);
@@ -151,33 +161,57 @@ export class Housekeeping {
    * cleanupWorktree (kill PIDs → git worktree remove --force).
    */
   async #sweepOrphans(liveThreadIds: Set<string>, now: number, dryRun: boolean): Promise<void> {
-    const worktreesDir = resolveWorktreesDir(this.#botId);
+    const reclaimDir =
+      this.#runtime === "agent_workspace"
+        ? resolveAgentWorkspaceSessionsDir(this.#botId ?? "")
+        : resolveWorktreesDir(this.#botId);
     let dirNames: string[];
     try {
-      const entries = await readdir(worktreesDir, { withFileTypes: true });
+      const entries = await readdir(reclaimDir, { withFileTypes: true });
       dirNames = entries.filter((e) => e.isDirectory()).map((e) => e.name);
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
-        console.error(`[gc] orphan sweep: cannot read ${worktreesDir}:`, err);
+        console.error(`[gc] orphan sweep: cannot read ${reclaimDir}:`, err);
       }
       return;
     }
 
     for (const name of selectOrphanWorktreeNames(dirNames, liveThreadIds)) {
-      const wtPath = pathJoin(worktreesDir, name);
+      // Skip scaffold/bookkeeping dirs (e.g. agent_workspace "_creation"); only
+      // thread-id-shaped dirs are reclaimable session/worktree working dirs.
+      if (name.startsWith("_")) continue;
+      const dirPath = pathJoin(reclaimDir, name);
       let ageMs: number;
       try {
-        ageMs = now - (await stat(wtPath)).mtimeMs;
+        ageMs = now - (await stat(dirPath)).mtimeMs;
       } catch {
         continue; // vanished between readdir and stat — fine
       }
       if (ageMs < this.#idleCleanupMs) continue; // young → might be in-flight, skip
       const ageHours = Math.floor(ageMs / (60 * 60 * 1000));
       console.warn(
-        `[housekeeping] orphan worktree ${name}(无 session 记录, idle ${ageHours}h+)— 清理`,
+        `[housekeeping] orphan ${name}(无 session 记录, idle ${ageHours}h+)— 清理`,
       );
-      await cleanupWorktree(name, this.#botId, dryRun);
+      await this.#cleanupThread(name, this.#botId, dryRun);
     }
+  }
+
+  /**
+   * Runtime-aware reclaim of one thread's working dir.
+   * - agent_workspace: rm -rf agents/<id>/workspace/sessions/<tid> (plain dir /
+   *   full clones — `git worktree remove` cannot reclaim these).
+   * - legacy:          git worktree remove --force <botId>/worktrees/<tid>.
+   * Both kill any lingering runner PIDs first (idle >24h → normally dead).
+   */
+  #cleanupThread(
+    threadId: string,
+    botId: string | undefined,
+    dryRun: boolean,
+  ): Promise<void> {
+    if (this.#runtime === "agent_workspace") {
+      return cleanupAgentSession(threadId, botId ?? this.#botId, dryRun);
+    }
+    return cleanupWorktree(threadId, botId, dryRun);
   }
 }
 
@@ -463,4 +497,105 @@ export async function cleanupWorktree(
   } catch (err) {
     console.error(`[gc] worktree remove failed for path=${worktreePath}:`, err);
   }
+}
+
+// ---------------------------------------------------------------------------
+// agent_workspace session reclaim (rm -rf — NOT a git worktree)
+// ---------------------------------------------------------------------------
+
+/**
+ * Safety predicate: is `p` shaped like an agent_workspace session dir we may
+ * `rm -rf`? Requires the trailing `.../workspace/sessions/<threadId>` shape so
+ * an upstream bug can never recurse-delete a parent (sessions root, workspace,
+ * home, "/"). Pure — unit-testable without fs.
+ */
+export function isReclaimableSessionPath(p: string): boolean {
+  const m = /[/\\]workspace[/\\]sessions[/\\]([^/\\]+)[/\\]?$/.exec(p);
+  if (m === null) return false;
+  const seg = m[1];
+  // Reject traversal segments: ".../sessions/.." resolves to the workspace dir
+  // and ".../sessions/." to the sessions root — never rm -rf either.
+  return seg !== "." && seg !== "..";
+}
+
+/**
+ * Recursively remove an agent_workspace session directory (a plain dir that may
+ * contain full `git clone`s — NOT a registered git worktree, so
+ * `git worktree remove` cannot reclaim it). In dry-run mode, logs but does
+ * nothing. Refuses any path failing {@link isReclaimableSessionPath}.
+ */
+export async function removeSessionDir(
+  sessionPath: string,
+  dryRun: boolean,
+): Promise<void> {
+  if (!isReclaimableSessionPath(sessionPath)) {
+    console.error(`[gc] refusing to rm -rf non-session path: ${sessionPath}`);
+    return;
+  }
+  if (dryRun) {
+    console.log(`[gc] dry-run: would rm -rf ${sessionPath}`);
+    return;
+  }
+  console.log(`[gc] rm -rf ${sessionPath}`);
+  try {
+    await rm(sessionPath, { recursive: true, force: true });
+  } catch (err) {
+    console.error(`[gc] rm -rf failed for ${sessionPath}:`, err);
+  }
+}
+
+/**
+ * Full cleanup for an idle agent_workspace session:
+ *   1. Resolve session path (agents/<id>/workspace/sessions/<tid>)
+ *   2. Kill lingering runner PIDs (idle >24h → normally already dead)
+ *   3. rm -rf the session dir
+ * In dry-run mode all actions are logged but never executed.
+ */
+export async function cleanupAgentSession(
+  threadId: string,
+  agentId: string | undefined,
+  dryRun: boolean,
+): Promise<void> {
+  if (!agentId) {
+    console.error(
+      `[gc] cleanupAgentSession: missing agentId for thread=${threadId}`,
+    );
+    return;
+  }
+  let sessionPath: string;
+  try {
+    sessionPath = resolveAgentSessionPath(agentId, threadId);
+  } catch (err) {
+    console.error(`[gc] invalid session threadId=${threadId}:`, err);
+    return;
+  }
+  console.log(
+    `[gc] cleanup session thread=${threadId} path=${sessionPath} dryRun=${dryRun}`,
+  );
+
+  let pids: number[];
+  try {
+    pids = await findPidsByWorktree(sessionPath);
+  } catch (err) {
+    console.error(`[gc] pid lookup failed for path=${sessionPath}:`, err);
+    pids = [];
+  }
+
+  // SAFETY GATE (do NOT remove): a live runner pid means this session is IN USE
+  // right now. Both triggers that route here can be STALE while a turn runs —
+  // record.lastActiveTs is only written at turn finalize, and a session dir's
+  // mtime does not advance when the agent writes into an existing clone — so an
+  // idle classification is NOT proof the session is free. A live pid is the
+  // authoritative "in-flight, do not touch" signal. Never rm -rf a live session;
+  // a later scan reclaims it once the process has exited.
+  const alivePids = pids.filter(isPidAlive);
+  if (alivePids.length > 0) {
+    console.warn(
+      `[gc] skip live session thread=${threadId} path=${sessionPath}: runner pid(s) [${alivePids.join(", ")}] still alive — not reclaiming in-flight work`,
+    );
+    return;
+  }
+
+  // No live process → the session is genuinely idle/abandoned; reclaim it.
+  await removeSessionDir(sessionPath, dryRun);
 }

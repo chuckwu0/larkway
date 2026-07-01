@@ -1263,6 +1263,26 @@ export class BridgeHandler {
           gitlabToken: this.deps.gitlabToken,
         });
 
+        // GC liveness (agent_workspace only): the runner's cwd is the SHARED
+        // workspace root, so its own runner.pid lands there — NOT in this
+        // thread's session dir (worktreePath). Housekeeping GC reclaims
+        // per-thread session dirs by rm -rf, and gates that on a live pid read
+        // from <sessionDir>/.larkway/runner.pid; without this write that probe
+        // is empty and, for codex (prompt goes over stdin, session path never
+        // in argv), pgrep can't find the process either → GC could rm -rf a
+        // live session. Best-effort; a write failure must never fail the turn.
+        if (isAgentWorkspace && handle.pid != null) {
+          const sessionPidFile = path.join(worktreePath, ".larkway", "runner.pid");
+          void fs
+            .mkdir(path.dirname(sessionPidFile), { recursive: true })
+            .then(() =>
+              fs.writeFile(sessionPidFile, JSON.stringify({ pid: handle.pid }), "utf8"),
+            )
+            .catch(() => {
+              /* best-effort GC hint — never fail the turn on pid-file write */
+            });
+        }
+
         // Step 4d: stream events
         let sessionId: string | undefined;
         let trustedAnswerText = "";
