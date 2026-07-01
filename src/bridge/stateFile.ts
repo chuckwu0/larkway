@@ -199,10 +199,47 @@ export const StateFileSchema = z.object({
    * ignored and the legacy card path remains authoritative.
    */
   response_surface: ResponseSurfaceStateSchema.optional(),
-  updated_at: z.string(),
+  /**
+   * Freshness signal for the handler's stale-guard (it compares this against a
+   * pre-run snapshot to decide whether the bot rewrote state THIS turn).
+   *
+   * **OPTIONAL by thin-channel principle.** This used to be the ONE hard-required
+   * field, so a bot that wrote a perfectly good `status` + `last_message` but
+   * omitted `updated_at` had its ENTIRE state discarded → the card stranded on
+   * "本轮没有拿到 agent 的新回复" every single turn (2026-07-02 排障: one shared
+   * topic reproduced this on every @). Same failure class as the old
+   * `z.string().url()` mr_url and the strict `stage`/`card_color` enums.
+   *
+   * When absent, {@link readStateFileDetailed} server-stamps it from the file's
+   * mtime — which advances only on a real rewrite, so the stale-guard stays
+   * correct even for bots that never write the field.
+   */
+  updated_at: z.string().optional(),
 });
 
 export type StateFile = z.infer<typeof StateFileSchema>;
+
+/**
+ * 止血 salvage schema for field-level degradation (2026-07-02).
+ *
+ * When the full {@link StateFileSchema} rejects the whole object over ONE bad
+ * field, the bridge still only truly needs `status` (+ the operator-facing
+ * `last_message`). This lenient schema keeps those and drops everything else, so
+ * a single malformed/absent field can never strand the card on the generic
+ * "没拿到新回复" fallback. `z.object` strips unknown keys (structured business
+ * fields are simply omitted on this path); scalar fields use `.catch(undefined)`
+ * so a wrong-typed one degrades instead of failing salvage. `status` stays
+ * hard-required — without a valid status there is genuinely no usable report and
+ * the caller falls through to `null`.
+ */
+const SalvageStateSchema = z.object({
+  status: z.enum(["in_progress", "ready", "failed"]),
+  last_message: z.string().optional().catch(undefined),
+  error: z.string().optional().catch(undefined),
+  card_title: z.string().optional().catch(undefined),
+  card_text: z.string().optional().catch(undefined),
+  updated_at: z.string().optional().catch(undefined),
+});
 
 export interface StateFileReadResult {
   state: StateFile | null;
@@ -276,6 +313,16 @@ export async function readStateFileDetailed(
     return { state: null, diagnostics: [] };
   }
 
+  // mtime is the server-side freshness fallback for a missing `updated_at`
+  // (advances only on a real rewrite → keeps the handler's stale-guard correct).
+  // Best-effort: never fail the read over a missing stat.
+  let mtimeIso: string | undefined;
+  try {
+    mtimeIso = (await fs.stat(file)).mtime.toISOString();
+  } catch {
+    /* leave undefined; withStampedUpdatedAt falls back to now() */
+  }
+
   let parsed: unknown;
   try {
     parsed = JSON.parse(raw);
@@ -305,18 +352,59 @@ export async function readStateFileDetailed(
   }
 
   const result = StateFileSchema.safeParse(parsed);
-  if (!result.success) {
-    console.warn(
-      `[stateFile] ${file} failed schema validation:`,
-      result.error.issues,
-    );
-    return { state: null, diagnostics: [] };
+  if (result.success) {
+    const state = withStampedUpdatedAt(result.data, mtimeIso);
+    const diagnostics = diagnoseStateFile(parsed, result.data);
+    for (const diagnostic of diagnostics) {
+      console.warn(`[stateFile] ${file}: ${diagnostic}`);
+    }
+    return { state, diagnostics };
   }
-  const diagnostics = diagnoseStateFile(parsed, result.data);
-  for (const diagnostic of diagnostics) {
+
+  // Field-level degradation (止血, 2026-07-02): the full schema rejected the
+  // whole object over some field, but the bridge only truly needs `status`
+  // (+ the operator-facing last_message). Salvage those instead of discarding
+  // everything — otherwise one malformed/absent field strands the card on the
+  // generic "本轮没有拿到 agent 的新回复" fallback every turn.
+  const salvaged = SalvageStateSchema.safeParse(parsed);
+  if (salvaged.success) {
+    const droppedFields = summarizeRejectedTopFields(result.error);
+    const state = withStampedUpdatedAt(salvaged.data, mtimeIso);
+    const diagnostic = `state.json 部分字段无效已忽略，保留 status/last_message（受影响字段：${droppedFields}）`;
     console.warn(`[stateFile] ${file}: ${diagnostic}`);
+    return { state, diagnostics: [diagnostic] };
   }
-  return { state: result.data, diagnostics };
+
+  // Unsalvageable — not even a valid `status`. Genuine "no usable report".
+  console.warn(
+    `[stateFile] ${file} failed schema validation (unsalvageable):`,
+    result.error.issues,
+  );
+  return { state: null, diagnostics: [] };
+}
+
+/**
+ * Server-stamp a missing/blank `updated_at` from the file's mtime. mtime advances
+ * only when the bot actually rewrites state.json, so the handler's stale-guard
+ * (`updated_at !== preRunUpdatedAt`) keeps working even for bots that never write
+ * the field. Falls back to now() only if mtime was unavailable (stat failed).
+ */
+function withStampedUpdatedAt(
+  state: StateFile,
+  mtimeIso: string | undefined,
+): StateFile {
+  if (state.updated_at != null && state.updated_at !== "") return state;
+  return { ...state, updated_at: mtimeIso ?? new Date().toISOString() };
+}
+
+/** Distinct top-level field names that failed full-schema validation. */
+function summarizeRejectedTopFields(error: z.ZodError): string {
+  const fields = new Set<string>();
+  for (const issue of error.issues) {
+    const top = issue.path[0];
+    fields.add(top === undefined ? "(root)" : String(top));
+  }
+  return [...fields].join(", ") || "(unknown)";
 }
 
 function diagnoseStateFile(parsed: unknown, state: StateFile): string[] {

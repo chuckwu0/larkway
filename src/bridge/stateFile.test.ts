@@ -576,3 +576,137 @@ describe("StateFileSchema — V2 content blocks (ordered card body)", () => {
     }
   });
 });
+
+describe("readStateFileDetailed — updated_at optional + server-stamp (2026-07-02 排障)", () => {
+  it("accepts a state.json missing updated_at and server-stamps it (no whole-state discard)", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "larkway-state-"));
+    try {
+      await mkdir(join(dir, ".larkway"), { recursive: true });
+      // The exact shape that stranded a live topic every turn: valid status +
+      // last_message, but NO updated_at.
+      await writeFile(
+        stateFilePathOf(dir),
+        JSON.stringify({ status: "ready", last_message: "真实回复必须活下来" }),
+        "utf8",
+      );
+
+      const result = await readStateFileDetailed(dir);
+      expect(result.state).not.toBeNull();
+      expect(result.state?.status).toBe("ready");
+      expect(result.state?.last_message).toBe("真实回复必须活下来");
+      // server-stamped from file mtime → non-empty ISO string
+      expect(typeof result.state?.updated_at).toBe("string");
+      expect(result.state?.updated_at).not.toBe("");
+      expect(() => new Date(result.state!.updated_at!).toISOString()).not.toThrow();
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("stamps updated_at from mtime, which advances on rewrite (keeps the stale-guard working)", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "larkway-state-"));
+    try {
+      await mkdir(join(dir, ".larkway"), { recursive: true });
+      const body = { status: "in_progress" as const, last_message: "v1" };
+      await writeFile(stateFilePathOf(dir), JSON.stringify(body), "utf8");
+      const first = await readStateFileDetailed(dir);
+
+      // Rewrite the file after a real delay so mtime advances.
+      await new Promise((r) => setTimeout(r, 15));
+      await writeFile(
+        stateFilePathOf(dir),
+        JSON.stringify({ status: "in_progress", last_message: "v2" }),
+        "utf8",
+      );
+      const second = await readStateFileDetailed(dir);
+
+      expect(first.state?.updated_at).toBeTruthy();
+      expect(second.state?.updated_at).toBeTruthy();
+      // A rewrite advances mtime → the handler's `updated_at !== preRun` guard
+      // still detects a fresh write even though the bot never wrote updated_at.
+      expect(second.state?.updated_at).not.toBe(first.state?.updated_at);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("readStateFileDetailed — field-level degradation salvage (2026-07-02 排障)", () => {
+  it("salvages status + last_message when a non-critical field fails the full schema", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "larkway-state-"));
+    try {
+      await mkdir(join(dir, ".larkway"), { recursive: true });
+      // choices is structurally invalid (missing value) → full StateFileSchema
+      // rejects the whole object. Salvage must still surface status+last_message.
+      await writeFile(
+        stateFilePathOf(dir),
+        JSON.stringify({
+          status: "ready",
+          last_message: "operator 必须看到这条,而不是通用兜底",
+          choices: [{ label: "no value here" }],
+          updated_at: "2026-07-02T00:00:00.000Z",
+        }),
+        "utf8",
+      );
+
+      const result = await readStateFileDetailed(dir);
+      expect(result.state).not.toBeNull();
+      expect(result.state?.status).toBe("ready");
+      expect(result.state?.last_message).toBe("operator 必须看到这条,而不是通用兜底");
+      // the bad field is dropped, not the whole state
+      expect(result.state?.choices).toBeUndefined();
+      // and the drop is diagnosed (names the offending field)
+      expect(result.diagnostics.join("\n")).toContain("choices");
+      expect(result.diagnostics.join("\n")).toContain("保留 status/last_message");
+      // updated_at was present here → preserved verbatim
+      expect(result.state?.updated_at).toBe("2026-07-02T00:00:00.000Z");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("salvages + stamps updated_at when BOTH a field is bad AND updated_at is missing", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "larkway-state-"));
+    try {
+      await mkdir(join(dir, ".larkway"), { recursive: true });
+      await writeFile(
+        stateFilePathOf(dir),
+        JSON.stringify({
+          status: "failed",
+          last_message: "止血:坏字段+缺 updated_at 都要活下来",
+          error: "boom",
+          content_blocks: [{ type: "markdown" }], // missing content → invalid
+        }),
+        "utf8",
+      );
+
+      const result = await readStateFileDetailed(dir);
+      expect(result.state?.status).toBe("failed");
+      expect(result.state?.last_message).toBe("止血:坏字段+缺 updated_at 都要活下来");
+      expect(result.state?.error).toBe("boom");
+      expect(result.state?.content_blocks).toBeUndefined();
+      expect(typeof result.state?.updated_at).toBe("string");
+      expect(result.state?.updated_at).not.toBe("");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("still returns null when there is no salvageable status (genuinely no report)", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "larkway-state-"));
+    try {
+      await mkdir(join(dir, ".larkway"), { recursive: true });
+      // status is invalid → nothing usable to salvage → null (honest "no report")
+      await writeFile(
+        stateFilePathOf(dir),
+        JSON.stringify({ status: "bogus", last_message: "no valid status" }),
+        "utf8",
+      );
+
+      const result = await readStateFileDetailed(dir);
+      expect(result.state).toBeNull();
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+});

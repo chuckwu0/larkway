@@ -1569,6 +1569,17 @@ export class BridgeHandler {
             trustedAnswerText.trim() ||
             cardKitProgress?.answerText.trim() ||
             "";
+          // When there's genuinely no fresh state AND no answer text, tell the
+          // operator WHERE it broke + a concrete next step, instead of the old
+          // loop-inducing "再 @ 我一次重试" (which just reproduced the same
+          // failure — e.g. a bot that keeps writing a state.json the schema
+          // rejects). 2026-07-02 排障 fix #3.
+          const noOutputFallback =
+            "⚠️ 本轮 agent 没有产出正文，也没有写入有效状态(state.json)。\n" +
+            (result.exitCode !== 0
+              ? `agent 进程异常退出(exit code ${result.exitCode})。\n`
+              : "") +
+            "下一步：换个说法重试，或新开一个话题继续；若反复如此，请让维护者查看该 session 日志。";
           const cardBody =
             cardKitTimeoutFailure
               // PRB-9/§12.2: idle-stuck → unified explicit-failure sink, never a
@@ -1576,9 +1587,7 @@ export class BridgeHandler {
               // manually (safe auto-replay + idempotency is 批B §11.6).
               ? "⚠️ 本轮被中断（长时间无活性，判定卡死），未完成。请重试。"
               : reportedState?.last_message ??
-                (fallbackAnswer
-                  ? fallbackAnswer
-                  : "⚠️ 本轮没有拿到 agent 的新回复(可能被中断或未更新状态),再 @ 我一次重试。");
+                (fallbackAnswer ? fallbackAnswer : noOutputFallback);
 
           // When the agent didn't report status this turn (reportedState null,
           // per stale-guard) but exited cleanly, don't let the card default to
