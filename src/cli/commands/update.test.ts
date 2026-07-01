@@ -4,7 +4,7 @@
  * Unit tests for `larkway update` command.
  *
  * Two upgrade paths are tested:
- *   - npm path (default): npm i -g larkway@latest + lifecycle restart (3 steps).
+ *   - npm path: explicit package spec + lifecycle restart (3 steps).
  *   - Git-pull path (--git-pull): git pull --ff-only + pnpm install + lifecycle (4 steps).
  *
  * Isolation strategy:
@@ -175,18 +175,30 @@ vi.mock("node:child_process", () => {
 // Tests: npm path (default)
 // ---------------------------------------------------------------------------
 
-describe("larkway update --dry-run (npm path, default)", () => {
+describe("larkway update --dry-run (npm path)", () => {
   beforeEach(() => {
     spawnCalls = [];
     spawnResults = [];
     delete process.env["LARKWAY_UPDATE_URL"];
   });
 
-  it("exits 0 and prints npm step without spawning anything", async () => {
+  it("refuses implicit latest without spawning anything", async () => {
     const out = buildCapture();
     const ctx = buildCtx(out);
 
     const code = await run(ctx, ["--dry-run"]);
+
+    expect(code).toBe(1);
+    expect(spawnCalls).toHaveLength(0);
+    expect(out.failures.join("\n")).toContain("Refusing to install");
+    expect(out.failures.join("\n")).toContain("--package");
+  });
+
+  it("exits 0 and prints npm step when --latest is explicit", async () => {
+    const out = buildCapture();
+    const ctx = buildCtx(out);
+
+    const code = await run(ctx, ["--dry-run", "--latest"]);
 
     expect(code).toBe(0);
     // No spawn calls — dry-run must not execute
@@ -203,7 +215,7 @@ describe("larkway update --dry-run (npm path, default)", () => {
     const out = buildCapture();
     const ctx = buildCtx(out);
 
-    await run(ctx, ["--dry-run"]);
+    await run(ctx, ["--dry-run", "--latest"]);
 
     expect(out.warnings.some((w) => w.toLowerCase().includes("dry"))).toBe(true);
   });
@@ -212,7 +224,7 @@ describe("larkway update --dry-run (npm path, default)", () => {
     const out = buildCapture();
     const ctx = buildCtx(out, { json: true });
 
-    const code = await run(ctx, ["--dry-run"]);
+    const code = await run(ctx, ["--dry-run", "--latest"]);
 
     expect(code).toBe(0);
     expect(spawnCalls).toHaveLength(0);
@@ -230,10 +242,33 @@ describe("larkway update --dry-run (npm path, default)", () => {
     const out = buildCapture();
     const ctx = buildCtx(out, { json: true });
 
-    await run(ctx, ["--dry-run"]);
+    await run(ctx, ["--dry-run", "--latest"]);
 
     const result = out.jsons[0] as { packageSpec: string };
     expect(result.packageSpec).toBe("larkway@latest");
+  });
+
+  it("lets --package provide an explicit npm package spec", async () => {
+    const out = buildCapture();
+    const ctx = buildCtx(out, { json: true });
+
+    await run(ctx, ["--dry-run", "--package", "larkway@0.3.30"]);
+
+    const result = out.jsons[0] as { packageSpec: string; steps: Array<{ args: string[] }> };
+    expect(result.packageSpec).toBe("larkway@0.3.30");
+    expect(result.steps[0]?.args).toEqual(["i", "-g", "larkway@0.3.30"]);
+  });
+
+  it("rejects --package without a value", async () => {
+    const out = buildCapture();
+    const ctx = buildCtx(out, { json: true });
+
+    const code = await run(ctx, ["--dry-run", "--package"]);
+
+    expect(code).toBe(1);
+    expect(spawnCalls).toHaveLength(0);
+    expect((out.jsons[0] as { ok: boolean; error: string }).ok).toBe(false);
+    expect((out.jsons[0] as { error: string }).error).toContain("--package");
   });
 
   it("lets LARKWAY_UPDATE_URL override the npm package spec", async () => {
@@ -298,12 +333,23 @@ describe("larkway update (npm path, full run)", () => {
     delete process.env["LARKWAY_UPDATE_URL"];
   });
 
-  it("spawns npm i -g larkway@latest + stop + start in order (3 spawns)", async () => {
+  it("refuses implicit latest before spawning", async () => {
+    const out = buildCapture();
+    const ctx = buildCtx(out);
+
+    const code = await run(ctx, []);
+
+    expect(code).toBe(1);
+    expect(spawnCalls).toHaveLength(0);
+    expect(out.failures.join("\n")).toContain("Refusing to install");
+  });
+
+  it("spawns npm i -g larkway@latest + stop + start when --latest is explicit", async () => {
     const out = buildCapture();
     const ctx = buildCtx(out);
     spawnResults = [0, 0, 0]; // all succeed
 
-    const code = await run(ctx, []);
+    const code = await run(ctx, ["--latest"]);
 
     expect(code).toBe(0);
     expect(spawnCalls).toHaveLength(3);
@@ -321,7 +367,7 @@ describe("larkway update (npm path, full run)", () => {
     const ctx = buildCtx(out);
     spawnResults = [1]; // npm i fails
 
-    const code = await run(ctx, []);
+    const code = await run(ctx, ["--latest"]);
 
     expect(code).toBe(1);
     expect(spawnCalls).toHaveLength(1);
@@ -336,7 +382,7 @@ describe("larkway update (npm path, full run)", () => {
     const ctx = buildCtx(out);
     spawnResults = [0, 1, 0]; // npm ok, stop fails, start ok
 
-    const code = await run(ctx, []);
+    const code = await run(ctx, ["--latest"]);
 
     expect(code).toBe(0);
     expect(spawnCalls).toHaveLength(3);
@@ -348,7 +394,7 @@ describe("larkway update (npm path, full run)", () => {
     const ctx = buildCtx(out, { json: true });
     spawnResults = [0, 0, 0];
 
-    const code = await run(ctx, []);
+    const code = await run(ctx, ["--latest"]);
 
     expect(code).toBe(0);
     const lastEvent = out.jsons[out.jsons.length - 1] as { ok: boolean; status: string; mode: string };
@@ -362,7 +408,7 @@ describe("larkway update (npm path, full run)", () => {
     const ctx = buildCtx(out, { json: true });
     spawnResults = [1];
 
-    const code = await run(ctx, []);
+    const code = await run(ctx, ["--latest"]);
 
     expect(code).toBe(1);
     const errorEvent = out.jsons.find(
@@ -377,7 +423,7 @@ describe("larkway update (npm path, full run)", () => {
     const ctx = buildCtx(out, { json: true });
     spawnResults = [0, 1, 0]; // npm ok, stop fails, start ok
 
-    const code = await run(ctx, []);
+    const code = await run(ctx, ["--latest"]);
 
     expect(code).toBe(0);
     const lastEvent = out.jsons[out.jsons.length - 1] as {
@@ -396,7 +442,7 @@ describe("larkway update (npm path, full run)", () => {
     const ctx = buildCtx(out, { json: true });
     spawnResults = [0, 1, 1]; // npm ok, stop fails, start fails
 
-    const code = await run(ctx, []);
+    const code = await run(ctx, ["--latest"]);
 
     expect(code).toBe(0);
     const lastEvent = out.jsons[out.jsons.length - 1] as {
@@ -415,12 +461,12 @@ describe("larkway update (npm path, full run)", () => {
     const ctx = buildCtx(out);
     spawnResults = [0, 0, 1]; // npm ok, stop ok, start fails
 
-    const code = await run(ctx, []);
+    const code = await run(ctx, ["--latest"]);
 
     expect(code).toBe(0);
     const successMsgs = out.successes.join("\n");
     // Should NOT claim bridge was restarted cleanly
-    expect(successMsgs).not.toContain("已升级到最新 npm 版本");
+    expect(successMsgs).not.toContain("已升级指定 npm package");
     // Should hint manual restart
     expect(successMsgs).toMatch(/手动重启/);
   });
@@ -430,11 +476,11 @@ describe("larkway update (npm path, full run)", () => {
     const ctx = buildCtx(out);
     spawnResults = [0, 0, 0];
 
-    const code = await run(ctx, []);
+    const code = await run(ctx, ["--latest"]);
 
     expect(code).toBe(0);
     const successMsgs = out.successes.join("\n");
-    expect(successMsgs).toContain("已升级到最新 npm 版本");
+    expect(successMsgs).toContain("已升级指定 npm package");
   });
 });
 
