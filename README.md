@@ -149,7 +149,7 @@ Secrets live only in `~/.larkway/.env` (mode 0600). Config and memory contain no
 | `larkway memory edit <id>` | Edit L2 identity memory |
 | `larkway perms <id>` | Adjust L1 permissions |
 | `larkway ui` | Start local web management UI |
-| `larkway update` | Upgrade Larkway and restart bridge |
+| `larkway update --package larkway@<version>` | Upgrade from an explicit package spec and restart bridge (`--latest` opts into npm latest) |
 
 ---
 

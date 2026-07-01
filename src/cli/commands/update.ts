@@ -1,13 +1,13 @@
 /**
  * src/cli/commands/update.ts
  *
- * `larkway update` — 从 npm 一行升级(推荐),回退到 git pull + build。
+ * `larkway update` — 显式指定 npm 包/URL 后升级,或回退到 git pull + build。
  *
  * 升级策略(按优先级):
  *   1. npm 源(默认):
- *      a. `npm i -g larkway@latest` —— 原子升级,无需 repo clone。
+ *      a. `npm i -g <explicit-spec>` —— 原子升级,无需 repo clone。
  *      b. `larkway stop` + `larkway start` 重启 bridge。
- *      c. 运维可用 LARKWAY_UPDATE_URL 显式覆盖为一个 npm 可安装 URL/tarball。
+ *      c. spec 必须来自 --package、LARKWAY_UPDATE_URL,或显式 --latest。
  *   2. 回退(git pull + build):
  *      当 --git-pull flag 被显式传入,或 npm 升级失败(非 0 退出)时触发。
  *      步骤同原有逻辑:git pull --ff-only → pnpm install → restart。
@@ -15,6 +15,8 @@
  * Flags:
  *   --dry-run    Print steps without executing; exit 0.
  *   --git-pull   强制走 git pull + build 路径(跳过 npm 源)。
+ *   --package    npm-installable package spec, e.g. larkway@0.3.30.
+ *   --latest     Explicitly opt into npm latest.
  *   --json       Machine-readable output (emitJson events).
  *
  * Exit codes:  0 = ok  |  1 = error
@@ -31,13 +33,34 @@ import type { CliContext } from "../types.js";
 // ---------------------------------------------------------------------------
 
 const DEFAULT_NPM_PACKAGE_SPEC = "larkway@latest";
+const UPDATE_REQUIRE_EXPLICIT_HINT =
+  "Refusing to install `larkway@latest` without explicit approval. " +
+  "Use `larkway update --package larkway@<version>`, " +
+  "`LARKWAY_UPDATE_URL=<trusted-spec> larkway update`, or " +
+  "`larkway update --latest` if you intentionally want npm latest.";
 
-/**
- * Resolve the npm-installable package spec. By default Larkway updates from the
- * public npm package. Operators can override with a tarball/Git URL via env.
- */
-function resolveNpmPackageSpec(): string {
-  return process.env["LARKWAY_UPDATE_URL"] ?? DEFAULT_NPM_PACKAGE_SPEC;
+/** Resolve the explicitly-approved npm-installable package spec. */
+function readFlagValue(args: string[], flag: string): string | null | undefined {
+  const idx = args.indexOf(flag);
+  if (idx === -1) return undefined;
+  const value = args[idx + 1];
+  if (!value || value.startsWith("--")) return null;
+  return value;
+}
+
+function resolveNpmPackageSpec(args: string[]): { packageSpec?: string; error?: string } {
+  const envSpec = process.env["LARKWAY_UPDATE_URL"];
+  if (envSpec && envSpec.trim()) return { packageSpec: envSpec.trim() };
+
+  const packageArg = readFlagValue(args, "--package");
+  if (packageArg === null) {
+    return { error: "`--package` requires an npm-installable spec, e.g. `larkway@0.3.30`." };
+  }
+  if (packageArg) return { packageSpec: packageArg };
+
+  if (args.includes("--latest")) return { packageSpec: DEFAULT_NPM_PACKAGE_SPEC };
+
+  return { error: UPDATE_REQUIRE_EXPLICIT_HINT };
 }
 
 // ---------------------------------------------------------------------------
@@ -268,12 +291,21 @@ export async function run(ctx: CliContext, args: string[]): Promise<number> {
   const isDryRun = args.includes("--dry-run");
   const forceGitPull = args.includes("--git-pull");
 
-  const packageSpec = resolveNpmPackageSpec();
-
   // ------------------------------------------------------------------
   // npm path (default)
   // ------------------------------------------------------------------
   if (!forceGitPull) {
+    const resolved = resolveNpmPackageSpec(args);
+    if (resolved.error) {
+      if (flags.json) {
+        ui.emitJson({ ok: false, error: resolved.error });
+      } else {
+        ui.failure(resolved.error);
+      }
+      return 1;
+    }
+
+    const packageSpec = resolved.packageSpec ?? DEFAULT_NPM_PACKAGE_SPEC;
     const npmSteps = buildNpmSteps(packageSpec, cwd);
     const lifecycleLabels = new Set(["larkway stop (bridge lifecycle)", "larkway start (bridge lifecycle)"]);
 
@@ -336,7 +368,7 @@ export async function run(ctx: CliContext, args: string[]): Promise<number> {
       if (hadWarning) {
         ui.success("larkway update 完成,但 bridge 需手动重启(请运行 `larkway start`)。");
       } else {
-        ui.success("larkway update 完成。已升级到最新 npm 版本,bridge 已重启。");
+        ui.success("larkway update 完成。已升级指定 npm package,bridge 已重启。");
       }
     }
     return 0;
