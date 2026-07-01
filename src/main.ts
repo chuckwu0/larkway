@@ -509,7 +509,7 @@ async function runV2Mode({
         err,
       );
     }
-    await reconcileOrphanedCards({
+    const reconcileResult = await reconcileOrphanedCards({
       botId: bot.id,
       worktreesDir: bot.runtime === "agent_workspace"
         ? resolveAgentWorkspaceSessionsDir(bot.id)
@@ -525,6 +525,21 @@ async function runV2Mode({
         : undefined,
       log: (m) => console.log(m),
     });
+
+    // PRB-8 §11.2: at-least-once replay of turns killed mid-run by this restart.
+    // Fire-and-forget so a slow history pull never blocks boot; gap-fill swallows
+    // its own errors, and if replay can't run the Phase-1 explicit-failure card
+    // still stands for the owner to retry.
+    if (reconcileResult.interrupted.length > 0) {
+      void client
+        .replayInterruptedTriggers(reconcileResult.interrupted)
+        .catch((err) =>
+          console.warn(
+            `[larkway] bot "${bot.id}" PRB-8 replay failed (explicit-failure card stands):`,
+            err,
+          ),
+        );
+    }
   }
 
   // ── Arm liveness heartbeats (status.json) ────────────────────────────────

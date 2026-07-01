@@ -748,6 +748,78 @@ describe("ChannelClient — gap-fill after reconnect (BL-15)", () => {
     vi.resetModules();
   });
 
+  it("PRB-8: replayInterruptedTriggers re-dispatches an un-acked trigger via gap-fill", async () => {
+    // The interrupted trigger is still in history (never acked) and @-mentions
+    // the bot. replayInterruptedTriggers must re-pull + re-dispatch it — the
+    // at-least-once boot replay for a turn killed mid-run by a restart.
+    const triggerMessageId = "om_interrupted_1";
+    const triggerContent = JSON.stringify({ text: "@bot 修个 bug" });
+
+    vi.resetModules();
+    vi.doMock("node:child_process", () => ({
+      execFile: (
+        _cmd: string,
+        _args: string[],
+        cb: (err: null, result: { stdout: string; stderr: string }) => void,
+      ) => {
+        const items = [
+          {
+            message_id: triggerMessageId,
+            chat_id: "oc_1",
+            chat_type: "group",
+            content: triggerContent,
+            sender: { id: "ou_sender" },
+            create_time: String(Date.now()),
+            mentions: [{ id: { open_id: "ou_bot" } }],
+          },
+        ];
+        cb(null, { stdout: JSON.stringify({ ok: true, data: { messages: items } }), stderr: "" });
+      },
+    }));
+    const chObj = makeFakeChannelWithHandlers();
+    vi.doMock("@larksuiteoapi/node-sdk", () => ({
+      createLarkChannel: () => chObj.ch,
+    }));
+
+    const { ChannelClient } = await import("./channelClient.js");
+    const client = new ChannelClient({
+      allowedChatIds: new Set(["oc_1"]),
+      botOpenId: "ou_bot",
+      appId: "cli_x",
+      appSecret: "secret",
+      connectGraceMs: 0,
+      channelStaleMs: 0,
+      openChatDiscoveryMs: 0,
+    });
+
+    const dispatched: string[] = [];
+    void (async () => {
+      for await (const ev of client.events()) dispatched.push(ev.message_id);
+    })();
+    for (let i = 0; i < 100 && !chObj.handlers["reconnected"]; i++) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
+
+    // No reconnect cycle — a full restart never fires it. Boot recovery calls
+    // replayInterruptedTriggers directly with the interrupted chat + lookback.
+    await client.replayInterruptedTriggers([
+      { chatId: "oc_1", sinceMs: Date.now() - 60_000 },
+    ]);
+
+    for (let i = 0; i < 100 && !dispatched.includes(triggerMessageId); i++) {
+      await new Promise((r) => setTimeout(r, 20));
+    }
+    expect(dispatched).toContain(triggerMessageId);
+
+    // Empty input is a no-op (no throw, nothing dispatched).
+    await expect(client.replayInterruptedTriggers([])).resolves.toBeUndefined();
+
+    await client.close();
+    vi.doUnmock("@larksuiteoapi/node-sdk");
+    vi.doUnmock("node:child_process");
+    vi.resetModules();
+  });
+
   it("dispatches a gap thread reply nested under chat-messages-list thread_replies", async () => {
     const rootMessageId = "om_thread_root";
     const replyMessageId = "om_thread_reply";

@@ -603,6 +603,43 @@ export class ChannelClient {
   }
 
   /**
+   * PRB-8 (§11.2): at-least-once replay of triggers whose turn was killed
+   * mid-run by a bridge restart. main.ts calls this at boot AFTER reconcile has
+   * identified the interrupted turns. We reuse the EXACT gap-fill machinery
+   * (history re-pull for the chat + seen/in-flight dedup + poison-message cap) —
+   * this is channel-level redelivery of un-acked messages, the same primitive a
+   * message queue uses, NOT orchestration: we replay the SAME trigger, and never
+   * re-route it to another agent, mutate its input, or reorder anything.
+   *
+   * Why it works: an interrupted turn never reached terminal success, so its
+   * trigger was never promoted to the persisted seen-set; gap-fill re-pulls the
+   * chat window and re-dispatches the still-un-acked trigger exactly once. If the
+   * poison-message cap is already reached (repeatedly crashes the bridge), the
+   * cap gives up instead of an infinite reboot→replay→crash loop.
+   *
+   * Fire-and-forget friendly: never throws (gap-fill swallows its own errors);
+   * a failed history pull just means the explicit-failure card (Phase 1) stands
+   * and the owner retries manually.
+   */
+  async replayInterruptedTriggers(
+    interrupted: ReadonlyArray<{ chatId: string; sinceMs: number }>,
+    log: (s: string) => void = (s) => console.log(`[channel.client] ${s}`),
+  ): Promise<void> {
+    if (interrupted.length === 0) return;
+    const chatIds = new Set(interrupted.map((i) => i.chatId));
+    // Oldest interrupted card sets the look-back floor; gap-fill clamps it to the
+    // replay max age so we never flood with ancient history.
+    const oldest = Math.min(...interrupted.map((i) => i.sinceMs));
+    // Make sure these chats are gap-fillable even before any live event this boot.
+    for (const chatId of chatIds) this.recentlySeenChatIds.add(chatId);
+    log(
+      `[channel.client] PRB-8 replay: re-dispatching interrupted trigger(s) across ` +
+        `${chatIds.size} chat(s) since ${new Date(oldest).toISOString()}`,
+    );
+    await this.gapFill(oldest, log, chatIds);
+  }
+
+  /**
    * Async iterator over inbound events — interface-compatible with LarkClient.
    * Connects the WS on first call. The SDK's policy gate (requireMention +
    * groupAllowlist) filters to group-@-bot messages in allowed chats, matching
