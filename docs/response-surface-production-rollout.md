@@ -13,13 +13,16 @@ mention policy to control blast radius.
   - `allowed_chats: []` means all chats allowed
   - `allowed_threads: []` means all threads allowed
   - `allow_agent_mentions: true`
-  - `allowed_mention_open_ids: []`
+  - `denied_mention_open_ids: []`
 - Use `kill_switch: true` for immediate rollback to legacy visible cards.
 - To narrow rollout, set one chat or one thread in the allowlist. Empty
   chat/thread allowlists are intentionally broad.
-- Agent-authored mentions are on by default for peer handoff. Empty
-  `allowed_mention_open_ids` means the Agent may choose mention targets;
-  non-empty lists narrow mentions to that exact private set.
+- Agent-authored mentions are on by default. Empty `denied_mention_open_ids`
+  means the Agent may choose mention targets; non-empty lists block only those
+  private exceptions.
+- CardKit late mentions are not a reliable content carrier for peer-agent
+  dispatch. Peer handoff that must be consumed by another bot needs a real
+  Feishu post with an `at` tag and readable body.
 - Never use `@all`.
 - A turn must always produce a visible CardKit card, legacy fallback card, or
   final create-only fallback post. No code path may produce a no-card/no-message
@@ -42,6 +45,7 @@ mention policy to control blast radius.
      allow_agent_mentions: true
      allowed_chats: []
      allowed_threads: []
+     denied_mention_open_ids: []
      allowed_mention_open_ids: []
    ```
 
@@ -54,6 +58,7 @@ mention policy to control blast radius.
      allow_agent_mentions: false
      allowed_chats: []
      allowed_threads: []
+     denied_mention_open_ids: []
      allowed_mention_open_ids: []
    ```
 3. Confirm the production bridge has no response-surface error spike in recent
@@ -62,8 +67,8 @@ mention policy to control blast radius.
    - one test or grey chat in `allowed_chats`, or one topic in `allowed_threads`;
    - `allow_agent_mentions: true` for Agent-directed handoff, or false to
      suppress every real `@`;
-   - optional `allowed_mention_open_ids` containing only confirmed members when
-     the rollout should narrow mention targets;
+   - optional `denied_mention_open_ids` containing private exceptions that
+     should not be mentioned;
    - `kill_switch: false` only for the rollout window.
 5. Prepare rollback config before changing anything:
    ```yaml
@@ -73,6 +78,7 @@ mention policy to control blast radius.
      post_outbound_enabled: false
      allowed_chats: []
      allowed_threads: []
+     denied_mention_open_ids: []
      allowed_mention_open_ids: []
    ```
 
@@ -84,8 +90,8 @@ kill switch.
 
 1. Apply optional `allowed_chats` / `allowed_threads` narrowing before clearing
    `kill_switch`.
-2. Keep `allow_agent_mentions: true` for default peer handoff, or set a
-   non-empty `allowed_mention_open_ids` to narrow targets.
+2. Keep `allow_agent_mentions: true` for default peer mentions, or set a
+   non-empty `denied_mention_open_ids` to block specific targets.
 3. Keep `post_outbound_enabled: true` when final create-only fallback posts are
    allowed.
 4. Set `enabled: true` and `kill_switch: false`.
@@ -114,7 +120,7 @@ Immediately rollback if any of these occur:
 
 - any send targets a chat or thread outside a non-empty rollout allowlist
 - any mention target violates `allow_agent_mentions`,
-  `allowed_mention_open_ids`, or `@all` policy
+  `denied_mention_open_ids`, or `@all` policy
 - a turn has no visible card and no visible post
 - a ledger entry becomes `fallback_visible` without `fallbackCardMessageId`
 - duplicate recovery cards are created for the same orphan
@@ -137,6 +143,7 @@ Prefer config rollback over code rollback for response surface incidents.
      allow_agent_mentions: false
      allowed_chats: []
      allowed_threads: []
+     denied_mention_open_ids: []
      allowed_mention_open_ids: []
    ```
 2. Use the deployment system's normal config reload path. Do not run broad kill

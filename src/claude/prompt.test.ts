@@ -98,6 +98,8 @@ describe("renderPrompt — V2 mode (botName set)", () => {
     expect(prompt).toContain("LARKWAY_ANSWER_BEGIN");
     expect(prompt).toContain("LARKWAY_ANSWER_END");
     expect(prompt).toContain("旧 `mode`/`primary` 仅兼容解析");
+    expect(prompt).toContain("late @ 只是最终卡片里的视觉提示");
+    expect(prompt).toContain("handoff 必须由 Agent/团队工作流发送真实 Feishu post + at 标签");
     expect(prompt).toContain("不要写 raw Feishu post/card JSON");
     expect(prompt).toContain("markdown -> image -> markdown -> image");
     expect(prompt).toContain("若 `content_blocks` 非空");

@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   defaultResponseSurfacePrototypeConfig,
+  evaluateResponseSurfaceMentionPolicy,
   isResponseSurfaceMentionAllowed,
   isResponseSurfaceCardKitAvailable,
   isResponseSurfacePostOutboundAvailable,
@@ -24,6 +25,7 @@ describe("response surface production gates", () => {
       cardkit_streaming_enabled: true,
       kill_switch: false,
       allow_agent_mentions: true,
+      denied_mention_open_ids: [],
       allowed_chats: [],
       allowed_threads: [],
       allowed_mention_open_ids: [],
@@ -70,12 +72,27 @@ describe("response surface production gates", () => {
     expect(shouldProvideResponseSurfacePostClient(cfg)).toBe(false);
   });
 
-  it("can narrow or disable agent-authored mentions without hardcoded default ids", () => {
-    const narrowed = { ...enabledConfig, allowed_mention_open_ids: ["peer_a"] };
-    expect(isResponseSurfaceMentionAllowed(narrowed, "peer_a")).toBe(true);
-    expect(isResponseSurfaceMentionAllowed(narrowed, "peer_b")).toBe(false);
+  it("uses deny-list/default-allow policy for agent-authored mentions", () => {
+    const denied = { ...enabledConfig, denied_mention_open_ids: ["peer_b"] };
+    expect(isResponseSurfaceMentionAllowed(denied, "peer_a")).toBe(true);
+    expect(isResponseSurfaceMentionAllowed(denied, "peer_b")).toBe(false);
+    expect(evaluateResponseSurfaceMentionPolicy(denied, "peer_b")).toMatchObject({
+      allowed: false,
+      rule: "denied_target",
+    });
 
     const disabled = { ...enabledConfig, allow_agent_mentions: false };
     expect(isResponseSurfaceMentionAllowed(disabled, "peer_a")).toBe(false);
+    expect(evaluateResponseSurfaceMentionPolicy(disabled, "peer_a")).toMatchObject({
+      allowed: false,
+      rule: "agent_mentions_disabled",
+    });
+  });
+
+  it("parses legacy allow-list config without narrowing mentions", () => {
+    const legacyAllowList = { ...enabledConfig, allowed_mention_open_ids: ["peer_a"] };
+
+    expect(isResponseSurfaceMentionAllowed(legacyAllowList, "peer_a")).toBe(true);
+    expect(isResponseSurfaceMentionAllowed(legacyAllowList, "peer_b")).toBe(true);
   });
 });

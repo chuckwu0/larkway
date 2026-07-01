@@ -51,8 +51,8 @@ import {
 import type { RuntimeEventPatch } from "./eventLog.js";
 import type { RuntimeRequirement } from "../runtimeRequirements.js";
 import {
+  evaluateResponseSurfaceMentionPolicy,
   isResponseSurfaceCardKitAvailable,
-  isResponseSurfaceMentionAllowed,
   type ResponseSurfacePrototypeConfig,
 } from "../responseSurface.js";
 import {
@@ -64,6 +64,16 @@ import { buildPostContent } from "../lark/postContent.js";
 import { derivePostIdempotencyKey, digestPostContent } from "../lark/idempotency.js";
 
 const DEFAULT_CARDKIT_RESPONSE_SURFACE_TIMEOUT_MS = 20 * 60 * 1000;
+
+function summarizeMentionPolicyRules(rules: string[]): string {
+  const counts = new Map<string, number>();
+  for (const rule of rules) {
+    counts.set(rule, (counts.get(rule) ?? 0) + 1);
+  }
+  return Array.from(counts.entries())
+    .map(([rule, count]) => `${rule}=${count}`)
+    .join(", ");
+}
 
 // ---------------------------------------------------------------------------
 // Private helpers — worktree bootstrap
@@ -1444,9 +1454,16 @@ export class BridgeHandler {
           if (cardKitProgress) {
             const declaredMentions = reportedState?.response_surface?.post?.mentions ?? [];
             const responseSurfacePostDeclared = reportedState?.response_surface?.post !== undefined;
-            const mentions = declaredMentions.filter((mention) =>
-              isResponseSurfaceMentionAllowed(prototypeConfig, mention.user_id),
-            );
+            const mentionPolicyResults = declaredMentions.map((mention) => ({
+              mention,
+              policy: evaluateResponseSurfaceMentionPolicy(prototypeConfig, mention.user_id),
+            }));
+            const mentions = mentionPolicyResults
+              .filter(({ policy }) => policy.allowed)
+              .map(({ mention }) => mention);
+            const blockedMentionRules = mentionPolicyResults
+              .filter(({ policy }) => !policy.allowed)
+              .map(({ policy }) => policy.rule);
             if (responseSurfacePostDeclared && declaredMentions.length === 0) {
               const reason = "response_surface.post was declared with an empty mentions array.";
               console.warn("[bridge.handler] response_surface post has no mentions");
@@ -1458,7 +1475,8 @@ export class BridgeHandler {
             } else if (declaredMentions.length > mentions.length) {
               const reason =
                 `response_surface mentions filtered by policy: ` +
-                `${mentions.length}/${declaredMentions.length} allowed.`;
+                `${mentions.length}/${declaredMentions.length} allowed; ` +
+                `blocked rules: ${summarizeMentionPolicyRules(blockedMentionRules)}.`;
               console.warn("[bridge.handler] response_surface mention policy filtered targets");
               await recordEvent({
                 status: "running",

@@ -55,6 +55,11 @@ Supported fields:
   render as final-card `<at id=...></at>` mentions after passing mention policy.
   Mention `user_id` values must use the CardKit-renderable character set:
   letters, numbers, `_`, `:`, and `-`.
+- `response_surface.post.mentions` is a visual late mention on the final card.
+  It is not a reliable dispatch carrier for peer-agent handoff content. When a
+  peer bot must consume instructions, the agent/team workflow must send a real
+  Feishu post with an `at` tag and readable body. See
+  [Agent Handoff Reliability](agent-handoff-reliability.md).
 - `response_surface.mode` / `primary` are accepted for compatibility with older
   agents and `mode` may be omitted; omitted `mode` parses as `card`. These fields
   no longer select a post-only or hybrid main surface. CardKit is the only normal
@@ -76,6 +81,7 @@ response_surface_prototype:
   post_outbound_enabled: true
   cardkit_streaming_enabled: true
   allow_agent_mentions: true
+  denied_mention_open_ids: []
   allowed_mention_open_ids: []
 ```
 
@@ -88,6 +94,7 @@ Defaults:
 - `post_outbound_enabled: true`
 - `cardkit_streaming_enabled: true`
 - `allow_agent_mentions: true`
+- `denied_mention_open_ids: []`
 - `allowed_mention_open_ids: []`
 
 Empty `allowed_chats` and `allowed_threads` mean all chats/threads are allowed.
@@ -101,9 +108,13 @@ fallback only.
 Mention policy:
 
 - `allow_agent_mentions: false` suppresses all Agent-authored mentions.
-- Empty `allowed_mention_open_ids` allows the Agent to choose targets.
-- Non-empty `allowed_mention_open_ids` narrows mentions to that set.
+- Empty `denied_mention_open_ids` allows the Agent to choose targets.
+- Non-empty `denied_mention_open_ids` blocks only those targets.
+- `allowed_mention_open_ids` is deprecated and parsed only for compatibility;
+  new restrictions must use `denied_mention_open_ids`.
 - `all` / `@all` is always blocked.
+- Blocked mentions must produce a runtime diagnostic instead of silently
+  disappearing.
 
 ## CardKit Lifecycle
 
@@ -172,6 +183,9 @@ Required automated coverage:
 - CardKit surface renders the running footer, answer stream target, final body,
   mentions, choices, images, and content blocks without a header band or
   status/thinking/tool slots.
+- Mention policy allows peer mentions by default and blocks only the master
+  switch, broadcast aliases, and `denied_mention_open_ids`, with diagnostics for
+  every filtered target.
 - Handler uses CardKit by default, suppresses post editing, adopts an already
   visible CardKit reply if `idConvert` fails, and falls back to a visible legacy
   card on CardKit failure, then a create-only fallback post if the legacy card
