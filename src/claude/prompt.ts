@@ -311,6 +311,9 @@ function renderPeersBlock(peers: PeerBot[]): string[] {
     "- 不要把同一任务同时转发给多个 peer",
     "- @ peer 必须用 **post 消息** + at 标签 `{\"tag\":\"at\",\"user_id\":\"ou_xxx\"}`(用上面的 open_id),",
     "  **严禁用纯 text 的 @xxx**(纯文本 @ 不会真正触达对方 bot)",
+    "- 发起 peer handoff 后,在你的协调层/工作区台账记录 task_id、assignee、来源、期望产出、deadline 和升级人;没有专用 skill 时至少写入本 session summary。",
+    "- 收到 peer handoff 后,先用真实 post 轻量 ack(收到/开始)再做长任务;完成、失败或阻塞时必须用真实 post 回报终态,不要让链路静默停在你这里。",
+    "- 默认 deadline 可按团队工作流设置(常见默认 15 分钟);超时检测、重试/重派/升级属于协调层 skill/workspace 逻辑,不要期待 bridge 替你编排。",
     "</peer-bots>",
   ];
 }

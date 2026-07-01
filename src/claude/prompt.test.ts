@@ -239,6 +239,11 @@ describe("renderPrompt — V2 mode (botName set)", () => {
     expect(prompt).toContain("ou_peerbot001");
     expect(prompt).toContain("做测试和质量检查");
     expect(prompt).toContain("Backend Bot");
+    expect(prompt).toContain("工作区台账记录 task_id");
+    expect(prompt).toContain("先用真实 post 轻量 ack");
+    expect(prompt).toContain("必须用真实 post 回报终态");
+    expect(prompt).toContain("默认 15 分钟");
+    expect(prompt).toContain("不要期待 bridge 替你编排");
     expect(prompt).toContain("</peer-bots>");
   });
 

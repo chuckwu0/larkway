@@ -20,6 +20,38 @@ and schema behavior, but it does not decide product ownership or reassign work.
 - Keep the bridge-managed main reply in `.larkway/state.json`; do not patch or
   overwrite bridge-managed cards/posts directly.
 
+## Coordination P0 Contract
+
+Peer-agent coordination state lives in the agent/team workflow layer, not in the
+bridge. A coordinator skill or workspace artifact should track each handoff
+with these fields:
+
+- `task_id`: unique within the topic/session;
+- `assignee`: peer bot id or stable label;
+- `source_message_id`: the Feishu message that created the handoff;
+- `expected_output`: the deliverable or terminal condition;
+- `deadline`: when missing ack or missing terminal status becomes actionable;
+- `escalation_owner`: who gets notified when the deadline is missed;
+- `status`: `dispatched`, `acked`, `in_progress`, `completed`, `failed`, or
+  `timeout`.
+
+Minimum P0 behavior:
+
+- The sender records `dispatched` before or immediately after sending the real
+  post handoff.
+- The receiver sends a lightweight real-post ack ("received / starting") before
+  long-running work and records `acked` when it can write the ledger.
+- Every receiver sends a terminal real-post update: `completed`, `failed`, or
+  explicit `blocked`. It must not let the chain stop silently.
+- The coordinator checks deadlines when it runs. If a task is overdue without
+  ack or terminal status, it marks `timeout` and escalates to the configured
+  owner in the same Feishu topic.
+
+The bridge may expose run failure, timeout, mention filtering, and stale-state
+facts through logs, cards, or session diagnostics. It must not decide retry,
+reassignment, escalation, or ownership; those are coordination workflow
+decisions.
+
 ## Mention Policy
 
 Agent-authored mentions are default-allow and deny-list based:
