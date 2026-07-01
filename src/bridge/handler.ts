@@ -1437,7 +1437,11 @@ export class BridgeHandler {
             "";
           const cardBody =
             cardKitTimeoutFailure
-              ? "⚠️ 本轮处理超时，已中断。请再 @ 我一次重试。"
+              // PRB-8 §11.1: a timed-out turn is an EXPLICIT failure, not a
+              // passive wait. Unlike a restart-killed turn it is NOT auto-replayed
+              // (it already used its full wall-clock budget; re-running would just
+              // re-time-out) — the owner retries manually if the work is still wanted.
+              ? "⚠️ 本轮处理超时，已中断（未完成）。请重试。"
               : reportedState?.last_message ??
                 (fallbackAnswer
                   ? fallbackAnswer
