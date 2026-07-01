@@ -201,10 +201,21 @@ export function selectOrphanCards(
 // ---------------------------------------------------------------------------
 
 /**
+ * PRB-8 (§11.2): an interrupted turn's card must read as an EXPLICIT FAILURE
+ * ("未完成，请重试"), never the old passive "请再@我一次继续" — that phrasing
+ * disguised a turn killed by the bridge's own restart as if the bot were simply
+ * waiting on the user (a silent-failure product defect per PRD §11.1). Paired
+ * with titleOverride "⚠️ 本轮被中断" + colorOverride "failure" so the owner can
+ * tell at a glance this is an interruption to retry, not a wait for input.
+ */
+const INTERRUPTED_TURN_TEXT =
+  "⚠️ 本轮在处理中被 bridge 重启中断，未完成。请重试(重新发起本轮)。";
+
+/**
  * Map a (state, success) pair to the finalize() args, mirroring handler.ts's
  * success/failure + title/color ordering:
  *   - body text = state.last_message (bot's productized reply) when present,
- *     else an honest "本轮被中断" prompt.
+ *     else the explicit INTERRUPTED_TURN_TEXT failure prompt.
  *   - failureReason = state.error on failure.
  *   - titleOverride / colorOverride = bot's card_title / card_color when set.
  */
@@ -215,7 +226,7 @@ function mapFinalizeArgs(
 ): Parameters<CardHandle["finalize"]>[0] {
   if (!stateFresh) {
     return {
-      finalText: "⚠️ 本轮在处理中被 bridge 重启中断，未拿到 agent 的新回复。请再 @ 我一次继续。",
+      finalText: INTERRUPTED_TURN_TEXT,
       success: false,
       failureReason: "bridge 重启后发现旧 state.json 早于本轮卡片，已阻止旧回复覆盖新问题",
       titleOverride: "⚠️ 本轮被中断",
@@ -223,9 +234,7 @@ function mapFinalizeArgs(
     };
   }
 
-  const finalText =
-    state.last_message ??
-    "⚠️ 本轮在处理中被中断(bridge 重启),状态已据 state.json 收尾。再 @ 我一次可继续。";
+  const finalText = state.last_message ?? INTERRUPTED_TURN_TEXT;
 
   const failureReason = success
     ? undefined
@@ -251,7 +260,7 @@ function mapCardKitFinalizeArgs(
 ): Parameters<typeof finalizeExistingCardKitCard>[0]["final"] {
   const args = mapFinalizeArgs(state, success, stateFresh);
   return {
-    finalText: args.finalText ?? "⚠️ 本轮在处理中被 bridge 重启中断，未拿到 agent 的新回复。",
+    finalText: args.finalText ?? INTERRUPTED_TURN_TEXT,
     ...(args.titleOverride !== undefined ? { title: args.titleOverride } : {}),
     ...(args.choices !== undefined ? { choices: args.choices } : {}),
     ...(args.choicePrompt !== undefined ? { choicePrompt: args.choicePrompt } : {}),
@@ -591,6 +600,24 @@ async function markVisiblePostFallbacksForCard(input: {
 // Impure reconcile shell
 // ---------------------------------------------------------------------------
 
+/**
+ * A trigger whose turn was interrupted mid-run by a bridge restart, eligible for
+ * at-least-once channel-level replay (PRB-8 §11.2). We carry only the chat + a
+ * lookback timestamp — replay re-pulls history for that chat and re-dispatches
+ * the un-acked trigger via the existing gap-fill path (MQ-style redelivery), so
+ * no per-message reconstruction is needed and dedup/poison-cap still apply.
+ */
+export interface InterruptedTrigger {
+  chatId: string;
+  /** Lookback floor (ms epoch) — the interrupted card's createdAt. */
+  sinceMs: number;
+}
+
+export interface ReconcileResult {
+  /** Interrupted turns to replay at-least-once (PRB-8). Empty when none. */
+  interrupted: InterruptedTrigger[];
+}
+
 export interface ReconcileDeps {
   /** This bot's id (per-bot scope). */
   botId: string;
@@ -623,9 +650,18 @@ export interface ReconcileDeps {
  * boot continues. A missing worktrees dir, a malformed card.json, and a
  * finalize rejection are all swallowed.
  */
-export async function reconcileOrphanedCards(deps: ReconcileDeps): Promise<void> {
+export async function reconcileOrphanedCards(deps: ReconcileDeps): Promise<ReconcileResult> {
   const log = deps.log ?? ((m: string) => console.log(m));
   const minAgeMs = deps.minAgeMs ?? DEFAULT_MIN_AGE_MS;
+
+  // PRB-8: triggers whose turn was killed mid-run by a bridge restart, collected
+  // so the caller can replay them at-least-once (see ReconcileResult).
+  const interrupted: InterruptedTrigger[] = [];
+  const noteInterrupted = (chatId: string | undefined, createdAt: string | undefined): void => {
+    if (!chatId) return;
+    const parsed = createdAt ? Date.parse(createdAt) : NaN;
+    interrupted.push({ chatId, sinceMs: Number.isFinite(parsed) ? parsed : Date.now() });
+  };
 
   // ── List worktree dirs ────────────────────────────────────────────────────
   let dirNames: string[];
@@ -636,7 +672,7 @@ export async function reconcileOrphanedCards(deps: ReconcileDeps): Promise<void>
     if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
       log(`[reconcile] cannot read ${deps.worktreesDir} (skipping): ${String(err)}`);
     }
-    return; // no worktrees dir (fresh bot) or unreadable → nothing to do
+    return { interrupted }; // no worktrees dir (fresh bot) or unreadable → nothing to do
   }
 
   // ── Gather per-worktree observations ──────────────────────────────────────
@@ -735,6 +771,13 @@ export async function reconcileOrphanedCards(deps: ReconcileDeps): Promise<void>
               nowIso,
               log,
             });
+            // PRB-8: a fresh in_progress turn reconciled as failure = killed
+            // mid-run by the restart (not an agent-declared ready/failed) →
+            // eligible for at-least-once replay. Stale (!stateFresh) and
+            // agent-terminal (ready/failed) states are NOT replayed.
+            if (state.status === "in_progress" && selectedCardKit.stateFresh) {
+              noteInterrupted(cardKit.chatId, cardKit.createdAt);
+            }
           } catch (err) {
             log(`[reconcile] cardkit failed for ${name} (skipping): ${String(err)}`);
           }
@@ -750,7 +793,7 @@ export async function reconcileOrphanedCards(deps: ReconcileDeps): Promise<void>
   }
 
   const orphans = selectOrphanCards(candidates, { botId: deps.botId, minAgeMs });
-  if (orphans.length === 0) return;
+  if (orphans.length === 0) return { interrupted };
 
   log(`[reconcile] bot=${deps.botId} found ${orphans.length} orphaned card(s) to finalize`);
 
@@ -767,6 +810,11 @@ export async function reconcileOrphanedCards(deps: ReconcileDeps): Promise<void>
     try {
       handle = deps.cardRenderer.handleFor(orphan.card.messageId);
       await handle.finalize(mapFinalizeArgs(state, orphan.success, orphan.stateFresh));
+      // PRB-8: same rule as the CardKit path — a fresh in_progress turn
+      // reconciled as failure was killed mid-run by the restart → replayable.
+      if (state.status === "in_progress" && orphan.stateFresh) {
+        noteInterrupted(orphan.card.chatId, orphan.card.createdAt);
+      }
     } catch (err) {
       // Finalize PATCH rejected (e.g. message deleted, transient network).
       // Bump retryCount; if over the cap, delete card.json to stop looping.
@@ -813,4 +861,6 @@ export async function reconcileOrphanedCards(deps: ReconcileDeps): Promise<void>
       log(`[reconcile] could not delete card.json for ${orphan.name} after finalize (ignoring): ${String(err)}`);
     }
   }
+
+  return { interrupted };
 }

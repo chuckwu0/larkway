@@ -476,7 +476,7 @@ describe("reconcileOrphanedCards — integration", () => {
     const { renderer } = makeFakeRenderer();
     const { client: cardKitClient, calls } = makeFakeCardKitClient();
 
-    await reconcileOrphanedCards({
+    const result = await reconcileOrphanedCards({
       botId: "gitlab",
       worktreesDir: root,
       cardRenderer: renderer,
@@ -485,9 +485,18 @@ describe("reconcileOrphanedCards — integration", () => {
     });
 
     expect(calls.map((c) => c.kind)).toEqual(["stream", "update", "settings"]);
-    expect(calls[0]?.content).toContain("处理中被中断");
-    expect(JSON.stringify(calls[1]?.payload)).toContain("处理中被中断");
+    // PRB-8: interrupted turn renders an explicit failure ("未完成，请重试"),
+    // never the old passive "请再@我一次继续".
+    expect(calls[0]?.content).toContain("未完成");
+    expect(calls[0]?.content).toContain("请重试");
+    expect(calls[0]?.content).not.toContain("请再 @ 我一次继续");
+    expect(JSON.stringify(calls[1]?.payload)).toContain("未完成");
     expect(await readCardKitFile(wt)).toBeNull();
+    // PRB-8: a turn killed mid-run (in_progress + dead pid) is returned for
+    // at-least-once replay, carrying the chat + a finite lookback floor.
+    expect(result.interrupted).toHaveLength(1);
+    expect(result.interrupted[0]?.chatId).toBe("chat-a");
+    expect(Number.isFinite(result.interrupted[0]?.sinceMs)).toBe(true);
   });
 
   it("creates missing final_md before finalizing an orphaned CardKit stream", async () => {
@@ -754,7 +763,7 @@ describe("reconcileOrphanedCards — integration", () => {
         minAgeMs: 60_000,
         log: (message) => logs.push(message),
       }),
-    ).resolves.toBeUndefined();
+    ).resolves.toEqual({ interrupted: [] });
 
     const cardAfterMarkFailure = await readCardFile(wt);
     expect(cardAfterMarkFailure).not.toBeNull();
@@ -818,7 +827,7 @@ describe("reconcileOrphanedCards — integration", () => {
         cardRenderer: renderer,
         log: () => {},
       }),
-    ).resolves.toBeUndefined();
+    ).resolves.toEqual({ interrupted: [] });
 
     // card.json NOT deleted (finalize failed), retryCount bumped to 1
     const after = await readCardFile(wt);
@@ -893,6 +902,6 @@ describe("reconcileOrphanedCards — integration", () => {
         cardRenderer: renderer,
         log: () => {},
       }),
-    ).resolves.toBeUndefined();
+    ).resolves.toEqual({ interrupted: [] });
   });
 });

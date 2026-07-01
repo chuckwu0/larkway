@@ -1182,7 +1182,7 @@ describe("handleOne — thin-channel finalize", () => {
     expect(settings?.payload).toEqual({
       config: {
         streaming_mode: false,
-        summary: { content: "⚠️ 本轮处理超时，已中断。请再 @ 我一次重试。" },
+        summary: { content: "⚠️ 本轮处理超时，已中断（未完成）。请重试。" },
       },
     });
   });
