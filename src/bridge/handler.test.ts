@@ -107,8 +107,33 @@ afterEach(async () => {
   runnerBackends = [];
   spawnCalls = [];
   spawnShouldFail = null;
-  await rm(root, { recursive: true, force: true });
+  await rmWithRetry(root);
 });
+
+/**
+ * handler.run() dispatches handleOne fire-and-forget, so a turn keeps writing
+ * ledger files into <worktree>/.larkway (updateCardKitRecord / deleteCardFile)
+ * AFTER the visible card.finalize that tests sync on via `whenFinalized`, and
+ * only then settles. Removing `root` at that mid-turn point can race a trailing
+ * write landing between rm's unlink pass and its rmdir → ENOTEMPTY. This is a
+ * cleanup-ordering artifact, not a product bug (write-ledger-then-settle is
+ * correct): retry the removal until those in-flight writes have landed and the
+ * tree is fully removable. Deterministic — the writes complete within ms.
+ */
+async function rmWithRetry(dir: string): Promise<void> {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      await rm(dir, { recursive: true, force: true });
+      return;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "ENOTEMPTY" && attempt < 50) {
+        await new Promise((r) => setTimeout(r, 20));
+        continue;
+      }
+      throw err;
+    }
+  }
+}
 
 interface FinalizeArgs {
   finalText?: string;
