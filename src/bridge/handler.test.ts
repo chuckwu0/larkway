@@ -1196,6 +1196,71 @@ describe("handleOne — thin-channel finalize", () => {
     expect(JSON.stringify(settings?.payload)).toContain("本轮被中断");
   });
 
+  it("PRB-6/§11.3: injects peer @ open_ids from the live roster (same app scope), not the static config id", async () => {
+    const threadId = "om_msg";
+    await seedWorktree(threadId);
+    await seedRepoCachePath();
+    const { client: cardKitClient } = makeCardKitClient();
+    let capturedPrompt = "";
+
+    runClaudeImpl = (opts: unknown) => {
+      capturedPrompt = (opts as { prompt?: string }).prompt ?? "";
+      return {
+        events: (async function* () {
+          yield { type: "system_init", sessionId: "sess_roster", raw: {} };
+        })(),
+        done: Promise.resolve({ exitCode: 0, sessionId: "sess_roster" }),
+        kill: () => {},
+      };
+    };
+
+    const { renderer } = makeCardRenderer();
+    const { store } = makeSessionStore();
+    const { client, acked } = makeClient(makeEvent());
+
+    const handler = new BridgeHandler({
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      client: client as any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      cardRenderer: renderer as any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      sessionStore: store as any,
+      conventions: makeConventions(),
+      botConfig: {
+        id: "frontend",
+        name: "Frontend",
+        turn_taking_limit: 10,
+        backend: "claude",
+        response_surface_prototype: {
+          enabled: true,
+          allowed_chats: [],
+          allowed_threads: ["om_msg"],
+          kill_switch: false,
+          post_outbound_enabled: false,
+          cardkit_streaming_enabled: true,
+          allow_agent_mentions: true,
+          denied_mention_open_ids: [],
+          allowed_mention_open_ids: [],
+        },
+      },
+      cardKitClient,
+      peers: [{ id: "ou_cfg_elon", name: "Elon", description: "coord" }],
+      // Live roster returns a DIFFERENT (same-app-scope) id than the static config.
+      resolveLiveRoster: async () => new Map([["Elon", "ou_live_elon"]]),
+    });
+
+    await handler.run();
+    for (let i = 0; i < 200 && acked.length === 0; i++) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
+
+    // The prompt the runner received must @-target the LIVE id, never the stale
+    // config id — that's the correct-delivery guarantee (Turing rework).
+    expect(capturedPrompt).toContain("<peer-bots>");
+    expect(capturedPrompt).toContain("ou_live_elon");
+    expect(capturedPrompt).not.toContain("ou_cfg_elon");
+  });
+
   it("adopts the already-visible CardKit reply when idConvert fails instead of creating a second card", async () => {
     const threadId = "om_msg";
     const finalState = {

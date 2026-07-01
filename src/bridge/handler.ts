@@ -26,6 +26,7 @@ import type { CardRenderer } from "../lark/card.js";
 import type { SessionStore } from "../claude/sessionStore.js";
 import { parseMessage } from "../lark/message.js";
 import { renderPrompt } from "../claude/prompt.js";
+import { remapPeersToLiveRoster, type LiveRosterResolver } from "../lark/rosterResolver.js";
 import type { PeerBot, RepoRef } from "../claude/prompt.js";
 import { createRunner } from "../agent/runner.js";
 import type { BotConfig } from "../config/botLoader.js";
@@ -620,6 +621,13 @@ export interface BridgeHandlerDeps {
    * profile name). When absent (V1), lark-cli uses the default profile.
    */
   larkCliProfile?: string;
+  /**
+   * PRB-6/§11.3 peer-@ correct delivery. Resolves the live chat bot roster (in
+   * THIS bot's app scope) so `<peer-bots>` @ targets use the same-scope open_id
+   * instead of the possibly cross-scope static config id. main.ts wires a
+   * per-chat-cached resolver; absent (V1 / tests) → static config ids are used.
+   */
+  resolveLiveRoster?: LiveRosterResolver;
   /**
    * Optional dashboard observability sink. It records the bridge lifecycle for
    * recent Feishu events, so the Web UI can explain silent @ mentions.
@@ -1226,6 +1234,44 @@ export class BridgeHandler {
 
         // Step 4b: render prompt — isNewThread reflects current attempt's state.
         const currentIsNewThread = currentExisting === undefined;
+        // PRB-6/§11.3: resolve peer @ targets to their same-app-scope open_id
+        // from the LIVE chat roster before building the prompt, so a handoff @
+        // actually wakes the peer (the static config id may be cross-scope).
+        // Best-effort: any failure keeps the static ids and never blocks the turn.
+        let effectivePeers = this.deps.peers;
+        if (effectivePeers?.length && this.deps.resolveLiveRoster) {
+          try {
+            const liveRoster = await this.deps.resolveLiveRoster(parsed.chatId);
+            if (liveRoster) {
+              const { peers: remappedPeers, remapped, unresolved } = remapPeersToLiveRoster(
+                effectivePeers,
+                liveRoster,
+              );
+              effectivePeers = remappedPeers;
+              if (remapped.length > 0 || unresolved.length > 0) {
+                await recordEvent({
+                  status: "running",
+                  appendPath: "peer roster",
+                  reason:
+                    `live-roster resolve: remapped [${remapped.join(", ") || "none"}] to ` +
+                    `same-app-scope open_id; unresolved (kept static config id, may not be ` +
+                    `deliverable) [${unresolved.join(", ") || "none"}].`,
+                });
+              }
+            } else {
+              await recordEvent({
+                status: "running",
+                appendPath: "peer roster",
+                reason:
+                  "live-roster resolve returned nothing; kept static <peer-bots> open_ids " +
+                  "(may be cross-app-scope / undeliverable).",
+              });
+            }
+          } catch (err) {
+            console.warn("[bridge.handler] live-roster resolve failed (using static peers):", err);
+          }
+        }
+
         const prompt = renderPrompt({
           parsed,
           isNewThread: currentIsNewThread,
@@ -1247,7 +1293,7 @@ export class BridgeHandler {
             readOnly: conventions.readOnly,
             gitlabTokenEnvName: conventions.gitlabTokenEnvName,
           },
-          peers: this.deps.peers,
+          peers: effectivePeers,
           turn_taking_limit: this.deps.botConfig?.turn_taking_limit,
           botName: this.deps.botConfig?.name,
           backend: this.deps.botConfig?.backend,

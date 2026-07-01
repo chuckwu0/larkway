@@ -29,6 +29,7 @@ import { registerRunner } from "./agent/runner.js";
 import { ClaudeRunner } from "./claude/runner.js";
 import { CodexRunner } from "./codex/runner.js";
 import { ensureLarkCliProfile, deriveLarkCliProfile } from "./lark/profileBootstrap.js";
+import { createCachedRosterResolver } from "./lark/rosterResolver.js";
 import { checkWorkspacePermissionGrant } from "./agent/permissionGate.js";
 import { runtimeRequirementsForBots } from "./runtimeRequirements.js";
 import { registerCrashGuard } from "./crashGuard.js";
@@ -370,6 +371,12 @@ async function runV2Mode({
       gitlabToken: effectiveGitlabToken,
       agentMemory: bot.agent_memory,
       larkCliProfile,
+      // PRB-6/§11.3: resolve peer @ targets to same-app-scope open_ids from the
+      // live chat roster (per-chat cached), only when this bot actually has peers.
+      resolveLiveRoster:
+        resolvedPeers.length > 0
+          ? createCachedRosterResolver({ profile: larkCliProfile })
+          : undefined,
       runtimeRequirements: runtimeRequirementsForBots([bot]),
       recordRuntimeEvent: async (patch) => {
         await upsertRuntimeEvent(larkwayHome(), bot.id, patch);
