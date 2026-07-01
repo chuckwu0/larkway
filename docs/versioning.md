@@ -75,4 +75,5 @@ v0.3.25       = harden CardKit live diagnostics and running-card fallback
 v0.3.26       = stream marker-gated Claude and Codex answers as CardKit deltas
 v0.3.27       = retire post-only response surfaces; CardKit streaming surface stabilization
 v0.3.28       = multi-bot stability: tame the open-chat discovery storm caused by multiple bots in open mode (chats:[]) — periodic discovery now back-fills only newly-discovered chats or chats with a pending gap window (steady-state pulls nothing), default interval 60s->300s with per-instance jitter and failure backoff, new-chat lookback widened to cover the interval; atomic JSON writes prevent concurrent-write corruption; retains the WebSocket pingTimeout half-open watchdog (verified real half-open detection); includes the retire-post-only-response-surfaces cleanup
+v0.3.30       = fix: housekeeping GC reclaims agent_workspace session dirs (was unbounded disk growth); never deletes live/in-flight sessions (per-session pid liveness, claude + codex)
 ```
