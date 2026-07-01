@@ -1113,21 +1113,32 @@ describe("handleOne — thin-channel finalize", () => {
     expect(JSON.stringify(finalUpdate?.payload)).toContain("工具计数完成");
   });
 
-  it("finalizes the same CardKit card as interrupted when the turn reaches the response-surface timeout", async () => {
+  it("PRB-9: interrupts an idle-stuck CardKit turn as explicit failure (idle, not wall-clock)", async () => {
     const threadId = "om_msg";
     const wt = await seedWorktree(threadId);
     await seedRepoCachePath();
     const { client: cardKitClient, calls: cardKitCalls } = makeCardKitClient();
     let runOpts: { timeoutMs?: number } | undefined;
+    let killed = false;
 
+    // Runner emits one event then STALLS with no further activity — the idle
+    // watchdog must kill it; total-duration wall-clock must NOT be the trigger.
     runClaudeImpl = (opts: unknown) => {
       runOpts = opts as { timeoutMs?: number };
+      let resolveDone: (r: { exitCode: number; sessionId?: string }) => void = () => {};
+      const done = new Promise<{ exitCode: number; sessionId?: string }>((res) => {
+        resolveDone = res;
+      });
       return {
         events: (async function* () {
-          yield { type: "system_init", sessionId: "sess_cardkit_timeout", raw: {} };
+          yield { type: "system_init", sessionId: "sess_idle", raw: {} };
+          while (!killed) await new Promise((r) => setTimeout(r, 5));
         })(),
-        done: Promise.resolve({ exitCode: 1, sessionId: "sess_cardkit_timeout" }),
-        kill: () => {},
+        done,
+        kill: () => {
+          killed = true;
+          resolveDone({ exitCode: 143, sessionId: "sess_idle" });
+        },
       };
     };
 
@@ -1161,30 +1172,28 @@ describe("handleOne — thin-channel finalize", () => {
         },
       },
       cardKitClient,
-      responseSurfaceTimeoutMs: 0,
+      responseSurfaceIdleTimeoutMs: 30, // tiny idle threshold for a fast, deterministic test
     });
 
     await handler.run();
-    for (let i = 0; i < 100 && acked.length === 0; i++) {
+    for (let i = 0; i < 300 && acked.length === 0; i++) {
       await new Promise((r) => setTimeout(r, 10));
     }
 
-    expect(runOpts?.timeoutMs).toBe(0);
+    // Runner got the coarse runaway guard (≥60s), NOT the retired 20-min cut.
+    expect(runOpts?.timeoutMs ?? 0).toBeGreaterThan(60_000);
+    // The idle watchdog killed the stalled runner.
+    expect(killed).toBe(true);
     expect(acked).toEqual(["om_msg"]);
     expect(startArgs).toHaveLength(0);
     expect(finalizeArgs).toHaveLength(0);
-    expect(await readFile(stateFileMod.stateFilePathOf(wt), "utf8")).toContain("in_progress");
     const stream = cardKitCalls.find((c) => c.kind === "stream" && c.elementId === "final_md");
-    expect(stream?.content).toContain("已中断");
-    const finalUpdate = cardKitCalls.find((c) => c.kind === "updateCard");
-    expect(JSON.stringify(finalUpdate?.payload)).toContain("已中断");
+    expect(stream?.content).toContain("被中断");
+    expect(stream?.content).toContain("无活性");
+    expect(stream?.content).toContain("请重试");
+    expect(stream?.content).not.toContain("请再 @ 我一次");
     const settings = cardKitCalls.find((c) => c.kind === "settings");
-    expect(settings?.payload).toEqual({
-      config: {
-        streaming_mode: false,
-        summary: { content: "⚠️ 本轮处理超时，已中断。请再 @ 我一次重试。" },
-      },
-    });
+    expect(JSON.stringify(settings?.payload)).toContain("本轮被中断");
   });
 
   it("adopts the already-visible CardKit reply when idConvert fails instead of creating a second card", async () => {
