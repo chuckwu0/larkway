@@ -63,7 +63,28 @@ import type { OutboundPostClient } from "../lark/outboundPostClient.js";
 import { buildPostContent } from "../lark/postContent.js";
 import { derivePostIdempotencyKey, digestPostContent } from "../lark/idempotency.js";
 
+/**
+ * @deprecated PRB-9 (§12): the fixed wall-clock response-surface cut is retired
+ * as the primary interrupt criterion — it mis-killed legitimately long tasks
+ * ("复杂任务本来就会花很久"). Kept only so an old override doesn't break; the
+ * primary interrupt is now the idle watchdog below.
+ */
 const DEFAULT_CARDKIT_RESPONSE_SURFACE_TIMEOUT_MS = 20 * 60 * 1000;
+
+/**
+ * PRB-9 (§12) idle-stuck threshold. The interrupt criterion is ACTIVITY, not
+ * total wall-clock: a turn is cut only when it emits NO runner activity (token /
+ * tool / any stream event) for this long — a real hang signal — never merely for
+ * taking a long time. A turn that keeps streaming tokens or driving tools runs to
+ * completion no matter the total duration. 3 min default (boss-approved),
+ * overridable per bot via `responseSurfaceIdleTimeoutMs`.
+ *
+ * NOTE (批A scope): activity here = runner output events (§12.1). The refined
+ * "存活型活性" (process alive but silent — pure inference / awaiting upstream API,
+ * §12.5) is 批B; and a coarse 60-min subprocess runaway guard still backstops a
+ * silent hang that also stops emitting — the proper budget soft-net is 批B (§12.7).
+ */
+const DEFAULT_CARDKIT_IDLE_TIMEOUT_MS = 3 * 60 * 1000;
 
 function summarizeMentionPolicyRules(rules: string[]): string {
   const counts = new Map<string, number>();
@@ -533,8 +554,15 @@ export interface BridgeHandlerDeps {
    * CardKit card finalizes as a clean timeout instead of hanging forever.
    *
    * @default 20 * 60 * 1000
+   * @deprecated PRB-9: no longer the primary interrupt. Use responseSurfaceIdleTimeoutMs.
    */
   responseSurfaceTimeoutMs?: number;
+  /**
+   * PRB-9 (§12): idle-stuck threshold in ms. A CardKit turn is interrupted only
+   * after this long with NO runner activity (a real hang), never for total
+   * duration. @default 3 * 60 * 1000 (3 min), overridable per bot.
+   */
+  responseSurfaceIdleTimeoutMs?: number;
   /**
    * V2: fully-resolved peer bot list for this bot.
    * Pre-resolved by runV2Mode: each entry has the peer bot's open_id, name, description.
@@ -1243,13 +1271,14 @@ export class BridgeHandler {
         // Default 60min — real-business prompts (D1-D3 multi-file write +
         // Agent-tool subagent spawn) easily exceed 15min. Per-spawn timeout
         // is just a runaway guard, not a UX choice.
+        // PRB-9 (§12): the runner gets only the coarse subprocess runaway guard
+        // (default 60 min) — NOT the retired 20-min response-surface cut. The
+        // primary interrupt is the idle watchdog below, so a turn that keeps
+        // producing activity runs to completion regardless of total duration.
         const baseTimeoutMs = this.deps.subprocessTimeoutMs ?? 60 * 60 * 1000;
-        const timeoutMs = cardKitProgress
-          ? Math.min(
-              baseTimeoutMs,
-              this.deps.responseSurfaceTimeoutMs ?? DEFAULT_CARDKIT_RESPONSE_SURFACE_TIMEOUT_MS,
-            )
-          : baseTimeoutMs;
+        const timeoutMs = baseTimeoutMs;
+        const idleTimeoutMs =
+          this.deps.responseSurfaceIdleTimeoutMs ?? DEFAULT_CARDKIT_IDLE_TIMEOUT_MS;
         const runnerStartedAt = Date.now();
 
         const handle = createRunner(backend).run({
@@ -1262,6 +1291,32 @@ export class BridgeHandler {
           botGitIdentity: this.deps.botConfig?.git_identity,
           gitlabToken: this.deps.gitlabToken,
         });
+
+        // PRB-9 idle watchdog: interrupt only on a real hang (no runner activity
+        // for idleTimeoutMs), never on total wall-clock. Any stream event pokes
+        // lastActivityAt; if the gap exceeds the threshold we kill the runner and
+        // route to the unified explicit-failure sink (§12.2). Only armed for the
+        // CardKit streaming surface. Check cadence = idle/4 (bounded 50ms–15s) so
+        // prod polls ~every 15s and tests with a tiny threshold fire promptly.
+        let lastActivityAt = Date.now();
+        let interruptedByIdle = false;
+        let idleWatchdog: ReturnType<typeof setInterval> | undefined;
+        if (cardKitProgress) {
+          const cadenceMs = Math.max(50, Math.min(Math.floor(idleTimeoutMs / 4), 15_000));
+          idleWatchdog = setInterval(() => {
+            if (Date.now() - lastActivityAt >= idleTimeoutMs) {
+              interruptedByIdle = true;
+              if (idleWatchdog) clearInterval(idleWatchdog);
+              idleWatchdog = undefined;
+              try {
+                handle.kill();
+              } catch {
+                /* best-effort: kill failure still finalizes as interrupted below */
+              }
+            }
+          }, cadenceMs);
+          idleWatchdog.unref?.();
+        }
 
         // GC liveness (agent_workspace only): the runner's cwd is the SHARED
         // workspace root, so its own runner.pid lands there — NOT in this
@@ -1289,6 +1344,8 @@ export class BridgeHandler {
 
         try {
           for await (const ev of handle.events) {
+            // PRB-9: any runner event = activity; resets the idle watchdog.
+            lastActivityAt = Date.now();
             if (cardKitProgress) cardKitProgress.handle(ev);
             else if (card) card.handle(ev);
             if (ev.type === "system_init") {
@@ -1302,10 +1359,14 @@ export class BridgeHandler {
           }
 
           const result = await handle.done;
-          const cardKitTurnTimedOut =
-            cardKitProgress != null &&
-            result.exitCode !== 0 &&
-            Date.now() - runnerStartedAt >= timeoutMs;
+          if (idleWatchdog) {
+            clearInterval(idleWatchdog);
+            idleWatchdog = undefined;
+          }
+          // PRB-9: a CardKit turn is "interrupted" when the idle watchdog killed
+          // it (real hang), NOT when total wall-clock elapsed. Routed to the same
+          // explicit-failure sink as crash/restart (§12.2).
+          const cardKitTurnTimedOut = cardKitProgress != null && interruptedByIdle;
 
           // Step 4d-ii: read state.json the bot wrote during the response.
           const reportedStateRead = await readStateFileDetailed(worktreePath);
@@ -1408,10 +1469,10 @@ export class BridgeHandler {
             success = true;
           } else if (cardKitTimeoutFailure) {
             success = false;
-            failureReason = `agent turn timed out after ${timeoutMs}ms; CardKit running card was finalized as interrupted`;
+            failureReason = `agent turn idle for ${idleTimeoutMs}ms with no activity (treated as stuck); run interrupted`;
             await recordEvent({
               status: "running",
-              appendPath: "Agent 超时",
+              appendPath: "Agent 卡死中断",
               reason: failureReason,
             });
           } else if (result.exitCode === 0) {
@@ -1437,7 +1498,10 @@ export class BridgeHandler {
             "";
           const cardBody =
             cardKitTimeoutFailure
-              ? "⚠️ 本轮处理超时，已中断。请再 @ 我一次重试。"
+              // PRB-9/§12.2: idle-stuck → unified explicit-failure sink, never a
+              // passive wait. 批A does NOT auto-replay it — the owner retries
+              // manually (safe auto-replay + idempotency is 批B §11.6).
+              ? "⚠️ 本轮被中断（长时间无活性，判定卡死），未完成。请重试。"
               : reportedState?.last_message ??
                 (fallbackAnswer
                   ? fallbackAnswer
