@@ -485,8 +485,12 @@ describe("reconcileOrphanedCards — integration", () => {
     });
 
     expect(calls.map((c) => c.kind)).toEqual(["stream", "update", "settings"]);
-    expect(calls[0]?.content).toContain("处理中被中断");
-    expect(JSON.stringify(calls[1]?.payload)).toContain("处理中被中断");
+    // PRB-8: interrupted turn renders an explicit failure ("未完成，请重试"),
+    // never the old passive "请再@我一次继续".
+    expect(calls[0]?.content).toContain("未完成");
+    expect(calls[0]?.content).toContain("请重试");
+    expect(calls[0]?.content).not.toContain("请再 @ 我一次继续");
+    expect(JSON.stringify(calls[1]?.payload)).toContain("未完成");
     expect(await readCardKitFile(wt)).toBeNull();
   });
 
