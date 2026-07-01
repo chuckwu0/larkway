@@ -1504,6 +1504,29 @@ export class BridgeHandler {
                 reason,
               });
             }
+            // Roster guard: a mention target that is not a known peer bot_open_id
+            // is almost certainly a transcript sender / relay / echo id copied from
+            // context. Feishu silently drops such an @, so the peer never wakes and
+            // the handoff chain stalls. We do not drop the mention (policy already
+            // gates allow/deny) — we surface the mis-@ so the silent failure is
+            // visible instead of a stuck link.
+            const rosterOpenIds = new Set((this.deps.peers ?? []).map((peer) => peer.id));
+            const nonRosterMentions = mentions.filter(
+              (mention) => !rosterOpenIds.has(mention.user_id),
+            );
+            if (nonRosterMentions.length > 0) {
+              const reason =
+                `response_surface mention target(s) not in peer roster: ` +
+                `${nonRosterMentions.map((mention) => mention.user_id).join(", ")}. ` +
+                `A non-roster id is likely a transcript sender/relay id and will NOT wake a ` +
+                `peer bot; resolve the peer's real bot_open_id from the <peer-bots> roster.`;
+              console.warn("[bridge.handler] response_surface mention target not in peer roster");
+              await recordEvent({
+                status: "running",
+                appendPath: "mention 诊断",
+                reason,
+              });
+            }
             try {
               await cardKitProgress.finalize({
                 title: baseCardPayload.titleOverride,

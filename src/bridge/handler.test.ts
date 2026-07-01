@@ -934,6 +934,95 @@ describe("handleOne — thin-channel finalize", () => {
     expect(runtimeEvents.some((e) => e.reason?.includes("denied_target=1"))).toBe(true);
   });
 
+  it("records a runtime diagnostic when a mention target is not in the peer roster", async () => {
+    const threadId = "om_msg";
+    const finalState = {
+      status: "ready",
+      last_message: "CardKit 最终正文",
+      response_surface: {
+        // Policy-allowed id, but NOT a known peer bot_open_id — this is the
+        // classic transcript-sender/relay id copied by mistake. It must not
+        // fail silently: the peer would never wake.
+        post: { mentions: [{ user_id: "ou_stranger_relay", label: "Stranger" }] },
+      },
+      updated_at: "2026-06-26T10:00:00.000Z",
+    };
+    const wt = await seedWorktree(threadId);
+    await seedRepoCachePath();
+    const { client: cardKitClient } = makeCardKitClient();
+    const runtimeEvents: Array<{ statusPath?: string[]; reason?: string }> = [];
+
+    runClaudeImpl = () => ({
+      events: (async function* () {
+        yield { type: "system_init", sessionId: "sess_cardkit_roster", raw: {} };
+        await writeFile(
+          stateFileMod.stateFilePathOf(wt),
+          JSON.stringify(finalState, null, 2),
+          "utf8",
+        );
+      })(),
+      done: Promise.resolve({ exitCode: 0, sessionId: "sess_cardkit_roster" }),
+      kill: () => {},
+    });
+
+    const { renderer } = makeCardRenderer();
+    const { store } = makeSessionStore();
+    const { client, acked } = makeClient(makeEvent());
+
+    const handler = new BridgeHandler({
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      client: client as any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      cardRenderer: renderer as any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      sessionStore: store as any,
+      conventions: makeConventions(),
+      peers: [{ id: "ou_known_peer", name: "Known", description: "" }],
+      botConfig: {
+        id: "frontend",
+        name: "Frontend",
+        turn_taking_limit: 10,
+        backend: "claude",
+        response_surface_prototype: {
+          enabled: true,
+          allowed_chats: [],
+          allowed_threads: ["om_msg"],
+          kill_switch: false,
+          post_outbound_enabled: true,
+          cardkit_streaming_enabled: true,
+          allow_agent_mentions: true,
+          denied_mention_open_ids: [],
+          allowed_mention_open_ids: [],
+        },
+      },
+      cardKitClient,
+      recordRuntimeEvent: async (patch) => {
+        runtimeEvents.push({
+          statusPath: patch.appendPath
+            ? Array.isArray(patch.appendPath)
+              ? patch.appendPath
+              : [patch.appendPath]
+            : patch.statusPath,
+          reason: patch.reason ?? undefined,
+        });
+      },
+    });
+
+    await handler.run();
+    for (let i = 0; i < 100 && acked.length === 0; i++) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
+
+    expect(
+      runtimeEvents.some(
+        (e) =>
+          e.statusPath?.includes("mention 诊断") &&
+          e.reason?.includes("not in peer roster") &&
+          e.reason?.includes("ou_stranger_relay"),
+      ),
+    ).toBe(true);
+  });
+
   it("records a state diagnostic instead of silently dropping invalid CardKit mention IDs", async () => {
     const threadId = "om_msg";
     const finalState = {

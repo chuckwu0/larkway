@@ -244,6 +244,11 @@ describe("renderPrompt — V2 mode (botName set)", () => {
     expect(prompt).toContain("必须用真实 post 回报终态");
     expect(prompt).toContain("默认 15 分钟");
     expect(prompt).toContain("不要期待 bridge 替你编排");
+    // Roster is the single source of truth for @ target open_id; never reuse
+    // the transcript sender / relay id (peer-@ reliability fix).
+    expect(prompt).toContain("唯一合法来源");
+    expect(prompt).toContain("绝不要");
+    expect(prompt).toContain("群成员 roster");
     expect(prompt).toContain("</peer-bots>");
   });
 
