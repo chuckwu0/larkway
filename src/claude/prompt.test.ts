@@ -244,11 +244,11 @@ describe("renderPrompt — V2 mode (botName set)", () => {
     expect(prompt).toContain("必须用真实 post 回报终态");
     expect(prompt).toContain("默认 15 分钟");
     expect(prompt).toContain("不要期待 bridge 替你编排");
-    // Roster is the single source of truth for @ target open_id; never reuse
-    // the transcript sender / relay id (peer-@ reliability fix).
-    expect(prompt).toContain("唯一合法来源");
-    expect(prompt).toContain("绝不要");
-    expect(prompt).toContain("群成员 roster");
+    // peer-@ reliability fix: open_id is app-scoped; resolve the @ target from
+    // the live chat roster in the bot's own app scope, not the static config id.
+    expect(prompt).toContain("open_id 按 app 作用域隔离");
+    expect(prompt).toContain("chat.members bots");
+    expect(prompt).toContain("以现查 roster 为准");
     expect(prompt).toContain("</peer-bots>");
   });
 
