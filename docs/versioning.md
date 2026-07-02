@@ -34,7 +34,9 @@
 | v0.3.23 | v0.3.23 | patch / 已发布 | ship CardKit answer streaming and hard-failure fallback |
 | v0.3.24 | v0.3.24 | patch / 已发布 | restore CardKit live streaming polish; harden orphan reconcile fallback |
 | v0.3.25 | v0.3.25 | patch / 已发布 | harden CardKit live diagnostics and running-card fallback |
-| v0.3.26 | v0.3.26 | 当前 patch / 已发布 | stream marker-gated Claude and Codex answers as CardKit deltas |
+| v0.3.26 | v0.3.26 | patch / 已发布 | stream marker-gated Claude and Codex answers as CardKit deltas |
+| v0.3.31 | v0.3.31 | patch / 已发布 | 批A 可靠性止血:显式失败态(重启/崩溃/卡死→「本轮被中断/未完成,请重试」)+ idle 阈值判卡死(默认 3min,退休 20min 盲砍)+ 失败可见(PR #35)。 |
+| v0.3.32 | v0.3.32 | 当前 patch / 已发布 | peer-@ 正确送达:构建 prompt 时现查 live-roster 拿本 app 作用域正确 peer open_id,缺 scope 安全回退静态 id(PR #36)。 |
 
 ## 使用原则
 
@@ -76,4 +78,6 @@ v0.3.26       = stream marker-gated Claude and Codex answers as CardKit deltas
 v0.3.27       = retire post-only response surfaces; CardKit streaming surface stabilization
 v0.3.28       = multi-bot stability: tame the open-chat discovery storm caused by multiple bots in open mode (chats:[]) — periodic discovery now back-fills only newly-discovered chats or chats with a pending gap window (steady-state pulls nothing), default interval 60s->300s with per-instance jitter and failure backoff, new-chat lookback widened to cover the interval; atomic JSON writes prevent concurrent-write corruption; retains the WebSocket pingTimeout half-open watchdog (verified real half-open detection); includes the retire-post-only-response-surfaces cleanup
 v0.3.30       = fix: housekeeping GC reclaims agent_workspace session dirs (was unbounded disk growth); never deletes live/in-flight sessions (per-session pid liveness, claude + codex)
+v0.3.31       = 批A 可靠性止血:显式失败态 + idle 阈值判卡死 + 失败可见(PR #35)
+v0.3.32       = peer-@ 正确送达:runtime live-roster open_id resolver(PR #36)
 ```
