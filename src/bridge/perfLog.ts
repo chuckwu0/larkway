@@ -28,6 +28,14 @@ export interface PerfSample {
   toolUseCount: number;
   /** Wall-clock turn duration (spawn to the runner's `done` resolving), ms. */
   turnDurationMs: number;
+  /**
+   * 批B Phase 1 A0 extension — mirrors RunHandle.done's same-named fields
+   * (src/agent/runner.ts). Undefined for every turn recorded before Phase 1
+   * shipped and for any non-pooled runner today, so old JSONL lines and new
+   * ones both parse fine as PerfSample.
+   */
+  pooled?: boolean;
+  resumeMode?: "same-process" | "cold";
 }
 
 export function resolvePerfLogPath(larkwayHome: string, botId?: string): string {

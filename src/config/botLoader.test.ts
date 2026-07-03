@@ -828,4 +828,90 @@ effort: hgih
       warnSpy.mockRestore();
     }
   });
+
+  // ---------------------------------------------------------------------------
+  // warmProcess / warmProcessIdleMs (perf plan §4, 批B Phase 1)
+  // ---------------------------------------------------------------------------
+
+  it("warmProcess/warmProcessIdleMs omitted by default — behavior byte-identical to before the field existed", async () => {
+    await createBotsDir();
+    await writeYaml(
+      "no-pool.yaml",
+      `
+id: no-pool-bot
+name: No Pool Bot
+description: bot without warmProcess configured
+app_id: cli_no_pool
+app_secret_env: NO_POOL_SECRET
+bot_open_id: ou_no_pool
+`,
+    );
+
+    const bots = await loadBots(botsDir());
+    expect(bots).toHaveLength(1);
+    // B1 fix: `.optional()`, not `.default(false)` — omitted stays undefined
+    // (not coerced to false), so a plain `larkway bot` yaml write-out never
+    // grows an unasked-for field and old-build round-tripping stays safe.
+    expect(bots[0]?.warmProcess).toBeUndefined();
+    expect(bots[0]?.warmProcessIdleMs).toBeUndefined();
+  });
+
+  it("warmProcess: true + backend: codex parses through with no warning", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      await createBotsDir();
+      await writeYaml(
+        "pooled-codex.yaml",
+        `
+id: pooled-codex-bot
+name: Pooled Codex Bot
+description: bot with warmProcess enabled on the codex backend
+app_id: cli_pooled_codex
+app_secret_env: POOLED_CODEX_SECRET
+bot_open_id: ou_pooled_codex
+backend: codex
+warmProcess: true
+warmProcessIdleMs: 300000
+`,
+      );
+
+      const bots = await loadBots(botsDir());
+      expect(bots).toHaveLength(1);
+      expect(bots[0]?.warmProcess).toBe(true);
+      expect(bots[0]?.warmProcessIdleMs).toBe(300000);
+      expect(warnSpy).not.toHaveBeenCalled();
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+
+  it("warmProcess: true on a non-codex backend parses through but warns (Phase 2 unbuilt, main.ts no-ops it)", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      await createBotsDir();
+      await writeYaml(
+        "pooled-claude.yaml",
+        `
+id: pooled-claude-bot
+name: Pooled Claude Bot
+description: bot with warmProcess enabled on the (unsupported) claude backend
+app_id: cli_pooled_claude
+app_secret_env: POOLED_CLAUDE_SECRET
+bot_open_id: ou_pooled_claude
+backend: claude
+warmProcess: true
+`,
+      );
+
+      const bots = await loadBots(botsDir());
+      expect(bots).toHaveLength(1);
+      expect(bots[0]?.warmProcess).toBe(true); // not blocked/coerced — advisory only
+      expect(warnSpy).toHaveBeenCalledTimes(1);
+      const [warnMessage] = warnSpy.mock.calls[0]!;
+      expect(String(warnMessage)).toContain("pooled-claude-bot");
+      expect(String(warnMessage)).toContain("claude");
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
 });

@@ -589,6 +589,16 @@ export interface BridgeHandlerDeps {
     turn_taking_limit?: number;
     git_identity?: BotConfig["git_identity"];
     backend?: string;
+    /**
+     * 批B Phase 1 (perf plan §4): registry key actually passed to
+     * `createRunner()`, when it needs to differ from the display/prompt-
+     * facing `backend` string above — e.g. main.ts routes a `warmProcess`
+     * bot to a per-bot pooled-runner registry key (`codex-pool:<botId>`)
+     * instead of the shared "codex" key, so two codex bots can independently
+     * be pooled or not. Falls back to `backend` when unset — every existing
+     * bot (no pool wiring) is byte-identical.
+     */
+    runnerKey?: string;
     runtime?: "legacy" | "agent_workspace";
     git_token_env?: string;       // preferred: generic git PAT env-var name
     gitlab_token_env?: string;    // compat alias (legacy)
@@ -1529,6 +1539,9 @@ export class BridgeHandler {
         // opt back into acceptEdits / ask via `~/.larkway/config.json`'s
         // `permissions.mode` (the future "real allow-list" path).
         const backend = this.deps.botConfig?.backend ?? "claude";
+        // 批B Phase 1: runnerKey defaults to backend, so this is a no-op for
+        // every bot that doesn't opt into pooling (see botConfig.runnerKey doc).
+        const runnerKey = this.deps.botConfig?.runnerKey ?? backend;
         const permissionMode = this.deps.permissionMode ?? "bypassPermissions";
         // Default 60min — real-business prompts (D1-D3 multi-file write +
         // Agent-tool subagent spawn) easily exceed 15min. Per-spawn timeout
@@ -1548,7 +1561,7 @@ export class BridgeHandler {
         // computed against markers.spawn once the turn completes, below.
         const perfMarkers: Partial<Record<PerfMarkerName, number>> = {};
 
-        const handle = createRunner(backend).run({
+        const handle = createRunner(runnerKey).run({
           prompt,
           resumeSessionId: currentExisting?.sessionId,
           permissionMode,
@@ -1613,9 +1626,17 @@ export class BridgeHandler {
         // is empty and, for codex (prompt goes over stdin, session path never
         // in argv), pgrep can't find the process either → GC could rm -rf a
         // live session. Best-effort; a write failure must never fail the turn.
+        //
+        // `pidFileWriteSettled` is captured (not just fire-and-forget) so the
+        // M3 pooled-turn cleanup below can wait for this write to actually
+        // land before deleting it — without that, a turn fast enough to reach
+        // `handle.done` before this write completes could have its cleanup
+        // run FIRST (finding nothing to delete) and the write land AFTER,
+        // permanently orphaning the exact stale entry M3 exists to remove.
+        let pidFileWriteSettled: Promise<unknown> = Promise.resolve();
         if (isAgentWorkspace && handle.pid != null) {
           const sessionPidFile = path.join(worktreePath, ".larkway", "runner.pid");
-          void fs
+          pidFileWriteSettled = fs
             .mkdir(path.dirname(sessionPidFile), { recursive: true })
             .then(() =>
               fs.writeFile(sessionPidFile, JSON.stringify({ pid: handle.pid }), "utf8"),
@@ -1663,6 +1684,29 @@ export class BridgeHandler {
             idleWatchdog = undefined;
           }
 
+          // M3 regression fix (Workflow review of 批B Phase 1): a POOLED
+          // turn's handle.pid is the bot's persistent warm process — the same
+          // pid across every past/future turn/session for this bot, not a
+          // one-shot child that naturally dies when this turn ends. Leaving
+          // it written at <worktreePath>/.larkway/runner.pid would make
+          // Housekeeping's isPidAlive() check see EVERY session dir for this
+          // bot as "still in use" forever, permanently blocking GC reclaim
+          // (housekeeping/gc.ts cleanupAgentSession's SAFETY GATE — this is
+          // the exact regression the 0.3.30 GC fix was written to prevent).
+          // Delete it once this turn is over; a cold turn's own pid already
+          // self-invalidates when its one-shot process exits, so this is a
+          // no-op there (result.pooled is only ever true for a pooled runner).
+          if (isAgentWorkspace && result.pooled === true) {
+            const sessionPidFile = path.join(worktreePath, ".larkway", "runner.pid");
+            // Wait for the write above to actually settle first (see its own
+            // comment) — otherwise a very fast pooled turn could run this
+            // delete before the write lands, permanently orphaning the entry.
+            await pidFileWriteSettled;
+            await fs.rm(sessionPidFile, { force: true }).catch(() => {
+              /* best-effort — a leftover pid file only delays GC reclaim by one scan */
+            });
+          }
+
           // A0: record the perf sample for this turn. Deltas are undefined
           // when a marker was never observed (e.g. the runner crashed before
           // emitting anything) — never treated as 0, which would be a false
@@ -1692,6 +1736,11 @@ export class BridgeHandler {
             spawnToFirstContentMs: deltaFrom("first_content"),
             toolUseCount: toolUseTotalCount,
             turnDurationMs: Date.now() - runnerStartedAt,
+            // 批B Phase 1 A0 extension: only a pooled runner (src/codex/
+            // pool.ts) ever sets these on `result`; every other runner leaves
+            // them undefined, same as every perf sample recorded before this.
+            pooled: result.pooled,
+            resumeMode: result.resumeMode,
           });
           // PRB-9: a CardKit turn is "interrupted" when the idle watchdog killed
           // it (real hang), NOT when total wall-clock elapsed. Routed to the same

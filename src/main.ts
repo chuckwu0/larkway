@@ -29,6 +29,7 @@ import { writeStatusFile } from "./bridge/statusFile.js";
 import { registerRunner } from "./agent/runner.js";
 import { ClaudeRunner } from "./claude/runner.js";
 import { CodexRunner } from "./codex/runner.js";
+import { CodexProcessPool, reapOrphanedWarmProcess } from "./codex/pool.js";
 import { ensureLarkCliProfile, deriveLarkCliProfile } from "./lark/profileBootstrap.js";
 import { createCachedRosterResolver } from "./lark/rosterResolver.js";
 import { checkWorkspacePermissionGrant } from "./agent/permissionGate.js";
@@ -182,6 +183,12 @@ async function runV2Mode({
     cardRenderer: CardRenderer;
     handler: BridgeHandler;
     housekeeping: Housekeeping;
+    /**
+     * 批B Phase 1 (perf plan §4): this bot's warm codex app-server process,
+     * when `warmProcess: true` in its yaml. undefined for every other bot —
+     * the overwhelming common case stays byte-identical to pre-Phase-1.
+     */
+    codexPool: CodexProcessPool | undefined;
     /** Task-handle comment poller (docs/task-handle.md) — undefined when the bot doesn't enable the feature. */
     taskCommentPoller: CommentPoller | undefined;
     /** Liveness heartbeat interval (status.json). Armed after wiring; unref()-ed. */
@@ -431,6 +438,37 @@ async function runV2Mode({
       }
     }
 
+    // 批B Phase 1 (perf plan §4): a per-bot warm codex app-server process,
+    // opt-in via bots/*.yaml `warmProcess: true`. Only implemented for
+    // backend=codex (Phase 2/claude pooling is unbuilt — botLoader already
+    // warned at load time if warmProcess is set on any other backend).
+    // Registered under a PER-BOT registry key (not the shared "codex" key)
+    // so two codex bots on the same larkway instance can independently be
+    // pooled or not — see botConfig.runnerKey's doc in bridge/handler.ts.
+    let codexPool: CodexProcessPool | undefined;
+    let runnerKey: string | undefined;
+    if (bot.warmProcess && bot.backend === "codex") {
+      const pidFilePath = path.join(botDir, "warm-codex.pid");
+      // M2 (Workflow review): a hard kill (kill -9 / watchdog / OOM) skips
+      // CodexProcessPool's own exit-time pid-file cleanup, so a stale entry
+      // from a PRIOR run of the bridge can point at an orphaned but
+      // still-running codex app-server process. Sweep it before constructing
+      // this bot's (fresh) pool. Best-effort — never blocks bot startup.
+      try {
+        await reapOrphanedWarmProcess(pidFilePath);
+      } catch (err) {
+        console.warn(`[larkway] bot "${bot.id}": orphaned warm-process sweep failed (continuing):`, err);
+      }
+      codexPool = new CodexProcessPool({
+        botGitIdentity: bot.git_identity,
+        gitlabToken: effectiveGitlabToken,
+        idleMs: bot.warmProcessIdleMs,
+        pidFilePath,
+      });
+      runnerKey = `codex-pool:${bot.id}`;
+      registerRunner(runnerKey, () => codexPool!);
+    }
+
     const handler = new BridgeHandler({
       client,
       cardRenderer,
@@ -448,6 +486,7 @@ async function runV2Mode({
         turn_taking_limit: bot.turn_taking_limit,
         git_identity: bot.git_identity,
         backend: bot.backend,
+        runnerKey,
         runtime: bot.runtime,
         git_token_env: bot.git_token_env,
         gitlab_token_env: bot.gitlab_token_env,
@@ -489,7 +528,7 @@ async function runV2Mode({
 
     const inst: BotInstance = {
       bot, client, sessionStore, cardRenderer, handler, housekeeping,
-      taskCommentPoller,
+      taskCommentPoller, codexPool,
       statusTimer: null, avatar: undefined,
     };
     instances.push(inst);
@@ -548,7 +587,7 @@ async function runV2Mode({
   async function shutdown(signal: string): Promise<void> {
     console.log(`\n[larkway] Received ${signal}, shutting down V2 bots…`);
     await Promise.all(
-      instances.map(async ({ bot, statusTimer, housekeeping, taskCommentPoller, handler, sessionStore, client, avatar }) => {
+      instances.map(async ({ bot, statusTimer, housekeeping, taskCommentPoller, handler, sessionStore, client, avatar, codexPool }) => {
         if (statusTimer) clearInterval(statusTimer);
         // Await drain (M1): stop() only cancels the NEXT scheduled cycle —
         // without awaiting, a cycle already in flight would keep running
@@ -568,6 +607,9 @@ async function runV2Mode({
           runtime: bot.runtime ?? "legacy",
         }).catch(() => {});
         housekeeping.stop();
+        // 批B Phase 1: drain in-flight turns (bounded) then SIGTERM the warm
+        // process, if this bot has one. undefined for every non-pooled bot.
+        await codexPool?.shutdown();
         await handler.close();
         await sessionStore.close();
         await client.close();
@@ -587,9 +629,11 @@ async function runV2Mode({
   if (dryRun) {
     console.log("[dry-run] V2 mode — all bots wired OK, exiting.");
     await Promise.all(
-      instances.map(async ({ housekeeping, taskCommentPoller, sessionStore, client }) => {
+      instances.map(async ({ housekeeping, taskCommentPoller, sessionStore, client, codexPool }) => {
         housekeeping.stop();
         await taskCommentPoller?.stop();
+        // No-op: dry-run never calls .run(), so no process was ever spawned.
+        await codexPool?.shutdown();
         await sessionStore.close();
         await client.close();
       }),

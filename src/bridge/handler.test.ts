@@ -3105,6 +3105,149 @@ describe("handleOne — provisioning decision tree (unified model)", () => {
     expect(gitCalls).toHaveLength(0);
   });
 
+  // M3 (Workflow review of 批B Phase 1): a pooled codex turn's handle.pid is
+  // the BOT's persistent warm process, which stays alive across every future
+  // turn/session — leaving it written at the session's runner.pid would make
+  // Housekeeping's isPidAlive() check see this session as "still in use"
+  // forever, permanently blocking GC reclaim (the exact regression the
+  // 0.3.30 GC fix was written to prevent). handler.ts must delete it once a
+  // POOLED turn settles; a cold turn's own pid is untouched (it naturally
+  // goes dead when that one-shot process exits — no extra step needed there).
+  it("pooled turn (result.pooled=true) deletes the session's runner.pid after finalize", async () => {
+    const threadId = "om_msg";
+    const workspacePath = join(root, "agents", "larkway-devops", "workspace");
+    const sessionsDir = join(workspacePath, "sessions");
+    const reposDir = join(workspacePath, "repos");
+    const sessionPath = join(sessionsDir, threadId);
+
+    runClaudeImpl = () => ({
+      events: (async function* () {
+        yield { type: "system_init", sessionId: "sess_pooled", raw: {} };
+      })(),
+      done: Promise.resolve({ exitCode: 0, sessionId: "sess_pooled", pooled: true }),
+      kill: () => {},
+      pid: 424242,
+    });
+
+    const { renderer, whenFinalized } = makeCardRenderer();
+    const { store } = makeSessionStore();
+    const { client } = makeClient(makeEvent());
+    const handler = new BridgeHandler({
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      client: client as any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      cardRenderer: renderer as any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      sessionStore: store as any,
+      conventions: {
+        runtime: "agent_workspace",
+        worktreesDir: join(root, "legacy-worktrees"),
+        agentWorkspacePath: workspacePath,
+        workspaceSessionsDir: sessionsDir,
+        workspaceReposPath: reposDir,
+        repoCachePath: join(reposDir, "larkway"),
+        primaryRepoUrl: "https://gitlab.example.com/chuckwu0/larkway.git",
+        defaultBranch: "main",
+        defaultProjectSlug: "chuckwu0/larkway",
+        gitlabTokenEnvName: "LARKWAY_DEVOPS_GITLAB_TOKEN",
+        devHostname: "10.0.0.1",
+        portRangeStart: 3000,
+        portRangeEnd: 3999,
+      },
+      botConfig: {
+        id: "larkway-devops",
+        name: "Larkway DevOps",
+        description: "Develop and operate Larkway",
+        turn_taking_limit: 10,
+        backend: "codex",
+        runtime: "agent_workspace",
+        gitlab_token_env: "LARKWAY_DEVOPS_GITLAB_TOKEN",
+      },
+    });
+
+    await handler.run();
+    await whenFinalized;
+
+    // handler.ts now `await`s the write before running the M3 delete (see
+    // its own comment — a fast pooled turn could otherwise delete before the
+    // write lands), and both happen strictly before the later card-finalize
+    // step that `whenFinalized` waits on — so by this point the full
+    // write-then-delete round trip is guaranteed complete already.
+    const pidFile = join(sessionPath, ".larkway", "runner.pid");
+    await expect(stat(pidFile)).rejects.toThrow();
+  });
+
+  it("cold turn (result.pooled unset) leaves the session's runner.pid in place — cold path behavior unchanged", async () => {
+    const threadId = "om_msg";
+    const workspacePath = join(root, "agents", "larkway-devops", "workspace");
+    const sessionsDir = join(workspacePath, "sessions");
+    const reposDir = join(workspacePath, "repos");
+    const sessionPath = join(sessionsDir, threadId);
+
+    runClaudeImpl = () => ({
+      events: (async function* () {
+        yield { type: "system_init", sessionId: "sess_cold", raw: {} };
+      })(),
+      done: Promise.resolve({ exitCode: 0, sessionId: "sess_cold" }), // no `pooled` field — cold runner shape
+      kill: () => {},
+      pid: 424243,
+    });
+
+    const { renderer, whenFinalized } = makeCardRenderer();
+    const { store } = makeSessionStore();
+    const { client } = makeClient(makeEvent());
+    const handler = new BridgeHandler({
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      client: client as any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      cardRenderer: renderer as any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      sessionStore: store as any,
+      conventions: {
+        runtime: "agent_workspace",
+        worktreesDir: join(root, "legacy-worktrees"),
+        agentWorkspacePath: workspacePath,
+        workspaceSessionsDir: sessionsDir,
+        workspaceReposPath: reposDir,
+        repoCachePath: join(reposDir, "larkway"),
+        primaryRepoUrl: "https://gitlab.example.com/chuckwu0/larkway.git",
+        defaultBranch: "main",
+        defaultProjectSlug: "chuckwu0/larkway",
+        gitlabTokenEnvName: "LARKWAY_DEVOPS_GITLAB_TOKEN",
+        devHostname: "10.0.0.1",
+        portRangeStart: 3000,
+        portRangeEnd: 3999,
+      },
+      botConfig: {
+        id: "larkway-devops",
+        name: "Larkway DevOps",
+        description: "Develop and operate Larkway",
+        turn_taking_limit: 10,
+        backend: "codex",
+        runtime: "agent_workspace",
+        gitlab_token_env: "LARKWAY_DEVOPS_GITLAB_TOKEN",
+      },
+    });
+
+    await handler.run();
+    await whenFinalized;
+
+    // Unlike the pooled path, this write is genuinely fire-and-forget with
+    // nothing downstream awaiting it — poll briefly rather than assume it
+    // has landed the instant whenFinalized resolves.
+    const pidFile = join(sessionPath, ".larkway", "runner.pid");
+    const deadline = Date.now() + 1000;
+    for (;;) {
+      const exists = await stat(pidFile).then(() => true, () => false);
+      if (exists) break;
+      if (Date.now() >= deadline) throw new Error(`${pidFile} was never written within 1000ms`);
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    // Cold path must never delete it — confirms cold-turn behavior is
+    // byte-identical to before this fix existed.
+    await expect(stat(pidFile)).resolves.toBeTruthy();
+  });
+
   it("agent_workspace same topic reply resumes the same workspace session", async () => {
     const threadId = "om_root";
     const workspacePath = join(root, "agents", "larkway-devops", "workspace");

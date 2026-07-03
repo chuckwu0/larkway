@@ -152,7 +152,24 @@ export function markPerfForEventType(
 
 export interface RunHandle {
   events: AsyncIterable<AgentStreamEvent>;
-  done: Promise<{ exitCode: number; sessionId?: string }>;
+  /**
+   * `pooled`/`resumeMode` (perf plan 批B Phase 1 A0 extension): set only by a
+   * pooled runner (src/codex/pool.ts); absent/undefined for the existing
+   * one-shot runners, which is what makes this an additive, non-breaking
+   * change to the interface. `pooled` = this turn ran on a bot's warm
+   * per-process pool (not a fresh cold-started subprocess). `resumeMode` is
+   * only meaningful when the turn is a resume (`RunOptions.resumeSessionId`
+   * set): "same-process" = resumed on the same still-warm process (the
+   * actual perf win — zero repeat MCP handshake per the spike); "cold" =
+   * resumed via a fresh subprocess (either pooling is off, or this specific
+   * turn fell back to a cold start after a pool crash/init failure).
+   */
+  done: Promise<{
+    exitCode: number;
+    sessionId?: string;
+    pooled?: boolean;
+    resumeMode?: "same-process" | "cold";
+  }>;
   kill(): void;
   /**
    * OS pid of the spawned agent CLI child, when available. The bridge writes a

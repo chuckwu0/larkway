@@ -710,3 +710,15 @@ export {
   CodexLineParser as _CodexLineParser,
   parseCodexLine as _parseCodexLine,
 };
+
+// Real (non-underscore) exports for src/codex/pool.ts (perf plan 批B Phase 1):
+// the pool speaks the same app-server wire protocol as runCodex() above and
+// must not fork a second copy of these small pure helpers (DRY).
+export {
+  codexApprovalPolicy,
+  codexThreadSandboxMode,
+  codexTurnSandboxPolicy,
+  asRecord,
+  extractThreadIdFromThreadResponse,
+  CodexAppServerLineParser,
+};
