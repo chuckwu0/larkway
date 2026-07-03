@@ -230,11 +230,15 @@ export interface RenderPromptInput {
    */
   runtimeWarnings?: RuntimeWarning[];
   /**
-   * Task-handle tasklist GUID (docs/task-handle.md), when the bot's
-   * `taskHandle.enabled` + `tasklistGuid` are both configured. Thin-bridge:
-   * this injects only the fact pointer + a one-line SKILL pointer, never the
+   * Task-handle tasklist GUID (docs/task-handle.md, v2), when the bot has a
+   * live tasklistGuid — configured in yaml, or discovered via the shared team
+   * registry that `larkway tasklist-init --team` populated (main.ts only
+   * ever reads this at startup; it never creates a tasklist itself). Gate is
+   * presence of the guid alone, not any enable flag (§6.3/§6.4) — a bot with
+   * no live guid renders zero task-handle prompt overhead. Thin-bridge: this
+   * injects only the fact pointer + a one-line SKILL pointer, never the
    * claim/writeback workflow itself (that lives entirely in the SKILL).
-   * Absent = feature not configured for this bot → no block rendered.
+   * Absent = no live tasklist for this bot → no block rendered.
    */
   taskHandleTasklistGuid?: string;
   /**

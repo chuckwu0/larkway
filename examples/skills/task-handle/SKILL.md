@@ -9,24 +9,26 @@ description: 话题 ↔ 飞书任务句柄 —— 用户把当前话题转成飞
 > bridge 侧的机械回写(完成时勾选、失败时评论、reopen)已经自动发生,你不需要、也不应该自己去调这些"收尾"动作 ——
 > 你只需要做**认领**、**声明是否真正完成(`done`)**和**里程碑评论/描述更新**这几件事。
 
-## 前提:这条群是否启用了任务句柄
+## 前提:这个 bot 有没有可用的共享清单
 
-每轮 prompt 事实里如果有 `<task-handle>` 块,说明本群启用了该 feature:
+每轮 prompt 事实里如果有 `<task-handle>` 块,说明这个 bot 已经有一个可用的
+「Agent Team」共享清单(owner 的一整组 bot 共用同一个,不管来自哪个群、哪个 bot 被 @):
 
 ```
 task_handle_tasklist_guid: <guid>
 task_handle_claimed: yes|no
-本群启用了任务句柄;用户要求认领任务时,按 task-handle skill 流程处理。
+已启用任务句柄;用户要求认领任务时,按 task-handle skill 流程处理。
 ```
 
-没有这个块 = 本群未启用,跳过本 SKILL 全部内容。
+没有这个块 = 这个 bot 暂时没有可用的清单(可能是 owner 还没授权 task scope、或清单尚未 provision),
+跳过本 SKILL 全部内容。
 
 `task_handle_claimed` 是 bridge 注入的**事实**(本话题是否已有认领记录),不是流程指令 ——
 你据此决定要不要在回复里带认领按钮(见下面「一键认领按钮」),bridge 本身不做任何判断。
 
 ## 0. 一键认领按钮(减少打字)
 
-当 `task_handle_claimed: no` 且本群启用了任务句柄时,在你这一轮的回复卡片里带上一个按钮,
+当 `task_handle_claimed: no` 且有可用清单时,在你这一轮的回复卡片里带上一个按钮,
 免得用户每次都要打字说"认领任务":
 
 ```json
@@ -49,7 +51,7 @@ task_handle_claimed: yes|no
 
 ## 2. 认领流程
 
-1. **确认这是你自己的话题**:只认领"源话题确实是当前 session"的任务(用你自己的根消息原文去匹配,不要跨话题认领)。对不上就礼貌拒绝,说明找不到匹配的任务。
+1. **确认这是你自己的话题、且是 owner 转的任务**:只认领"源话题确实是当前 session"的任务(用你自己的根消息原文去匹配,不要跨话题认领)。这个共享清单本来就只对 owner 私有(§5.3),所以清单里出现的任务默认都是 owner 转的;如果候选任务的发起人明显不是当前话题的 owner,礼貌拒绝并说明。对不上就礼貌拒绝,说明找不到匹配的任务。
 
 2. **检索候选任务**:用 `lark-cli task tasklists tasks --tasklist-guid <guid> --page-size 50` 拉出清单里的任务,按标题/描述与你话题根消息原文的相似度筛出候选。
 

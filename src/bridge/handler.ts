@@ -603,7 +603,13 @@ export interface BridgeHandlerDeps {
     git_token_env?: string;       // preferred: generic git PAT env-var name
     gitlab_token_env?: string;    // compat alias (legacy)
     response_surface_prototype?: ResponseSurfacePrototypeConfig;
-    /** Only the tasklistGuid is prompt-relevant; enabled/admin stay provisioning-only. */
+    /**
+     * v2: no `enabled` flag — presence of a live tasklistGuid (resolved by
+     * main.ts, read-only, from yaml or the shared team registry — the
+     * registry itself is only ever populated by the human-run
+     * `larkway tasklist-init --team` CLI, never by a bot at startup) IS the
+     * gate.
+     */
     taskHandle?: { tasklistGuid?: string };
     /** Perf plan 批C model/effort knobs — passed through to RunOptions verbatim. */
     model?: string;

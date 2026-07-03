@@ -159,6 +159,83 @@ describe("TaskListClient.createTasklist", () => {
   });
 });
 
+describe("TaskListClient.getTasklist", () => {
+  it("returns null on a 404-shaped error (tasklist deleted / no scope)", async () => {
+    const client = new TaskListClient(
+      fakeRequester(() => {
+        throw { response: { status: 404 } };
+      }),
+    );
+    await expect(client.getTasklist("tl-1")).resolves.toBeNull();
+  });
+
+  it("maps a successful response into guid + members, filtering unknown type/role to safe defaults", async () => {
+    const client = new TaskListClient(
+      fakeRequester(() => ({
+        data: {
+          tasklist: {
+            guid: "tl-1",
+            members: [
+              { id: "ou_owner", type: "user", role: "editor" },
+              { id: "cli_bot", type: "app", role: "editor" },
+              { id: "weird", type: "something-unexpected", role: "something-else" },
+            ],
+          },
+        },
+      })),
+    );
+    await expect(client.getTasklist("tl-1")).resolves.toEqual({
+      guid: "tl-1",
+      members: [
+        { id: "ou_owner", type: "user", role: "editor" },
+        { id: "cli_bot", type: "app", role: "editor" },
+        { id: "weird", type: undefined, role: "editor" },
+      ],
+    });
+  });
+
+  it("returns an empty members array when the response has no members field", async () => {
+    const client = new TaskListClient(fakeRequester(() => ({ data: { tasklist: { guid: "tl-1" } } })));
+    await expect(client.getTasklist("tl-1")).resolves.toEqual({ guid: "tl-1", members: [] });
+  });
+
+  it("throws a TaskApiError for a genuine transport failure", async () => {
+    const client = new TaskListClient(
+      fakeRequester(() => {
+        throw new Error("ECONNRESET");
+      }),
+    );
+    await expect(client.getTasklist("tl-1")).rejects.toThrow(TaskApiError);
+  });
+});
+
+describe("TaskListClient.addTasklistMembers", () => {
+  it("POSTs to /tasklists/:guid/members with the members payload", async () => {
+    let captured: LarkTaskRequestConfig | undefined;
+    const client = new TaskListClient(
+      fakeRequester((config) => {
+        captured = config;
+        return { data: {} };
+      }),
+    );
+    await client.addTasklistMembers("tl-1", [{ id: "cli_app1", type: "app", role: "editor" }]);
+    expect(captured?.method).toBe("POST");
+    expect(captured?.url).toBe("/open-apis/task/v2/tasklists/tl-1/members");
+    expect(captured?.data).toEqual({ members: [{ id: "cli_app1", type: "app", role: "editor" }] });
+  });
+
+  it("wraps a failure into a TaskApiError (best-effort swallowing happens one layer up)", async () => {
+    const client = new TaskListClient(
+      fakeRequester(() => {
+        throw new Error("boom");
+      }),
+    );
+    await expect(
+      client.addTasklistMembers("tl-1", [{ id: "cli_app1", type: "app", role: "editor" }]),
+    ).rejects.toThrow(TaskApiError);
+  });
+});
+
 describe("isTaskNotFoundError", () => {
   it("recognizes a TaskApiError with status 404", () => {
     expect(isTaskNotFoundError(new TaskApiError("boom", { status: 404 }))).toBe(true);

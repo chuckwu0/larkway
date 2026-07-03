@@ -39,11 +39,12 @@ import {
   shouldProvideResponseSurfaceCardKitClient,
   shouldProvideResponseSurfacePostClient,
 } from "./responseSurface.js";
-import { resolveTaskHandlesPath } from "./config/paths.js";
+import { resolveTaskHandlesPath, resolveTaskTeamRegistryPath } from "./config/paths.js";
 import { TaskHandleStore } from "./tasklist/store.js";
 import { TaskListClient, type LarkTaskRequester } from "./tasklist/client.js";
 import { applyTaskHandleWriteback } from "./tasklist/writeback.js";
 import { CommentPoller } from "./tasklist/commentPoller.js";
+import { readTeamTasklistGuid } from "./tasklist/teamRegistry.js";
 
 /** How often the bridge rewrites each bot's status.json liveness heartbeat. */
 const STATUS_WRITE_INTERVAL_MS = 30_000;
@@ -359,50 +360,53 @@ async function runV2Mode({
       ? client.outboundCardKitClient()
       : undefined;
 
-    // Task-handle (docs/task-handle.md) — entirely opt-in per bot. Uses a
-    // standalone SDK Client (same one-off REST pattern as fetchBotAvatar
-    // above) rather than the live Channel SDK handle: task v2 calls are
-    // infrequent request/response, not part of the WS inbound/outbound path.
-    //
-    // `effectiveTaskHandleTasklistGuid` is the SINGLE source of truth for
-    // "feature is actually live for this bot" — both the hooks/poller wiring
-    // below AND the prompt-fact injection (botConfig.taskHandle) key off this
-    // one value, so they can never disagree (previously the prompt injection
-    // checked only tasklistGuid, independent of `enabled` — an
-    // enabled:false-but-guid-still-set config would inject the prompt pointer
-    // while the writeback hooks stayed off, silently dropping every claim).
+    // Task-handle (docs/task-handle.md v2: team-shared single tasklist).
+    // No `enabled` flag gates this — the real gate is whether a LIVE guid
+    // ends up resolved at all (§6.3/§6.4). Resolution is PURE lookup, never
+    // creation — the only way a tasklist ever comes into existence is the
+    // explicit `larkway tasklist-init --team` CLI (run once, by the owner,
+    // who alone can identify themselves as the human owner — see
+    // tasklistInit.ts). Startup here just asks "does a guid already exist
+    // somewhere for me?":
+    //   1. bot.taskHandle.tasklistGuid from yaml, if set.
+    //   2. the shared team registry (the CLI, or a sibling bot, already
+    //      recorded one there).
+    // Neither branch ever calls createTasklist — a bot with no guid anywhere
+    // makes ZERO task-API network calls and the feature stays fully dormant
+    // (no prompt injection, no store/poller construction) until the operator
+    // runs the CLI. Uses a standalone SDK Client (same one-off REST pattern
+    // as fetchBotAvatar above) rather than the live Channel SDK handle: task
+    // v2 calls are infrequent request/response, not part of the WS inbound/
+    // outbound path.
     let effectiveTaskHandleTasklistGuid: string | undefined;
     let taskHandleLifecycle: ((patch: import("./tasklist/types.js").TaskHandleLifecyclePatch) => Promise<void>) | undefined;
     let taskHandleClaim: ((patch: import("./tasklist/types.js").TaskHandleClaimPatch) => Promise<void>) | undefined;
     let taskHandleClaimedLookup: ((threadId: string) => boolean) | undefined;
     let taskCommentPoller: CommentPoller | undefined;
-    if (bot.taskHandle?.enabled) {
-      if (!bot.taskHandle.tasklistGuid) {
-        console.warn(
-          `[larkway] bot "${bot.id}" has taskHandle.enabled=true but no tasklistGuid configured — ` +
-            "feature stays inert (equivalent to disabled) until provisioned via `larkway tasklist-init`.",
-        );
-      } else if (bot.chats.length !== 1) {
-        // docs/task-handle.md §5.3/§7: a tasklist is provisioned for exactly one
-        // group (member=chat, 1:1 clean binding). A tasklistGuid is bot-scoped,
-        // not chat-scoped — a bot serving 0/2+ chats (incl. default open-mode
-        // `chats:[]`) has no single group the "本群启用了任务句柄" prompt line
-        // could correctly refer to, so the feature degrades to disabled rather
-        // than leaking the prompt hint (and a stray claim path) into unrelated
-        // groups. warn-once at startup, not a crash.
-        console.warn(
-          `[larkway] bot "${bot.id}" has taskHandle.enabled=true but serves ${bot.chats.length} chat(s) ` +
-            "(feature currently requires exactly one — see docs/task-handle.md §7); " +
-            "feature stays inert (equivalent to disabled) until the bot is scoped to a single group.",
-        );
-      } else {
-        effectiveTaskHandleTasklistGuid = bot.taskHandle.tasklistGuid;
-        const taskHandleStore = await TaskHandleStore.load(resolveTaskHandlesPath(bot.id));
+    {
+      const guid = bot.taskHandle?.tasklistGuid ?? (await readTeamTasklistGuid(resolveTaskTeamRegistryPath()));
+      if (guid) {
         const taskSdkClient = new LarkSdkClient({ appId: bot.app_id, appSecret });
         const taskRequester: LarkTaskRequester = {
           request: (config) => taskSdkClient.request(config as Parameters<typeof taskSdkClient.request>[0]),
         };
         const taskListClient = new TaskListClient(taskRequester);
+        // Self-join: idempotent best-effort add of this bot's app as editor
+        // (docs/task-handle.md §7 — "其他 bot 首次用时读到 guid… 把自己加为
+        // editor"). Harmless if already a member (client.ts's doc comment);
+        // swallowed on failure like every other step here — a bot that can't
+        // self-join still gets the prompt pointer/writeback wired below
+        // (best case it was already a member from `tasklist-init --team`).
+        await taskListClient
+          .addTasklistMembers(guid, [{ id: bot.app_id, type: "app", role: "editor" }])
+          .catch((err) => {
+            console.warn(
+              `[larkway] bot "${bot.id}": self-join tasklist ${guid} as editor failed (continuing, best-effort):`,
+              err,
+            );
+          });
+        effectiveTaskHandleTasklistGuid = guid;
+        const taskHandleStore = await TaskHandleStore.load(resolveTaskHandlesPath(bot.id));
         taskHandleLifecycle = (patch) => applyTaskHandleWriteback(patch, { store: taskHandleStore, client: taskListClient });
         // TaskHandleStore.claim() is idempotent on an unchanged guid (see its
         // doc comment) — this is what makes it safe for handler.ts to call

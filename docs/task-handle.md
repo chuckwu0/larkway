@@ -1,11 +1,11 @@
 # 话题 ↔ 飞书任务句柄(Task Handle)
 
-> 状态:v1 设计定稿(2026-07)。本文是该 feature 的权威设计文档;实现以此为准。
+> 状态:v2 设计定稿(2026-07,团队共享单清单模型,取代 v1 的每群一清单)。本文是该 feature 的权威设计文档;实现以此为准。
 > 原则依据:[principles.md](principles.md)。飞书平台能力结论均经过实测验证(见 §9 平台事实)。
 
 ## 1. 一句话
 
-**群里的一个飞书话题 = agent 的一项工作;用户把话题「转任务」后,这条飞书任务成为该话题的管理句柄** —— 可改名、可备注、看得到状态、收得到推送、点得回话题;agent 认领后自动维护它的生命周期。
+**群里的一个飞书话题 = agent 的一项工作;用户把话题「转任务」后,这条飞书任务成为该话题的管理句柄** —— 可改名、可备注、看得到状态、收得到推送、点得回话题;agent 认领后自动维护它的生命周期。**owner 的一整组 agent 共用一个「Agent Team」任务清单**(owner 私有,想给谁看自己手动分享),不管 @ 哪个 agent、在哪个群,转出来的任务都进这一个清单。
 
 ## 2. 动机(要解决的痛点)
 
@@ -64,33 +64,48 @@
 - **人改的字段永不覆盖**:任务标题、人在描述外自行添加的内容,agent/bridge 一律不动;bridge 只覆盖写自己维护的描述状态日志区块。
 - **完成语义由 agent 声明,不是 turn 成功即勾**(dogfood v1.1 修复):`state.json` 的 `task_handle` 支持可选 `done` 布尔字段;只有 agent 在真正对用户交付的那一轮写 `done: true`,bridge 才把任务勾完成。省略/`false`(如把活派给下游 agent、自己这轮只是正常收尾)时,`status=completed` 仍会刷新描述日志,但不勾完成、不触发 reopen——避免把"turn 正常结束"错误等同于"任务已交付"。
 
-### 5.3 多主人语义与隐私边界
+### 5.3 归属与隐私边界(v2:团队共享单清单)
 
-- **清单每群一个,永不跨群共用(铁律)**。清单共享给「群」这个成员(member type=chat),隐私边界 = 群边界;禁止全局清单。
-- **任务归转任务的人**:谁右键转的,谁是创建者/负责人、谁收推送 —— 与 agent 的 owner 无关。非 owner 群成员同样可用整个流程(这属于「使用 agent」,不触碰 owner-only 动作;owner 语义沿用 agent-workspace.md §6 的 `sender_open_id / is_owner` 机制,不变)。
+- **一个 owner 一个「Agent Team」清单,跨群跨 agent 共用**。清单归 owner 所有,人类成员**只有 owner**(默认不共享给任何群);owner 想给谁看,自己在飞书里手动分享/加权限,**bridge 不管可见范围**。隐私天然干净:清单不自动暴露给任何群,不管话题来自哪个群,板都只有 owner 看得到。
+  > 平台细节:task v2 API 的 `owner`/`creator` 字段是建清单时调用身份自动生成的(此实现无 user-token 流程,实际调用身份是 team 里第一个 bot 的 app,而非 owner 本人的账号)。owner 能在自己的飞书任务中心**看到并管理**这个清单,靠的不是这个 API 字段,而是 `tasklist-init` CLI 把 owner 的 open_id 作为**人类成员**(role=editor)显式加入清单(见 §7)——这是 F2 修复项,早期实现遗漏过这一步,导致清单建成后 owner 反而看不到。
+- **写入方 = owner 这一组 agent 的 app**。这些 agent 是不同 app 身份,要都能往清单写任务/评论,provisioning 时把它们的 app 都加为清单 **editor**(这是给「自己的 agent」写权限,不是共享给外人,隐私不变)。
+- **只收 owner 转的任务**:owner 右键转的话题才进这个清单;非 owner(群里其他人)转的任务不进 owner 的板(那是他自己的任务,在他「我负责的」里,与本清单无关)。owner 语义沿用 agent-workspace.md §6 的 `sender_open_id / is_owner`。
 - **认领护栏**:agent 只认领「源话题确实是自己 session」的任务;对不上的礼貌拒绝。
-- **发起人自动加关注**:话题发起人 ≠ 转任务的人时,agent 认领后把发起人加为任务关注人,双方都收到里程碑推送。
+- **哪些 agent 算「一组」**:配了同一个 `tasklistGuid` 的那几个 bot(默认可以是同一部署上的全部 bot);跨部署由 provisioning 把同一 guid 写进各 bot 配置。
 
 ## 6. 降级契约(必须遵守的不变量)
 
 1. **任务回写永远 best-effort,绝不阻塞/失败 agent 主流程**(容错模式照 recordRuntimeEvent 的 swallow-and-warn 先例)。
-2. **任务/清单被人删除**:停止回写、记一条日志,**不自动重建**(重建即违反「不自动建任务」);下次用户重新转任务重新认领。
-3. **缺 scope / 未配置清单**:与「功能未启用」行为完全一致 —— agent 照常在话题里干活,只是没有任务镜像;不报错、不提示轰炸。
-4. **feature 整体默认关闭**,bot 配置显式开启(`taskHandle.enabled`)。
+2. **任务/清单被人删除**:停止回写、记一条日志,**不自动重建 owner 未主动要的东西**;清单本身只有 §7 的 `tasklist-init` CLI 能建(bot 在 startup 时只做只读解析,从不自动建清单——见下一条),owner 需要重新手动跑一次 CLI 才能恢复。
+3. **真正的开关 = 有没有清单,不是配置字段**(v2):去掉 `taskHandle.enabled`。bot 在 startup 时只做只读解析(yaml 里的 `tasklistGuid`,或共享注册文件里已有的 guid)——**清单本身只由 §7 的 `tasklist-init` CLI 建一次,bot 自己从不自动建**(F1 修正:早期设计曾让 bot 在 startup 时自动 createTasklist,已删除——没有 owner 身份的自动建清单既建不出 owner 能看到的板,又让每个 bot 每次启动都发一次可能失败的网络调用;二者都无必要)。省略 `taskHandle:`/两处都查不到 guid → 与「功能未启用」**行为完全一致**(agent 照常干活,无任务镜像,不报错、不刷屏,**零网络调用**)。⚠️ 实现铁律:降级必须**密不透风**——bot 唯一还会发的 task API 调用是「已知 guid 时把自己加为 editor」(幂等 self-join),这个调用的任何失败也绝不能冒出错误卡/刷屏。
+4. **prompt 注入只在「清单已 provision」时发,不跟随任何 enable 标志**——否则没用这个 feature 的部署每轮白背 task-handle prompt 脚手架(与性能优化冲突)。gate 在「tasklistGuid 已知/已建」。
 
-## 7. 配置与权限
+## 7. 配置与权限(v2)
 
 ```yaml
-# bots/<bot>.yaml 新增(全部可选)
+# bots/<bot>.yaml 新增(可选;不配 = 不用该 feature)
 taskHandle:
-  enabled: true            # 默认 false
-  tasklistGuid: "..."      # 本群清单;由 provisioning 子命令产出,跨实例部署时手工填写
+  tasklistGuid: "..."      # owner 的「Agent Team」清单;同一 owner 的一组 bot 填同一个 guid
 ```
 
-所需飞书 scope(开放平台后台勾选):`task:task:read`、`task:task:write`、`task:tasklist:write`。
-注意:应用若在后台配置过默认第三方来源名(origin),API 建任务会展示该名称;本 feature 不由 API 建任务,故无影响,但 adopter 应确保应用显示名可辨识(评论创建者显示为应用名)。
+- **去掉 `enabled` 字段**(v2)。真正的门槛是有没有清单(见 §6.3);配了 `tasklistGuid`,或共享注册文件里能查到,就用得上。
+  - 迁移兼容:v1 已部署的 yaml 若还带着 `enabled: true`,新 schema **接受但忽略**它(不 strip、不报错,只在启动日志打一条一次性 deprecation warn 提示删除)——避免这批 v1 yaml 因 strict schema 拒绝未知字段而直接加载失败。
+- **不再要求单群模式**——v1 的「每群一清单、bot 必须单群」限制全部取消。bot 可服务任意群,owner 在任何群转的任务都进这同一个清单。
+- 所需飞书 scope(开放平台后台勾选,这就是 opt-in 动作):`task:task:read`、`task:task:write`、`task:tasklist:write`。
+- 应用显示名要可辨识(评论创建者显示为应用名)。
 
-**当前实现要求启用该功能的 bot 以单群模式运行**(`chats` 恰好一项)—— `tasklistGuid` 是 bot 级配置、不是 chat 级,而清单按 §5.3 铁律"每群一个,永不跨群共用"。默认 open-mode(`chats: []`)或服务多群的 bot 若把 `taskHandle.enabled` 设为 true,bridge 在启动时会检测到并 warn-once,整个 feature 按"未启用"降级(不崩溃、不猜哪个群),直到该 bot 被收窄到单群。
+**Provisioning(唯一路径:人手动跑一次 CLI)**:
+- `larkway tasklist-init --team <bot1,bot2,…> [--name "Agent Team"] [--owner <open_id>] [--force]`。
+- **owner open_id 解析**(建清单/复用清单前必须先拿到,拿不到直接报错退出,不建、不动任何清单):优先用显式 `--owner`;省略时尝试从 `lark-cli auth status --profile <profile> --json` 读团队第一个 bot 的 lark-cli profile 下已登录的用户身份(`identities.user.openId`)—— larkway 自己没有 OAuth 用户登录流程,这是本机唯一现成的人类身份来源,依赖 owner 之前对该 profile 跑过 `lark-cli auth login`;两者都拿不到就必须显式传 `--owner`。
+- **先查共享注册表,再决定建不建**(重要:防止重复跑出多个板):
+  - 共享注册文件(`<LARKWAY_HOME>/task-team.json`)里**已有** guid 且未传 `--force` → **复用**这个清单,只对**已有清单**调 `add_members` 把 owner + 这组 bot 的 app 补为成员(幂等)——绝不再 `createTasklist`,避免 owner 重新跑一次 CLI(比如给团队新增一个 bot)就意外建出第二个「Agent Team」板,导致某些 bot 写的任务、owner 转的任务分裂在两个不同的板上。
+  - 注册表**为空**,或显式传了 `--force` → 建一个新清单(默认名 "Agent Team");`--force` 额外**覆盖**注册表里已有的 guid(默认不覆盖,避免误操作把整个团队切到一个新板——这是显式、需要人确认的动作)。
+- 建/复用清单的成员 = **owner 的 open_id(type=user,role=editor)** + 这组 bot 的 app(type=app,role=editor)。owner 作为人类成员是可见性的关键(见 §5.3 平台细节框);**绝不加 type=chat**(v2 owner 私有)。
+- **安全网**:操作完成后读回清单成员列表,若 owner 的 open_id 未出现在成员里(比如被平台静默丢弃),打印一条 warning 提示检查 open_id / 跨租户,而不是让命令直接报错——这条检查本身失败(读回接口调用出错)也只 warn,不影响本次建/复用结果。
+- 新建时,guid 写入共享注册文件 —— 团队里的 bot 下次重启自动发现并把自己加为 editor(self-join,幂等、best-effort),**不需要**手工改 yaml;也可以选择手写进各 bot yaml 的 `taskHandle.tasklistGuid` 固定绑定。
+- **bot 在 startup 时绝不建清单**——只做上面这两处(yaml / 注册文件)的只读解析 + 已知 guid 时的 self-join;没有清单就保持休眠,零网络调用、不注入 prompt,直到 owner 跑一次这条 CLI。
+- 跨部署:provisioning 产出的 guid 手工同步进各部署的共享注册文件或 bot 配置。
+- ⚠️ **留给 dogfood 验证的一步**:「editor 成员能否在飞书任务中心看到板」目前未经真机验证(本实现开发环境无网络/API 访问,只核对了 schema 接受 `type=user` 成员形状,见 §5.3 平台细节框)。首次跑完 `tasklist-init` 后,请实际打开飞书任务中心确认这个清单确实可见、可管理,再判定 provisioning 走通。
 
 ## 8. 明确不做(边界)
 

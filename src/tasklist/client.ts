@@ -288,6 +288,44 @@ export class TaskListClient {
     };
   }
 
+  /**
+   * Fetch a tasklist's current guid + member list (verified against live
+   * `lark-cli schema task tasklists get`, 1.0.64 — `GET /tasklists/
+   * :tasklist_guid`). Used by `tasklist-init` as a post-create/post-reuse
+   * safety net: read the membership back and warn if the owner's open_id
+   * didn't actually land as a member (a silently-dropped member is a real
+   * platform failure mode this guards against — see tasklistInit.ts).
+   */
+  async getTasklist(tasklistGuid: string): Promise<{ guid: string; members: TaskMember[] } | null> {
+    const label = `getTasklist(${tasklistGuid})`;
+    let resp: { data?: { tasklist?: Record<string, unknown> } };
+    try {
+      resp = await this.#request(
+        {
+          method: "GET",
+          url: `${TASK_V2_BASE}/tasklists/${encodeURIComponent(tasklistGuid)}`,
+          params: { user_id_type: "open_id" },
+        },
+        label,
+      );
+    } catch (err) {
+      if (isNotFoundLikeRaw(err)) return null;
+      wrapErr(label, err);
+    }
+    const tasklist = resp.data?.tasklist;
+    if (!tasklist) return null;
+    const rawMembers = Array.isArray(tasklist["members"]) ? (tasklist["members"] as Record<string, unknown>[]) : [];
+    const members: TaskMember[] = rawMembers.map((m) => ({
+      id: String(m["id"] ?? ""),
+      type: m["type"] === "user" || m["type"] === "chat" || m["type"] === "app" ? m["type"] : undefined,
+      role:
+        m["role"] === "assignee" || m["role"] === "follower" || m["role"] === "editor" || m["role"] === "viewer"
+          ? m["role"]
+          : "editor",
+    }));
+    return { guid: String(tasklist["guid"] ?? tasklistGuid), members };
+  }
+
   async createTasklist(name: string, members: TaskMember[] = []): Promise<{ guid: string }> {
     const label = `createTasklist(${name})`;
     let resp: { data?: { tasklist?: Record<string, unknown> } };
@@ -309,6 +347,35 @@ export class TaskListClient {
       throw new TaskApiError(`[tasklist.client] createTasklist(${name}) returned no guid`, {});
     }
     return { guid };
+  }
+
+  /**
+   * Add members to an existing tasklist (verified against `lark-cli schema
+   * task tasklists add_members`, 1.0.64 — `POST /tasklists/:tasklist_guid/
+   * members`). Used by `tasklist-init --team` and by a bot's own first-run
+   * self-join (docs/task-handle.md §7 "同一 owner 的一组 bot… 把自己加为
+   * editor") to add sibling bot apps as `editor` members of the shared
+   * "Agent Team" list. Idempotent from the caller's perspective: re-adding an
+   * existing member is a harmless no-op per the platform (not independently
+   * verified against a live 409/duplicate-shaped error — callers should treat
+   * any failure here as best-effort, same swallow-and-warn posture as the
+   * rest of this feature).
+   */
+  async addTasklistMembers(tasklistGuid: string, members: TaskMember[]): Promise<void> {
+    const label = `addTasklistMembers(${tasklistGuid})`;
+    try {
+      await this.#request(
+        {
+          method: "POST",
+          url: `${TASK_V2_BASE}/tasklists/${encodeURIComponent(tasklistGuid)}/members`,
+          params: { user_id_type: "open_id" },
+          data: { members },
+        },
+        label,
+      );
+    } catch (err) {
+      wrapErr(label, err);
+    }
   }
 }
 

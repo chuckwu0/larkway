@@ -914,4 +914,93 @@ warmProcess: true
       warnSpy.mockRestore();
     }
   });
+
+  it("taskHandle (v2): omitted entirely parses through as undefined — byte-identical to before the field existed", async () => {
+    await createBotsDir();
+    await writeYaml(
+      "no-task-handle.yaml",
+      `
+id: no-task-handle-bot
+name: No Task Handle Bot
+description: bot with no taskHandle block at all
+app_id: cli_no_task_handle
+app_secret_env: NO_TASK_HANDLE_SECRET
+bot_open_id: ou_no_task_handle
+`,
+    );
+    const bots = await loadBots(botsDir());
+    expect(bots[0]?.taskHandle).toBeUndefined();
+  });
+
+  it("taskHandle (v2): tasklistGuid alone parses through, with no enabled field required", async () => {
+    await createBotsDir();
+    await writeYaml(
+      "task-handle-bot.yaml",
+      `
+id: task-handle-bot
+name: Task Handle Bot
+description: bot with a configured shared tasklist
+app_id: cli_task_handle
+app_secret_env: TASK_HANDLE_SECRET
+bot_open_id: ou_task_handle
+taskHandle:
+  tasklistGuid: "tl-abc123"
+`,
+    );
+    const bots = await loadBots(botsDir());
+    expect(bots[0]?.taskHandle).toEqual({ tasklistGuid: "tl-abc123" });
+  });
+
+  it("taskHandle (v2): an empty block (no tasklistGuid) parses through — main.ts only reads yaml/registry at startup, never creates a tasklist itself", async () => {
+    await createBotsDir();
+    await writeYaml(
+      "task-handle-empty.yaml",
+      `
+id: task-handle-empty-bot
+name: Task Handle Empty Bot
+description: bot opting into the block without a pinned guid
+app_id: cli_task_handle_empty
+app_secret_env: TASK_HANDLE_EMPTY_SECRET
+bot_open_id: ou_task_handle_empty
+taskHandle: {}
+`,
+    );
+    const bots = await loadBots(botsDir());
+    expect(bots[0]?.taskHandle).toEqual({});
+  });
+
+  it("taskHandle (v2 migration, F3): a v1-shaped `enabled` field is accepted (never breaks loading a live deployment's yaml), but warns and is never read", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      await createBotsDir();
+      await writeYaml(
+        "task-handle-v1.yaml",
+        `
+id: task-handle-v1-bot
+name: Task Handle V1 Bot
+description: bot yaml still carrying the removed v1 enabled field
+app_id: cli_task_handle_v1
+app_secret_env: TASK_HANDLE_V1_SECRET
+bot_open_id: ou_task_handle_v1
+taskHandle:
+  enabled: true
+  tasklistGuid: "tl-abc123"
+`,
+      );
+      const bots = await loadBots(botsDir());
+      expect(bots).toHaveLength(1);
+      // tasklistGuid still parses through; `enabled` is accepted (kept on the
+      // parsed object per zod's default optional-passthrough-when-typed
+      // behavior) but no code path reads it — see main.ts's F1 resolution,
+      // which only ever consults `.tasklistGuid`.
+      expect(bots[0]?.taskHandle?.tasklistGuid).toBe("tl-abc123");
+      const deprecationWarn = warnSpy.mock.calls.find((call) =>
+        String(call[0]).includes("taskHandle.enabled"),
+      );
+      expect(deprecationWarn).toBeDefined();
+      expect(String(deprecationWarn?.[0])).toContain("task-handle-v1-bot");
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
 });

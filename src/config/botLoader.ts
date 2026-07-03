@@ -36,17 +36,26 @@ const GitIdentitySchema = z.object({
 });
 
 /**
- * 话题 ↔ 飞书任务句柄(docs/task-handle.md)。全部可选、默认关闭 —— 未设置这个
- * 字段的所有现存 bot yaml 行为字节级不变(§6 降级契约 #4:feature 整体默认关闭)。
+ * 话题 ↔ 飞书任务句柄(docs/task-handle.md,v2:团队共享单清单)。全部可选 ——
+ * 真正的开关是「有没有 tasklistGuid」,不是配置字段。清单只由
+ * `larkway tasklist-init --team` 一次性建(main.ts 在 startup 时只做只读解析:
+ * yaml 里的 tasklistGuid,或共享注册文件里同组 bot 已经建好的那个;从不自动
+ * 建清单——省略这个字段/两处都查不到 = 功能保持休眠,零网络调用,不注入 prompt)。
  */
 const TaskHandleConfigSchema = z.object({
-  /** @default false — 显式开启才生效。 */
-  enabled: z.boolean().default(false),
   /**
-   * 本群共享清单的 GUID。由 `larkway tasklist-init` provisioning 子命令产出;
-   * 跨实例部署时手工填写。缺失 = 与「功能未启用」等价降级(§6 #3)。
+   * owner 的「Agent Team」共享清单 GUID。由 `larkway tasklist-init --team`
+   * provisioning 子命令产出并手工填入,或经共享注册文件(task-team.json)被
+   * 同组 bot 自动发现。缺失 = 功能休眠(main.ts 不会替你建)。
    */
   tasklistGuid: z.string().min(1).optional(),
+  /**
+   * @deprecated v1 遗留字段,v2 已去掉「enabled 开关」语义 —— 真正门槛见上。
+   * 仅为了不 break 现网已写 `enabled: true` 的 yaml(strict schema 否则会拒绝
+   * 未知字段)而接受它;接受后从不读取,loadBots() 会打一条 deprecation warn
+   * 提示删除。新 yaml 不要再写这个字段。
+   */
+  enabled: z.boolean().optional(),
 }).strict();
 
 const GitCloneUrlSchema = z.string().min(1).refine(
@@ -259,7 +268,10 @@ export const BotConfigSchema = z.object({
   backend: z.string().min(1).default("claude"),
 
   /**
-   * 话题 ↔ 飞书任务句柄(docs/task-handle.md)。省略 = 功能关闭,行为不变。
+   * 话题 ↔ 飞书任务句柄(docs/task-handle.md,v2)。省略此字段不代表关闭,但也
+   * 不会触发任何自动建清单——main.ts 在 startup 时只做只读解析(yaml 里的
+   * tasklistGuid,或共享注册文件里已有的 guid);清单本身只由
+   * `larkway tasklist-init --team` 建一次。
    */
   taskHandle: TaskHandleConfigSchema.optional(),
 
@@ -400,6 +412,22 @@ export async function loadBots(botsDir: string): Promise<BotConfig[]> {
       console.warn(
         `[botLoader] Bot "${bot.id}" sets warmProcess:true but backend is "${bot.backend}" ` +
           `(only "codex" is supported as of this writing). warmProcess will be a no-op for this bot.`,
+      );
+    }
+
+    // F3 (task-handle v2 migration): `taskHandle.enabled` was the v1 on/off
+    // flag; v2 dropped the concept entirely (the real gate is whether a
+    // tasklistGuid resolves — see TaskHandleConfigSchema's doc comment). The
+    // field stays accepted (not stripped) purely so already-deployed yaml
+    // carrying `enabled: true` from before this migration doesn't fail to
+    // load under this schema's `.strict()` — but it is never read by any
+    // code path. Advisory-only nudge to clean it up, matches the
+    // effort/warmProcess warning style above.
+    if (bot.taskHandle?.enabled !== undefined) {
+      console.warn(
+        `[botLoader] Bot "${bot.id}" has taskHandle.enabled set, but this field was removed in v2 ` +
+          `(docs/task-handle.md §6.3 — the gate is now whether a tasklistGuid resolves, not a flag). ` +
+          `The value is accepted for backward compat but never read; safe to delete it from the yaml.`,
       );
     }
 

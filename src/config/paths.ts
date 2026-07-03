@@ -107,14 +107,44 @@ export function resolveLogsDir(botId?: string): string {
 
 /**
  * Resolve the task-handle store path for a bot (thread ↔ Feishu task_guid
- * claims — see docs/task-handle.md). Feature is per-bot and opt-in, so this
- * is only ever read/written when `bot.taskHandle.enabled` is true.
+ * claims — see docs/task-handle.md). Read/written whenever the bot has a
+ * live tasklistGuid — configured in yaml, or discovered via the shared team
+ * registry (populated by `larkway tasklist-init --team`, the ONLY path that
+ * ever creates a tasklist; main.ts's own startup resolution is read-only,
+ * it never creates one — see main.ts's task-handle block).
  *
  * V1 mode: ~/.larkway/task-handles.json
  * V2 mode: ~/.larkway/<botId>/task-handles.json
  */
 export function resolveTaskHandlesPath(botId?: string): string {
   return join(resolveLarkwayDir(botId), "task-handles.json");
+}
+
+/**
+ * Resolve the shared task-handle team registry path (docs/task-handle.md §7):
+ * a single home-level (NOT per-bot) file recording the "Agent Team" tasklist
+ * guid that every bot in this deployment shares. **Only ever written by
+ * `larkway tasklist-init --team ...`** (a human-run, one-time host command —
+ * see src/cli/commands/tasklistInit.ts); bots themselves only ever READ this
+ * file at startup so siblings adopt the same guid the CLI provisioned,
+ * they never write to it or create a tasklist of their own.
+ *
+ * REMOVED (do not reintroduce): an earlier design had a bot auto-create a
+ * tasklist at startup the first time no guid was found anywhere, and self-
+ * register the result here. That path was deleted (docs/task-handle.md §6.3
+ * "F1 修正") — it had no way to identify a human owner (so the resulting
+ * tasklist had no member who could see it in their own Feishu Task Center),
+ * and it made every un-provisioned bot retry a possibly-failing network call
+ * on every single restart. Provisioning is a deliberate, human-run action now.
+ *
+ * Deliberately home-level, not bucketed under resolveLarkwayDir(botId): one
+ * LARKWAY_HOME is treated as one owner's fleet (docs/task-handle.md §5.3 —
+ * "哪些 agent 算「一组」…默认可以是同一部署上的全部 bot"); this codebase has
+ * no per-bot owner identity to further disambiguate multiple owners sharing
+ * one LARKWAY_HOME.
+ */
+export function resolveTaskTeamRegistryPath(): string {
+  return join(larkwayHome(), "task-team.json");
 }
 
 function assertSafePathSegment(label: string, value: string): void {
