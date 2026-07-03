@@ -366,6 +366,7 @@ async function runV2Mode({
     let effectiveTaskHandleTasklistGuid: string | undefined;
     let taskHandleLifecycle: ((patch: import("./tasklist/types.js").TaskHandleLifecyclePatch) => Promise<void>) | undefined;
     let taskHandleClaim: ((patch: import("./tasklist/types.js").TaskHandleClaimPatch) => Promise<void>) | undefined;
+    let taskHandleClaimedLookup: ((threadId: string) => boolean) | undefined;
     let taskCommentPoller: CommentPoller | undefined;
     if (bot.taskHandle?.enabled) {
       if (!bot.taskHandle.tasklistGuid) {
@@ -399,6 +400,11 @@ async function runV2Mode({
         // doc comment) — this is what makes it safe for handler.ts to call
         // every turn the agent re-declares task_handle.guid, not just once.
         taskHandleClaim = (patch) => taskHandleStore.claim(patch);
+        // Dogfood fix V2 — a plain in-memory fact lookup (no I/O, no judgment):
+        // handler.ts calls this at prompt-build time to inject
+        // `task_handle_claimed: yes|no` so the SKILL can offer a one-tap claim
+        // button only when this thread genuinely has no claim yet.
+        taskHandleClaimedLookup = (threadId) => taskHandleStore.get(threadId) !== undefined;
         taskCommentPoller = new CommentPoller({
           store: taskHandleStore,
           client: taskListClient,
@@ -464,6 +470,7 @@ async function runV2Mode({
       },
       taskHandleLifecycle,
       taskHandleClaim,
+      taskHandleClaimedLookup,
     });
 
     const housekeeping = new Housekeeping({

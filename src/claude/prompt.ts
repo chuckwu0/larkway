@@ -209,6 +209,15 @@ export interface RenderPromptInput {
    * Absent = feature not configured for this bot → no block rendered.
    */
   taskHandleTasklistGuid?: string;
+  /**
+   * Whether THIS thread already has a claimed task-handle (dogfood fix V2).
+   * A per-turn fact injection only — the bridge does no more than look up
+   * TaskHandleStore for the current threadId; the SKILL decides what to do
+   * with the fact (e.g. offer a one-tap claim-task choice when unclaimed).
+   * Ignored when taskHandleTasklistGuid is absent (block isn't rendered at all).
+   * @default false
+   */
+  taskHandleClaimed?: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -341,15 +350,17 @@ function renderTurnTakingHint(limit: number): string[] {
 }
 
 /**
- * Render the `<task-handle>` fact block. Only two lines by design (thin
- * bridge — see docs/task-handle.md §3): the tasklist GUID pointer, and a
+ * Render the `<task-handle>` fact block (thin bridge — see docs/task-handle.md
+ * §3): the tasklist GUID pointer, whether THIS thread already has a claimed
+ * task (dogfood fix V2 — a plain fact lookup, no bridge judgment), and a
  * one-line pointer at the SKILL that owns the actual claim/writeback flow.
  * Called only when the bot has a configured tasklistGuid.
  */
-function renderTaskHandleBlock(tasklistGuid: string): string[] {
+function renderTaskHandleBlock(tasklistGuid: string, claimed: boolean): string[] {
   return [
     "<task-handle>",
     `task_handle_tasklist_guid: ${tasklistGuid}`,
+    `task_handle_claimed: ${claimed ? "yes" : "no"}`,
     "本群启用了任务句柄;用户要求认领任务时,按 task-handle skill 流程处理。",
     "</task-handle>",
   ];
@@ -517,6 +528,7 @@ export function renderPrompt(input: RenderPromptInput): string {
     larkCliProfile,
     runtimeWarnings = [],
     taskHandleTasklistGuid,
+    taskHandleClaimed = false,
   } = input;
   const backend = input.backend ?? "claude";
 
@@ -544,7 +556,7 @@ export function renderPrompt(input: RenderPromptInput): string {
     ? renderTurnTakingHint(turn_taking_limit)
     : [];
   const taskHandleBlock = taskHandleTasklistGuid
-    ? renderTaskHandleBlock(taskHandleTasklistGuid)
+    ? renderTaskHandleBlock(taskHandleTasklistGuid, taskHandleClaimed)
     : [];
   const runtimeWarningsBlock = renderRuntimeWarningsBlock(runtimeWarnings);
   // Workspace warm-up block — rendered for all bots that have at least one repo.

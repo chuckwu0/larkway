@@ -8,7 +8,7 @@ import {
   applyTaskHandleWriteback,
   mergeDescriptionSnapshot,
   renderFailureComment,
-  renderStatusSnapshot,
+  sanitizeSummary,
   STATUS_SNAPSHOT_MARKER,
 } from "./writeback.js";
 
@@ -16,54 +16,102 @@ import {
 // Pure helpers
 // ---------------------------------------------------------------------------
 
-describe("renderStatusSnapshot", () => {
-  it("renders a completed snapshot with finalText", () => {
-    const body = renderStatusSnapshot({
-      status: "completed",
-      finalText: "done, MR here",
-      updatedAt: "2026-07-01T00:00:00.000Z",
-    });
-    expect(body).toContain("status: completed");
-    expect(body).toContain("updated_at: 2026-07-01T00:00:00.000Z");
-    expect(body).toContain("done, MR here");
+describe("sanitizeSummary", () => {
+  it("strips heading markers", () => {
+    expect(sanitizeSummary("### 完成部署")).toBe("完成部署");
   });
 
-  it("renders a failed snapshot with the failure reason", () => {
-    const body = renderStatusSnapshot({
-      status: "failed",
-      failureReason: "boom",
-      updatedAt: "2026-07-01T00:00:00.000Z",
-    });
-    expect(body).toContain("status: failed");
-    expect(body).toContain("error: boom");
+  it("strips bold/italic emphasis", () => {
+    expect(sanitizeSummary("**已完成**部署,*已验证*")).toBe("已完成部署,已验证");
   });
 
-  it("truncates an over-long finalText", () => {
-    const long = "x".repeat(3000);
-    const body = renderStatusSnapshot({ status: "completed", finalText: long });
-    expect(body.length).toBeLessThan(3000);
-    expect(body).toContain("截断");
+  it("strips list bullets (bare and ordered)", () => {
+    expect(sanitizeSummary("- **完成**: 部署好了")).toBe("完成: 部署好了");
+    expect(sanitizeSummary("1. 已处理: 收到需求")).toBe("已处理: 收到需求");
+  });
+
+  it("strips the dangling colon a bullet-only label leaves behind", () => {
+    expect(sanitizeSummary("- : 部署好了")).toBe("部署好了");
+  });
+
+  it("collapses consecutive blank lines / repeated whitespace into single spaces", () => {
+    expect(sanitizeSummary("第一行\n\n\n第二行   有多个空格")).toBe("第一行 第二行 有多个空格");
+  });
+
+  it("truncates an over-long summary to ~200 chars", () => {
+    const long = "x".repeat(500);
+    const cleaned = sanitizeSummary(long);
+    expect(cleaned.length).toBeLessThanOrEqual(201);
+    expect(cleaned.endsWith("…")).toBe(true);
   });
 });
 
 describe("mergeDescriptionSnapshot", () => {
+  const fixedNow = new Date("2026-07-03T05:30:00.000Z"); // any instant; only local-render matters
+
   it("appends the marker+block when no prior description", () => {
-    const merged = mergeDescriptionSnapshot(undefined, "status: completed");
-    expect(merged).toBe(`${STATUS_SNAPSHOT_MARKER}\nstatus: completed`);
+    const merged = mergeDescriptionSnapshot(undefined, { status: "completed", summary: "已完成", now: fixedNow });
+    expect(merged.startsWith(STATUS_SNAPSHOT_MARKER)).toBe(true);
+    expect(merged).toContain("status: completed");
+    expect(merged).toContain("· ");
+    expect(merged).toContain("已完成");
   });
 
-  it("preserves human content before the marker and replaces the block after it", () => {
-    const original = `人写的需求描述\n\n${STATUS_SNAPSHOT_MARKER}\nstatus: in_progress\nupdated_at: old`;
-    const merged = mergeDescriptionSnapshot(original, "status: completed\nupdated_at: new");
-    expect(merged).toBe(
-      `人写的需求描述\n\n${STATUS_SNAPSHOT_MARKER}\nstatus: completed\nupdated_at: new`,
-    );
+  it("renders the status line's updated_at in local YYYY-MM-DD HH:mm shape, not raw UTC ISO (V3)", () => {
+    const merged = mergeDescriptionSnapshot(undefined, { status: "failed", summary: "boom", now: fixedNow });
+    const updatedAtLine = merged.split("\n").find((l) => l.startsWith("updated_at: "));
+    expect(updatedAtLine).toBeDefined();
+    expect(updatedAtLine).toMatch(/^updated_at: \d{4}-\d{2}-\d{2} \d{2}:\d{2}$/);
+    expect(updatedAtLine).not.toContain("T");
+    expect(updatedAtLine).not.toContain("Z");
   });
 
-  it("treats a description with no marker as all-human and appends the block", () => {
+  it("preserves human content before the marker and keeps rolling log after it (V4)", () => {
+    const original = `人写的需求描述\n\n${STATUS_SNAPSHOT_MARKER}\nstatus: in_progress\nupdated_at: 07-01 10:00\n\n· 07-01 10:00 收到需求`;
+    const merged = mergeDescriptionSnapshot(original, { status: "completed", summary: "已完成", now: fixedNow });
+    expect(merged.startsWith("人写的需求描述")).toBe(true);
+    expect(merged).toContain("收到需求"); // earlier entry preserved
+    expect(merged).toContain("已完成"); // new entry present
+  });
+
+  it("treats a description with no marker as all-human and appends a fresh block", () => {
     const original = "纯人写的描述,从未被 bridge 写过";
-    const merged = mergeDescriptionSnapshot(original, "status: completed");
-    expect(merged).toBe(`纯人写的描述,从未被 bridge 写过\n\n${STATUS_SNAPSHOT_MARKER}\nstatus: completed`);
+    const merged = mergeDescriptionSnapshot(original, { status: "completed", summary: "done", now: fixedNow });
+    expect(merged.startsWith(`纯人写的描述,从未被 bridge 写过\n\n${STATUS_SNAPSHOT_MARKER}`)).toBe(true);
+  });
+
+  it("caps the rolling log at 5 entries, dropping the oldest, newest on top (V4)", () => {
+    let description: string | undefined;
+    for (let i = 1; i <= 6; i++) {
+      description = mergeDescriptionSnapshot(description, {
+        status: "completed",
+        summary: `turn-${i}`,
+        now: fixedNow,
+      });
+    }
+    expect(description).toBeDefined();
+    const bulletLines = description!
+      .split("\n")
+      .filter((l) => l.trim().startsWith("· "))
+      .map((l) => l.trim());
+    expect(bulletLines.length).toBe(5);
+    // newest (turn-6) first, oldest surviving (turn-2) last; turn-1 dropped entirely
+    expect(bulletLines[0]).toContain("turn-6");
+    expect(bulletLines[4]).toContain("turn-2");
+    expect(description).not.toContain("turn-1");
+  });
+
+  it("rebuilds an empty log (no throw) when the existing block doesn't match the expected shape", () => {
+    const legacyBlob = `${STATUS_SNAPSHOT_MARKER}\nstatus: completed\nupdated_at: 2026-07-01T00:00:00.000Z\n\n旧版本整块覆盖的自由文本,没有 “· ” 前缀`;
+    expect(() =>
+      mergeDescriptionSnapshot(legacyBlob, { status: "completed", summary: "新一轮", now: fixedNow }),
+    ).not.toThrow();
+    const merged = mergeDescriptionSnapshot(legacyBlob, { status: "completed", summary: "新一轮", now: fixedNow });
+    expect(merged).not.toContain("旧版本整块覆盖的自由文本");
+    expect(merged).toContain("新一轮");
+    // only the fresh entry — old unparseable blob contributed no log lines
+    const bulletCount = merged.split("\n").filter((l) => l.trim().startsWith("· ")).length;
+    expect(bulletCount).toBe(1);
   });
 });
 
@@ -153,14 +201,14 @@ describe("applyTaskHandleWriteback", () => {
     expect(calls.some((c) => c.config.method === "PATCH")).toBe(false);
   });
 
-  it("completed: patches description and marks the task complete", async () => {
+  it("completed + agentDeclaredDone=true: patches description and marks the task complete (V1)", async () => {
     const store = await TaskHandleStore.load(join(dir, "task-handles.json"));
     await store.put({ threadId: "t1", taskGuid: "guid-1", chatId: "oc_1", claimedTs: 1 });
     const { requester, calls } = makeFakeRequester({ task: { description: "原始需求" } });
     const client = new TaskListClient(requester);
 
     await applyTaskHandleWriteback(
-      { botId: "b1", threadId: "t1", status: "completed", finalText: "已完成,见 MR" },
+      { botId: "b1", threadId: "t1", status: "completed", finalText: "已完成,见 MR", agentDeclaredDone: true },
       { store, client },
     );
 
@@ -174,6 +222,32 @@ describe("applyTaskHandleWriteback", () => {
     const descBody = (descPatch!.config.data as { task: { description: string } }).task.description;
     expect(descBody).toContain("原始需求");
     expect(descBody).toContain("已完成,见 MR");
+    expect(descBody).toContain("status: completed");
+    const completePatch = patchCalls.find(
+      (c) => (c.config.data as { update_fields: string[] }).update_fields.includes("completed_at"),
+    );
+    expect(completePatch).toBeDefined();
+  });
+
+  it("completed WITHOUT agentDeclaredDone: only refreshes the description log, never completes (V1)", async () => {
+    const store = await TaskHandleStore.load(join(dir, "task-handles.json"));
+    await store.put({ threadId: "t1", taskGuid: "guid-1", chatId: "oc_1", claimedTs: 1 });
+    const { requester, calls } = makeFakeRequester({ task: { description: "原始需求" } });
+    const client = new TaskListClient(requester);
+
+    await applyTaskHandleWriteback(
+      { botId: "b1", threadId: "t1", status: "completed", finalText: "已派给下游 agent,等待其反馈" },
+      { store, client },
+    );
+
+    const patchCalls = calls.filter((c) => c.config.method === "PATCH");
+    expect(patchCalls.length).toBe(1); // description only — no completed_at patch
+    const descBody = (patchCalls[0]!.config.data as { task: { description: string } }).task.description;
+    expect(descBody).toContain("status: in_progress");
+    expect(descBody).toContain("已派给下游 agent");
+    expect(calls.some((c) => (c.config.data as { update_fields?: string[] })?.update_fields?.includes("completed_at"))).toBe(
+      false,
+    );
   });
 
   it("failed: posts a comment and reopens if it was completed", async () => {

@@ -21,6 +21,18 @@ export interface TaskHandleLifecyclePatch {
   finalText?: string;
   /** Present when status="failed". */
   failureReason?: string;
+  /**
+   * Only meaningful when status="completed". Mirrors the agent's own
+   * `task_handle.done` declaration in `.larkway/state.json` for THIS turn
+   * (docs/task-handle.md §4 step 4 / dogfood fix V1). A turn ending
+   * successfully does NOT by itself mean the underlying task is delivered —
+   * e.g. the agent may have just handed the work off to a downstream
+   * agent/peer and is otherwise done with its own turn. Only
+   * `agentDeclaredDone === true` ticks the task complete in
+   * src/tasklist/writeback.ts; `completed` without it only refreshes the
+   * rolling description log (no completion, no reopen).
+   */
+  agentDeclaredDone?: boolean;
 }
 
 /**

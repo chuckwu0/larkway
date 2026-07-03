@@ -659,6 +659,16 @@ export interface BridgeHandlerDeps {
    * of its own (that's the agent's job via the SKILL).
    */
   taskHandleClaim?: (patch: TaskHandleClaimPatch) => Promise<void>;
+  /**
+   * Task-handle claimed-state fact lookup (dogfood fix V2). Synchronous
+   * because it's a plain in-memory TaskHandleStore.get() check — no I/O.
+   * The handler calls this once per turn, at prompt-build time, purely to
+   * inject the current thread's claimed/unclaimed FACT into the prompt
+   * (`task_handle_claimed: yes|no`); it is not a bridge judgment call — the
+   * SKILL decides what to do with the fact (e.g. offer a claim-task choice
+   * button). Absent or returning false when the feature isn't configured.
+   */
+  taskHandleClaimedLookup?: (threadId: string) => boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -1366,6 +1376,7 @@ export class BridgeHandler {
           larkCliProfile: this.deps.larkCliProfile,
           runtimeWarnings: this.runtimeWarnings(),
           taskHandleTasklistGuid: this.deps.botConfig?.taskHandle?.tasklistGuid,
+          taskHandleClaimed: this.deps.taskHandleClaimedLookup?.(threadId) ?? false,
         });
 
         // Step 4c: spawn local agent backend.
@@ -1843,9 +1854,17 @@ export class BridgeHandler {
           // (may be false even though the bridge dispatch itself completed
           // cleanly, e.g. bot reported status=failed) — maps 1:1 onto the
           // task-handle "completed"/"failed" writeback (docs/task-handle.md §5.1).
+          // `agentDeclaredDone` is passed through verbatim from the agent's own
+          // `task_handle.done` declaration (dogfood fix V1) — the bridge makes
+          // no judgment of its own about whether a successful turn means the
+          // task is actually delivered; see src/tasklist/writeback.ts.
           await invokeTaskHandleLifecycle(
             success
-              ? { status: "completed", finalText: baseCardPayload.finalText }
+              ? {
+                  status: "completed",
+                  finalText: baseCardPayload.finalText,
+                  agentDeclaredDone: reportedState?.task_handle?.done === true,
+                }
               : { status: "failed", failureReason: failureReason ?? baseCardPayload.finalText },
           );
 

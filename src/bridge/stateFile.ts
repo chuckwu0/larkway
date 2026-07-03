@@ -202,10 +202,15 @@ export const StateFileSchema = z.object({
   /**
    * 话题 ↔ 飞书任务句柄认领声明(docs/task-handle.md §5.1/§5.2)。agent 在 turn
    * 内检索到候选任务、消解歧义后,把 guid 写进这里;bridge finalize 时读取并
-   * 持久化进 TaskHandleStore(thread → task_guid)。**只有这一个字段** bridge
-   * 关心;其余认领判断/歧义处理全在 agent 侧(SKILL),不进 bridge。
+   * 持久化进 TaskHandleStore(thread → task_guid)。**只有 guid 这一个字段**是
+   * 认领声明;其余认领判断/歧义处理全在 agent 侧(SKILL),不进 bridge。
+   *
+   * `done`(dogfood fix V1):turn 成功 ≠ 任务已交付 —— 实测踩坑,agent 把活派给
+   * 下游/peer 后自己这轮正常结束,曾被误勾完成。只有 agent 在**真正交付给用户**
+   * 的那一轮显式写 `done: true`,bridge 才会把任务勾完成;省略/false 时 turn
+   * 仍算 status=completed,但只刷新描述里的滚动日志,不勾完成、不触发 reopen。
    */
-  task_handle: z.object({ guid: z.string().min(1) }).optional(),
+  task_handle: z.object({ guid: z.string().min(1), done: z.boolean().optional() }).optional(),
   /**
    * Freshness signal for the handler's stale-guard (it compares this against a
    * pre-run snapshot to decide whether the bot rewrote state THIS turn).
