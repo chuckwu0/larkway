@@ -2400,6 +2400,34 @@ function buildAgentConfigHTML(bot, memContent, mode, prefill) {
   const chatsVal = Array.isArray(bot.chats) ? bot.chats.join("\n") : (bot.chats || "");
   const turnLimit = bot.turn_taking_limit ?? 10;
 
+  // model / effort 覆盖(perf plan 批 C 旋钮)。仅编辑态渲染 —— 新建流程走
+  // /api/onboard/finalize,那条路径尚不转发这两个字段,建完再来编辑页配即可。
+  const modelVal = bot.model ?? "";
+  const effortVal = bot.effort ?? "";
+  const modelOptionsHTML = [
+    ["", "默认（不覆盖）"],
+    ["fable", "fable"],
+    ["opus", "opus"],
+    ["sonnet", "sonnet"],
+  ].map(([v, label]) => `<option value="${esc(v)}"${v === modelVal ? " selected" : ""}>${esc(label)}</option>`).join("");
+  const effortOptionsHTML = [
+    ["", "默认（不覆盖）"],
+    ["low", "low"],
+    ["medium", "medium"],
+    ["high", "high"],
+    ["max", "max"],
+  ].map(([v, label]) => `<option value="${esc(v)}"${v === effortVal ? " selected" : ""}>${esc(label)}</option>`).join("");
+  const modelEffortHTML = isCreate ? "" : (
+    `<div class="ac-field">` +
+    `<label class="ac-label" for="ac-model">Model / Effort 覆盖 <span class="ac-optional">可选</span></label>` +
+    `<p class="ac-hint">effort 只对 claude 基座生效；换更快模型或降低 effort 都能提速，但降 effort 会牺牲判断深度——判断类角色建议保持默认。</p>` +
+    `<div style="display:flex;gap:12px;flex-wrap:wrap">` +
+    `<select id="ac-model" name="model" class="ac-input" style="width:170px">${modelOptionsHTML}</select>` +
+    `<select id="ac-effort" name="effort" class="ac-input" style="width:170px">${effortOptionsHTML}</select>` +
+    `</div>` +
+    `</div>`
+  );
+
   const appId = isCreate ? (prefill?.appId ?? "") : (bot.app_id ?? "");
   const openId = isCreate ? (prefill?.openId ?? "") : (bot.bot_open_id ?? "");
 
@@ -2562,6 +2590,7 @@ function buildAgentConfigHTML(bot, memContent, mode, prefill) {
     `<p class="ac-hint">防止它一口气干太多步；默认 10。</p>` +
     `<input id="ac-turn-limit" name="turn_taking_limit" class="ac-input" type="number" min="1" value="${esc(turnLimit)}" style="width:130px" />` +
     `</div>` +
+    modelEffortHTML +
     `<div class="ac-field">` +
     `<label class="ac-label" for="ac-chats">谁能 @ 它（哪些群）</label>` +
     `<p class="ac-hint">留空 = 任何群 @ 它都会回复（最省事，推荐）。只想限定 → 填群号 oc_…，一行一个。</p>` +
@@ -2826,6 +2855,13 @@ function readAgentConfigValues(panel) {
     turn_taking_limit: turnLimit,
     _memContent: memContent, // 带出,由调用方分别 PUT /api/memory
   };
+  // model/effort:仅编辑态渲染这两个 select(create 模式下查不到,值为 undefined
+  // 时不带字段)。带 "" 是有意的 ——「默认（不覆盖）」选项要让后端把已有覆盖值删掉,
+  // 不是不发这个字段(不发 = 后端保留原值,详见 api.ts putBot 的合并逻辑)。
+  const modelSel = ac.querySelector("#ac-model");
+  const effortSel = ac.querySelector("#ac-effort");
+  if (modelSel) config.model = modelSel.value;
+  if (effortSel) config.effort = effortSel.value;
   if (botId) config.id = botId;
   // ① 新保存契约:_gitlabTokenValue === undefined 表示「不带字段」(保留现有)
   if (_gitlabTokenValue !== undefined) config.gitlab_token_value = _gitlabTokenValue;

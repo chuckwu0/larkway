@@ -1354,6 +1354,65 @@ turn_taking_limit: 10
     expect((getRes.json as { bot: Record<string, unknown> }).bot.backend).toBe("codex");
   });
 
+  it("PUT /api/bot/:id sets model/effort overrides", async () => {
+    const dir = await makeLocalBotsDir();
+    const ctx = makeCtx(dir);
+    const res = await call(ctx, "PUT /api/bot/:id", {
+      params: { id: "test-bot" },
+      body: { ...SAMPLE_BOT, model: "opus", effort: "high" },
+    });
+    expect(res.status).toBe(200);
+
+    const getRes = await call(ctx, "GET /api/bot/:id", { params: { id: "test-bot" } });
+    const bot = (getRes.json as { bot: Record<string, unknown> }).bot;
+    expect(bot.model).toBe("opus");
+    expect(bot.effort).toBe("high");
+  });
+
+  it("PUT /api/bot/:id clears model/effort when sent as empty string (UI's '默认（不覆盖）' option)", async () => {
+    const dir = await makeLocalBotsDir();
+    const ctx = makeCtx(dir);
+    // First set an override…
+    await call(ctx, "PUT /api/bot/:id", {
+      params: { id: "test-bot" },
+      body: { ...SAMPLE_BOT, model: "sonnet", effort: "low" },
+    });
+    // …then send "" (not omit the field) to clear it back to "no override".
+    const res = await call(ctx, "PUT /api/bot/:id", {
+      params: { id: "test-bot" },
+      body: { ...SAMPLE_BOT, model: "", effort: "" },
+    });
+    expect(res.status).toBe(200);
+
+    const getRes = await call(ctx, "GET /api/bot/:id", { params: { id: "test-bot" } });
+    const bot = (getRes.json as { bot: Record<string, unknown> }).bot;
+    // Cleared to "no override" means the key is absent, never an empty string
+    // (the schema rejects `model: ""` / `effort: ""` on disk).
+    expect(bot.model).toBeUndefined();
+    expect(bot.effort).toBeUndefined();
+  });
+
+  it("PUT /api/bot/:id omitting model/effort leaves an existing override untouched", async () => {
+    const dir = await makeLocalBotsDir();
+    const ctx = makeCtx(dir);
+    await call(ctx, "PUT /api/bot/:id", {
+      params: { id: "test-bot" },
+      body: { ...SAMPLE_BOT, model: "fable", effort: "medium" },
+    });
+    // A PUT that doesn't mention model/effort at all (e.g. a caller that only
+    // edits name) must not wipe the previously-set override.
+    const res = await call(ctx, "PUT /api/bot/:id", {
+      params: { id: "test-bot" },
+      body: { ...SAMPLE_BOT, name: "Renamed Bot" },
+    });
+    expect(res.status).toBe(200);
+
+    const getRes = await call(ctx, "GET /api/bot/:id", { params: { id: "test-bot" } });
+    const bot = (getRes.json as { bot: Record<string, unknown> }).bot;
+    expect(bot.model).toBe("fable");
+    expect(bot.effort).toBe("medium");
+  });
+
   // BL-4: gitlab_token_env is an internal detail — UI sends token value only.
   it("BL-4: gitlab_token_env in body is silently ignored (not written to yaml)", async () => {
     const dir = await makeLocalBotsDir();
