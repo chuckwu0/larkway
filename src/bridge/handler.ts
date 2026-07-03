@@ -29,9 +29,15 @@ import { renderPrompt } from "../claude/prompt.js";
 import { remapPeersToLiveRoster, type LiveRosterResolver } from "../lark/rosterResolver.js";
 import type { PeerBot, RepoRef } from "../claude/prompt.js";
 import { createRunner } from "../agent/runner.js";
+import type { PerfMarkerName } from "../agent/runner.js";
 import type { BotConfig } from "../config/botLoader.js";
 import { ensureSessionArtifacts } from "../agent/sessionArtifacts.js";
 import { ensureAgentWorkspace } from "../agent/workspaceStore.js";
+import {
+  computeMtimeFacts,
+  readMtimeBaseline,
+  writeMtimeBaseline,
+} from "../agent/mtimeFacts.js";
 import {
   ensureStateFile,
   readStateFile,
@@ -50,6 +56,7 @@ import {
   type CardKitLiveMetrics,
 } from "./cardkitProgress.js";
 import type { RuntimeEventPatch } from "./eventLog.js";
+import type { PerfSample } from "./perfLog.js";
 import type { RuntimeRequirement } from "../runtimeRequirements.js";
 import type { TaskHandleClaimPatch, TaskHandleLifecyclePatch } from "../tasklist/types.js";
 import {
@@ -588,6 +595,9 @@ export interface BridgeHandlerDeps {
     response_surface_prototype?: ResponseSurfacePrototypeConfig;
     /** Only the tasklistGuid is prompt-relevant; enabled/admin stay provisioning-only. */
     taskHandle?: { tasklistGuid?: string };
+    /** Perf plan 批C model/effort knobs — passed through to RunOptions verbatim. */
+    model?: string;
+    effort?: string;
   };
   /**
    * Optional outbound post transport. main.ts only injects this when the bot's
@@ -636,6 +646,14 @@ export interface BridgeHandlerDeps {
    * recent Feishu events, so the Web UI can explain silent @ mentions.
    */
   recordRuntimeEvent?: (patch: RuntimeEventPatch) => Promise<void>;
+  /**
+   * A0 (perf plan §3): optional per-turn perf sample sink, for the batch-B
+   * sizing decision — NOT a dashboard feature. Best-effort: a throw here is
+   * caught and logged, never propagated (same contract as recordRuntimeEvent).
+   * Absent = feature not wired up (no perf overhead beyond the marker calls
+   * already made by the runner regardless of whether anything consumes them).
+   */
+  recordPerfSample?: (sample: PerfSample) => Promise<void>;
   /**
    * Per-bot startup/runtime probes. The handler injects missing local tools
    * and auth material into the prompt so the agent can ask the Feishu user for
@@ -822,6 +840,14 @@ export class BridgeHandler {
         console.warn("[bridge.handler] recordRuntimeEvent failed (continuing):", err);
       }
     };
+    const recordPerf = async (sample: PerfSample) => {
+      if (!this.deps.recordPerfSample) return;
+      try {
+        await this.deps.recordPerfSample(sample);
+      } catch (err) {
+        console.warn("[bridge.handler] recordPerfSample failed (continuing):", err);
+      }
+    };
     const triggerType =
       typeof parsed.raw.root_id === "string" && parsed.raw.root_id
         ? "thread_reply"
@@ -935,6 +961,169 @@ export class BridgeHandler {
         ? conventions.agentWorkspacePath!
         : worktreePath;
 
+      // A1 (perf plan §3): create the CardKit placeholder card before the
+      // prewarm work — but ONLY for agent_workspace runtime. This is
+      // deliberately gated, not unconditional:
+      //
+      //   agent_workspace: prewarm below is millisecond local fs work (no
+      //     bridge-managed worktree), so creating the card first is a pure
+      //     win — the operator sees the placeholder as early as possible.
+      //
+      //   legacy: BLOCKER (found in verification) — writeCardKitFile's own
+      //     mkdir-recursive would pre-materialize worktreePath as a plain
+      //     (non-git) directory BEFORE the BL-8 existence/health probe further
+      //     below runs. That either (a) gets misdetected as a migrated/
+      //     corrupted worktree and rm -rf'd — destroying the crash-recovery
+      //     cardkit.json we just wrote — or (b) gets accepted as an already-
+      //     healthy worktree and PERMANENTLY skips `git worktree add`,
+      //     leaving the agent operating inside a bare non-git directory.
+      //     Legacy runtime is exactly where A1's savings would matter most
+      //     (real git fetch / pnpm install prewarm) but is also the one
+      //     runtime where the reorder is unsafe — so legacy keeps the
+      //     baseline ordering (card created once the worktree definitely
+      //     exists, see the second call site below, after ensureStateFile).
+      let cardKitRecordWrite: Promise<void> = Promise.resolve();
+      const updateCardKitRecord = async (patch: Partial<CardKitFile>): Promise<void> => {
+        if (!cardKitRecord) return;
+        cardKitRecord = {
+          ...cardKitRecord,
+          ...patch,
+          updatedAt: new Date().toISOString(),
+        };
+        const record = cardKitRecord;
+        cardKitRecordWrite = cardKitRecordWrite
+          .catch(() => {})
+          .then(() => writeCardKitFile(worktreePath, record));
+        await cardKitRecordWrite;
+      };
+      const updateCardKitLiveMetrics = (
+        metrics: CardKitLiveMetrics & { sequence: number },
+      ): void => {
+        const { sequence, ...live } = metrics;
+        void updateCardKitRecord({ sequence, live }).catch((err) => {
+          console.warn("[bridge.handler] write CardKit live metrics failed:", err);
+        });
+      };
+
+      // CardKit response surface: default main surface when the transport and
+      // rollout gates are available. It streams bounded progress into a
+      // thinking area during execution, then replaces the card entity with a
+      // clean final answer + interaction surface. Any failure here falls back
+      // to the legacy visible card path before the agent starts. Extracted to
+      // a closure so the two runtime-specific call sites (see above) don't
+      // duplicate ~90 lines of identical create/fallback logic.
+      const createCardKitPlaceholder = async (): Promise<void> => {
+        if (!card && cardKitAvailable && this.deps.cardKitClient) {
+          try {
+            cardKitProgress = await createCardKitProgressHandle({
+              cardKitClient: this.deps.cardKitClient,
+              replyToMessageId: messageId,
+              replyInThread,
+              facts: {
+                botId: this.deps.botConfig?.id ?? "v1-default",
+                threadId,
+                triggerMessageId: messageId,
+              },
+              initialStatusText: "努力回答中...",
+              onSequenceCommitted: async (sequence) => {
+                await updateCardKitRecord({ status: "streaming", sequence });
+              },
+              onLiveMetricsChanged: updateCardKitLiveMetrics,
+            });
+            cardKitRecord = {
+              surface: "cardkit_stream",
+              status: "message_sent",
+              cardId: cardKitProgress.cardId,
+              messageId: cardKitProgress.messageId,
+              replyToMessageId: messageId,
+              chatId: parsed.chatId,
+              threadId,
+              botId: this.deps.botConfig?.id ?? "",
+              larkCliProfile: this.deps.larkCliProfile,
+              replyInThread,
+              idempotencyKey: cardKitProgress.idempotencyKey,
+              sequence: cardKitProgress.sequence,
+              live: cardKitProgress.liveMetrics,
+              elements: {
+                footer: { elementId: "footer_md" },
+                final: { elementId: "final_md" },
+              },
+              lastVisibleFallbackMessageId: null,
+              retryCount: 0,
+              createdAt: new Date().toISOString(),
+              updatedAt: new Date().toISOString(),
+            };
+            await writeCardKitFile(worktreePath, cardKitRecord);
+            await this.deps.client.removeProcessingReaction?.(messageId);
+            await recordEvent({
+              status: "running",
+              startedAt: new Date().toISOString(),
+              appendPath: "已创建 CardKit 流式卡片",
+              reason: "response surface 使用 CardKit 作为本轮主回复面。",
+            });
+          } catch (err) {
+            const existingMessageId = cardKitReplyConversionMessageId(err);
+            if (existingMessageId) {
+              card = this.deps.cardRenderer.handleFor(existingMessageId);
+              await this.deps.client.removeProcessingReaction?.(messageId);
+              await recordEvent({
+                status: "running",
+                startedAt: new Date().toISOString(),
+                appendPath: "已收编 CardKit 占位卡",
+                reason: "CardKit idConvert 失败但占位卡已发出，bridge 复用同一张卡做可见兜底。",
+              });
+            } else {
+              cardKitStartFailed = true;
+              console.warn("[bridge.handler] create CardKit progress surface failed; using card fallback:", err);
+            }
+          }
+        }
+
+        if (!card && cardKitStartFailed) {
+          try {
+            card = await this.deps.cardRenderer.start(messageId, { replyInThread, threadId });
+            await this.deps.client.removeProcessingReaction?.(messageId);
+            await recordEvent({
+              status: "running",
+              startedAt: new Date().toISOString(),
+              appendPath: "CardKit 失败，已创建卡片",
+              reason: "CardKit 主面创建失败，bridge 使用可见卡片兜底。",
+            });
+          } catch (err) {
+            console.error(
+              "[bridge.handler] visible card fallback start failed after primary surface start failure:",
+              err,
+            );
+            const postFallback = await createOnlyPostFallback({
+              postClient: this.deps.postClient,
+              replyToMessageId: messageId,
+              replyInThread,
+              botId: this.deps.botConfig?.id ?? "v1-default",
+              threadId,
+              triggerMessageId: messageId,
+              finalText: "CardKit 主回复面创建失败, legacy 可见卡片兜底也创建失败。",
+              failureReason: String(err),
+              title: "Larkway fallback",
+              logPrefix: "[bridge.handler]",
+            });
+            if (postFallback) startFailurePostFallbackSent = true;
+            await this.deps.client.removeProcessingReaction?.(messageId);
+            await recordEvent({
+              status: "running",
+              startedAt: new Date().toISOString(),
+              appendPath: "卡片兜底失败，已尝试 post 兜底",
+              reason: String(err),
+            });
+          }
+        }
+      };
+
+      if (isAgentWorkspace) {
+        // A1 early path: safe (see rationale above) — no bridge-managed
+        // worktree to race against.
+        await createCardKitPlaceholder();
+      }
+
       // Provisioning decision tree (unified — no read/write split):
       //
       //   hasRepo (repoCachePath defined, i.e. bot.repos[0] exists)
@@ -987,10 +1176,9 @@ export class BridgeHandler {
         });
       }
 
-      // Step 4a-i: ensure primary cache clone exists, then fetch latest.
+      // Step 4a-i: ensure primary cache clone exists.
       // ensureRepoClone errors are fatal (no local clone + no url = operator
       // config error; fail loudly so the operator sees the card failure).
-      // fetch errors are best-effort (network may be flaky; warn + continue).
       if (hasRepo) {
         // Fatal: missing base + no url → throw (surfaced as failure card).
         await ensureRepoClone(
@@ -999,34 +1187,6 @@ export class BridgeHandler {
           this.deps.gitlabToken,
           conventions.defaultProjectSlug ?? "primary",
         );
-        try {
-          await execGit(conventions.repoCachePath!, ["fetch", "origin", "--quiet"]);
-        } catch (err) {
-          console.warn("[bridge.handler] primary repo fetch failed (continuing):", err);
-        }
-      }
-
-      // Step 4a-i-b: keep extra repo caches warm (clone-if-missing + fetch).
-      // We do NOT reset --hard on the base: it is a shared bare-ish clone and
-      // resetting it can interfere if the agent already branched from it. The
-      // agent's per-thread worktree is the place to branch; the base is only
-      // used as the source for `git worktree add` and `git fetch`.
-      for (const repo of isAgentWorkspace ? [] : extraRepos) {
-        // Fatal per extra repo: same rationale as primary.
-        await ensureRepoClone(
-          repo.cachePath,
-          repo.url,
-          this.deps.gitlabToken,
-          repo.slug,
-        );
-        try {
-          await execGit(repo.cachePath, ["fetch", "origin", "--quiet"]);
-        } catch (err) {
-          console.warn(
-            `[bridge.handler] extra repo ${repo.slug} fetch failed (continuing):`,
-            err,
-          );
-        }
       }
 
       // Step 4a-ii: ensure the per-thread dir exists (and is git-healthy for worktrees).
@@ -1036,6 +1196,11 @@ export class BridgeHandler {
       // true for such dirs, but any subsequent `git` command fails with "fatal:
       // not a git repository". We detect this early and rebuild the worktree so
       // the operator's next @ is handled cleanly instead of crashing.
+      //
+      // Moved ahead of the primary fetch (was Step 4a-i) so A4 below can
+      // decide fetch await-vs-background from the real "do we need `git
+      // worktree add` THIS turn" signal — this check only stats/probes
+      // worktreePath itself, it never depends on the fetch having run.
       let worktreeExists = await pathExists(worktreePath);
       if (worktreeExists && buildWorktree) {
         // Probe git health: `git -C <wt> rev-parse --git-dir` exits 0 iff the
@@ -1054,6 +1219,71 @@ export class BridgeHandler {
           worktreeExists = false; // fall through to the worktree-add branch below
         }
       }
+
+      // A4 (perf plan §3, legacy runtime only — agent_workspace has no bridge
+      // -managed worktree/fetch at all): a FIRST turn is about to branch off
+      // origin/<defaultBranch> via `git worktree add` below — it MUST see a
+      // fresh fetch first, or the new branch silently bases off a stale
+      // snapshot (a correctness regression, not just perf). A CONTINUATION
+      // turn (worktree already exists + healthy) doesn't consume the fetch
+      // result at all this turn — keeping the shared cache warm can run in
+      // the background without making the operator wait on it.
+      const needsWorktreeAdd = buildWorktree && !worktreeExists;
+      if (hasRepo) {
+        if (needsWorktreeAdd) {
+          try {
+            await execGit(conventions.repoCachePath!, ["fetch", "origin", "--quiet"]);
+          } catch (err) {
+            console.warn("[bridge.handler] primary repo fetch failed (continuing):", err);
+          }
+        } else {
+          // Fire-and-forget: continuation turn doesn't wait on this fetch.
+          // Swallow-warn only — never let a rejected background fetch surface
+          // as an unhandled rejection.
+          //
+          // Known limitation (recorded, not fixed — low-probability/
+          // acceptable per perf plan review): if two turns for the SAME
+          // thread land close together (e.g. a fast human double-@), both
+          // could each kick off their own background `git fetch` into the
+          // same shared repoCachePath, racing each other. `git fetch` is
+          // itself safe to run concurrently against the same repo (worst
+          // case: one process's fetch is redundant with the other's), so
+          // this cannot corrupt the cache — it's just a wasted duplicate
+          // network call, not a correctness bug.
+          void execGit(conventions.repoCachePath!, ["fetch", "origin", "--quiet"]).catch(
+            (err: unknown) => {
+              console.warn(
+                "[bridge.handler] background primary repo fetch failed (continuing):",
+                err,
+              );
+            },
+          );
+        }
+      }
+
+      // Step 4a-i-b: keep extra repo caches warm (clone-if-missing + fetch),
+      // in parallel (A4) — these are never the base `git worktree add`
+      // branches off of, so per-repo latency here was always pure waiting,
+      // never a correctness dependency. We do NOT reset --hard on the base:
+      // it is a shared bare-ish clone and resetting it can interfere if the
+      // agent already branched from it. The agent's per-thread worktree is
+      // the place to branch; the base is only used as the source for
+      // `git worktree add` and `git fetch`.
+      await Promise.all(
+        (isAgentWorkspace ? [] : extraRepos).map(async (repo) => {
+          // Fatal per extra repo: same rationale as primary.
+          await ensureRepoClone(repo.cachePath, repo.url, this.deps.gitlabToken, repo.slug);
+          try {
+            await execGit(repo.cachePath, ["fetch", "origin", "--quiet"]);
+          } catch (err) {
+            console.warn(
+              `[bridge.handler] extra repo ${repo.slug} fetch failed (continuing):`,
+              err,
+            );
+          }
+        }),
+      );
+
       if (!worktreeExists) {
         if (buildWorktree) {
           // Derive a safe branch name: strip om_ prefix, keep first 16 chars.
@@ -1122,136 +1352,11 @@ export class BridgeHandler {
         console.warn("[bridge.handler] ensureStateFile failed (continuing):", err);
       }
 
-      let cardKitRecordWrite: Promise<void> = Promise.resolve();
-      const updateCardKitRecord = async (patch: Partial<CardKitFile>): Promise<void> => {
-        if (!cardKitRecord) return;
-        cardKitRecord = {
-          ...cardKitRecord,
-          ...patch,
-          updatedAt: new Date().toISOString(),
-        };
-        const record = cardKitRecord;
-        cardKitRecordWrite = cardKitRecordWrite
-          .catch(() => {})
-          .then(() => writeCardKitFile(worktreePath, record));
-        await cardKitRecordWrite;
-      };
-      const updateCardKitLiveMetrics = (
-        metrics: CardKitLiveMetrics & { sequence: number },
-      ): void => {
-        const { sequence, ...live } = metrics;
-        void updateCardKitRecord({ sequence, live }).catch((err) => {
-          console.warn("[bridge.handler] write CardKit live metrics failed:", err);
-        });
-      };
-
-      // CardKit response surface: default main surface when the transport and
-      // rollout gates are available. It streams bounded progress into a
-      // thinking area during execution, then replaces the card entity with a
-      // clean final answer + interaction surface. Any failure here falls back
-      // to the legacy visible card path before the agent starts.
-      if (!card && cardKitAvailable && this.deps.cardKitClient) {
-        try {
-          cardKitProgress = await createCardKitProgressHandle({
-            cardKitClient: this.deps.cardKitClient,
-            replyToMessageId: messageId,
-            replyInThread,
-            facts: {
-              botId: this.deps.botConfig?.id ?? "v1-default",
-              threadId,
-              triggerMessageId: messageId,
-            },
-            initialStatusText: "努力回答中...",
-            onSequenceCommitted: async (sequence) => {
-              await updateCardKitRecord({ status: "streaming", sequence });
-            },
-            onLiveMetricsChanged: updateCardKitLiveMetrics,
-          });
-          cardKitRecord = {
-            surface: "cardkit_stream",
-            status: "message_sent",
-            cardId: cardKitProgress.cardId,
-            messageId: cardKitProgress.messageId,
-            replyToMessageId: messageId,
-            chatId: parsed.chatId,
-            threadId,
-            botId: this.deps.botConfig?.id ?? "",
-            larkCliProfile: this.deps.larkCliProfile,
-            replyInThread,
-            idempotencyKey: cardKitProgress.idempotencyKey,
-            sequence: cardKitProgress.sequence,
-            live: cardKitProgress.liveMetrics,
-            elements: {
-              footer: { elementId: "footer_md" },
-              final: { elementId: "final_md" },
-            },
-            lastVisibleFallbackMessageId: null,
-            retryCount: 0,
-            createdAt: new Date().toISOString(),
-            updatedAt: new Date().toISOString(),
-          };
-          await writeCardKitFile(worktreePath, cardKitRecord);
-          await this.deps.client.removeProcessingReaction?.(messageId);
-          await recordEvent({
-            status: "running",
-            startedAt: new Date().toISOString(),
-            appendPath: "已创建 CardKit 流式卡片",
-            reason: "response surface 使用 CardKit 作为本轮主回复面。",
-          });
-        } catch (err) {
-          const existingMessageId = cardKitReplyConversionMessageId(err);
-          if (existingMessageId) {
-            card = this.deps.cardRenderer.handleFor(existingMessageId);
-            await this.deps.client.removeProcessingReaction?.(messageId);
-            await recordEvent({
-              status: "running",
-              startedAt: new Date().toISOString(),
-              appendPath: "已收编 CardKit 占位卡",
-              reason: "CardKit idConvert 失败但占位卡已发出，bridge 复用同一张卡做可见兜底。",
-            });
-          } else {
-            cardKitStartFailed = true;
-            console.warn("[bridge.handler] create CardKit progress surface failed; using card fallback:", err);
-          }
-        }
-      }
-
-      if (!card && cardKitStartFailed) {
-        try {
-          card = await this.deps.cardRenderer.start(messageId, { replyInThread, threadId });
-          await this.deps.client.removeProcessingReaction?.(messageId);
-          await recordEvent({
-            status: "running",
-            startedAt: new Date().toISOString(),
-            appendPath: "CardKit 失败，已创建卡片",
-            reason: "CardKit 主面创建失败，bridge 使用可见卡片兜底。",
-          });
-        } catch (err) {
-          console.error(
-            "[bridge.handler] visible card fallback start failed after primary surface start failure:",
-            err,
-          );
-          const postFallback = await createOnlyPostFallback({
-            postClient: this.deps.postClient,
-            replyToMessageId: messageId,
-            replyInThread,
-            botId: this.deps.botConfig?.id ?? "v1-default",
-            threadId,
-            triggerMessageId: messageId,
-            finalText: "CardKit 主回复面创建失败, legacy 可见卡片兜底也创建失败。",
-            failureReason: String(err),
-            title: "Larkway fallback",
-            logPrefix: "[bridge.handler]",
-          });
-          if (postFallback) startFailurePostFallbackSent = true;
-          await this.deps.client.removeProcessingReaction?.(messageId);
-          await recordEvent({
-            status: "running",
-            startedAt: new Date().toISOString(),
-            appendPath: "卡片兜底失败，已尝试 post 兜底",
-            reason: String(err),
-          });
-        }
+      if (!isAgentWorkspace) {
+        // Legacy runtime: baseline ordering — the worktree definitely exists
+        // (built above) before the card is created. See the A1 rationale at
+        // the other call site for why legacy does NOT get the early-card path.
+        await createCardKitPlaceholder();
       }
 
       // Step 4a-v-bis: persist a card.json handle so boot reconcile can
@@ -1298,6 +1403,39 @@ export class BridgeHandler {
       // prior turn and MUST be ignored — otherwise every turn re-renders the
       // bot's previous reply ("回复被重置成重复内容" bug).
       const preRunUpdatedAt = (await readStateFile(worktreePath))?.updated_at;
+
+      // A2 (perf plan): mechanical mtime-change fact computation for
+      // agent_workspace bots — replaces the every-turn "起手先读 index.md…"
+      // ceremony line (now first-turn-only, see renderAgentWorkspaceBlock)
+      // with a neutral fact only when a watched workspace file actually
+      // changed. Baseline persists per-session (worktreePath IS the session
+      // dir for agent_workspace). Best-effort: a failure here must never
+      // block the turn — it only means a change goes unreported this turn.
+      //
+      // Known limitation (recorded, not fixed — low-probability/acceptable
+      // per perf plan review): the baseline file lives inside worktreePath,
+      // which Housekeeping GC can rm -rf after a long idle period (same
+      // lifecycle as summary.md/transcript.md). If that happens mid-topic,
+      // the next turn re-seeds every watched file's baseline from scratch
+      // (computeMtimeFacts treats them as "first ever seen") and silently
+      // reports zero facts for that one turn, even if files changed earlier
+      // in the (GC'd) session history — it self-heals from the next real
+      // change onward, so this is a one-turn blind window, not a permanent one.
+      let mtimeFacts: string[] = [];
+      if (isAgentWorkspace) {
+        const mtimeBaselinePath = path.join(worktreePath, ".larkway", "mtime-baseline.json");
+        try {
+          const previousBaseline = await readMtimeBaseline(mtimeBaselinePath);
+          const { facts, baseline } = await computeMtimeFacts(
+            conventions.agentWorkspacePath!,
+            previousBaseline,
+          );
+          mtimeFacts = facts;
+          await writeMtimeBaseline(mtimeBaselinePath, baseline);
+        } catch (err) {
+          console.warn("[bridge.handler] mtime fact computation failed (continuing):", err);
+        }
+      }
 
       // Step 4b–4f: spawn + stream + finalize, with one stale-session retry.
       // `currentExisting` may be reset to undefined on retry (ghost session cleared).
@@ -1347,7 +1485,7 @@ export class BridgeHandler {
           }
         }
 
-        const prompt = renderPrompt({
+        const prompt = await renderPrompt({
           parsed,
           isNewThread: currentIsNewThread,
           conventions: {
@@ -1377,6 +1515,7 @@ export class BridgeHandler {
           runtimeWarnings: this.runtimeWarnings(),
           taskHandleTasklistGuid: this.deps.botConfig?.taskHandle?.tasklistGuid,
           taskHandleClaimed: this.deps.taskHandleClaimedLookup?.(threadId) ?? false,
+          mtimeFacts,
         });
 
         // Step 4c: spawn local agent backend.
@@ -1404,6 +1543,11 @@ export class BridgeHandler {
           this.deps.responseSurfaceIdleTimeoutMs ?? DEFAULT_CARDKIT_IDLE_TIMEOUT_MS;
         const runnerStartedAt = Date.now();
 
+        // A0 (perf plan §3): collect the 4 perf markers the runner reports
+        // (each fires at most once — see createPerfMarker). Deltas are
+        // computed against markers.spawn once the turn completes, below.
+        const perfMarkers: Partial<Record<PerfMarkerName, number>> = {};
+
         const handle = createRunner(backend).run({
           prompt,
           resumeSessionId: currentExisting?.sessionId,
@@ -1413,6 +1557,11 @@ export class BridgeHandler {
           // V2: inject per-bot git identity; absent in V1 → runner.ts uses "larkway-bot" fallback
           botGitIdentity: this.deps.botConfig?.git_identity,
           gitlabToken: this.deps.gitlabToken,
+          model: this.deps.botConfig?.model,
+          effort: this.deps.botConfig?.effort,
+          onPerfMarker: (marker, atMs) => {
+            if (!(marker in perfMarkers)) perfMarkers[marker] = atMs;
+          },
         });
 
         // PRB-9 idle watchdog: interrupt only on a real hang (no runner activity
@@ -1421,12 +1570,27 @@ export class BridgeHandler {
         // route to the unified explicit-failure sink (§12.2). Only armed for the
         // CardKit streaming surface. Check cadence = idle/4 (bounded 50ms–15s) so
         // prod polls ~every 15s and tests with a tiny threshold fire promptly.
+        //
+        // A3 (perf plan): a single long tool call (e.g. a slow build, a subagent
+        // spawn) emits no stream events between its tool_use and matching
+        // tool_result, which used to look identical to a real hang. Track real
+        // in-flight tool calls from the actual tool_use/tool_result events (NOT
+        // a synthetic timer that fakes activity — that would blind the watchdog
+        // to genuine hangs) and exempt the idle judgment while any are pending.
+        // The 60-min subprocess runaway guard (timeoutMs above) is untouched —
+        // it still backstops a tool call that never returns at all.
         let lastActivityAt = Date.now();
         let interruptedByIdle = false;
+        let toolsInFlight = 0;
+        // A0: cumulative tool_use count for the whole turn — distinct from
+        // toolsInFlight above (which decrements on tool_result); this one only
+        // ever grows, for the perf sample recorded once the turn completes.
+        let toolUseTotalCount = 0;
         let idleWatchdog: ReturnType<typeof setInterval> | undefined;
         if (cardKitProgress) {
           const cadenceMs = Math.max(50, Math.min(Math.floor(idleTimeoutMs / 4), 15_000));
           idleWatchdog = setInterval(() => {
+            if (toolsInFlight > 0) return; // real tool call pending — exempt from idle judgment
             if (Date.now() - lastActivityAt >= idleTimeoutMs) {
               interruptedByIdle = true;
               if (idleWatchdog) clearInterval(idleWatchdog);
@@ -1469,6 +1633,18 @@ export class BridgeHandler {
           for await (const ev of handle.events) {
             // PRB-9: any runner event = activity; resets the idle watchdog.
             lastActivityAt = Date.now();
+            // A3: track real tool-call in-flight state from the actual
+            // tool_use/tool_result event pair (both claude and codex runners
+            // emit these — see src/claude/runner.ts parseLinesMulti and
+            // src/codex/runner.ts CodexAppServerLineParser). Clamped at 0 so
+            // an unmatched tool_result (shouldn't happen, but non-fatal if it
+            // does) can never go negative and permanently disable idle-kill.
+            if (ev.type === "tool_use") {
+              toolsInFlight += 1;
+              toolUseTotalCount += 1;
+            } else if (ev.type === "tool_result") {
+              toolsInFlight = Math.max(0, toolsInFlight - 1);
+            }
             if (cardKitProgress) cardKitProgress.handle(ev);
             else if (card) card.handle(ev);
             if (ev.type === "system_init") {
@@ -1486,6 +1662,37 @@ export class BridgeHandler {
             clearInterval(idleWatchdog);
             idleWatchdog = undefined;
           }
+
+          // A0: record the perf sample for this turn. Deltas are undefined
+          // when a marker was never observed (e.g. the runner crashed before
+          // emitting anything) — never treated as 0, which would be a false
+          // "instant" reading.
+          //
+          // Known limitation (recorded, not fixed — low-probability/
+          // acceptable per perf plan review): this call site is only reached
+          // on the success path (this try block reaching handle.done). A
+          // turn whose spawn/stream throws before getting here (the spawnErr
+          // catch below, or the outer handleOne catch) records no perf
+          // sample at all — those variables live inside this while-loop
+          // iteration's scope and the outer catch can't see them. A0's stated
+          // purpose is sizing batch B off typical-turn latency, and a crashed
+          // turn's timing isn't representative of that anyway, so this gap is
+          // an intentional scope decision, not an oversight.
+          const deltaFrom = (marker: PerfMarkerName): number | undefined =>
+            perfMarkers.spawn != null && perfMarkers[marker] != null
+              ? perfMarkers[marker]! - perfMarkers.spawn
+              : undefined;
+          void recordPerf({
+            botId,
+            threadId,
+            backend,
+            spawnedAt: new Date(runnerStartedAt).toISOString(),
+            spawnToFirstLineMs: deltaFrom("first_line"),
+            spawnToSessionInitMs: deltaFrom("session_init"),
+            spawnToFirstContentMs: deltaFrom("first_content"),
+            toolUseCount: toolUseTotalCount,
+            turnDurationMs: Date.now() - runnerStartedAt,
+          });
           // PRB-9: a CardKit turn is "interrupted" when the idle watchdog killed
           // it (real hang), NOT when total wall-clock elapsed. Routed to the same
           // explicit-failure sink as crash/restart (§12.2).

@@ -11,13 +11,13 @@
  * See docs/prompt-contract.md and examples/prompt.template.md for the spec.
  */
 
-import { readFileSync } from "node:fs";
+import fs from "node:fs/promises";
 import type { ParsedMessage } from "../lark/message.js";
 import { deriveTriggerFacts } from "../agent/triggerFacts.js";
 import { ANSWER_BEGIN_MARKER, ANSWER_END_MARKER } from "../agent/answerChannel.js";
 
 /** Memory category files watched for the over-size hint (D9). */
-const MEMORY_CATEGORY_FILE_NAMES = [
+export const MEMORY_CATEGORY_FILE_NAMES = [
   "preferences.md",
   "reusable-knowledge.md",
   "workflows.md",
@@ -28,14 +28,19 @@ const MEMORY_CATEGORY_FILE_NAMES = [
 /** Line count above which a memory file should be distilled at next 整理记忆. */
 const MEMORY_FILE_LINE_LIMIT = 200;
 
+/** Max chars of memory/index.md injected verbatim (A7) — index.md has no
+ * code-level size contract, so an unbounded file could blow up prompt size. */
+const MEMORY_INDEX_MAX_CHARS = 4000;
+
 /**
- * Read a file's line count synchronously. Returns 0 if the file is missing or
- * unreadable — never throws. Used only to inject an advisory hint into the
- * memory prompt block; it must not break prompt rendering.
+ * Read a file's line count asynchronously (A5 perf: off the sync fs path).
+ * Returns 0 if the file is missing or unreadable — never throws. Used only to
+ * inject an advisory hint into the memory prompt block; it must not break
+ * prompt rendering.
  */
-function statMemoryLines(filePath: string): number {
+async function statMemoryLines(filePath: string): Promise<number> {
   try {
-    const text = readFileSync(filePath, "utf8");
+    const text = await fs.readFile(filePath, "utf8");
     if (text.length === 0) return 0;
     // True line count (wc -l semantics): count newlines, +1 only when the file
     // does not end in a newline. `split("\n").length` over-counts by 1 on the
@@ -44,6 +49,29 @@ function statMemoryLines(filePath: string): number {
     return (text.match(/\n/g)?.length ?? 0) + (text.endsWith("\n") ? 0 : 1);
   } catch {
     return 0;
+  }
+}
+
+/**
+ * Read memory/index.md content verbatim for L3 injection (A7) — saves the
+ * agent a tool round-trip reading the same file on almost every turn.
+ * Truncated (with a note) above MEMORY_INDEX_MAX_CHARS; never parsed/expanded
+ * (thin-bridge: verbatim only). Returns undefined when missing/unreadable —
+ * a read failure must never break prompt rendering.
+ */
+async function readMemoryIndexContent(indexPath: string): Promise<string | undefined> {
+  try {
+    const text = await fs.readFile(indexPath, "utf8");
+    // Code-point-safe truncation (minor fix): `string.slice()` counts UTF-16
+    // code units, so a plain `.slice(0, N)` can land in the middle of a
+    // surrogate pair (any character outside the BMP, e.g. most emoji) and
+    // emit a lone unpaired surrogate — Array.from() iterates by code point,
+    // so slicing the resulting array never splits one.
+    const chars = Array.from(text);
+    if (chars.length <= MEMORY_INDEX_MAX_CHARS) return text;
+    return `${chars.slice(0, MEMORY_INDEX_MAX_CHARS).join("")}\n\n…(已截断，完整内容见 memory_index 路径原文件)`;
+  } catch {
+    return undefined;
   }
 }
 
@@ -218,6 +246,14 @@ export interface RenderPromptInput {
    * @default false
    */
   taskHandleClaimed?: boolean;
+  /**
+   * A2 (perf plan): neutral fact lines for agent-workspace files whose mtime
+   * has advanced since the bridge last told the agent (see
+   * src/agent/mtimeFacts.ts). Rendered verbatim in `<workspace-file-changes>`.
+   * Empty/absent = no watched file changed this turn — no block rendered.
+   * Ignored outside agent_workspace runtime (legacy has no workspace files).
+   */
+  mtimeFacts?: string[];
 }
 
 // ---------------------------------------------------------------------------
@@ -422,10 +458,12 @@ function renderWorkspaceBlock(
   return lines;
 }
 
-function renderAgentWorkspaceBlock(
+async function renderAgentWorkspaceBlock(
   conventions: PromptConventions,
   extraRepos: RepoRef[],
-): string[] {
+  isNewThread: boolean,
+  mtimeFacts: string[],
+): Promise<string[]> {
   const summaryFilePath = conventions.workspaceSessionPath
     ? `${conventions.workspaceSessionPath}/summary.md`
     : undefined;
@@ -447,7 +485,17 @@ function renderAgentWorkspaceBlock(
     "- 群里 @ 你时,bridge 会拉起/关联一个话题;是否读取群历史、话题历史、附件、文档,由你根据任务自行决定。",
     "- 不要假设 bridge 已经 clone/fetch/worktree/pnpm install;需要代码时,你在 workspace 里自己 clone/branch/install/test。",
     "- summary.md 是你维护本话题摘要、决策和下一步 notes 的地方;bridge 只创建占位,不替你总结。",
-    "- 起手先读 memory/index.md 拉起跨 session 长期记忆(preferences / reusable-knowledge / workflows / decisions / assets),再读 workspace 内的 AGENTS.md、CLAUDE.md(如存在)、permissions-request.md、permissions-granted.md。",
+    // A2(仪式降频): "起手先读 memory/index.md…" only on the FIRST turn of a
+    // topic. Continuation turns already got this once, and memory_index's
+    // content is now injected verbatim below on every turn anyway (A7) —
+    // repeating the command-style reminder every turn is exactly the
+    // "instruction ceremony" this batch is cutting. mtimeFacts (below) is the
+    // neutral-fact substitute for "something changed, go re-read it".
+    ...(isNewThread
+      ? [
+          "- 起手先读 memory/index.md 拉起跨 session 长期记忆(preferences / reusable-knowledge / workflows / decisions / assets),再读 workspace 内的 AGENTS.md、CLAUDE.md(如存在)、permissions-request.md、permissions-granted.md。",
+        ]
+      : []),
     "- 本 session 里跨 session 可复用的内容,先记到 topic_session_path/memory-candidates.md;owner 确认后,由你写进 memory/<category>.md。",
     "- 热路径(每轮)只允许 ADD / NOOP:把候选 append 到 memory-candidates.md,或往 category 文件追加新条目;不在热路径做 UPDATE/DELETE/改写已有条目。",
     "- 改写、删除、解决冲突 → 推迟到 owner 显式说「整理记忆」时的离线步骤做。失效/被推翻的条目移 memory/archive/(注一句原因),不物理删。",
@@ -456,7 +504,7 @@ function renderAgentWorkspaceBlock(
   ];
   if (memoryDir) {
     for (const fileName of MEMORY_CATEGORY_FILE_NAMES) {
-      const count = statMemoryLines(`${memoryDir}/${fileName}`);
+      const count = await statMemoryLines(`${memoryDir}/${fileName}`);
       if (count > MEMORY_FILE_LINE_LIMIT) {
         lines.push(
           `- ⚠️ ${fileName} 已 ${count} 行,超限——下次「整理记忆」时先蒸馏压缩。`,
@@ -485,6 +533,33 @@ function renderAgentWorkspaceBlock(
   lines.push("- prompt 和 workspace 只允许出现 env var name,绝不出现 token/app secret 真值。");
   if (conventions.gitlabTokenEnvName) {
     lines.push(`- gitlab_token_env_name: ${conventions.gitlabTokenEnvName}`);
+  }
+  // A7: inject memory/index.md content verbatim (both new-thread and
+  // continuation turns — same treatment as L2 <agent-memory>), so the agent
+  // doesn't spend a tool round-trip reading the same short index file nearly
+  // every turn. Verbatim only, never parsed/expanded (thin-bridge). Absent /
+  // unreadable → block omitted, non-fatal.
+  if (memoryIndex) {
+    const indexContent = await readMemoryIndexContent(memoryIndex);
+    if (indexContent && indexContent.trim().length > 0) {
+      lines.push("");
+      lines.push("<memory-index-content>");
+      lines.push("以下是 memory_index 文件当前内容(逐字注入,未解析;完整历史仍可自行 Read 原文件):");
+      lines.push(indexContent.trim());
+      lines.push("</memory-index-content>");
+    }
+  }
+  // A2: neutral mtime-change facts for the ceremony line dropped above on
+  // continuation turns (bridge-computed, not a business judgment — see
+  // src/agent/mtimeFacts.ts). Rendered on every turn a watched file changed,
+  // including permissions-request/granted.md — the honor-code revocation
+  // safety net under bypassPermissions must never go quiet just because the
+  // "起手先读" ceremony line did.
+  if (mtimeFacts.length > 0) {
+    lines.push("");
+    lines.push("<workspace-file-changes>");
+    for (const fact of mtimeFacts) lines.push(`- ${fact}`);
+    lines.push("</workspace-file-changes>");
   }
   lines.push("</agent-workspace>");
   return lines;
@@ -516,7 +591,7 @@ function sceneFacts(parsed: ParsedMessage, isNewThread: boolean): {
 // Prompt renderer
 // ---------------------------------------------------------------------------
 
-export function renderPrompt(input: RenderPromptInput): string {
+export async function renderPrompt(input: RenderPromptInput): Promise<string> {
   const {
     parsed,
     isNewThread,
@@ -529,6 +604,7 @@ export function renderPrompt(input: RenderPromptInput): string {
     runtimeWarnings = [],
     taskHandleTasklistGuid,
     taskHandleClaimed = false,
+    mtimeFacts = [],
   } = input;
   const backend = input.backend ?? "claude";
 
@@ -562,7 +638,7 @@ export function renderPrompt(input: RenderPromptInput): string {
   // Workspace warm-up block — rendered for all bots that have at least one repo.
   const extraRepos = extraRepoPaths ?? conventions.extraRepoPaths ?? [];
   const workspaceBlock = isAgentWorkspace
-    ? renderAgentWorkspaceBlock(conventions, extraRepos)
+    ? await renderAgentWorkspaceBlock(conventions, extraRepos, isNewThread, mtimeFacts)
     : hasRepo
       ? renderWorkspaceBlock(
         conventions.defaultProjectSlug ?? "repo",

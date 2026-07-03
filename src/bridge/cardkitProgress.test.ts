@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi, afterEach } from "vitest";
 import type { OutboundCardKitClient } from "../lark/channelCardKitClient.js";
 import { createCardKitProgressHandle, finalizeExistingCardKitCard } from "./cardkitProgress.js";
 
@@ -299,5 +299,54 @@ describe("CardKitProgressHandle", () => {
       "updateCardSettings",
     ]);
     expect(calls[0]!.args[1]).toBe("final_md");
+  });
+
+  describe("A6: patch-interval backoff instead of a hard stop", () => {
+    afterEach(() => {
+      vi.useRealTimers();
+    });
+
+    it("keeps patching past the soft budget, backing off along the ladder instead of freezing", async () => {
+      vi.useFakeTimers();
+      const { client } = fakeCardKitClient();
+      const handle = await createCardKitProgressHandle({
+        cardKitClient: client,
+        replyToMessageId: "trigger_message",
+        replyInThread: true,
+        facts: { botId: "bot", threadId: "thread", triggerMessageId: "trigger_message" },
+        patchIntervalMs: 10,
+        maxProgressUpdates: 2, // tiny soft budget so the test reaches backoff fast
+      });
+
+      // 1st delta patches immediately (existing "commit first delta" behavior).
+      handle.handle({ type: "answer_delta", text: "a", raw: {} });
+      await handle.drain();
+      expect(handle.liveMetrics.progressUpdateCount).toBe(1);
+
+      // 2nd delta: still under the soft budget (1 < 2) — normal 10ms cadence.
+      handle.handle({ type: "answer_delta", text: "b", raw: {} });
+      await vi.advanceTimersByTimeAsync(10);
+      expect(handle.liveMetrics.progressUpdateCount).toBe(2);
+
+      // 3rd delta: progressUpdateCount(2) has now reached the soft budget(2) —
+      // backoff tier 0 = 250ms, NOT the old hard stop (this must still patch).
+      handle.handle({ type: "answer_delta", text: "c", raw: {} });
+      await vi.advanceTimersByTimeAsync(10);
+      expect(handle.liveMetrics.progressUpdateCount).toBe(2); // not yet — backed off past 10ms
+      await vi.advanceTimersByTimeAsync(240); // total 250ms
+      expect(handle.liveMetrics.progressUpdateCount).toBe(3); // patched — no hard stop at the budget
+
+      // 4th delta: now one tier further over budget — backoff tier 1 = 1000ms.
+      handle.handle({ type: "answer_delta", text: "d", raw: {} });
+      await vi.advanceTimersByTimeAsync(250);
+      expect(handle.liveMetrics.progressUpdateCount).toBe(3); // not yet at 250ms this time
+      await vi.advanceTimersByTimeAsync(750); // total 1000ms
+      expect(handle.liveMetrics.progressUpdateCount).toBe(4);
+
+      // finalize() behavior is unchanged: drains pending work and still lands
+      // the final answer regardless of how far the backoff had progressed.
+      await handle.finalize({ finalText: "最终答案" });
+      expect(handle.answerText).toBe("最终答案");
+    });
   });
 });

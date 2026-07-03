@@ -22,6 +22,8 @@ import {
   type AgentStreamEvent,
   type RunOptions,
   type RunHandle,
+  createPerfMarker,
+  markPerfForEventType,
 } from "../agent/runner.js";
 import {
   AnswerChannelExtractor,
@@ -363,6 +365,9 @@ export function runCodex(opts: RunOptions, codexBinPath = "codex"): RunHandle {
   const requestById = new Map<number, string>();
   let nextRequestId = 1;
 
+  // A0 (perf plan): dedup'd marker sink — see createPerfMarker/markPerfForEventType.
+  const markPerf = createPerfMarker(opts.onPerfMarker);
+
   // ── spawn ─────────────────────────────────────────────────────────────────
   // stdin/stdout carry app-server JSON-RPC. This is the Codex surface that
   // emits item/agentMessage/delta during generation; `codex exec --json`
@@ -372,6 +377,7 @@ export function runCodex(opts: RunOptions, codexBinPath = "codex"): RunHandle {
     stdio: ["pipe", "pipe", "pipe"],
     ...(opts.cwd != null ? { cwd: opts.cwd } : {}),
   });
+  markPerf("spawn");
 
   function sendRequest(method: string, params: unknown): number {
     const id = nextRequestId++;
@@ -571,6 +577,9 @@ export function runCodex(opts: RunOptions, codexBinPath = "codex"): RunHandle {
 
     try {
       for await (const line of rl) {
+        // A0: first stdout line observed — for codex this is the `initialize`
+        // JSON-RPC response (marks once, regardless of content/trim result).
+        markPerf("first_line");
         const trimmed = line.trim();
         if (!trimmed) continue;
 
@@ -614,6 +623,7 @@ export function runCodex(opts: RunOptions, codexBinPath = "codex"): RunHandle {
             const threadId = extractThreadIdFromThreadResponse(obj);
             if (threadId) {
               discoveredSessionId = threadId;
+              markPerfForEventType(markPerf, "system_init");
               yield { type: "system_init", sessionId: threadId, raw: obj };
               const turnParams: JsonRecord = {
                 threadId,
@@ -622,6 +632,13 @@ export function runCodex(opts: RunOptions, codexBinPath = "codex"): RunHandle {
                 sandboxPolicy: codexTurnSandboxPolicy(mode),
               };
               if (opts.cwd != null) turnParams["cwd"] = opts.cwd;
+              // Per-bot model override (perf plan 批C): `turn/start` params
+              // confirmed to accept an optional `model` override. `effort` is
+              // NOT wired here — no confirmed equivalent per-turn override
+              // field in the app-server JSON-RPC schema as of this writing
+              // (unlike the claude CLI's `--effort` flag); setting
+              // botConfig.effort on a codex bot is currently a harmless no-op.
+              if (opts.model) turnParams["model"] = opts.model;
               sendRequest("turn/start", turnParams);
             }
             continue;
@@ -637,6 +654,7 @@ export function runCodex(opts: RunOptions, codexBinPath = "codex"): RunHandle {
           if (event.type === "result") {
             turnCompleted = true;
           }
+          markPerfForEventType(markPerf, event.type);
           yield event;
         }
 

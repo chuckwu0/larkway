@@ -67,15 +67,15 @@ const peers: PeerBot[] = [
 // ---------------------------------------------------------------------------
 
 describe("renderPrompt — V2 mode (botName set)", () => {
-  it("does NOT contain stage schema lines in state contract", () => {
-    const prompt = renderPrompt(makeInput({ botName: "Frontend" }));
+  it("does NOT contain stage schema lines in state contract", async () => {
+    const prompt = await renderPrompt(makeInput({ botName: "Frontend" }));
     // V2 state contract drops stage lifecycle lines
     expect(prompt).not.toContain("stage: developing / local_demo_ready");
     expect(prompt).not.toContain("mr_submitted");
   });
 
-  it("does NOT leak the V1 dev_url probe / stage-demotion rule (thin channel, ITEM 3)", () => {
-    const prompt = renderPrompt(makeInput({ botName: "Frontend" }));
+  it("does NOT leak the V1 dev_url probe / stage-demotion rule (thin channel, ITEM 3)", async () => {
+    const prompt = await renderPrompt(makeInput({ botName: "Frontend" }));
     // The V1 contract tells the bot "bridge re-probes dev_url and demotes the
     // stage on failure". In V2 the bridge does NEITHER, so this rule must be
     // absent from the V2 prompt.
@@ -88,8 +88,8 @@ describe("renderPrompt — V2 mode (botName set)", () => {
     expect(prompt).toContain("不感知其业务含义");
   });
 
-  it("still contains state-contract block (minimal V2 schema)", () => {
-    const prompt = renderPrompt(makeInput({ botName: "Frontend" }));
+  it("still contains state-contract block (minimal V2 schema)", async () => {
+    const prompt = await renderPrompt(makeInput({ botName: "Frontend" }));
     expect(prompt).toContain("<state-contract>");
     expect(prompt).toContain("status: in_progress / ready / failed");
     expect(prompt).toContain("content_blocks");
@@ -113,8 +113,8 @@ describe("renderPrompt — V2 mode (botName set)", () => {
     expect(prompt).toContain("</state-contract>");
   });
 
-  it("renders Feishu scene facts for a top-level group mention that opens a topic", () => {
-    const prompt = renderPrompt(
+  it("renders Feishu scene facts for a top-level group mention that opens a topic", async () => {
+    const prompt = await renderPrompt(
       makeInput({
         parsed: makeParsed({
           raw: {
@@ -134,8 +134,8 @@ describe("renderPrompt — V2 mode (botName set)", () => {
     expect(prompt).toContain("拉起/关联一个飞书话题");
   });
 
-  it("renders Feishu scene facts for a topic continuation", () => {
-    const prompt = renderPrompt(
+  it("renders Feishu scene facts for a topic continuation", async () => {
+    const prompt = await renderPrompt(
       makeInput({
         isNewThread: false,
         parsed: makeParsed({
@@ -168,8 +168,8 @@ describe("renderPrompt — V2 mode (botName set)", () => {
     expect(prompt).toContain("我暂时无法读取话题历史");
   });
 
-  it("new thread with empty mention still points to topic history before answering", () => {
-    const prompt = renderPrompt(
+  it("new thread with empty mention still points to topic history before answering", async () => {
+    const prompt = await renderPrompt(
       makeInput({
         isNewThread: true,
         parsed: makeParsed({
@@ -194,8 +194,8 @@ describe("renderPrompt — V2 mode (botName set)", () => {
     expect(prompt).toContain("**先拉完整上下文历史**");
   });
 
-  it("continuation weak instruction explicitly requires reading topic history first", () => {
-    const prompt = renderPrompt(
+  it("continuation weak instruction explicitly requires reading topic history first", async () => {
+    const prompt = await renderPrompt(
       makeInput({
         isNewThread: false,
         parsed: makeParsed({
@@ -215,23 +215,23 @@ describe("renderPrompt — V2 mode (botName set)", () => {
     expect(prompt).toContain("找到最近一条有实质内容的用户消息");
   });
 
-  it("carries the self-verify-before-ready rule moved from the deleted skills (Phase 3)", () => {
+  it("carries the self-verify-before-ready rule moved from the deleted skills (Phase 3)", async () => {
     // V2 removed the dev_url probe → verification is now 100% the agent's job.
     // This rule used to live ONLY in skills/larkway-protocol; it MUST be in the
     // prompt now or the agent loses it. Lock it here.
-    const prompt = renderPrompt(makeInput({ botName: "Frontend" }));
+    const prompt = await renderPrompt(makeInput({ botName: "Frontend" }));
     expect(prompt).toContain("写 status=ready 前必须自己用代码验过");
     expect(prompt).toContain("验证完全是你的责任");
   });
 
-  it("does not render stage lines in thread-context", () => {
-    const prompt = renderPrompt(makeInput({ botName: "Frontend" }));
+  it("does not render stage lines in thread-context", async () => {
+    const prompt = await renderPrompt(makeInput({ botName: "Frontend" }));
     // Stage lifecycle is gone → no 当前阶段 line
     expect(prompt).not.toContain("当前阶段");
   });
 
-  it("renders <peer-bots> block when peers array is non-empty", () => {
-    const prompt = renderPrompt(
+  it("renders <peer-bots> block when peers array is non-empty", async () => {
+    const prompt = await renderPrompt(
       makeInput({ botName: "Frontend", peers }),
     );
     expect(prompt).toContain("<peer-bots>");
@@ -247,8 +247,8 @@ describe("renderPrompt — V2 mode (botName set)", () => {
     expect(prompt).toContain("</peer-bots>");
   });
 
-  it("renders <turn-taking> block when turn_taking_limit is set", () => {
-    const prompt = renderPrompt(
+  it("renders <turn-taking> block when turn_taking_limit is set", async () => {
+    const prompt = await renderPrompt(
       makeInput({ botName: "Frontend", turn_taking_limit: 5 }),
     );
     expect(prompt).toContain("<turn-taking>");
@@ -256,44 +256,44 @@ describe("renderPrompt — V2 mode (botName set)", () => {
     expect(prompt).toContain("</turn-taking>");
   });
 
-  it("turn_taking_limit block includes the specific number", () => {
-    const prompt = renderPrompt(
+  it("turn_taking_limit block includes the specific number", async () => {
+    const prompt = await renderPrompt(
       makeInput({ botName: "Frontend", turn_taking_limit: 8 }),
     );
     expect(prompt).toContain("8 个 turn");
   });
 
-  it("does NOT render <peer-bots> when peers is empty array", () => {
-    const prompt = renderPrompt(
+  it("does NOT render <peer-bots> when peers is empty array", async () => {
+    const prompt = await renderPrompt(
       makeInput({ botName: "Frontend", peers: [] }),
     );
     expect(prompt).not.toContain("<peer-bots>");
   });
 
-  it("does NOT render <peer-bots> when peers is undefined", () => {
-    const prompt = renderPrompt(
+  it("does NOT render <peer-bots> when peers is undefined", async () => {
+    const prompt = await renderPrompt(
       makeInput({ botName: "Frontend", peers: undefined }),
     );
     expect(prompt).not.toContain("<peer-bots>");
   });
 
-  it("does NOT render <turn-taking> when turn_taking_limit is undefined", () => {
-    const prompt = renderPrompt(
+  it("does NOT render <turn-taking> when turn_taking_limit is undefined", async () => {
+    const prompt = await renderPrompt(
       makeInput({ botName: "Frontend" }),
     );
     expect(prompt).not.toContain("<turn-taking>");
   });
 
-  it("V2 continuation thread also suppresses stage lines", () => {
-    const prompt = renderPrompt(
+  it("V2 continuation thread also suppresses stage lines", async () => {
+    const prompt = await renderPrompt(
       makeInput({ botName: "Frontend", isNewThread: false }),
     );
     expect(prompt).not.toContain("stage: developing");
     expect(prompt).toContain("status: in_progress / ready / failed");
   });
 
-  it("documents the dynamic choices contract (write choices → buttons → click sends value verbatim)", () => {
-    const prompt = renderPrompt(makeInput({ botName: "Frontend" }));
+  it("documents the dynamic choices contract (write choices → buttons → click sends value verbatim)", async () => {
+    const prompt = await renderPrompt(makeInput({ botName: "Frontend" }));
     // The agent learns to declare choices, what label vs value mean, and that a
     // click round-trips the chosen `value` verbatim as a new turn.
     expect(prompt).toContain("choices");
@@ -304,12 +304,12 @@ describe("renderPrompt — V2 mode (botName set)", () => {
     expect(prompt).toContain("省略");
   });
 
-  it("base contract: card shell is bridge-rendered — agent must NEVER PATCH the card itself", () => {
+  it("base contract: card shell is bridge-rendered — agent must NEVER PATCH the card itself", async () => {
     // Root-cause of the stuck-处理中 bug: the OLD contract told the agent to
     // 'PATCH 到卡片', so it freelanced lark-cli card PATCH, never cleanly ended
     // the turn → runner.done never fired → card stranded. The base contract now
     // forbids self-PATCH and mandates a clean exit. Lock it for ALL bots.
-    const prompt = renderPrompt(makeInput({ botName: "Frontend" }));
+    const prompt = await renderPrompt(makeInput({ botName: "Frontend" }));
     expect(prompt).toContain("thin-channel 外壳");
     expect(prompt).toContain("你负责把最终给运营看的正文");
     expect(prompt).toContain("绝不自己");
@@ -320,39 +320,39 @@ describe("renderPrompt — V2 mode (botName set)", () => {
     expect(prompt).not.toContain("PATCH 到卡片");
   });
 
-  it("base contract: buttons are auto-numbered A/B/C by the bridge (agent writes short labels, no hand-listing)", () => {
-    const prompt = renderPrompt(makeInput({ botName: "Frontend" }));
+  it("base contract: buttons are auto-numbered A/B/C by the bridge (agent writes short labels, no hand-listing)", async () => {
+    const prompt = await renderPrompt(makeInput({ botName: "Frontend" }));
     expect(prompt).toContain("A/B/C/D/E"); // bridge auto-numbers
     expect(prompt).toContain("图例"); // bridge generates the legend from labels
     expect(prompt).toContain("card_color"); // decorative override documented
   });
 
-  it("base contract: agent owns final card content, bridge does not infer business status", () => {
-    const prompt = renderPrompt(makeInput({ botName: "Frontend" }));
+  it("base contract: agent owns final card content, bridge does not infer business status", async () => {
+    const prompt = await renderPrompt(makeInput({ botName: "Frontend" }));
     expect(prompt).toContain("最终卡片以你的 `last_message` 为主");
     expect(prompt).toContain("bridge 会在同一张最终卡片承载这些能力");
     expect(prompt).toContain("不要依赖 bridge 从输出里解析业务阶段");
     expect(prompt).toContain("不要求固定格式");
   });
 
-  it("base contract: default is operator @-reply in text; buttons only for a single discrete choice", () => {
+  it("base contract: default is operator @-reply in text; buttons only for a single discrete choice", async () => {
     // 2026-05-30 UX decision: choice buttons were over-used for multi-part
     // info-gathering (package + page path + style). A tap answers one slot only
     // and each click spawns a fresh worktree (no session resume) → heavier than
     // a text reply. So the contract now defaults to @-reply and reserves buttons
     // for a single discrete choice that fully answers in one tap.
-    const prompt = renderPrompt(makeInput({ botName: "Frontend" }));
+    const prompt = await renderPrompt(makeInput({ botName: "Frontend" }));
     expect(prompt).toContain("默认让运营直接在话题里 @ 你回复");
     expect(prompt).toContain("别用按钮做信息收集 / 多部分提问");
   });
 
-  it("base peer-contract: @ peer must use a post message + at tag, never plain text", () => {
-    const prompt = renderPrompt(makeInput({ botName: "Frontend", peers }));
+  it("base peer-contract: @ peer must use a post message + at tag, never plain text", async () => {
+    const prompt = await renderPrompt(makeInput({ botName: "Frontend", peers }));
     expect(prompt).toContain('{"tag":"at","user_id":"ou_xxx"}');
     expect(prompt).toContain("严禁用纯 text");
   });
 
-  it("repo-less agent (no repoCachePath): omits project-skill intro + repo-cache line, keeps memory + state-contract", () => {
+  it("repo-less agent (no repoCachePath): omits project-skill intro + repo-cache line, keeps memory + state-contract", async () => {
     // 2026-05-30 generalization: an operator's custom agent may have NO repo
     // (bot.repos === []). It gets a scratch dir, relies on its L2 memory, and
     // must NOT be told to "follow the project skill" (there is none).
@@ -363,7 +363,7 @@ describe("renderPrompt — V2 mode (botName set)", () => {
       portRangeEnd: 3999,
       // repoCachePath / defaultBranch / defaultProjectSlug intentionally absent
     };
-    const prompt = renderPrompt(
+    const prompt = await renderPrompt(
       makeInput({ conventions: noRepoConventions, agentMemory: "你是运营定制 agent,只答问题。" }),
     );
     expect(prompt).toContain("<agent-memory>"); // its 职能 still injected
@@ -372,8 +372,8 @@ describe("renderPrompt — V2 mode (botName set)", () => {
     expect(prompt).not.toContain("公司前端缓存"); // no repo cache path line
   });
 
-  it("repo bot still gets the project-skill intro + repo-cache line (regression)", () => {
-    const prompt = renderPrompt(makeInput({ botName: "Frontend" }));
+  it("repo bot still gets the project-skill intro + repo-cache line (regression)", async () => {
+    const prompt = await renderPrompt(makeInput({ botName: "Frontend" }));
     expect(prompt).toContain(".claude/skills/");
     expect(prompt).toContain("公司前端缓存");
   });
@@ -386,30 +386,30 @@ describe("renderPrompt — V2 mode (botName set)", () => {
 describe("renderPrompt — V2 Agent Memory + thin skill discovery", () => {
   const MEMORY = "你是活动前端 bot,负责 H5。完成后 @lee-qa review。";
 
-  it("injects <agent-memory> block when agentMemory is provided (new thread)", () => {
-    const prompt = renderPrompt(makeInput({ botName: "Frontend", agentMemory: MEMORY }));
+  it("injects <agent-memory> block when agentMemory is provided (new thread)", async () => {
+    const prompt = await renderPrompt(makeInput({ botName: "Frontend", agentMemory: MEMORY }));
     expect(prompt).toContain("<agent-memory>");
     expect(prompt).toContain("@lee-qa review");
     expect(prompt).toContain("</agent-memory>");
   });
 
-  it("injects <agent-memory> on continuation threads too", () => {
-    const prompt = renderPrompt(
+  it("injects <agent-memory> on continuation threads too", async () => {
+    const prompt = await renderPrompt(
       makeInput({ botName: "Frontend", isNewThread: false, agentMemory: MEMORY }),
     );
     expect(prompt).toContain("<agent-memory>");
     expect(prompt).toContain("@lee-qa review");
   });
 
-  it("does NOT render <agent-memory> when agentMemory is absent/blank", () => {
-    expect(renderPrompt(makeInput({ botName: "Frontend" }))).not.toContain("<agent-memory>");
+  it("does NOT render <agent-memory> when agentMemory is absent/blank", async () => {
+    expect(await renderPrompt(makeInput({ botName: "Frontend" }))).not.toContain("<agent-memory>");
     expect(
-      renderPrompt(makeInput({ botName: "Frontend", agentMemory: "   " })),
+      await renderPrompt(makeInput({ botName: "Frontend", agentMemory: "   " })),
     ).not.toContain("<agent-memory>");
   });
 
-  it("V2 mode names NO hardcoded larkway skill path (thin channel)", () => {
-    const prompt = renderPrompt(makeInput({ botName: "Frontend", agentMemory: MEMORY }));
+  it("V2 mode names NO hardcoded larkway skill path (thin channel)", async () => {
+    const prompt = await renderPrompt(makeInput({ botName: "Frontend", agentMemory: MEMORY }));
     expect(prompt).not.toContain("larkway-workflow");
     expect(prompt).not.toContain("larkway-protocol");
     // …but still tells the agent its project skills auto-load from cwd
@@ -427,23 +427,23 @@ describe("renderPrompt — workspace warm-up block", () => {
     { slug: "group/backend", cachePath: "/home/larkway/.larkway/repos/backend" },
   ];
 
-  it("renders <workspace> block when bot has a primary repo (new thread)", () => {
+  it("renders <workspace> block when bot has a primary repo (new thread)", async () => {
     // makeConventions() has repoCachePath set → workspace block rendered.
-    const prompt = renderPrompt(makeInput({}));
+    const prompt = await renderPrompt(makeInput({}));
     expect(prompt).toContain("<workspace>");
     expect(prompt).toContain("</workspace>");
     expect(prompt).toContain("myproject"); // defaultProjectSlug
     expect(prompt).toContain("/home/larkway/.larkway/repos/myproject");
   });
 
-  it("renders <workspace> block on continuation thread too", () => {
-    const prompt = renderPrompt(makeInput({ isNewThread: false }));
+  it("renders <workspace> block on continuation thread too", async () => {
+    const prompt = await renderPrompt(makeInput({ isNewThread: false }));
     expect(prompt).toContain("<workspace>");
     expect(prompt).toContain("</workspace>");
     expect(prompt).toContain("myproject");
   });
 
-  it("does NOT render <workspace> when bot has no repo (repo-less agent)", () => {
+  it("does NOT render <workspace> when bot has no repo (repo-less agent)", async () => {
     const noRepoConventions = {
       worktreePath: "/home/larkway/.larkway/worktrees/om_thread001",
       devHostname: "10.0.0.1",
@@ -451,19 +451,19 @@ describe("renderPrompt — workspace warm-up block", () => {
       portRangeEnd: 3999,
       // no repoCachePath → repo-less agent
     };
-    const prompt = renderPrompt(makeInput({ conventions: noRepoConventions }));
+    const prompt = await renderPrompt(makeInput({ conventions: noRepoConventions }));
     expect(prompt).not.toContain("<workspace>");
   });
 
-  it("workspace block includes extra repo paths from extraRepoPaths input field", () => {
-    const prompt = renderPrompt(makeInput({ extraRepoPaths: EXTRA_REPOS }));
+  it("workspace block includes extra repo paths from extraRepoPaths input field", async () => {
+    const prompt = await renderPrompt(makeInput({ extraRepoPaths: EXTRA_REPOS }));
     expect(prompt).toContain("<workspace>");
     expect(prompt).toContain("group/frontend");
     expect(prompt).toContain("/home/larkway/.larkway/repos/frontend");
     expect(prompt).toContain("group/backend");
   });
 
-  it("workspace block includes extra repo paths from conventions.extraRepoPaths fallback", () => {
+  it("workspace block includes extra repo paths from conventions.extraRepoPaths fallback", async () => {
     // When extraRepoPaths not in RenderPromptInput but IS in conventions.
     const conventionsWithExtra = {
       ...makeConventions(),
@@ -471,15 +471,15 @@ describe("renderPrompt — workspace warm-up block", () => {
         { slug: "group/shared", cachePath: "/home/larkway/.larkway/repos/shared" },
       ],
     };
-    const prompt = renderPrompt(makeInput({ conventions: conventionsWithExtra }));
+    const prompt = await renderPrompt(makeInput({ conventions: conventionsWithExtra }));
     expect(prompt).toContain("<workspace>");
     expect(prompt).toContain("group/shared");
     expect(prompt).toContain("/home/larkway/.larkway/repos/shared");
   });
 
-  it("workspace block: no prescriptive read/write instructions — just informs agent", () => {
+  it("workspace block: no prescriptive read/write instructions — just informs agent", async () => {
     // Spec: workspace block is pure information, no命令式 read/write instructions.
-    const prompt = renderPrompt(makeInput({ extraRepoPaths: EXTRA_REPOS }));
+    const prompt = await renderPrompt(makeInput({ extraRepoPaths: EXTRA_REPOS }));
     // Must NOT contain old readonly-repos prescriptive language.
     expect(prompt).not.toContain("<readonly-repos>");
     expect(prompt).not.toContain("严禁在这些目录里 commit");
@@ -490,14 +490,14 @@ describe("renderPrompt — workspace warm-up block", () => {
     expect(prompt).toContain("fetch 到最新");
   });
 
-  it("repo-less bot: no project-skill intro, no workspace block, memory + state-contract present", () => {
+  it("repo-less bot: no project-skill intro, no workspace block, memory + state-contract present", async () => {
     const noRepoConventions = {
       worktreePath: "/home/larkway/.larkway/worktrees/om_thread001",
       devHostname: "10.0.0.1",
       portRangeStart: 3000,
       portRangeEnd: 3999,
     };
-    const prompt = renderPrompt(
+    const prompt = await renderPrompt(
       makeInput({
         conventions: noRepoConventions,
         agentMemory: "你是运营定制 agent,只答问题。",
@@ -509,9 +509,9 @@ describe("renderPrompt — workspace warm-up block", () => {
     expect(prompt).toContain("<state-contract>"); // card contract still universal
   });
 
-  it("bot with primary repo: project-skill intro + workspace block both present", () => {
+  it("bot with primary repo: project-skill intro + workspace block both present", async () => {
     // Bot has primary repo (repoCachePath set) + extra repos.
-    const prompt = renderPrompt(
+    const prompt = await renderPrompt(
       makeInput({
         conventions: makeConventions(), // has repoCachePath
         extraRepoPaths: [{ slug: "group/backend", cachePath: "/home/larkway/.larkway/repos/backend" }],
@@ -523,17 +523,17 @@ describe("renderPrompt — workspace warm-up block", () => {
     expect(prompt).toContain("group/backend"); // extra repo listed
   });
 
-  it("backward compat: existing write-only bot with no extraRepoPaths has workspace block (primary only)", () => {
+  it("backward compat: existing write-only bot with no extraRepoPaths has workspace block (primary only)", async () => {
     // Regression: existing write bot still gets workspace block for primary repo.
-    const prompt = renderPrompt(makeInput({ botName: "Frontend" }));
+    const prompt = await renderPrompt(makeInput({ botName: "Frontend" }));
     expect(prompt).toContain("<workspace>"); // always present when primary repo exists
     expect(prompt).not.toContain("<readonly-repos>"); // old block gone
     expect(prompt).toContain(".claude/skills/"); // write framing unchanged
     expect(prompt).toContain("公司前端缓存");
   });
 
-  it("agent_workspace runtime renders pointer-only workspace/session contract", () => {
-    const prompt = renderPrompt(
+  it("agent_workspace runtime renders pointer-only workspace/session contract", async () => {
+    const prompt = await renderPrompt(
       makeInput({
         conventions: {
           ...makeConventions(),
@@ -583,8 +583,8 @@ describe("renderPrompt — workspace warm-up block", () => {
     expect(prompt).not.toContain("fetch 到最新");
   });
 
-  it("agent_workspace prompt keeps Feishu context as pointers, not bridge-side workflow", () => {
-    const prompt = renderPrompt(
+  it("agent_workspace prompt keeps Feishu context as pointers, not bridge-side workflow", async () => {
+    const prompt = await renderPrompt(
       makeInput({
         conventions: {
           ...makeConventions(),
@@ -616,8 +616,8 @@ describe("renderPrompt — workspace warm-up block", () => {
     expect(prompt).not.toContain("bridge 已经总结");
   });
 
-  it("agent_workspace prompt stays agent-neutral for Codex backend", () => {
-    const prompt = renderPrompt(
+  it("agent_workspace prompt stays agent-neutral for Codex backend", async () => {
+    const prompt = await renderPrompt(
       makeInput({
         backend: "codex",
         conventions: {
@@ -643,8 +643,8 @@ describe("renderPrompt — workspace warm-up block", () => {
     expect(prompt).not.toContain("auto-load");
   });
 
-  it("tells agents how to handle lark-cli update npm permission failures", () => {
-    const prompt = renderPrompt(makeInput());
+  it("tells agents how to handle lark-cli update npm permission failures", async () => {
+    const prompt = await renderPrompt(makeInput());
 
     expect(prompt).toContain("lark-cli 更新失败时");
     expect(prompt).toContain("EACCES");
@@ -655,7 +655,7 @@ describe("renderPrompt — workspace warm-up block", () => {
     expect(prompt).toContain("不要默认要求 sudo");
   });
 
-  it("D9: injects an over-size hint when a memory category file exceeds the line limit", () => {
+  it("D9: injects an over-size hint when a memory category file exceeds the line limit", async () => {
     const workspaceDir = mkdtempSync(path.join(tmpdir(), "larkway-mem-"));
     try {
       const memoryDir = path.join(workspaceDir, "memory");
@@ -669,7 +669,7 @@ describe("renderPrompt — workspace warm-up block", () => {
       // A small file must NOT trigger the hint.
       writeFileSync(path.join(memoryDir, "decisions.md"), "x\n".repeat(3), "utf8");
 
-      const prompt = renderPrompt(
+      const prompt = await renderPrompt(
         makeInput({
           conventions: {
             ...makeConventions(),
@@ -696,11 +696,11 @@ describe("renderPrompt — workspace warm-up block", () => {
     }
   });
 
-  it("D9: statMemoryLines is non-throwing — no hint when memory dir is absent", () => {
+  it("D9: statMemoryLines is non-throwing — no hint when memory dir is absent", async () => {
     const workspaceDir = mkdtempSync(path.join(tmpdir(), "larkway-nomem-"));
     try {
       // No memory/ dir created → reads return 0, no hint, no throw.
-      const prompt = renderPrompt(
+      const prompt = await renderPrompt(
         makeInput({
           conventions: {
             ...makeConventions(),
@@ -723,11 +723,157 @@ describe("renderPrompt — workspace warm-up block", () => {
       rmSync(workspaceDir, { recursive: true, force: true });
     }
   });
+
+  it("A7: injects memory/index.md content verbatim on a NEW-thread prompt", async () => {
+    const workspaceDir = mkdtempSync(path.join(tmpdir(), "larkway-a7-"));
+    try {
+      const memoryDir = path.join(workspaceDir, "memory");
+      mkdirSync(memoryDir, { recursive: true });
+      writeFileSync(path.join(memoryDir, "index.md"), "# Memory Index\n\nsome distinctive content ABC123", "utf8");
+
+      const prompt = await renderPrompt(
+        makeInput({
+          isNewThread: true,
+          conventions: {
+            ...makeConventions(),
+            runtime: "agent_workspace",
+            agentWorkspacePath: workspaceDir,
+            workspaceSessionPath: path.join(workspaceDir, "sessions", "om_thread001"),
+            workspaceReposPath: path.join(workspaceDir, "repos"),
+            stateFilePath: path.join(workspaceDir, "sessions", "om_thread001", ".larkway", "state.json"),
+          },
+        }),
+      );
+
+      expect(prompt).toContain("<memory-index-content>");
+      expect(prompt).toContain("some distinctive content ABC123");
+      expect(prompt).toContain("</memory-index-content>");
+    } finally {
+      rmSync(workspaceDir, { recursive: true, force: true });
+    }
+  });
+
+  it("A7: injects memory/index.md content verbatim on a CONTINUATION prompt too (both branches)", async () => {
+    const workspaceDir = mkdtempSync(path.join(tmpdir(), "larkway-a7-cont-"));
+    try {
+      const memoryDir = path.join(workspaceDir, "memory");
+      mkdirSync(memoryDir, { recursive: true });
+      writeFileSync(path.join(memoryDir, "index.md"), "# Memory Index\n\ncontinuation-branch-marker-XYZ", "utf8");
+
+      const prompt = await renderPrompt(
+        makeInput({
+          isNewThread: false,
+          conventions: {
+            ...makeConventions(),
+            runtime: "agent_workspace",
+            agentWorkspacePath: workspaceDir,
+            workspaceSessionPath: path.join(workspaceDir, "sessions", "om_thread001"),
+            workspaceReposPath: path.join(workspaceDir, "repos"),
+            stateFilePath: path.join(workspaceDir, "sessions", "om_thread001", ".larkway", "state.json"),
+          },
+        }),
+      );
+
+      expect(prompt).toContain("<memory-index-content>");
+      expect(prompt).toContain("continuation-branch-marker-XYZ");
+    } finally {
+      rmSync(workspaceDir, { recursive: true, force: true });
+    }
+  });
+
+  it("A7: read failure (missing index.md) is non-fatal — no block rendered, no throw", async () => {
+    const workspaceDir = mkdtempSync(path.join(tmpdir(), "larkway-a7-missing-"));
+    try {
+      // No memory/ dir at all — readMemoryIndexContent must swallow the ENOENT.
+      const prompt = await renderPrompt(
+        makeInput({
+          conventions: {
+            ...makeConventions(),
+            runtime: "agent_workspace",
+            agentWorkspacePath: workspaceDir,
+            workspaceSessionPath: path.join(workspaceDir, "sessions", "om_thread001"),
+            workspaceReposPath: path.join(workspaceDir, "repos"),
+            stateFilePath: path.join(workspaceDir, "sessions", "om_thread001", ".larkway", "state.json"),
+          },
+        }),
+      );
+      expect(prompt).not.toContain("<memory-index-content>");
+    } finally {
+      rmSync(workspaceDir, { recursive: true, force: true });
+    }
+  });
+
+  it("A7: truncates content over the size cap and appends a truncation note", async () => {
+    const workspaceDir = mkdtempSync(path.join(tmpdir(), "larkway-a7-trunc-"));
+    try {
+      const memoryDir = path.join(workspaceDir, "memory");
+      mkdirSync(memoryDir, { recursive: true });
+      // Comfortably over the 4000-char cap.
+      writeFileSync(path.join(memoryDir, "index.md"), "z".repeat(5000), "utf8");
+
+      const prompt = await renderPrompt(
+        makeInput({
+          conventions: {
+            ...makeConventions(),
+            runtime: "agent_workspace",
+            agentWorkspacePath: workspaceDir,
+            workspaceSessionPath: path.join(workspaceDir, "sessions", "om_thread001"),
+            workspaceReposPath: path.join(workspaceDir, "repos"),
+            stateFilePath: path.join(workspaceDir, "sessions", "om_thread001", ".larkway", "state.json"),
+          },
+        }),
+      );
+
+      expect(prompt).toContain("<memory-index-content>");
+      expect(prompt).toContain("已截断，完整内容见 memory_index 路径原文件");
+      expect(prompt).not.toContain("z".repeat(5000)); // full content must not appear verbatim
+    } finally {
+      rmSync(workspaceDir, { recursive: true, force: true });
+    }
+  });
+
+  it("A7 minor fix: truncation is code-point safe — never splits a surrogate pair (e.g. an emoji) in half", async () => {
+    const workspaceDir = mkdtempSync(path.join(tmpdir(), "larkway-a7-surrogate-"));
+    try {
+      const memoryDir = path.join(workspaceDir, "memory");
+      mkdirSync(memoryDir, { recursive: true });
+      // 3999 ASCII chars + one 2-code-unit emoji landing exactly on the
+      // truncation boundary (code point #4000) + trailing filler past the
+      // cap. A naive `string.slice(0, 4000)` (UTF-16 code units) would cut
+      // this emoji in half, leaving a lone unpaired surrogate in the prompt.
+      const content = "x".repeat(3999) + "😀" + "y".repeat(50);
+      writeFileSync(path.join(memoryDir, "index.md"), content, "utf8");
+
+      const prompt = await renderPrompt(
+        makeInput({
+          conventions: {
+            ...makeConventions(),
+            runtime: "agent_workspace",
+            agentWorkspacePath: workspaceDir,
+            workspaceSessionPath: path.join(workspaceDir, "sessions", "om_thread001"),
+            workspaceReposPath: path.join(workspaceDir, "repos"),
+            stateFilePath: path.join(workspaceDir, "sessions", "om_thread001", ".larkway", "state.json"),
+          },
+        }),
+      );
+
+      expect(prompt).toContain("<memory-index-content>");
+      // The emoji must appear intact (either whole or wholly excluded) —
+      // never as a lone unpaired surrogate (which would render as U+FFFD or
+      // similar mojibake once split).
+      expect(prompt).toContain("😀");
+      // eslint-disable-next-line no-control-regex
+      expect(prompt).not.toMatch(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])/); // no unpaired high surrogate
+      expect(prompt).not.toMatch(/(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/); // no unpaired low surrogate
+    } finally {
+      rmSync(workspaceDir, { recursive: true, force: true });
+    }
+  });
 });
 
 describe("renderPrompt — advisory runtime warnings", () => {
-  it("renders missing lark-cli as an advisory warning, not a hard stop", () => {
-    const prompt = renderPrompt(
+  it("renders missing lark-cli as an advisory warning, not a hard stop", async () => {
+    const prompt = await renderPrompt(
       makeInput({
         runtimeWarnings: [
           {
@@ -761,8 +907,8 @@ describe("renderPrompt — advisory runtime warnings", () => {
 describe("renderPrompt — larkCliProfile --profile injection", () => {
   const PROFILE = "cli_xxxxxxxx";
 
-  it("injects --profile flag into the pull-first-floor lark-cli example when larkCliProfile is set (new thread)", () => {
-    const prompt = renderPrompt(makeInput({ larkCliProfile: PROFILE }));
+  it("injects --profile flag into the pull-first-floor lark-cli example when larkCliProfile is set (new thread)", async () => {
+    const prompt = await renderPrompt(makeInput({ larkCliProfile: PROFILE }));
     expect(prompt).toContain(`--profile ${PROFILE}`);
     // Both the thread-pull and the messages-list commands must carry the flag
     expect(prompt).toContain(`/open-apis/im/v1/messages/om_thread001 --profile ${PROFILE} --as bot`);
@@ -770,23 +916,23 @@ describe("renderPrompt — larkCliProfile --profile injection", () => {
     expect(prompt).toContain(`--thread om_thread001 --profile ${PROFILE} --as bot`);
   });
 
-  it("injects --profile flag into docs +get command when larkCliProfile is set", () => {
-    const prompt = renderPrompt(makeInput({ larkCliProfile: PROFILE }));
+  it("injects --profile flag into docs +get command when larkCliProfile is set", async () => {
+    const prompt = await renderPrompt(makeInput({ larkCliProfile: PROFILE }));
     expect(prompt).toContain(`lark-cli docs +get <doc-url> --profile ${PROFILE}`);
   });
 
-  it("does NOT inject --profile when larkCliProfile is absent (V1 single-bot backward compat)", () => {
-    const prompt = renderPrompt(makeInput({ larkCliProfile: undefined }));
+  it("does NOT inject --profile when larkCliProfile is absent (V1 single-bot backward compat)", async () => {
+    const prompt = await renderPrompt(makeInput({ larkCliProfile: undefined }));
     expect(prompt).not.toContain("--profile");
   });
 
-  it("does NOT inject --profile when larkCliProfile is absent (no botName either — pure V1 path)", () => {
-    const prompt = renderPrompt(makeInput({}));
+  it("does NOT inject --profile when larkCliProfile is absent (no botName either — pure V1 path)", async () => {
+    const prompt = await renderPrompt(makeInput({}));
     expect(prompt).not.toContain("--profile");
   });
 
-  it("injects --profile on continuation thread too", () => {
-    const prompt = renderPrompt(makeInput({ larkCliProfile: PROFILE, isNewThread: false }));
+  it("injects --profile on continuation thread too", async () => {
+    const prompt = await renderPrompt(makeInput({ larkCliProfile: PROFILE, isNewThread: false }));
     // Continuation thread must include executable commands under this bot's
     // lark-cli profile, especially topic history for weak follow-ups.
     expect(prompt).toContain(`/open-apis/im/v1/messages/om_msg001 --profile ${PROFILE} --as bot`);

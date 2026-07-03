@@ -12,7 +12,11 @@
 
 import { describe, it, expect, afterEach, vi } from "vitest";
 import { EventEmitter, PassThrough } from "node:stream";
-import { AnswerChannelExtractor } from "../agent/answerChannel.js";
+import {
+  AnswerChannelExtractor,
+  ANSWER_BEGIN_MARKER,
+  ANSWER_END_MARKER,
+} from "../agent/answerChannel.js";
 import {
   _buildCommand as buildCommand,
   _buildEnv as buildEnv,
@@ -174,6 +178,24 @@ describe("buildCommand", () => {
 
     expect(args[args.indexOf("--permission-mode") + 1]).toBe("bypassPermissions");
   });
+
+  it("批C: adds --model when opts.model is set", () => {
+    const [, args] = buildCommand({ prompt: "hello", model: "claude-opus-4-8" });
+    expect(args).toContain("--model");
+    expect(args[args.indexOf("--model") + 1]).toBe("claude-opus-4-8");
+  });
+
+  it("批C: adds --effort when opts.effort is set", () => {
+    const [, args] = buildCommand({ prompt: "hello", effort: "high" });
+    expect(args).toContain("--effort");
+    expect(args[args.indexOf("--effort") + 1]).toBe("high");
+  });
+
+  it("批C: omits both flags when model/effort are unset — byte-identical to pre-existing behavior", () => {
+    const [, args] = buildCommand({ prompt: "hello" });
+    expect(args).not.toContain("--model");
+    expect(args).not.toContain("--effort");
+  });
 });
 
 describe("parseLinesMulti", () => {
@@ -264,6 +286,46 @@ describe("parseLinesMulti", () => {
 
     expect(streamEvents.some((event) => event.type === "answer_delta")).toBe(true);
     expect(finalEvents.filter((event) => event.type === "answer_snapshot")).toHaveLength(0);
+  });
+
+  it("A3 fix: yields one tool_result event per block for a parallel tool-call batch (was only the first, unbalancing toolsInFlight)", () => {
+    const extractor = new AnswerChannelExtractor();
+
+    // Two parallel tool_use blocks in one assistant message...
+    const assistantParallelToolUse = JSON.stringify({
+      type: "assistant",
+      message: {
+        content: [
+          { type: "tool_use", id: "call_1", name: "Bash", input: { command: "one" } },
+          { type: "tool_use", id: "call_2", name: "Bash", input: { command: "two" } },
+        ],
+      },
+    });
+    // ...and their results arrive together in ONE "user" message (Claude's
+    // real shape for parallel tool calls) — both tool_result blocks must
+    // each yield their own event.
+    const userParallelToolResult = JSON.stringify({
+      type: "user",
+      message: {
+        content: [
+          { type: "tool_result", tool_use_id: "call_1", content: "one done" },
+          { type: "tool_result", tool_use_id: "call_2", content: "two done" },
+        ],
+      },
+    });
+
+    const toolUseEvents = [...parseLinesMulti(assistantParallelToolUse, extractor)].filter(
+      (event) => event.type === "tool_use",
+    );
+    const toolResultEvents = [...parseLinesMulti(userParallelToolResult, extractor)].filter(
+      (event) => event.type === "tool_result",
+    );
+
+    expect(toolUseEvents).toHaveLength(2);
+    // Before the fix this was 1 (only the first block, then an early return),
+    // which would leave handler.ts's toolsInFlight counter permanently
+    // positive (2 increments, 1 decrement) for the rest of the turn.
+    expect(toolResultEvents).toHaveLength(2);
   });
 });
 
@@ -356,6 +418,58 @@ describe("runClaude() — grandchild-holds-stdout finalize unblock", () => {
     expect(result.sessionId).toBe("sess_normal");
     expect(events).toContain("system_init");
     expect(events).toContain("result");
+  });
+
+  it("A0: fires spawn / first_line / session_init / first_content perf markers in order, each once", async () => {
+    const fake = makeFakeChild();
+    __nextFakeChild = fake;
+
+    const markers: string[] = [];
+    const { runClaude } = await import("./runner.js");
+    const handle = runClaude({
+      prompt: "test",
+      agentBinPath: "/fake/claude",
+      onPerfMarker: (marker) => markers.push(marker),
+    });
+
+    // "spawn" fires synchronously inside runClaude(), before any stdout activity.
+    expect(markers).toEqual(["spawn"]);
+
+    let resolveFirstEvent!: () => void;
+    const firstEventSeen = new Promise<void>((r) => { resolveFirstEvent = r; });
+    const eventsLoopDone = (async () => {
+      for await (const _ev of handle.events) {
+        resolveFirstEvent();
+      }
+    })();
+
+    await new Promise<void>((resolve) => setImmediate(() => {
+      fake.stdout.write(JSON.stringify({ type: "system", subtype: "init", session_id: "sess_perf" }) + "\n");
+      // Wrapped in the answer-channel markers so AnswerChannelExtractor
+      // actually surfaces a content event (plain unmarked prose is buffered
+      // while "waiting" for the begin marker and never flushed on its own —
+      // see AnswerChannelExtractor.ingestGrowingSnapshot/drain).
+      fake.stdout.write(
+        JSON.stringify({
+          type: "assistant",
+          message: {
+            content: [{ type: "text", text: `${ANSWER_BEGIN_MARKER}\nhello\n${ANSWER_END_MARKER}` }],
+          },
+        }) + "\n",
+      );
+      fake.stdout.write(JSON.stringify({ type: "result", stop_reason: "end_turn" }) + "\n");
+      fake.stdout.end();
+      fake.child.emit("exit", 0);
+      void firstEventSeen.then(() => {
+        fake.child.emit("close", 0);
+        resolve();
+      });
+    }));
+
+    await eventsLoopDone;
+    await handle.done;
+
+    expect(markers).toEqual(["spawn", "first_line", "session_init", "first_content"]);
   });
 
   it("BL-9: child exits with non-zero code but no 'close' — done rejects within 5s fallback", async () => {

@@ -599,6 +599,47 @@ describe("runCodex() — spawn-level integration", () => {
     expect(result.sessionId).toBe(APP_THREAD_ID);
   });
 
+  it("A0: fires spawn / first_line / session_init / first_content perf markers in order, each once", async () => {
+    const fake = makeFakeCodexChild();
+    __nextFakeCodexChild = fake;
+
+    const markers: string[] = [];
+    const { runCodex } = await import("./runner.js");
+    const handle = runCodex({
+      prompt: "list files",
+      timeoutMs: 30_000,
+      onPerfMarker: (marker) => markers.push(marker),
+    });
+
+    // "spawn" fires synchronously inside runCodex(), before any stdout activity.
+    expect(markers).toEqual(["spawn"]);
+
+    let resolveFirstEvent!: () => void;
+    const firstEventSeen = new Promise<void>((r) => { resolveFirstEvent = r; });
+    const eventsPromise = (async () => {
+      for await (const _ev of handle.events) {
+        resolveFirstEvent();
+      }
+    })();
+
+    await new Promise<void>((res) => setImmediate(() => {
+      fake.stdout.write(APP_INIT_RESPONSE + "\n");
+      fake.stdout.write(APP_THREAD_RESPONSE + "\n");
+      fake.stdout.write(APP_TURN_RESPONSE + "\n");
+      fake.stdout.write(appAgentDelta("LARKWAY_ANSWER_BEGIN\nHello\nLARKWAY_ANSWER_END") + "\n");
+      fake.stdout.write(APP_TURN_COMPLETED + "\n");
+      void firstEventSeen.then(() => {
+        fake.child.emit("close", 0);
+        res();
+      });
+    }));
+
+    await eventsPromise;
+    await handle.done;
+
+    expect(markers).toEqual(["spawn", "first_line", "session_init", "first_content"]);
+  });
+
   it("unknown events degrade to raw — no throw", async () => {
     const fake = makeFakeCodexChild();
     __nextFakeCodexChild = fake;
@@ -679,6 +720,66 @@ describe("runCodex() — spawn-level integration", () => {
       approvalPolicy: "on-request",
       sandboxPolicy: { type: "readOnly", networkAccess: false },
     });
+  });
+
+  it("批C: passes opts.model through as turn/start.model (confirmed-supported app-server override)", async () => {
+    const fake = makeFakeCodexChild();
+    __nextFakeCodexChild = fake;
+
+    const { runCodex } = await import("./runner.js");
+    const handle = runCodex({ prompt: "continue the task", model: "gpt-5.4-codex" });
+
+    const eventsPromise = collectEvents(handle.events);
+    await new Promise<void>((res) => setImmediate(() => {
+      fake.stdout.write(APP_INIT_RESPONSE + "\n");
+      fake.stdout.write(APP_THREAD_RESPONSE + "\n");
+      fake.stdout.write(APP_TURN_RESPONSE + "\n");
+      fake.stdout.write(APP_TURN_COMPLETED + "\n");
+      res();
+    }));
+
+    await eventsPromise;
+    await handle.done;
+
+    const stdinText: string = fake.child.stdin.read()?.toString("utf8") ?? "";
+    const requests: Array<{ method?: string; params?: Record<string, unknown> }> = stdinText
+      .trim()
+      .split("\n")
+      .filter(Boolean)
+      .map((line: string) => JSON.parse(line) as { method?: string; params?: Record<string, unknown> });
+
+    const turnStart = requests.find((request) => request.method === "turn/start");
+    expect(turnStart?.params).toMatchObject({ model: "gpt-5.4-codex" });
+  });
+
+  it("批C: omits turn/start.model when opts.model is unset — byte-identical to pre-existing behavior", async () => {
+    const fake = makeFakeCodexChild();
+    __nextFakeCodexChild = fake;
+
+    const { runCodex } = await import("./runner.js");
+    const handle = runCodex({ prompt: "continue the task" });
+
+    const eventsPromise = collectEvents(handle.events);
+    await new Promise<void>((res) => setImmediate(() => {
+      fake.stdout.write(APP_INIT_RESPONSE + "\n");
+      fake.stdout.write(APP_THREAD_RESPONSE + "\n");
+      fake.stdout.write(APP_TURN_RESPONSE + "\n");
+      fake.stdout.write(APP_TURN_COMPLETED + "\n");
+      res();
+    }));
+
+    await eventsPromise;
+    await handle.done;
+
+    const stdinText: string = fake.child.stdin.read()?.toString("utf8") ?? "";
+    const requests: Array<{ method?: string; params?: Record<string, unknown> }> = stdinText
+      .trim()
+      .split("\n")
+      .filter(Boolean)
+      .map((line: string) => JSON.parse(line) as { method?: string; params?: Record<string, unknown> });
+
+    const turnStart = requests.find((request) => request.method === "turn/start");
+    expect(turnStart?.params).not.toHaveProperty("model");
   });
 
   it("resume: app-server receives thread/resume over JSON-RPC", async () => {

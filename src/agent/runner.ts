@@ -64,6 +64,86 @@ export interface RunOptions {
    * If absent, the child inherits the host Git auth environment unchanged.
    */
   gitlabToken?: string;
+  /**
+   * Optional per-bot model override (perf plan 批C). Passed through verbatim
+   * to the backend CLI — larkway does not validate model ids.
+   * @default undefined — unset preserves the backend/host default model.
+   */
+  model?: string;
+  /**
+   * Optional per-bot reasoning-effort override (perf plan 批C). The claude
+   * CLI supports `--effort <low|medium|high|max>` (confirmed, incl. in
+   * non-interactive `-p` mode). Codex app-server support for a per-turn
+   * effort override is unconfirmed — see src/codex/runner.ts — so setting
+   * this on a codex bot is currently a no-op there, not an error.
+   * @default undefined
+   */
+  effort?: string;
+  /**
+   * A0 (docs/larkway-perf-plan.md §3): optional perf-marker sink. Runners
+   * invoke this at up to 4 points, each ONCE, with a monotonic timestamp
+   * (`performance.now()` — only deltas between markers are meaningful, never
+   * treat this as wall-clock/epoch time):
+   *   - "spawn": right after the CLI subprocess is spawned.
+   *   - "first_line": first stdout line/response observed from the subprocess
+   *     (claude: first NDJSON line; codex: the `initialize` JSON-RPC response
+   *     — both are simply "the first line read off stdout").
+   *   - "session_init": the normalised `system_init` event is about to be
+   *     yielded (claude: system/init line; codex: thread.started/thread/started).
+   *   - "first_content": the first content-bearing event (answer_delta /
+   *     answer_snapshot / internal_text / text_delta) is about to be yielded.
+   * Best-effort only: a throwing callback must never break the runner —
+   * see {@link createPerfMarker}, which already swallows for callers.
+   * @default undefined — no perf overhead when not wired up.
+   */
+  onPerfMarker?: (marker: PerfMarkerName, atMs: number) => void;
+}
+
+/** A0 perf marker names — see {@link RunOptions.onPerfMarker}. */
+export type PerfMarkerName = "spawn" | "first_line" | "session_init" | "first_content";
+
+/**
+ * Build a dedup'd, swallow-on-throw marker function shared by both runners.
+ * Each marker name fires at most once per run (later calls for the same name
+ * are no-ops) — a runner's generateEvents() loop calls this on every event,
+ * so dedup keeps the sink call cheap and the first-occurrence semantics
+ * correct without each call site tracking its own "have I marked this yet" flag.
+ */
+export function createPerfMarker(
+  onPerfMarker: RunOptions["onPerfMarker"],
+): (marker: PerfMarkerName) => void {
+  const seen = new Set<PerfMarkerName>();
+  return (marker: PerfMarkerName): void => {
+    if (seen.has(marker)) return;
+    seen.add(marker);
+    try {
+      onPerfMarker?.(marker, performance.now());
+    } catch {
+      /* perf marker callback must never break the runner */
+    }
+  };
+}
+
+/**
+ * Fires "session_init" or "first_content" when `eventType` is the
+ * corresponding AgentStreamEvent kind; a no-op for every other event type.
+ * Shared by both runners so the "which event types count as first content"
+ * definition lives in exactly one place (DRY).
+ */
+export function markPerfForEventType(
+  mark: (marker: PerfMarkerName) => void,
+  eventType: AgentStreamEvent["type"],
+): void {
+  if (eventType === "system_init") {
+    mark("session_init");
+  } else if (
+    eventType === "answer_delta" ||
+    eventType === "answer_snapshot" ||
+    eventType === "internal_text" ||
+    eventType === "text_delta"
+  ) {
+    mark("first_content");
+  }
 }
 
 // ---------------------------------------------------------------------------

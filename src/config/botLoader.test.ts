@@ -2,7 +2,7 @@
  * Tests for src/config/botLoader.ts
  */
 
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { mkdtemp, writeFile, mkdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -729,5 +729,103 @@ gitlab_token_env: LARKWAY_BOT_BOTH_TOKENS_BOT_GITLAB_TOKEN
     // Both fields parsed and present; main.ts uses git_token_env ?? gitlab_token_env.
     expect(bots[0]?.git_token_env).toBe("LARKWAY_BOT_BOTH_TOKENS_BOT_GIT_TOKEN");
     expect(bots[0]?.gitlab_token_env).toBe("LARKWAY_BOT_BOTH_TOKENS_BOT_GITLAB_TOKEN");
+  });
+
+  it("model/effort knobs (批C): both omitted by default — behavior byte-identical to before the field existed", async () => {
+    await createBotsDir();
+    await writeYaml(
+      "no-knobs.yaml",
+      `
+id: no-knobs-bot
+name: No Knobs Bot
+description: bot without model/effort configured
+app_id: cli_no_knobs
+app_secret_env: NO_KNOBS_SECRET
+bot_open_id: ou_no_knobs
+`,
+    );
+
+    const bots = await loadBots(botsDir());
+    expect(bots).toHaveLength(1);
+    expect(bots[0]?.model).toBeUndefined();
+    expect(bots[0]?.effort).toBeUndefined();
+  });
+
+  it("model/effort knobs (批C): both parse through when configured", async () => {
+    await createBotsDir();
+    await writeYaml(
+      "with-knobs.yaml",
+      `
+id: with-knobs-bot
+name: With Knobs Bot
+description: bot with model/effort configured
+app_id: cli_with_knobs
+app_secret_env: WITH_KNOBS_SECRET
+bot_open_id: ou_with_knobs
+model: claude-opus-4-8
+effort: high
+`,
+    );
+
+    const bots = await loadBots(botsDir());
+    expect(bots).toHaveLength(1);
+    expect(bots[0]?.model).toBe("claude-opus-4-8");
+    expect(bots[0]?.effort).toBe("high");
+  });
+
+  it("model/effort knobs (minor fix): known effort values load silently (no warn)", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      await createBotsDir();
+      for (const effort of ["low", "medium", "high", "max"]) {
+        await writeYaml(
+          `known-effort-${effort}.yaml`,
+          `
+id: known-effort-${effort}
+name: Known Effort Bot
+description: bot with a recognized effort value
+app_id: cli_known_${effort}
+app_secret_env: KNOWN_${effort.toUpperCase()}_SECRET
+bot_open_id: ou_known_${effort}
+effort: ${effort}
+`,
+        );
+      }
+
+      const bots = await loadBots(botsDir());
+      expect(bots).toHaveLength(4);
+      expect(warnSpy).not.toHaveBeenCalled();
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+
+  it("model/effort knobs (minor fix): an unrecognized effort value warns but does NOT fail loading", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      await createBotsDir();
+      await writeYaml(
+        "typo-effort.yaml",
+        `
+id: typo-effort-bot
+name: Typo Effort Bot
+description: bot with a typo'd effort value
+app_id: cli_typo_effort
+app_secret_env: TYPO_EFFORT_SECRET
+bot_open_id: ou_typo_effort
+effort: hgih
+`,
+      );
+
+      const bots = await loadBots(botsDir());
+      expect(bots).toHaveLength(1);
+      expect(bots[0]?.effort).toBe("hgih"); // not blocked/coerced — advisory only
+      expect(warnSpy).toHaveBeenCalledTimes(1);
+      const [warnMessage] = warnSpy.mock.calls[0]!;
+      expect(String(warnMessage)).toContain("typo-effort-bot");
+      expect(String(warnMessage)).toContain("hgih");
+    } finally {
+      warnSpy.mockRestore();
+    }
   });
 });

@@ -7,7 +7,7 @@
  * and NOT demoted — finalize follows status=ready → success.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { mkdtemp, rm, mkdir, writeFile, readFile } from "node:fs/promises";
+import { mkdtemp, rm, mkdir, writeFile, readFile, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { readPostFile, writePostFile } from "./postFile.js";
@@ -17,6 +17,7 @@ import { derivePostIdempotencyKey, digestPostContent } from "../lark/idempotency
 import type { OutboundPostClient } from "../lark/outboundPostClient.js";
 import type { OutboundCardKitClient } from "../lark/channelCardKitClient.js";
 import { CardKitReplyConversionError } from "../lark/channelCardKitClient.js";
+import type { PerfSample } from "./perfLog.js";
 
 // ---------------------------------------------------------------------------
 // handler.ts calls createRunner("claude").run(...) from agent/runner.
@@ -50,6 +51,10 @@ type SpawnCall = { cmd: string; args: string[]; cwd?: string; env?: Record<strin
 let spawnCalls: SpawnCall[] = [];
 // Per-test override: return non-zero exit for matching spawn calls.
 let spawnShouldFail: ((cmd: string, args: string[]) => boolean) | null = null;
+// Per-test override (A4): delay a matching spawn's close event, so a test can
+// prove a call is genuinely fire-and-forget (turn completes before this
+// resolves) rather than merely fast in practice.
+let spawnDelayMs: ((cmd: string, args: string[]) => number | null) | null = null;
 
 vi.mock("node:child_process", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:child_process")>();
@@ -73,10 +78,13 @@ vi.mock("node:child_process", async (importOriginal) => {
         child.stdout = new EventEmitter();
         child.stderr = new EventEmitter();
         child.kill = () => {};
-        setImmediate(() => {
+        const delay = spawnDelayMs?.(cmd, args) ?? 0;
+        const fire = () => {
           child.stderr.emit("data", Buffer.from(shouldFail ? "mock error" : ""));
           child.emit("close", shouldFail ? 1 : 0);
-        });
+        };
+        if (delay > 0) setTimeout(fire, delay);
+        else setImmediate(fire);
         return child;
       },
     },
@@ -107,6 +115,7 @@ afterEach(async () => {
   runnerBackends = [];
   spawnCalls = [];
   spawnShouldFail = null;
+  spawnDelayMs = null;
   await rm(root, { recursive: true, force: true });
 });
 
@@ -1194,6 +1203,649 @@ describe("handleOne — thin-channel finalize", () => {
     expect(stream?.content).not.toContain("请再 @ 我一次");
     const settings = cardKitCalls.find((c) => c.kind === "settings");
     expect(JSON.stringify(settings?.payload)).toContain("本轮被中断");
+  });
+
+  it("A3: does not kill an idle-stuck turn while a real tool call is in flight (tool_use with no matching tool_result yet)", async () => {
+    const threadId = "om_msg";
+    const wt = await seedWorktree(threadId);
+    await seedRepoCachePath();
+    const { client: cardKitClient, calls: cardKitCalls } = makeCardKitClient();
+    let killed = false;
+
+    // Runner emits tool_use then goes silent for well beyond the idle
+    // threshold (multiple poll cadences) BEFORE emitting the matching
+    // tool_result — simulating one long tool call (e.g. a slow build). The
+    // idle watchdog must NOT kill this: A3 exempts idle judgment while a real
+    // tool call is in flight, which is the whole point (previously this
+    // pattern was indistinguishable from a real hang and got killed).
+    runClaudeImpl = () => ({
+      events: (async function* () {
+        yield { type: "system_init", sessionId: "sess_toolinflight", raw: {} };
+        yield { type: "tool_use", toolName: "Bash", toolInput: { command: "slow build" }, raw: {} };
+        await new Promise((r) => setTimeout(r, 200)); // >> 30ms idle threshold, several poll cadences
+        yield { type: "tool_result", raw: {} };
+        yield { type: "answer_snapshot", text: "build done", raw: {} };
+        await writeFile(
+          stateFileMod.stateFilePathOf(wt),
+          JSON.stringify({
+            status: "ready",
+            last_message: "build done",
+            updated_at: new Date().toISOString(),
+          }),
+          "utf8",
+        );
+      })(),
+      done: Promise.resolve({ exitCode: 0, sessionId: "sess_toolinflight" }),
+      kill: () => {
+        killed = true;
+      },
+    });
+
+    const { renderer, startArgs, finalizeArgs } = makeCardRenderer();
+    const { store } = makeSessionStore();
+    const { client, acked } = makeClient(makeEvent());
+
+    const handler = new BridgeHandler({
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      client: client as any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      cardRenderer: renderer as any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      sessionStore: store as any,
+      conventions: makeConventions(),
+      botConfig: {
+        id: "frontend",
+        name: "Frontend",
+        turn_taking_limit: 10,
+        backend: "claude",
+        response_surface_prototype: {
+          enabled: true,
+          allowed_chats: [],
+          allowed_threads: ["om_msg"],
+          kill_switch: false,
+          post_outbound_enabled: false,
+          cardkit_streaming_enabled: true,
+          allow_agent_mentions: true,
+          denied_mention_open_ids: [],
+          allowed_mention_open_ids: [],
+        },
+      },
+      cardKitClient,
+      responseSurfaceIdleTimeoutMs: 30, // tiny idle threshold — would fire many times over during the 200ms tool call if not exempted
+    });
+
+    await handler.run();
+    for (let i = 0; i < 300 && acked.length === 0; i++) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
+
+    expect(killed).toBe(false);
+    expect(acked).toEqual(["om_msg"]);
+    expect(startArgs).toHaveLength(0);
+    expect(finalizeArgs).toHaveLength(0);
+    const stream = cardKitCalls.find((c) => c.kind === "stream" && c.elementId === "final_md");
+    expect(stream?.content).toContain("build done");
+    const settings = cardKitCalls.find((c) => c.kind === "settings");
+    expect(JSON.stringify(settings?.payload)).not.toContain("本轮被中断");
+  });
+
+  it("A3 fix regression: toolsInFlight returns to 0 after a parallel tool-call batch (2 tool_use + both matching tool_result), so idle-kill still works afterward", async () => {
+    const threadId = "om_msg";
+    await seedWorktree(threadId);
+    await seedRepoCachePath();
+    const { client: cardKitClient, calls: cardKitCalls } = makeCardKitClient();
+    let killed = false;
+
+    // Mirrors what the FIXED claude parser now emits for one "user" message
+    // containing 2 tool_result blocks (previously only 1 was yielded — see
+    // src/claude/runner.test.ts's parser-level regression test). If
+    // toolsInFlight didn't balance back to 0 here, the idle watchdog would
+    // stay permanently exempted for the rest of the turn and the genuine
+    // stall below would never get killed.
+    runClaudeImpl = () => ({
+      events: (async function* () {
+        yield { type: "system_init", sessionId: "sess_parallel_tools", raw: {} };
+        yield { type: "tool_use", toolName: "Bash", toolInput: { command: "one" }, raw: {} };
+        yield { type: "tool_use", toolName: "Bash", toolInput: { command: "two" }, raw: {} };
+        yield { type: "tool_result", raw: {} };
+        yield { type: "tool_result", raw: {} };
+        // Genuine stall AFTER both tool calls resolved — must be killable.
+        while (!killed) await new Promise((r) => setTimeout(r, 5));
+      })(),
+      done: Promise.resolve({ exitCode: 143, sessionId: "sess_parallel_tools" }),
+      kill: () => {
+        killed = true;
+      },
+    });
+
+    const { renderer, startArgs, finalizeArgs } = makeCardRenderer();
+    const { store } = makeSessionStore();
+    const { client, acked } = makeClient(makeEvent());
+
+    const handler = new BridgeHandler({
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      client: client as any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      cardRenderer: renderer as any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      sessionStore: store as any,
+      conventions: makeConventions(),
+      botConfig: {
+        id: "frontend",
+        name: "Frontend",
+        turn_taking_limit: 10,
+        backend: "claude",
+        response_surface_prototype: {
+          enabled: true,
+          allowed_chats: [],
+          allowed_threads: ["om_msg"],
+          kill_switch: false,
+          post_outbound_enabled: false,
+          cardkit_streaming_enabled: true,
+          allow_agent_mentions: true,
+          denied_mention_open_ids: [],
+          allowed_mention_open_ids: [],
+        },
+      },
+      cardKitClient,
+      responseSurfaceIdleTimeoutMs: 30,
+    });
+
+    await handler.run();
+    for (let i = 0; i < 300 && acked.length === 0; i++) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
+
+    // The idle watchdog DID kill the stalled runner — proof toolsInFlight
+    // came back down to 0 after both tool_result events were counted.
+    expect(killed).toBe(true);
+    expect(acked).toEqual(["om_msg"]);
+    expect(startArgs).toHaveLength(0);
+    expect(finalizeArgs).toHaveLength(0);
+    const stream = cardKitCalls.find((c) => c.kind === "stream" && c.elementId === "final_md");
+    expect(stream?.content).toContain("被中断");
+  });
+
+  it("批C: threads botConfig.model/effort through to the runner's RunOptions", async () => {
+    const threadId = "om_msg";
+    await seedWorktree(threadId);
+    await seedRepoCachePath();
+    const { client: cardKitClient } = makeCardKitClient();
+    let capturedOpts: { model?: string; effort?: string } | undefined;
+
+    runClaudeImpl = (opts: unknown) => {
+      capturedOpts = opts as { model?: string; effort?: string };
+      return {
+        events: (async function* () {
+          yield { type: "system_init", sessionId: "sess_knobs", raw: {} };
+        })(),
+        done: Promise.resolve({ exitCode: 0, sessionId: "sess_knobs" }),
+        kill: () => {},
+      };
+    };
+
+    const { renderer } = makeCardRenderer();
+    const { store } = makeSessionStore();
+    const { client, acked } = makeClient(makeEvent());
+
+    const handler = new BridgeHandler({
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      client: client as any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      cardRenderer: renderer as any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      sessionStore: store as any,
+      conventions: makeConventions(),
+      botConfig: {
+        id: "frontend",
+        name: "Frontend",
+        turn_taking_limit: 10,
+        backend: "claude",
+        model: "claude-opus-4-8",
+        effort: "high",
+        response_surface_prototype: {
+          enabled: true,
+          allowed_chats: [],
+          allowed_threads: ["om_msg"],
+          kill_switch: false,
+          post_outbound_enabled: false,
+          cardkit_streaming_enabled: true,
+          allow_agent_mentions: true,
+          denied_mention_open_ids: [],
+          allowed_mention_open_ids: [],
+        },
+      },
+      cardKitClient,
+    });
+
+    await handler.run();
+    for (let i = 0; i < 200 && acked.length === 0; i++) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
+
+    expect(acked).toEqual(["om_msg"]);
+    expect(capturedOpts?.model).toBe("claude-opus-4-8");
+    expect(capturedOpts?.effort).toBe("high");
+  });
+
+  it("A0: threads onPerfMarker through to recordPerfSample with computed deltas + cumulative tool count", async () => {
+    const threadId = "om_msg";
+    await seedWorktree(threadId);
+    await seedRepoCachePath();
+    const { client: cardKitClient } = makeCardKitClient();
+
+    runClaudeImpl = (opts: unknown) => {
+      const { onPerfMarker } = opts as {
+        onPerfMarker?: (marker: string, atMs: number) => void;
+      };
+      // Simulate a real runner's marker timeline — spawn at t0, then
+      // increasing offsets for each subsequent marker.
+      onPerfMarker?.("spawn", 1000);
+      onPerfMarker?.("first_line", 1010); // +10ms
+      onPerfMarker?.("session_init", 1040); // +40ms
+      onPerfMarker?.("first_content", 1900); // +900ms
+      return {
+        events: (async function* () {
+          yield { type: "system_init", sessionId: "sess_a0", raw: {} };
+          yield { type: "tool_use", toolName: "Bash", toolInput: {}, raw: {} };
+          yield { type: "tool_result", raw: {} };
+          yield { type: "tool_use", toolName: "Read", toolInput: {}, raw: {} };
+          yield { type: "tool_result", raw: {} };
+          yield { type: "answer_snapshot", text: "done", raw: {} };
+        })(),
+        done: Promise.resolve({ exitCode: 0, sessionId: "sess_a0" }),
+        kill: () => {},
+      };
+    };
+
+    const { renderer } = makeCardRenderer();
+    const { store } = makeSessionStore();
+    const { client, acked } = makeClient(makeEvent());
+
+    let capturedSample: PerfSample | undefined;
+
+    const handler = new BridgeHandler({
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      client: client as any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      cardRenderer: renderer as any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      sessionStore: store as any,
+      conventions: makeConventions(),
+      botConfig: {
+        id: "frontend",
+        name: "Frontend",
+        turn_taking_limit: 10,
+        backend: "claude",
+        response_surface_prototype: {
+          enabled: true,
+          allowed_chats: [],
+          allowed_threads: ["om_msg"],
+          kill_switch: false,
+          post_outbound_enabled: false,
+          cardkit_streaming_enabled: true,
+          allow_agent_mentions: true,
+          denied_mention_open_ids: [],
+          allowed_mention_open_ids: [],
+        },
+      },
+      cardKitClient,
+      recordPerfSample: async (sample) => {
+        capturedSample = sample;
+      },
+    });
+
+    await handler.run();
+    for (let i = 0; i < 200 && acked.length === 0; i++) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
+
+    expect(acked).toEqual(["om_msg"]);
+    expect(capturedSample).toBeDefined();
+    expect(capturedSample).toMatchObject({
+      botId: "frontend",
+      threadId: "om_msg",
+      backend: "claude",
+      spawnToFirstLineMs: 10,
+      spawnToSessionInitMs: 40,
+      spawnToFirstContentMs: 900,
+      toolUseCount: 2, // cumulative — both tool_use events, even though each already resolved (toolsInFlight back to 0)
+    });
+    expect(typeof capturedSample?.turnDurationMs).toBe("number");
+    expect(capturedSample?.turnDurationMs).toBeGreaterThanOrEqual(0);
+  });
+
+  it("A1 (agent_workspace): creates the CardKit placeholder card BEFORE the (local-fs-only) prewarm work", async () => {
+    // agent_workspace has no bridge-managed git worktree at all — the A1
+    // early-card path is safe here (see the BLOCKER writeup on the legacy
+    // regression test below for why legacy does NOT get this treatment).
+    // "prewarm" in this runtime is ensureAgentWorkspace's local fs writes
+    // (AGENTS.md etc.) — verify the card is created before those land.
+    const threadId = "om_msg";
+    const workspacePath = join(root, "agents", "frontend", "workspace");
+    const sessionsDir = join(workspacePath, "sessions");
+    const reposDir = join(workspacePath, "repos");
+    let agentsMdExistedAtCardCreate: boolean | undefined;
+
+    const cardKitClient: OutboundCardKitClient = {
+      async createCardReply() {
+        agentsMdExistedAtCardCreate = await stat(join(workspacePath, "AGENTS.md"))
+          .then(() => true)
+          .catch(() => false);
+        return { cardId: "card_entity", messageId: "card_message" };
+      },
+      async createCardEntity() {
+        throw new Error("unused");
+      },
+      async replyCardEntity() {
+        throw new Error("unused");
+      },
+      async updateCardEntity() {},
+      async streamElementContent() {},
+      async createElements() {},
+      async deleteElement() {},
+      async patchElement() {},
+      async updateElement() {},
+      async updateCardSettings() {},
+    };
+
+    runClaudeImpl = () => ({
+      events: (async function* () {
+        yield { type: "system_init", sessionId: "sess_a1_aw", raw: {} };
+        yield { type: "answer_snapshot", text: "done", raw: {} };
+      })(),
+      done: Promise.resolve({ exitCode: 0, sessionId: "sess_a1_aw" }),
+      kill: () => {},
+    });
+
+    const { renderer } = makeCardRenderer();
+    const { store } = makeSessionStore();
+    const { client, acked } = makeClient(makeEvent());
+
+    const handler = new BridgeHandler({
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      client: client as any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      cardRenderer: renderer as any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      sessionStore: store as any,
+      conventions: {
+        runtime: "agent_workspace",
+        worktreesDir: join(root, "legacy-worktrees"),
+        agentWorkspacePath: workspacePath,
+        workspaceSessionsDir: sessionsDir,
+        workspaceReposPath: reposDir,
+        devHostname: "10.0.0.1",
+        portRangeStart: 3000,
+        portRangeEnd: 3999,
+      },
+      botConfig: {
+        id: "frontend",
+        name: "Frontend",
+        turn_taking_limit: 10,
+        backend: "claude",
+        runtime: "agent_workspace",
+        response_surface_prototype: {
+          enabled: true,
+          allowed_chats: [],
+          allowed_threads: ["om_msg"],
+          kill_switch: false,
+          post_outbound_enabled: false,
+          cardkit_streaming_enabled: true,
+          allow_agent_mentions: true,
+          denied_mention_open_ids: [],
+          allowed_mention_open_ids: [],
+        },
+      },
+      cardKitClient,
+    });
+
+    await handler.run();
+    for (let i = 0; i < 200 && acked.length === 0; i++) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
+
+    expect(acked).toEqual(["om_msg"]);
+    // The card was created before ensureAgentWorkspace's AGENTS.md write...
+    expect(agentsMdExistedAtCardCreate).toBe(false);
+    // ...but the (local-fs) prewarm still ran, just after.
+    await expect(stat(join(workspacePath, "AGENTS.md"))).resolves.toBeTruthy();
+  });
+
+  it("A1 BLOCKER regression (legacy + CardKit, first turn): worktreePath must NOT be materialized before git prewarm runs; the card is created only after", async () => {
+    const threadId = "om_msg";
+    // Deliberately do NOT seedWorktree: this is a first turn on legacy
+    // runtime. Before the fix, writeCardKitFile's mkdir-recursive would
+    // pre-materialize worktreePath as a plain (non-git) directory BEFORE the
+    // BL-8 existence/health probe ran — misdetecting it as either a corrupted
+    // migrated worktree (rm -rf'd, destroying the crash-recovery
+    // cardkit.json) or (if some ancestor dir happens to be git-tracked) as an
+    // already-healthy worktree, permanently skipping `git worktree add`. The
+    // fix: legacy runtime keeps the baseline ordering — card created only
+    // after the worktree definitely exists.
+    await seedRepoCachePath();
+    let spawnCallsAtCardCreate = -1;
+    let stateFileExistedAtCardCreate: boolean | undefined;
+    const worktreePath = join(root, threadId);
+
+    const cardKitClient: OutboundCardKitClient = {
+      async createCardReply() {
+        spawnCallsAtCardCreate = spawnCalls.length;
+        // Anchor: by the time the card is created, the FULL provisioning
+        // pipeline (worktree add → settings → ensureStateFile) has already
+        // run and legitimately materialized worktreePath — not a mkdir
+        // shortcut racing ahead of it. state.json only exists once
+        // ensureStateFile has run, which in the fixed ordering is the LAST
+        // provisioning step before card creation.
+        stateFileExistedAtCardCreate = await stat(stateFileMod.stateFilePathOf(worktreePath))
+          .then(() => true)
+          .catch(() => false);
+        return { cardId: "card_entity", messageId: "card_message" };
+      },
+      async createCardEntity() {
+        throw new Error("unused");
+      },
+      async replyCardEntity() {
+        throw new Error("unused");
+      },
+      async updateCardEntity() {},
+      async streamElementContent() {},
+      async createElements() {},
+      async deleteElement() {},
+      async patchElement() {},
+      async updateElement() {},
+      async updateCardSettings() {},
+    };
+
+    runClaudeImpl = () => ({
+      events: (async function* () {
+        yield { type: "system_init", sessionId: "sess_a1_legacy", raw: {} };
+        yield { type: "answer_snapshot", text: "done", raw: {} };
+      })(),
+      done: Promise.resolve({ exitCode: 0, sessionId: "sess_a1_legacy" }),
+      kill: () => {},
+    });
+
+    const { renderer } = makeCardRenderer();
+    const { store } = makeSessionStore();
+    const { client, acked } = makeClient(makeEvent());
+
+    const handler = new BridgeHandler({
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      client: client as any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      cardRenderer: renderer as any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      sessionStore: store as any,
+      conventions: makeConventions(),
+      botConfig: {
+        id: "frontend",
+        name: "Frontend",
+        turn_taking_limit: 10,
+        backend: "claude",
+        response_surface_prototype: {
+          enabled: true,
+          allowed_chats: [],
+          allowed_threads: ["om_msg"],
+          kill_switch: false,
+          post_outbound_enabled: false,
+          cardkit_streaming_enabled: true,
+          allow_agent_mentions: true,
+          denied_mention_open_ids: [],
+          allowed_mention_open_ids: [],
+        },
+      },
+      cardKitClient,
+    });
+
+    await handler.run();
+    for (let i = 0; i < 200 && acked.length === 0; i++) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
+
+    expect(acked).toEqual(["om_msg"]);
+    // ANCHOR: the full provisioning pipeline (incl. ensureStateFile, the very
+    // last step before card creation in the fixed ordering) had already run
+    // by card-creation time — proof writeCardKitFile's mkdir-recursive never
+    // got a chance to race ahead of the real `git worktree add` + BL-8 probe.
+    expect(stateFileExistedAtCardCreate).toBe(true);
+    // The card was created only AFTER the prewarm git work (fetch + worktree add).
+    expect(spawnCallsAtCardCreate).toBeGreaterThan(0);
+    expect(spawnCalls.some((c) => c.args.includes("fetch"))).toBe(true);
+    expect(spawnCalls.some((c) => c.args.includes("worktree"))).toBe(true);
+  });
+
+  it("A4: backgrounds the primary repo fetch on a continuation turn instead of blocking the turn on it", async () => {
+    const threadId = "om_msg";
+    // Pre-existing worktree dir + the (default, unpatched) rev-parse spawn
+    // reporting success = a healthy continuation-turn worktree, i.e. this
+    // turn will NOT run `git worktree add` and so must not need to await the
+    // fetch either.
+    await seedWorktree(threadId);
+    await seedRepoCachePath();
+    spawnDelayMs = (_cmd, args) => (args[0] === "fetch" ? 300 : null);
+
+    const { client: cardKitClient } = makeCardKitClient();
+    runClaudeImpl = () => ({
+      events: (async function* () {
+        yield { type: "system_init", sessionId: "sess_a4_bg", raw: {} };
+        yield { type: "answer_snapshot", text: "done", raw: {} };
+      })(),
+      done: Promise.resolve({ exitCode: 0, sessionId: "sess_a4_bg" }),
+      kill: () => {},
+    });
+
+    const { renderer } = makeCardRenderer();
+    const { store } = makeSessionStore();
+    const { client, acked } = makeClient(makeEvent());
+
+    const handler = new BridgeHandler({
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      client: client as any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      cardRenderer: renderer as any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      sessionStore: store as any,
+      conventions: makeConventions(),
+      botConfig: {
+        id: "frontend",
+        name: "Frontend",
+        turn_taking_limit: 10,
+        backend: "claude",
+        response_surface_prototype: {
+          enabled: true,
+          allowed_chats: [],
+          allowed_threads: ["om_msg"],
+          kill_switch: false,
+          post_outbound_enabled: false,
+          cardkit_streaming_enabled: true,
+          allow_agent_mentions: true,
+          denied_mention_open_ids: [],
+          allowed_mention_open_ids: [],
+        },
+      },
+      cardKitClient,
+    });
+
+    const startedAt = Date.now();
+    await handler.run();
+    for (let i = 0; i < 200 && acked.length === 0; i++) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    const elapsedMs = Date.now() - startedAt;
+
+    expect(acked).toEqual(["om_msg"]);
+    // The turn finished well before the 300ms fetch resolved — proof it was
+    // never awaited (the old behavior would have blocked ~300ms here).
+    expect(elapsedMs).toBeLessThan(300);
+    expect(spawnCalls.some((c) => c.args[0] === "fetch")).toBe(true);
+    expect(spawnCalls.some((c) => c.args[0] === "worktree")).toBe(false);
+  });
+
+  it("A4: awaits the primary repo fetch on a first turn (about to `git worktree add`)", async () => {
+    const threadId = "om_msg";
+    // No seedWorktree(): first turn — worktreePath does not exist as a real
+    // git worktree yet. rev-parse must fail so the BL-8 health check
+    // correctly reports "not yet a real worktree" (mirroring what a real
+    // empty/non-git dir does) — see the A1 test above for the same setup.
+    await seedRepoCachePath();
+    spawnShouldFail = (_cmd, args) => args.includes("rev-parse");
+    spawnDelayMs = (_cmd, args) => (args[0] === "fetch" ? 150 : null);
+
+    const { client: cardKitClient } = makeCardKitClient();
+    runClaudeImpl = () => ({
+      events: (async function* () {
+        yield { type: "system_init", sessionId: "sess_a4_await", raw: {} };
+        yield { type: "answer_snapshot", text: "done", raw: {} };
+      })(),
+      done: Promise.resolve({ exitCode: 0, sessionId: "sess_a4_await" }),
+      kill: () => {},
+    });
+
+    const { renderer } = makeCardRenderer();
+    const { store } = makeSessionStore();
+    const { client, acked } = makeClient(makeEvent());
+
+    const handler = new BridgeHandler({
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      client: client as any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      cardRenderer: renderer as any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      sessionStore: store as any,
+      conventions: makeConventions(),
+      botConfig: {
+        id: "frontend",
+        name: "Frontend",
+        turn_taking_limit: 10,
+        backend: "claude",
+        response_surface_prototype: {
+          enabled: true,
+          allowed_chats: [],
+          allowed_threads: ["om_msg"],
+          kill_switch: false,
+          post_outbound_enabled: false,
+          cardkit_streaming_enabled: true,
+          allow_agent_mentions: true,
+          denied_mention_open_ids: [],
+          allowed_mention_open_ids: [],
+        },
+      },
+      cardKitClient,
+    });
+
+    const startedAt = Date.now();
+    await handler.run();
+    for (let i = 0; i < 200 && acked.length === 0; i++) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    const elapsedMs = Date.now() - startedAt;
+
+    expect(acked).toEqual(["om_msg"]);
+    // The turn genuinely waited on the 150ms fetch before proceeding — a
+    // first-turn branch must never be cut from a stale (un-fetched) base.
+    expect(elapsedMs).toBeGreaterThanOrEqual(140);
+    expect(spawnCalls.some((c) => c.args[0] === "worktree")).toBe(true);
   });
 
   it("PRB-6/§11.3: injects peer @ open_ids from the live roster (same app scope), not the static config id", async () => {

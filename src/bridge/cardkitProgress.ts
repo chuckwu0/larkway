@@ -14,7 +14,15 @@ import {
 } from "../lark/cardkitSurface.js";
 
 const DEFAULT_PATCH_INTERVAL_MS = 250;
+/**
+ * Soft budget: below this many progress patches, cadence is patchIntervalMs.
+ * At/above it, patches keep flowing (A6 perf plan — a long task's card must
+ * not freeze mid-stream) but back off along BACKOFF_LADDER_MS so a very long
+ * turn doesn't hammer Feishu at the normal cadence forever.
+ */
 const DEFAULT_MAX_PROGRESS_UPDATES = 240;
+/** A6: patch-interval backoff ladder once the soft budget is exceeded, capped at the last entry. */
+const BACKOFF_LADDER_MS = [250, 1_000, 2_000, 5_000];
 
 export interface CardKitLiveMetrics {
   answerDeltaCount: number;
@@ -55,6 +63,7 @@ export interface CreateCardKitProgressHandleOpts {
   };
   initialStatusText?: string;
   patchIntervalMs?: number;
+  /** Soft budget before patch cadence backs off (A6) — no longer a hard stop. */
   maxProgressUpdates?: number;
   onSequenceCommitted?: (sequence: number) => Promise<void>;
   onLiveMetricsChanged?: (metrics: CardKitLiveMetrics & { sequence: number }) => void;
@@ -301,8 +310,21 @@ class LiveCardKitProgressHandle implements CardKitProgressHandle {
       });
   }
 
+  /**
+   * A6: patch cadence for the NEXT scheduled patch. Below the soft budget,
+   * this is just patchIntervalMs (unchanged behavior). At/above it, back off
+   * along BACKOFF_LADDER_MS instead of freezing the card entirely — a long
+   * task keeps making visible (if slower) progress instead of looking stuck.
+   */
+  private currentPatchIntervalMs(): number {
+    const overBudget = this.metrics.progressUpdateCount - this.maxProgressUpdates;
+    if (overBudget < 0) return this.patchIntervalMs;
+    const tier = Math.min(overBudget, BACKOFF_LADDER_MS.length - 1);
+    return Math.max(this.patchIntervalMs, BACKOFF_LADDER_MS[tier]!);
+  }
+
   private schedulePatch(opts: { immediate?: boolean } = {}): void {
-    if (this.pendingPatch || this.metrics.progressUpdateCount >= this.maxProgressUpdates) return;
+    if (this.pendingPatch) return;
     if (opts.immediate) {
       this.immediatePatchStarted = true;
       void this.patchProgress();
@@ -311,12 +333,12 @@ class LiveCardKitProgressHandle implements CardKitProgressHandle {
     this.pendingPatch = setTimeout(() => {
       this.pendingPatch = null;
       void this.patchProgress();
-    }, this.patchIntervalMs);
+    }, this.currentPatchIntervalMs());
     this.pendingPatch.unref?.();
   }
 
   private async patchProgress(): Promise<void> {
-    if (this.closed || this.metrics.progressUpdateCount >= this.maxProgressUpdates) return;
+    if (this.closed) return;
     if (!this.answerBuffer) return;
     this.inFlight = this.inFlight
       .then(() =>

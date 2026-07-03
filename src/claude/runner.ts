@@ -20,6 +20,8 @@ import {
   type AgentStreamEvent,
   type RunOptions,
   type RunHandle,
+  createPerfMarker,
+  markPerfForEventType,
 } from "../agent/runner.js";
 import { AnswerChannelExtractor } from "../agent/answerChannel.js";
 
@@ -96,6 +98,17 @@ function buildCommand(opts: RunOptions): [string, string[]] {
 
   if (opts.resumeSessionId != null) {
     args.push("--resume", opts.resumeSessionId);
+  }
+
+  // Per-bot model/effort override (perf plan 批C). Both confirmed-supported
+  // by the claude CLI, including in non-interactive `-p` mode:
+  // `claude --model <alias>` / `claude --effort low|medium|high|max`.
+  // Omitted opts → no flags added → byte-identical to pre-existing behavior.
+  if (opts.model) {
+    args.push("--model", opts.model);
+  }
+  if (opts.effort) {
+    args.push("--effort", opts.effort);
   }
 
   // Note: claude CLI does NOT support a --cwd flag (verified: exits with
@@ -216,14 +229,24 @@ function* parseLinesMulti(
       Array.isArray((message as Record<string, unknown>)["content"])
     ) {
       const content = (message as Record<string, unknown>)["content"] as unknown[];
+      // A3 fix: a parallel tool-call batch puts MULTIPLE tool_result blocks
+      // in one "user" message (mirroring the "assistant" branch above, which
+      // already yields one tool_use event per block). Yielding only the
+      // first and returning early — the previous bug — under-counts
+      // tool_result events relative to tool_use, so handler.ts's
+      // toolsInFlight counter (incremented per tool_use, decremented per
+      // tool_result) would drift positive and never reach zero again for the
+      // rest of the turn, permanently exempting it from the idle watchdog.
+      let emittedToolResult = false;
       for (const item of content) {
         if (typeof item !== "object" || item === null) continue;
         const block = item as Record<string, unknown>;
         if (block["type"] === "tool_result") {
           yield { type: "tool_result", raw: obj };
-          return;
+          emittedToolResult = true;
         }
       }
+      if (emittedToolResult) return;
     }
     yield { type: "raw", raw: obj };
     return;
@@ -241,6 +264,9 @@ export function runClaude(opts: RunOptions): RunHandle {
   const [bin, args] = buildCommand(opts);
   const env = buildEnv(opts.botGitIdentity, opts.gitlabToken);
 
+  // A0 (perf plan): dedup'd marker sink — see createPerfMarker/markPerfForEventType.
+  const markPerf = createPerfMarker(opts.onPerfMarker);
+
   // ── spawn ─────────────────────────────────────────────────────────────────
   // opts.cwd is passed both as spawn's cwd (sandbox boundary) and --cwd flag
   // (claude internal logic). spawn cwd is the authoritative sandbox boundary.
@@ -250,6 +276,7 @@ export function runClaude(opts: RunOptions): RunHandle {
     // Shell is NOT used — args are passed as array, safe for prompt content
     ...(opts.cwd != null ? { cwd: opts.cwd } : {}),
   });
+  markPerf("spawn");
 
   // ── pid file ──────────────────────────────────────────────────────────────
   // Written immediately after spawn so gc.ts can locate the claude main process
@@ -521,6 +548,8 @@ export function runClaude(opts: RunOptions): RunHandle {
 
     try {
       for await (const line of rl) {
+        // A0: first stdout line observed, regardless of content (marks once).
+        markPerf("first_line");
         for (const event of parseLinesMulti(line, answerExtractor)) {
           // Track sessionId as we see it
           if (event.type === "system_init") {
@@ -532,6 +561,7 @@ export function runClaude(opts: RunOptions): RunHandle {
           if (event.type === "result") {
             scheduleGrandchildGrace();
           }
+          markPerfForEventType(markPerf, event.type);
           yield event;
         }
       }

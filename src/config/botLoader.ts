@@ -23,6 +23,13 @@ import { ResponseSurfacePrototypeConfigSchema } from "../responseSurface.js";
 // Zod schema
 // ---------------------------------------------------------------------------
 
+/**
+ * Known claude CLI `--effort` values (confirmed via docs, see src/claude/
+ * runner.ts). Advisory only — `effort` itself stays an open zod string so an
+ * unrecognized value never fails validation, it's just flagged with a warn.
+ */
+const KNOWN_EFFORT_VALUES = new Set(["low", "medium", "high", "max"]);
+
 const GitIdentitySchema = z.object({
   name: z.string().min(1),
   email: z.string().email(),
@@ -255,6 +262,26 @@ export const BotConfigSchema = z.object({
    * 话题 ↔ 飞书任务句柄(docs/task-handle.md)。省略 = 功能关闭,行为不变。
    */
   taskHandle: TaskHandleConfigSchema.optional(),
+
+  /**
+   * Per-bot model override (perf plan 批 C 旋钮). Passed through verbatim to
+   * the backend CLI as `--model <value>` (claude) / `turn/start.model`
+   * (codex) — larkway does not validate or allowlist model ids, same
+   * precedent as `backend` above. Omitted = unchanged host/backend default
+   * behavior (byte-identical to before this field existed).
+   */
+  model: z.string().min(1).optional(),
+
+  /**
+   * Per-bot reasoning-effort override (perf plan 批 C 旋钮). Passed through
+   * verbatim as `--effort <value>` on the claude CLI (confirmed supported:
+   * `claude --effort low|medium|high|max`, also non-interactive). Codex
+   * app-server support for a per-turn effort override is unconfirmed as of
+   * this writing (only `model` is confirmed in `turn/start` params) — set
+   * on a codex bot is currently a harmless no-op there, not an error.
+   * Omitted = unchanged default behavior.
+   */
+  effort: z.string().min(1).optional(),
 }).strict();
 
 /**
@@ -323,6 +350,21 @@ export async function loadBots(botsDir: string): Promise<BotConfig[]> {
     }
 
     const bot: BotConfig = result.data;
+
+    // Minor fix (perf plan model/effort knobs): `effort` is an open string
+    // (not a zod enum — larkway doesn't want to hardcode/allowlist model-
+    // specific vocab, same precedent as `backend`), so a typo'd value would
+    // otherwise silently reach the CLI and fail the bot's spawn every turn
+    // with no upfront signal. Advisory only — matches the existing
+    // doctor/warn style (never blocks startup over it).
+    if (bot.effort && !KNOWN_EFFORT_VALUES.has(bot.effort)) {
+      console.warn(
+        `[botLoader] Bot "${bot.id}" effort "${bot.effort}" is not one of the known values ` +
+          `(${[...KNOWN_EFFORT_VALUES].join(", ")}). Continuing — the value is still passed ` +
+          `through to the backend CLI verbatim, but a typo here will silently fail the bot's ` +
+          `spawn every turn. Double-check it against the claude CLI's --effort flag.`,
+      );
+    }
 
     // L2 Agent Memory: load memory_file content (relative to botsDir) so the
     // bridge can inject it as the agent's role preamble. Missing file is fatal

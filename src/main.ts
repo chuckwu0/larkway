@@ -9,6 +9,7 @@ import { CardRenderer } from "./lark/card.js";
 import { SessionStore } from "./claude/sessionStore.js";
 import { BridgeHandler } from "./bridge/handler.js";
 import { upsertRuntimeEvent } from "./bridge/eventLog.js";
+import { appendPerfSample } from "./bridge/perfLog.js";
 import type { HandlerConventions } from "./bridge/handler.js";
 import { Housekeeping } from "./housekeeping/gc.js";
 import { loadBots } from "./config/botLoader.js";
@@ -452,6 +453,8 @@ async function runV2Mode({
         gitlab_token_env: bot.gitlab_token_env,
         response_surface_prototype: bot.response_surface_prototype,
         taskHandle: effectiveTaskHandleTasklistGuid ? { tasklistGuid: effectiveTaskHandleTasklistGuid } : undefined,
+        model: bot.model,
+        effort: bot.effort,
       },
       cardKitClient,
       postClient,
@@ -467,6 +470,11 @@ async function runV2Mode({
       runtimeRequirements: runtimeRequirementsForBots([bot]),
       recordRuntimeEvent: async (patch) => {
         await upsertRuntimeEvent(larkwayHome(), bot.id, patch);
+      },
+      // A0 (perf plan): raw per-turn perf samples for the batch-B sizing
+      // decision (§6 step 2). Diagnostic-only JSONL, not a dashboard feature.
+      recordPerfSample: async (sample) => {
+        await appendPerfSample(larkwayHome(), bot.id, sample);
       },
       taskHandleLifecycle,
       taskHandleClaim,
