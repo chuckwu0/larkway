@@ -37,6 +37,11 @@ import {
   shouldProvideResponseSurfaceCardKitClient,
   shouldProvideResponseSurfacePostClient,
 } from "./responseSurface.js";
+import { resolveTaskHandlesPath } from "./config/paths.js";
+import { TaskHandleStore } from "./tasklist/store.js";
+import { TaskListClient, type LarkTaskRequester } from "./tasklist/client.js";
+import { applyTaskHandleWriteback } from "./tasklist/writeback.js";
+import { CommentPoller } from "./tasklist/commentPoller.js";
 
 /** How often the bridge rewrites each bot's status.json liveness heartbeat. */
 const STATUS_WRITE_INTERVAL_MS = 30_000;
@@ -176,6 +181,8 @@ async function runV2Mode({
     cardRenderer: CardRenderer;
     handler: BridgeHandler;
     housekeeping: Housekeeping;
+    /** Task-handle comment poller (docs/task-handle.md) — undefined when the bot doesn't enable the feature. */
+    taskCommentPoller: CommentPoller | undefined;
     /** Liveness heartbeat interval (status.json). Armed after wiring; unref()-ed. */
     statusTimer: ReturnType<typeof setInterval> | null;
     /**
@@ -344,6 +351,79 @@ async function runV2Mode({
       ? client.outboundCardKitClient()
       : undefined;
 
+    // Task-handle (docs/task-handle.md) — entirely opt-in per bot. Uses a
+    // standalone SDK Client (same one-off REST pattern as fetchBotAvatar
+    // above) rather than the live Channel SDK handle: task v2 calls are
+    // infrequent request/response, not part of the WS inbound/outbound path.
+    //
+    // `effectiveTaskHandleTasklistGuid` is the SINGLE source of truth for
+    // "feature is actually live for this bot" — both the hooks/poller wiring
+    // below AND the prompt-fact injection (botConfig.taskHandle) key off this
+    // one value, so they can never disagree (previously the prompt injection
+    // checked only tasklistGuid, independent of `enabled` — an
+    // enabled:false-but-guid-still-set config would inject the prompt pointer
+    // while the writeback hooks stayed off, silently dropping every claim).
+    let effectiveTaskHandleTasklistGuid: string | undefined;
+    let taskHandleLifecycle: ((patch: import("./tasklist/types.js").TaskHandleLifecyclePatch) => Promise<void>) | undefined;
+    let taskHandleClaim: ((patch: import("./tasklist/types.js").TaskHandleClaimPatch) => Promise<void>) | undefined;
+    let taskCommentPoller: CommentPoller | undefined;
+    if (bot.taskHandle?.enabled) {
+      if (!bot.taskHandle.tasklistGuid) {
+        console.warn(
+          `[larkway] bot "${bot.id}" has taskHandle.enabled=true but no tasklistGuid configured — ` +
+            "feature stays inert (equivalent to disabled) until provisioned via `larkway tasklist-init`.",
+        );
+      } else if (bot.chats.length !== 1) {
+        // docs/task-handle.md §5.3/§7: a tasklist is provisioned for exactly one
+        // group (member=chat, 1:1 clean binding). A tasklistGuid is bot-scoped,
+        // not chat-scoped — a bot serving 0/2+ chats (incl. default open-mode
+        // `chats:[]`) has no single group the "本群启用了任务句柄" prompt line
+        // could correctly refer to, so the feature degrades to disabled rather
+        // than leaking the prompt hint (and a stray claim path) into unrelated
+        // groups. warn-once at startup, not a crash.
+        console.warn(
+          `[larkway] bot "${bot.id}" has taskHandle.enabled=true but serves ${bot.chats.length} chat(s) ` +
+            "(feature currently requires exactly one — see docs/task-handle.md §7); " +
+            "feature stays inert (equivalent to disabled) until the bot is scoped to a single group.",
+        );
+      } else {
+        effectiveTaskHandleTasklistGuid = bot.taskHandle.tasklistGuid;
+        const taskHandleStore = await TaskHandleStore.load(resolveTaskHandlesPath(bot.id));
+        const taskSdkClient = new LarkSdkClient({ appId: bot.app_id, appSecret });
+        const taskRequester: LarkTaskRequester = {
+          request: (config) => taskSdkClient.request(config as Parameters<typeof taskSdkClient.request>[0]),
+        };
+        const taskListClient = new TaskListClient(taskRequester);
+        taskHandleLifecycle = (patch) => applyTaskHandleWriteback(patch, { store: taskHandleStore, client: taskListClient });
+        // TaskHandleStore.claim() is idempotent on an unchanged guid (see its
+        // doc comment) — this is what makes it safe for handler.ts to call
+        // every turn the agent re-declares task_handle.guid, not just once.
+        taskHandleClaim = (patch) => taskHandleStore.claim(patch);
+        taskCommentPoller = new CommentPoller({
+          store: taskHandleStore,
+          client: taskListClient,
+          enqueueSyntheticTurn: (turn) => {
+            client.enqueueSyntheticEvent({
+              message_id: `synthetic-task-comment-${turn.threadId}-${Date.now()}`,
+              chat_id: turn.chatId,
+              chat_type: "group",
+              thread_id: turn.threadId,
+              root_id: turn.threadId,
+              // Distinct marker (NOT "card_action") so triggerFacts.ts's mention_type
+              // resolves via the normal no-mentions-array path ("no_mention_metadata")
+              // instead of being mislabeled as a card-button click. Purely informational
+              // for anything inspecting the raw event; no bridge logic branches on it.
+              larkway_trigger_type: "task_comment",
+              sender_id: turn.senderId,
+              content: JSON.stringify({ text: turn.text }),
+              create_time: String(Date.now()),
+            });
+          },
+        });
+        taskCommentPoller.start();
+      }
+    }
+
     const handler = new BridgeHandler({
       client,
       cardRenderer,
@@ -365,6 +445,7 @@ async function runV2Mode({
         git_token_env: bot.git_token_env,
         gitlab_token_env: bot.gitlab_token_env,
         response_surface_prototype: bot.response_surface_prototype,
+        taskHandle: effectiveTaskHandleTasklistGuid ? { tasklistGuid: effectiveTaskHandleTasklistGuid } : undefined,
       },
       cardKitClient,
       postClient,
@@ -381,6 +462,8 @@ async function runV2Mode({
       recordRuntimeEvent: async (patch) => {
         await upsertRuntimeEvent(larkwayHome(), bot.id, patch);
       },
+      taskHandleLifecycle,
+      taskHandleClaim,
     });
 
     const housekeeping = new Housekeeping({
@@ -391,6 +474,7 @@ async function runV2Mode({
 
     const inst: BotInstance = {
       bot, client, sessionStore, cardRenderer, handler, housekeeping,
+      taskCommentPoller,
       statusTimer: null, avatar: undefined,
     };
     instances.push(inst);
@@ -449,8 +533,13 @@ async function runV2Mode({
   async function shutdown(signal: string): Promise<void> {
     console.log(`\n[larkway] Received ${signal}, shutting down V2 bots…`);
     await Promise.all(
-      instances.map(async ({ bot, statusTimer, housekeeping, handler, sessionStore, client, avatar }) => {
+      instances.map(async ({ bot, statusTimer, housekeeping, taskCommentPoller, handler, sessionStore, client, avatar }) => {
         if (statusTimer) clearInterval(statusTimer);
+        // Await drain (M1): stop() only cancels the NEXT scheduled cycle —
+        // without awaiting, a cycle already in flight would keep running
+        // (and writing to the store / enqueueing turns) after shutdown()
+        // has logged "complete" and the process is exiting.
+        await taskCommentPoller?.stop();
         // Mark this bot as no-longer-serving on the way out (ws:false). The Web
         // 管理面 will then show 🟡 degraded briefly, then 🔴 offline once the
         // file goes stale. Best-effort — never block shutdown on it. Preserve the
@@ -483,8 +572,9 @@ async function runV2Mode({
   if (dryRun) {
     console.log("[dry-run] V2 mode — all bots wired OK, exiting.");
     await Promise.all(
-      instances.map(async ({ housekeeping, sessionStore, client }) => {
+      instances.map(async ({ housekeeping, taskCommentPoller, sessionStore, client }) => {
         housekeeping.stop();
+        await taskCommentPoller?.stop();
         await sessionStore.close();
         await client.close();
       }),

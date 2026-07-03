@@ -201,6 +201,14 @@ export interface RenderPromptInput {
    * current message or needs to ask the user/owner for remediation.
    */
   runtimeWarnings?: RuntimeWarning[];
+  /**
+   * Task-handle tasklist GUID (docs/task-handle.md), when the bot's
+   * `taskHandle.enabled` + `tasklistGuid` are both configured. Thin-bridge:
+   * this injects only the fact pointer + a one-line SKILL pointer, never the
+   * claim/writeback workflow itself (that lives entirely in the SKILL).
+   * Absent = feature not configured for this bot → no block rendered.
+   */
+  taskHandleTasklistGuid?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -329,6 +337,21 @@ function renderTurnTakingHint(limit: number): string[] {
     "建议主动 @ 用户说明当前进展并询问是否继续,",
     "或 @ 相关 peer bot 请求协助,避免无限循环讨论。",
     "</turn-taking>",
+  ];
+}
+
+/**
+ * Render the `<task-handle>` fact block. Only two lines by design (thin
+ * bridge — see docs/task-handle.md §3): the tasklist GUID pointer, and a
+ * one-line pointer at the SKILL that owns the actual claim/writeback flow.
+ * Called only when the bot has a configured tasklistGuid.
+ */
+function renderTaskHandleBlock(tasklistGuid: string): string[] {
+  return [
+    "<task-handle>",
+    `task_handle_tasklist_guid: ${tasklistGuid}`,
+    "本群启用了任务句柄;用户要求认领任务时,按 task-handle skill 流程处理。",
+    "</task-handle>",
   ];
 }
 
@@ -493,6 +516,7 @@ export function renderPrompt(input: RenderPromptInput): string {
     extraRepoPaths,
     larkCliProfile,
     runtimeWarnings = [],
+    taskHandleTasklistGuid,
   } = input;
   const backend = input.backend ?? "claude";
 
@@ -518,6 +542,9 @@ export function renderPrompt(input: RenderPromptInput): string {
   const peersBlock = peers && peers.length > 0 ? renderPeersBlock(peers) : [];
   const turnTakingBlock = turn_taking_limit && turn_taking_limit > 0
     ? renderTurnTakingHint(turn_taking_limit)
+    : [];
+  const taskHandleBlock = taskHandleTasklistGuid
+    ? renderTaskHandleBlock(taskHandleTasklistGuid)
     : [];
   const runtimeWarningsBlock = renderRuntimeWarningsBlock(runtimeWarnings);
   // Workspace warm-up block — rendered for all bots that have at least one repo.
@@ -675,6 +702,7 @@ export function renderPrompt(input: RenderPromptInput): string {
       ...(workspaceBlock.length > 0 ? ["", ...workspaceBlock] : []),
       ...(peersBlock.length > 0 ? ["", ...peersBlock] : []),
       ...(turnTakingBlock.length > 0 ? ["", ...turnTakingBlock] : []),
+      ...(taskHandleBlock.length > 0 ? ["", ...taskHandleBlock] : []),
       "",
       "<user-message>",
       `${parsed.senderOpenId}: ${parsed.text}`,
@@ -734,6 +762,7 @@ export function renderPrompt(input: RenderPromptInput): string {
     ...(workspaceBlock.length > 0 ? ["", ...workspaceBlock] : []),
     ...(peersBlock.length > 0 ? ["", ...peersBlock] : []),
     ...(turnTakingBlock.length > 0 ? ["", ...turnTakingBlock] : []),
+    ...(taskHandleBlock.length > 0 ? ["", ...taskHandleBlock] : []),
     "",
     "<user-message>",
     `${parsed.senderOpenId}: ${parsed.text}`,

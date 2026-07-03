@@ -793,6 +793,21 @@ export class ChannelClient {
   }
 
   /**
+   * Push an already-built synthetic LarkMessageEvent onto the inbound queue,
+   * so handler.ts processes it as an ordinary turn. Same mechanism as
+   * {@link handleCardAction}'s cardAction → queue.push, generalized for other
+   * bridge-external signal sources — currently only the task-handle comment
+   * poller (src/tasklist/commentPoller.ts), which synthesizes a turn from a
+   * new Feishu task comment. Public because the poller lives outside this
+   * class (main.ts wires it); the caller is fully responsible for building a
+   * well-formed event (thread_id/root_id resolved, etc.) — this method does
+   * no validation of its own, mirroring handleCardAction's contract.
+   */
+  enqueueSyntheticEvent(ev: LarkMessageEvent): void {
+    this.queue.push(ev);
+  }
+
+  /**
    * Return an OutboundCardClient bound to this client's channel handle.
    *
    * Safe to call before connect: the returned client resolves the live channel

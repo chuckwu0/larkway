@@ -200,6 +200,13 @@ export const StateFileSchema = z.object({
    */
   response_surface: ResponseSurfaceStateSchema.optional(),
   /**
+   * 话题 ↔ 飞书任务句柄认领声明(docs/task-handle.md §5.1/§5.2)。agent 在 turn
+   * 内检索到候选任务、消解歧义后,把 guid 写进这里;bridge finalize 时读取并
+   * 持久化进 TaskHandleStore(thread → task_guid)。**只有这一个字段** bridge
+   * 关心;其余认领判断/歧义处理全在 agent 侧(SKILL),不进 bridge。
+   */
+  task_handle: z.object({ guid: z.string().min(1) }).optional(),
+  /**
    * Freshness signal for the handler's stale-guard (it compares this against a
    * pre-run snapshot to decide whether the bot rewrote state THIS turn).
    *

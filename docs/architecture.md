@@ -180,6 +180,8 @@
                  session.store
 
   housekeeping.gc ──── 独立后台 task,只读 sessions.json + 文件系统
+  tasklist.*      ──── 独立模块(store/client/writeback/commentPoller),bridge.handler 只调一个
+                       可选注入 hook,不含任务业务逻辑 —— 见 [task-handle.md](task-handle.md)
 ```
 
 ---

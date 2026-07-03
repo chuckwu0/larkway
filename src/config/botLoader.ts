@@ -28,6 +28,20 @@ const GitIdentitySchema = z.object({
   email: z.string().email(),
 });
 
+/**
+ * 话题 ↔ 飞书任务句柄(docs/task-handle.md)。全部可选、默认关闭 —— 未设置这个
+ * 字段的所有现存 bot yaml 行为字节级不变(§6 降级契约 #4:feature 整体默认关闭)。
+ */
+const TaskHandleConfigSchema = z.object({
+  /** @default false — 显式开启才生效。 */
+  enabled: z.boolean().default(false),
+  /**
+   * 本群共享清单的 GUID。由 `larkway tasklist-init` provisioning 子命令产出;
+   * 跨实例部署时手工填写。缺失 = 与「功能未启用」等价降级(§6 #3)。
+   */
+  tasklistGuid: z.string().min(1).optional(),
+}).strict();
+
 const GitCloneUrlSchema = z.string().min(1).refine(
   (value) => {
     if (/^https?:\/\/\S+$/i.test(value)) return true;
@@ -236,6 +250,11 @@ export const BotConfigSchema = z.object({
    * @default "claude"
    */
   backend: z.string().min(1).default("claude"),
+
+  /**
+   * 话题 ↔ 飞书任务句柄(docs/task-handle.md)。省略 = 功能关闭,行为不变。
+   */
+  taskHandle: TaskHandleConfigSchema.optional(),
 }).strict();
 
 /**

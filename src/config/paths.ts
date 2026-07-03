@@ -105,6 +105,18 @@ export function resolveLogsDir(botId?: string): string {
   return join(resolveLarkwayDir(botId), "logs");
 }
 
+/**
+ * Resolve the task-handle store path for a bot (thread ↔ Feishu task_guid
+ * claims — see docs/task-handle.md). Feature is per-bot and opt-in, so this
+ * is only ever read/written when `bot.taskHandle.enabled` is true.
+ *
+ * V1 mode: ~/.larkway/task-handles.json
+ * V2 mode: ~/.larkway/<botId>/task-handles.json
+ */
+export function resolveTaskHandlesPath(botId?: string): string {
+  return join(resolveLarkwayDir(botId), "task-handles.json");
+}
+
 function assertSafePathSegment(label: string, value: string): void {
   if (!/^[A-Za-z0-9_-]+$/.test(value)) {
     throw new Error(`${label} must be a safe path segment`);

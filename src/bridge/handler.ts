@@ -51,6 +51,7 @@ import {
 } from "./cardkitProgress.js";
 import type { RuntimeEventPatch } from "./eventLog.js";
 import type { RuntimeRequirement } from "../runtimeRequirements.js";
+import type { TaskHandleClaimPatch, TaskHandleLifecyclePatch } from "../tasklist/types.js";
 import {
   evaluateResponseSurfaceMentionPolicy,
   isResponseSurfaceCardKitAvailable,
@@ -585,6 +586,8 @@ export interface BridgeHandlerDeps {
     git_token_env?: string;       // preferred: generic git PAT env-var name
     gitlab_token_env?: string;    // compat alias (legacy)
     response_surface_prototype?: ResponseSurfacePrototypeConfig;
+    /** Only the tasklistGuid is prompt-relevant; enabled/admin stay provisioning-only. */
+    taskHandle?: { tasklistGuid?: string };
   };
   /**
    * Optional outbound post transport. main.ts only injects this when the bot's
@@ -639,6 +642,23 @@ export interface BridgeHandlerDeps {
    * confirmation or fall back to the host's normal environment.
    */
   runtimeRequirements?: RuntimeRequirement[];
+  /**
+   * Task-handle (docs/task-handle.md) mechanical writeback hook — fired at the
+   * three lifecycle points the bridge already computes (turn received /
+   * completed / failed). Business logic (which task, whether/how to mirror
+   * status) lives entirely in src/tasklist/writeback.ts; the handler only
+   * calls this — it never imports TaskHandleStore/TaskListClient directly.
+   * Best-effort by contract: a throw here is caught and logged, never
+   * propagated (mirrors recordRuntimeEvent's swallow-and-warn shape).
+   */
+  taskHandleLifecycle?: (patch: TaskHandleLifecyclePatch) => Promise<void>;
+  /**
+   * Task-handle claim hook — fired once per turn when the agent declared
+   * `task_handle.guid` in `.larkway/state.json`. This is the ONLY path that
+   * writes a new thread↔task claim; the handler does no matching/validation
+   * of its own (that's the agent's job via the SKILL).
+   */
+  taskHandleClaim?: (patch: TaskHandleClaimPatch) => Promise<void>;
 }
 
 // ---------------------------------------------------------------------------
@@ -811,6 +831,24 @@ export class BridgeHandler {
       reason: "已进入 bridge，准备创建处理卡片。",
     });
     await this.deps.client.addProcessingReaction?.(messageId);
+
+    // Task-handle mechanical writeback (docs/task-handle.md §5.1) — best-effort,
+    // never throws into the main dispatch. botId absent (V1/no-yaml) → no-op,
+    // since TaskHandleStore is always per-bot.
+    const invokeTaskHandleLifecycle = async (
+      fields: Omit<TaskHandleLifecyclePatch, "botId" | "threadId">,
+    ): Promise<void> => {
+      if (!this.deps.taskHandleLifecycle || !botId) return;
+      try {
+        await this.deps.taskHandleLifecycle({ botId, threadId, ...fields });
+      } catch (err) {
+        console.warn("[bridge.handler] taskHandleLifecycle hook failed (continuing):", err);
+      }
+    };
+    // "received": fires on every turn for this thread (new or continuation) so
+    // a previously-completed claimed task auto-reopens before the agent starts
+    // working on it again (docs/task-handle.md §4 step 4).
+    await invokeTaskHandleLifecycle({ status: "received" });
 
     // Step 2: session lookup — determines is_new_thread.
     const existing = this.deps.sessionStore.get(threadId, botId);
@@ -1327,6 +1365,7 @@ export class BridgeHandler {
           agentMemory: this.deps.agentMemory,
           larkCliProfile: this.deps.larkCliProfile,
           runtimeWarnings: this.runtimeWarnings(),
+          taskHandleTasklistGuid: this.deps.botConfig?.taskHandle?.tasklistGuid,
         });
 
         // Step 4c: spawn local agent backend.
@@ -1473,6 +1512,23 @@ export class BridgeHandler {
                   ? "本轮结束时未读取到 state.json。"
                   : "本轮 state.json 没有 fresh updated_at，已忽略旧状态。",
             });
+          }
+
+          // Task-handle claim declaration (docs/task-handle.md §5.2): the agent
+          // wrote `task_handle.guid` this turn — this is the ONLY path that
+          // records a new thread↔task claim. Best-effort, never blocks finalize.
+          const claimedTaskGuid = reportedState?.task_handle?.guid;
+          if (claimedTaskGuid && this.deps.taskHandleClaim && botId) {
+            try {
+              await this.deps.taskHandleClaim({
+                botId,
+                threadId,
+                chatId: parsed.chatId,
+                taskGuid: claimedTaskGuid,
+              });
+            } catch (err) {
+              console.warn("[bridge.handler] taskHandleClaim hook failed (continuing):", err);
+            }
           }
 
           // Thin-channel: NO dev_url HTTP probe, NO stage state-machine, NO
@@ -1783,6 +1839,15 @@ export class BridgeHandler {
             appendPath: "已完成",
             reason: "Agent 已结束，消息已确认。",
           });
+          // `success` here is the state.json/exitCode-derived business outcome
+          // (may be false even though the bridge dispatch itself completed
+          // cleanly, e.g. bot reported status=failed) — maps 1:1 onto the
+          // task-handle "completed"/"failed" writeback (docs/task-handle.md §5.1).
+          await invokeTaskHandleLifecycle(
+            success
+              ? { status: "completed", finalText: baseCardPayload.finalText }
+              : { status: "failed", failureReason: failureReason ?? baseCardPayload.finalText },
+          );
 
           // Success — exit the retry loop
           break;
@@ -1817,6 +1882,7 @@ export class BridgeHandler {
         appendPath: "异常",
         reason: String(err),
       });
+      await invokeTaskHandleLifecycle({ status: "failed", failureReason: String(err) });
 
       // Terminal FAILURE/ABORT: release the message from in-flight WITHOUT
       // marking it seen, so the next gap-fill window can re-dispatch it. This is
