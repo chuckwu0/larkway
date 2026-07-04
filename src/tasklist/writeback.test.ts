@@ -7,6 +7,7 @@ import { TaskListClient, type LarkTaskRequestConfig, type LarkTaskRequester } fr
 import {
   applyTaskHandleWriteback,
   mergeDescriptionSnapshot,
+  parseStatusSnapshotStatus,
   renderFailureComment,
   sanitizeSummary,
   STATUS_SNAPSHOT_MARKER,
@@ -52,22 +53,32 @@ describe("mergeDescriptionSnapshot", () => {
   it("appends the marker+block when no prior description", () => {
     const merged = mergeDescriptionSnapshot(undefined, { status: "completed", summary: "已完成", now: fixedNow });
     expect(merged.startsWith(STATUS_SNAPSHOT_MARKER)).toBe(true);
-    expect(merged).toContain("status: completed");
-    expect(merged).toContain("· ");
+    expect(merged).toContain("**状态**:已完成 (completed)");
+    expect(merged).toContain("**进展**");
+    expect(merged).toContain("- ");
     expect(merged).toContain("已完成");
   });
 
   it("renders the status line's updated_at in local YYYY-MM-DD HH:mm shape, not raw UTC ISO (V3)", () => {
     const merged = mergeDescriptionSnapshot(undefined, { status: "failed", summary: "boom", now: fixedNow });
-    const updatedAtLine = merged.split("\n").find((l) => l.startsWith("updated_at: "));
+    const updatedAtLine = merged.split("\n").find((l) => l.startsWith("**更新**:"));
     expect(updatedAtLine).toBeDefined();
-    expect(updatedAtLine).toMatch(/^updated_at: \d{4}-\d{2}-\d{2} \d{2}:\d{2}$/);
+    expect(updatedAtLine).toMatch(/^\*\*更新\*\*:\d{4}-\d{2}-\d{2} \d{2}:\d{2}$/);
     expect(updatedAtLine).not.toContain("T");
     expect(updatedAtLine).not.toContain("Z");
   });
 
-  it("preserves human content before the marker and keeps rolling log after it (V4)", () => {
-    const original = `人写的需求描述\n\n${STATUS_SNAPSHOT_MARKER}\nstatus: in_progress\nupdated_at: 07-01 10:00\n\n· 07-01 10:00 收到需求`;
+  it("keeps the marker line byte-for-byte stable — TasklistPoller's candidate filter keys off it (v3)", () => {
+    const merged = mergeDescriptionSnapshot(undefined, { status: "in_progress", summary: "认领了", now: fixedNow });
+    expect(merged.split("\n")[0]).toBe(STATUS_SNAPSHOT_MARKER);
+  });
+
+  it("preserves human content before the marker and keeps rolling log after it (V4, v3 template)", () => {
+    // Simulates a description a PRIOR v3-bridge turn already wrote (same
+    // format this version renders) — the "- " bullet must round-trip.
+    const original =
+      `人写的需求描述\n\n${STATUS_SNAPSHOT_MARKER}\n**状态**:进行中 (in_progress)\n**更新**:07-01 10:00\n\n` +
+      `**进展**\n- 07-01 10:00 收到需求`;
     const merged = mergeDescriptionSnapshot(original, { status: "completed", summary: "已完成", now: fixedNow });
     expect(merged.startsWith("人写的需求描述")).toBe(true);
     expect(merged).toContain("收到需求"); // earlier entry preserved
@@ -92,7 +103,7 @@ describe("mergeDescriptionSnapshot", () => {
     expect(description).toBeDefined();
     const bulletLines = description!
       .split("\n")
-      .filter((l) => l.trim().startsWith("· "))
+      .filter((l) => l.trim().startsWith("- "))
       .map((l) => l.trim());
     expect(bulletLines.length).toBe(5);
     // newest (turn-6) first, oldest surviving (turn-2) last; turn-1 dropped entirely
@@ -102,7 +113,7 @@ describe("mergeDescriptionSnapshot", () => {
   });
 
   it("rebuilds an empty log (no throw) when the existing block doesn't match the expected shape", () => {
-    const legacyBlob = `${STATUS_SNAPSHOT_MARKER}\nstatus: completed\nupdated_at: 2026-07-01T00:00:00.000Z\n\n旧版本整块覆盖的自由文本,没有 “· ” 前缀`;
+    const legacyBlob = `${STATUS_SNAPSHOT_MARKER}\nstatus: completed\nupdated_at: 2026-07-01T00:00:00.000Z\n\n旧版本整块覆盖的自由文本,没有 “- ” 前缀`;
     expect(() =>
       mergeDescriptionSnapshot(legacyBlob, { status: "completed", summary: "新一轮", now: fixedNow }),
     ).not.toThrow();
@@ -110,8 +121,34 @@ describe("mergeDescriptionSnapshot", () => {
     expect(merged).not.toContain("旧版本整块覆盖的自由文本");
     expect(merged).toContain("新一轮");
     // only the fresh entry — old unparseable blob contributed no log lines
-    const bulletCount = merged.split("\n").filter((l) => l.trim().startsWith("· ")).length;
+    const bulletCount = merged.split("\n").filter((l) => l.trim().startsWith("- ")).length;
     expect(bulletCount).toBe(1);
+  });
+
+  it("rebuilds an empty log for a pre-v3 block using the old '· ' bullet (template migration degrades gracefully)", () => {
+    const preV3Blob = `${STATUS_SNAPSHOT_MARKER}\nstatus: in_progress\nupdated_at: 07-01 10:00\n\n· 07-01 10:00 旧版本记录`;
+    const merged = mergeDescriptionSnapshot(preV3Blob, { status: "completed", summary: "新版本记录", now: fixedNow });
+    expect(merged).not.toContain("旧版本记录"); // old bullet char not recognized — dropped, not carried forward
+    expect(merged).toContain("新版本记录");
+    expect(merged).toContain("**状态**:已完成 (completed)");
+  });
+});
+
+describe("parseStatusSnapshotStatus", () => {
+  it("round-trips each status value through a rendered block", () => {
+    for (const status of ["completed", "in_progress", "failed"] as const) {
+      const merged = mergeDescriptionSnapshot(undefined, { status, summary: "x" });
+      expect(parseStatusSnapshotStatus(merged)).toBe(status);
+    }
+  });
+
+  it("returns undefined for a description with no status line", () => {
+    expect(parseStatusSnapshotStatus("纯人写的描述")).toBeUndefined();
+    expect(parseStatusSnapshotStatus(undefined)).toBeUndefined();
+  });
+
+  it("returns undefined for a pre-v3 (plain key-value) status line", () => {
+    expect(parseStatusSnapshotStatus(`${STATUS_SNAPSHOT_MARKER}\nstatus: completed`)).toBeUndefined();
   });
 });
 
@@ -222,7 +259,7 @@ describe("applyTaskHandleWriteback", () => {
     const descBody = (descPatch!.config.data as { task: { description: string } }).task.description;
     expect(descBody).toContain("原始需求");
     expect(descBody).toContain("已完成,见 MR");
-    expect(descBody).toContain("status: completed");
+    expect(descBody).toContain("**状态**:已完成 (completed)");
     const completePatch = patchCalls.find(
       (c) => (c.config.data as { update_fields: string[] }).update_fields.includes("completed_at"),
     );
@@ -243,11 +280,40 @@ describe("applyTaskHandleWriteback", () => {
     const patchCalls = calls.filter((c) => c.config.method === "PATCH");
     expect(patchCalls.length).toBe(1); // description only — no completed_at patch
     const descBody = (patchCalls[0]!.config.data as { task: { description: string } }).task.description;
-    expect(descBody).toContain("status: in_progress");
+    expect(descBody).toContain("**状态**:进行中 (in_progress)");
     expect(descBody).toContain("已派给下游 agent");
     expect(calls.some((c) => (c.config.data as { update_fields?: string[] })?.update_fields?.includes("completed_at"))).toBe(
       false,
     );
+  });
+
+  it("G: prefers the agent's short `note` over the full `finalText` for the description log entry", async () => {
+    const store = await TaskHandleStore.load(join(dir, "task-handles.json"));
+    await store.put({ threadId: "t1", taskGuid: "guid-1", chatId: "oc_1", claimedTs: 1 });
+    const { requester, calls } = makeFakeRequester({ task: { description: "原始需求" } });
+    const client = new TaskListClient(requester);
+    const longChatReply =
+      "已认领任务,后续这条话题的状态我会自动维护。回到正题——我们还停在讨论 COT 这个功能亮点上,你想先聊定位,还是直接钉功能范围?";
+
+    await applyTaskHandleWriteback(
+      {
+        botId: "b1",
+        threadId: "t1",
+        status: "completed",
+        finalText: longChatReply,
+        note: "已认领任务,自动维护本话题状态",
+        agentDeclaredDone: true,
+      },
+      { store, client },
+    );
+
+    const descPatch = calls.find(
+      (c) => (c.config.data as { update_fields: string[] })?.update_fields?.includes("description"),
+    );
+    const descBody = (descPatch!.config.data as { task: { description: string } }).task.description;
+    expect(descBody).toContain("已认领任务,自动维护本话题状态");
+    expect(descBody).not.toContain("回到正题");
+    expect(descBody).not.toContain("COT");
   });
 
   it("failed: posts a comment and reopens if it was completed", async () => {
@@ -270,6 +336,28 @@ describe("applyTaskHandleWriteback", () => {
     expect(reopenPatch).toBeDefined();
   });
 
+  it("G: failed branch also prefers `note` over `failureReason` for the description log entry (comment still uses failureReason)", async () => {
+    const store = await TaskHandleStore.load(join(dir, "task-handles.json"));
+    await store.put({ threadId: "t1", taskGuid: "guid-1", chatId: "oc_1", claimedTs: 1 });
+    const { requester, calls } = makeFakeRequester({ task: { description: "原始需求" } });
+    const client = new TaskListClient(requester);
+
+    await applyTaskHandleWriteback(
+      { botId: "b1", threadId: "t1", status: "failed", failureReason: "网络异常导致进程崩溃,堆栈略", note: "本轮失败,网络异常" },
+      { store, client },
+    );
+
+    const descPatch = calls.find(
+      (c) => (c.config.data as { update_fields: string[] })?.update_fields?.includes("description"),
+    );
+    const descBody = (descPatch!.config.data as { task: { description: string } }).task.description;
+    expect(descBody).toContain("本轮失败,网络异常");
+    expect(descBody).not.toContain("堆栈略");
+    const commentCall = calls.find((c) => c.config.url.includes("/comments"));
+    // the posted comment is a different artifact — still carries the full failureReason
+    expect((commentCall!.config.data as { content: string }).content).toContain("堆栈略");
+  });
+
   it("drops the mapping when the task is gone (404) — no auto-recreate", async () => {
     const store = await TaskHandleStore.load(join(dir, "task-handles.json"));
     await store.put({ threadId: "t1", taskGuid: "guid-1", chatId: "oc_1", claimedTs: 1 });
@@ -279,6 +367,27 @@ describe("applyTaskHandleWriteback", () => {
     await applyTaskHandleWriteback({ botId: "b1", threadId: "t1", status: "completed" }, { store, client });
 
     expect(store.get("t1")).toBeUndefined();
+  });
+
+  it("D: keeps the claim mapping on a permission-denied error (does NOT treat it as not-found)", async () => {
+    const store = await TaskHandleStore.load(join(dir, "task-handles.json"));
+    await store.put({ threadId: "t1", taskGuid: "guid-1", chatId: "oc_1", claimedTs: 1 });
+    const requester: LarkTaskRequester = {
+      request: vi.fn(async () => {
+        const err: { response: { status: number; data: { code: number; msg: string } } } = {
+          response: { status: 403, data: { code: 99999, msg: "no permission" } },
+        };
+        throw err;
+      }),
+    };
+    const client = new TaskListClient(requester);
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    await applyTaskHandleWriteback({ botId: "b1", threadId: "t1", status: "completed" }, { store, client });
+
+    expect(store.get("t1")).toBeDefined(); // NOT dropped — scope errors self-heal once granted
+    expect(warnSpy.mock.calls.some((call) => String(call[0]).includes("permission denied"))).toBe(true);
+    warnSpy.mockRestore();
   });
 
   it("never throws even when the client rejects unexpectedly", async () => {

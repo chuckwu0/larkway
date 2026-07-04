@@ -206,4 +206,92 @@ describe("CommentPoller", () => {
       text: "[任务评论] 还在等你处理",
     });
   });
+
+  // D: a missing task:comment scope used to be conflated with "task not
+  // found" (dropping the claim) and, since every poll cycle re-attempted and
+  // re-warned, spammed hundreds of warn lines/minute (mini dogfood). Both
+  // must be fixed: the mapping survives, and a second immediate poll cycle
+  // must not re-attempt the denied call (backoff).
+  describe("permission-denied handling (D)", () => {
+    function makePermissionDeniedRequester(): LarkTaskRequester {
+      const request = vi.fn(async () => {
+        const err: { response: { status: number } } = { response: { status: 403 } };
+        throw err;
+      });
+      return { request: request as unknown as LarkTaskRequester["request"] };
+    }
+
+    it("keeps the claim mapping on a permission-denied error (does not treat it as not-found)", async () => {
+      const store = await TaskHandleStore.load(join(dir, "task-handles.json"));
+      await store.put({ threadId: "t1", taskGuid: "guid-1", chatId: "oc_1", claimedTs: 1 });
+      const client = new TaskListClient(makePermissionDeniedRequester());
+      const enqueueSyntheticTurn = vi.fn();
+      const poller = new CommentPoller({ store, client, enqueueSyntheticTurn });
+
+      await poller.pollOnceForTest();
+
+      expect(store.get("t1")).toBeDefined();
+    });
+
+    it("does not re-attempt the API call on the very next poll cycle (backoff)", async () => {
+      const store = await TaskHandleStore.load(join(dir, "task-handles.json"));
+      await store.put({ threadId: "t1", taskGuid: "guid-1", chatId: "oc_1", claimedTs: 1 });
+      const requester = makePermissionDeniedRequester();
+      const client = new TaskListClient(requester);
+      const enqueueSyntheticTurn = vi.fn();
+      const poller = new CommentPoller({ store, client, enqueueSyntheticTurn });
+
+      await poller.pollOnceForTest();
+      const callsAfterFirst = (requester.request as ReturnType<typeof vi.fn>).mock.calls.length;
+      await poller.pollOnceForTest();
+      const callsAfterSecond = (requester.request as ReturnType<typeof vi.fn>).mock.calls.length;
+
+      expect(callsAfterFirst).toBe(1);
+      expect(callsAfterSecond).toBe(1); // second cycle skipped the call entirely — still backing off
+    });
+
+    it("resumes polling once the backoff window elapses and the scope is granted", async () => {
+      vi.useFakeTimers();
+      try {
+        const store = await TaskHandleStore.load(join(dir, "task-handles.json"));
+        // Pre-seed a cursor (as if a prior successful poll already happened) so
+        // the post-backoff success below is diffed against it, not treated as
+        // a first-ever poll (which would only seed the cursor, not emit).
+        await store.put({ threadId: "t1", taskGuid: "guid-1", chatId: "oc_1", claimedTs: 1, lastSeenCommentId: "c0" });
+        let denied = true;
+        const request = vi.fn(async (config: LarkTaskRequestConfig) => {
+          if (denied) {
+            const err: { response: { status: number } } = { response: { status: 403 } };
+            throw err;
+          }
+          if (config.url.includes("/comments")) {
+            return {
+              data: {
+                items: [
+                  { id: "c0", content: "old", created_at: "50", creator: { type: "user", id: "ou_1" } },
+                  { id: "c1", content: "现在能看到了", created_at: "100", creator: { type: "user", id: "ou_1" } },
+                ],
+                has_more: false,
+              },
+            };
+          }
+          return { data: {} };
+        });
+        const client = new TaskListClient({ request: request as unknown as LarkTaskRequester["request"] });
+        const enqueueSyntheticTurn = vi.fn();
+        const poller = new CommentPoller({ store, client, enqueueSyntheticTurn });
+
+        await poller.pollOnceForTest(); // denied — enters backoff (default interval = 60s)
+        denied = false;
+        vi.advanceTimersByTime(61_000); // past the backoff window
+        await poller.pollOnceForTest(); // scope now granted, backoff elapsed — should actually call + surface the comment
+
+        expect(enqueueSyntheticTurn).toHaveBeenCalledWith(
+          expect.objectContaining({ text: "[任务评论] 现在能看到了" }),
+        );
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+  });
 });

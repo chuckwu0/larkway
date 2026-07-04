@@ -710,3 +710,66 @@ describe("readStateFileDetailed — field-level degradation salvage (2026-07-02 
     }
   });
 });
+
+describe("StateFileSchema — task_handle", () => {
+  it("accepts guid alone (done/note both optional)", () => {
+    const r = StateFileSchema.safeParse({
+      status: "ready",
+      updated_at: "2026-07-04T12:00:00.000Z",
+      task_handle: { guid: "task-guid-1" },
+    });
+    expect(r.success).toBe(true);
+    if (r.success) {
+      expect(r.data.task_handle).toEqual({ guid: "task-guid-1" });
+    }
+  });
+
+  it("accepts guid + done + note together (v3 content-discipline field)", () => {
+    const r = StateFileSchema.safeParse({
+      status: "ready",
+      updated_at: "2026-07-04T12:00:00.000Z",
+      task_handle: { guid: "task-guid-1", done: true, note: "已完成,见 MR:xxx" },
+    });
+    expect(r.success).toBe(true);
+    if (r.success) {
+      expect(r.data.task_handle).toEqual({ guid: "task-guid-1", done: true, note: "已完成,见 MR:xxx" });
+    }
+  });
+
+  it("rejects task_handle missing guid at the raw schema level", () => {
+    const r = StateFileSchema.safeParse({
+      status: "ready",
+      last_message: "回复正文",
+      updated_at: "2026-07-04T12:00:00.000Z",
+      task_handle: { note: "缺 guid" },
+    });
+    expect(r.success).toBe(false);
+  });
+
+  it("a bad task_handle shape still salvages status/last_message via readStateFileDetailed (thin-channel leniency)", async () => {
+    // Same posture as the mr_url/content_blocks salvage tests above:
+    // task_handle.guid is the one hard-required sub-field, but a bad
+    // task_handle shape must not take the bridge's actual hard need
+    // (status/last_message) down with it.
+    const dir = await mkdtemp(join(tmpdir(), "larkway-state-"));
+    try {
+      await mkdir(join(dir, ".larkway"), { recursive: true });
+      await writeFile(
+        stateFilePathOf(dir),
+        JSON.stringify({
+          status: "ready",
+          last_message: "task_handle 字段坏了也要活下来",
+          task_handle: { note: "缺 guid" },
+        }),
+        "utf8",
+      );
+
+      const result = await readStateFileDetailed(dir);
+      expect(result.state?.status).toBe("ready");
+      expect(result.state?.last_message).toBe("task_handle 字段坏了也要活下来");
+      expect(result.state?.task_handle).toBeUndefined();
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+});

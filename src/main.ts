@@ -44,6 +44,7 @@ import { TaskHandleStore } from "./tasklist/store.js";
 import { TaskListClient, type LarkTaskRequester } from "./tasklist/client.js";
 import { applyTaskHandleWriteback } from "./tasklist/writeback.js";
 import { CommentPoller } from "./tasklist/commentPoller.js";
+import { TasklistPoller } from "./tasklist/tasklistPoller.js";
 import { readTeamTasklistGuid } from "./tasklist/teamRegistry.js";
 
 /** How often the bridge rewrites each bot's status.json liveness heartbeat. */
@@ -204,6 +205,18 @@ async function runV2Mode({
   }
 
   const instances: BotInstance[] = [];
+
+  // Task-handle v3 "候选注入": one TasklistPoller per UNIQUE tasklistGuid,
+  // shared by every bot configured with that guid (see the construction loop
+  // right after `for (const bot of healthyBots)` below for why this is
+  // deferred to a second pass — isClaimedByAnyBot needs every sharing bot's
+  // TaskHandleStore, not just whichever bot's iteration happens to see the
+  // guid first). `taskHandleCandidatesLookup` closures captured inside the
+  // per-bot loop read this map by reference, so they safely resolve to the
+  // real poller even though it's populated after the loop finishes — nothing
+  // reads a candidate snapshot before the bridge's main loop starts.
+  const tasklistPollersByGuid = new Map<string, TasklistPoller>();
+  const tasklistGuidGroups = new Map<string, { client: TaskListClient; stores: TaskHandleStore[] }>();
 
   for (const bot of healthyBots) {
     const appSecret = process.env[bot.app_secret_env]!;
@@ -382,6 +395,7 @@ async function runV2Mode({
     let taskHandleLifecycle: ((patch: import("./tasklist/types.js").TaskHandleLifecyclePatch) => Promise<void>) | undefined;
     let taskHandleClaim: ((patch: import("./tasklist/types.js").TaskHandleClaimPatch) => Promise<void>) | undefined;
     let taskHandleClaimedLookup: ((threadId: string) => boolean) | undefined;
+    let taskHandleCandidatesLookup: (() => readonly import("./tasklist/types.js").TaskCandidate[]) | undefined;
     let taskCommentPoller: CommentPoller | undefined;
     {
       const guid = bot.taskHandle?.tasklistGuid ?? (await readTeamTasklistGuid(resolveTaskTeamRegistryPath()));
@@ -417,6 +431,17 @@ async function runV2Mode({
         // `task_handle_claimed: yes|no` so the SKILL can offer a one-tap claim
         // button only when this thread genuinely has no claim yet.
         taskHandleClaimedLookup = (threadId) => taskHandleStore.get(threadId) !== undefined;
+        // Dedup group for the shared TasklistPoller (v3) — this bot's store
+        // joins whichever group already exists for `guid` (first bot to see
+        // it seeds the group's client; every later bot just adds its store so
+        // isClaimedByAnyBot checks ALL of them). The poller itself is
+        // constructed once, after this whole per-bot loop, in the pass below.
+        {
+          const group = tasklistGuidGroups.get(guid) ?? { client: taskListClient, stores: [] };
+          group.stores.push(taskHandleStore);
+          tasklistGuidGroups.set(guid, group);
+        }
+        taskHandleCandidatesLookup = () => tasklistPollersByGuid.get(guid)?.getCandidates() ?? [];
         taskCommentPoller = new CommentPoller({
           store: taskHandleStore,
           client: taskListClient,
@@ -522,6 +547,7 @@ async function runV2Mode({
       taskHandleLifecycle,
       taskHandleClaim,
       taskHandleClaimedLookup,
+      taskHandleCandidatesLookup,
     });
 
     const housekeeping = new Housekeeping({
@@ -543,6 +569,25 @@ async function runV2Mode({
     void fetchBotAvatar(bot.app_id, appSecret).then((url) => {
       if (url) inst.avatar = url;
     });
+  }
+
+  // ── Tasklist candidate pollers (v3 "候选注入", dedup by guid) ─────────────
+  // Constructed here, AFTER every bot's TaskHandleStore is loaded, so each
+  // poller's isClaimedByAnyBot sees every bot sharing that guid — not just
+  // whichever bot happened to resolve the guid first during the loop above.
+  // Exactly one poller per unique tasklistGuid regardless of how many bots
+  // share it (see the loop above's own comment for why that matters — the
+  // same multi-bot-storm lesson CommentPoller already learned).
+  const tasklistPollers: TasklistPoller[] = [];
+  for (const [guid, group] of tasklistGuidGroups) {
+    const poller = new TasklistPoller({
+      client: group.client,
+      tasklistGuid: guid,
+      isClaimedByAnyBot: (taskGuid) => group.stores.some((s) => s.list().some((r) => r.taskGuid === taskGuid)),
+    });
+    poller.start();
+    tasklistPollersByGuid.set(guid, poller);
+    tasklistPollers.push(poller);
   }
 
   // ── Banner ────────────────────────────────────────────────────────────────
@@ -619,6 +664,10 @@ async function runV2Mode({
         await client.close();
       }),
     );
+    // TasklistPollers are shared across bots (not per-instance), so they're
+    // stopped once here rather than inside the per-instance map above — same
+    // await-drain reasoning as taskCommentPoller.stop() (M1).
+    await Promise.all(tasklistPollers.map((p) => p.stop()));
     console.log("[larkway] V2 shutdown complete.");
     process.exit(0);
   }
@@ -642,6 +691,7 @@ async function runV2Mode({
         await client.close();
       }),
     );
+    await Promise.all(tasklistPollers.map((p) => p.stop()));
     return;
   }
 

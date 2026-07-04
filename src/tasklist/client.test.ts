@@ -3,6 +3,7 @@ import {
   TaskApiError,
   TaskListClient,
   isTaskNotFoundError,
+  isPermissionDeniedError,
   type LarkTaskRequestConfig,
   type LarkTaskRequester,
 } from "./client.js";
@@ -248,5 +249,76 @@ describe("isTaskNotFoundError", () => {
   it("does not flag an unrelated error", () => {
     expect(isTaskNotFoundError(new TaskApiError("rate limited", { status: 429 }))).toBe(false);
     expect(isTaskNotFoundError(new Error("plain error"))).toBe(false);
+  });
+
+  // D: previously a "no permission" message was conflated with "not found",
+  // which made a missing scope grant look like a deleted task and dropped
+  // the claim mapping. Must NOT match here anymore — see isPermissionDeniedError.
+  it("does not flag a permission-denied error", () => {
+    expect(isTaskNotFoundError(new TaskApiError("no permission", { status: 403 }))).toBe(false);
+    expect(isTaskNotFoundError(new TaskApiError("user has no access to this resource", {}))).toBe(false);
+  });
+});
+
+describe("isPermissionDeniedError", () => {
+  it("recognizes a TaskApiError with status 403", () => {
+    expect(isPermissionDeniedError(new TaskApiError("boom", { status: 403 }))).toBe(true);
+  });
+
+  it("recognizes english permission-denied phrasing", () => {
+    expect(isPermissionDeniedError(new TaskApiError("no permission to access this task", {}))).toBe(true);
+    expect(isPermissionDeniedError(new TaskApiError("access denied", {}))).toBe(true);
+  });
+
+  it("recognizes Chinese permission-denied phrasing", () => {
+    expect(isPermissionDeniedError(new TaskApiError("无权限访问", {}))).toBe(true);
+  });
+
+  it("does not flag a not-found error", () => {
+    expect(isPermissionDeniedError(new TaskApiError("task not found", { status: 404 }))).toBe(false);
+  });
+
+  it("does not flag an unrelated error", () => {
+    expect(isPermissionDeniedError(new TaskApiError("rate limited", { status: 429 }))).toBe(false);
+    expect(isPermissionDeniedError(new Error("plain error"))).toBe(false);
+  });
+});
+
+describe("TaskListClient.listTasklistTasks", () => {
+  it("maps list items into TaskSnapshot entries", async () => {
+    const client = new TaskListClient(
+      fakeRequester(() => ({
+        data: {
+          items: [{ guid: "t1", summary: "标题", description: "描述", completed_at: "0" }],
+          has_more: false,
+        },
+      })),
+    );
+    const { tasks, hasMore } = await client.listTasklistTasks("tl-1");
+    expect(tasks).toEqual([{ guid: "t1", summary: "标题", description: "描述", completedAt: "0" }]);
+    expect(hasMore).toBe(false);
+  });
+
+  it("requests the tasklist's own /tasks sub-resource", async () => {
+    let captured: LarkTaskRequestConfig | undefined;
+    const client = new TaskListClient(
+      fakeRequester((config) => {
+        captured = config;
+        return { data: { items: [], has_more: false } };
+      }),
+    );
+    await client.listTasklistTasks("tl-1", { pageToken: "p1", pageSize: 10 });
+    expect(captured?.method).toBe("GET");
+    expect(captured?.url).toBe("/open-apis/task/v2/tasklists/tl-1/tasks");
+    expect(captured?.params).toMatchObject({ page_size: 10, page_token: "p1" });
+  });
+
+  it("wraps a failure into a TaskApiError (best-effort swallowing happens one layer up)", async () => {
+    const client = new TaskListClient(
+      fakeRequester(() => {
+        throw new Error("boom");
+      }),
+    );
+    await expect(client.listTasklistTasks("tl-1")).rejects.toThrow(TaskApiError);
   });
 });

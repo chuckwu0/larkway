@@ -1,7 +1,9 @@
 # 话题 ↔ 飞书任务句柄(Task Handle)
 
-> 状态:v2 设计定稿(2026-07,团队共享单清单模型,取代 v1 的每群一清单)。本文是该 feature 的权威设计文档;实现以此为准。
+> 状态:v3 补丁(2026-07,bridge 侧候选轮询 + 权限/404 拆分,基于 v2 的团队共享单清单模型)。本文是该 feature 的权威设计文档;实现以此为准。
 > 原则依据:[principles.md](principles.md)。飞书平台能力结论均经过实测验证(见 §9 平台事实)。
+>
+> **v3 改了什么、为什么**:v2 上线后 dogfood 暴露三个问题——① 每轮 prompt 都指令 agent 自己调 `lark-cli task tasklists tasks` 查一遍清单,绝大多数从未转过任务的话题也要白付这个调用+判断;② 认领只挂在"agent 恰好这一轮跑" 上,用户转完任务不追问就永远不认领;③ 403(缺 scope)被误判成 404(任务已删),静默丢认领映射还刷屏。v3 只解决①③(候选注入 + 权限/404 拆分);②(纯 bridge 侧按标题精确自动绑定)因为话题根消息文本在 bridge 侧从未持久化(见下方"未采纳项"),留待以后有了这份数据再做,本次未实现。
 
 ## 1. 一句话
 
@@ -48,21 +50,33 @@
 
 | 组件 | 位置 | 职责 |
 |---|---|---|
-| **task-handle SKILL** | agent workspace(仓库随附样例,adopter 自行安装) | 教 agent:每轮静默检索清单自动认领(无用户交互,高置信才认领、歧义就跳过自愈)、把 task_guid 写入 state.json、干活中如何发里程碑评论/刷描述(全部经 `lark-cli task` 命令) |
+| **task-handle SKILL** | agent workspace(仓库随附样例,adopter 自行安装) | 教 agent:从 prompt 注入的候选里挑(v3 起不再自己调 `lark-cli` 列清单)、高置信才认领、歧义就跳过自愈、把 task_guid 写入 state.json、干活中如何发里程碑评论/刷描述(全部经 `lark-cli task` 命令) |
 | **state.json 声明** | 既有 agent→bridge 结构化通道扩展 | 新增可选字段 `task_handle: { guid }`;bridge 在 finalize 时读取并持久化 thread↔task 映射 |
-| **tasklist 模块** | `src/tasklist/`(独立于 bridge/,仿 housekeeping 的 class+timer 形状) | ① provisioning:建共享清单、把群加为成员(member type=chat)、把兄弟 agent app 加为 editor(CLI 子命令,一次性,不在消息路径上);② 机械回写:接收 bridge 注入的生命周期事件,按已声明的 task_guid 调飞书任务 API(完成/reopen/失败标注);③ 评论轮询:仅扫**已认领**任务的评论,发现新评论合成 turn |
-| **bridge 改动(极小)** | `src/bridge/handler.ts` | 仅新增一个可选注入 hook 调用(仿 recordRuntimeEvent 形状),把 status/threadId/finalText 传给 tasklist 模块;不含任何任务逻辑 |
+| **TasklistPoller**(v3 新增) | `src/tasklist/tasklistPoller.ts`(仿 CommentPoller 的 class+timer 形状) | 每个**唯一 tasklistGuid** 在进程内只跑一个实例(多 bot 共享同一 guid 时去重,同 CommentPoller 的教训);定期列清单,筛出"未完成 + 未被任何 bot 认领 + 从未被 bridge 写回过"的候选,缓存成一个供 prompt 读取的零 I/O 快照(`getCandidates()`)。只做结构性筛选,**不做匹配判断**——匹配仍是 agent 的活 |
+| **tasklist 模块(其余部分)** | `src/tasklist/`(独立于 bridge/) | ① provisioning:建共享清单、把兄弟 agent app 加为 editor(CLI 子命令,一次性,不在消息路径上);② 机械回写:接收 bridge 注入的生命周期事件,按已声明的 task_guid 调飞书任务 API(完成/reopen/失败标注),权限错误(缺 scope)与真正的 404 分开处理(见 §6);③ 评论轮询:仅扫**已认领**任务的评论,发现新评论合成 turn,权限错误按任务退避避免刷屏 |
+| **bridge 改动(极小)** | `src/bridge/handler.ts` | 新增两个可选注入 hook 调用(仿 recordRuntimeEvent 形状):① 把 status/threadId/finalText 传给 tasklist 模块做机械回写;② 每轮读一次 TasklistPoller 的候选快照传给 prompt。都是纯数据搬运,不含任何任务逻辑 |
 | **存储** | `<LARKWAY_HOME>/<botId>/task-handles.json` | thread↔task_guid 认领映射;原子写(tmp+rename),照 SessionStore 范式 |
 
 ### 5.2 关键设计决策
 
 - **认领 = agent 每轮静默自动做,不用户驱动**(2026-07 修订:v2 初版曾设计「用户说一声/点按钮」,dogfood 反馈用户已经手动转过一次任务、认领应是无感的后台动作,不该再要求二次触发)。理由:① agent 手握根消息全文与会话上下文,匹配远比 bridge 可靠;② 歧义就静默跳过、下一轮自愈,不需要用户介入消解(不像 v1 设想的 choices 卡片那样打扰用户);③ 消除跨实例认领竞态(声明经 state.json 串行落盘);④ 符合 thin-bridge 判据与 ownership 原则。
 - **双 @ 竞态兜底**:两个 agent 同话题在同一轮都满足认领条件时,先在任务评论区追加「认领声明」再回读评论列表,时间序在前者胜;败者静默放弃(不告诉用户),下一轮 `task_handle_claimed` 事实会显示已认领,自然不再重试。低频场景,确定性规则即可。
-- **发现轮询不存在**:bridge/模块**不**扫描清单找新任务(v1 的做法,已废——会重演多 bot 定时器风暴)。认领由人触发、agent 执行。
+- **发现轮询的边界(v3 修订)**:v1 的"bridge 后台轮询清单、按标题配对认领"被否决过(§5 顶部的历史记录),原因是**配对判断**被塞进了 bridge。v3 的 TasklistPoller 恰好只做前半句——轮询——不做后半句——配对:它只把"哪些任务结构上还没人认领"缓存成一份候选快照喂给 prompt,是否认领、认领哪一个,仍然 100% 是 agent 在 turn 内的判断。这解决了 v2 遗留的性能问题(每轮 prompt 都指令 agent 自己查一遍清单,没转任务的话题也要白付一次 API 调用),同时不违反 thin-bridge:候选提取是结构性事实(完成?已认领?bridge 碰过没?),不是业务判断。多 bot 共享同一 guid 时只跑一个 poller 实例(main.ts 按 guid 去重),避免重演 v1 那版设计真正的风险——多 bot 定时器风暴。
 - **评论轮询规模可控**:只轮询本 bot 已认领的任务(用户精选的少数),默认 60s 间隔 + 抖动;这是「第二信箱」,分钟级延迟可接受。
 - **里程碑评论克制**:仅交付/失败/等拍板三类节点发评论(每条都会推送给人,滥发 = 通知骚扰);过程性状态只刷描述(不推送)。
 - **人改的字段永不覆盖**:任务标题、人在描述外自行添加的内容,agent/bridge 一律不动;bridge 只覆盖写自己维护的描述状态日志区块。
 - **完成语义由 agent 声明,不是 turn 成功即勾**(dogfood v1.1 修复):`state.json` 的 `task_handle` 支持可选 `done` 布尔字段;只有 agent 在真正对用户交付的那一轮写 `done: true`,bridge 才把任务勾完成。省略/`false`(如把活派给下游 agent、自己这轮只是正常收尾)时,`status=completed` 仍会刷新描述日志,但不勾完成、不触发 reopen——避免把"turn 正常结束"错误等同于"任务已交付"。
+- **状态块人类友好化 + 内容纪律**(v3 dogfood 修复):早期模板是纯 `key: value`(`status: in_progress` / `updated_at: ...` / `· ` 前缀),机读但难读——任务描述是给人在飞书任务中心扫一眼看进展的,不是调试日志。v3 改成 Markdown 排版(粗体标签、`-` 列表),机器可读值保留在括号里(`**状态**:进行中 (in_progress)`,见 `parseStatusSnapshotStatus`),`--- larkway status ---` 分隔线本身**不变**——TasklistPoller 的候选过滤靠它判断"这个任务 bridge 碰过没"。同一次 dogfood 还暴露另一个问题:agent 把整段聊天回复(含跟任务无关的闲聊)倒进了滚动日志——这不是模板问题,是内容问题:`state.json` 的 `task_handle` 新增可选字段 `note`(一句话里程碑摘要,跟完整回复 `last_message`是两回事),SKILL 要求每次声明都带上、只写"认领/关键进展/阻塞/下一步"，严禁粘贴聊天回复原文;省略 `note` 时 bridge 退化为整段使用 `last_message`/失败原因(能用但容易读起来像日志)。bridge 侧仍有 `sanitizeSummary` 的机械长度兜底(单条 >200 字符截断加省略号),但那只防"写太长",防不了"写错内容"——这是本条修复的核心教训:**格式好看不能替代内容克制**,两者都要做。
+
+  最终模板样例(`已认领` + 一条后续进展):
+  ```
+  --- larkway status ---
+  **状态**:进行中 (in_progress)
+  **更新**:2026-07-04 11:53
+
+  **进展**
+  - 07-04 11:53 已认领任务,自动维护本话题状态
+  ```
 
 ### 5.3 归属与隐私边界(v2:团队共享单清单)
 
@@ -78,7 +92,8 @@
 1. **任务回写永远 best-effort,绝不阻塞/失败 agent 主流程**(容错模式照 recordRuntimeEvent 的 swallow-and-warn 先例)。
 2. **任务/清单被人删除**:停止回写、记一条日志,**不自动重建 owner 未主动要的东西**;清单本身只有 §7 的 `tasklist-init` CLI 能建(bot 在 startup 时只做只读解析,从不自动建清单——见下一条),owner 需要重新手动跑一次 CLI 才能恢复。
 3. **真正的开关 = 有没有清单,不是配置字段**(v2):去掉 `taskHandle.enabled`。bot 在 startup 时只做只读解析(yaml 里的 `tasklistGuid`,或共享注册文件里已有的 guid)——**清单本身只由 §7 的 `tasklist-init` CLI 建一次,bot 自己从不自动建**(F1 修正:早期设计曾让 bot 在 startup 时自动 createTasklist,已删除——没有 owner 身份的自动建清单既建不出 owner 能看到的板,又让每个 bot 每次启动都发一次可能失败的网络调用;二者都无必要)。省略 `taskHandle:`/两处都查不到 guid → 与「功能未启用」**行为完全一致**(agent 照常干活,无任务镜像,不报错、不刷屏,**零网络调用**)。⚠️ 实现铁律:降级必须**密不透风**——bot 唯一还会发的 task API 调用是「已知 guid 时把自己加为 editor」(幂等 self-join),这个调用的任何失败也绝不能冒出错误卡/刷屏。
-4. **prompt 注入只在「清单已 provision」时发,不跟随任何 enable 标志**——否则没用这个 feature 的部署每轮白背 task-handle prompt 脚手架(与性能优化冲突)。gate 在「tasklistGuid 已知/已建」。
+4. **prompt 注入只在「清单已 provision」时发,不跟随任何 enable 标志**——否则没用这个 feature 的部署每轮白背 task-handle prompt 脚手架(与性能优化冲突)。gate 在「tasklistGuid 已知/已建」。v3 追加一层:即使清单已 provision,`<task-handle>` 块也只在「本话题已认领」或「候选非空」时才渲染——没转过任务的话题(绝大多数)看到的是零字节的 task-handle prompt 开销。
+5. **权限错误(缺 scope)≠ 资源已删除**(v3,D 项修复):`isTaskNotFoundError` 只认真正的 404/"不存在";403 或"no permission"类消息走独立的 `isPermissionDeniedError` 分支——**不删认领映射**(scope 补上就自愈),只打一条可行动的日志(提示去开放平台后台补 `task:task:read`/`task:comment` 等 scope),且 CommentPoller 对这类错误按任务指数退避(封顶 30 分钟)避免每个轮询周期都重试+刷屏。此前两者共用一个正则,一个缺 scope 的 bot 会把认领映射当"任务已删"误删,还在日志里骗人说"task not found"(mini 实测:403 每分钟刷几百行)。
 
 ## 7. 配置与权限(v2)
 
@@ -126,6 +141,8 @@ taskHandle:
 5. **任务字段变更有事件**:可选订阅上述事件感知「人手动改名/勾完成」,保持本地映射新鲜。
 6. **清单成员支持 `type=chat`**:一次调用把整个群加为清单成员;任务级成员仅 user/app。
 7. **任务评论会触发任务助手推送**(对创建者/关注者)—— agent 发里程碑评论即免费获得「主动通知人」的通道。
+8. **清单下任务列表接口未经真机核实**(v3 新增,待验证项):`GET /tasklists/:tasklist_guid/tasks`(TasklistPoller 用来发现候选)是照着已验证的 `/tasklists/:tasklist_guid/members` 的 URL 形状 + `getTask` 已验证的任务对象形状拼出来的,本实现开发环境无网络访问,没能像 get/patch/members 那样对一次真实响应核实过。首次跑起来后建议观察一次真实候选是否正确出现。
+9. **话题根消息文本在 bridge 侧没有持久化落点**(v3 调研结论,决定了「候选注入」为何止步于候选、没有做成 bridge 侧自动精确绑定):`SessionRecord`(`src/claude/sessionStore.ts`)和 `TaskHandleRecord`(`src/tasklist/store.ts`)都不存标题/正文字段;`handler.ts` 里离得最近的是 `RuntimeEventRecord.textPreview`(120 字符截断,滚动日志上限 20 条,不是稳定的 per-thread 索引)。要拿到某个历史话题的根消息原文,只能像 gap-fill(`channelClient.ts` 的 `+chat-messages-list`)那样现查,不是一次廉价的内存读。所以 v3 没有做「候选 summary 与某话题标题字符串相等就由 bridge 直接绑定」——这需要新增一次不便宜的实时查询,不满足"机械/确定性且低成本"的 bridge 铁律;这项匹配继续留给 agent(它手里已经有当前话题的根消息原文,零额外成本)。
 
 ## 10. 开源定位与路线
 

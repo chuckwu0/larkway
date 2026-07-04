@@ -901,6 +901,56 @@ describe("renderPrompt — advisory runtime warnings", () => {
 });
 
 // ---------------------------------------------------------------------------
+// task-handle v3: candidate injection (docs/task-handle.md §5.1)
+// ---------------------------------------------------------------------------
+
+describe("renderPrompt — task-handle candidate injection (v3)", () => {
+  it("renders no <task-handle> block when the bot has no tasklistGuid", async () => {
+    const prompt = await renderPrompt(makeInput({}));
+    expect(prompt).not.toContain("<task-handle>");
+  });
+
+  it("renders no <task-handle> block when unclaimed and there are no candidates (the common case — zero overhead)", async () => {
+    const prompt = await renderPrompt(
+      makeInput({ taskHandleTasklistGuid: "tl-1", taskHandleClaimed: false, taskHandleCandidates: [] }),
+    );
+    expect(prompt).not.toContain("<task-handle>");
+  });
+
+  it("renders the lifecycle-maintenance block when this thread is already claimed, ignoring any candidates", async () => {
+    const prompt = await renderPrompt(
+      makeInput({
+        taskHandleTasklistGuid: "tl-1",
+        taskHandleClaimed: true,
+        taskHandleCandidates: [{ guid: "should-not-appear", summary: "不应该出现" }],
+      }),
+    );
+    expect(prompt).toContain("<task-handle>");
+    expect(prompt).toContain("task_handle_tasklist_guid: tl-1");
+    expect(prompt).toContain("task_handle_claimed: yes");
+    expect(prompt).not.toContain("should-not-appear");
+    expect(prompt).toContain("</task-handle>");
+  });
+
+  it("renders the candidate list when unclaimed and candidates are present", async () => {
+    const prompt = await renderPrompt(
+      makeInput({
+        taskHandleTasklistGuid: "tl-1",
+        taskHandleClaimed: false,
+        taskHandleCandidates: [
+          { guid: "t1", summary: "帮我修一下登录页" },
+          { guid: "t2", summary: "写个周报", descriptionExcerpt: "本周进展摘要" },
+        ],
+      }),
+    );
+    expect(prompt).toContain("task_handle_claimed: no");
+    expect(prompt).toContain("guid=t1 | summary=帮我修一下登录页");
+    expect(prompt).toContain("guid=t2 | summary=写个周报 | description: 本周进展摘要");
+    expect(prompt).toContain("不要为了消歧义去调用 lark-cli 列清单");
+  });
+});
+
+// ---------------------------------------------------------------------------
 // larkCliProfile: --profile injection into lark-cli command examples (BL-19)
 // ---------------------------------------------------------------------------
 

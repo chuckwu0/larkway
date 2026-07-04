@@ -15,6 +15,7 @@ import fs from "node:fs/promises";
 import type { ParsedMessage } from "../lark/message.js";
 import { deriveTriggerFacts } from "../agent/triggerFacts.js";
 import { ANSWER_BEGIN_MARKER, ANSWER_END_MARKER } from "../agent/answerChannel.js";
+import type { TaskCandidate } from "../tasklist/types.js";
 
 /** Memory category files watched for the over-size hint (D9). */
 export const MEMORY_CATEGORY_FILE_NAMES = [
@@ -251,6 +252,20 @@ export interface RenderPromptInput {
    */
   taskHandleClaimed?: boolean;
   /**
+   * v3 "候选注入" (docs/task-handle.md §5.1): unclaimed candidate tasks the
+   * bridge's TasklistPoller found in the shared tasklist, when this thread
+   * hasn't claimed one yet. Ignored when `taskHandleClaimed` is true (the
+   * lifecycle-maintenance text is rendered instead). This REPLACES the old
+   * design where the agent queried `lark-cli task tasklists tasks` itself
+   * every turn — that cost a list call + judgment pass on every turn in every
+   * thread, even the overwhelming majority that never transferred anything.
+   * An empty array (the common case: nothing new to claim) renders NO
+   * `<task-handle>` block at all — zero prompt overhead, matching §6.4's
+   * "no enable flag, gate on live capability" contract.
+   * @default []
+   */
+  taskHandleCandidates?: readonly TaskCandidate[];
+  /**
    * A2 (perf plan): neutral fact lines for agent-workspace files whose mtime
    * has advanced since the bridge last told the agent (see
    * src/agent/mtimeFacts.ts). Rendered verbatim in `<workspace-file-changes>`.
@@ -392,16 +407,46 @@ function renderTurnTakingHint(limit: number): string[] {
 /**
  * Render the `<task-handle>` fact block (thin bridge — see docs/task-handle.md
  * §3): the tasklist GUID pointer, whether THIS thread already has a claimed
- * task (dogfood fix V2 — a plain fact lookup, no bridge judgment), and a
- * one-line pointer at the SKILL that owns the actual claim/writeback flow.
- * Called only when the bot has a configured tasklistGuid.
+ * task (dogfood fix V2 — a plain fact lookup, no bridge judgment), and —
+ * v3 "候选注入" — the bounded list of unclaimed candidate tasks the bridge's
+ * TasklistPoller already found, when there's something to look at. Bridge
+ * only extracts/filters candidates by structural fact (completed? already
+ * claimed by any bot? already bridge-touched?); it never guesses which
+ * candidate matches this thread — that judgment is the SKILL's job.
+ *
+ * Called only when the bot has a configured tasklistGuid. Returns an empty
+ * array (no block rendered at all) when there's nothing actionable this
+ * turn: unclaimed AND no candidates — the common case for the overwhelming
+ * majority of threads that never transferred anything into the tasklist.
  */
-function renderTaskHandleBlock(tasklistGuid: string, claimed: boolean): string[] {
+function renderTaskHandleBlock(
+  tasklistGuid: string,
+  claimed: boolean,
+  candidates: readonly TaskCandidate[],
+): string[] {
+  if (claimed) {
+    return [
+      "<task-handle>",
+      `task_handle_tasklist_guid: ${tasklistGuid}`,
+      "task_handle_claimed: yes",
+      "本话题已认领任务句柄;bridge 已自动维护完成/失败/reopen,按 task-handle skill 处理里程碑评论与 done 声明即可。",
+      "</task-handle>",
+    ];
+  }
+  if (candidates.length === 0) return [];
   return [
     "<task-handle>",
     `task_handle_tasklist_guid: ${tasklistGuid}`,
-    `task_handle_claimed: ${claimed ? "yes" : "no"}`,
-    "本群启用了任务句柄;若本话题尚未认领,按 task-handle skill 静默自认领流程处理。",
+    "task_handle_claimed: no",
+    "以下是该共享清单里当前未被任何 agent 认领的候选任务(bridge 只做结构性筛选,不做匹配判断):",
+    ...candidates.map(
+      (c) =>
+        `- guid=${c.guid} | summary=${c.summary}` +
+        (c.descriptionExcerpt ? ` | description: ${c.descriptionExcerpt}` : ""),
+    ),
+    "仅当其中一个候选与本话题高置信对应(summary 与本话题根消息原文一致,或是其强前缀且非「帮我」「跟进一下」" +
+      "这类泛化短语)时,才静默把该 guid 写入 state.json 的 task_handle.guid;歧义(零个或多个候选都像)就什么都不做," +
+      "不要为了消歧义去调用 lark-cli 列清单——候选已经在这里,判断不到就是这一轮没有匹配。",
     "</task-handle>",
   ];
 }
@@ -608,6 +653,7 @@ export async function renderPrompt(input: RenderPromptInput): Promise<string> {
     runtimeWarnings = [],
     taskHandleTasklistGuid,
     taskHandleClaimed = false,
+    taskHandleCandidates = [],
     mtimeFacts = [],
   } = input;
   const backend = input.backend ?? "claude";
@@ -636,7 +682,7 @@ export async function renderPrompt(input: RenderPromptInput): Promise<string> {
     ? renderTurnTakingHint(turn_taking_limit)
     : [];
   const taskHandleBlock = taskHandleTasklistGuid
-    ? renderTaskHandleBlock(taskHandleTasklistGuid, taskHandleClaimed)
+    ? renderTaskHandleBlock(taskHandleTasklistGuid, taskHandleClaimed, taskHandleCandidates)
     : [];
   const runtimeWarningsBlock = renderRuntimeWarningsBlock(runtimeWarnings);
   // Workspace warm-up block — rendered for all bots that have at least one repo.

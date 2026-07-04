@@ -14,11 +14,20 @@
  */
 
 import type { TaskHandleStore } from "./store.js";
-import { TaskListClient, isTaskNotFoundError, type TaskComment } from "./client.js";
+import { TaskListClient, isTaskNotFoundError, isPermissionDeniedError, type TaskComment } from "./client.js";
 
 const DEFAULT_INTERVAL_MS = 60_000;
 const DEFAULT_JITTER_MS = 10_000;
 const COMMENT_PREFIX = "[任务评论] ";
+/**
+ * Permission-denied backoff (D — mini dogfood: a missing `task:comment`
+ * scope produced 403s on every ~60s poll cycle, hundreds of warn lines/
+ * minute). Doubles from the poll interval up to a 30-minute ceiling per task,
+ * so a persistently missing scope grant degrades to an occasional retry
+ * instead of a per-cycle log flood; a successful poll (scope granted) clears
+ * the backoff immediately.
+ */
+const PERMISSION_BACKOFF_CEILING_MS = 30 * 60_000;
 
 export interface SyntheticCommentTurn {
   threadId: string;
@@ -102,6 +111,12 @@ export class CommentPoller {
    * Starts pre-resolved so a stop() before any poll ever ran doesn't hang.
    */
   #inFlight: Promise<void> = Promise.resolve();
+  /**
+   * threadId -> next-eligible-retry-time + current backoff width, for tasks
+   * currently denied by scope (§D). In-memory only — a bridge restart resets
+   * the backoff, which is fine (worst case: one extra denied attempt).
+   */
+  readonly #permissionBackoff = new Map<string, { nextAttemptAt: number; backoffMs: number }>();
 
   constructor(deps: CommentPollerDeps, opts: CommentPollerOptions = {}) {
     this.#deps = deps;
@@ -163,8 +178,15 @@ export class CommentPoller {
   async #pollOne(threadId: string): Promise<void> {
     const record = this.#deps.store.get(threadId);
     if (!record) return; // dropped between list() snapshot and now
+
+    // §D: still backing off a known scope-denial for this thread — skip the
+    // API call entirely rather than re-attempting (and re-warning) every cycle.
+    const backoff = this.#permissionBackoff.get(threadId);
+    if (backoff && Date.now() < backoff.nextAttemptAt) return;
+
     try {
       const { comments } = await this.#deps.client.listComments(record.taskGuid);
+      this.#permissionBackoff.delete(threadId); // a successful call clears any prior backoff
       const { newComments, nextCursorId } = selectNewComments(comments, record.lastSeenCommentId);
 
       for (const comment of newComments) {
@@ -188,6 +210,23 @@ export class CommentPoller {
             "dropping claim mapping (no auto-recreate, per docs/task-handle.md §6.2)",
         );
         await this.#deps.store.delete(threadId).catch(() => {});
+        this.#permissionBackoff.delete(threadId);
+        return;
+      }
+      if (isPermissionDeniedError(err)) {
+        // §D: missing scope is recoverable by the operator, not "task gone" —
+        // never drop the mapping. Back off exponentially (capped) so a
+        // persistently missing scope degrades to an occasional log instead of
+        // spamming one warning per poll cycle for every claimed task.
+        const nextBackoffMs = Math.min(backoff ? backoff.backoffMs * 2 : this.#intervalMs, PERMISSION_BACKOFF_CEILING_MS);
+        this.#permissionBackoff.set(threadId, { nextAttemptAt: Date.now() + nextBackoffMs, backoffMs: nextBackoffMs });
+        console.warn(
+          `[tasklist.commentPoller] permission denied polling comments for task ${record.taskGuid} ` +
+            `(thread ${threadId}) — likely a missing task:comment scope grant; go authorize it in the ` +
+            `Feishu open-platform console. Claim mapping kept; backing off comment polling for this ` +
+            `task for ${Math.round(nextBackoffMs / 1000)}s.`,
+          err,
+        );
         return;
       }
       console.warn(`[tasklist.commentPoller] poll failed for thread ${threadId} (continuing):`, err);

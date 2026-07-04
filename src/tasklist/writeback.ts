@@ -3,11 +3,11 @@
  *
  * Mechanical bridge→task writeback (docs/task-handle.md §5.1 "机械回写").
  * Pure business-free plumbing: given a lifecycle patch the bridge already
- * computed (status/finalText/failureReason/agentDeclaredDone), look up the
- * thread's claimed task and mirror status onto it. No judgment calls beyond
- * the fixed rules below — anything that requires interpretation (which task,
- * whether to claim, milestone wording) is the agent's job, done in-turn via
- * the SKILL.
+ * computed (status/finalText/failureReason/agentDeclaredDone/note), look up
+ * the thread's claimed task and mirror status onto it. No judgment calls
+ * beyond the fixed rules below — anything that requires interpretation
+ * (which task, whether to claim, milestone wording) is the agent's job, done
+ * in-turn via the SKILL.
  *
  * Degradation contract (§6), enforced here:
  *   1. Best-effort, never throws back to the caller (applyTaskHandleWriteback
@@ -18,25 +18,66 @@
  *   5. Never touch a title or anything a human wrote outside the bridge's own
  *      description block (see mergeDescriptionSnapshot).
  *
- * Description block shape (dogfood fix V4): a fixed status line (state + the
- * bridge machine's LOCAL time, not UTC — dogfood fix V3) followed by a
- * rolling log of the last 5 per-turn summaries (newest first), instead of the
- * old "overwrite the whole block with this turn's finalText" shape — the old
- * shape silently destroyed every earlier turn's summary on each write.
+ * Description block shape (v3 human-friendly template, 2026-07 dogfood fix):
+ * a markdown-flavored status line (bold labels, not raw `key: value`) followed
+ * by a rolling log of the last 5 per-turn summaries under a "**进展**"
+ * heading (newest first). Two prior shapes led here:
+ *   - dogfood fix V4 introduced the rolling log (replacing the original
+ *     "overwrite the whole block with this turn's finalText" shape, which
+ *     silently destroyed every earlier turn's summary on each write);
+ *   - v3 replaced V4's machine `status: x` / `updated_at: x` plain key-value
+ *     lines with bold Markdown labels — a task description is read by a
+ *     human in the Feishu task center, not parsed by a machine, and the raw
+ *     key-value form read like a debug log. The machine-readable status
+ *     value is kept in parens (`**状态**:进行中 (in_progress)`) so a future
+ *     consumer can still parse it (see {@link parseStatusSnapshotStatus}) —
+ *     nothing in this codebase currently needs to (writeback always derives
+ *     status from the live `completed_at` API field, never from the
+ *     description text it wrote itself).
+ *   {@link STATUS_SNAPSHOT_MARKER} itself is UNCHANGED and must stay that way
+ *   — src/tasklist/tasklistPoller.ts's candidate filter keys off this exact
+ *   literal substring to detect "has the bridge ever touched this task".
+ *
+ * Content discipline (v3, dogfood fix): each log entry's `summary` SHOULD be
+ * the agent's `task_handle.note` (a short milestone-only fact) rather than
+ * the full `finalText`/`failureReason` — dogfood caught an agent's ENTIRE
+ * chat reply (multi-paragraph, off-topic asides included) landing verbatim
+ * in a task description meant to be scannable at a glance. `sanitizeSummary`
+ * below is a mechanical length backstop (it truncates anything over
+ * {@link SUMMARY_MAX_LEN} chars), but that only catches "too long" — it
+ * can't catch "on-topic length, wrong content" (the dogfood screenshot was
+ * under 200 chars and still wrong). The real fix is the SKILL instructing
+ * the agent to set `note` explicitly; `note` absent is a graceful but
+ * imperfect degradation to the full text, not a hard error.
  */
 
 import type { TaskHandleLifecyclePatch } from "./types.js";
 import type { TaskHandleStore } from "./store.js";
-import { TaskListClient, isTaskNotFoundError } from "./client.js";
+import { TaskListClient, isTaskNotFoundError, isPermissionDeniedError } from "./client.js";
 
-/** Marks the start of the bridge-owned status block inside a task's description. */
+/**
+ * Marks the start of the bridge-owned status block inside a task's
+ * description. MUST stay this exact literal string — src/tasklist/
+ * tasklistPoller.ts's candidate filter (`isBridgeTouched`) does a plain
+ * substring match on it to decide "has the bridge ever written back to this
+ * task", which is how cross-bot duplicate-claim candidates get excluded. Any
+ * future template change must keep this line byte-for-byte unchanged.
+ */
 export const STATUS_SNAPSHOT_MARKER = "--- larkway status ---";
 
 /** Rolling log cap (dogfood fix V4 §"最近 5 条轮次日志"). */
 const MAX_LOG_ENTRIES = 5;
-/** Per-entry summary cap, after markdown cleanup (dogfood fix V4). */
+/** Per-entry summary cap, after markdown cleanup (dogfood fix V4) — mechanical length backstop, see module doc's "content discipline" note. */
 const SUMMARY_MAX_LEN = 200;
-const LOG_LINE_PREFIX = "· ";
+/** v3: markdown list bullet (was "· ") so the rolling log reads as a normal Markdown list. */
+const LOG_LINE_PREFIX = "- ";
+
+/** 中文人类可读状态标签,配上机器可读的英文枚举值(括号内)——见 {@link renderDescriptionBlock} / {@link parseStatusSnapshotStatus}。 */
+const STATUS_LABELS: Record<"completed" | "in_progress" | "failed", string> = {
+  completed: "已完成",
+  in_progress: "进行中",
+  failed: "失败",
+};
 
 function pad2(n: number): string {
   return String(n).padStart(2, "0");
@@ -89,10 +130,15 @@ export function sanitizeSummary(raw: string): string {
  *
  * A description with no marker (never touched by the bridge, or predating
  * this format) or whose block body doesn't contain any recognizable
- * `LOG_LINE_PREFIX` lines (e.g. the old single-blob "status/updated_at/
- * finalText" shape, or genuine corruption) is NOT an error — per dogfood fix
- * V4 spec, a parse failure just rebuilds an EMPTY log (never throws); only
- * the human part before the marker (if any) survives.
+ * `LOG_LINE_PREFIX` lines (e.g. an older bridge version's bullet character,
+ * the original single-blob "status/updated_at/finalText" shape, or genuine
+ * corruption) is NOT an error — per dogfood fix V4 spec, a parse failure just
+ * rebuilds an EMPTY log (never throws); only the human part before the
+ * marker (if any) survives. This is also how the v3 template migration
+ * degrades: a block written by a pre-v3 bridge uses a different bullet
+ * character, so its old log entries are dropped (not carried forward) the
+ * first time a v3 bridge writes to it — acceptable, same tolerance the V4
+ * migration already relied on.
  */
 function splitDescription(original: string | undefined): { humanPart: string; logEntries: string[] } {
   const base = original ?? "";
@@ -120,6 +166,9 @@ function splitDescription(original: string | undefined): { humanPart: string; lo
  * Pure function — no I/O, easy to unit test without a fake network client.
  * `entries` must already be newest-first and capped by the caller
  * ({@link mergeDescriptionSnapshot} does both).
+ *
+ * v3 human-friendly template: bold Markdown labels instead of raw
+ * `key: value` lines (see module doc). The marker line itself is untouched.
  */
 function renderDescriptionBlock(input: {
   status: "completed" | "in_progress" | "failed";
@@ -128,13 +177,32 @@ function renderDescriptionBlock(input: {
 }): string {
   const lines = [
     STATUS_SNAPSHOT_MARKER,
-    `status: ${input.status}`,
-    `updated_at: ${formatLocalDateTime(input.now)}`,
+    `**状态**:${STATUS_LABELS[input.status]} (${input.status})`,
+    `**更新**:${formatLocalDateTime(input.now)}`,
   ];
   if (input.entries.length > 0) {
-    lines.push("", ...input.entries.map((entry) => `${LOG_LINE_PREFIX}${entry}`));
+    lines.push("", "**进展**", ...input.entries.map((entry) => `${LOG_LINE_PREFIX}${entry}`));
   }
   return lines.join("\n");
+}
+
+/**
+ * Extract the machine-readable status value from a rendered description
+ * block, if present. The v3 template keeps it in parens after the Chinese
+ * label (`**状态**:进行中 (in_progress)`) specifically so the human-friendly
+ * rendering doesn't sacrifice parseability. Nothing in this codebase
+ * currently calls this (writeback always derives status from the live
+ * `completed_at` API field, never re-parses its own description text) — it
+ * exists so a future consumer (e.g. a dashboard reading raw task
+ * descriptions) doesn't have to invent its own parsing. Returns undefined
+ * for anything that doesn't match, including pre-v3 descriptions.
+ */
+export function parseStatusSnapshotStatus(
+  description: string | undefined,
+): "completed" | "in_progress" | "failed" | undefined {
+  if (!description) return undefined;
+  const match = description.match(/\*\*状态\*\*:.*\((completed|in_progress|failed)\)/);
+  return match ? (match[1] as "completed" | "in_progress" | "failed") : undefined;
 }
 
 export interface MergeDescriptionInput {
@@ -228,9 +296,12 @@ export async function applyTaskHandleWriteback(
         // it just handed off to a downstream agent/peer) the log is still
         // refreshed, but neither `complete()` nor a reopen is called.
         const isDone = patch.agentDeclaredDone === true;
+        // Content discipline (v3): prefer the agent's short milestone `note`
+        // over the full chat-reply `finalText` — see module doc. `note`
+        // absent (agent didn't set one) degrades to the old behavior.
         const description = mergeDescriptionSnapshot(task.description, {
           status: isDone ? "completed" : "in_progress",
-          summary: patch.finalText ?? "",
+          summary: patch.note ?? patch.finalText ?? "",
         });
         await deps.client.patchDescription(record.taskGuid, description);
         if (isDone) {
@@ -239,9 +310,14 @@ export async function applyTaskHandleWriteback(
         break;
       }
       case "failed": {
+        // Same content-discipline preference as the completed branch above —
+        // only affects the description LOG entry; the posted failure comment
+        // below still uses the full failureReason (renderFailureComment is a
+        // different artifact with its own truncation, not this dogfood fix's
+        // target).
         const description = mergeDescriptionSnapshot(task.description, {
           status: "failed",
-          summary: patch.failureReason ?? "",
+          summary: patch.note ?? patch.failureReason ?? "",
         });
         await deps.client.patchDescription(record.taskGuid, description);
         await deps.client.addComment(record.taskGuid, renderFailureComment(patch.failureReason));
@@ -253,6 +329,21 @@ export async function applyTaskHandleWriteback(
       }
     }
   } catch (err) {
+    // Permission-denied (missing scope grant, e.g. task:task:write) is
+    // recoverable by the operator and NOT the same as "task is gone" — it
+    // must not be logged with the misleading "not found" phrasing, and (per
+    // isTaskNotFoundError's narrowing above) it never reaches the getTask
+    // catch's not-found branch, so the mapping is correctly left in place —
+    // it self-heals the next turn once the scope is granted.
+    if (isPermissionDeniedError(err)) {
+      console.warn(
+        `[tasklist.writeback] permission denied writing back thread ${patch.threadId}'s task ` +
+          `(status=${patch.status}) — likely a missing task:task:write/task:comment scope grant; ` +
+          "go authorize it in the Feishu open-platform console. Claim mapping kept (will retry next turn).",
+        err,
+      );
+      return;
+    }
     console.warn(
       `[tasklist.writeback] best-effort writeback failed for thread ${patch.threadId} (status=${patch.status}):`,
       err,

@@ -58,7 +58,7 @@ import {
 import type { RuntimeEventPatch } from "./eventLog.js";
 import type { PerfSample } from "./perfLog.js";
 import type { RuntimeRequirement } from "../runtimeRequirements.js";
-import type { TaskHandleClaimPatch, TaskHandleLifecyclePatch } from "../tasklist/types.js";
+import type { TaskCandidate, TaskHandleClaimPatch, TaskHandleLifecyclePatch } from "../tasklist/types.js";
 import {
   evaluateResponseSurfaceMentionPolicy,
   isResponseSurfaceCardKitAvailable,
@@ -703,6 +703,16 @@ export interface BridgeHandlerDeps {
    * button). Absent or returning false when the feature isn't configured.
    */
   taskHandleClaimedLookup?: (threadId: string) => boolean;
+  /**
+   * v3 "候选注入" (docs/task-handle.md §5.1): reads the bridge's TasklistPoller
+   * cache — a plain in-memory snapshot read, no I/O, safe to call once per
+   * turn at prompt-build time. Not thread-scoped (candidates aren't matched
+   * to a thread by the bridge at all — that judgment is the agent's, via the
+   * SKILL); the handler injects the SAME candidate list into every unclaimed
+   * thread's prompt and lets the agent decide whether any of them is a
+   * confident match for ITS OWN thread context.
+   */
+  taskHandleCandidatesLookup?: () => readonly TaskCandidate[];
 }
 
 // ---------------------------------------------------------------------------
@@ -1531,6 +1541,7 @@ export class BridgeHandler {
           runtimeWarnings: this.runtimeWarnings(),
           taskHandleTasklistGuid: this.deps.botConfig?.taskHandle?.tasklistGuid,
           taskHandleClaimed: this.deps.taskHandleClaimedLookup?.(threadId) ?? false,
+          taskHandleCandidates: this.deps.taskHandleCandidatesLookup?.() ?? [],
           mtimeFacts,
         });
 
@@ -2126,8 +2137,13 @@ export class BridgeHandler {
                   status: "completed",
                   finalText: baseCardPayload.finalText,
                   agentDeclaredDone: reportedState?.task_handle?.done === true,
+                  note: reportedState?.task_handle?.note,
                 }
-              : { status: "failed", failureReason: failureReason ?? baseCardPayload.finalText },
+              : {
+                  status: "failed",
+                  failureReason: failureReason ?? baseCardPayload.finalText,
+                  note: reportedState?.task_handle?.note,
+                },
           );
 
           // Success — exit the retry loop

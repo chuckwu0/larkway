@@ -60,20 +60,53 @@ export class TaskApiError extends Error {
 }
 
 /**
- * Heuristic "task/tasklist no longer exists or app lost access" detector.
- * Feishu wraps most business errors in an HTTP 200 envelope
- * (`{code, msg, data}`) rather than a 4xx, so we can't rely on status alone —
- * we also pattern-match the message. This is intentionally permissive: a
- * false positive here just means writeback.ts drops a mapping it could have
- * kept (§6 already tolerates "user re-claims after re-transaction"); a false
- * negative just means one extra best-effort retry next turn. Documented as a
- * known soft spot in the final report — tightening it needs live API access
- * to see the real error codes.
+ * Heuristic "task/tasklist no longer exists" detector. Feishu wraps most
+ * business errors in an HTTP 200 envelope (`{code, msg, data}`) rather than a
+ * 4xx, so we can't rely on status alone — we also pattern-match the message.
+ * This is intentionally permissive: a false positive here just means
+ * writeback.ts drops a mapping it could have kept (§6 already tolerates
+ * "user re-claims after re-transaction"); a false negative just means one
+ * extra best-effort retry next turn. Documented as a known soft spot in the
+ * final report — tightening it needs live API access to see the real error
+ * codes.
+ *
+ * Deliberately does NOT match "no permission"/"no access" — see
+ * {@link isPermissionDeniedError}. The two used to be conflated under one
+ * regex, which made a missing `task:comment` scope grant (self-inflicted,
+ * fixable in the open-platform console) look identical to "the task was
+ * deleted" — writeback.ts/commentPoller.ts would silently drop the claim
+ * mapping and log a misleading "task not found" for what was actually a
+ * scope problem (mini dogfood: 403 spam, hundreds of lines/minute, from a bot
+ * missing `task:comment` scope).
  */
 export function isTaskNotFoundError(err: unknown): boolean {
   if (err instanceof TaskApiError) {
     if (err.status === 404) return true;
-    if (typeof err.message === "string" && /not.?found|不存在|resource_not_exist|no permission|no.access/i.test(err.message)) {
+    if (typeof err.message === "string" && /not.?found|不存在|resource_not_exist/i.test(err.message)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Detects "we lack/lost access" (missing scope grant, revoked membership) as
+ * distinct from "the resource is gone" ({@link isTaskNotFoundError}). Same
+ * HTTP-200-envelope caveat applies: Feishu wraps business errors, so status
+ * alone isn't reliable and this pattern-matches the message too. Callers
+ * treat this as recoverable-by-operator (grant the scope) rather than
+ * permanent — see writeback.ts / commentPoller.ts for the differentiated
+ * handling (no mapping drop, actionable log, and — for the periodic
+ * commentPoller — a backoff so a persistently missing scope doesn't spam a
+ * warning on every poll cycle).
+ */
+export function isPermissionDeniedError(err: unknown): boolean {
+  if (err instanceof TaskApiError) {
+    if (err.status === 403) return true;
+    if (
+      typeof err.message === "string" &&
+      /no permission|no.access|forbidden|access.denied|无权限|未授权/i.test(err.message)
+    ) {
       return true;
     }
   }
@@ -347,6 +380,51 @@ export class TaskListClient {
       throw new TaskApiError(`[tasklist.client] createTasklist(${name}) returned no guid`, {});
     }
     return { guid };
+  }
+
+  /**
+   * List tasks belonging to a tasklist (used by TasklistPoller,
+   * src/tasklist/tasklistPoller.ts, for the v3 "候选注入" candidate
+   * discovery). URL pattern (`GET /tasklists/:tasklist_guid/tasks`) mirrors
+   * the already-verified `/tasklists/:tasklist_guid/members` shape used by
+   * {@link addTasklistMembers}, and the returned task shape is the same one
+   * `getTask` already maps — but unlike get/patch/members, this exact
+   * endpoint was NOT independently checked against a live response (this
+   * feature's dev environment has no network access, per docs/task-handle.md
+   * §9's standing caveat). Treat as best-effort like every other tasklist
+   * call: TasklistPoller swallows failures and keeps its previous candidate
+   * snapshot rather than propagating.
+   */
+  async listTasklistTasks(
+    tasklistGuid: string,
+    opts: { pageToken?: string; pageSize?: number } = {},
+  ): Promise<{ tasks: TaskSnapshot[]; hasMore: boolean; pageToken?: string }> {
+    const label = `listTasklistTasks(${tasklistGuid})`;
+    let resp: { data?: { items?: Record<string, unknown>[]; has_more?: boolean; page_token?: string } };
+    try {
+      resp = await this.#request(
+        {
+          method: "GET",
+          url: `${TASK_V2_BASE}/tasklists/${encodeURIComponent(tasklistGuid)}/tasks`,
+          params: {
+            user_id_type: "open_id",
+            page_size: opts.pageSize ?? 50,
+            page_token: opts.pageToken,
+          },
+        },
+        label,
+      );
+    } catch (err) {
+      wrapErr(label, err);
+    }
+    const items = resp.data?.items ?? [];
+    const tasks: TaskSnapshot[] = items.map((task) => ({
+      guid: String(task["guid"] ?? task["id"] ?? ""),
+      summary: typeof task["summary"] === "string" ? task["summary"] : undefined,
+      description: typeof task["description"] === "string" ? task["description"] : undefined,
+      completedAt: typeof task["completed_at"] === "string" ? task["completed_at"] : undefined,
+    }));
+    return { tasks, hasMore: Boolean(resp.data?.has_more), pageToken: resp.data?.page_token };
   }
 
   /**
