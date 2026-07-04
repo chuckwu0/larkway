@@ -11,13 +11,15 @@
  *     enough (CodexProcessPool).
  *   - `claude -p --input-format stream-json --output-format stream-json` has
  *     no such multiplexing: a process handles exactly ONE turn at a time and
- *     --resume/--model/--effort/cwd are all spawn-time-only flags (confirmed
- *     by spike: `/Users/chuck/.claude/jobs/6d3ccb94/tmp/persistent_test.mjs`
- *     + `interrupt_test.mjs` and their run logs). So this pool keeps one warm
- *     child PER (thread, cwd, model, effort) combination — every parameter a
- *     spawn would otherwise need to bake in — and never tries to "reuse
- *     across a config change"; a change in any of them retires the old child
- *     and cold-starts a fresh one under the new key (see #computeKey below).
+ *     --resume/--model/--effort/cwd are all spawn-time-only flags (verified
+ *     against a local `claude` CLI build in 2026-07 by driving the stream-json
+ *     protocol directly over a spawned child's stdin/stdout — no public spec
+ *     for this protocol exists, hence the cold-fallback net described below).
+ *     So this pool keeps one warm child PER (thread, cwd, model, effort)
+ *     combination — every parameter a spawn would otherwise need to bake in —
+ *     and never tries to "reuse across a config change"; a change in any of
+ *     them retires the old child and cold-starts a fresh one under the new
+ *     key (see #computeKey below).
  *
  * Spike-confirmed wire protocol (no `claude` SDK, no public spec — this is
  * the CLI's internal stream-json protocol, reverse-engineered from behavior;
@@ -61,7 +63,7 @@
  */
 
 import { execFile, spawn, type ChildProcess } from "node:child_process";
-import { mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { createInterface } from "node:readline";
 import { randomUUID } from "node:crypto";
@@ -91,6 +93,10 @@ const SIGKILL_GRACE_MS = 5_000;
 const INTERRUPT_GRACE_MS = 3_000;
 /** Same default as the cold runner (src/claude/runner.ts) when a turn's caller doesn't set one. */
 const DEFAULT_TURN_TIMEOUT_MS = 15 * 60 * 1000;
+/** shutdown()'s bounded wait for each destroyed entry's real exit — longer than SIGKILL_GRACE_MS so that backstop gets a chance to fire first. */
+const SHUTDOWN_EXIT_WAIT_MS = SIGKILL_GRACE_MS + 2_000;
+/** Diagnostic-only cap on a warm entry's buffered stderr (#appendStderrChunk) — only the tail ever matters for the died-before-first-output warning, so this bounds an otherwise-unbounded buffer over a long-lived process's life. */
+const STDERR_BUFFER_CAP_BYTES = 64 * 1024;
 
 // ---------------------------------------------------------------------------
 // Per-turn / per-process state
@@ -193,6 +199,15 @@ export class ClaudeProcessPool implements AgentRunner {
   #nextUnkeyedId = 1;
   #shuttingDown = false;
   #idleSweepTimer: ReturnType<typeof setInterval> | undefined;
+  /**
+   * Serializes every #rewritePidListBestEffort() call through one chain so
+   * overlapping writeFile(tmp)+rename pairs (fired from #spawnEntry,
+   * #onEntryExit) can never land out of order on the fs thread pool — each
+   * write's snapshot is taken when its OWN turn in the chain runs (i.e. after
+   * every #entries mutation queued ahead of it), so the LAST call is
+   * guaranteed to be the LAST rename to land on disk.
+   */
+  #pidListWriteChain: Promise<void> = Promise.resolve();
 
   constructor(opts: ClaudeProcessPoolOptions) {
     this.#botId = opts.botId;
@@ -324,9 +339,43 @@ export class ClaudeProcessPool implements AgentRunner {
         t.unref?.();
       }),
     ]);
-    for (const entry of [...this.#entries.values()]) {
+    const entries = [...this.#entries.values()];
+    for (const entry of entries) {
       this.#destroyEntry(entry, "pool shutdown");
     }
+    // Bounded wait for each child's REAL exit — not just the SIGTERM send.
+    // #onEntryExit only removes a pid from the on-disk list once the OS
+    // confirms the process is actually gone (see its own doc), and
+    // #killEntryChild's SIGKILL backstop is an unref()'d 5s timer that would
+    // never get a chance to fire if the whole bridge process calls
+    // process.exit() (main.ts, right after shutdown() resolves) before then.
+    // SHUTDOWN_EXIT_WAIT_MS is deliberately longer than SIGKILL_GRACE_MS so
+    // that backstop still gets its shot. A child that STILL hasn't died
+    // after the wait is simply left running with its pid still recorded on
+    // disk — the next boot's reapOrphanedWarmClaudeProcesses sweep picks it
+    // up; we never force-remove it from the list on a timeout.
+    await Promise.all(entries.map((entry) => this.#waitForEntryExit(entry, SHUTDOWN_EXIT_WAIT_MS)));
+    // Ensure the post-exit pid-list rewrite(s) #onEntryExit just queued above
+    // have actually landed on disk before returning.
+    await this.#pidListWriteChain;
+  }
+
+  /** Resolves once `entry.child` has actually exited, or after `timeoutMs` — whichever comes first. Never rejects. */
+  #waitForEntryExit(entry: PoolEntry, timeoutMs: number): Promise<void> {
+    const child = entry.child;
+    if (child.exitCode != null || child.signalCode != null) return Promise.resolve();
+    return new Promise((resolve) => {
+      const onExit = () => {
+        clearTimeout(timer);
+        resolve();
+      };
+      child.once("exit", onExit);
+      const timer = setTimeout(() => {
+        child.removeListener("exit", onExit);
+        resolve();
+      }, timeoutMs);
+      timer.unref?.();
+    });
   }
 
   // -- key computation ---------------------------------------------------------
@@ -566,7 +615,7 @@ export class ClaudeProcessPool implements AgentRunner {
     };
     this.#entries.set(key, entry);
     void this.#writeRunnerPidFileBestEffort(entry);
-    void this.#rewritePidListBestEffort();
+    this.#rewritePidListBestEffort();
 
     // A write after the child has died (e.g. a stale interrupt racing the
     // process's own exit) would otherwise surface as an unhandled 'error' on
@@ -574,7 +623,7 @@ export class ClaudeProcessPool implements AgentRunner {
     child.stdin?.on("error", () => {
       /* surfaced via the child's own 'error'/'exit' handlers below */
     });
-    child.stderr.on("data", (chunk: Buffer) => entry.stderrChunks.push(chunk));
+    child.stderr.on("data", (chunk: Buffer) => this.#appendStderrChunk(entry, chunk));
 
     child.on("error", (err) => this.#onEntryExit(entry, err instanceof Error ? err : new Error(String(err))));
     child.on("exit", () => this.#onEntryExit(entry, new Error("claude process exited")));
@@ -636,7 +685,10 @@ export class ClaudeProcessPool implements AgentRunner {
     const wasAlreadyMarkedDestroyed = entry.destroyed;
     entry.destroyed = true;
     if (this.#entries.get(entry.key) === entry) this.#entries.delete(entry.key);
-    void this.#rewritePidListBestEffort();
+    // The OS has now confirmed this child is actually gone — safe to drop it
+    // from the on-disk list (see #destroyEntry's doc for why that must NOT
+    // happen any earlier, e.g. at the moment SIGTERM is merely sent).
+    this.#rewritePidListBestEffort();
     void this.#deleteRunnerPidFileIfMine(entry);
 
     const state = entry.current;
@@ -671,7 +723,12 @@ export class ClaudeProcessPool implements AgentRunner {
     if (entry.destroyed) return;
     entry.destroyed = true;
     if (this.#entries.get(entry.key) === entry) this.#entries.delete(entry.key);
-    void this.#rewritePidListBestEffort();
+    // Deliberately NOT rewriting the on-disk pid list here: that would drop
+    // this pid from the list the instant SIGTERM is SENT, before the child
+    // has actually exited. A child that ignores/slow-handles SIGTERM would
+    // then be invisible to reapOrphanedWarmClaudeProcesses even though it's
+    // still alive. #onEntryExit (fired only once the OS confirms the exit)
+    // is the single place the pid list gets rewritten.
     console.warn(`[claude-pool] tearing down warm process pid=${entry.child.pid ?? "?"} (key=${entry.key}): ${reason}`);
     this.#killEntryChild(entry);
   }
@@ -750,12 +807,26 @@ export class ClaudeProcessPool implements AgentRunner {
   }
 
   /**
-   * Atomically (write-tmp-then-rename) persist the full set of currently-live
-   * warm child pids, so a hard kill of the WHOLE bridge process (which skips
-   * every entry's own exit-time cleanup) leaves a list {@link
-   * reapOrphanedWarmClaudeProcesses} can sweep at next boot.
+   * Queues an atomic (write-tmp-then-rename) rewrite of the full set of
+   * currently-live warm child pids, so a hard kill of the WHOLE bridge
+   * process (which skips every entry's own exit-time cleanup) leaves a list
+   * {@link reapOrphanedWarmClaudeProcesses} can sweep at next boot.
+   *
+   * Chained through `#pidListWriteChain` (not fired standalone): call sites
+   * (#spawnEntry, #onEntryExit) can fire in quick succession, and overlapping
+   * writeFile(tmp)+rename pairs would otherwise complete on the fs thread
+   * pool in arbitrary order — an EARLIER call's rename landing AFTER a LATER
+   * call's would leave a stale snapshot (e.g. missing a pid that was actually
+   * still live) as the final file content. Each link in the chain takes its
+   * `#entries` snapshot when it actually RUNS, so by construction the last
+   * queued call is always the last one to land on disk.
    */
-  async #rewritePidListBestEffort(): Promise<void> {
+  #rewritePidListBestEffort(): void {
+    if (this.#pidListFilePath == null) return;
+    this.#pidListWriteChain = this.#pidListWriteChain.then(() => this.#writePidListSnapshot());
+  }
+
+  async #writePidListSnapshot(): Promise<void> {
     if (this.#pidListFilePath == null) return;
     try {
       const list = [...this.#entries.values()]
@@ -769,17 +840,72 @@ export class ClaudeProcessPool implements AgentRunner {
       /* best-effort — worst case the boot-time orphan sweep has a stale/empty list */
     }
   }
+
+  /**
+   * Bounds a warm entry's buffered stderr (only ever read once, in the
+   * died-before-first-output warning) so a long-lived process — each turn
+   * resets its 10-min idle clock, so it can outlive any single turn by a lot
+   * — can't accumulate unbounded memory from recurring stderr noise (node
+   * warnings, CLI diagnostics, MCP chatter, …). Keeps only the tail, which is
+   * all the warning ever needs.
+   */
+  #appendStderrChunk(entry: PoolEntry, chunk: Buffer): void {
+    entry.stderrChunks.push(chunk);
+    let total = 0;
+    for (const c of entry.stderrChunks) total += c.length;
+    while (total > STDERR_BUFFER_CAP_BYTES && entry.stderrChunks.length > 1) {
+      total -= entry.stderrChunks.shift()!.length;
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------
 // reapOrphanedWarmClaudeProcesses — boot-time hard-kill orphan sweep
 // ---------------------------------------------------------------------------
 
+/**
+ * How long ago the pid-LIST FILE ITSELF must have last changed before this
+ * sweep will touch it at all. This function only ever runs once, at THIS
+ * process's own boot, before it has constructed its own pool — so if the
+ * file was modified more recently than this, something else must have
+ * written it just now, most plausibly another bridge instance that is
+ * ALREADY live against the same botDir (duplicate bridge instances are a
+ * documented, repeatedly-hit real failure mode in this deployment). Skipping
+ * in that case is a cheap heuristic, not a lock: it cannot detect a second
+ * instance that boots more than this long after the first, and does not by
+ * itself prevent two instances from running concurrently — see main.ts/the
+ * ops runbook for actually avoiding duplicate instances.
+ */
+const REAP_FRESHNESS_GUARD_MS = 5_000;
+
+/**
+ * How much a live pid's ACTUAL process start time (`ps -o lstart=`) may
+ * differ from the `startedAt` this pool itself recorded for it before
+ * treating them as "not the same process" (i.e. pid reuse by an unrelated
+ * process after a reboot) rather than a genuine orphan. Generous window:
+ * `lstart` has ~1s resolution and boot-time process scheduling adds jitter.
+ */
+const REAP_START_TIME_TOLERANCE_MS = 10_000;
+
 /** Runs `ps -p <pid> -o command=` and resolves its stdout (empty string on any error — never throws/rejects). */
 function readProcessCommandLine(pid: number): Promise<string> {
   return new Promise((resolve) => {
     execFile("ps", ["-p", String(pid), "-o", "command="], (err, stdout) => {
       resolve(err ? "" : stdout);
+    });
+  });
+}
+
+/** Runs `ps -p <pid> -o lstart=` and resolves the process's start time as epoch ms, or undefined if it can't be determined (never throws/rejects). */
+function readProcessStartTimeMs(pid: number): Promise<number | undefined> {
+  return new Promise((resolve) => {
+    execFile("ps", ["-p", String(pid), "-o", "lstart="], (err, stdout) => {
+      if (err) {
+        resolve(undefined);
+        return;
+      }
+      const parsed = Date.parse(stdout.trim());
+      resolve(Number.isNaN(parsed) ? undefined : parsed);
     });
   });
 }
@@ -792,10 +918,19 @@ function readProcessCommandLine(pid: number): Promise<string> {
  * Call this once at bridge boot, before constructing a `ClaudeProcessPool`,
  * for every `warmProcess`-enabled claude bot (see src/main.ts).
  *
- * Verifies BOTH that each pid is alive (housekeeping/gc.ts's isPidAlive) AND
- * that its command line actually looks like `claude` before touching it, so
- * pid reuse by an unrelated process after a reboot can never cause this to
- * kill the wrong thing. Always removes the (now-stale) list file afterward.
+ * Before touching anything, checks that the list FILE itself isn't
+ * suspiciously fresh ({@link REAP_FRESHNESS_GUARD_MS} — see its doc for the
+ * known limitation this heuristic does NOT cover: it is not a lock). For
+ * each remaining listed pid, only SIGTERMs it when ALL of the following
+ * hold: the pid is alive (housekeeping/gc.ts's isPidAlive), its command line
+ * contains BOTH `claude` and the warm-spawn-specific `--input-format
+ * stream-json` flags (tighter than a bare substring match — a `node
+ * /path/containing/claude/somewhere.mjs` process would not match), and its
+ * actual OS-reported start time is within {@link
+ * REAP_START_TIME_TOLERANCE_MS} of the `startedAt` this pool persisted for
+ * it. Any of those failing is treated as pid reuse (or an unrelated process)
+ * and left alone. Always removes the (now-stale) list file afterward, unless
+ * the freshness guard above caused an early return.
  *
  * Best-effort and non-fatal: never throws, never blocks startup for long.
  */
@@ -807,7 +942,22 @@ export async function reapOrphanedWarmClaudeProcesses(pidListFilePath: string): 
     return; // no leftover pid-list file — nothing to do
   }
 
-  let entries: Array<{ pid?: unknown; key?: unknown }>;
+  try {
+    const st = await stat(pidListFilePath);
+    const ageMs = Date.now() - st.mtimeMs;
+    if (ageMs < REAP_FRESHNESS_GUARD_MS) {
+      console.warn(
+        `[claude-pool] ${pidListFilePath} was modified ${Math.max(0, Math.round(ageMs))}ms ago — too recent to ` +
+          "safely treat as a stale crash artifact (another bridge instance may be actively writing it right now). " +
+          "Skipping the orphan sweep entirely this boot and leaving the file untouched.",
+      );
+      return;
+    }
+  } catch {
+    /* stat failure — fall through and let the sweep proceed as before */
+  }
+
+  let entries: Array<{ pid?: unknown; key?: unknown; startedAt?: unknown }>;
   try {
     const parsed = JSON.parse(raw);
     entries = Array.isArray(parsed) ? parsed : [];
@@ -821,21 +971,36 @@ export async function reapOrphanedWarmClaudeProcesses(pidListFilePath: string): 
     if (!isPidAlive(pid)) continue;
 
     const cmdline = await readProcessCommandLine(pid);
-    if (cmdline.includes("claude")) {
-      console.warn(
-        `[claude-pool] reaping an orphaned warm claude process (pid=${pid}, key=${String(item.key)}) left over ` +
-          "from a prior hard kill/crash — sending SIGTERM.",
-      );
-      try {
-        process.kill(pid, "SIGTERM");
-      } catch {
-        /* best-effort */
-      }
-    } else {
+    const looksLikeWarmClaude = cmdline.includes("claude") && cmdline.includes("--input-format") && cmdline.includes("stream-json");
+    if (!looksLikeWarmClaude) {
       console.warn(
         `[claude-pool] ${pidListFilePath} lists pid=${pid}, which is alive but its command line doesn't look ` +
-          "like `claude` (pid likely reused by an unrelated process) — leaving it running.",
+          "like a warm claude pool child (pid likely reused by an unrelated process) — leaving it running.",
       );
+      continue;
+    }
+
+    const recordedStartedAt = typeof item?.startedAt === "number" ? item.startedAt : undefined;
+    if (recordedStartedAt != null) {
+      const actualStartedAt = await readProcessStartTimeMs(pid);
+      if (actualStartedAt == null || Math.abs(actualStartedAt - recordedStartedAt) > REAP_START_TIME_TOLERANCE_MS) {
+        console.warn(
+          `[claude-pool] ${pidListFilePath} lists pid=${pid} (key=${String(item.key)}) with startedAt=` +
+            `${recordedStartedAt}, but its actual process start time doesn't match within ` +
+            `${REAP_START_TIME_TOLERANCE_MS}ms (pid likely reused by an unrelated process) — leaving it running.`,
+        );
+        continue;
+      }
+    }
+
+    console.warn(
+      `[claude-pool] reaping an orphaned warm claude process (pid=${pid}, key=${String(item.key)}) left over ` +
+        "from a prior hard kill/crash — sending SIGTERM.",
+    );
+    try {
+      process.kill(pid, "SIGTERM");
+    } catch {
+      /* best-effort */
     }
   }
 

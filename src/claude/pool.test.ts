@@ -23,7 +23,7 @@
 
 import { describe, it, expect, afterEach, vi } from "vitest";
 import { EventEmitter, PassThrough } from "node:stream";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import {
@@ -45,6 +45,8 @@ vi.mock("../housekeeping/gc.js", () => ({
 }));
 
 let __fakeCommandLine = "";
+/** Fake `ps -o lstart=` output — must be Date.parse()-able (e.g. `new Date(ms).toString()`). */
+let __fakeStartTimeIso = "";
 
 // ---------------------------------------------------------------------------
 // Fixture builders — claude CLI stream-json NDJSON shapes (matches
@@ -113,10 +115,13 @@ vi.mock("node:child_process", async (importOriginal) => {
     },
     execFile: (
       _cmd: string,
-      _args: string[],
+      args: string[],
       callback: (err: Error | null, stdout: string) => void,
     ) => {
-      callback(null, __fakeCommandLine);
+      // Distinguish reapOrphanedWarmClaudeProcesses's two `ps` shapes: `-o
+      // command=` (cmdline check) vs `-o lstart=` (start-time tolerance check).
+      const isLstart = args.includes("lstart=");
+      callback(null, isLstart ? __fakeStartTimeIso : __fakeCommandLine);
     },
   };
 });
@@ -126,6 +131,7 @@ afterEach(() => {
   spawnArgs = [];
   __fakeIsPidAlive = () => false;
   __fakeCommandLine = "";
+  __fakeStartTimeIso = "";
   vi.useRealTimers();
 });
 
@@ -302,6 +308,58 @@ describe("ClaudeProcessPool — LRU eviction", () => {
     expect(resultB.pooled).toBe(true);
   });
 
+  it("evicts the OLDER of two idle entries, not just any idle entry (real 'longest-idle' ordering)", async () => {
+    // The test above only ever has ONE idle entry at eviction time, so any
+    // idle-eviction policy — pick the newest, pick randomly, Map-insertion
+    // order — would pass it too. This one pins the actual comparison
+    // #pickLruIdleVictim implements (smallest lastUsedAt among idle entries)
+    // with two idle candidates of different ages.
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "Date"] });
+    try {
+      const pool = new ClaudeProcessPool({ botId: "bot-a", maxProcesses: 2 });
+
+      // Entry A finishes first — its lastUsedAt is the OLDER of the two.
+      const handleA = pool.run({ prompt: "a", cwd: "/wt/thread-a", threadId: "thread-a" });
+      await flush();
+      const childA = spawnedChildren[0]!;
+      childA.stdout.write(systemInit("sa") + "\n");
+      childA.stdout.write(resultLine("success") + "\n");
+      await flush();
+      await handleA.done;
+
+      // Advance the clock so entry B's lastUsedAt is strictly newer than A's.
+      await vi.advanceTimersByTimeAsync(5_000);
+
+      const handleB = pool.run({ prompt: "b", cwd: "/wt/thread-b", threadId: "thread-b" });
+      await flush();
+      const childB = spawnedChildren[1]!;
+      childB.stdout.write(systemInit("sb") + "\n");
+      childB.stdout.write(resultLine("success") + "\n");
+      await flush();
+      await handleB.done; // both A and B are now idle; B is the newer of the two
+
+      // Pool is at capacity (2) with BOTH idle — a third thread's turn must
+      // evict the OLDER one (A). An implementation that inverted the
+      // comparison (or picked by insertion/random order) would instead kill
+      // B here, or leave A alive — either way this assertion would catch it.
+      const handleC = pool.run({ prompt: "c", cwd: "/wt/thread-c", threadId: "thread-c" });
+      await flush();
+
+      expect(childA.killed).toBe(true);
+      expect(childB.killed).toBe(false);
+      expect(spawnedChildren).toHaveLength(3);
+
+      const childC = spawnedChildren[2]!;
+      childC.stdout.write(systemInit("sc") + "\n");
+      childC.stdout.write(resultLine("success") + "\n");
+      await flush();
+      const resultC = await handleC.done;
+      expect(resultC.pooled).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("never evicts a BUSY entry — falls back to a cold start instead of growing past the cap", async () => {
     const pool = new ClaudeProcessPool({ botId: "bot-a", maxProcesses: 1 });
 
@@ -465,6 +523,62 @@ describe("ClaudeProcessPool — cold fallback", () => {
       warnSpy.mockRestore();
     }
   });
+
+  it("caps the buffered stderr so the died-before-first-output warning never grows unbounded", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const pool = new ClaudeProcessPool({ botId: "bot-a" });
+      const handle = pool.run({ prompt: "hello", cwd: "/wt/thread-1", threadId: "thread-1" });
+      await flush();
+      const warmChild = spawnedChildren[0]!;
+
+      // Simulate a noisy child: far more stderr than any reasonable cap
+      // before it eventually dies pre-first-output.
+      const chunk = "x".repeat(8 * 1024); // 8KB
+      for (let i = 0; i < 20; i++) warmChild.stderr.write(chunk); // 160KB total
+      await flush();
+
+      warmChild.emit("error", new Error("spawn ENOENT"));
+      await flush();
+
+      const warnedWithStderr = warnSpy.mock.calls.find(
+        (call) => typeof call[0] === "string" && call[0].includes("died before yielding any turn output"),
+      );
+      expect(warnedWithStderr).toBeDefined();
+      const message = warnedWithStderr![0] as string;
+      const marker = "stderr:\n";
+      const stderrIdx = message.indexOf(marker);
+      expect(stderrIdx).toBeGreaterThanOrEqual(0);
+      const capturedStderr = message.slice(stderrIdx + marker.length);
+      // Proves it was actually capped (not the full 160KB written above),
+      // while still keeping the useful tail (within one chunk of the cap).
+      expect(capturedStderr.length).toBeLessThan(160 * 1024);
+      expect(capturedStderr.length).toBeLessThanOrEqual(64 * 1024 + 8 * 1024);
+
+      // Drain the cold fallback so the turn settles cleanly.
+      const coldChild = spawnedChildren[1]!;
+      let resolveResultSeen!: () => void;
+      const resultSeen = new Promise<void>((r) => {
+        resolveResultSeen = r;
+      });
+      const eventsLoopDone = (async () => {
+        for await (const ev of handle.events) {
+          if (ev.type === "result") resolveResultSeen();
+        }
+      })();
+      coldChild.stdout.write(systemInit("cold-session") + "\n");
+      coldChild.stdout.write(JSON.stringify({ type: "result", stop_reason: "end_turn" }) + "\n");
+      coldChild.stdout.end();
+      coldChild.emit("exit", 0);
+      void resultSeen.then(() => {
+        coldChild.emit("close", 0);
+      });
+      await eventsLoopDone;
+      await handle.done;
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -489,9 +603,14 @@ describe("ClaudeProcessPool — shutdown()", () => {
     const shutdownPromise = pool.shutdown(5_000);
     await flush();
     await handle.done;
-    await shutdownPromise;
-
+    await flush(); // let shutdown()'s drain race resolve and reach #destroyEntry
     expect(child.killed).toBe(true);
+
+    // shutdown() now bounded-waits for the child's REAL exit (not just the
+    // SIGTERM send) before resolving — simulate the OS confirming it, same
+    // as a real process would, asynchronously and shortly after.
+    child.emit("exit");
+    await shutdownPromise;
   });
 });
 
@@ -506,13 +625,22 @@ describe("reapOrphanedWarmClaudeProcesses", () => {
     if (dir) await rm(dir, { recursive: true, force: true });
   });
 
+  /** Backdate a file's mtime past REAP_FRESHNESS_GUARD_MS so the sweep doesn't skip it as "too recently written". */
+  async function backdateMtime(filePath: string, msAgo = 60_000): Promise<void> {
+    const past = new Date(Date.now() - msAgo);
+    await utimes(filePath, past, past);
+  }
+
   it("SIGTERMs an alive pid whose command line looks like `claude`, then removes the list file", async () => {
     dir = await mkdtemp(path.join(tmpdir(), "claude-pool-reap-"));
     const listPath = path.join(dir, "warm-claude.pids.json");
-    await writeFile(listPath, JSON.stringify([{ pid: 4242, key: "bot-a::thread-1::/wt/1::x::y", startedAt: 1 }]), "utf8");
+    const startedAt = Date.now() - 3_600_000; // 1h ago — must match the fake `ps -o lstart=` below
+    await writeFile(listPath, JSON.stringify([{ pid: 4242, key: "bot-a::thread-1::/wt/1::x::y", startedAt }]), "utf8");
+    await backdateMtime(listPath);
 
     __fakeIsPidAlive = (pid) => pid === 4242;
     __fakeCommandLine = "/usr/local/bin/claude -p --input-format stream-json";
+    __fakeStartTimeIso = new Date(startedAt).toString();
     const killSpy = vi.spyOn(process, "kill").mockImplementation(() => true as never);
 
     try {
@@ -529,6 +657,7 @@ describe("reapOrphanedWarmClaudeProcesses", () => {
     dir = await mkdtemp(path.join(tmpdir(), "claude-pool-reap-"));
     const listPath = path.join(dir, "warm-claude.pids.json");
     await writeFile(listPath, JSON.stringify([{ pid: 5252, key: "bot-a::thread-1::/wt/1::x::y", startedAt: 1 }]), "utf8");
+    await backdateMtime(listPath);
 
     __fakeIsPidAlive = (pid) => pid === 5252;
     __fakeCommandLine = "/usr/bin/some-unrelated-daemon";
@@ -545,8 +674,135 @@ describe("reapOrphanedWarmClaudeProcesses", () => {
     await expect(readFile(listPath, "utf8")).rejects.toThrow();
   });
 
+  it("leaves the pid alone when its command line matches but the recorded startedAt doesn't (pid reuse guard)", async () => {
+    dir = await mkdtemp(path.join(tmpdir(), "claude-pool-reap-"));
+    const listPath = path.join(dir, "warm-claude.pids.json");
+    await writeFile(listPath, JSON.stringify([{ pid: 6262, key: "bot-a::thread-1::/wt/1::x::y", startedAt: Date.now() - 3_600_000 }]), "utf8");
+    await backdateMtime(listPath);
+
+    __fakeIsPidAlive = (pid) => pid === 6262;
+    __fakeCommandLine = "/usr/local/bin/claude -p --input-format stream-json";
+    // The pid is alive and cmdline matches, but its ACTUAL start time is way
+    // more recent than the recorded startedAt — i.e. an unrelated process
+    // reused this pid long after the real warm child died.
+    __fakeStartTimeIso = new Date().toString();
+    const killSpy = vi.spyOn(process, "kill").mockImplementation(() => true as never);
+
+    try {
+      await reapOrphanedWarmClaudeProcesses(listPath);
+      expect(killSpy).not.toHaveBeenCalled();
+    } finally {
+      killSpy.mockRestore();
+    }
+  });
+
+  it("skips the whole sweep (and leaves the file untouched) when the list file was modified too recently", async () => {
+    dir = await mkdtemp(path.join(tmpdir(), "claude-pool-reap-"));
+    const listPath = path.join(dir, "warm-claude.pids.json");
+    await writeFile(listPath, JSON.stringify([{ pid: 7272, key: "bot-a::thread-1::/wt/1::x::y", startedAt: 1 }]), "utf8");
+    // Deliberately NOT backdating — a freshly-written file (as if another
+    // live bridge instance just touched it) must not be swept.
+
+    __fakeIsPidAlive = (pid) => pid === 7272;
+    __fakeCommandLine = "/usr/local/bin/claude -p --input-format stream-json";
+    const killSpy = vi.spyOn(process, "kill").mockImplementation(() => true as never);
+
+    try {
+      await reapOrphanedWarmClaudeProcesses(listPath);
+      expect(killSpy).not.toHaveBeenCalled();
+    } finally {
+      killSpy.mockRestore();
+    }
+
+    // Untouched, not deleted — the guard bails out before even parsing it.
+    await expect(readFile(listPath, "utf8")).resolves.toContain("7272");
+  });
+
   it("is a no-op when no list file exists", async () => {
     dir = await mkdtemp(path.join(tmpdir(), "claude-pool-reap-"));
     await expect(reapOrphanedWarmClaudeProcesses(path.join(dir, "missing.json"))).resolves.toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// pid-list lifecycle — real disk I/O, no node:child_process mock bypass needed
+// ---------------------------------------------------------------------------
+
+describe("ClaudeProcessPool — pid-list lifecycle", () => {
+  let dir: string;
+
+  afterEach(async () => {
+    if (dir) await rm(dir, { recursive: true, force: true });
+  });
+
+  /** Poll the pid-list file until `predicate` matches (real disk I/O is decoupled from anything a test directly awaits). */
+  async function waitForListMatching(
+    filePath: string,
+    predicate: (list: Array<{ pid: number }>) => boolean,
+    timeoutMs = 1000,
+  ): Promise<Array<{ pid: number }>> {
+    const deadline = Date.now() + timeoutMs;
+    for (;;) {
+      try {
+        const list = JSON.parse(await readFile(filePath, "utf8")) as Array<{ pid: number }>;
+        if (predicate(list)) return list;
+      } catch {
+        /* not written yet, or mid-rewrite — keep polling */
+      }
+      if (Date.now() >= deadline) throw new Error(`pid list at ${filePath} never matched within ${timeoutMs}ms`);
+      await new Promise((r) => setTimeout(r, 5));
+    }
+  }
+
+  it("keeps a pid on disk while SIGTERM is in flight, and removes it only once the OS confirms exit", async () => {
+    dir = await mkdtemp(path.join(tmpdir(), "claude-pool-pidlist-"));
+    const pidListFilePath = path.join(dir, "warm-claude.pids.json");
+    const pool = new ClaudeProcessPool({ botId: "bot-a", pidListFilePath });
+
+    const handle = pool.run({ prompt: "hi", cwd: "/wt/thread-1", threadId: "thread-1" });
+    await flush();
+    const child = spawnedChildren[0]!;
+    child.stdout.write(systemInit("s1") + "\n");
+    child.stdout.write(resultLine("success") + "\n");
+    await flush();
+    await handle.done;
+
+    await waitForListMatching(pidListFilePath, (list) => list.length === 1);
+
+    // shutdown() destroys the (now-idle) entry — sends SIGTERM — but we
+    // deliberately never emit 'exit' yet.
+    const shutdownPromise = pool.shutdown(1_000);
+    await flush();
+    expect(child.killed).toBe(true);
+
+    // The pid must STILL be listed: SIGTERM was only just sent, the OS
+    // hasn't confirmed the process is actually gone (the exact bug this
+    // fixes — previously the list was rewritten at SIGTERM-send time).
+    const listWhileDying = JSON.parse(await readFile(pidListFilePath, "utf8")) as Array<{ pid: number }>;
+    expect(listWhileDying.some((e) => e.pid === child.pid)).toBe(true);
+
+    child.emit("exit");
+    await shutdownPromise;
+
+    const listAfterExit = await waitForListMatching(pidListFilePath, (list) => !list.some((e) => e.pid === child.pid));
+    expect(listAfterExit).toEqual([]);
+  });
+
+  it("serializes concurrent rewrites — the final on-disk snapshot reflects every live entry, never a stale reorder", async () => {
+    dir = await mkdtemp(path.join(tmpdir(), "claude-pool-pidlist-"));
+    const pidListFilePath = path.join(dir, "warm-claude.pids.json");
+    const pool = new ClaudeProcessPool({ botId: "bot-a", pidListFilePath, maxProcesses: 4 });
+
+    // Two spawns fire in the same tick, each queuing its own rewrite onto
+    // the shared chain — without serialization, overlapping writeFile(tmp)+
+    // rename pairs could complete out of order and leave a stale snapshot
+    // missing one of the two live pids.
+    pool.run({ prompt: "a", cwd: "/wt/thread-a", threadId: "thread-a" });
+    pool.run({ prompt: "b", cwd: "/wt/thread-b", threadId: "thread-b" });
+    await flush();
+
+    const expectedPids = spawnedChildren.map((c) => c.pid).sort();
+    const finalList = await waitForListMatching(pidListFilePath, (list) => list.length === 2);
+    expect(finalList.map((e) => e.pid).sort()).toEqual(expectedPids);
   });
 });
