@@ -288,6 +288,69 @@ describe("applyTaskHandleWriteback", () => {
     );
   });
 
+  // v3.2 交接断链检测 (docs/task-handle.md §13)
+  it("completed: persists mentionedPeerBotIds onto lastTurnMentions/lastTurnMentionsAt", async () => {
+    const store = await TaskHandleStore.load(join(dir, "task-handles.json"));
+    await store.put({ threadId: "t1", taskGuid: "guid-1", chatId: "oc_1", claimedTs: 1 });
+    const { requester } = makeFakeRequester({ task: { description: "原始需求" } });
+    const client = new TaskListClient(requester);
+
+    await applyTaskHandleWriteback(
+      { botId: "b1", threadId: "t1", status: "completed", finalText: "@李四 请复验", mentionedPeerBotIds: ["peer-bot"] },
+      { store, client },
+    );
+
+    const record = store.get("t1");
+    expect(record?.lastTurnMentions).toEqual(["peer-bot"]);
+    expect(record?.lastTurnMentionsAt).toBeTypeOf("number");
+  });
+
+  it("completed: clears lastTurnMentions when this turn's reply mentions nobody (REPLACE, not accumulate)", async () => {
+    const store = await TaskHandleStore.load(join(dir, "task-handles.json"));
+    await store.put({
+      threadId: "t1",
+      taskGuid: "guid-1",
+      chatId: "oc_1",
+      claimedTs: 1,
+      lastTurnMentions: ["peer-bot"],
+      lastTurnMentionsAt: 100,
+    });
+    const { requester } = makeFakeRequester({ task: { description: "原始需求" } });
+    const client = new TaskListClient(requester);
+
+    await applyTaskHandleWriteback(
+      { botId: "b1", threadId: "t1", status: "completed", finalText: "继续处理,没有 @ 任何人" },
+      { store, client },
+    );
+
+    const record = store.get("t1");
+    expect(record?.lastTurnMentions).toBeUndefined();
+    expect(record?.lastTurnMentionsAt).toBeUndefined();
+  });
+
+  it("failed: clears any stale lastTurnMentions (a crash isn't a deliberate handoff)", async () => {
+    const store = await TaskHandleStore.load(join(dir, "task-handles.json"));
+    await store.put({
+      threadId: "t1",
+      taskGuid: "guid-1",
+      chatId: "oc_1",
+      claimedTs: 1,
+      lastTurnMentions: ["peer-bot"],
+      lastTurnMentionsAt: 100,
+    });
+    const { requester } = makeFakeRequester({ task: { description: "原始需求" } });
+    const client = new TaskListClient(requester);
+
+    await applyTaskHandleWriteback(
+      { botId: "b1", threadId: "t1", status: "failed", failureReason: "崩溃了" },
+      { store, client },
+    );
+
+    const record = store.get("t1");
+    expect(record?.lastTurnMentions).toBeUndefined();
+    expect(record?.lastTurnMentionsAt).toBeUndefined();
+  });
+
   it("G: prefers the agent's short `note` over the full `finalText` for the description log entry", async () => {
     const store = await TaskHandleStore.load(join(dir, "task-handles.json"));
     await store.put({ threadId: "t1", taskGuid: "guid-1", chatId: "oc_1", claimedTs: 1 });

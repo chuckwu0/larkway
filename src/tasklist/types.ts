@@ -44,6 +44,16 @@ export interface TaskHandleLifecyclePatch {
    * see the SKILL's content-discipline rule).
    */
   note?: string;
+  /**
+   * v3.2 交接断链检测 (docs/task-handle.md §13): internal bot config ids
+   * (roster peers whose display NAME the "completed" turn's `finalText`
+   * mentioned, mechanical substring match — see BridgeHandler's
+   * `#matchMentionedPeers`). Only meaningful when status="completed".
+   * src/tasklist/writeback.ts persists this onto TaskHandleRecord so
+   * StallDetector can check "did that peer have a turn in this thread since
+   * the mention?" using a much shorter threshold than the general one.
+   */
+  mentionedPeerBotIds?: string[];
 }
 
 /**

@@ -141,8 +141,8 @@ export interface TasklistPollerOptions {
  * That regex was unanchored (matched an @-token ANYWHERE in the text) and
  * collapsed clearly DIFFERENT messages onto the same normalized string —
  * confirmed by execution: "帮我查 user@example.com 的账号" and "帮我查
- * user@other.org 的账号" both collapsed to "帮我查 user的账号"; "@Elon 在吗"
- * and "@Linus 在吗" both collapsed to "在吗". Because the bidirectional 1:1
+ * user@other.org 的账号" both collapsed to "帮我查 user的账号"; "@张三 在吗"
+ * and "@李四 在吗" both collapsed to "在吗". Because the bidirectional 1:1
  * uniqueness check only catches collisions between candidates/threads
  * PRESENT IN THE SAME CYCLE, an asymmetric collision (e.g. a manually
  * created task whose title happens to normalize the same as some unrelated

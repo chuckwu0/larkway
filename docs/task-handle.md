@@ -151,7 +151,7 @@ taskHandle:
 8. **清单下任务列表接口已真机核实**(2026-07-04):`GET /tasklists/:tasklist_guid/tasks`(TasklistPoller 用来发现候选)对真实清单实测 200 + items[],任务对象形状与 `getTask` 一致。⚠️ 该端点对 `page_token` **严格校验**——query 里出现字面量 `page_token=undefined` 直接 400(code 1470400,"You can invoke this api without page_token"),client 侧必须「无值不带键」;`/comments` 端点反而容忍这种脏参数,不能拿它当先例。
 9. **话题根消息文本在 bridge 侧没有持久化落点 —— 已通过 dispatch 时捕获解决(v3 二次修订,v3 三次修订加固)**。第一版调研结论(仍如实保留在下方作为排查记录)是「没有廉价的读法」;但那个结论遗漏了一条零成本路径:**handler 分发消息时手里本来就有这一轮的消息文本**,不需要事后再查。修法:`SessionRecord`(`src/claude/sessionStore.ts`)新增可选字段 `rootText`(截断至 ~200 字符)+ `chatId`,只在 `handler.ts` 首次为一个 thread 建 session 记录时写入——零额外网络调用,复用已经在内存里的 `parsed.text`/`parsed.chatId`。
    > **三次修订(adversarial review 修正)**:「那一条消息就是话题的根消息」这句断言原本不成立——bot 首次在某 thread 完成的 turn,可能只是人已经开了话题、之后才 @ bot 的一条回复,把回复文本错当根消息存起来,后续可能精确匹配到无关任务、造成错误 auto-bind。修法:只在 `isTopLevel`(`handler.ts` 里已经算出的信号——`root_id` 缺失代表这条消息本身没有父消息,即真的是话题根)为真时才捕获 `rootText`/`chatId`;不是根消息时两个字段保持 absent(和"没看到根消息""字段建立之前的老 session"走同一条已文档化的降级路径——退化为"这个 thread 没有 auto-bind 候选",agent 路径不受影响)。这是一次零成本加固:`isTopLevel` 早已算好,只是之前没用在这里。
-   `TasklistPoller` 每轮在候选快照之外,新增一步机械比对:候选 `summary` 与任一 thread 的 `rootText`(两侧都过 `normalizeForExactMatch`——**只做空白归一化,不做任何 @提及剥离/模糊/前缀/相似度**;三次修订前的版本还会剥离 @-mention token,但那条正则不锚定位置、会把明显不同的文本归一化成同一个串——比如 `user@example.com` 和 `user@other.org` 的域名部分,或「@Elon 在吗」和「@Linus 在吗」都会被剥成一样的短语,详见 `tasklistPoller.ts` 里 `normalizeForExactMatch` 的完整事故记录)做字符串完全相等;要求**严格双向 1:1**(该任务只匹配到一个 thread,且该 thread 只匹配到一个任务,**且该 thread 当前没有任何已有 claim**——见下一条修订)才自动绑定,否则一律留给 agent 路径、只打一条 debug 级日志说明,不阻塞、不报错。命中后 bridge 直接调对应 bot 的 `TaskHandleStore.claim()`(等价认领,`claim()` 本身现在也会拒绝"这个 taskGuid 已经被另一个 thread 认领"这种情况——见 §12 附带修的存储层加固)并调用 `applyAutoBindConfirmation` 立即在任务描述里写一条确认(因为这次绑定发生在 poller 自己的定时器上,不搭在任何 agent turn 上,没有天然的「completed」事件可以顺带写确认)。**已知且接受的降级**:飞书「转任务」时任务标题 = 消息文本,可能被平台按其自身规则截断;若截断点与我们的 200 字符截断点不一致,两侧归一化后仍不相等 → 不绑定,留给 agent 路径兜底——这是有意选择,不为了追平这类边界情况去加前缀/模糊匹配(那会违反"机械匹配,不做业务判断"的边界)。
+   `TasklistPoller` 每轮在候选快照之外,新增一步机械比对:候选 `summary` 与任一 thread 的 `rootText`(两侧都过 `normalizeForExactMatch`——**只做空白归一化,不做任何 @提及剥离/模糊/前缀/相似度**;三次修订前的版本还会剥离 @-mention token,但那条正则不锚定位置、会把明显不同的文本归一化成同一个串——比如 `user@example.com` 和 `user@other.org` 的域名部分,或「@张三 在吗」和「@李四 在吗」都会被剥成一样的短语,详见 `tasklistPoller.ts` 里 `normalizeForExactMatch` 的完整事故记录)做字符串完全相等;要求**严格双向 1:1**(该任务只匹配到一个 thread,且该 thread 只匹配到一个任务,**且该 thread 当前没有任何已有 claim**——见下一条修订)才自动绑定,否则一律留给 agent 路径、只打一条 debug 级日志说明,不阻塞、不报错。命中后 bridge 直接调对应 bot 的 `TaskHandleStore.claim()`(等价认领,`claim()` 本身现在也会拒绝"这个 taskGuid 已经被另一个 thread 认领"这种情况——见 §12 附带修的存储层加固)并调用 `applyAutoBindConfirmation` 立即在任务描述里写一条确认(因为这次绑定发生在 poller 自己的定时器上,不搭在任何 agent turn 上,没有天然的「completed」事件可以顺带写确认)。**已知且接受的降级**:飞书「转任务」时任务标题 = 消息文本,可能被平台按其自身规则截断;若截断点与我们的 200 字符截断点不一致,两侧归一化后仍不相等 → 不绑定,留给 agent 路径兜底——这是有意选择,不为了追平这类边界情况去加前缀/模糊匹配(那会违反"机械匹配,不做业务判断"的边界)。
    > 第一版调研记录(已被上面的方案取代,保留供参考):`SessionRecord` 和 `TaskHandleRecord`(`src/tasklist/store.ts`)都不存标题/正文字段;`handler.ts` 里离得最近的是 `RuntimeEventRecord.textPreview`(120 字符截断,滚动日志上限 20 条,不是稳定的 per-thread 索引)。若要在 THREAD 早已存在、poller 独立定时器触发的场景下事后补一次"这个 thread 的根消息是什么",确实只能像 gap-fill(`channelClient.ts` 的 `+chat-messages-list`)那样现查,不便宜——但这个顾虑只适用于"事后补查",不适用于"分发时顺手记一次",第二版方案绕开了这个假设。
 10. **共享 guid 组的 TaskListClient 固定绑定首个到达的 bot,是个已知的残余降级点**(v3 三次修订):`main.ts` 的 `tasklistGuidGroups` 按 guid 去重时,`group.client` 永远是数组顺序里第一个解析到该 guid 的 bot 的凭据,不会轮换/健康检查。若这个 bot 的 scope 或清单成员资格出问题,整个 guid 组的候选发现 + auto-bind 确认都会失败,即使组内其他 bot 的凭据完全正常。本次只加了"连续失败 N 次后,日志明确点名是哪个 bot 的凭据在拖累整组"(`TasklistPoller` 的 `clientOwnerBotId`),**没有做完整的 client 轮换/故障转移**——那需要更大的改动(检测哪个 client 健康、动态切换),权衡后判断当前"降级为可见的日志"已经把最糟的情况(静默失效)排除了,完整方案留作已知 TODO。
 
@@ -304,3 +304,116 @@ CommentPoller 合成的任务评论 turn,还是本 feature自己发的唤醒 tur
 `update(threadId, updateFn)` API——`updateFn` 在**当前**值上同步执行,不允许调用方在读和写之间
 夹 await,三个写者全部切过去调用它(`src/tasklist/store.ts`,测试见 `store.test.ts` 的
 "两个交错写者"用例,以及一个反向用例证明旧的 `put({...过期快照, 字段})` 写法确实会丢更新)。
+
+## 13. v3.2:协作断链检测 + @ 出口治根
+
+> 产品意图:多个 agent 在同一话题里互相 @ 配合时,某个 agent 掉链子(崩溃 / 或它发出的 @ 从未真正
+> 触达目标),整条协作链就停摆——但触发这次断链的那一轮 turn,从 bridge 的角度看是"成功"的(没有
+> 抛异常),现有 30min 失败快通道抓不到,24h 通用阈值又太慢。任务多为小时级,断链理应分钟级发现。
+
+### 13.1 调查结论 A:agent 互 @ 的真实机制
+
+**结论:机制本身没问题——bridge 对消息分发不做任何"发送者是不是 bot"的过滤,唯一的门槛是这条
+消息的 `mentions` 字段里有没有本 bot 的 open_id。** 逐项核实:
+
+- 实时 WS 路径(`channelClient.ts` 的 `channel.on("message", ...)`)对收到的每条消息事件**直接
+  分发**,不检查发送者身份、不区分人类/bot——由飞书平台自己的事件订阅机制决定"这条消息该不该
+  推给我"(即:是否携带了指向本 bot 的结构化 mention)。
+- gap-fill 补抓路径显式检查 `mentionsBot`(`mentions` 数组里有没有本 bot 的 open_id),同样不做
+  发送者身份区分。
+- 全仓未找到任何"过滤自己发的消息"或"过滤所有 bot 发的消息"的逻辑。
+
+**结论:因此 bot A 用真实结构化 mention(post 消息 + at 标签)@ bot B,能够像人类 @ 一样正常
+触发 B 的 dispatch——这条路径本身没有平台限制,前提是 mention 真的是结构化的(见 §13.2)。**
+
+**但实测发现一个更值得警惕的现象**:抽查一次真实多 agent 协作会话的运行时事件记录,涉及协作
+的多个 bot 各自记录的"触发本次 turn 的 sender_id",**没有一次**匹配另一个协作 bot 自己的
+open_id——也就是说,至少在抽查的这个窗口里,看起来像"agent 之间在自动互相触发"的协作过程,
+实际发起者的身份并不是任何一个协作 bot 自己(最可能的解释:操作者手动在多个话题间转发/中转
+内容作为过渡性验证手段,而不是全靠 bot 各自发真实结构化 mention 完成)。这条结论提醒:**"agent
+们看起来在互相协作"不能直接当作"bot 间自动 mention 触发链路已经跑通"的证据**——如果自动路径
+真的可靠,不需要人工中转;如果确实存在人工中转,更说明这条链路容易在缺人盯梢时静默断掉,正是
+本节要机械补上的那个缺口。
+
+同一次抽查还发现一个更具体、可复现的实际问题(见下)。
+
+### 13.2 调查结论 B:「@ 格式不对」的具体形态,以及一个已验证的相关故障模式
+
+**真 mention vs 纯文本 @,在 bridge 收到的事件里长这样**:
+
+- **真 mention**:发消息时用飞书的结构化 @(post 消息里的 `{"tag":"at","user_id":"ou_xxx"}` 元素,
+  或客户端 UI 里选中的 @),服务端解析后:纯文本消息里表现为占位符 `@_user_N`,并在事件的
+  `mentions` 数组里补上对应的用户/bot 身份;`lark/message.ts` 的 `AT_PLACEHOLDER_RE` 专门剥离
+  这种占位符。**这是唯一会真正推送/触发目标 bot 的形态**。
+- **纯文本 @**:直接在正文里打字打出"@张三"这几个字符,不经过飞书的结构化 @ 机制——不会出现在
+  `mentions` 数组里,平台的事件订阅根本不会扫描正文内容做名字匹配。**这种 @ 只是视觉上像个提及,
+  实际上是死的,目标 bot 永远不会因此被触发**。
+
+`prompt.ts` 的 `<peer-bots>` 块已经把这条规则写清楚了("@ peer 必须用 post 消息 + at 标签…严禁
+用纯 text 的 @xxx"),不是本次新增结论。
+
+**新发现、已用真实日志验证的故障模式**:同一次抽查里,反复出现协作 bot 之间互相提醒"你发的是
+交互卡片,我这边只收到一个『请升级客户端查看』的降级占位,读不到你的真实结论"这类对话(同一次
+会话里出现了至少 3 次,时间间隔几分钟,一次比一次着急)。也就是说:**当一个 bot 把给协作对象看
+的实质结论放进了(面向人类展示用的)交互卡片,另一个 agent 尝试读取这条卡片消息时,拿到的是
+飞书对不兼容渲染端的通用降级文案,不是卡片里的真实内容**。这不是"@ 没触发"的问题(这些消息本身
+就触发了对方的 turn,对方才有机会去读、去抱怨读不到),而是"触发了,但读不懂内容"——效果同样是
+协作链看起来推进了、实际卡住了,人不盯着容易漏。
+
+### 13.3 @ 出口治根:调查结论决定的取舍
+
+**没有做"在 bridge 出口把卡片里的 @文本机械转成真 mention 结构"**——原因:
+
+1. 飞书卡片(interactive 消息类型)和文本 / post 消息是结构不同的内容类型,没有证据(也没有实测
+   条件验证)卡片 schema 里存在一种"at 元素"会走 IM 消息的 mention 解析→事件推送这条链路;卡片
+   本身的用途是给人看的展示层,peer 间需要触发对方 turn 的 @ 从设计上就不该依赖它。
+2. 更关键的是:§13.2 实测到的故障根本不是"卡片里的 @ 没转换成真结构"——而是"卡片内容对另一个
+   agent 的读取工具不可见",即便真做了机械转换也解决不了这个问题。
+
+**因此按调研结论走的是 SKILL/prompt 注入这条路**:`prompt.ts` 的 `<peer-bots>` 协作规则块新增
+一条——需要对方行动的实质内容必须写进那条 post 消息本体,不要指望对方去读你发的卡片总结(卡片
+不是可靠的 agent 间数据通道,附上 §13.2 实测到的降级占位现象作为具体例证)。这是纯文档/指令层
+的加固,不改变任何 bridge 代码路径。
+
+### 13.4 机械信号与设计
+
+对每个"已认领 + 未完成"的任务,新增第三档阈值——**交接**:如果这个 claim 的
+`TaskHandleRecord.lastTurnMentions`(最近一轮*完成* turn 的回复文本里,机械字符串匹配花名册
+命中的协作 bot;`writeback.ts` 在其 completed 分支顺手提取、每轮整体替换不累加;failed 分支
+清空,因为一次崩溃不算蓄意交接,已有更高优先级的加急阈值覆盖这种情况)非空,且被提到的协作 bot
+在这个 thread 里、`lastTurnMentionsAt` 之后**没有**跑过任何 turn(通过 `getPeerLastActiveTs`
+读该 bot 自己的 `SessionStore.lastActiveTs`,同进程内跨 bot 只读,main.ts 用与 `TasklistPoller`
+的 `listRootTexts` 相同的"启动时逐步填充、轮询时才读"闭包手法达成),就用
+`taskHandle.stallHandoffThresholdMs`(默认 **15 分钟**)代替一般/加急阈值——三档阈值取**最短
+的那个生效**。判断逻辑全部是时间戳比较 + 字符串匹配,不涉及任何语义理解。
+
+**护栏完全复用**(不是两套计数):交接断链和一般停滞共用同一个 `stallNudge` 状态机——冷却、
+两步确认归因、升级熔断全部适用;触发的仍是 StallDetector 现有的合成 turn 唤醒管道。**唤醒的
+永远是认领任务的那个 bot 自己**(即这个 StallDetector 实例所属的 bot)——因为
+`lastTurnMentions` 只由这个 bot自己的 completed turn 写入,"唤醒发起 @ 的 bot"和"唤醒认领者"
+在这套实现里天然是同一个 bot,不需要额外的跨 bot 唤醒路径。
+
+### 13.5 配置
+
+```yaml
+taskHandle:
+  tasklistGuid: "..."
+  stallHandoffThresholdMs: 900000    # 15min(默认),交接断链专用,取三档最短生效
+```
+
+**活跃协作团队推荐配置示例**(多 bot 频繁互相 @ 配合的部署):
+
+```yaml
+taskHandle:
+  stallHandoffThresholdMs: 900000     # 15min —— 交接断链
+  stallFastThresholdMs: 1800000       # 30min —— 上一轮 turn 崩溃/失败(默认值,保持不变)
+  stallThresholdMs: 14400000          # 4h —— 一般停滞(比默认 24h 更激进,适合小时级任务、协作密集的团队)
+```
+
+### 13.6 明确不做
+
+- ❌ 不做"在 bridge 出口把卡片文本机械转换成真 mention 结构"——见 §13.3 的调研结论,这条路要么
+  平台不支持,要么解决不了实测到的真实故障。
+- ❌ 不新增一套独立于 `stallNudge` 的交接计数——护栏(冷却/两步确认/升级)全部复用现有状态机。
+- ❌ 不做"唤醒非本 bridge 管理的 bot"这类跨部署/跨进程唤醒——本实现里"发起 @ 的 bot"和"认领
+  任务的 bot"恒等,不存在需要跨进程唤醒别的 bridge 实例的场景。

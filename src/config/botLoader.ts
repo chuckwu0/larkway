@@ -69,6 +69,13 @@ const TaskHandleConfigSchema = z.object({
   stallThresholdMs: z.number().positive().optional(),
   /** 若该话题最后一轮 turn 以失败/崩溃收场,改用这个更短的阈值(ms)。默认 30min。 */
   stallFastThresholdMs: z.number().positive().optional(),
+  /**
+   * v3.2 交接断链检测(docs/task-handle.md §13):若最后一轮完成 turn 的回复
+   * @ 了花名册上的另一个 bot,且对方在这个阈值(ms)内在同一话题没有任何 turn,
+   * 改用这个更短的阈值(优先级高于上面两个,取更短者)。默认 15min——协作断链
+   * 比一般停滞紧急得多,任务多为小时级,理应分钟级发现。
+   */
+  stallHandoffThresholdMs: z.number().positive().optional(),
   /** 同一任务两次提醒之间的最短间隔(ms),防止骚扰。默认 24h。 */
   stallNudgeCooldownMs: z.number().positive().optional(),
   /** 连续几次提醒仍无进展后改为升级(任务评论通知人类,此后对该任务静默直到有新活动)。默认 2。 */

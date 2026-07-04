@@ -352,6 +352,16 @@ describe("renderPrompt — V2 mode (botName set)", () => {
     expect(prompt).toContain("严禁用纯 text");
   });
 
+  // v3.2 交接断链检测 investigation (docs/task-handle.md §13): dogfood logs
+  // showed peers reading each other's CARD replies get a degraded "请升级
+  // 客户端查看" placeholder, not the real content — actionable substance must
+  // go in the post message body itself, not rely on the card being legible.
+  it("peer-contract: warns that card content is not a reliable agent-to-agent channel", async () => {
+    const prompt = await renderPrompt(makeInput({ botName: "Frontend", peers }));
+    expect(prompt).toContain("请升级客户端查看");
+    expect(prompt).toContain("不是可靠的 agent 间数据通道");
+  });
+
   it("repo-less agent (no repoCachePath): omits project-skill intro + repo-cache line, keeps memory + state-contract", async () => {
     // 2026-05-30 generalization: an operator's custom agent may have NO repo
     // (bot.repos === []). It gets a scratch dir, relies on its L2 memory, and

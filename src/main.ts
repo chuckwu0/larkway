@@ -215,6 +215,15 @@ async function runV2Mode({
 
   const instances: BotInstance[] = [];
 
+  // v3.2 交接断链检测 (docs/task-handle.md §13): every bot's own SessionStore,
+  // keyed by its internal config id — populated progressively as each bot's
+  // iteration below creates its store. StallDetector closures reference this
+  // map by reference (same "populated-after, read-later" trick as
+  // tasklistPollersByGuid above), so a bot's StallDetector can read ANOTHER
+  // bot's `lastActiveTs` for the SAME thread even though that other bot's
+  // SessionStore might not exist yet at the moment the closure is created.
+  const sessionStoresByBotId = new Map<string, SessionStore>();
+
   // Task-handle v3 "候选注入": one TasklistPoller per UNIQUE tasklistGuid,
   // shared by every bot configured with that guid (see the construction loop
   // right after `for (const bot of healthyBots)` below for why this is
@@ -321,6 +330,7 @@ async function runV2Mode({
     // Session store — scoped to this bot
     const sessionsPath = resolveSessionsPath(bot.id);
     const sessionStore = await SessionStore.load(sessionsPath);
+    sessionStoresByBotId.set(bot.id, sessionStore);
 
     // Inbound transport — Channel SDK only. In-process WS (robust reconnect,
     // no 1006/3003 self-kill, no subscribe subprocess). Needs raw appId+appSecret.
@@ -394,6 +404,15 @@ async function runV2Mode({
       const peer = bots.find((b) => b.id === peerId);
       if (!peer) return []; // should not happen (botLoader cross-validates), but guard
       return [{ id: peer.bot_open_id, name: peer.name, description: peer.description ?? "" }];
+    });
+    // v3.2 交接断链检测 (docs/task-handle.md §13): same source (bot.peers) as
+    // resolvedPeers above, but keeping the peer's INTERNAL config id (not
+    // bot_open_id) — that's what SessionStore lookups need. Kept as a
+    // separate, narrow structure rather than extending PeerBot/resolvedPeers,
+    // which are used much more broadly (prompt rendering).
+    const taskHandleMentionRoster = bot.peers.flatMap((peerId) => {
+      const peer = bots.find((b) => b.id === peerId);
+      return peer ? [{ name: peer.name, botId: peer.id }] : [];
     });
 
     const postClient = shouldProvideResponseSurfacePostClient(bot.response_surface_prototype)
@@ -524,6 +543,10 @@ async function runV2Mode({
               client: taskListClient,
               // Plain in-memory read of this bot's own SessionStore — no I/O.
               getLastActiveTs: (threadId) => sessionStore.get(threadId, bot.id)?.lastActiveTs,
+              // v3.2 交接断链检测: plain in-memory read of ANOTHER bot's
+              // SessionStore, via the progressively-populated map above.
+              getPeerLastActiveTs: (peerBotId, threadId) =>
+                sessionStoresByBotId.get(peerBotId)?.get(threadId, peerBotId)?.lastActiveTs,
               enqueueNudgeTurn: (turn) => {
                 client.enqueueSyntheticEvent({
                   message_id: `synthetic-task-stall-${turn.threadId}-${Date.now()}`,
@@ -544,6 +567,7 @@ async function runV2Mode({
             {
               stallThresholdMs: bot.taskHandle?.stallThresholdMs,
               stallFastThresholdMs: bot.taskHandle?.stallFastThresholdMs,
+              stallHandoffThresholdMs: bot.taskHandle?.stallHandoffThresholdMs,
               nudgeCooldownMs: bot.taskHandle?.stallNudgeCooldownMs,
               escalateAfterNudges: bot.taskHandle?.stallEscalateAfterNudges,
             },
@@ -615,6 +639,7 @@ async function runV2Mode({
       // full-host posture); set to acceptEdits/ask to tighten via config.
       permissionMode: configJson.permissions.mode,
       peers: resolvedPeers,
+      taskHandleMentionRoster,
       botConfig: {
         id: bot.id,
         name: bot.name,

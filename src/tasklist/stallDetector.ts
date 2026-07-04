@@ -86,6 +86,34 @@
  *      step in one move); a pending nudge that gets no confirming activity
  *      within a bounded window is treated as lost and doesn't count.
  *
+ * ## v3.2 交接断链检测 (docs/task-handle.md §13)
+ *
+ * Multi-agent handoff in a shared topic breaks in a way the general stall
+ * check (above) is too slow to catch: bot A's completed turn @-mentions
+ * peer bot B (asking it to pick up), but B never runs a turn in that thread
+ * — because B crashed, because the @ never actually resolved to a real
+ * Feishu mention (see docs/task-handle.md §13's investigation), or any
+ * other reason. Tasks here are hour-scale, so the general 24h (or even the
+ * 30min failure-fast) threshold is far too slow — this needs minute-scale
+ * detection. `writeback.ts` mechanically string-matches each completed
+ * turn's reply text against the bot's peer-name roster (no NLP) and
+ * persists which peer(s) were mentioned (`TaskHandleRecord.lastTurnMentions`
+ * + `lastTurnMentionsAt`, REPLACED not accumulated each turn). This module
+ * checks whether ANY mentioned peer has had a turn in the SAME thread since
+ * that mention (via `getPeerLastActiveTs`, a cross-bot SessionStore read —
+ * main.ts wires this from every bot's own SessionStore, populated
+ * progressively during startup and read lazily at poll time, the same
+ * closure-over-a-map trick TasklistPoller's rootTextMatch already uses); if
+ * not, the effective threshold drops to `stallHandoffThresholdMs` (default
+ * 15min) — whichever of the applicable thresholds is SHORTER always wins.
+ * Deliberately reuses the EXACT SAME `stallNudge` state machine (cooldown,
+ * two-step confirmation, escalation) as the general check — this is a
+ * different way to arrive at "time to nudge," not a second, parallel
+ * counter. The wake-up is always the claiming bot itself (whoever this
+ * StallDetector instance runs for) — since only ITS OWN completed turns
+ * ever populate ITS OWN `lastTurnMentions`, "wake the bot that sent the @"
+ * and "wake the claiming bot" are the same bot by construction here.
+ *
  * Class shape (timer/start/stop/jitter) mirrors commentPoller.ts.
  */
 
@@ -97,6 +125,7 @@ const DEFAULT_INTERVAL_MS = 60_000;
 const DEFAULT_JITTER_MS = 10_000;
 const DEFAULT_STALL_THRESHOLD_MS = 24 * 60 * 60_000; // 24h
 const DEFAULT_STALL_FAST_THRESHOLD_MS = 30 * 60_000; // 30min — last turn crashed
+const DEFAULT_STALL_HANDOFF_THRESHOLD_MS = 15 * 60_000; // 15min — mentioned peer hasn't picked up (v3.2)
 const DEFAULT_NUDGE_COOLDOWN_MS = 24 * 60 * 60_000; // 24h
 const DEFAULT_ESCALATE_AFTER_NUDGES = 2;
 /** How long a nudge can sit "pending" (enqueued, unconfirmed) before being treated as lost — see the module doc's fix #3. Generous relative to a normal turn's duration, short relative to the 24h cooldown. Not exposed via bot yaml — an implementation detail of delivery confirmation, not a product-facing threshold. */
@@ -125,6 +154,14 @@ export interface StallDetectorDeps {
   getLastActiveTs: (threadId: string) => number | undefined;
   /** Pushes a synthesized turn onto the bridge's normal inbound queue — same mechanism as CommentPoller's enqueueSyntheticTurn. */
   enqueueNudgeTurn: (turn: StallNudgeTurn) => void;
+  /**
+   * v3.2 交接断链检测: reads ANOTHER bot's SessionStore for its `lastActiveTs`
+   * in the SAME thread — a plain in-memory Map read, no I/O (main.ts closes
+   * over a botId→SessionStore map populated during startup). Omit to disable
+   * handoff-break detection entirely (the general stall check above is
+   * unaffected either way).
+   */
+  getPeerLastActiveTs?: (peerBotId: string, threadId: string) => number | undefined;
 }
 
 export interface StallDetectorOptions {
@@ -136,6 +173,8 @@ export interface StallDetectorOptions {
   stallThresholdMs?: number;
   /** @default 30min */
   stallFastThresholdMs?: number;
+  /** @default 15min. v3.2 交接断链检测 — see the module doc's own section. */
+  stallHandoffThresholdMs?: number;
   /** @default 24h */
   nudgeCooldownMs?: number;
   /** @default 2 */
@@ -144,15 +183,28 @@ export interface StallDetectorOptions {
   pendingConfirmTimeoutMs?: number;
 }
 
+/** `ms` rendered as a human-friendly duration label, minutes below an hour, hours at/above — a fixed 15min threshold reading "已超过 1 小时" (rounding-to-hours) would be actively misleading. Exported for direct unit testing — pure, no I/O. */
+export function formatDurationLabel(ms: number): string {
+  if (ms < 3_600_000) return `${Math.max(1, Math.round(ms / 60_000))} 分钟`;
+  return `${Math.max(1, Math.round(ms / 3_600_000))} 小时`;
+}
+
 /** Renders the synthesized "message" text the claiming agent sees on a nudge turn — a plain fact block, no instruction on WHAT to do (that's the SKILL's job). */
 export function renderStallNudgeText(input: {
   summary: string | undefined;
-  idleHours: number;
+  idleMs: number;
   nudgeCount: number;
+  /** @default "normal" */
+  reason?: "handoff" | "failed" | "normal";
 }): string {
   const title = input.summary ? `“${input.summary}”` : "(无标题)";
+  const idleLabel = formatDurationLabel(input.idleMs);
+  const situation =
+    input.reason === "handoff"
+      ? `你上一轮回复里 @ 的协作 bot,已超过 ${idleLabel}没有在这个话题接手`
+      : `已超过 ${idleLabel}没有新动态`;
   return (
-    `${STALL_NUDGE_PREFIX}你认领的任务 ${title} 已超过 ${input.idleHours} 小时没有新动态` +
+    `${STALL_NUDGE_PREFIX}你认领的任务 ${title}${input.reason === "handoff" ? "," : ""} ${situation}` +
     `(第 ${input.nudgeCount} 次提醒)。请判断如何推进这项工作。`
   );
 }
@@ -172,6 +224,7 @@ export class StallDetector {
   readonly #jitterMs: number;
   readonly #stallThresholdMs: number;
   readonly #stallFastThresholdMs: number;
+  readonly #stallHandoffThresholdMs: number;
   readonly #nudgeCooldownMs: number;
   readonly #escalateAfterNudges: number;
   readonly #pendingConfirmTimeoutMs: number;
@@ -188,6 +241,7 @@ export class StallDetector {
     this.#jitterMs = Math.min(opts.jitterMs ?? DEFAULT_JITTER_MS, this.#intervalMs);
     this.#stallThresholdMs = opts.stallThresholdMs ?? DEFAULT_STALL_THRESHOLD_MS;
     this.#stallFastThresholdMs = opts.stallFastThresholdMs ?? DEFAULT_STALL_FAST_THRESHOLD_MS;
+    this.#stallHandoffThresholdMs = opts.stallHandoffThresholdMs ?? DEFAULT_STALL_HANDOFF_THRESHOLD_MS;
     this.#nudgeCooldownMs = opts.nudgeCooldownMs ?? DEFAULT_NUDGE_COOLDOWN_MS;
     this.#escalateAfterNudges = opts.escalateAfterNudges ?? DEFAULT_ESCALATE_AFTER_NUDGES;
     this.#pendingConfirmTimeoutMs = opts.pendingConfirmTimeoutMs ?? DEFAULT_PENDING_CONFIRM_TIMEOUT_MS;
@@ -306,7 +360,7 @@ export class StallDetector {
     }
 
     const nudge = record.stallNudge;
-    const threshold = record.lastTurnOutcome === "failed" ? this.#stallFastThresholdMs : this.#stallThresholdMs;
+    const { ms: threshold } = this.#effectiveThreshold(record, threadId);
 
     if (!nudge || nudge.count === 0) {
       if (now - lastActiveTs < threshold) return; // not stalled yet
@@ -330,6 +384,35 @@ export class StallDetector {
     } else {
       await this.#sendNudge(threadId);
     }
+  }
+
+  /**
+   * The effective stall threshold for this record right now, and which rule
+   * produced it (module doc's v3.2 section) — whichever applicable rule is
+   * SHORTEST always wins; a mentioned peer that already responded removes
+   * the handoff rule from consideration entirely (not just "picks the other
+   * one" — it means the handoff condition genuinely no longer holds).
+   */
+  #effectiveThreshold(
+    record: TaskHandleRecord,
+    threadId: string,
+  ): { ms: number; reason: "handoff" | "failed" | "normal" } {
+    const base: { ms: number; reason: "failed" | "normal" } =
+      record.lastTurnOutcome === "failed"
+        ? { ms: this.#stallFastThresholdMs, reason: "failed" }
+        : { ms: this.#stallThresholdMs, reason: "normal" };
+
+    if (!this.#deps.getPeerLastActiveTs || !record.lastTurnMentions?.length || record.lastTurnMentionsAt === undefined) {
+      return base;
+    }
+    const mentionAt = record.lastTurnMentionsAt;
+    const anyPeerResponded = record.lastTurnMentions.some((peerBotId) => {
+      const peerActivity = this.#deps.getPeerLastActiveTs!(peerBotId, threadId);
+      return peerActivity !== undefined && peerActivity > mentionAt;
+    });
+    if (anyPeerResponded) return base; // the mentioned peer already picked it up — handoff condition doesn't hold
+
+    return this.#stallHandoffThresholdMs < base.ms ? { ms: this.#stallHandoffThresholdMs, reason: "handoff" } : base;
   }
 
   /**
@@ -391,7 +474,7 @@ export class StallDetector {
       return;
     }
 
-    const threshold = record.lastTurnOutcome === "failed" ? this.#stallFastThresholdMs : this.#stallThresholdMs;
+    const { ms: threshold, reason } = this.#effectiveThreshold(record, threadId);
     const prospectiveCount = (record.stallNudge?.count ?? 0) + 1; // display only — the persisted count increments on confirm, not here
     const now = Date.now();
     this.#deps.enqueueNudgeTurn({
@@ -399,8 +482,9 @@ export class StallDetector {
       chatId: record.chatId,
       text: renderStallNudgeText({
         summary: task.summary,
-        idleHours: Math.max(1, Math.round(threshold / 3_600_000)),
+        idleMs: threshold,
         nudgeCount: prospectiveCount,
+        reason,
       }),
     });
     await this.#deps.store.update(threadId, (r) =>

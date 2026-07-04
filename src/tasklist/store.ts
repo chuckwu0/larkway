@@ -95,6 +95,19 @@ export interface TaskHandleRecord {
    * past it, e.g. a new turn reopens the task.
    */
   stallSuppressUntilActivityAfter?: number;
+  /**
+   * v3.2 交接断链检测 (docs/task-handle.md §13): internal bot config ids
+   * (NOT bot_open_id — SessionStore lookups are keyed by config id) that the
+   * MOST RECENT completed turn's reply text mentioned by roster name-match.
+   * Written by writeback.ts's "completed" branch, REPLACED (not merged) on
+   * every completed turn — this reflects only the latest turn's handoff
+   * intent, not history. Absent/empty when that turn mentioned nobody, or
+   * on a "failed" turn (a crash isn't a deliberate handoff — the existing
+   * fast-failure threshold already covers that case with higher priority).
+   */
+  lastTurnMentions?: string[];
+  /** ms epoch — when `lastTurnMentions` was recorded (the mentioning turn's completion time). Always set together with `lastTurnMentions`. */
+  lastTurnMentionsAt?: number;
 }
 
 interface StoreFile {
@@ -125,7 +138,10 @@ function isTaskHandleRecord(value: unknown): value is TaskHandleRecord {
     (v["lastSeenCommentId"] === undefined || typeof v["lastSeenCommentId"] === "string") &&
     (v["lastTurnOutcome"] === undefined || v["lastTurnOutcome"] === "completed" || v["lastTurnOutcome"] === "failed") &&
     (v["stallNudge"] === undefined || isStallNudgeState(v["stallNudge"])) &&
-    (v["stallSuppressUntilActivityAfter"] === undefined || typeof v["stallSuppressUntilActivityAfter"] === "number")
+    (v["stallSuppressUntilActivityAfter"] === undefined || typeof v["stallSuppressUntilActivityAfter"] === "number") &&
+    (v["lastTurnMentions"] === undefined ||
+      (Array.isArray(v["lastTurnMentions"]) && v["lastTurnMentions"].every((m) => typeof m === "string"))) &&
+    (v["lastTurnMentionsAt"] === undefined || typeof v["lastTurnMentionsAt"] === "number")
   );
 }
 

@@ -215,8 +215,8 @@ describe("normalizeForExactMatch", () => {
     );
   });
 
-  it("regression: @Elon 在吗 vs @Linus 在吗 must never normalize equal (the exact case adversarial review flagged)", () => {
-    expect(normalizeForExactMatch("@Elon 在吗")).not.toBe(normalizeForExactMatch("@Linus 在吗"));
+  it("regression: @张三 在吗 vs @李四 在吗 must never normalize equal (the exact case adversarial review flagged)", () => {
+    expect(normalizeForExactMatch("@张三 在吗")).not.toBe(normalizeForExactMatch("@李四 在吗"));
   });
 
   it("regression: email-domain collision must never normalize equal", () => {

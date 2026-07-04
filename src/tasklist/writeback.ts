@@ -302,8 +302,23 @@ export async function applyTaskHandleWriteback(
         // in place — `record` here was captured before the getTask() await
         // above, so spreading it directly would clobber anything either of
         // those wrote during that window (adversarial-review RMW fix).
+        //
+        // v3.2 交接断链检测 (docs/task-handle.md §13): also persist which
+        // roster peers (if any) THIS turn's reply mentioned by name — bundled
+        // into the SAME update() call as lastTurnOutcome (one write, not two).
+        // Always REPLACES (never accumulates) — only the latest completed
+        // turn's mention intent matters.
+        const mentionedPeerBotIds =
+          patch.mentionedPeerBotIds && patch.mentionedPeerBotIds.length > 0 ? patch.mentionedPeerBotIds : undefined;
         await deps.store.update(patch.threadId, (current) =>
-          current ? { ...current, lastTurnOutcome: "completed" } : current,
+          current
+            ? {
+                ...current,
+                lastTurnOutcome: "completed",
+                lastTurnMentions: mentionedPeerBotIds,
+                lastTurnMentionsAt: mentionedPeerBotIds ? Date.now() : undefined,
+              }
+            : current,
         );
         // dogfood fix V1: a successful turn only ticks the task complete when
         // the agent itself declared `done: true` this turn — otherwise (e.g.
@@ -325,9 +340,14 @@ export async function applyTaskHandleWriteback(
       }
       case "failed": {
         // v3.1 stall detection — see the "completed" branch's identical note
-        // above (same update()-based RMW fix, same reasoning).
+        // above (same update()-based RMW fix, same reasoning). Also clears
+        // any stale lastTurnMentions/lastTurnMentionsAt (v3.2) — a crash
+        // isn't a deliberate handoff, and the fast-failure threshold already
+        // covers this case with higher priority than the handoff one would.
         await deps.store.update(patch.threadId, (current) =>
-          current ? { ...current, lastTurnOutcome: "failed" } : current,
+          current
+            ? { ...current, lastTurnOutcome: "failed", lastTurnMentions: undefined, lastTurnMentionsAt: undefined }
+            : current,
         );
         // Same content-discipline preference as the completed branch above —
         // only affects the description LOG entry; the posted failure comment

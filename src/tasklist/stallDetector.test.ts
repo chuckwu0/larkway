@@ -4,22 +4,51 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { TaskHandleStore } from "./store.js";
 import { TaskListClient, type LarkTaskRequestConfig, type LarkTaskRequester } from "./client.js";
-import { StallDetector, renderStallEscalationComment, renderStallNudgeText } from "./stallDetector.js";
+import { StallDetector, formatDurationLabel, renderStallEscalationComment, renderStallNudgeText } from "./stallDetector.js";
+
+const HOUR = 3_600_000;
+const DAY = 24 * HOUR;
 
 // ---------------------------------------------------------------------------
 // Pure renderers
 // ---------------------------------------------------------------------------
 
+describe("formatDurationLabel", () => {
+  it("renders sub-hour durations in minutes, not a misleading rounded-to-hours value", () => {
+    expect(formatDurationLabel(15 * 60_000)).toBe("15 分钟");
+    expect(formatDurationLabel(30 * 60_000)).toBe("30 分钟");
+  });
+
+  it("renders hour-scale durations in hours", () => {
+    expect(formatDurationLabel(24 * 60 * 60_000)).toBe("24 小时");
+  });
+});
+
 describe("renderStallNudgeText", () => {
   it("includes the task title, idle duration, and nudge count", () => {
-    const text = renderStallNudgeText({ summary: "帮我修一下登录页", idleHours: 24, nudgeCount: 1 });
+    const text = renderStallNudgeText({ summary: "帮我修一下登录页", idleMs: 24 * 60 * 60_000, nudgeCount: 1 });
     expect(text).toContain("帮我修一下登录页");
     expect(text).toContain("24 小时");
     expect(text).toContain("第 1 次提醒");
   });
 
   it("falls back to a placeholder title when summary is missing", () => {
-    expect(renderStallNudgeText({ summary: undefined, idleHours: 1, nudgeCount: 1 })).toContain("(无标题)");
+    expect(renderStallNudgeText({ summary: undefined, idleMs: 60_000, nudgeCount: 1 })).toContain("(无标题)");
+  });
+
+  it("renders a 15-minute handoff threshold in minutes, not misleadingly rounded to '1 小时'", () => {
+    const text = renderStallNudgeText({ summary: "任务A", idleMs: 15 * 60_000, nudgeCount: 1, reason: "handoff" });
+    expect(text).toContain("15 分钟");
+    expect(text).not.toContain("小时");
+  });
+
+  it("mentions the handoff-specific framing (协作对象...接手) only for reason='handoff'", () => {
+    const handoff = renderStallNudgeText({ summary: "任务A", idleMs: 15 * 60_000, nudgeCount: 1, reason: "handoff" });
+    expect(handoff).toContain("协作");
+    expect(handoff).toContain("接手");
+
+    const normal = renderStallNudgeText({ summary: "任务A", idleMs: DAY, nudgeCount: 1, reason: "normal" });
+    expect(normal).not.toContain("协作");
   });
 });
 
@@ -74,9 +103,6 @@ afterEach(async () => {
   vi.useRealTimers();
   await rm(dir, { recursive: true, force: true });
 });
-
-const HOUR = 3_600_000;
-const DAY = 24 * HOUR;
 
 describe("StallDetector", () => {
   it("does nothing when idle time is under the threshold (no getTask call at all)", async () => {
@@ -450,5 +476,155 @@ describe("StallDetector", () => {
     await detector2.pollOnceForTest();
     expect(enqueueNudgeTurn2).not.toHaveBeenCalled();
     expect(store2.get("t1")?.stallNudge?.count).toBe(0); // still unconfirmed, not incremented by the restart
+  });
+
+  // v3.2 交接断链检测 (docs/task-handle.md §13)
+  describe("handoff-break detection", () => {
+    const HANDOFF = 15 * 60_000;
+
+    it("uses the much shorter handoff threshold when the mentioned peer has NOT had a turn since the mention", async () => {
+      const store = await TaskHandleStore.load(join(dir, "task-handles.json"));
+      const claimedAt = Date.now();
+      await store.put({
+        threadId: "t1",
+        taskGuid: "g1",
+        chatId: "oc_1",
+        claimedTs: claimedAt,
+        lastTurnMentions: ["peer-bot"],
+        lastTurnMentionsAt: claimedAt,
+      });
+      const { requester } = makeFakeRequester({ g1: { guid: "g1", summary: "任务A" } });
+      const client = new TaskListClient(requester);
+      const enqueueNudgeTurn = vi.fn();
+      const detector = new StallDetector(
+        {
+          store,
+          client,
+          getLastActiveTs: () => claimedAt,
+          enqueueNudgeTurn,
+          getPeerLastActiveTs: () => undefined, // peer never had a session at all in this thread
+        },
+        { stallThresholdMs: DAY, stallHandoffThresholdMs: HANDOFF },
+      );
+
+      // Only 16 minutes idle — nowhere near the 24h normal threshold, but past the 15min handoff one.
+      vi.setSystemTime(claimedAt + HANDOFF + 60_000);
+      await detector.pollOnceForTest();
+
+      expect(enqueueNudgeTurn).toHaveBeenCalledTimes(1);
+      const text = (enqueueNudgeTurn.mock.calls[0]![0] as { text: string }).text;
+      expect(text).toContain("分钟");
+      expect(text).toContain("协作");
+    });
+
+    it("does NOT use the handoff threshold once the mentioned peer has had a turn since the mention", async () => {
+      const store = await TaskHandleStore.load(join(dir, "task-handles.json"));
+      const claimedAt = Date.now();
+      await store.put({
+        threadId: "t1",
+        taskGuid: "g1",
+        chatId: "oc_1",
+        claimedTs: claimedAt,
+        lastTurnMentions: ["peer-bot"],
+        lastTurnMentionsAt: claimedAt,
+      });
+      const { requester } = makeFakeRequester({ g1: { guid: "g1", summary: "任务A" } });
+      const client = new TaskListClient(requester);
+      const enqueueNudgeTurn = vi.fn();
+      const detector = new StallDetector(
+        {
+          store,
+          client,
+          getLastActiveTs: () => claimedAt,
+          enqueueNudgeTurn,
+          getPeerLastActiveTs: () => claimedAt + 60_000, // peer DID pick it up shortly after the mention
+        },
+        { stallThresholdMs: DAY, stallHandoffThresholdMs: HANDOFF },
+      );
+
+      // Well past the 15min handoff window, but nowhere near the 24h normal one.
+      vi.setSystemTime(claimedAt + HANDOFF + 60_000);
+      await detector.pollOnceForTest();
+
+      expect(enqueueNudgeTurn).not.toHaveBeenCalled();
+    });
+
+    it("falls back to the normal/fast threshold when getPeerLastActiveTs is not wired (backward compatible)", async () => {
+      const store = await TaskHandleStore.load(join(dir, "task-handles.json"));
+      const claimedAt = Date.now();
+      await store.put({
+        threadId: "t1",
+        taskGuid: "g1",
+        chatId: "oc_1",
+        claimedTs: claimedAt,
+        lastTurnMentions: ["peer-bot"],
+        lastTurnMentionsAt: claimedAt,
+      });
+      const { requester } = makeFakeRequester({ g1: { guid: "g1", summary: "任务A" } });
+      const client = new TaskListClient(requester);
+      const enqueueNudgeTurn = vi.fn();
+      const detector = new StallDetector(
+        { store, client, getLastActiveTs: () => claimedAt, enqueueNudgeTurn }, // no getPeerLastActiveTs at all
+        { stallThresholdMs: DAY, stallHandoffThresholdMs: HANDOFF },
+      );
+
+      vi.setSystemTime(claimedAt + HANDOFF + 60_000); // past handoff, nowhere near 24h
+      await detector.pollOnceForTest();
+
+      expect(enqueueNudgeTurn).not.toHaveBeenCalled(); // handoff rule never considered without the dep
+    });
+
+    it("picks whichever applicable threshold is SHORTEST — handoff (15min) beats fast-failure (30min)", async () => {
+      const store = await TaskHandleStore.load(join(dir, "task-handles.json"));
+      const claimedAt = Date.now();
+      await store.put({
+        threadId: "t1",
+        taskGuid: "g1",
+        chatId: "oc_1",
+        claimedTs: claimedAt,
+        lastTurnOutcome: "failed",
+        lastTurnMentions: ["peer-bot"],
+        lastTurnMentionsAt: claimedAt,
+      });
+      const { requester } = makeFakeRequester({ g1: { guid: "g1", summary: "任务A" } });
+      const client = new TaskListClient(requester);
+      const enqueueNudgeTurn = vi.fn();
+      const detector = new StallDetector(
+        { store, client, getLastActiveTs: () => claimedAt, enqueueNudgeTurn, getPeerLastActiveTs: () => undefined },
+        { stallThresholdMs: DAY, stallFastThresholdMs: 30 * 60_000, stallHandoffThresholdMs: HANDOFF },
+      );
+
+      // Past the 15min handoff threshold but well under the 30min fast-failure one.
+      vi.setSystemTime(claimedAt + HANDOFF + 60_000);
+      await detector.pollOnceForTest();
+
+      expect(enqueueNudgeTurn).toHaveBeenCalledTimes(1);
+      const text = (enqueueNudgeTurn.mock.calls[0]![0] as { text: string }).text;
+      expect(text).toContain("分钟"); // rendered using the shorter (handoff) threshold, not the 30min one
+    });
+
+    it("a 'failed' turn clears lastTurnMentions — writeback.ts's job, but StallDetector must tolerate its absence gracefully", async () => {
+      const store = await TaskHandleStore.load(join(dir, "task-handles.json"));
+      const claimedAt = Date.now();
+      // Simulates the post-writeback state after a failed turn: no lastTurnMentions.
+      await store.put({ threadId: "t1", taskGuid: "g1", chatId: "oc_1", claimedTs: claimedAt, lastTurnOutcome: "failed" });
+      const { requester } = makeFakeRequester({ g1: { guid: "g1", summary: "任务A" } });
+      const client = new TaskListClient(requester);
+      const enqueueNudgeTurn = vi.fn();
+      const detector = new StallDetector(
+        { store, client, getLastActiveTs: () => claimedAt, enqueueNudgeTurn, getPeerLastActiveTs: () => undefined },
+        { stallThresholdMs: DAY, stallFastThresholdMs: 30 * 60_000, stallHandoffThresholdMs: HANDOFF },
+      );
+
+      // Past the 15min handoff window but under the 30min fast-failure threshold — must NOT fire yet.
+      vi.setSystemTime(claimedAt + HANDOFF + 60_000);
+      await detector.pollOnceForTest();
+      expect(enqueueNudgeTurn).not.toHaveBeenCalled();
+
+      // Past the 30min fast-failure threshold now fires normally.
+      vi.setSystemTime(claimedAt + 31 * 60_000);
+      await detector.pollOnceForTest();
+      expect(enqueueNudgeTurn).toHaveBeenCalledTimes(1);
+    });
   });
 });

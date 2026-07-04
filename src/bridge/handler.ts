@@ -579,6 +579,16 @@ export interface BridgeHandlerDeps {
    */
   peers?: PeerBot[];
   /**
+   * v3.2 交接断链检测 (docs/task-handle.md §13): this bot's peers, but keyed
+   * by their INTERNAL bot config id (not `bot_open_id` — SessionStore
+   * lookups need the config id, whereas `peers` above carries the open_id
+   * used for actually @-mentioning them). Deliberately a separate, narrow
+   * dep rather than extending `PeerBot` — this is the only place that needs
+   * the config id, and `peers`/`PeerBot` is used much more broadly (prompt
+   * rendering). Absent → mention detection is a no-op (no peers configured).
+   */
+  taskHandleMentionRoster?: Array<{ name: string; botId: string }>;
+  /**
    * V2: sourced from BotConfig — passed to renderPrompt + createRunner().run.
    * When absent (V1), renderPrompt and the runner fall back to V1 behavior.
    */
@@ -754,6 +764,21 @@ export class BridgeHandler {
     return (this.deps.runtimeRequirements ?? []).filter((req) =>
       !req.ok && (req.severity === "required" || req.kind === "secret")
     );
+  }
+
+  /**
+   * v3.2 交接断链检测 (docs/task-handle.md §13): mechanical roster name-match
+   * — does THIS turn's reply text mention any configured peer by their
+   * display name? Plain substring match, no NLP/semantic judgment (matches
+   * this feature's "bridge only does string/time comparison" iron rule).
+   * Returns undefined (not an empty array) when there's nothing to report,
+   * so callers can treat "no mentions" and "no roster configured" the same.
+   */
+  #matchMentionedPeers(text: string): string[] | undefined {
+    const roster = this.deps.taskHandleMentionRoster;
+    if (!roster || roster.length === 0) return undefined;
+    const matched = roster.filter((p) => p.name.length > 0 && text.includes(p.name)).map((p) => p.botId);
+    return matched.length > 0 ? matched : undefined;
   }
 
   /**
@@ -2163,6 +2188,7 @@ export class BridgeHandler {
                   finalText: baseCardPayload.finalText,
                   agentDeclaredDone: reportedState?.task_handle?.done === true,
                   note: reportedState?.task_handle?.note,
+                  mentionedPeerBotIds: this.#matchMentionedPeers(baseCardPayload.finalText),
                 }
               : {
                   status: "failed",

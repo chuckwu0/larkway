@@ -1050,6 +1050,7 @@ taskHandle:
   tasklistGuid: "tl-abc123"
   stallThresholdMs: 43200000
   stallFastThresholdMs: 900000
+  stallHandoffThresholdMs: 600000
   stallNudgeCooldownMs: 43200000
   stallEscalateAfterNudges: 3
   stallDetectionDisabled: false
@@ -1060,6 +1061,7 @@ taskHandle:
       tasklistGuid: "tl-abc123",
       stallThresholdMs: 43200000,
       stallFastThresholdMs: 900000,
+      stallHandoffThresholdMs: 600000,
       stallNudgeCooldownMs: 43200000,
       stallEscalateAfterNudges: 3,
       stallDetectionDisabled: false,

@@ -127,6 +127,22 @@ describe("TaskHandleStore", () => {
     expect(reloaded.get("t1")?.lastSeenCommentId).toBe("c1");
   });
 
+  // v3.2 交接断链检测 (docs/task-handle.md §13)
+  it("lastTurnMentions/lastTurnMentionsAt round-trip when present", async () => {
+    const store = await TaskHandleStore.load(filePath);
+    await store.put({
+      threadId: "t1",
+      taskGuid: "g1",
+      chatId: "oc_1",
+      claimedTs: 1,
+      lastTurnMentions: ["turing", "elon"],
+      lastTurnMentionsAt: 12345,
+    });
+    const reloaded = await TaskHandleStore.load(filePath);
+    expect(reloaded.get("t1")?.lastTurnMentions).toEqual(["turing", "elon"]);
+    expect(reloaded.get("t1")?.lastTurnMentionsAt).toBe(12345);
+  });
+
   // B2: handler.ts fires the taskHandleClaim hook (which main.ts wires to
   // claim()) EVERY turn the agent re-declares task_handle.guid in state.json,
   // not just on the first claim — because the guid is normally the same task
