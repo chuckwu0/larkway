@@ -401,7 +401,7 @@ function renderTaskHandleBlock(tasklistGuid: string, claimed: boolean): string[]
     "<task-handle>",
     `task_handle_tasklist_guid: ${tasklistGuid}`,
     `task_handle_claimed: ${claimed ? "yes" : "no"}`,
-    "本群启用了任务句柄;用户要求认领任务时,按 task-handle skill 流程处理。",
+    "本群启用了任务句柄;若本话题尚未认领,按 task-handle skill 静默自认领流程处理。",
     "</task-handle>",
   ];
 }

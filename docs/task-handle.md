@@ -5,7 +5,7 @@
 
 ## 1. 一句话
 
-**群里的一个飞书话题 = agent 的一项工作;用户把话题「转任务」后,这条飞书任务成为该话题的管理句柄** —— 可改名、可备注、看得到状态、收得到推送、点得回话题;agent 认领后自动维护它的生命周期。**owner 的一整组 agent 共用一个「Agent Team」任务清单**(owner 私有,想给谁看自己手动分享),不管 @ 哪个 agent、在哪个群,转出来的任务都进这一个清单。
+**群里的一个飞书话题 = agent 的一项工作;用户把话题「转任务」后,这条飞书任务成为该话题的管理句柄** —— 可改名、可备注、看得到状态、收得到推送、点得回话题;agent 每轮静默自动认领(无感,不用户驱动),之后自动维护它的生命周期。**owner 的一整组 agent 共用一个「Agent Team」任务清单**(owner 私有,想给谁看自己手动分享),不管 @ 哪个 agent、在哪个群,转出来的任务都进这一个清单。
 
 ## 2. 动机(要解决的痛点)
 
@@ -33,7 +33,7 @@
 
 1. **开话题** —— 群里 @ agent 说需求,agent 在话题里干活。**默认不产生任何任务**;快问快答不留垃圾。
 2. **值得跟踪的,用户转一下** —— 右键话题根消息 →「添加任务」→ 挂进本群的共享清单(如「Agent Team」)。得到一条带原生「创建于会话」回跳的任务(全飞书唯一能点回话题的绑定,只能由人在客户端创建,见 §9)。
-3. **告诉 agent 认领** —— 在话题里说一声「认领任务」(或点 agent 卡片上的认领按钮)。agent 拿自己的根消息原文到清单里检索候选;有歧义就出 choices 卡片让用户确认;确认后把 `task_guid` 写进 `.larkway/state.json` 声明给 bridge。
+3. **无需任何操作** —— 下次在话题里 @ agent 继续干活时,它会顺带拿自己的根消息原文到清单里检索候选,高置信匹配就静默把 `task_guid` 写进 `.larkway/state.json` 声明给 bridge;歧义就静默跳过、不打扰用户,下一轮自愈重试。整个过程对用户不可见,不出按钮、不出确认卡片、不宣布"已认领"。
 4. **此后自动维护** ——
    - agent 每轮跑完:任务描述刷成最新状态日志(状态行 + 最近几条轮次摘要滚动更新);关键里程碑(交付/失败/等拍板)发**任务评论**,任务助手将其原生推送给任务创建者/关注者;
    - **turn 成功 ≠ 任务已交付**(dogfood 实测:agent 把活派给下游 agent、自己这轮正常收尾,曾被误勾完成)—— 完成与否由 agent 在 `task_handle.done` 里显式声明,只有 `done: true` 的那一轮 bridge 才勾完成;`completed` 但未声明 `done` 只刷新描述日志;同话题新 turn → 自动 reopen;agent 崩溃/超时 → bridge 把任务标注失败原因(死进程无法自报,这是 bridge 必须兜底的唯一场景);
@@ -48,7 +48,7 @@
 
 | 组件 | 位置 | 职责 |
 |---|---|---|
-| **task-handle SKILL** | agent workspace(仓库随附样例,adopter 自行安装) | 教 agent:何时/如何检索清单认领任务、歧义时出 choices 问人、把 task_guid 写入 state.json、干活中如何发里程碑评论/刷描述(全部经 `lark-cli task` 命令) |
+| **task-handle SKILL** | agent workspace(仓库随附样例,adopter 自行安装) | 教 agent:每轮静默检索清单自动认领(无用户交互,高置信才认领、歧义就跳过自愈)、把 task_guid 写入 state.json、干活中如何发里程碑评论/刷描述(全部经 `lark-cli task` 命令) |
 | **state.json 声明** | 既有 agent→bridge 结构化通道扩展 | 新增可选字段 `task_handle: { guid }`;bridge 在 finalize 时读取并持久化 thread↔task 映射 |
 | **tasklist 模块** | `src/tasklist/`(独立于 bridge/,仿 housekeeping 的 class+timer 形状) | ① provisioning:建共享清单、把群加为成员(member type=chat)、把兄弟 agent app 加为 editor(CLI 子命令,一次性,不在消息路径上);② 机械回写:接收 bridge 注入的生命周期事件,按已声明的 task_guid 调飞书任务 API(完成/reopen/失败标注);③ 评论轮询:仅扫**已认领**任务的评论,发现新评论合成 turn |
 | **bridge 改动(极小)** | `src/bridge/handler.ts` | 仅新增一个可选注入 hook 调用(仿 recordRuntimeEvent 形状),把 status/threadId/finalText 传给 tasklist 模块;不含任何任务逻辑 |
@@ -56,8 +56,8 @@
 
 ### 5.2 关键设计决策
 
-- **认领 = agent 在 turn 内做**,理由:① agent 手握根消息全文与会话上下文,匹配远比 bridge 可靠;② 歧义可用 choices 卡片交互消解(bridge 做不到);③ 消除跨实例认领竞态(声明经 state.json 串行落盘);④ 符合 thin-bridge 判据与 ownership 原则。
-- **双 @ 竞态兜底**:两个 agent 同话题都被指示认领时,先在任务评论区追加「认领声明」再回读评论列表,时间序在前者胜;败者放弃并在话题里说明。低频场景,确定性规则即可。
+- **认领 = agent 每轮静默自动做,不用户驱动**(2026-07 修订:v2 初版曾设计「用户说一声/点按钮」,dogfood 反馈用户已经手动转过一次任务、认领应是无感的后台动作,不该再要求二次触发)。理由:① agent 手握根消息全文与会话上下文,匹配远比 bridge 可靠;② 歧义就静默跳过、下一轮自愈,不需要用户介入消解(不像 v1 设想的 choices 卡片那样打扰用户);③ 消除跨实例认领竞态(声明经 state.json 串行落盘);④ 符合 thin-bridge 判据与 ownership 原则。
+- **双 @ 竞态兜底**:两个 agent 同话题在同一轮都满足认领条件时,先在任务评论区追加「认领声明」再回读评论列表,时间序在前者胜;败者静默放弃(不告诉用户),下一轮 `task_handle_claimed` 事实会显示已认领,自然不再重试。低频场景,确定性规则即可。
 - **发现轮询不存在**:bridge/模块**不**扫描清单找新任务(v1 的做法,已废——会重演多 bot 定时器风暴)。认领由人触发、agent 执行。
 - **评论轮询规模可控**:只轮询本 bot 已认领的任务(用户精选的少数),默认 60s 间隔 + 抖动;这是「第二信箱」,分钟级延迟可接受。
 - **里程碑评论克制**:仅交付/失败/等拍板三类节点发评论(每条都会推送给人,滥发 = 通知骚扰);过程性状态只刷描述(不推送)。
@@ -70,7 +70,7 @@
   > 平台细节:task v2 API 的 `owner`/`creator` 字段是建清单时调用身份自动生成的(此实现无 user-token 流程,实际调用身份是 team 里第一个 bot 的 app,而非 owner 本人的账号)。owner 能在自己的飞书任务中心**看到并管理**这个清单,靠的不是这个 API 字段,而是 `tasklist-init` CLI 把 owner 的 open_id 作为**人类成员**(role=editor)显式加入清单(见 §7)——这是 F2 修复项,早期实现遗漏过这一步,导致清单建成后 owner 反而看不到。
 - **写入方 = owner 这一组 agent 的 app**。这些 agent 是不同 app 身份,要都能往清单写任务/评论,provisioning 时把它们的 app 都加为清单 **editor**(这是给「自己的 agent」写权限,不是共享给外人,隐私不变)。
 - **只收 owner 转的任务**:owner 右键转的话题才进这个清单;非 owner(群里其他人)转的任务不进 owner 的板(那是他自己的任务,在他「我负责的」里,与本清单无关)。owner 语义沿用 agent-workspace.md §6 的 `sender_open_id / is_owner`。
-- **认领护栏**:agent 只认领「源话题确实是自己 session」的任务;对不上的礼貌拒绝。
+- **认领护栏**:agent 只认领「源话题确实是自己 session」的任务;对不上就静默跳过,不告诉用户。
 - **哪些 agent 算「一组」**:配了同一个 `tasklistGuid` 的那几个 bot(默认可以是同一部署上的全部 bot);跨部署由 provisioning 把同一 guid 写进各 bot 配置。
 
 ## 6. 降级契约(必须遵守的不变量)
