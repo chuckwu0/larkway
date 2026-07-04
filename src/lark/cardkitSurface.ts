@@ -3,6 +3,9 @@ import type { Choice, ContentBlock, ImageBlock } from "./card.js";
 export const CARDKIT_FINAL_ELEMENT_ID = "final_md";
 export const CARDKIT_FOOTER_ELEMENT_ID = "footer_md";
 export const CARDKIT_CHOICES_ELEMENT_ID = "choices_slot";
+/** COT-in-card (方案 B): the collapsible reasoning panel and its inner markdown. */
+export const CARDKIT_COT_PANEL_ELEMENT_ID = "cot_panel";
+export const CARDKIT_COT_INNER_ELEMENT_ID = "cot_inner_md";
 
 const MAX_CARD_BYTES = 30 * 1024;
 const FINAL_BUDGET_CHARS = 22_000;
@@ -27,6 +30,14 @@ export interface BuildCardKitFinalCardOpts {
   choicePrompt?: string;
   imageBlocks?: ImageBlock[];
   contentBlocks?: ContentBlock[];
+  /**
+   * COT-in-card (方案 B): when the reasoning panel was created this turn, its
+   * collapsed final form is embedded ABOVE the answer here. This is deliberate:
+   * finalize replaces the whole card via updateCardEntity, so a separate
+   * collapse-PATCH would be clobbered by that rebuild — the panel must live in
+   * the final card itself. Omitted when no reasoning streamed.
+   */
+  cotPanel?: { title: string; content: string };
 }
 
 function plainText(content: string): { tag: "plain_text"; content: string } {
@@ -41,6 +52,28 @@ function markdown(content: string, elementId?: string): Record<string, unknown> 
 
 export function buildCardKitAnswerElement(content = ""): Record<string, unknown> {
   return markdown(content, CARDKIT_FINAL_ELEMENT_ID);
+}
+
+/**
+ * COT-in-card (方案 B): a collapsible_panel wrapping a single markdown element
+ * that the reasoning stream flows into. Verified against Feishu CardKit 2.0
+ * (cot-write-probe.md): the nested markdown is accepted at create time and can
+ * be streamed via PUT elements/{inner}/content; expanded + header.title are
+ * settable. During the run the panel is expanded ("思考中…"); the final card
+ * embeds it collapsed with a settled title.
+ */
+export function buildCotPanelElement(opts: {
+  expanded: boolean;
+  title: string;
+  content: string;
+}): Record<string, unknown> {
+  return {
+    tag: "collapsible_panel",
+    element_id: CARDKIT_COT_PANEL_ELEMENT_ID,
+    expanded: opts.expanded,
+    header: { title: { tag: "markdown", content: opts.title } },
+    elements: [markdown(opts.content || "…", CARDKIT_COT_INNER_ELEMENT_ID)],
+  };
 }
 
 function safeAtMention(target: CardKitMentionTarget): string {
@@ -161,7 +194,19 @@ function finalMarkdown(opts: BuildCardKitFinalCardOpts): string {
 export function buildCardKitFinalCard(
   opts: BuildCardKitFinalCardOpts,
 ): Record<string, unknown> {
-  const elements: unknown[] = [buildCardKitAnswerElement(finalMarkdown(opts))];
+  const elements: unknown[] = [];
+  // Collapsed reasoning panel sits ABOVE the answer (matches its streaming
+  // position). Embedded here so the full-card rebuild keeps it (collapsed).
+  if (opts.cotPanel) {
+    elements.push(
+      buildCotPanelElement({
+        expanded: false,
+        title: opts.cotPanel.title,
+        content: opts.cotPanel.content,
+      }),
+    );
+  }
+  elements.push(buildCardKitAnswerElement(finalMarkdown(opts)));
   const images: ImageBlock[] = [];
   if (opts.contentBlocks?.length) {
     for (const block of opts.contentBlocks) {

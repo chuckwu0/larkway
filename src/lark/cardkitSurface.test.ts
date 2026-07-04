@@ -2,8 +2,11 @@ import { describe, expect, it } from "vitest";
 import {
   buildCardKitFinalCard,
   buildCardKitInitialCard,
+  buildCotPanelElement,
   CARDKIT_FOOTER_ELEMENT_ID,
   CARDKIT_FINAL_ELEMENT_ID,
+  CARDKIT_COT_PANEL_ELEMENT_ID,
+  CARDKIT_COT_INNER_ELEMENT_ID,
 } from "./cardkitSurface.js";
 
 function elements(card: Record<string, unknown>): Record<string, unknown>[] {
@@ -97,4 +100,32 @@ describe("cardkitSurface", () => {
     const tags = elements(card).map((e) => e["tag"]);
     expect(tags).toEqual(["markdown"]);
   });
+
+  it("buildCotPanelElement wraps an inner markdown in a collapsible_panel", () => {
+    const panel = buildCotPanelElement({ expanded: true, title: "思考中…", content: "推理" }) as Record<string, unknown>;
+    expect(panel["tag"]).toBe("collapsible_panel");
+    expect(panel["element_id"]).toBe(CARDKIT_COT_PANEL_ELEMENT_ID);
+    expect(panel["expanded"]).toBe(true);
+    const inner = (panel["elements"] as Record<string, unknown>[])[0]!;
+    expect(inner["element_id"]).toBe(CARDKIT_COT_INNER_ELEMENT_ID);
+    expect(inner["content"]).toBe("推理");
+  });
+
+  it("buildCardKitFinalCard embeds the collapsed cotPanel ABOVE the answer", () => {
+    const card = buildCardKitFinalCard({ finalText: "答案", cotPanel: { title: "思考过程", content: "推理内容" } });
+    const els = elements(card);
+    const panelIdx = els.findIndex((e) => e["tag"] === "collapsible_panel");
+    const answerIdx = els.findIndex((e) => e["element_id"] === CARDKIT_FINAL_ELEMENT_ID);
+    expect(panelIdx).toBeGreaterThanOrEqual(0);
+    expect(panelIdx).toBeLessThan(answerIdx);
+    expect(els[panelIdx]!["expanded"]).toBe(false);
+    expect(JSON.stringify(els[panelIdx])).toContain("思考过程");
+    expect(JSON.stringify(els[panelIdx])).toContain("推理内容");
+  });
+
+  it("buildCardKitFinalCard omits the panel when no cotPanel is given", () => {
+    const card = buildCardKitFinalCard({ finalText: "答案" });
+    expect(elements(card).some((e) => e["tag"] === "collapsible_panel")).toBe(false);
+  });
+
 });

@@ -340,6 +340,17 @@ export const BotConfigSchema = z.object({
   cot: z.enum(["off", "brief", "detailed"]).default("brief"),
 
   /**
+   * COT 展示形态(方案 B)。`cot` 管密度(off/brief/detailed),这个管落点:
+   * - "card"(默认):思考过程折叠进答案卡片里的 collapsible_panel(懒创建、
+   *   答案上方、finalize 时折叠)。话题群里也能用,是默认形态。
+   * - "bubble":走飞书原生 message_cot 思维链气泡(src/bridge/cotProgress.ts)。
+   *   保留为实验选项 —— 已知限制:话题内锚定不可用(气泡落群顶层),且本租户
+   *   thread 通道判死、chat 通道 PUT 偶发 400。
+   * cot="off" 时本字段无意义(两种形态都不产出)。
+   */
+  cotSurface: z.enum(["card", "bubble"]).default("card"),
+
+  /**
    * 话题 ↔ 飞书任务句柄(docs/task-handle.md,v2)。省略此字段不代表关闭,但也
    * 不会触发任何自动建清单——main.ts 在 startup 时只做只读解析(yaml 里的
    * tasklistGuid,或共享注册文件里已有的 guid);清单本身只由
