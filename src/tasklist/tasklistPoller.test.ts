@@ -274,11 +274,12 @@ describe("TasklistPoller", () => {
 });
 
 describe("normalizeForExactMatch", () => {
-  // Adversarial-review fix: an earlier version also stripped a leading
-  // @-mention token, but the regex was unanchored and collapsed clearly
-  // DIFFERENT messages onto the same string (see the function's own doc
-  // comment for the full incident writeup). These tests pin the fixed
-  // behavior: no @-stripping at all, whitespace-only normalization.
+  // Real-machine fix (2026-07): a converted Feishu task keeps the literal
+  // "@Name " prefix in its summary while inbound rootText already has it
+  // stripped, so a LEADING-mention strip is applied to both sides. It is
+  // anchored (^) + whitespace-terminated so it never touches an in-text "@"
+  // (the class of collision the earlier unanchored version caused). See the
+  // function's own doc comment.
 
   it("collapses repeated/incidental whitespace", () => {
     expect(normalizeForExactMatch("帮我修一下   登录页\n\n")).toBe("帮我修一下 登录页");
@@ -288,25 +289,47 @@ describe("normalizeForExactMatch", () => {
     expect(normalizeForExactMatch("帮我修一下登录页")).toBe("帮我修一下登录页");
   });
 
-  it("does NOT strip a leading @-mention — a mention prefix makes two messages genuinely different", () => {
-    expect(normalizeForExactMatch("@张三 帮我修一下登录页")).toBe("@张三 帮我修一下登录页");
-    expect(normalizeForExactMatch("@张三 帮我修一下登录页")).not.toBe(
+  it("strips a leading @-mention so a mentioned title aligns with the un-mentioned rootText", () => {
+    // The exact real-machine shape: "@BotA  自我介绍一下" (double space) vs the
+    // @-stripped "自我介绍一下" must now compare equal.
+    expect(normalizeForExactMatch("@张三  帮我修一下登录页")).toBe("帮我修一下登录页");
+    expect(normalizeForExactMatch("@张三 帮我修一下登录页")).toBe(
       normalizeForExactMatch("帮我修一下登录页"),
     );
   });
 
-  it("regression: @张三 在吗 vs @李四 在吗 must never normalize equal (the exact case adversarial review flagged)", () => {
-    expect(normalizeForExactMatch("@张三 在吗")).not.toBe(normalizeForExactMatch("@李四 在吗"));
+  it("strips multiple consecutive leading @-mentions", () => {
+    expect(normalizeForExactMatch("@张三 @李四 帮我修一下登录页")).toBe("帮我修一下登录页");
   });
 
-  it("regression: email-domain collision must never normalize equal", () => {
+  it("does NOT strip an in-text @ — only leading mentions are removed", () => {
+    // Anchored strip leaves the message body untouched: a message that merely
+    // contains an @ mid-text is unchanged (and stays distinct from a peer).
+    expect(normalizeForExactMatch("帮我查 user@example.com 的账号")).toBe(
+      "帮我查 user@example.com 的账号",
+    );
     expect(normalizeForExactMatch("帮我查 user@example.com 的账号")).not.toBe(
       normalizeForExactMatch("帮我查 user@other.org 的账号"),
     );
   });
 
-  it("regression: CJK no-space mid-sentence mentions must never normalize equal", () => {
-    expect(normalizeForExactMatch("请@张三处理登录崩溃")).not.toBe(normalizeForExactMatch("请@李四买咖啡"));
+  it("regression: CJK no-space mid-sentence mentions are NOT stripped and stay distinct", () => {
+    expect(normalizeForExactMatch("请@张三处理登录崩溃")).toBe("请@张三处理登录崩溃");
+    expect(normalizeForExactMatch("请@张三处理登录崩溃")).not.toBe(
+      normalizeForExactMatch("请@李四买咖啡"),
+    );
+  });
+
+  it("does not over-strip a message that is only a mention (no trailing content)", () => {
+    // No whitespace-terminated body after the mention → nothing to strip to;
+    // must not collapse to an empty string.
+    expect(normalizeForExactMatch("@张三")).toBe("@张三");
+  });
+
+  it("leading-mention-only variants collapse equal by design — the bidirectional 1:1 auto-bind guard, not this function, prevents a wrong bind", () => {
+    // Intentional: two short messages differing only in the @target normalize
+    // the same. Bind-level safety is asserted in the auto-bind suite below.
+    expect(normalizeForExactMatch("@张三 在吗")).toBe(normalizeForExactMatch("@李四 在吗"));
   });
 });
 
@@ -345,7 +368,7 @@ describe("TasklistPoller — exact root-text auto-bind", () => {
     expect(poller.getCandidates()).toEqual([]);
   });
 
-  it("matches across incidental whitespace differences only (no @-mention stripping — see normalizeForExactMatch)", async () => {
+  it("matches across incidental whitespace differences (see normalizeForExactMatch)", async () => {
     const { requester } = makeFakeRequester({ tasks: [{ guid: "task-1", summary: "帮我修一下   登录页" }] });
     const client = new TaskListClient(requester);
     const bindThreadToTask = vi.fn(async () => {});
@@ -364,7 +387,9 @@ describe("TasklistPoller — exact root-text auto-bind", () => {
     expect(bindThreadToTask).toHaveBeenCalledTimes(1);
   });
 
-  it("does NOT bind when the task title carries a leading @-mention the rootText lacks (accepted degradation, not a false match)", async () => {
+  it("binds a task whose summary carries a leading @-mention against the @-stripped rootText (real-machine fix)", async () => {
+    // The bug: "@BotA 自我介绍一下" → task summary keeps "@BotA ", rootText has
+    // it stripped → auto-bind never fired. Now the leading strip realigns them.
     const { requester } = makeFakeRequester({ tasks: [{ guid: "task-1", summary: "@张三 帮我修一下登录页" }] });
     const client = new TaskListClient(requester);
     const bindThreadToTask = vi.fn(async () => {});
@@ -380,8 +405,40 @@ describe("TasklistPoller — exact root-text auto-bind", () => {
 
     await poller.pollOnceForTest();
 
+    expect(bindThreadToTask).toHaveBeenCalledWith({
+      botId: "bot-a",
+      threadId: "t1",
+      chatId: "oc_1",
+      taskGuid: "task-1",
+    });
+    expect(poller.getCandidates()).toEqual([]);
+  });
+
+  it("still refuses to bind when a leading-@ task normalizes onto more than one thread (guard holds post-strip)", async () => {
+    // Two threads whose rootText both normalize to "在吗"; a task "@张三 在吗"
+    // also normalizes to "在吗". The leading strip must NOT bypass the strict
+    // 1:1 guard — >1 matching thread → ambiguous → no bind. This is the safety
+    // that replaces the old "never normalize equal" property.
+    const { requester } = makeFakeRequester({ tasks: [{ guid: "task-1", summary: "@张三 在吗" }] });
+    const client = new TaskListClient(requester);
+    const bindThreadToTask = vi.fn(async () => {});
+    const poller = new TasklistPoller({
+      client,
+      tasklistGuid: "guid-1",
+      isClaimedByAnyBot: () => false,
+      rootTextMatch: {
+        listRootTexts: () => [
+          rootTextEntry({ threadId: "t1", rootText: "在吗" }),
+          rootTextEntry({ threadId: "t2", rootText: "在吗" }),
+        ],
+        bindThreadToTask,
+      },
+    });
+
+    await poller.pollOnceForTest();
+
     expect(bindThreadToTask).not.toHaveBeenCalled();
-    expect(poller.getCandidates().length).toBe(1); // left for the agent path
+    expect(poller.getCandidates().length).toBe(1);
   });
 
   it("does NOT bind when a candidate matches more than one thread (ambiguous)", async () => {

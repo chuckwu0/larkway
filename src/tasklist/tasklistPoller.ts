@@ -36,9 +36,9 @@
  * root — no new network call, no per-poll cost). Every poll cycle, after
  * building the candidate snapshot above, this module compares each
  * candidate's summary against every known thread's rootText (both sides run
- * through {@link normalizeForExactMatch} — whitespace collapse ONLY, see its
- * own doc for why an earlier @-mention-stripping version was removed after
- * adversarial review). Only a STRICT 1:1 match — exactly one thread matches
+ * through {@link normalizeForExactMatch} — whitespace collapse + a strip of
+ * LEADING @-mentions only, see its own doc for why the strip is anchored to
+ * the start). Only a STRICT 1:1 match — exactly one thread matches
  * this candidate, AND that thread matches no other candidate, AND the
  * thread does not already hold some OTHER claim (main.ts's listRootTexts
  * excludes already-claimed threads entirely; store.ts's claim() also
@@ -151,40 +151,45 @@ export function renderCandidateUnboundAlertComment(): string {
 /**
  * Fixed, documented normalization applied to BOTH sides of the exact-match
  * comparison (docs/task-handle.md §5.2 v3 addendum) — deliberately NOT
- * fuzzy/prefix/similarity matching. Only canonicalizes incidental whitespace
- * (leading/trailing/repeated); does NOT strip @-mentions.
+ * fuzzy/prefix/similarity matching. It (1) canonicalizes incidental whitespace
+ * (leading/trailing/repeated) and (2) strips a run of LEADING @-mention tokens.
  *
- * History (adversarial review, docs/task-handle.md §9.9): an earlier version
- * also stripped a leading `@\S+` token, on the theory that Feishu renders a
- * human-readable "@张三 " into a converted task's title while our own
- * message parsing (lark/message.ts's AT_PLACEHOLDER_RE) already strips its
- * placeholder form out of rootText, so the two sides needed reconciling.
- * That regex was unanchored (matched an @-token ANYWHERE in the text) and
- * collapsed clearly DIFFERENT messages onto the same normalized string —
- * confirmed by execution: "帮我查 user@example.com 的账号" and "帮我查
- * user@other.org 的账号" both collapsed to "帮我查 user的账号"; "@张三 在吗"
- * and "@李四 在吗" both collapsed to "在吗". Because the bidirectional 1:1
- * uniqueness check only catches collisions between candidates/threads
- * PRESENT IN THE SAME CYCLE, an asymmetric collision (e.g. a manually
- * created task whose title happens to normalize the same as some unrelated
- * thread's rootText) would pass as a unique match and silently auto-bind the
- * wrong pair. The theorized asymmetry (task title keeps a literal "@Name ",
- * rootText never does) could not be verified against a live Feishu response
- * in this dev environment, and a real fix would need a MUCH narrower rule
- * (anchor to a genuine leading-mention prefix only, plus a minimum
- * post-strip specificity threshold) to avoid reintroducing the same class
- * of bug — see the finding's own P1 discussion. Given the uncertainty, the
- * conservative choice is the one this function now implements: no
- * @-stripping at all. The accepted cost is a real but narrow one — an exact
- * match legitimately fails whenever a title DOES carry a literal leading
- * mention rootText doesn't (same accepted-degradation shape as the 200-char
- * truncation mismatch case) — which just falls back to the agent-path
- * candidate injection, never a silent wrong bind.
+ * Why strip leading mentions (real-machine bug, 2026-07): a topic-group
+ * top-level "@BotA 自我介绍一下" converts to a Feishu task whose summary keeps
+ * the literal "@BotA  自我介绍一下" prefix, while our own inbound parsing
+ * (lark/message.ts's AT_PLACEHOLDER_RE) already stripped the mention out of
+ * rootText ("自我介绍一下"). With whitespace-only normalization the two sides
+ * never compared equal, so auto-bind NEVER fired for any @-prefixed task.
+ * Running the same leading-mention strip over BOTH sides realigns them.
+ *
+ * Why the strip is ANCHORED (`^(@\S+\s+)+`), not the earlier unanchored form
+ * (adversarial review, docs/task-handle.md §9.9): the old `@\S+` matched an
+ * @-token ANYWHERE, collapsing genuinely different messages —
+ * "帮我查 user@example.com 的账号" vs "…user@other.org…" both became
+ * "帮我查 user的账号". Anchoring to the start and requiring a trailing space
+ * leaves every in-text "@" untouched (`user@example.com`, CJK `请@张三…`), so
+ * those never collide.
+ *
+ * Residual risk + why it's contained: two SHORT messages that differ only in
+ * their leading @target still collapse equal ("@张三 在吗" and "@李四 在吗"
+ * both → "在吗"). The bidirectional strict-1:1 guard in #autoBindExactMatches
+ * is what keeps that safe: a task matching >1 such thread (or a thread
+ * matching >1 task) is ruled ambiguous and left to the agent path, never
+ * auto-bound. The only way a genuinely wrong pair could slip through is an
+ * asymmetric 1:1 collision (the task's real source thread absent from
+ * listRootTexts while an unrelated same-normalizing thread is present) — a
+ * narrow, pre-existing shape, not one this change introduces at the bind
+ * layer. A future hardening (minimum post-strip length threshold) could shrink
+ * it further; see the finding's P1 discussion.
  *
  * Exported for direct unit testing — pure, no I/O.
  */
 export function normalizeForExactMatch(text: string): string {
-  return text.replace(/\s+/g, " ").trim();
+  const collapsed = text.replace(/\s+/g, " ").trim();
+  // Anchored, whitespace-terminated, one-or-more: strips "@Name " and
+  // "@A @B " runs at the very start ONLY. `\S+` = the display name (any
+  // non-space run), so it never reaches into the message body.
+  return collapsed.replace(/^(?:@\S+\s+)+/, "").trim();
 }
 
 /** Internal cache entry — keeps the RAW description so a re-poll's marker check never operates on an already-truncated excerpt. */
