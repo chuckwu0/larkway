@@ -72,17 +72,26 @@ const TaskHandleConfigSchema = z.object({
   /**
    * v3.2 交接断链检测(docs/task-handle.md §13):若最后一轮完成 turn 的回复
    * @ 了花名册上的另一个 bot,且对方的 bridge 在这个阈值(ms)内在同一话题没
-   * 有收到任何事件(收到即算,不要求对方 turn 已经跑完/开跑),改用这个更短
-   * 的阈值(优先级高于上面两个,取更短者)。默认 5min——协作断链比一般停滞
-   * 紧急得多,任务多为小时级,理应分钟级发现。**下限提示**:5min 对应本机
-   * open 模式 bot 的 gap-fill 巡检周期(300s)+ 一个 patrol tick 缓冲——配更
-   * 短不会被拦,但低于部署实际的 gap-fill 周期有跟补投撞车、同一事件被提醒
-   * 两次的风险,见 docs/task-handle.md §13。只有明确 chats 白名单(非 open
-   * 模式)的 bot 没有周期性 gap-fill(只有断线重连触发),下限可以放宽到
-   * 2min。且只对**同一 bridge 进程内**的协作 bot 生效——跨 bridge 的 @ 天生
-   * 观察不到对方的收到时间,走一般停滞阈值。
+   * 有收到任何事件,改用这个更短的阈值(优先级高于上面两个,取更短者)。
+   * 默认 5min——协作断链比一般停滞紧急得多,任务多为小时级,理应分钟级发现。
+   * **下限提示**:5min 对应本机 open 模式 bot 的 gap-fill 巡检周期(300s)+
+   * 一个 patrol tick 缓冲——配更短不会被拦,但低于部署实际的 gap-fill 周期
+   * 有跟补投撞车、同一事件被提醒两次的风险,见 docs/task-handle.md §13。只有
+   * 明确 chats 白名单(非 open 模式)的 bot 没有周期性 gap-fill(只有断线重连
+   * 触发),下限可以放宽到 2min。且只对**同一 bridge 进程内**的协作 bot 生
+   * 效——跨 bridge 的 @ 天生观察不到对方的收到时间,走一般停滞阈值。
+   * **收到只是暂缓,不是永久解除**——见 stallHandoffReceiptGraceMs。
    */
   stallHandoffThresholdMs: z.number().positive().optional(),
+  /**
+   * v3.2 revision 3(docs/task-handle.md §13):对方"收到了事件"只在这个阈值
+   * (ms)内被信任——收到之后这段时间里,如果对方**真的跑完一轮 turn**(不是
+   * 又收到一次事件),才算真正解除交接断链;超过这个时长仍没有对方跑完 turn
+   * 的记录,重新判定为断链、再次提醒。默认 30min(相对 handler.ts 自己注释的
+   * 单轮 turn 5-15 分钟耗时留足余量)。防的是反向漏洞:如果"收到"永久解除
+   * 断链判定,对方收到后真的崩了/卡死,就再也不会被判定断链了。
+   */
+  stallHandoffReceiptGraceMs: z.number().positive().optional(),
   /** 同一任务两次提醒之间的最短间隔(ms),防止骚扰。默认 24h。 */
   stallNudgeCooldownMs: z.number().positive().optional(),
   /** 连续几次提醒仍无进展后改为升级(任务评论通知人类,此后对该任务静默直到有新活动)。默认 2。 */

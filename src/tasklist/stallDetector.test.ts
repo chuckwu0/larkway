@@ -549,7 +549,7 @@ describe("StallDetector", () => {
       expect(enqueueNudgeTurn).not.toHaveBeenCalled();
     });
 
-    it("does NOT trigger a handoff nudge when the peer received the event but is still queued (no dispatch/completion signal at all) — receipt alone is enough, per revision 2's 'received, not dispatched' contract", async () => {
+    it("does NOT trigger a handoff nudge when the peer received the event but is still queued, within the receipt-grace window (no dispatch/completion signal at all) — revision 2+3's 'received, provisionally enough' contract", async () => {
       const store = await TaskHandleStore.load(join(dir, "task-handles.json"));
       const claimedAt = Date.now();
       await store.put({
@@ -566,19 +566,102 @@ describe("StallDetector", () => {
       // Peer's bridge enqueued the event just after the mention (getThreadReceivedAt
       // would report this instant), but its turn never dispatches — imagine it's
       // stuck behind handler.ts's MAX_CONCURRENT=5 semaphore, or is itself a 5-15min
-      // turn still running. No SessionStore.lastActiveTs bump ever happens for it.
-      // If the signal were "turn started/finished" instead of "received", this would
-      // misjudge the (perfectly healthy) handoff as broken.
+      // turn still running. No SessionStore.lastActiveTs (getPeerLastActiveTs) bump
+      // ever happens for it. If the signal were "turn started/finished" instead of
+      // "received", this would misjudge the (perfectly healthy, still-queued) handoff
+      // as broken.
       const receivedAt = claimedAt + 5_000;
       const detector = new StallDetector(
-        { store, client, getLastActiveTs: () => claimedAt, enqueueNudgeTurn, getPeerReceivedAt: () => receivedAt },
-        { stallThresholdMs: DAY, stallHandoffThresholdMs: HANDOFF },
+        {
+          store,
+          client,
+          getLastActiveTs: () => claimedAt,
+          enqueueNudgeTurn,
+          getPeerReceivedAt: () => receivedAt,
+          getPeerLastActiveTs: () => undefined, // never completed a turn — but still within grace below
+        },
+        { stallThresholdMs: DAY, stallHandoffThresholdMs: HANDOFF, handoffReceiptGraceMs: 30 * 60_000 },
       );
 
-      // Advance WAY past the handoff threshold (45min) — if this used dispatch/turn
-      // completion as the signal, "still queued" would look identical to "never
-      // received" and misfire. It must not, because receivedAt > mentionAt regardless.
-      vi.setSystemTime(claimedAt + 45 * 60_000);
+      // Well past the 15min handoff threshold, but only 10min after receivedAt —
+      // still inside the 30min receipt-grace window, so must NOT fire yet.
+      vi.setSystemTime(claimedAt + 10 * 60_000);
+      await detector.pollOnceForTest();
+
+      expect(enqueueNudgeTurn).not.toHaveBeenCalled();
+    });
+
+    it("RE-ARMS and fires a handoff nudge once the receipt-grace window elapses with no genuinely completed turn since — revision 3's fix for the 'receipt = permanent immunity' loophole", async () => {
+      const store = await TaskHandleStore.load(join(dir, "task-handles.json"));
+      const claimedAt = Date.now();
+      await store.put({
+        threadId: "t1",
+        taskGuid: "g1",
+        chatId: "oc_1",
+        claimedTs: claimedAt,
+        lastTurnMentions: ["peer-bot"],
+        lastTurnMentionsAt: claimedAt,
+      });
+      const { requester } = makeFakeRequester({ g1: { guid: "g1", summary: "任务A" } });
+      const client = new TaskListClient(requester);
+      const enqueueNudgeTurn = vi.fn();
+      // Peer's bridge received the event, but its turn genuinely never wrapped up
+      // (crashed, hung, stuck) — no getPeerLastActiveTs bump ever happens after
+      // receivedAt. Without this re-arm, a single receipt would permanently clear
+      // the handoff condition even though the task is now genuinely stuck.
+      const receivedAt = claimedAt + 5_000;
+      const detector = new StallDetector(
+        {
+          store,
+          client,
+          getLastActiveTs: () => claimedAt,
+          enqueueNudgeTurn,
+          getPeerReceivedAt: () => receivedAt,
+          getPeerLastActiveTs: () => undefined,
+        },
+        { stallThresholdMs: DAY, stallHandoffThresholdMs: HANDOFF, handoffReceiptGraceMs: 30 * 60_000 },
+      );
+
+      // 35 minutes since receivedAt — past the 30min receipt-grace window, and
+      // still no confirming completed-turn signal — must re-arm and fire.
+      vi.setSystemTime(claimedAt + 35 * 60_000);
+      await detector.pollOnceForTest();
+
+      expect(enqueueNudgeTurn).toHaveBeenCalledTimes(1);
+      const text = (enqueueNudgeTurn.mock.calls[0]![0] as { text: string }).text;
+      expect(text).toContain("30 分钟"); // rendered using the receipt-grace floor, not the shorter initial handoff threshold
+    });
+
+    it("does NOT re-arm when the peer genuinely completed a turn after receiving (real progress, not just another receipt)", async () => {
+      const store = await TaskHandleStore.load(join(dir, "task-handles.json"));
+      const claimedAt = Date.now();
+      await store.put({
+        threadId: "t1",
+        taskGuid: "g1",
+        chatId: "oc_1",
+        claimedTs: claimedAt,
+        lastTurnMentions: ["peer-bot"],
+        lastTurnMentionsAt: claimedAt,
+      });
+      const { requester } = makeFakeRequester({ g1: { guid: "g1", summary: "任务A" } });
+      const client = new TaskListClient(requester);
+      const enqueueNudgeTurn = vi.fn();
+      const receivedAt = claimedAt + 5_000;
+      const detector = new StallDetector(
+        {
+          store,
+          client,
+          getLastActiveTs: () => claimedAt,
+          enqueueNudgeTurn,
+          getPeerReceivedAt: () => receivedAt,
+          getPeerLastActiveTs: () => receivedAt + 60_000, // peer's turn genuinely finished shortly after receiving
+        },
+        { stallThresholdMs: DAY, stallHandoffThresholdMs: HANDOFF, handoffReceiptGraceMs: 30 * 60_000 },
+      );
+
+      // Well past the 30min receipt-grace window — would have re-armed without
+      // the completed-turn signal above.
+      vi.setSystemTime(claimedAt + 35 * 60_000);
       await detector.pollOnceForTest();
 
       expect(enqueueNudgeTurn).not.toHaveBeenCalled();

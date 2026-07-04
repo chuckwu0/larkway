@@ -431,21 +431,47 @@ open_id——也就是说,至少在抽查的这个窗口里,看起来像"agent �
 (agent 收到无害的一次巡检 turn,自己判断"不用管")也不可漏报真正断掉的协作,静默期这个设计
 同样是"宁可多等一会再信任沉默"这个取舍的一次应用,不是追求精确。
 
+#### 修订 3(2026-07):"收到"只暂缓,不永久解除
+
+修订 2 堵住了一个误报(收到但排着队,被误判断链),但反过来开了一个新口子:如果"收到"永久
+解除断链判定,而对方收到之后这一轮 turn 真的崩了/卡死/再也没跑完,断链检测就再也不会重新判定
+它了——任务从此没人管,恰恰是这整套机制要消灭的"漏报"。"收到"应该只买到一段有边界的宽限期,
+不是永久免疫。
+
+改法:每个被 @ 的协作 bot 现在按**三档**判定(用两个信号——`getPeerReceivedAt` 收到时间,和
+`getPeerLastActiveTs` 对方自己的 `SessionStore.lastActiveTs`;后者经代码核实**只在 turn 真正
+收尾时写入**——`handler.ts` 的"session persistence"步骤,agent 子进程退出之后,从来不在
+dispatch 开始时写,所以不会重蹈修订 2 的覆辙):
+
+1. **从未收到** → 跟修订 2 一样,`stallHandoffThresholdMs`(默认 5min)后判定断链。
+2. **收到了,且在 `stallHandoffReceiptGraceMs`(默认 30min,对齐 handler.ts 自己注释的单轮
+   turn 5-15 分钟耗时,留足余量)以内** → 不判定断链,对方大概率排着队或者正在跑。
+3. **收到了,但宽限期过了、期间对方没有任何一轮 turn 真正收尾** → **重新判定断链**,唤醒
+   A。如果宽限期内对方确实跑完过一轮 turn,才算真正解除。
+
+净效果贴合产品语言:没收到→5min 开火;收到了→耐心等 30min;收到却烂尾→重新开火。
+`getPeerLastActiveTs` 跟这个 bot 自己读自己 SessionStore 用的 `getLastActiveTs` 是同一种信号,
+只是读的是另一个 bot 的——修订 2 里之所以不敢拿它当**主信号**,是因为"排着队还没跑"和"真断了"
+在那个信号下长得一样;这里把它降级成**宽限期过后才启用的次要确认**,就是安全的,因为已经先
+用"收到"信号躲开了"排队误判"那个坑。
+
 ### 13.5 配置
 
 ```yaml
 taskHandle:
   tasklistGuid: "..."
-  stallHandoffThresholdMs: 300000    # 5min(默认,修订1),交接断链专用,取三档最短生效
+  stallHandoffThresholdMs: 300000        # 5min(默认,修订1),交接断链专用,取三档最短生效
+  stallHandoffReceiptGraceMs: 1800000    # 30min(默认,修订3),"收到"信号的有效期,过期未收尾则重新判定断链
 ```
 
 **活跃协作团队推荐配置示例**(多 bot 频繁互相 @ 配合的部署):
 
 ```yaml
 taskHandle:
-  stallHandoffThresholdMs: 300000      # 5min —— 交接断链(默认值;低于本部署 gap-fill 周期会触发启动告警,见 §13.4 修订1)
-  stallFastThresholdMs: 1800000        # 30min —— 上一轮 turn 崩溃/失败(默认值,保持不变)
-  stallThresholdMs: 14400000           # 4h —— 一般停滞(比默认 24h 更激进,适合小时级任务、协作密集的团队)
+  stallHandoffThresholdMs: 300000       # 5min —— 交接断链(默认值;低于本部署 gap-fill 周期会触发启动告警,见 §13.4 修订1)
+  stallHandoffReceiptGraceMs: 1800000   # 30min —— "收到"信号有效期(默认值;修订3)
+  stallFastThresholdMs: 1800000         # 30min —— 上一轮 turn 崩溃/失败(默认值,保持不变)
+  stallThresholdMs: 14400000            # 4h —— 一般停滞(比默认 24h 更激进,适合小时级任务、协作密集的团队)
 ```
 
 ### 13.6 明确不做

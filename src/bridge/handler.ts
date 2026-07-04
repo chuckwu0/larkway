@@ -775,6 +775,21 @@ export class BridgeHandler {
   }
 
   /**
+   * v3.2 交接断链检测 (docs/task-handle.md §13, revision 3): cross-bot
+   * "genuinely completed a turn" signal — the SAME kind of read
+   * `getLastActiveTs` does for a bot's own thread, exposed here so another
+   * bot's StallDetector can use it as a SECONDARY, delayed confirmation once
+   * a peer's mere receipt (getThreadReceivedAt above) is stale past the
+   * handoff receipt-grace window. Reads this bot's own SessionStore, which
+   * only bumps `lastActiveTs` at true turn completion (handler.ts's session-
+   * persistence step, after the agent subprocess exits) — never at dispatch
+   * start, so unlike getThreadReceivedAt this really does mean "finished."
+   */
+  getThreadLastActiveTs(threadId: string): number | undefined {
+    return this.deps.sessionStore.get(threadId, this.deps.botConfig?.id)?.lastActiveTs;
+  }
+
+  /**
    * Resolves when every dispatched turn has fully completed (handleOne returned
    * and its trailing render/ledger I/O drained). Test-facing sync point; a bridge
    * that keeps receiving events would keep finding work, so callers use this

@@ -172,6 +172,49 @@
  * docs/task-handle.md §13), the quiet period intentionally errs toward
  * "wait a bit longer before trusting silence," not toward tight precision.
  *
+ * ### Revision 3 (2026-07): receipt only DEFERS the handoff check, it never
+ * permanently clears it
+ *
+ * Revision 2 (above) fixed one false positive (received-but-queued misread
+ * as broken) but in doing so opened a reverse hole: if B's bridge receives
+ * the event but B's turn then genuinely never finishes — crashes mid-run,
+ * hangs, gets stuck behind a permission prompt — `anyPeerResponded` would
+ * stay true FOREVER (a single receipt permanently satisfies it), so the
+ * handoff would never be flagged again even though the task is now
+ * genuinely stuck. "Received" must only buy the peer a bounded grace
+ * period, not indefinite immunity.
+ *
+ * So the handoff condition is now evaluated per mentioned peer in three
+ * tiers, using TWO signals: `getPeerReceivedAt` (event arrival, as above)
+ * and `getPeerLastActiveTs` (the peer's OWN `SessionStore.lastActiveTs` —
+ * confirmed via code inspection to be written only at true turn
+ * COMPLETION, `handler.ts`'s "session persistence" step after the agent
+ * subprocess has finished, never at dispatch start — so unlike revision 2's
+ * concern, this signal genuinely means "the peer's turn finished", not
+ * "started" or "is queued"):
+ *
+ *   1. **Never received** (`getPeerReceivedAt` undefined, or at/before the
+ *      mention) — broken once `stallHandoffThresholdMs` (5min) has elapsed
+ *      since the mention. Same as revision 2.
+ *   2. **Received, within `handoffReceiptGraceMs`** (default 30min) of that
+ *      receipt — provisionally NOT broken; the peer plausibly has a turn
+ *      queued or in progress (turns run 5-15min per handler.ts). Falls back
+ *      to the general threshold, same as "peer responded" in revision 2.
+ *   3. **Received, past the grace window, with no completed turn since**
+ *      (`getPeerLastActiveTs` undefined or at/before the receipt) —
+ *      RE-ARMS: broken again, same as tier 1. If a completed turn DID
+ *      happen after the receipt, the peer genuinely picked it up — stays
+ *      resolved, no re-arm.
+ *
+ * Net effect, matching the product framing: never received → nudge in 5min;
+ * received → wait patiently up to 30min; received but never wrapped up →
+ * nudge fires anyway. `getPeerLastActiveTs` here is the SAME kind of signal
+ * `getLastActiveTs` already reads for THIS bot's own thread (a completed-
+ * turn timestamp) — it just wasn't safe to use it as the PRIMARY signal in
+ * revision 2 (queued-but-not-yet-run would misfire); reintroducing it here
+ * as a SECONDARY, delayed confirmation is safe precisely because it's now
+ * gated behind the grace window, not read the instant a mention lands.
+ *
  * Class shape (timer/start/stop/jitter) mirrors commentPoller.ts.
  */
 
@@ -190,6 +233,8 @@ const DEFAULT_ESCALATE_AFTER_NUDGES = 2;
 const DEFAULT_PENDING_CONFIRM_TIMEOUT_MS = 30 * 60_000;
 /** v3.2 revision 2: how long after construction the handoff rule stays disarmed, so an empty post-restart `getPeerReceivedAt` map isn't mistaken for "never received." Mirrors channelClient.ts's 300s gap-fill cycle + a buffer — see the module doc's revision 2 section. Not exposed via bot yaml — an implementation detail of restart safety, not a product-facing threshold. */
 const DEFAULT_HANDOFF_STARTUP_QUIET_MS = 6 * 60_000;
+/** v3.2 revision 3: how long a peer's RECEIPT alone is trusted before requiring a genuinely completed turn as confirmation — see the module doc's revision 3 section. 30min is generous relative to handler.ts's own 5-15min turn duration comment. */
+const DEFAULT_HANDOFF_RECEIPT_GRACE_MS = 30 * 60_000;
 /** Mirrors commentPoller.ts's PERMISSION_BACKOFF_CEILING_MS — same rationale (§D). */
 const PERMISSION_BACKOFF_CEILING_MS = 30 * 60_000;
 
@@ -225,6 +270,21 @@ export interface StallDetectorDeps {
    * way).
    */
   getPeerReceivedAt?: (peerBotId: string, threadId: string) => number | undefined;
+  /**
+   * v3.2 交接断链检测 (revision 3): reads ANOTHER bot's OWN `lastActiveTs` for
+   * this thread — i.e. the SAME kind of signal `getLastActiveTs` reads for
+   * this bot's own thread, just cross-bot. Confirmed via code inspection to
+   * be written only at true turn COMPLETION (handler.ts's session-persistence
+   * step, after the agent subprocess finishes), never at dispatch start.
+   * Used ONLY as a secondary, delayed confirmation once a peer's receipt is
+   * older than `handoffReceiptGraceMs` — see the module doc's revision 3
+   * section for why it wasn't safe to use as the PRIMARY signal (that's
+   * exactly the revision-2 bug: a queued-but-not-yet-run turn would misfire).
+   * Omit to skip the re-arm tier entirely — a peer's receipt then stays a
+   * permanent (not just provisional) all-clear, matching revision 2's
+   * behavior before this revision.
+   */
+  getPeerLastActiveTs?: (peerBotId: string, threadId: string) => number | undefined;
 }
 
 export interface StallDetectorOptions {
@@ -246,6 +306,8 @@ export interface StallDetectorOptions {
   pendingConfirmTimeoutMs?: number;
   /** @default 6min. v3.2 revision 2 — see DEFAULT_HANDOFF_STARTUP_QUIET_MS's doc. Primarily for tests (set to 0 to disarm the quiet period). */
   handoffStartupQuietMs?: number;
+  /** @default 30min. v3.2 revision 3 — see DEFAULT_HANDOFF_RECEIPT_GRACE_MS's doc: how long a peer's receipt alone is trusted before requiring a genuinely completed turn as confirmation. */
+  handoffReceiptGraceMs?: number;
 }
 
 /** `ms` rendered as a human-friendly duration label, minutes below an hour, hours at/above — a fixed 15min threshold reading "已超过 1 小时" (rounding-to-hours) would be actively misleading. Exported for direct unit testing — pure, no I/O. */
@@ -294,6 +356,7 @@ export class StallDetector {
   readonly #escalateAfterNudges: number;
   readonly #pendingConfirmTimeoutMs: number;
   readonly #handoffStartupQuietMs: number;
+  readonly #handoffReceiptGraceMs: number;
   /** Construction time — the baseline for the revision-2 startup quiet period, since this instance's getPeerReceivedAt-backed map starts empty either way (fresh process or fresh instance). */
   readonly #startedAt: number;
   #timer: ReturnType<typeof setTimeout> | ReturnType<typeof setInterval> | undefined;
@@ -314,6 +377,7 @@ export class StallDetector {
     this.#escalateAfterNudges = opts.escalateAfterNudges ?? DEFAULT_ESCALATE_AFTER_NUDGES;
     this.#pendingConfirmTimeoutMs = opts.pendingConfirmTimeoutMs ?? DEFAULT_PENDING_CONFIRM_TIMEOUT_MS;
     this.#handoffStartupQuietMs = opts.handoffStartupQuietMs ?? DEFAULT_HANDOFF_STARTUP_QUIET_MS;
+    this.#handoffReceiptGraceMs = opts.handoffReceiptGraceMs ?? DEFAULT_HANDOFF_RECEIPT_GRACE_MS;
     this.#startedAt = Date.now();
   }
 
@@ -459,15 +523,29 @@ export class StallDetector {
   /**
    * The effective stall threshold for this record right now, and which rule
    * produced it (module doc's v3.2 section) — whichever applicable rule is
-   * SHORTEST always wins; a mentioned peer that already RECEIVED the event
-   * removes the handoff rule from consideration entirely (not just "picks
-   * the other one" — it means the handoff condition genuinely no longer
-   * holds, even if that peer's turn is still queued behind other work).
+   * SHORTEST always wins.
    *
-   * Disarmed for `handoffStartupQuietMs` after construction (revision 2) —
-   * `getPeerReceivedAt`'s backing map is process-local and starts empty, so
-   * "peer hasn't received it" is not trustworthy evidence until gap-fill has
-   * had a chance to redeliver anything that was in flight across a restart.
+   * Per mentioned peer (revision 3), this is a three-tier check using precise
+   * timestamps (not the coarser `now - thisBot'sOwnLastActiveTs` comparison
+   * `#pollOne` uses downstream — this method resolves the handoff verdict
+   * itself using real anchors, then returns a threshold value that is
+   * GUARANTEED to already be satisfied by that outer comparison once a tier
+   * fires, since `stallHandoffThresholdMs`/`handoffReceiptGraceMs` are the
+   * exact bounds this method itself already waited out):
+   *
+   *   1. Never received → broken once `stallHandoffThresholdMs` has elapsed
+   *      since the mention.
+   *   2. Received, within `handoffReceiptGraceMs` of that receipt → NOT
+   *      broken (falls back to `base`) — the peer plausibly has a turn
+   *      queued or in progress.
+   *   3. Received, past the grace window, with no completed turn (per
+   *      `getPeerLastActiveTs`) since the receipt → RE-ARMS, broken again.
+   *
+   * Disarmed entirely for `handoffStartupQuietMs` after construction
+   * (revision 2) — `getPeerReceivedAt`'s backing map is process-local and
+   * starts empty, so "peer hasn't received it" is not trustworthy evidence
+   * until gap-fill has had a chance to redeliver anything in flight across
+   * a restart.
    */
   #effectiveThreshold(
     record: TaskHandleRecord,
@@ -487,13 +565,41 @@ export class StallDetector {
       return base;
     }
     const mentionAt = record.lastTurnMentionsAt;
-    const anyPeerResponded = record.lastTurnMentions.some((peerBotId) => {
-      const peerReceivedAt = this.#deps.getPeerReceivedAt!(peerBotId, threadId);
-      return peerReceivedAt !== undefined && peerReceivedAt > mentionAt;
-    });
-    if (anyPeerResponded) return base; // the mentioned peer's bridge already received it — handoff condition doesn't hold
+    const now = Date.now();
 
-    return this.#stallHandoffThresholdMs < base.ms ? { ms: this.#stallHandoffThresholdMs, reason: "handoff" } : base;
+    // Per broken peer, which tier fired decides the DISPLAY floor ("已超过 X
+    // 分钟" — tier 1 fired at stallHandoffThresholdMs, tier 3 fired at the
+    // longer handoffReceiptGraceMs; showing the tier-appropriate floor is a
+    // stronger, still-true claim than always showing the shorter one). The
+    // outer numeric comparison in #pollOne/#sendNudge only needs SOME value
+    // ≤ base — both floors already reflect real elapsed time this method
+    // itself just verified, so either is safe there regardless of tier.
+    let brokenFloorMs: number | undefined;
+    for (const peerBotId of record.lastTurnMentions) {
+      const receivedAt = this.#deps.getPeerReceivedAt!(peerBotId, threadId);
+      if (receivedAt === undefined || receivedAt <= mentionAt) {
+        // Tier 1: never received — broken only once the handoff threshold
+        // has actually elapsed since the mention (not the instant it lands).
+        if (now - mentionAt >= this.#stallHandoffThresholdMs) {
+          brokenFloorMs = this.#stallHandoffThresholdMs;
+          break;
+        }
+        continue;
+      }
+      // Tier 2: received, still within the receipt grace window — not
+      // broken; the peer plausibly has a turn queued or running.
+      if (now - receivedAt < this.#handoffReceiptGraceMs) continue;
+      // Tier 3: grace elapsed — only a genuinely COMPLETED turn since the
+      // receipt (not another receipt) counts as real resolution.
+      const completedAt = this.#deps.getPeerLastActiveTs?.(peerBotId, threadId);
+      if (!(completedAt !== undefined && completedAt > receivedAt)) {
+        brokenFloorMs = this.#handoffReceiptGraceMs;
+        break;
+      }
+    }
+    if (brokenFloorMs === undefined) return base;
+
+    return brokenFloorMs < base.ms ? { ms: brokenFloorMs, reason: "handoff" } : base;
   }
 
   /**

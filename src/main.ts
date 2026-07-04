@@ -574,6 +574,12 @@ async function runV2Mode({
               // doc for why.
               getPeerReceivedAt: (peerBotId, threadId) =>
                 handlersByBotId.get(peerBotId)?.getThreadReceivedAt(threadId),
+              // v3.2 交接断链检测 (revision 3): SECONDARY, delayed confirmation
+              // once a peer's mere receipt goes stale past the receipt-grace
+              // window — "did their turn genuinely finish", not "did it start
+              // or get queued". See stallDetector.ts's module doc revision 3.
+              getPeerLastActiveTs: (peerBotId, threadId) =>
+                handlersByBotId.get(peerBotId)?.getThreadLastActiveTs(threadId),
               enqueueNudgeTurn: (turn) => {
                 client.enqueueSyntheticEvent({
                   message_id: `synthetic-task-stall-${turn.threadId}-${Date.now()}`,
@@ -595,6 +601,7 @@ async function runV2Mode({
               stallThresholdMs: bot.taskHandle?.stallThresholdMs,
               stallFastThresholdMs: bot.taskHandle?.stallFastThresholdMs,
               stallHandoffThresholdMs: bot.taskHandle?.stallHandoffThresholdMs,
+              handoffReceiptGraceMs: bot.taskHandle?.stallHandoffReceiptGraceMs,
               nudgeCooldownMs: bot.taskHandle?.stallNudgeCooldownMs,
               escalateAfterNudges: bot.taskHandle?.stallEscalateAfterNudges,
             },
