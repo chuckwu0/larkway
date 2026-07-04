@@ -99,20 +99,78 @@
  * turn's reply text against the bot's peer-name roster (no NLP) and
  * persists which peer(s) were mentioned (`TaskHandleRecord.lastTurnMentions`
  * + `lastTurnMentionsAt`, REPLACED not accumulated each turn). This module
- * checks whether ANY mentioned peer has had a turn in the SAME thread since
- * that mention (via `getPeerLastActiveTs`, a cross-bot SessionStore read —
- * main.ts wires this from every bot's own SessionStore, populated
- * progressively during startup and read lazily at poll time, the same
- * closure-over-a-map trick TasklistPoller's rootTextMatch already uses); if
- * not, the effective threshold drops to `stallHandoffThresholdMs` (default
- * 15min) — whichever of the applicable thresholds is SHORTER always wins.
- * Deliberately reuses the EXACT SAME `stallNudge` state machine (cooldown,
- * two-step confirmation, escalation) as the general check — this is a
- * different way to arrive at "time to nudge," not a second, parallel
- * counter. The wake-up is always the claiming bot itself (whoever this
- * StallDetector instance runs for) — since only ITS OWN completed turns
- * ever populate ITS OWN `lastTurnMentions`, "wake the bot that sent the @"
- * and "wake the claiming bot" are the same bot by construction here.
+ * checks whether ANY mentioned peer has RECEIVED an event in the SAME thread
+ * since that mention (via `getPeerReceivedAt`); if not, the effective
+ * threshold drops to `stallHandoffThresholdMs` — whichever of the applicable
+ * thresholds is SHORTER always wins. Deliberately reuses the EXACT SAME
+ * `stallNudge` state machine (cooldown, two-step confirmation, escalation)
+ * as the general check — this is a different way to arrive at "time to
+ * nudge," not a second, parallel counter. The wake-up is always the claiming
+ * bot itself (whoever this StallDetector instance runs for) — since only ITS
+ * OWN completed turns ever populate ITS OWN `lastTurnMentions`, "wake the bot
+ * that sent the @" and "wake the claiming bot" are the same bot by
+ * construction here.
+ *
+ * ### Revision 1 (2026-07): 15min → 5min default, and the physical floor
+ *
+ * Handoff is machine-to-machine — a real @-mention dispatches within seconds,
+ * so there's no "give the human time to notice" grace period to respect the
+ * way there is for the general stall check. The only real lower bound is
+ * `channelClient.ts`'s periodic gap-fill/open-chat-discovery cycle
+ * (`DEFAULT_OPEN_CHAT_DISCOVERY_MS` = 300s, open-mode bots only — see
+ * `startOpenChatDiscovery()`'s `allowedChatIds.size > 0` guard): if the
+ * handoff threshold is shorter than that cycle, a WS-disconnect window can
+ * cause a nudge AND a gap-fill redelivery to both fire for the same missed
+ * event, doing the same wake-up twice. Default is therefore 5min (300s + one
+ * patrol-tick buffer, this module's own poll interval). Config CAN set it
+ * lower — nothing enforces a floor at runtime, per this module's iron rule
+ * that the bridge stays mechanical and doesn't second-guess operator config
+ * — but going below the deployment's actual gap-fill cycle risks that
+ * double-fire; docs/task-handle.md §13 carries the explicit warning. A bot
+ * with an explicit `chats:` allowlist (not open mode) has no periodic
+ * gap-fill sweep at all (only reconnect-triggered, not a fixed cycle), so its
+ * practical floor relaxes to ~2min — verified via `channelClient.ts`'s own
+ * guard clause, not assumed.
+ *
+ * Handoff detection only ever arms for a peer bot running in the SAME bridge
+ * process: `taskHandleMentionRoster` (main.ts) is built by cross-referencing
+ * `bot.peers` against the same process's full `bots` list, so
+ * `lastTurnMentions` can structurally never contain a cross-bridge peer's id
+ * in the first place — there's no separate check needed to enforce this, and
+ * a cross-bridge @ (which this process has no way to observe the receipt of)
+ * simply never enters the handoff path and falls back to the general
+ * threshold above.
+ *
+ * ### Revision 2 (2026-07): received, not dispatched
+ *
+ * "Has peer B responded" is deliberately "B's bridge RECEIVED the mention
+ * event" (`BridgeHandler.getThreadReceivedAt`, stamped in `run()`'s
+ * for-await loop at the moment an event is pulled off the queue) — NOT "B's
+ * turn started running." `handler.ts`'s `run()` is cross-thread-concurrent
+ * but same-thread-serial, globally capped at `MAX_CONCURRENT = 5` concurrent
+ * `handleOne()` calls, and a single turn can take 5-15 minutes (per that
+ * file's own comments) — so a received event can sit queued behind other
+ * work for well over 5 minutes even though the handoff link is completely
+ * intact. Using dispatch-start as the signal would misjudge "received but
+ * queued" as a broken handoff and fire a spurious nudge telling A to resend,
+ * duplicating work. The actual defining trait of a truly broken @ (bad
+ * format, lost message) is that the event NEVER enters B's queue at all —
+ * so "received" is the only mechanically correct signal: received (even if
+ * still queued) means the link isn't broken; never-received means it is.
+ *
+ * `getThreadReceivedAt` is in-memory and per-process, so it's empty right
+ * after a bridge restart — an event that was queued or mid-redelivery when
+ * the process died would read back as "never received" even though it may
+ * arrive again shortly via gap-fill. To avoid false handoff-positives in
+ * that window, `#effectiveThreshold` skips the handoff rule entirely for
+ * `handoffStartupQuietMs` (default: the same 300s gap-fill cycle + a
+ * buffer) after this StallDetector instance is constructed — the general
+ * stall check is unaffected and still applies during the quiet period.
+ * Per this feature's own product principle (over-nudging is a cheap,
+ * harmless false positive the agent shrugs off; under-detecting a genuinely
+ * broken handoff is the actual thing this exists to prevent — see
+ * docs/task-handle.md §13), the quiet period intentionally errs toward
+ * "wait a bit longer before trusting silence," not toward tight precision.
  *
  * Class shape (timer/start/stop/jitter) mirrors commentPoller.ts.
  */
@@ -125,11 +183,13 @@ const DEFAULT_INTERVAL_MS = 60_000;
 const DEFAULT_JITTER_MS = 10_000;
 const DEFAULT_STALL_THRESHOLD_MS = 24 * 60 * 60_000; // 24h
 const DEFAULT_STALL_FAST_THRESHOLD_MS = 30 * 60_000; // 30min — last turn crashed
-const DEFAULT_STALL_HANDOFF_THRESHOLD_MS = 15 * 60_000; // 15min — mentioned peer hasn't picked up (v3.2)
+const DEFAULT_STALL_HANDOFF_THRESHOLD_MS = 5 * 60_000; // 5min — mentioned peer hasn't received the event (v3.2 revision 1: 300s gap-fill cycle + one patrol-tick buffer)
 const DEFAULT_NUDGE_COOLDOWN_MS = 24 * 60 * 60_000; // 24h
 const DEFAULT_ESCALATE_AFTER_NUDGES = 2;
 /** How long a nudge can sit "pending" (enqueued, unconfirmed) before being treated as lost — see the module doc's fix #3. Generous relative to a normal turn's duration, short relative to the 24h cooldown. Not exposed via bot yaml — an implementation detail of delivery confirmation, not a product-facing threshold. */
 const DEFAULT_PENDING_CONFIRM_TIMEOUT_MS = 30 * 60_000;
+/** v3.2 revision 2: how long after construction the handoff rule stays disarmed, so an empty post-restart `getPeerReceivedAt` map isn't mistaken for "never received." Mirrors channelClient.ts's 300s gap-fill cycle + a buffer — see the module doc's revision 2 section. Not exposed via bot yaml — an implementation detail of restart safety, not a product-facing threshold. */
+const DEFAULT_HANDOFF_STARTUP_QUIET_MS = 6 * 60_000;
 /** Mirrors commentPoller.ts's PERMISSION_BACKOFF_CEILING_MS — same rationale (§D). */
 const PERMISSION_BACKOFF_CEILING_MS = 30 * 60_000;
 
@@ -155,13 +215,16 @@ export interface StallDetectorDeps {
   /** Pushes a synthesized turn onto the bridge's normal inbound queue — same mechanism as CommentPoller's enqueueSyntheticTurn. */
   enqueueNudgeTurn: (turn: StallNudgeTurn) => void;
   /**
-   * v3.2 交接断链检测: reads ANOTHER bot's SessionStore for its `lastActiveTs`
-   * in the SAME thread — a plain in-memory Map read, no I/O (main.ts closes
-   * over a botId→SessionStore map populated during startup). Omit to disable
-   * handoff-break detection entirely (the general stall check above is
-   * unaffected either way).
+   * v3.2 交接断链检测 (revision 2): reads ANOTHER bot's `BridgeHandler` for
+   * when it last RECEIVED an event in this thread — a plain in-memory Map
+   * read, no I/O (main.ts closes over a botId→BridgeHandler map populated
+   * during startup). Deliberately "received," not "turn started" — see the
+   * module doc's revision 2 section for why dispatch-start would misfire
+   * under this bridge's concurrency model. Omit to disable handoff-break
+   * detection entirely (the general stall check above is unaffected either
+   * way).
    */
-  getPeerLastActiveTs?: (peerBotId: string, threadId: string) => number | undefined;
+  getPeerReceivedAt?: (peerBotId: string, threadId: string) => number | undefined;
 }
 
 export interface StallDetectorOptions {
@@ -173,7 +236,7 @@ export interface StallDetectorOptions {
   stallThresholdMs?: number;
   /** @default 30min */
   stallFastThresholdMs?: number;
-  /** @default 15min. v3.2 交接断链检测 — see the module doc's own section. */
+  /** @default 5min. v3.2 交接断链检测 — see the module doc's revision 1 section for the gap-fill-cycle floor reasoning; docs/task-handle.md §13 has the operator-facing warning. */
   stallHandoffThresholdMs?: number;
   /** @default 24h */
   nudgeCooldownMs?: number;
@@ -181,6 +244,8 @@ export interface StallDetectorOptions {
   escalateAfterNudges?: number;
   /** @default 30min. Primarily for tests — see DEFAULT_PENDING_CONFIRM_TIMEOUT_MS's doc. */
   pendingConfirmTimeoutMs?: number;
+  /** @default 6min. v3.2 revision 2 — see DEFAULT_HANDOFF_STARTUP_QUIET_MS's doc. Primarily for tests (set to 0 to disarm the quiet period). */
+  handoffStartupQuietMs?: number;
 }
 
 /** `ms` rendered as a human-friendly duration label, minutes below an hour, hours at/above — a fixed 15min threshold reading "已超过 1 小时" (rounding-to-hours) would be actively misleading. Exported for direct unit testing — pure, no I/O. */
@@ -228,6 +293,9 @@ export class StallDetector {
   readonly #nudgeCooldownMs: number;
   readonly #escalateAfterNudges: number;
   readonly #pendingConfirmTimeoutMs: number;
+  readonly #handoffStartupQuietMs: number;
+  /** Construction time — the baseline for the revision-2 startup quiet period, since this instance's getPeerReceivedAt-backed map starts empty either way (fresh process or fresh instance). */
+  readonly #startedAt: number;
   #timer: ReturnType<typeof setTimeout> | ReturnType<typeof setInterval> | undefined;
   #running = false;
   /** See CommentPoller's identical field for why stop() must await this. */
@@ -245,6 +313,8 @@ export class StallDetector {
     this.#nudgeCooldownMs = opts.nudgeCooldownMs ?? DEFAULT_NUDGE_COOLDOWN_MS;
     this.#escalateAfterNudges = opts.escalateAfterNudges ?? DEFAULT_ESCALATE_AFTER_NUDGES;
     this.#pendingConfirmTimeoutMs = opts.pendingConfirmTimeoutMs ?? DEFAULT_PENDING_CONFIRM_TIMEOUT_MS;
+    this.#handoffStartupQuietMs = opts.handoffStartupQuietMs ?? DEFAULT_HANDOFF_STARTUP_QUIET_MS;
+    this.#startedAt = Date.now();
   }
 
   start(): void {
@@ -389,9 +459,15 @@ export class StallDetector {
   /**
    * The effective stall threshold for this record right now, and which rule
    * produced it (module doc's v3.2 section) — whichever applicable rule is
-   * SHORTEST always wins; a mentioned peer that already responded removes
-   * the handoff rule from consideration entirely (not just "picks the other
-   * one" — it means the handoff condition genuinely no longer holds).
+   * SHORTEST always wins; a mentioned peer that already RECEIVED the event
+   * removes the handoff rule from consideration entirely (not just "picks
+   * the other one" — it means the handoff condition genuinely no longer
+   * holds, even if that peer's turn is still queued behind other work).
+   *
+   * Disarmed for `handoffStartupQuietMs` after construction (revision 2) —
+   * `getPeerReceivedAt`'s backing map is process-local and starts empty, so
+   * "peer hasn't received it" is not trustworthy evidence until gap-fill has
+   * had a chance to redeliver anything that was in flight across a restart.
    */
   #effectiveThreshold(
     record: TaskHandleRecord,
@@ -402,15 +478,20 @@ export class StallDetector {
         ? { ms: this.#stallFastThresholdMs, reason: "failed" }
         : { ms: this.#stallThresholdMs, reason: "normal" };
 
-    if (!this.#deps.getPeerLastActiveTs || !record.lastTurnMentions?.length || record.lastTurnMentionsAt === undefined) {
+    if (
+      !this.#deps.getPeerReceivedAt ||
+      !record.lastTurnMentions?.length ||
+      record.lastTurnMentionsAt === undefined ||
+      Date.now() - this.#startedAt < this.#handoffStartupQuietMs
+    ) {
       return base;
     }
     const mentionAt = record.lastTurnMentionsAt;
     const anyPeerResponded = record.lastTurnMentions.some((peerBotId) => {
-      const peerActivity = this.#deps.getPeerLastActiveTs!(peerBotId, threadId);
-      return peerActivity !== undefined && peerActivity > mentionAt;
+      const peerReceivedAt = this.#deps.getPeerReceivedAt!(peerBotId, threadId);
+      return peerReceivedAt !== undefined && peerReceivedAt > mentionAt;
     });
-    if (anyPeerResponded) return base; // the mentioned peer already picked it up — handoff condition doesn't hold
+    if (anyPeerResponded) return base; // the mentioned peer's bridge already received it — handoff condition doesn't hold
 
     return this.#stallHandoffThresholdMs < base.ms ? { ms: this.#stallHandoffThresholdMs, reason: "handoff" } : base;
   }

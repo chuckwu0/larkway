@@ -4,7 +4,7 @@ import { resolveLarkwayVersion } from "./version.js";
 import { Client as LarkSdkClient } from "@larksuiteoapi/node-sdk";
 import { loadConfig, loadConfigJson } from "./config.js";
 import type { Config, ConfigJsonType } from "./config.js";
-import { ChannelClient } from "./lark/channelClient.js";
+import { ChannelClient, DEFAULT_OPEN_CHAT_DISCOVERY_MS } from "./lark/channelClient.js";
 import { CardRenderer } from "./lark/card.js";
 import { SessionStore } from "./claude/sessionStore.js";
 import { BridgeHandler } from "./bridge/handler.js";
@@ -215,14 +215,20 @@ async function runV2Mode({
 
   const instances: BotInstance[] = [];
 
-  // v3.2 交接断链检测 (docs/task-handle.md §13): every bot's own SessionStore,
+  // v3.2 交接断链检测 (docs/task-handle.md §13): every bot's own BridgeHandler,
   // keyed by its internal config id — populated progressively as each bot's
-  // iteration below creates its store. StallDetector closures reference this
-  // map by reference (same "populated-after, read-later" trick as
+  // iteration below constructs its handler. StallDetector closures reference
+  // this map by reference (same "populated-after, read-later" trick as
   // tasklistPollersByGuid above), so a bot's StallDetector can read ANOTHER
-  // bot's `lastActiveTs` for the SAME thread even though that other bot's
-  // SessionStore might not exist yet at the moment the closure is created.
-  const sessionStoresByBotId = new Map<string, SessionStore>();
+  // bot's `getThreadReceivedAt` for the SAME thread even though that other
+  // bot's handler might not exist yet at the moment the closure is created —
+  // by the time the closure is actually INVOKED (poll time, after this whole
+  // startup loop has finished), the map is fully populated. Deliberately a
+  // BridgeHandler map, not a SessionStore map (revision 2): the signal is
+  // "did this bot's bridge RECEIVE the event", not "did its last turn run" —
+  // see stallDetector.ts's module doc for why that distinction matters under
+  // this bridge's queued-concurrency model.
+  const handlersByBotId = new Map<string, BridgeHandler>();
 
   // Task-handle v3 "候选注入": one TasklistPoller per UNIQUE tasklistGuid,
   // shared by every bot configured with that guid (see the construction loop
@@ -330,7 +336,6 @@ async function runV2Mode({
     // Session store — scoped to this bot
     const sessionsPath = resolveSessionsPath(bot.id);
     const sessionStore = await SessionStore.load(sessionsPath);
-    sessionStoresByBotId.set(bot.id, sessionStore);
 
     // Inbound transport — Channel SDK only. In-process WS (robust reconnect,
     // no 1006/3003 self-kill, no subscribe subprocess). Needs raw appId+appSecret.
@@ -537,16 +542,38 @@ async function runV2Mode({
         // tasks IT ITSELF claimed, so there's no cross-bot dedup concern the
         // way TasklistPoller/CommentPoller had to solve for the shared list).
         if (bot.taskHandle?.stallDetectionDisabled !== true) {
+          // v3.2 revision 1 (docs/task-handle.md §13): a handoff threshold
+          // shorter than this bot's actual gap-fill cycle risks a nudge and a
+          // gap-fill redelivery both firing for the same missed event. Open
+          // mode (chats: []) gets the periodic 300s cycle (channelClient.ts's
+          // startOpenChatDiscovery); an explicit chats allowlist has no
+          // periodic sweep at all (only reconnect-triggered gap-fill), so its
+          // practical floor is lower. Warning only — never enforced, per this
+          // module's own "bridge stays mechanical, doesn't second-guess
+          // operator config" rule; the operator can still configure below it.
+          const isOpenMode = allowedChatIds.size === 0;
+          const recommendedHandoffFloorMs = isOpenMode ? DEFAULT_OPEN_CHAT_DISCOVERY_MS : 2 * 60_000;
+          const configuredHandoffMs = bot.taskHandle?.stallHandoffThresholdMs;
+          if (configuredHandoffMs !== undefined && configuredHandoffMs < recommendedHandoffFloorMs) {
+            console.warn(
+              `[larkway] bot "${bot.id}": taskHandle.stallHandoffThresholdMs (${configuredHandoffMs}ms) is below ` +
+                `the recommended floor for this bot's discovery mode (${isOpenMode ? "open" : "chats allowlist"} — ` +
+                `${recommendedHandoffFloorMs}ms) — a handoff nudge could double-fire alongside gap-fill redelivery ` +
+                `after a WS disconnect. See docs/task-handle.md §13.`,
+            );
+          }
           stallDetector = new StallDetector(
             {
               store: taskHandleStore,
               client: taskListClient,
               // Plain in-memory read of this bot's own SessionStore — no I/O.
               getLastActiveTs: (threadId) => sessionStore.get(threadId, bot.id)?.lastActiveTs,
-              // v3.2 交接断链检测: plain in-memory read of ANOTHER bot's
-              // SessionStore, via the progressively-populated map above.
-              getPeerLastActiveTs: (peerBotId, threadId) =>
-                sessionStoresByBotId.get(peerBotId)?.get(threadId, peerBotId)?.lastActiveTs,
+              // v3.2 交接断链检测 (revision 2): plain in-memory read of ANOTHER
+              // bot's BridgeHandler, via the progressively-populated map above —
+              // "received", not "last turn ran". See stallDetector.ts's module
+              // doc for why.
+              getPeerReceivedAt: (peerBotId, threadId) =>
+                handlersByBotId.get(peerBotId)?.getThreadReceivedAt(threadId),
               enqueueNudgeTurn: (turn) => {
                 client.enqueueSyntheticEvent({
                   message_id: `synthetic-task-stall-${turn.threadId}-${Date.now()}`,
@@ -681,6 +708,10 @@ async function runV2Mode({
       taskHandleClaimedLookup,
       taskHandleCandidatesLookup,
     });
+    // v3.2 交接断链检测 (revision 2, docs/task-handle.md §13): register so
+    // OTHER bots' StallDetector closures (see handlersByBotId above) can read
+    // this bot's getThreadReceivedAt for a shared thread.
+    handlersByBotId.set(bot.id, handler);
 
     const housekeeping = new Housekeeping({
       sessionStore,

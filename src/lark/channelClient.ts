@@ -69,7 +69,12 @@ const PROCESSING_REACTION_EMOJI = "Typing";
  * within one interval (and gap-fill them on first sight). Override via
  * LARKWAY_OPEN_CHAT_DISCOVERY_MS.
  */
-const DEFAULT_OPEN_CHAT_DISCOVERY_MS = 300_000;
+// Exported (not just an internal tuning constant) because main.ts's v3.2
+// handoff-threshold floor warning (docs/task-handle.md §13) cross-references
+// this exact value rather than duplicating the magic number — that warning
+// only applies to open-mode bots (allowedChatIds.size === 0), the only case
+// this periodic cycle actually runs for (see startOpenChatDiscovery's guard).
+export const DEFAULT_OPEN_CHAT_DISCOVERY_MS = 300_000;
 /**
  * Per-instance startup jitter (ms) added before the FIRST discovery run and
  * baked into the interval phase, so multiple bots on the same host don't fire

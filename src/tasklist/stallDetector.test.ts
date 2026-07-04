@@ -482,7 +482,7 @@ describe("StallDetector", () => {
   describe("handoff-break detection", () => {
     const HANDOFF = 15 * 60_000;
 
-    it("uses the much shorter handoff threshold when the mentioned peer has NOT had a turn since the mention", async () => {
+    it("uses the much shorter handoff threshold when the mentioned peer's bridge NEVER received an event in this thread (never entered its queue at all)", async () => {
       const store = await TaskHandleStore.load(join(dir, "task-handles.json"));
       const claimedAt = Date.now();
       await store.put({
@@ -502,7 +502,7 @@ describe("StallDetector", () => {
           client,
           getLastActiveTs: () => claimedAt,
           enqueueNudgeTurn,
-          getPeerLastActiveTs: () => undefined, // peer never had a session at all in this thread
+          getPeerReceivedAt: () => undefined, // this is the true "broken @" signature: never enqueued at all
         },
         { stallThresholdMs: DAY, stallHandoffThresholdMs: HANDOFF },
       );
@@ -517,7 +517,7 @@ describe("StallDetector", () => {
       expect(text).toContain("协作");
     });
 
-    it("does NOT use the handoff threshold once the mentioned peer has had a turn since the mention", async () => {
+    it("does NOT use the handoff threshold once the mentioned peer's bridge has RECEIVED an event since the mention", async () => {
       const store = await TaskHandleStore.load(join(dir, "task-handles.json"));
       const claimedAt = Date.now();
       await store.put({
@@ -537,7 +537,7 @@ describe("StallDetector", () => {
           client,
           getLastActiveTs: () => claimedAt,
           enqueueNudgeTurn,
-          getPeerLastActiveTs: () => claimedAt + 60_000, // peer DID pick it up shortly after the mention
+          getPeerReceivedAt: () => claimedAt + 60_000, // peer's bridge received an event shortly after the mention
         },
         { stallThresholdMs: DAY, stallHandoffThresholdMs: HANDOFF },
       );
@@ -549,7 +549,42 @@ describe("StallDetector", () => {
       expect(enqueueNudgeTurn).not.toHaveBeenCalled();
     });
 
-    it("falls back to the normal/fast threshold when getPeerLastActiveTs is not wired (backward compatible)", async () => {
+    it("does NOT trigger a handoff nudge when the peer received the event but is still queued (no dispatch/completion signal at all) — receipt alone is enough, per revision 2's 'received, not dispatched' contract", async () => {
+      const store = await TaskHandleStore.load(join(dir, "task-handles.json"));
+      const claimedAt = Date.now();
+      await store.put({
+        threadId: "t1",
+        taskGuid: "g1",
+        chatId: "oc_1",
+        claimedTs: claimedAt,
+        lastTurnMentions: ["peer-bot"],
+        lastTurnMentionsAt: claimedAt,
+      });
+      const { requester } = makeFakeRequester({ g1: { guid: "g1", summary: "任务A" } });
+      const client = new TaskListClient(requester);
+      const enqueueNudgeTurn = vi.fn();
+      // Peer's bridge enqueued the event just after the mention (getThreadReceivedAt
+      // would report this instant), but its turn never dispatches — imagine it's
+      // stuck behind handler.ts's MAX_CONCURRENT=5 semaphore, or is itself a 5-15min
+      // turn still running. No SessionStore.lastActiveTs bump ever happens for it.
+      // If the signal were "turn started/finished" instead of "received", this would
+      // misjudge the (perfectly healthy) handoff as broken.
+      const receivedAt = claimedAt + 5_000;
+      const detector = new StallDetector(
+        { store, client, getLastActiveTs: () => claimedAt, enqueueNudgeTurn, getPeerReceivedAt: () => receivedAt },
+        { stallThresholdMs: DAY, stallHandoffThresholdMs: HANDOFF },
+      );
+
+      // Advance WAY past the handoff threshold (45min) — if this used dispatch/turn
+      // completion as the signal, "still queued" would look identical to "never
+      // received" and misfire. It must not, because receivedAt > mentionAt regardless.
+      vi.setSystemTime(claimedAt + 45 * 60_000);
+      await detector.pollOnceForTest();
+
+      expect(enqueueNudgeTurn).not.toHaveBeenCalled();
+    });
+
+    it("falls back to the normal/fast threshold when getPeerReceivedAt is not wired (backward compatible)", async () => {
       const store = await TaskHandleStore.load(join(dir, "task-handles.json"));
       const claimedAt = Date.now();
       await store.put({
@@ -564,7 +599,7 @@ describe("StallDetector", () => {
       const client = new TaskListClient(requester);
       const enqueueNudgeTurn = vi.fn();
       const detector = new StallDetector(
-        { store, client, getLastActiveTs: () => claimedAt, enqueueNudgeTurn }, // no getPeerLastActiveTs at all
+        { store, client, getLastActiveTs: () => claimedAt, enqueueNudgeTurn }, // no getPeerReceivedAt at all
         { stallThresholdMs: DAY, stallHandoffThresholdMs: HANDOFF },
       );
 
@@ -590,7 +625,7 @@ describe("StallDetector", () => {
       const client = new TaskListClient(requester);
       const enqueueNudgeTurn = vi.fn();
       const detector = new StallDetector(
-        { store, client, getLastActiveTs: () => claimedAt, enqueueNudgeTurn, getPeerLastActiveTs: () => undefined },
+        { store, client, getLastActiveTs: () => claimedAt, enqueueNudgeTurn, getPeerReceivedAt: () => undefined },
         { stallThresholdMs: DAY, stallFastThresholdMs: 30 * 60_000, stallHandoffThresholdMs: HANDOFF },
       );
 
@@ -612,7 +647,7 @@ describe("StallDetector", () => {
       const client = new TaskListClient(requester);
       const enqueueNudgeTurn = vi.fn();
       const detector = new StallDetector(
-        { store, client, getLastActiveTs: () => claimedAt, enqueueNudgeTurn, getPeerLastActiveTs: () => undefined },
+        { store, client, getLastActiveTs: () => claimedAt, enqueueNudgeTurn, getPeerReceivedAt: () => undefined },
         { stallThresholdMs: DAY, stallFastThresholdMs: 30 * 60_000, stallHandoffThresholdMs: HANDOFF },
       );
 
@@ -625,6 +660,93 @@ describe("StallDetector", () => {
       vi.setSystemTime(claimedAt + 31 * 60_000);
       await detector.pollOnceForTest();
       expect(enqueueNudgeTurn).toHaveBeenCalledTimes(1);
+    });
+
+    it("revision 1: defaults to a 5-minute handoff threshold when stallHandoffThresholdMs isn't configured", async () => {
+      const store = await TaskHandleStore.load(join(dir, "task-handles.json"));
+      const claimedAt = Date.now();
+      await store.put({
+        threadId: "t1",
+        taskGuid: "g1",
+        chatId: "oc_1",
+        claimedTs: claimedAt,
+        lastTurnMentions: ["peer-bot"],
+        lastTurnMentionsAt: claimedAt,
+      });
+      const { requester } = makeFakeRequester({ g1: { guid: "g1", summary: "任务A" } });
+      const client = new TaskListClient(requester);
+      const enqueueNudgeTurn = vi.fn();
+      // No stallHandoffThresholdMs override at all — exercising the real default.
+      const detector = new StallDetector(
+        { store, client, getLastActiveTs: () => claimedAt, enqueueNudgeTurn, getPeerReceivedAt: () => undefined },
+        { stallThresholdMs: DAY },
+      );
+
+      // 4 minutes in: under the 5min default, must not fire yet.
+      vi.setSystemTime(claimedAt + 4 * 60_000);
+      await detector.pollOnceForTest();
+      expect(enqueueNudgeTurn).not.toHaveBeenCalled();
+
+      // Past 5 minutes: fires.
+      vi.setSystemTime(claimedAt + 6 * 60_000);
+      await detector.pollOnceForTest();
+      expect(enqueueNudgeTurn).toHaveBeenCalledTimes(1);
+    });
+
+    describe("revision 2: restart startup quiet period", () => {
+      it("disarms the handoff rule (falls back to the normal/fast threshold) for handoffStartupQuietMs after construction, even if the peer never received anything", async () => {
+        const store = await TaskHandleStore.load(join(dir, "task-handles.json"));
+        const claimedAt = Date.now();
+        await store.put({
+          threadId: "t1",
+          taskGuid: "g1",
+          chatId: "oc_1",
+          claimedTs: claimedAt,
+          lastTurnMentions: ["peer-bot"],
+          lastTurnMentionsAt: claimedAt,
+        });
+        const { requester } = makeFakeRequester({ g1: { guid: "g1", summary: "任务A" } });
+        const client = new TaskListClient(requester);
+        const enqueueNudgeTurn = vi.fn();
+        // Simulates a just-restarted bridge: getPeerReceivedAt's backing map is
+        // empty (undefined) simply because it hasn't had time to repopulate yet,
+        // not because the handoff is actually broken.
+        const detector = new StallDetector(
+          { store, client, getLastActiveTs: () => claimedAt, enqueueNudgeTurn, getPeerReceivedAt: () => undefined },
+          { stallThresholdMs: DAY, stallHandoffThresholdMs: HANDOFF, handoffStartupQuietMs: 20 * 60_000 },
+        );
+
+        // Well past the 15min handoff threshold, but still inside the 20min quiet
+        // period — must NOT fire (falls back to the 24h normal threshold instead).
+        vi.setSystemTime(claimedAt + HANDOFF + 60_000);
+        await detector.pollOnceForTest();
+        expect(enqueueNudgeTurn).not.toHaveBeenCalled();
+      });
+
+      it("arms the handoff rule normally once handoffStartupQuietMs has elapsed since construction", async () => {
+        const store = await TaskHandleStore.load(join(dir, "task-handles.json"));
+        const claimedAt = Date.now();
+        await store.put({
+          threadId: "t1",
+          taskGuid: "g1",
+          chatId: "oc_1",
+          claimedTs: claimedAt,
+          lastTurnMentions: ["peer-bot"],
+          lastTurnMentionsAt: claimedAt,
+        });
+        const { requester } = makeFakeRequester({ g1: { guid: "g1", summary: "任务A" } });
+        const client = new TaskListClient(requester);
+        const enqueueNudgeTurn = vi.fn();
+        const detector = new StallDetector(
+          { store, client, getLastActiveTs: () => claimedAt, enqueueNudgeTurn, getPeerReceivedAt: () => undefined },
+          { stallThresholdMs: DAY, stallHandoffThresholdMs: HANDOFF, handoffStartupQuietMs: 6 * 60_000 },
+        );
+
+        // Past both the 6min quiet period AND the 15min handoff threshold.
+        vi.setSystemTime(claimedAt + 20 * 60_000);
+        await detector.pollOnceForTest();
+        expect(enqueueNudgeTurn).toHaveBeenCalledTimes(1);
+      });
     });
   });
 });

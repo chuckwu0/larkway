@@ -381,10 +381,8 @@ open_id——也就是说,至少在抽查的这个窗口里,看起来像"agent �
 `TaskHandleRecord.lastTurnMentions`(最近一轮*完成* turn 的回复文本里,机械字符串匹配花名册
 命中的协作 bot;`writeback.ts` 在其 completed 分支顺手提取、每轮整体替换不累加;failed 分支
 清空,因为一次崩溃不算蓄意交接,已有更高优先级的加急阈值覆盖这种情况)非空,且被提到的协作 bot
-在这个 thread 里、`lastTurnMentionsAt` 之后**没有**跑过任何 turn(通过 `getPeerLastActiveTs`
-读该 bot 自己的 `SessionStore.lastActiveTs`,同进程内跨 bot 只读,main.ts 用与 `TasklistPoller`
-的 `listRootTexts` 相同的"启动时逐步填充、轮询时才读"闭包手法达成),就用
-`taskHandle.stallHandoffThresholdMs`(默认 **15 分钟**)代替一般/加急阈值——三档阈值取**最短
+**在这个 thread 里、`lastTurnMentionsAt` 之后没有收到过任何事件**,就用
+`taskHandle.stallHandoffThresholdMs`(默认见 §13.5)代替一般/加急阈值——三档阈值取**最短
 的那个生效**。判断逻辑全部是时间戳比较 + 字符串匹配,不涉及任何语义理解。
 
 **护栏完全复用**(不是两套计数):交接断链和一般停滞共用同一个 `stallNudge` 状态机——冷却、
@@ -393,21 +391,61 @@ open_id——也就是说,至少在抽查的这个窗口里,看起来像"agent �
 `lastTurnMentions` 只由这个 bot自己的 completed turn 写入,"唤醒发起 @ 的 bot"和"唤醒认领者"
 在这套实现里天然是同一个 bot,不需要额外的跨 bot 唤醒路径。
 
+#### 修订 1(2026-07):15min → 5min 默认值,以及物理下限
+
+交接是机器对机器的协作——真实 mention 秒级触发 dispatch,不像一般停滞那样需要"给人反应时间"的
+宽限期。唯一真实存在的下限来自 `channelClient.ts` 的周期性 gap-fill/open-chat-discovery 巡检
+(`DEFAULT_OPEN_CHAT_DISCOVERY_MS` = 300s,**仅 open 模式**——`chats: []`——的 bot 才有,见
+`startOpenChatDiscovery()` 自身的 `allowedChatIds.size > 0` 提前 return 守卫):如果交接阈值比
+这个周期还短,一次 WS 断连窗口可能让"唤醒提醒"和"gap-fill 补投"对同一条丢失事件同时触发,变成
+重复唤醒两次。默认改为 **5 分钟**(300s + 一个本模块自己的巡检 tick 缓冲)。
+
+配置**可以**设得比 5 分钟更短——本模块的机械铁律是 bridge 不对操作者的配置做价值判断,运行时不
+做任何强制——但低于部署实际的 gap-fill 周期就有上述"双触发"风险,请勿这样配。**若 bot 是明确
+`chats:` 白名单(非 open 模式),没有周期性 gap-fill(只有断线重连触发的 gap-fill,不是固定周期
+扫描),下限可以放宽到 ~2 分钟**——这一区分已通过代码验证(`startOpenChatDiscovery` 的守卫
+子句),不是假设。main.ts 在构造 `StallDetector` 时会按这条规则做**启动期一次性告警**(配置低于
+推荐下限时打 warning 日志,指向本节),不阻断启动、不改配置。
+
+**交接检测只对同一 bridge 进程内的协作 bot 生效**:`taskHandleMentionRoster`(main.ts)是拿
+`bot.peers` 跟同进程的完整 `bots` 列表交叉引用出来的,`lastTurnMentions` 结构上就不可能装进一个
+跨 bridge 部署的 bot id——不需要额外判断,跨 bridge 的 @ 天然走不到交接分支,自动落回一般停滞
+阈值(该阈值本来就没有"同进程"这个限制)。
+
+#### 修订 2(2026-07):信号 = "收到",不是"开始跑"
+
+"协作 bot 是否已响应"这个信号,准确定义是 **"对方的 bridge 收到了这条 mention 事件"**
+(`BridgeHandler.getThreadReceivedAt`,在 `run()` 的 for-await 循环里、事件刚出队列时打点)——
+**不是**"对方的 turn 已经开始跑"。原因见 `handler.ts` 的 `run()`(约 785-845 行)自己的注释:
+并发模型是跨 thread 并发、同 thread 串行,全局用 `MAX_CONCURRENT = 5` 的信号量封顶;单个 turn
+可能跑 5-15 分钟。也就是说,一个已经收到的事件完全可能在队列里排 5 分钟以上还没轮到执行,即便
+链路完全健康。如果拿"开始 dispatch"当信号,会把"收到了但还排着队"误判成"断链了",给 A 发一条
+多余的"重发一次"提醒,白做一遍工作。真正断链(@ 格式不对、消息丢失)的本质特征是**这个事件压根
+没进过 B 的队列**——所以"收到"才是唯一机械正确的信号:收到(哪怕还排着队)= 链路没断;
+从未收到 = 链路断了。
+
+`getThreadReceivedAt` 是进程内内存态,bridge 重启后必然清空——重启瞬间"从未收到"和"真的断链了"
+在这张表里长得一模一样。为避免重启后一段时间内把"还没来得及重新收到/补投中"的正常情况误判成
+断链,`StallDetector` 在构造后的 `handoffStartupQuietMs`(默认 6 分钟,即 5min gap-fill 周期 +
+1 分钟缓冲)内**完全不考虑交接阈值**(退回一般/加急阈值)——本产品的总原则是宁可多误报一次
+(agent 收到无害的一次巡检 turn,自己判断"不用管")也不可漏报真正断掉的协作,静默期这个设计
+同样是"宁可多等一会再信任沉默"这个取舍的一次应用,不是追求精确。
+
 ### 13.5 配置
 
 ```yaml
 taskHandle:
   tasklistGuid: "..."
-  stallHandoffThresholdMs: 900000    # 15min(默认),交接断链专用,取三档最短生效
+  stallHandoffThresholdMs: 300000    # 5min(默认,修订1),交接断链专用,取三档最短生效
 ```
 
 **活跃协作团队推荐配置示例**(多 bot 频繁互相 @ 配合的部署):
 
 ```yaml
 taskHandle:
-  stallHandoffThresholdMs: 900000     # 15min —— 交接断链
-  stallFastThresholdMs: 1800000       # 30min —— 上一轮 turn 崩溃/失败(默认值,保持不变)
-  stallThresholdMs: 14400000          # 4h —— 一般停滞(比默认 24h 更激进,适合小时级任务、协作密集的团队)
+  stallHandoffThresholdMs: 300000      # 5min —— 交接断链(默认值;低于本部署 gap-fill 周期会触发启动告警,见 §13.4 修订1)
+  stallFastThresholdMs: 1800000        # 30min —— 上一轮 turn 崩溃/失败(默认值,保持不变)
+  stallThresholdMs: 14400000           # 4h —— 一般停滞(比默认 24h 更激进,适合小时级任务、协作密集的团队)
 ```
 
 ### 13.6 明确不做
@@ -417,3 +455,7 @@ taskHandle:
 - ❌ 不新增一套独立于 `stallNudge` 的交接计数——护栏(冷却/两步确认/升级)全部复用现有状态机。
 - ❌ 不做"唤醒非本 bridge 管理的 bot"这类跨部署/跨进程唤醒——本实现里"发起 @ 的 bot"和"认领
   任务的 bot"恒等,不存在需要跨进程唤醒别的 bridge 实例的场景。
+- ❌ 不在运行时强制"交接阈值不能低于 gap-fill 周期"这条下限——只做启动期一次性告警,不拒绝启动、
+  不改写配置。理由:本模块的铁律是 bridge 不对操作者的配置做价值判断;把这条下限做成硬校验还会
+  让 `stallDetector.ts` 反向耦合 `channelClient.ts` 的内部巡检常量,收益(防呆)不足以覆盖这份
+  新增耦合的代价。

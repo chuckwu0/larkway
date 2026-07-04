@@ -743,8 +743,35 @@ export class BridgeHandler {
    */
   private readonly inFlightTurns = new Set<Promise<void>>();
 
+  /**
+   * v3.2 交接断链检测 (docs/task-handle.md §13, revision 2): per-thread "most
+   * recently RECEIVED" timestamp, stamped in run()'s for-await loop body —
+   * i.e. the moment an event is pulled off client.events() and enqueued,
+   * BEFORE acquire()/handleOne() ever run. This is deliberately NOT "turn
+   * started" or "turn finished": run() is cross-thread-concurrent but
+   * same-thread-serial with a global MAX_CONCURRENT=5 semaphore, and a single
+   * turn can take 5-15 min, so an event can sit queued for well over a
+   * plausible handoff threshold even though it unambiguously arrived. Using
+   * dispatch-start as the signal would misjudge "received but queued" as a
+   * broken handoff and fire a spurious nudge. Read via getThreadReceivedAt().
+   */
+  private readonly threadReceivedAt = new Map<string, number>();
+
   constructor(deps: BridgeHandlerDeps) {
     this.deps = deps;
+  }
+
+  /**
+   * Cross-bot peer-response signal for StallDetector's handoff-break check
+   * (docs/task-handle.md §13). Returns when THIS bridge process last saw an
+   * inbound event for threadId, regardless of whether that turn has started,
+   * is still queued, or has finished. undefined = never received (this
+   * process instance), which includes "not received yet since last restart"
+   * — callers must apply their own startup quiet-period before treating that
+   * as evidence of a truly broken handoff.
+   */
+  getThreadReceivedAt(threadId: string): number | undefined {
+    return this.threadReceivedAt.get(threadId);
   }
 
   /**
@@ -825,6 +852,9 @@ export class BridgeHandler {
       if (signal?.aborted) break;
 
       const key = event.thread_id ?? event.message_id;
+      // Stamp "received" here — synchronously, before acquire()/handleOne()
+      // — so this reflects arrival, not dispatch. See threadReceivedAt above.
+      this.threadReceivedAt.set(key, Date.now());
       const prev = threadQueues.get(key) ?? Promise.resolve();
       const next = prev
         .then(() => acquire())
