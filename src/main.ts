@@ -45,7 +45,11 @@ import { TaskListClient, type LarkTaskRequester } from "./tasklist/client.js";
 import { applyTaskHandleWriteback, applyAutoBindConfirmation } from "./tasklist/writeback.js";
 import { CommentPoller } from "./tasklist/commentPoller.js";
 import { TasklistPoller, type RootTextEntry } from "./tasklist/tasklistPoller.js";
+import { StallDetector } from "./tasklist/stallDetector.js";
 import { readTeamTasklistGuid } from "./tasklist/teamRegistry.js";
+
+/** Bridge-internal synthetic sender marker for stall-nudge turns — no real Feishu user triggered it (mirrors LEGACY_BOT_ID's sentinel-string convention). */
+const STALL_NUDGE_SENDER_ID = "larkway-stall-detector";
 
 /** How often the bridge rewrites each bot's status.json liveness heartbeat. */
 const STATUS_WRITE_INTERVAL_MS = 30_000;
@@ -193,6 +197,8 @@ async function runV2Mode({
     codexPool: CodexProcessPool | undefined;
     /** Task-handle comment poller (docs/task-handle.md) — undefined when the bot doesn't enable the feature. */
     taskCommentPoller: CommentPoller | undefined;
+    /** Task-handle v3.1 stall detector (docs/task-handle.md §12) — undefined when the bot doesn't enable the feature or has stallDetectionDisabled set. */
+    stallDetector: StallDetector | undefined;
     /** Liveness heartbeat interval (status.json). Armed after wiring; unref()-ed. */
     statusTimer: ReturnType<typeof setInterval> | null;
     /**
@@ -408,6 +414,7 @@ async function runV2Mode({
     let taskHandleClaimedLookup: ((threadId: string) => boolean) | undefined;
     let taskHandleCandidatesLookup: (() => readonly import("./tasklist/types.js").TaskCandidate[]) | undefined;
     let taskCommentPoller: CommentPoller | undefined;
+    let stallDetector: StallDetector | undefined;
     {
       const guid = bot.taskHandle?.tasklistGuid ?? (await readTeamTasklistGuid(resolveTaskTeamRegistryPath()));
       if (guid) {
@@ -476,6 +483,44 @@ async function runV2Mode({
           },
         });
         taskCommentPoller.start();
+
+        // v3.1 停滞检测 + 唤醒 (docs/task-handle.md §12) — per-bot, not deduped
+        // by guid (TaskHandleStore is already per-bot; a bot only ever nudges
+        // tasks IT ITSELF claimed, so there's no cross-bot dedup concern the
+        // way TasklistPoller/CommentPoller had to solve for the shared list).
+        if (bot.taskHandle?.stallDetectionDisabled !== true) {
+          stallDetector = new StallDetector(
+            {
+              store: taskHandleStore,
+              client: taskListClient,
+              // Plain in-memory read of this bot's own SessionStore — no I/O.
+              getLastActiveTs: (threadId) => sessionStore.get(threadId, bot.id)?.lastActiveTs,
+              enqueueNudgeTurn: (turn) => {
+                client.enqueueSyntheticEvent({
+                  message_id: `synthetic-task-stall-${turn.threadId}-${Date.now()}`,
+                  chat_id: turn.chatId,
+                  chat_type: "group",
+                  thread_id: turn.threadId,
+                  root_id: turn.threadId,
+                  // Distinct marker (NOT "card_action") — same reasoning as
+                  // taskCommentPoller's enqueueSyntheticTurn above: resolves
+                  // via the normal no-mentions-array path, purely informational.
+                  larkway_trigger_type: "task_stall",
+                  sender_id: STALL_NUDGE_SENDER_ID,
+                  content: JSON.stringify({ text: turn.text }),
+                  create_time: String(Date.now()),
+                });
+              },
+            },
+            {
+              stallThresholdMs: bot.taskHandle?.stallThresholdMs,
+              stallFastThresholdMs: bot.taskHandle?.stallFastThresholdMs,
+              nudgeCooldownMs: bot.taskHandle?.stallNudgeCooldownMs,
+              escalateAfterNudges: bot.taskHandle?.stallEscalateAfterNudges,
+            },
+          );
+          stallDetector.start();
+        }
       }
     }
 
@@ -570,7 +615,7 @@ async function runV2Mode({
 
     const inst: BotInstance = {
       bot, client, sessionStore, cardRenderer, handler, housekeeping,
-      taskCommentPoller, codexPool,
+      taskCommentPoller, stallDetector, codexPool,
       statusTimer: null, avatar: undefined,
     };
     instances.push(inst);
@@ -673,13 +718,14 @@ async function runV2Mode({
   async function shutdown(signal: string): Promise<void> {
     console.log(`\n[larkway] Received ${signal}, shutting down V2 bots…`);
     await Promise.all(
-      instances.map(async ({ bot, statusTimer, housekeeping, taskCommentPoller, handler, sessionStore, client, avatar, codexPool }) => {
+      instances.map(async ({ bot, statusTimer, housekeeping, taskCommentPoller, stallDetector, handler, sessionStore, client, avatar, codexPool }) => {
         if (statusTimer) clearInterval(statusTimer);
         // Await drain (M1): stop() only cancels the NEXT scheduled cycle —
         // without awaiting, a cycle already in flight would keep running
         // (and writing to the store / enqueueing turns) after shutdown()
         // has logged "complete" and the process is exiting.
         await taskCommentPoller?.stop();
+        await stallDetector?.stop();
         // Mark this bot as no-longer-serving on the way out (ws:false). The Web
         // 管理面 will then show 🟡 degraded briefly, then 🔴 offline once the
         // file goes stale. Best-effort — never block shutdown on it. Preserve the
@@ -719,9 +765,10 @@ async function runV2Mode({
   if (dryRun) {
     console.log("[dry-run] V2 mode — all bots wired OK, exiting.");
     await Promise.all(
-      instances.map(async ({ housekeeping, taskCommentPoller, sessionStore, client, codexPool }) => {
+      instances.map(async ({ housekeeping, taskCommentPoller, stallDetector, sessionStore, client, codexPool }) => {
         housekeeping.stop();
         await taskCommentPoller?.stop();
+        await stallDetector?.stop();
         // No-op: dry-run never calls .run(), so no process was ever spawned.
         await codexPool?.shutdown();
         await sessionStore.close();

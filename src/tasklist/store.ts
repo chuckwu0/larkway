@@ -7,10 +7,13 @@
  * atomic-write range (tmp + rename), simplified: no debounced touch, no
  * legacy V1 migration — this feature ships opt-in from day one.
  *
- * The ONLY writer of a new record is the agent's `task_handle.guid`
+ * The primary writer of a NEW record is the agent's `task_handle.guid`
  * declaration in `.larkway/state.json`, relayed by bridge/handler.ts at
- * finalize time. The bridge/tasklist modules never guess or create a claim
- * on their own (docs/task-handle.md §5.2 "认领 = agent 在 turn 内做").
+ * finalize time. The bridge/tasklist modules never GUESS a claim on their
+ * own — the one exception (v3 §5.2 "dispatch 时捕获根消息文本") is a fully
+ * mechanical exact-string match (src/tasklist/tasklistPoller.ts), which also
+ * writes through this same store; it's still not a judgment call, just a
+ * different trigger for the identical `claim()` write path.
  */
 
 import { rename, readFile, writeFile, mkdir } from "node:fs/promises";
@@ -29,11 +32,57 @@ export interface TaskHandleRecord {
    * pre-existing history — see commentPoller.ts).
    */
   lastSeenCommentId?: string;
+  /**
+   * v3.1 stall detection (docs/task-handle.md §12): whether the MOST RECENT
+   * lifecycle event bridge/handler.ts fired for this claim's thread was a
+   * turn that completed cleanly or one that crashed/errored. Written by
+   * src/tasklist/writeback.ts's applyTaskHandleWriteback on its "completed"/
+   * "failed" branches (never on "received" — that fires before an outcome is
+   * known, so it must not overwrite whatever the LAST known outcome was).
+   * Used by StallDetector to pick the "加急" fast threshold (a thread whose
+   * last turn crashed is far more likely to need a nudge soon) vs the normal
+   * one. Undefined until the first completed/failed event after a claim.
+   */
+  lastTurnOutcome?: "completed" | "failed";
+  /**
+   * v3.1 stall detection nudge/escalation state — see src/tasklist/
+   * stallDetector.ts for the full algorithm. Persisted here (not a separate
+   * file) so it survives a bridge restart without re-nudging from scratch,
+   * mirroring how `lastSeenCommentId` already piggybacks on this same record.
+   */
+  stallNudge?: {
+    /** How many nudges have been sent since the last confirmed real progress. */
+    count: number;
+    /** ms epoch — when the most recent nudge was sent (drives the cooldown gate). */
+    lastNudgeSentAt: number;
+    /**
+     * ms epoch — the thread's `lastActiveTs` value StallDetector has
+     * attributed to the nudge's OWN triggered turn (as opposed to further,
+     * independent activity). Undefined until that attribution happens (see
+     * stallDetector.ts's doc comment for why this two-step capture exists —
+     * without it, a nudge's own agent reply would look like "progress" and
+     * silently defeat the escalation counter).
+     */
+    lastNudgeTurnActivityAt?: number;
+    /** True once nudges have been exhausted and the escalation comment was posted. StallDetector goes silent for this task until real progress resets it. */
+    escalated: boolean;
+  };
 }
 
 interface StoreFile {
   version: 1;
   records: Record<string, TaskHandleRecord>;
+}
+
+function isStallNudgeState(value: unknown): value is NonNullable<TaskHandleRecord["stallNudge"]> {
+  if (typeof value !== "object" || value === null) return false;
+  const v = value as Record<string, unknown>;
+  return (
+    typeof v["count"] === "number" &&
+    typeof v["lastNudgeSentAt"] === "number" &&
+    (v["lastNudgeTurnActivityAt"] === undefined || typeof v["lastNudgeTurnActivityAt"] === "number") &&
+    typeof v["escalated"] === "boolean"
+  );
 }
 
 function isTaskHandleRecord(value: unknown): value is TaskHandleRecord {
@@ -44,7 +93,9 @@ function isTaskHandleRecord(value: unknown): value is TaskHandleRecord {
     typeof v["taskGuid"] === "string" &&
     typeof v["chatId"] === "string" &&
     typeof v["claimedTs"] === "number" &&
-    (v["lastSeenCommentId"] === undefined || typeof v["lastSeenCommentId"] === "string")
+    (v["lastSeenCommentId"] === undefined || typeof v["lastSeenCommentId"] === "string") &&
+    (v["lastTurnOutcome"] === undefined || v["lastTurnOutcome"] === "completed" || v["lastTurnOutcome"] === "failed") &&
+    (v["stallNudge"] === undefined || isStallNudgeState(v["stallNudge"]))
   );
 }
 

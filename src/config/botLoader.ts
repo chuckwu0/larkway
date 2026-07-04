@@ -60,6 +60,21 @@ const TaskHandleConfigSchema = z.object({
    * 提示删除。新 yaml 不要再写这个字段。
    */
   enabled: z.boolean().optional(),
+  /**
+   * v3.1 停滞检测(docs/task-handle.md §12)全部可选,均有保守默认值——不配
+   * 就用默认阈值,不是新的 enable 开关(检测本身跟 tasklistGuid 一样,只要有
+   * 认领记录就跑;想彻底关掉停滞检测本身,见 stallDetectionDisabled)。
+   */
+  /** 绑定话题超过这个时长(ms)无活动 → 判定停滞,唤醒认领的 agent。默认 24h。 */
+  stallThresholdMs: z.number().positive().optional(),
+  /** 若该话题最后一轮 turn 以失败/崩溃收场,改用这个更短的阈值(ms)。默认 30min。 */
+  stallFastThresholdMs: z.number().positive().optional(),
+  /** 同一任务两次提醒之间的最短间隔(ms),防止骚扰。默认 24h。 */
+  stallNudgeCooldownMs: z.number().positive().optional(),
+  /** 连续几次提醒仍无进展后改为升级(任务评论通知人类,此后对该任务静默直到有新活动)。默认 2。 */
+  stallEscalateAfterNudges: z.number().int().positive().optional(),
+  /** 彻底关闭停滞检测(默认 false = 开启,阈值保守)。 */
+  stallDetectionDisabled: z.boolean().optional(),
 }).strict();
 
 const GitCloneUrlSchema = z.string().min(1).refine(

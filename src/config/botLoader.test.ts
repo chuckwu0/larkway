@@ -1003,4 +1003,73 @@ taskHandle:
       warnSpy.mockRestore();
     }
   });
+
+  it("taskHandle (v3.1): stall-detection fields parse through with no enable flag required", async () => {
+    await createBotsDir();
+    await writeYaml(
+      "task-handle-stall.yaml",
+      `
+id: task-handle-stall-bot
+name: Task Handle Stall Bot
+description: bot with custom stall-detection thresholds
+app_id: cli_task_handle_stall
+app_secret_env: TASK_HANDLE_STALL_SECRET
+bot_open_id: ou_task_handle_stall
+taskHandle:
+  tasklistGuid: "tl-abc123"
+  stallThresholdMs: 43200000
+  stallFastThresholdMs: 900000
+  stallNudgeCooldownMs: 43200000
+  stallEscalateAfterNudges: 3
+  stallDetectionDisabled: false
+`,
+    );
+    const bots = await loadBots(botsDir());
+    expect(bots[0]?.taskHandle).toEqual({
+      tasklistGuid: "tl-abc123",
+      stallThresholdMs: 43200000,
+      stallFastThresholdMs: 900000,
+      stallNudgeCooldownMs: 43200000,
+      stallEscalateAfterNudges: 3,
+      stallDetectionDisabled: false,
+    });
+  });
+
+  it("taskHandle (v3.1): stall-detection fields are all optional — omitted entirely parses through untouched", async () => {
+    await createBotsDir();
+    await writeYaml(
+      "task-handle-stall-default.yaml",
+      `
+id: task-handle-stall-default-bot
+name: Task Handle Stall Default Bot
+description: bot relying on default stall-detection thresholds
+app_id: cli_task_handle_stall_default
+app_secret_env: TASK_HANDLE_STALL_DEFAULT_SECRET
+bot_open_id: ou_task_handle_stall_default
+taskHandle:
+  tasklistGuid: "tl-abc123"
+`,
+    );
+    const bots = await loadBots(botsDir());
+    expect(bots[0]?.taskHandle).toEqual({ tasklistGuid: "tl-abc123" });
+  });
+
+  it("taskHandle (v3.1): rejects a non-positive stallThresholdMs", async () => {
+    await createBotsDir();
+    await writeYaml(
+      "task-handle-stall-invalid.yaml",
+      `
+id: task-handle-stall-invalid-bot
+name: Task Handle Stall Invalid Bot
+description: bot with an invalid stall threshold
+app_id: cli_task_handle_stall_invalid
+app_secret_env: TASK_HANDLE_STALL_INVALID_SECRET
+bot_open_id: ou_task_handle_stall_invalid
+taskHandle:
+  tasklistGuid: "tl-abc123"
+  stallThresholdMs: -1
+`,
+    );
+    await expect(loadBots(botsDir())).rejects.toThrow();
+  });
 });

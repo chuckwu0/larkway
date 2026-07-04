@@ -102,6 +102,12 @@
 # bots/<bot>.yaml 新增(可选;不配 = 不用该 feature)
 taskHandle:
   tasklistGuid: "..."      # owner 的「Agent Team」清单;同一 owner 的一组 bot 填同一个 guid
+  # 以下 v3.1 停滞检测字段全部可选,不配就用括号里的默认值(见 §12):
+  # stallThresholdMs: 86400000        # 24h
+  # stallFastThresholdMs: 1800000     # 30min(上一轮 turn 失败/崩溃时用这个)
+  # stallNudgeCooldownMs: 86400000    # 24h
+  # stallEscalateAfterNudges: 2
+  # stallDetectionDisabled: false     # true = 彻底关闭停滞检测本身
 ```
 
 - **去掉 `enabled` 字段**(v2)。真正的门槛是有没有清单(见 §6.3);配了 `tasklistGuid`,或共享注册文件里能查到,就用得上。
@@ -162,3 +168,95 @@ taskHandle:
 4. 用户回头找话题,是否全靠任务回跳、不再翻群?
 
 四问全过 → 可随开源发布(P1)。
+
+## 12. v3.1:停滞检测 + 唤醒
+
+> 产品意图:Agent Team 话题协作里流程会断——@ 漏了、某个 agent turn 失败、讨论沉了。
+> 已认领的任务 = 团队立的承诺,bridge 要机械检测「停滞」这个事实,然后唤醒认领该任务的 agent
+> 来判断怎么推进(重新 @ 人 / 拆解 / 升级问人)。**判断永远归 agent,bridge 只捕获事实**——
+> 这条铁律贯穿本节每一个设计决定。
+
+### 12.1 停滞的机械定义
+
+对每个「已认领 + 未完成」的任务(`TaskHandleStore` 里有记录、且 `getTask().completed_at` 为空):
+
+- **常规阈值**:绑定话题的活动信号(见 §12.2)超过阈值无更新 → 判定停滞。默认 **24h**,可配
+  (`taskHandle.stallThresholdMs`)。
+- **加急阈值**:如果该话题**最近一次**由 bridge 记录的 lifecycle 事件是 `failed`(turn 崩溃/异常退出),
+  改用更短的阈值。默认 **30min**,可配(`taskHandle.stallFastThresholdMs`)。这个「最近一次结局」
+  存在 `TaskHandleRecord.lastTurnOutcome`(`completed`|`failed`),由 `writeback.ts` 的
+  `applyTaskHandleWriteback` 在它自己已经在处理的 `completed`/`failed` 分支顺手记录——`received`
+  分支不写(那时还不知道这一轮的结局)。
+
+### 12.2 活动信号(已调查,见下)
+
+调查结论:bridge 能机械观测到的、且**低成本**的话题活动信号只有一个——**`SessionStore` 的
+`lastActiveTs`**。它在**每一次被 dispatch 的 turn**上都会更新,不管触发源是真实 @ 提及、
+CommentPoller 合成的任务评论 turn,还是本 feature自己发的唤醒 turn。
+
+已知局限(如实记录,不是"绕过"):
+- 人在话题里发消息但**没有 @ 机器人**,这条消息永远不会到达 bridge(Channel SDK 只投递 @ 提及
+  触发的事件,以及 gap-fill 对同一类触发的补抓)——这不是本 feature 能补的信息缺口。
+- 任务侧活动只窄口径地用了一种信号:任务被独立标记为 `completed`(人在飞书客户端里直接勾掉),
+  视为最强的"活动"事实,直接终止该任务的停滞跟踪。**没有**做更广义的「描述文本是否变化」这类
+  字段级 diff——因为 bridge 自己每轮 turn(包括本 feature 触发的唤醒 turn)都会写描述,这个信号
+  会被自己的写入污染,没法可靠区分"真的有外部进展"和"我自己刚写的"。这是一个记录在案的范围
+  裁剪,不是遗漏。
+
+### 12.3 唤醒机制(已调查,见下)
+
+调查结论:**复用 CommentPoller 已经验证过的合成 turn seam**——`ChannelClient.enqueueSyntheticEvent`
+把一个合成的 `LarkMessageEvent` 推进 bridge 的正常入站队列,handler.ts 当作一次普通 turn 处理,
+和 `synthesizeCardActionEvent`(卡片按钮)、CommentPoller(任务评论)完全同一条路径。仓库里没有
+「patrol/定时触发」的先例可抄(这类用法只存在于某些私有生产部署,不在本仓库);本 feature 就是
+这条路径在开源仓库里的第一个"纯 bridge 内部触发"先例。机器人 @ 自己是否会被防循环过滤掉没有做
+真机验证(本开发环境无网络),但也不需要验证——合成事件走的是队列注入路径,完全绕开了真实消息
+摄入,自然不会撞上任何针对真实消息的防循环逻辑。
+
+唤醒时注入的内容是**纯事实块**,没有任何"怎么办"的指令(判断留给 agent):
+
+```
+[停滞提醒] 你认领的任务 "帮我修一下登录页" 已超过 24 小时没有新动态(第 1 次提醒)。请判断如何推进这项工作。
+```
+
+`src/tasklist/stallDetector.ts` 的 `renderStallNudgeText` 是这段文本唯一的生成点。
+
+### 12.4 护栏(全部落地,否则就是骚扰机器)
+
+- **冷却**:同一任务两次提醒之间至少间隔 `taskHandle.stallNudgeCooldownMs`(默认 24h)。
+- **进展重置计时器和计数**:「进展」=活动信号(§12.2)比这次唤醒**自己触发的那一轮**还要晚
+  ——不是"唤醒之后任何活动都算进展"这么简单,原因见下面的「两步归因」。
+- **升级链**:连续 `taskHandle.stallEscalateAfterNudges`(默认 2)次提醒都没有等到进展 → 第 3 次
+  改为**升级**:调 `client.addComment` 在任务评论区发一条说明(触发飞书任务助手推送给创建者/关注
+  者),**不再**合成新的唤醒 turn;升级之后对这个任务保持静默,直到观测到真进展才重新开始计数。
+- **持久化**:`stallNudge` 状态(次数/时间戳/是否已升级)扩展进 `TaskHandleRecord`
+  (`src/tasklist/store.ts`),跟 `lastSeenCommentId` 一样原子写在同一个文件里——bridge 重启不会
+  丢状态、不会从零重新骚扰。
+- **默认开,阈值保守**:不新增 enable 开关(跟 tasklistGuid 的门槛哲学一致),但可以用
+  `taskHandle.stallDetectionDisabled: true` 整体关掉。
+
+**两步归因(为什么"进展重置"不能简单地用"唤醒后有活动"判断)**:唤醒本身几乎必然会导致
+认领的 agent 跑一轮 turn 去回应,而这一轮 turn 会跟任何其他 turn 一样更新 `lastActiveTs`——如果
+"唤醒后有活动"就算进展,提醒计数永远会被自己触发的那一轮立刻清零,升级机制形同虚设。所以
+`StallDetector` 分两步:① 冷却期满后,第一次观测到"唤醒发出后出现了活动"时,把这次活动的
+`lastActiveTs` 值**归因**为"唤醒自己那一轮的回复",记下来但不算进展;② 只有**在归因之后再观测
+到一次更晚的活动**,才算真进展、才清空整个 `stallNudge` 状态。这个算法是纯时间戳比较(见
+`stallDetector.test.ts` 的完整 4 阶段测试:唤醒 → 归因 → 再唤醒 → 升级),不涉及任何语义判断。
+
+### 12.5 组件
+
+| 组件 | 位置 | 职责 |
+|---|---|---|
+| **StallDetector** | `src/tasklist/stallDetector.ts`(仿 CommentPoller 的 class+timer 形状,但**per-bot**,不像 TasklistPoller 那样跨 bot 按 guid 去重——`TaskHandleStore` 本来就是 per-bot 的,不存在"谁来唤醒"的多 bot 竞争) | 每轮扫这个 bot 名下"已认领+未完成"的任务,machinery 判定停滞/进展/升级,触发唤醒或升级评论 |
+| **SessionStore 扩展** | `src/claude/sessionStore.ts`(复用 v3 §5.2 已经加过的字段,无新增) | `lastActiveTs` 就是活动信号 |
+| **TaskHandleRecord 扩展** | `src/tasklist/store.ts` | 新增 `lastTurnOutcome`(completed/failed,由 writeback.ts 顺手记)+ `stallNudge`(count/lastNudgeSentAt/lastNudgeTurnActivityAt/escalated) |
+| **writeback.ts 扩展** | `src/tasklist/writeback.ts` | `applyTaskHandleWriteback` 的 completed/failed 分支各多一行:把这轮结局写进 `lastTurnOutcome`(在任何网络调用之前写,即使后续 API 调用失败也不丢) |
+| **配置** | `src/config/botLoader.ts` 的 `TaskHandleConfigSchema` | 新增 5 个可选字段(见 §7 的 yaml 示例),全部有保守默认值,不是新的 enable 开关 |
+| **bridge 改动(极小)** | `src/main.ts` | 每个已启用 task-handle 的 bot 额外构造一个 `StallDetector`(除非 `stallDetectionDisabled`),复用该 bot 已有的 `TaskHandleStore`/`TaskListClient`/`SessionStore`,唤醒走 `client.enqueueSyntheticEvent`(`larkway_trigger_type: "task_stall"`) |
+
+### 12.6 明确不做
+
+- ❌ 不判断"要不要推进""怎么推进"——这永远是被唤醒的 agent 的判断,bridge 只捕获"太久没动静"这个事实。
+- ❌ 不做通用的任务字段 diff 当活动信号(见 §12.2 的范围裁剪说明)。
+- ❌ 不做"@ 话题里的人类"这条升级路径——选择了任务评论(复用已有的 `addComment` + 飞书任务助手推送
+  给创建者/关注者的通道),因为已经有先例(§9.7)、不需要额外解析"该 @ 谁"。
