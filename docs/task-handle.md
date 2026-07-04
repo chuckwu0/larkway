@@ -154,6 +154,7 @@ taskHandle:
    `TasklistPoller` 每轮在候选快照之外,新增一步机械比对:候选 `summary` 与任一 thread 的 `rootText`(两侧都过 `normalizeForExactMatch`——**只做空白归一化,不做任何 @提及剥离/模糊/前缀/相似度**;三次修订前的版本还会剥离 @-mention token,但那条正则不锚定位置、会把明显不同的文本归一化成同一个串——比如 `user@example.com` 和 `user@other.org` 的域名部分,或「@张三 在吗」和「@李四 在吗」都会被剥成一样的短语,详见 `tasklistPoller.ts` 里 `normalizeForExactMatch` 的完整事故记录)做字符串完全相等;要求**严格双向 1:1**(该任务只匹配到一个 thread,且该 thread 只匹配到一个任务,**且该 thread 当前没有任何已有 claim**——见下一条修订)才自动绑定,否则一律留给 agent 路径、只打一条 debug 级日志说明,不阻塞、不报错。命中后 bridge 直接调对应 bot 的 `TaskHandleStore.claim()`(等价认领,`claim()` 本身现在也会拒绝"这个 taskGuid 已经被另一个 thread 认领"这种情况——见 §12 附带修的存储层加固)并调用 `applyAutoBindConfirmation` 立即在任务描述里写一条确认(因为这次绑定发生在 poller 自己的定时器上,不搭在任何 agent turn 上,没有天然的「completed」事件可以顺带写确认)。**已知且接受的降级**:飞书「转任务」时任务标题 = 消息文本,可能被平台按其自身规则截断;若截断点与我们的 200 字符截断点不一致,两侧归一化后仍不相等 → 不绑定,留给 agent 路径兜底——这是有意选择,不为了追平这类边界情况去加前缀/模糊匹配(那会违反"机械匹配,不做业务判断"的边界)。
    > 第一版调研记录(已被上面的方案取代,保留供参考):`SessionRecord` 和 `TaskHandleRecord`(`src/tasklist/store.ts`)都不存标题/正文字段;`handler.ts` 里离得最近的是 `RuntimeEventRecord.textPreview`(120 字符截断,滚动日志上限 20 条,不是稳定的 per-thread 索引)。若要在 THREAD 早已存在、poller 独立定时器触发的场景下事后补一次"这个 thread 的根消息是什么",确实只能像 gap-fill(`channelClient.ts` 的 `+chat-messages-list`)那样现查,不便宜——但这个顾虑只适用于"事后补查",不适用于"分发时顺手记一次",第二版方案绕开了这个假设。
 10. **共享 guid 组的 TaskListClient 固定绑定首个到达的 bot,是个已知的残余降级点**(v3 三次修订):`main.ts` 的 `tasklistGuidGroups` 按 guid 去重时,`group.client` 永远是数组顺序里第一个解析到该 guid 的 bot 的凭据,不会轮换/健康检查。若这个 bot 的 scope 或清单成员资格出问题,整个 guid 组的候选发现 + auto-bind 确认都会失败,即使组内其他 bot 的凭据完全正常。本次只加了"连续失败 N 次后,日志明确点名是哪个 bot 的凭据在拖累整组"(`TasklistPoller` 的 `clientOwnerBotId`),**没有做完整的 client 轮换/故障转移**——那需要更大的改动(检测哪个 client 健康、动态切换),权衡后判断当前"降级为可见的日志"已经把最糟的情况(静默失效)排除了,完整方案留作已知 TODO。
+11. **auto-bind 的"该 thread 当前没有任何已有 claim"防劫持,之前只堵了任务侧,没堵话题侧**(round-2 adversarial review 修正)。上一轮修订(见第 9 条)的表述"claim() 本身现在也会拒绝…"只准确覆盖了**任务侧**方向(同一个 taskGuid 不能被两个 thread 同时认领);但反方向的窗口一直存在:`listRootTexts` 的快照和 `bindThreadToTask` 真正调 `claim()` 之间隔着真实的 `await`(前面每个候选自己的 claim + 确认写入),这段时间里完全可能有一个 agent turn 的 finalize 抢先给同一个 thread 认领了另一个任务 X——auto-bind 随后对这个 thread 调 `claim({taskGuid: Y})` 时,`claim()` 的默认语义(为了兼容 agent 每轮重新声明 guid 的正常场景)会**直接用 Y 替换掉 X**,把 X 静默孤立(X 的描述已经写过 `STATUS_SNAPSHOT_MARKER`,从此被候选过滤器永久排除,没人再管)。修法:`claim()` 新增 `onlyIfThreadUnclaimed` 选项——真时只要这个 thread 已经持有*任何*claim(不只是"持有 Y 之外的另一个 claim"),就直接拒绝,不做替换;只有 `TasklistPoller` 的自动绑定回调会传这个选项,agent 每轮重新声明 guid 的默认路径不受影响、行为不变。
 
 ## 10. 开源定位与路线
 
@@ -305,6 +306,16 @@ CommentPoller 合成的任务评论 turn,还是本 feature自己发的唤醒 tur
 夹 await,三个写者全部切过去调用它(`src/tasklist/store.ts`,测试见 `store.test.ts` 的
 "两个交错写者"用例,以及一个反向用例证明旧的 `put({...过期快照, 字段})` 写法确实会丢更新)。
 
+**round-2 review 补充**:上面的 `update()` 只解决了内存态的原子性,没解决**磁盘写**的原子性——
+`update()` 内部仍然调用 `#flush()`,而 `#flush()` 一直是"各写各的、写完就 rename"(固定的 `.tmp`
+文件名,无排队)。三个并发写者现在全部经过 `update()`,意味着它们也会并发触发 `#flush()`——两个
+`writeFile(同一个 .tmp 路径)` 同时写、各自截断到 offset 0,谁先 rename 谁的内容就落地,短的那份
+如果先写完可能被长的那份的尾巴拼接成非法 JSON,下次 `load()` 会把这当成损坏,`#recoverFromCorruption`
+悄悄清空成一个新 store——所有活着的认领全部消失(§6 讲过"没有 claim = 功能等同禁用",但这不是
+预期的禁用,是数据丢失)。修法直接照搬 `ClaudeProcessPool` 已经用过的同一招:`#flushChain` 把每次
+`#flush()` 串成一条 promise 链(每个写各自在真正轮到执行的那一刻才取 `#map` 快照,保证队列里最后
+一个一定是最后落盘的那个),外加 tmp 文件名带上 `${pid}-${Date.now()}` 唯一后缀作为额外保险。
+
 ## 13. v3.2:协作断链检测 + @ 出口治根
 
 > 产品意图:多个 agent 在同一话题里互相 @ 配合时,某个 agent 掉链子(崩溃 / 或它发出的 @ 从未真正
@@ -455,6 +466,37 @@ dispatch 开始时写,所以不会重蹈修订 2 的覆辙):
 在那个信号下长得一样;这里把它降级成**宽限期过后才启用的次要确认**,就是安全的,因为已经先
 用"收到"信号躲开了"排队误判"那个坑。
 
+#### 修订 4(round-2 adversarial review):tier 1 重启假阳性 + mention 锚点时机
+
+**问题 1**:tier 1("从未收到")的判定只看 `getPeerReceivedAt`(进程内存,重启即空)——A @ B、
+B 收到且正常跑完,一切健康,但 bridge 之后重启了。重启后过了 `handoffStartupQuietMs`(6min)
+静默期,`getPeerReceivedAt` 依然是 `undefined`(不是因为断链,只是这个进程还没见过新事件),
+`lastTurnMentions` 却持久化在磁盘上、不会因为重启而消失——tier 1 于是把每一个"其实早就正常交接
+过"的历史 mention 都判定成断链,**每次重启都会对着所有已交接的话题发一轮虚假唤醒**。修复:tier 1
+在判定"从未收到"之前,先查 `getPeerLastActiveTs(peer, thread) > mentionAt`——磁盘持久化的"对方
+确实跑完过一轮 turn"跟"确实收到过"是同等强度的证据,且是跨重启唯一还在的证据。
+
+**问题 2**:`lastTurnMentionsAt`(mention 锚点)之前在 `writeback.ts` 里用 `Date.now()` 打点——
+这发生在 agent 子进程跑完**之后**,还经过 writeback 自己的一次 `getTask` 网络往返。一个完全健康、
+常见的写法——agent 在 turn **进行中**用 `lark-cli` @ 协作 bot——会让协作 bot 的真实收到时间必然
+**早于**这个(打得太晚的)锚点,tier 1 因此系统性地把"@ 已经触达、对方甚至可能已经在处理"误判成
+"从未收到"。修复:锚点改成这一轮 turn 自己的 `threadReceivedAt`(handler.ts 的 `run()` 入队时就
+已经打好的时间戳,经 `TaskHandleLifecyclePatch.turnReceivedAt` 字段传给 writeback.ts),而不是
+writeback 执行时的 `Date.now()`。跟问题 1 的修复结合起来,mid-turn `@` 这类场景不再误报。
+
+**问题 3(P2)**:pending 唤醒的 30 分钟确认超时,只看"有没有活动",没考虑合成唤醒 turn 本身可能
+还排在 `handler.ts` 全局 `MAX_CONCURRENT=5` 信号量后面没轮到——高负载下(几个 5-15 分钟的长 turn
+占满槽位)排队 30 分钟以上并不罕见。原逻辑会把这种"其实没丢、只是还没轮到"误判成"丢了"重发一次,
+两条合成 turn 前后脚跑完,后一条的完成又会被当成"真实进展"清空整个 `stallNudge`(白白重置升级
+计数)。修复:超时前先查这个 bot 自己的 `getOwnThreadReceivedAt`——如果显示合成事件确实在
+pendingSince 之后被这个 bridge 收到过(即真进了队列),就延长等待而不是判定丢失、重发;完全没有
+收到证据(比如两次重启之间真的丢了)才按原逻辑判定丢失。
+
+**问题 4(P2)**:`#escalate` 之前无论 `addComment` 成败都置 `escalated: true`——评论失败(网络
+瞬时故障)时,恰好是"唤醒耗尽 + 人工评论也没发出去"的最坏组合,任务从此静默,没有任何人被通知。
+修复:只有 `addComment` 真正成功才置 `escalated: true`;失败则保持 `escalated: false`(带指数退避
+重试,镜像 `#fetchTaskOrHandle` 的权限退避写法),下一轮符合条件时重试,直到评论真的发出去。
+
 ### 13.5 配置
 
 ```yaml
@@ -515,10 +557,22 @@ atomic tmp+rename 写)每周期做一次 `reconcile`:记录每个候选**连续�
 > ⚠️ 此任务未能自动关联到任何话题:请检查任务标题是否与话题根消息一致,或在对应话题里 @ 一次
 > agent 让它认领这个任务。
 
-**每个候选每次滞留周期只提示一次**——`reconcile` 一旦发现某 guid 不再出现在未绑定集合里(绑定
-成功、任务被完成、或被删除),立刻清空它的"已提示"标记和滞留时钟;之后如果它又变成未绑定状态
-(比如被重新转移),视为全新的一次滞留,可以再次提示。持久化(而不是纯内存)是为了让"滞留起始
-时间"和"是否已提示"扛得住 bridge 重启——否则每次重启都会把滞留时钟清零,永远也提示不到。
+**每个候选每次滞留周期只提示一次**——`reconcile` 一旦**确证**某 guid 不再未绑定了(绑定成功、
+任务被完成、或被删除),立刻清空它的"已提示"标记和滞留时钟;之后如果它又变成未绑定状态(比如被
+重新转移),视为全新的一次滞留,可以再次提示。持久化(而不是纯内存)是为了让"滞留起始时间"和
+"是否已提示"扛得住 bridge 重启——否则每次重启都会把滞留时钟清零,永远也提示不到。
+
+**已知缺口 + round-2 review 修复**:`fresh`(TasklistPoller 每周期算出的候选快照)本身受
+`MAX_CANDIDATES`(30)和 `MAX_PAGES_PER_CYCLE`(5)截断——一个大量积压的共享清单里,第 31 个及
+以后的未认领候选**这一轮压根没被扫描到**。第一版实现把"不在 `fresh` 里"直接等同于"确证已离开
+未绑定集合",导致截断本身会**静默清零**溢出候选的滞留时钟和已提示标记——这恰好是这个功能要
+消灭的那种"越积压越失效"的静默漏管,round-2 adversarial review 抓到后已修复:
+`CandidateAlertStore.reconcile` 现在额外接受一个 `scannedGuids` 参数(这一轮**真正确定了资格**
+的 guid 集合——进了 `fresh`,或被确认为已完成/已认领/已被bridge写回过,三者之一),只有"被扫描
+到但不在未绑定集合里"才会清零追踪;单纯因截断而这一轮没扫到的 guid,追踪状态原样保留。残余缺口
+仍然存在但已收窄:如果一个候选**持续**积压在截断线之外超过一整个 poll 周期都没被扫到过(极端情况,
+需要单一清单同时有 ≥30 个从未被自动/人工绑定的候选),它确实不会被提示——但只要它有任何一轮排进
+`fresh` 里,追踪和提示都会正常推进,不会因为"曾经被截断过"而重新计时或漏发。
 
 ### 14.2 due date 接入停滞判定
 
@@ -538,6 +592,26 @@ StallDetector 需要的恰恰是**已认领**的任务的 due,这类任务从不
 `MAX_PAGES_PER_CYCLE` 之一时就会提前停止翻页——如果某个已认领任务恰好在停止翻页之后的页上,这
 一轮周期就观察不到它的 due。接受这个缺口:后果只是"这次没能提前发现过期",一般停滞检测(24h/
 30min)依然兜底,不是真正的漏报,只是慢了一拍。
+
+**round-2 review 修复 1:`is_all_day` 处理**。`due.timestamp` 在 `is_all_day: true` 时只编码
+"日期"部分(即那一天的 00:00,`lark-cli schema task tasks get` 自己的字段描述明确说明),第一版
+`parseDueMs` 没读这个字段,导致全天截止的任务从截止日**凌晨**就被判定过期——叠加 due 档"立即
+适用、不等空闲阈值"的设计,意味着截止日当天越努力赶工,被唤醒骚扰得越狠。修复:`is_all_day: true`
+时把有效截止点顺延到当天 24:00(`timestamp + 86400000`)。
+
+**round-2 review 修复 2(P0):due 档的冷却锚点不能被"有进展"清空**。due 是**常驻条件**(只要还没
+过 due,状态就一直成立),不是像"沉寂太久"那样的一次性度量——但第一版实现里,"检测到真实进展"
+会无条件清空整条 `stallNudge`(包括冷却锚点 `lastNudgeSentAt`),这个设计对"沉寂"档是对的(要重新
+攒够一整个空闲阈值才会再唤醒),对"过期"档却是个漏洞:任何真实进展(人类 @、agent turn 完成)都会
+让状态清零,下一个 60s 巡检周期,过期任务的阈值恒为 0,立即再唤醒一次——**24h 冷却被完全绕过**,
+变成"每有一次进展就挨一次唤醒"的骚扰循环,而且小时级保险丝(§14.4)会被这一个任务吃满,连累同一
+bot 其他任务真正需要的断链/停滞唤醒被熔断误伤。修复:`reason==="due"` 时,进展重置只清零升级计数
+`count`(重新开始数"连续几次提醒无进展"),**保留** `lastNudgeSentAt` 冷却锚点不变;配套地,
+"count===0"分支现在也会检查这个残留的冷却锚点(仅当 `reason==="due"` 且不是刚从"pending 超时"
+判定路径过来的同一轮——那条路径必须保持立即重试的语义,不受冷却锚点阻拦,否则一次真正丢失的
+唤醒会被误判成"还在冷却"而白白多等一整个冷却周期)。**不变式**:同一任务因 due 被唤醒的间隔
+`≥ nudgeCooldownMs`,无论中间发生了多少次真实进展。测试见 `stallDetector.test.ts` 里 "P0
+invariant" 一节(连续 3 轮真实进展,断言全程只挨 1 次 due 唤醒)。
 
 ### 14.3 唤醒留痕进状态块
 

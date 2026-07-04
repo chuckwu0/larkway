@@ -305,6 +305,49 @@ describe("applyTaskHandleWriteback", () => {
     expect(record?.lastTurnMentionsAt).toBeTypeOf("number");
   });
 
+  // Round 2 adversarial review (docs/task-handle.md §13.4): the anchor must
+  // be THIS turn's own receipt timestamp (turn start), not writeback time —
+  // a mid-turn `lark-cli @` to the mentioned peer would otherwise guarantee
+  // the peer's genuine receipt predates a writeback-time anchor.
+  it("completed: anchors lastTurnMentionsAt at turnReceivedAt (turn start) when provided, NOT at writeback time", async () => {
+    const store = await TaskHandleStore.load(join(dir, "task-handles.json"));
+    await store.put({ threadId: "t1", taskGuid: "guid-1", chatId: "oc_1", claimedTs: 1 });
+    const { requester } = makeFakeRequester({ task: { description: "原始需求" } });
+    const client = new TaskListClient(requester);
+    const turnReceivedAt = Date.now() - 5 * 60_000; // 5 minutes before this writeback call runs
+
+    await applyTaskHandleWriteback(
+      {
+        botId: "b1",
+        threadId: "t1",
+        status: "completed",
+        finalText: "@李四 请复验",
+        mentionedPeerBotIds: ["peer-bot"],
+        turnReceivedAt,
+      },
+      { store, client },
+    );
+
+    expect(store.get("t1")?.lastTurnMentionsAt).toBe(turnReceivedAt); // exact anchor, not Date.now()
+  });
+
+  it("completed: falls back to Date.now() when turnReceivedAt is omitted (backward compatible)", async () => {
+    const store = await TaskHandleStore.load(join(dir, "task-handles.json"));
+    await store.put({ threadId: "t1", taskGuid: "guid-1", chatId: "oc_1", claimedTs: 1 });
+    const { requester } = makeFakeRequester({ task: { description: "原始需求" } });
+    const client = new TaskListClient(requester);
+    const before = Date.now();
+
+    await applyTaskHandleWriteback(
+      { botId: "b1", threadId: "t1", status: "completed", finalText: "@李四 请复验", mentionedPeerBotIds: ["peer-bot"] },
+      { store, client },
+    );
+
+    const anchor = store.get("t1")?.lastTurnMentionsAt;
+    expect(anchor).toBeGreaterThanOrEqual(before);
+    expect(anchor).toBeLessThanOrEqual(Date.now());
+  });
+
   it("completed: clears lastTurnMentions when this turn's reply mentions nobody (REPLACE, not accumulate)", async () => {
     const store = await TaskHandleStore.load(join(dir, "task-handles.json"));
     await store.put({

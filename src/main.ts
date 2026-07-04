@@ -4,7 +4,7 @@ import { resolveLarkwayVersion } from "./version.js";
 import { Client as LarkSdkClient } from "@larksuiteoapi/node-sdk";
 import { loadConfig, loadConfigJson } from "./config.js";
 import type { Config, ConfigJsonType } from "./config.js";
-import { ChannelClient, DEFAULT_OPEN_CHAT_DISCOVERY_MS } from "./lark/channelClient.js";
+import { ChannelClient, resolveOpenChatDiscoveryMs } from "./lark/channelClient.js";
 import { CardRenderer } from "./lark/card.js";
 import { SessionStore } from "./claude/sessionStore.js";
 import { BridgeHandler } from "./bridge/handler.js";
@@ -553,7 +553,13 @@ async function runV2Mode({
           // module's own "bridge stays mechanical, doesn't second-guess
           // operator config" rule; the operator can still configure below it.
           const isOpenMode = allowedChatIds.size === 0;
-          const recommendedHandoffFloorMs = isOpenMode ? DEFAULT_OPEN_CHAT_DISCOVERY_MS : 2 * 60_000;
+          // Round-2 adversarial review fix: use the ACTUAL resolved discovery
+          // cadence (constructor value > LARKWAY_OPEN_CHAT_DISCOVERY_MS env
+          // override > the 300s default), not the raw compile-time constant —
+          // main.ts never passes openChatDiscoveryMs to ChannelClient, so the
+          // env var (a documented, real deployment knob) always takes effect
+          // for this bot's actual gap-fill cadence.
+          const recommendedHandoffFloorMs = isOpenMode ? resolveOpenChatDiscoveryMs(undefined) : 2 * 60_000;
           const configuredHandoffMs = bot.taskHandle?.stallHandoffThresholdMs;
           if (configuredHandoffMs !== undefined && configuredHandoffMs < recommendedHandoffFloorMs) {
             console.warn(
@@ -588,6 +594,14 @@ async function runV2Mode({
               // constructed AFTER this whole per-bot loop finishes, but this
               // closure is only ever INVOKED later, at poll time).
               getTaskDueMs: (taskGuid) => tasklistPollersByGuid.get(guid)?.getDueTimestamp(taskGuid),
+              // Round-2 adversarial review fix: THIS bot's own receipt signal
+              // (not a peer's) — disambiguates a pending-nudge confirmation
+              // timeout from a nudge turn merely queued behind the semaphore.
+              // Same "populated after, read lazily" closure trick — this
+              // bot's OWN handler is constructed later in this same loop
+              // iteration (see `handlersByBotId.set(bot.id, handler)` below),
+              // but this closure is only invoked at poll time.
+              getOwnThreadReceivedAt: (threadId) => handlersByBotId.get(bot.id)?.getThreadReceivedAt(threadId),
               enqueueNudgeTurn: (turn) => {
                 client.enqueueSyntheticEvent({
                   message_id: `synthetic-task-stall-${turn.threadId}-${Date.now()}`,
@@ -811,6 +825,11 @@ async function runV2Mode({
               threadId: entry.threadId,
               taskGuid: entry.taskGuid,
               chatId: entry.chatId,
+              // Round-2 adversarial review fix: this mechanical auto-bind
+              // path must NEVER replace a claim that landed on this thread
+              // between listRootTexts()'s snapshot and this await — see
+              // store.ts claim()'s own doc for the hijack this closes.
+              onlyIfThreadUnclaimed: true,
             });
             if (!result.claimed) {
               // Residual race: the thread got claimed (or the task got claimed

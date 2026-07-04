@@ -805,4 +805,48 @@ describe("ClaudeProcessPool — pid-list lifecycle", () => {
     const finalList = await waitForListMatching(pidListFilePath, (list) => list.length === 2);
     expect(finalList.map((e) => e.pid).sort()).toEqual(expectedPids);
   });
+
+  // Round-2 adversarial review fix: #destroyEntry deliberately does NOT
+  // rewrite the pid list itself (see its own doc) — but ANY OTHER rewrite
+  // fired while the SIGTERM'd child is still dying must still include its
+  // pid. LRU eviction is the natural trigger: #destroyEntry(victim) is
+  // immediately followed by #spawnEntry(replacement), which fires ITS OWN
+  // rewrite — exactly the "unrelated rewrite while dying" scenario.
+  it("still lists an LRU-evicted entry's pid on disk after its REPLACEMENT spawns (an unrelated rewrite), until its own exit is confirmed", async () => {
+    dir = await mkdtemp(path.join(tmpdir(), "claude-pool-pidlist-"));
+    const pidListFilePath = path.join(dir, "warm-claude.pids.json");
+    const pool = new ClaudeProcessPool({ botId: "bot-a", pidListFilePath, maxProcesses: 1 });
+
+    const handleA = pool.run({ prompt: "a", cwd: "/wt/thread-a", threadId: "thread-a" });
+    await flush();
+    const childA = spawnedChildren[0]!;
+    childA.stdout.write(systemInit("sa") + "\n");
+    childA.stdout.write(resultLine("success") + "\n");
+    await flush();
+    await handleA.done; // thread-a's entry is now idle
+    await waitForListMatching(pidListFilePath, (list) => list.length === 1);
+
+    // A different thread's turn arrives at capacity — evicts A (SIGTERM
+    // sent, no 'exit' emitted yet) and immediately spawns B, which fires ITS
+    // OWN pid-list rewrite while A is still dying.
+    pool.run({ prompt: "b", cwd: "/wt/thread-b", threadId: "thread-b" });
+    await flush();
+    expect(childA.killed).toBe(true);
+    const childB = spawnedChildren[1]!;
+
+    // B's spawn-triggered rewrite must NOT have dropped A's still-dying pid.
+    const listAfterBSpawns = await waitForListMatching(
+      pidListFilePath,
+      (list) => list.some((e) => e.pid === childB.pid),
+    );
+    expect(listAfterBSpawns.some((e) => e.pid === childA.pid)).toBe(true);
+
+    // Once the OS confirms A's exit, its pid — and only its pid — drops off.
+    childA.emit("exit");
+    const listAfterAExits = await waitForListMatching(
+      pidListFilePath,
+      (list) => !list.some((e) => e.pid === childA.pid),
+    );
+    expect(listAfterAExits.some((e) => e.pid === childB.pid)).toBe(true);
+  });
 });

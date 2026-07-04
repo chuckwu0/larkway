@@ -928,6 +928,17 @@ export class BridgeHandler {
     const botId = this.deps.botConfig?.id;
     const eventLogId = messageId;
     const eventStartedAt = Date.now();
+    // v3.3 adversarial review round 2 (docs/task-handle.md §13.4): capture
+    // THIS turn's own receipt timestamp NOW, at turn start — not by re-
+    // reading `this.threadReceivedAt` later at writeback/finalize time. A
+    // later re-read could already reflect a NEXT inbound event for the same
+    // thread (received while this turn was still running — the enqueue-time
+    // stamp in run() is independent of this thread's serialized handleOne
+    // execution), which would silently anchor this turn's mention at the
+    // WRONG (later) receipt. Threaded through to writeback.ts's
+    // lastTurnMentionsAt so the handoff-break anchor is turn-start, not
+    // turn-completion + a getTask round-trip — see turnReceivedAt below.
+    const turnReceivedAt = this.threadReceivedAt.get(threadId);
     const recordEvent = async (patch: Omit<RuntimeEventPatch, "id">) => {
       if (!this.deps.recordRuntimeEvent) return;
       try {
@@ -2234,6 +2245,7 @@ export class BridgeHandler {
                   agentDeclaredDone: reportedState?.task_handle?.done === true,
                   note: reportedState?.task_handle?.note,
                   mentionedPeerBotIds: this.#matchMentionedPeers(baseCardPayload.finalText),
+                  turnReceivedAt,
                 }
               : {
                   status: "failed",

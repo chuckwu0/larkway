@@ -53,7 +53,7 @@
  * Class shape (timer/start/stop/jitter) mirrors commentPoller.ts.
  */
 
-import { TaskListClient } from "./client.js";
+import { TaskListClient, isTaskRequestTimeoutError } from "./client.js";
 import { STATUS_SNAPSHOT_MARKER } from "./writeback.js";
 import type { TaskCandidate } from "./types.js";
 import type { CandidateAlertStore } from "./candidateAlertStore.js";
@@ -302,6 +302,15 @@ export class TasklistPoller {
     try {
       const fresh = new Map<string, CachedCandidate>();
       const freshDue = new Map<string, number>();
+      // Round-2 adversarial review fix (docs/task-handle.md §14.1): every
+      // guid whose ELIGIBILITY was actually determined this cycle (accepted
+      // into `fresh`, OR confirmed completed/claimed/bridge-touched) — NOT
+      // merely "appeared somewhere in a fetched page". A guid truncated away
+      // by MAX_CANDIDATES/MAX_PAGES_PER_CYCLE, or whose getTask backfill
+      // failed, is simply absent from this set — `#alertUnboundCandidates`
+      // uses it to tell "confirmed no longer unbound" apart from "not
+      // observed this cycle" when reconciling candidateAlertStore.
+      const scannedGuids = new Set<string>();
       let pageToken: string | undefined;
       let pagesFetched = 0;
       do {
@@ -315,12 +324,19 @@ export class TasklistPoller {
           // pagination-cutoff gap this still has.
           if (task.guid && task.dueMs !== undefined) freshDue.set(task.guid, task.dueMs);
 
-          if (fresh.size >= MAX_CANDIDATES) break;
+          if (fresh.size >= MAX_CANDIDATES) break; // truncated — NOT scanned, see scannedGuids' own doc
           if (!task.guid) continue;
-          if (task.completedAt && task.completedAt !== "0") continue; // completed — never a claim candidate
-          if (this.#deps.isClaimedByAnyBot(task.guid)) continue; // already someone's
+          if (task.completedAt && task.completedAt !== "0") {
+            scannedGuids.add(task.guid); // confirmed: completed, never a claim candidate
+            continue;
+          }
+          if (this.#deps.isClaimedByAnyBot(task.guid)) {
+            scannedGuids.add(task.guid); // confirmed: already someone's
+            continue;
+          }
 
           let description = task.description;
+          let getTaskFailed = false;
           if (description === undefined) {
             // The list response may omit description (payload-size caution —
             // see client.ts's listTasklistTasks doc). Only pay for a get() on
@@ -329,11 +345,35 @@ export class TasklistPoller {
             // (it's bridge-authored content this poller would never mutate,
             // so it can't go stale in a way that matters here).
             const previouslySeen = this.#candidates.get(task.guid);
-            description =
-              previouslySeen !== undefined
-                ? previouslySeen.description
-                : (await this.#deps.client.getTask(task.guid).catch(() => null))?.description;
+            if (previouslySeen !== undefined) {
+              description = previouslySeen.description;
+            } else {
+              try {
+                // getTask resolves a 404-shaped failure to `null` rather than
+                // throwing (client.ts's own contract) — that's a CONCLUSIVE
+                // "doesn't exist"/inaccessible, not an ambiguous failure, so
+                // `null`'s `?.description` (undefined) is treated the same
+                // as "genuinely has no description", same as before this fix.
+                // Only a THROWN error (timeout, transport failure) is
+                // ambiguous enough to warrant skipping instead of caching.
+                description = (await this.#deps.client.getTask(task.guid))?.description;
+              } catch {
+                // Round-2 adversarial review fix: a getTask failure (timeout,
+                // network blip) must NOT be folded into "successfully
+                // resolved, no description" — that used to cache
+                // description=undefined forever (never retried while the
+                // task stays a candidate), which could make a genuinely
+                // bridge-touched task (STATUS_SNAPSHOT_MARKER in its real
+                // description) look like a fresh candidate — including
+                // getting a false black-hole alert an hour later. Skip this
+                // task entirely THIS cycle (not added to `fresh`, not marked
+                // scanned) — retried fresh next cycle.
+                getTaskFailed = true;
+              }
+            }
           }
+          if (getTaskFailed) continue;
+          scannedGuids.add(task.guid); // eligibility now fully determined
           if (isBridgeTouched(description)) continue; // bridge has already touched this task — not a fresh candidate
 
           fresh.set(task.guid, { guid: task.guid, summary: task.summary ?? "(无标题)", description });
@@ -355,7 +395,7 @@ export class TasklistPoller {
       // then alert any that have aged past the threshold and haven't been
       // alerted yet in their current unbound streak.
       if (this.#deps.candidateAlertStore) {
-        await this.#alertUnboundCandidates(fresh, this.#deps.candidateAlertStore);
+        await this.#alertUnboundCandidates(fresh, scannedGuids, this.#deps.candidateAlertStore);
       }
 
       this.#candidates = fresh;
@@ -467,14 +507,20 @@ export class TasklistPoller {
    * exactly "candidates still unbound after this cycle's auto-bind pass" —
    * reconciling against it (not the pre-auto-bind set) means a candidate
    * that just got bound this very cycle is dropped from tracking
-   * immediately, never alerted. Never throws — every failure (reconcile,
-   * addComment, markAlerted) is caught and logged, degrading to "try again
-   * next cycle" rather than losing the whole poll cycle's other work.
+   * immediately, never alerted. `scannedGuids` is passed straight through to
+   * `reconcile` — see its own doc for the round-2 truncation fix. Never
+   * throws — every failure (reconcile, addComment, markAlerted) is caught
+   * and logged, degrading to "try again next cycle" rather than losing the
+   * whole poll cycle's other work.
    */
-  async #alertUnboundCandidates(fresh: Map<string, CachedCandidate>, alertStore: CandidateAlertStore): Promise<void> {
+  async #alertUnboundCandidates(
+    fresh: Map<string, CachedCandidate>,
+    scannedGuids: ReadonlySet<string>,
+    alertStore: CandidateAlertStore,
+  ): Promise<void> {
     const now = Date.now();
     try {
-      alertStore.reconcile(new Set(fresh.keys()), now);
+      alertStore.reconcile(new Set(fresh.keys()), scannedGuids, now);
     } catch (err) {
       console.warn(
         `[tasklist.tasklistPoller] candidate-alert reconcile failed for tasklist ${this.#deps.tasklistGuid} ` +
@@ -491,6 +537,25 @@ export class TasklistPoller {
         await this.#deps.client.addComment(guid, renderCandidateUnboundAlertComment());
         await alertStore.markAlerted(guid, now);
       } catch (err) {
+        // Round-2 adversarial review fix: a LOCAL timeout doesn't mean the
+        // comment never landed — `withTimeout` races its own deadline
+        // without aborting the underlying request, so the POST may already
+        // be accepted server-side. Retrying blindly on every ambiguous
+        // failure (as the pre-fix code did for ALL failures) can post a
+        // duplicate alert comment every ~60s throughout a network
+        // degradation window. Per this feature's own "宁可少发" posture
+        // (mirrors #escalate's stance), treat a timeout as "probably sent"
+        // and mark it alerted anyway — a genuine transport/API failure
+        // (not a timeout) still retries next cycle as before.
+        if (isTaskRequestTimeoutError(err)) {
+          console.warn(
+            `[tasklist.tasklistPoller] candidate-unbound alert for task ${guid} timed out (outcome unknown) — ` +
+              "treating as sent to avoid a duplicate-post storm during a network degradation window:",
+            err,
+          );
+          await alertStore.markAlerted(guid, now);
+          continue;
+        }
         console.warn(
           `[tasklist.tasklistPoller] candidate-unbound alert failed for task ${guid} ` +
             "(will retry next cycle since it isn't marked alerted):",

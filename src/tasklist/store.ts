@@ -148,6 +148,22 @@ function isTaskHandleRecord(value: unknown): value is TaskHandleRecord {
 export class TaskHandleStore {
   readonly #filePath: string;
   readonly #map: Map<string, TaskHandleRecord>;
+  /**
+   * Round-2 adversarial review fix: serializes every #flush() call through
+   * one chain — mirrors ClaudeProcessPool's `#pidListWriteChain` (same
+   * rationale). `put`/`update`/`delete` (writeback.ts, commentPoller.ts,
+   * stallDetector.ts — three concurrent writers) each trigger their own
+   * `#flush()`; without serialization, two overlapping `writeFile(SAME fixed
+   * tmp path)+rename` pairs can interleave (both open with O_TRUNC at their
+   * own offset 0) and produce corrupt JSON, which `#recoverFromCorruption`
+   * then treats as unrecoverable and starts the NEXT load from an EMPTY
+   * store — silently dropping every live claim. Each link's
+   * `#writeSnapshot()` takes its `#map` snapshot when it actually RUNS (not
+   * at enqueue time), so the LAST queued write is always the LAST to land on
+   * disk — same guarantee `update()`'s in-memory atomicity already gives the
+   * map itself, now extended to the disk write.
+   */
+  #flushChain: Promise<void> = Promise.resolve();
 
   private constructor(filePath: string, map: Map<string, TaskHandleRecord>) {
     this.#filePath = filePath;
@@ -325,11 +341,27 @@ export class TaskHandleStore {
    * tasklistGuid across two different bots' stores is a known, documented
    * residual gap (docs/task-handle.md §12); closing that needs a cross-store
    * coordination primitive this per-bot store doesn't have.
+   *
+   * Round-2 adversarial review fix: `onlyIfThreadUnclaimed` closes the OTHER
+   * direction of the same hijack class. The default (agent re-declaration)
+   * path intentionally REPLACES `input.threadId`'s existing claim when handed
+   * a genuinely new/changed guid (see the doc above) — but TasklistPoller's
+   * mechanical auto-bind (docs/task-handle.md §5.2 v3 addendum) must NEVER
+   * do that: its own `listRootTexts` snapshot already excludes threads that
+   * held a claim AT SNAPSHOT TIME, but a real await gap (each earlier
+   * candidate's claim + confirmation write) can let a NEW claim land on that
+   * thread before auto-bind's own `claim()` call runs. Without this option,
+   * auto-bind would silently REPLACE that just-landed claim (X) with its own
+   * target (Y) — orphaning X (its description already carries
+   * STATUS_SNAPSHOT_MARKER from the writeback that just happened, so it's
+   * marker-excluded from candidates forever). Set only by the auto-bind
+   * caller; the agent re-declaration path never passes it.
    */
   async claim(input: {
     threadId: string;
     taskGuid: string;
     chatId: string;
+    onlyIfThreadUnclaimed?: boolean;
   }): Promise<{ claimed: boolean; reason?: string }> {
     let claimed = false;
     let reason: string | undefined;
@@ -337,6 +369,10 @@ export class TaskHandleStore {
       if (existing && existing.taskGuid === input.taskGuid) {
         claimed = true;
         return existing; // true no-op — see doc above for why this must not rebuild
+      }
+      if (input.onlyIfThreadUnclaimed && existing !== undefined) {
+        reason = `thread ${input.threadId} already holds a claim on task ${existing.taskGuid} — refusing to replace it for a mechanical auto-bind`;
+        return existing; // reject — never hijack an existing claim via auto-bind
       }
       for (const [otherThreadId, record] of this.#map) {
         if (otherThreadId !== input.threadId && record.taskGuid === input.taskGuid) {
@@ -364,13 +400,23 @@ export class TaskHandleStore {
     return Array.from(this.#map.values());
   }
 
-  async #flush(): Promise<void> {
+  /** Queues a disk write through `#flushChain` and returns a promise resolving once THIS specific write has landed — see the field's own doc for why serialization is required. */
+  #flush(): Promise<void> {
+    const next = this.#flushChain.then(() => this.#writeSnapshot());
+    this.#flushChain = next;
+    return next;
+  }
+
+  async #writeSnapshot(): Promise<void> {
     const file: StoreFile = {
       version: 1,
       records: Object.fromEntries(this.#map),
     };
     const json = JSON.stringify(file, null, 2);
-    const tmpPath = `${this.#filePath}.tmp`;
+    // Unique per write (mirrors ClaudeProcessPool's pid-list tmp naming) —
+    // belt-and-suspenders on top of #flushChain's serialization, in case any
+    // future call path ever reaches #writeSnapshot outside the chain.
+    const tmpPath = `${this.#filePath}.tmp-${process.pid}-${Date.now()}`;
     await mkdir(dirname(this.#filePath), { recursive: true });
     await writeFile(tmpPath, json, "utf8");
     await rename(tmpPath, this.#filePath);

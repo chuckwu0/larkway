@@ -210,6 +210,59 @@ describe("TaskHandleStore", () => {
       expect(result.claimed).toBe(true);
       expect(store.get("t1")?.taskGuid).toBe("g2");
     });
+
+    // Round-2 adversarial review fix: the auto-bind path must never hijack a
+    // thread's existing claim, unlike the default agent-re-declaration path.
+    describe("onlyIfThreadUnclaimed (mechanical auto-bind guard)", () => {
+      it("rejects binding a NEW guid onto a thread that already holds a DIFFERENT claim", async () => {
+        const store = await TaskHandleStore.load(filePath);
+        await store.claim({ threadId: "t1", taskGuid: "g1", chatId: "oc_1" }); // some other path already claimed X for t1
+
+        const result = await store.claim({ threadId: "t1", taskGuid: "g2", chatId: "oc_1", onlyIfThreadUnclaimed: true });
+
+        expect(result.claimed).toBe(false);
+        expect(result.reason).toContain("g1");
+        expect(store.get("t1")?.taskGuid).toBe("g1"); // t1's original claim survives, NOT replaced
+      });
+
+      it("still succeeds (idempotent no-op) when re-declaring the SAME guid the thread already holds", async () => {
+        const store = await TaskHandleStore.load(filePath);
+        await store.claim({ threadId: "t1", taskGuid: "g1", chatId: "oc_1" });
+
+        const result = await store.claim({ threadId: "t1", taskGuid: "g1", chatId: "oc_1", onlyIfThreadUnclaimed: true });
+
+        expect(result.claimed).toBe(true);
+      });
+
+      it("still succeeds for a genuinely unclaimed thread (the normal auto-bind case)", async () => {
+        const store = await TaskHandleStore.load(filePath);
+
+        const result = await store.claim({ threadId: "t1", taskGuid: "g1", chatId: "oc_1", onlyIfThreadUnclaimed: true });
+
+        expect(result.claimed).toBe(true);
+        expect(store.get("t1")?.taskGuid).toBe("g1");
+      });
+
+      it("still rejects the pre-existing cross-thread guid conflict even with onlyIfThreadUnclaimed set", async () => {
+        const store = await TaskHandleStore.load(filePath);
+        await store.claim({ threadId: "t1", taskGuid: "g1", chatId: "oc_1" });
+
+        const result = await store.claim({ threadId: "t2", taskGuid: "g1", chatId: "oc_2", onlyIfThreadUnclaimed: true });
+
+        expect(result.claimed).toBe(false);
+        expect(store.get("t2")).toBeUndefined();
+      });
+
+      it("without onlyIfThreadUnclaimed, the default path still REPLACES an existing claim on a genuinely new guid (unchanged, pre-existing behavior)", async () => {
+        const store = await TaskHandleStore.load(filePath);
+        await store.claim({ threadId: "t1", taskGuid: "g1", chatId: "oc_1" });
+
+        const result = await store.claim({ threadId: "t1", taskGuid: "g2", chatId: "oc_1" }); // no onlyIfThreadUnclaimed
+
+        expect(result.claimed).toBe(true);
+        expect(store.get("t1")?.taskGuid).toBe("g2");
+      });
+    });
   });
 
   // Adversarial-review P1 fix: writeback.ts/commentPoller.ts/stallDetector.ts
@@ -293,6 +346,52 @@ describe("TaskHandleStore", () => {
 
       expect(store.get("t1")?.lastSeenCommentId).toBe("c-from-A");
       expect(store.get("t1")?.lastTurnOutcome).toBeUndefined(); // lost — this is the bug update() fixes
+    });
+  });
+
+  // Round-2 adversarial review fix: update()'s in-memory atomicity alone
+  // doesn't protect the DISK write — every update() call also triggers its
+  // own #flush(), and unserialized writeFile(SAME fixed tmp path)+rename
+  // pairs can interleave into corrupt JSON. #flushChain closes that gap.
+  describe("disk flush serialization (round 2 adversarial review fix)", () => {
+    it("many concurrent update() calls never corrupt the on-disk file — it's always valid JSON reflecting a real intermediate or final state", async () => {
+      const store = await TaskHandleStore.load(filePath);
+      await store.put({ threadId: "t1", taskGuid: "g1", chatId: "oc_1", claimedTs: 1 });
+
+      // Fire a burst of concurrent, unserialized-from-the-CALLER's-perspective
+      // update() calls — each one internally queues its own #flush(). Without
+      // #flushChain, overlapping writeFile(same tmp path) calls can interleave.
+      const writers = Array.from({ length: 20 }, (_, i) =>
+        store.update("t1", (current) => (current ? { ...current, lastSeenCommentId: `c${i}` } : current)),
+      );
+      await Promise.all(writers);
+
+      // The raw on-disk file must be valid, parseable JSON at every point —
+      // read it directly (bypassing load()'s own corruption recovery, which
+      // would otherwise mask a corrupt write by silently returning empty).
+      const raw = await readFile(filePath, "utf8");
+      const parsed = JSON.parse(raw); // throws if corrupt — the assertion itself
+      expect(parsed.records.t1.taskGuid).toBe("g1");
+      expect(typeof parsed.records.t1.lastSeenCommentId).toBe("string");
+
+      // A fresh load() must NOT hit #recoverFromCorruption (which would
+      // silently drop this very claim) — the record must genuinely survive.
+      const reloaded = await TaskHandleStore.load(filePath);
+      expect(reloaded.get("t1")?.taskGuid).toBe("g1");
+    });
+
+    it("no stray .tmp-* files are left behind after concurrent writes settle", async () => {
+      const store = await TaskHandleStore.load(filePath);
+      await store.put({ threadId: "t1", taskGuid: "g1", chatId: "oc_1", claimedTs: 1 });
+
+      await Promise.all(
+        Array.from({ length: 10 }, (_, i) =>
+          store.update("t1", (current) => (current ? { ...current, lastSeenCommentId: `c${i}` } : current)),
+        ),
+      );
+
+      const files = await readdir(dir);
+      expect(files.filter((f) => f.includes(".tmp"))).toEqual([]);
     });
   });
 });

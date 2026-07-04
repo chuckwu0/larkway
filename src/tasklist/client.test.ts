@@ -87,6 +87,33 @@ describe("TaskListClient.getTask", () => {
     const task = await client.getTask("guid-1");
     expect(task?.dueMs).toBeUndefined();
   });
+
+  // Round-2 adversarial review fix: is_all_day=true means timestamp only
+  // encodes the day's START — push the effective cutoff to that day's END.
+  it("pushes dueMs to end-of-day (+24h) when is_all_day is true", async () => {
+    const client = new TaskListClient(
+      fakeRequester(() => ({
+        data: { task: { guid: "guid-1", due: { is_all_day: true, timestamp: "1675382400000" } } }, // a day boundary
+      })),
+    );
+    await expect(client.getTask("guid-1")).resolves.toMatchObject({ dueMs: 1675382400000 + 86_400_000 });
+  });
+
+  it("does NOT adjust dueMs when is_all_day is false (a precise timestamp)", async () => {
+    const client = new TaskListClient(
+      fakeRequester(() => ({
+        data: { task: { guid: "guid-1", due: { is_all_day: false, timestamp: "1675454764000" } } },
+      })),
+    );
+    await expect(client.getTask("guid-1")).resolves.toMatchObject({ dueMs: 1675454764000 });
+  });
+
+  it("does NOT adjust dueMs when is_all_day is absent (treated the same as false)", async () => {
+    const client = new TaskListClient(
+      fakeRequester(() => ({ data: { task: { guid: "guid-1", due: { timestamp: "1675454764000" } } } })),
+    );
+    await expect(client.getTask("guid-1")).resolves.toMatchObject({ dueMs: 1675454764000 });
+  });
 });
 
 describe("TaskListClient patch operations", () => {

@@ -2,7 +2,7 @@ import { describe, expect, it, vi, beforeEach, afterEach } from "vitest";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { TaskListClient, type LarkTaskRequestConfig, type LarkTaskRequester } from "./client.js";
+import { TaskListClient, TaskRequestTimeoutError, type LarkTaskRequestConfig, type LarkTaskRequester } from "./client.js";
 import { TasklistPoller, normalizeForExactMatch, type RootTextEntry } from "./tasklistPoller.js";
 import { CandidateAlertStore } from "./candidateAlertStore.js";
 import { STATUS_SNAPSHOT_MARKER } from "./writeback.js";
@@ -25,6 +25,10 @@ function makeFakeRequester(opts: {
   tasks: FakeTask[];
   /** Overrides for a single-task GET, keyed by guid — simulates a description the LIST response omitted. */
   getOverrides?: Record<string, { description?: string }>;
+  /** guids whose single-task GET should THROW (transport failure) instead of resolving — for the getTask-failure-not-cached test. */
+  getFailures?: Set<string>;
+  /** guids whose comment POST should throw a distinct timeout marker — for the alert-timeout-treated-as-sent test. */
+  commentTimeouts?: Set<string>;
   onCall?: (config: LarkTaskRequestConfig) => void;
 }): { requester: LarkTaskRequester; calls: LarkTaskRequestConfig[] } {
   const calls: LarkTaskRequestConfig[] = [];
@@ -34,8 +38,19 @@ function makeFakeRequester(opts: {
     if (config.url.includes("/tasklists/") && config.url.endsWith("/tasks")) {
       return { data: { items: opts.tasks, has_more: false } };
     }
+    if (config.method === "POST" && config.url.endsWith("/comments")) {
+      const guid = (config.data as { resource_id?: string })?.resource_id;
+      if (guid && opts.commentTimeouts?.has(guid)) {
+        // Throwing the SAME class client.ts's withTimeout produces on a real
+        // timeout — wrapErr wraps it into a TaskApiError with this preserved
+        // as .cause, exactly the shape isTaskRequestTimeoutError checks for.
+        throw new TaskRequestTimeoutError("simulated timeout");
+      }
+      return { data: {} };
+    }
     if (config.url.includes("/tasks/")) {
       const guid = config.url.split("/tasks/")[1]!;
+      if (opts.getFailures?.has(guid)) throw new Error("ETIMEDOUT simulated transport failure");
       const override = opts.getOverrides?.[guid];
       const base = opts.tasks.find((t) => t.guid === guid);
       return { data: { task: { guid, summary: base?.summary, ...override } } };
@@ -137,6 +152,65 @@ describe("TasklistPoller", () => {
 
     expect(getCallsAfterFirst).toBe(1);
     expect(getCallsAfterSecond).toBe(1); // unchanged — no re-fetch
+  });
+
+  // Round-2 adversarial review fix (docs/task-handle.md §14.1): a getTask
+  // FAILURE must not be folded into "no description" and cached forever.
+  describe("getTask failure is not permanently cached as 'no description'", () => {
+    it("skips the task entirely this cycle (not surfaced as a candidate) when its description backfill getTask fails", async () => {
+      const { requester } = makeFakeRequester({
+        tasks: [{ guid: "t1", summary: "标题" }], // no description in the list response
+        getFailures: new Set(["t1"]),
+      });
+      const client = new TaskListClient(requester);
+      const poller = new TasklistPoller({ client, tasklistGuid: "guid-1", isClaimedByAnyBot: () => false });
+
+      await poller.pollOnceForTest();
+
+      expect(poller.getCandidates()).toEqual([]); // not surfaced this cycle at all
+    });
+
+    it("retries getTask on the NEXT cycle instead of permanently caching the failure as 'no description'", async () => {
+      const getFailures = new Set(["t1"]);
+      const { requester, calls } = makeFakeRequester({
+        tasks: [{ guid: "t1", summary: "标题" }],
+        getFailures,
+        getOverrides: { t1: { description: "补回来的描述" } },
+      });
+      const client = new TaskListClient(requester);
+      const poller = new TasklistPoller({ client, tasklistGuid: "guid-1", isClaimedByAnyBot: () => false });
+
+      await poller.pollOnceForTest(); // cycle 1: getTask fails, task skipped entirely
+      expect(poller.getCandidates()).toEqual([]);
+
+      getFailures.delete("t1"); // network recovers
+      await poller.pollOnceForTest(); // cycle 2: retried (NOT permanently poisoned by cycle 1's failure)
+
+      expect(poller.getCandidates()).toEqual([{ guid: "t1", summary: "标题", descriptionExcerpt: "补回来的描述" }]);
+      expect(calls.filter((c) => c.url === "/open-apis/task/v2/tasks/t1").length).toBe(2); // retried, not skipped forever
+    });
+
+    it("does NOT falsely black-hole-alert a genuinely bridge-touched task whose one-time getTask backfill happened to fail", async () => {
+      // A task previously claimed+written-back by the bridge (its REAL
+      // description carries STATUS_SNAPSHOT_MARKER) but the list response
+      // omits description AND this cycle's backfill getTask call fails.
+      // Pre-fix, this would cache description=undefined forever, making
+      // isBridgeTouched(undefined) falsely "false" — surfacing it as a fresh
+      // candidate, and eventually posting a false black-hole alert.
+      const { requester } = makeFakeRequester({
+        tasks: [{ guid: "t1", summary: "曾经被认领过" }], // list response omits description
+        getFailures: new Set(["t1"]),
+      });
+      const client = new TaskListClient(requester);
+      const poller = new TasklistPoller({ client, tasklistGuid: "guid-1", isClaimedByAnyBot: () => false });
+
+      await poller.pollOnceForTest();
+
+      // Skipped entirely (not surfaced, not tracked as unbound) — never
+      // gets a chance to be mis-alerted on, unlike caching it as a fresh
+      // description-less candidate would have.
+      expect(poller.getCandidates()).toEqual([]);
+    });
   });
 
   it("truncates a long description to a bounded excerpt", async () => {
@@ -603,5 +677,119 @@ describe("TasklistPoller — v3.3 候选黑洞提示 (docs/task-handle.md §14)"
 
     expect(calls.filter((c) => c.method === "POST" && c.url.includes("/comments"))).toEqual([]);
     expect(poller.getCandidates().length).toBe(1); // candidate injection itself still works
+  });
+
+  // Round-2 adversarial review fix (docs/task-handle.md §14.1): a timeout is
+  // an AMBIGUOUS outcome (the POST may have already landed server-side) —
+  // treat it as sent instead of retrying every cycle during a degradation window.
+  it("treats an addComment TIMEOUT (ambiguous outcome) as sent — does NOT repost every cycle during a network degradation window", async () => {
+    const commentTimeouts = new Set(["t1"]);
+    const { requester, calls } = makeFakeRequester({
+      tasks: [{ guid: "t1", summary: "还没人管" }],
+      commentTimeouts,
+    });
+    const client = new TaskListClient(requester);
+    const alertStore = await CandidateAlertStore.load(path.join(tmpDir, "alerts.json"));
+    const poller = new TasklistPoller(
+      { client, tasklistGuid: "guid-1", isClaimedByAnyBot: () => false, candidateAlertStore: alertStore },
+      { candidateUnboundAlertMs: 60 * 60_000 },
+    );
+
+    await poller.pollOnceForTest();
+    vi.setSystemTime(Date.now() + 61 * 60_000);
+    await poller.pollOnceForTest(); // addComment times out — ambiguous, treated as sent
+
+    const commentPostsAfterTimeout = calls.filter((c) => c.method === "POST" && c.url.includes("/comments")).length;
+    expect(commentPostsAfterTimeout).toBe(1);
+    expect(alertStore.isAlerted("t1")).toBe(true); // marked alerted despite the timeout
+
+    // Even well into what would have been a retry window, must NOT repost.
+    vi.setSystemTime(Date.now() + 60 * 60_000);
+    await poller.pollOnceForTest();
+    expect(calls.filter((c) => c.method === "POST" && c.url.includes("/comments")).length).toBe(1);
+  });
+
+  it("still retries on a GENUINE (non-timeout) addComment failure, unlike the timeout case above", async () => {
+    let shouldFail = true;
+    const requester: LarkTaskRequester = {
+      request: vi.fn(async (config: LarkTaskRequestConfig) => {
+        if (config.url.includes("/tasklists/") && config.url.endsWith("/tasks")) {
+          return { data: { items: [{ guid: "t1", summary: "还没人管" }], has_more: false } };
+        }
+        if (config.method === "POST" && config.url.endsWith("/comments")) {
+          if (shouldFail) throw new Error("genuine transport failure, not a timeout");
+          return { data: {} };
+        }
+        return { data: {} };
+      }) as unknown as LarkTaskRequester["request"],
+    };
+    const client = new TaskListClient(requester);
+    const alertStore = await CandidateAlertStore.load(path.join(tmpDir, "alerts.json"));
+    const poller = new TasklistPoller(
+      { client, tasklistGuid: "guid-1", isClaimedByAnyBot: () => false, candidateAlertStore: alertStore },
+      { candidateUnboundAlertMs: 60 * 60_000 },
+    );
+
+    await poller.pollOnceForTest();
+    vi.setSystemTime(Date.now() + 61 * 60_000);
+    await poller.pollOnceForTest(); // genuine failure — NOT marked alerted
+    expect(alertStore.isAlerted("t1")).toBe(false);
+
+    shouldFail = false;
+    vi.setSystemTime(Date.now() + 62 * 60_000);
+    await poller.pollOnceForTest(); // retries and succeeds
+    expect(alertStore.isAlerted("t1")).toBe(true);
+  });
+
+  // Round-2 adversarial review fix (docs/task-handle.md §14.1): integration
+  // check that TasklistPoller's real MAX_CANDIDATES truncation doesn't reset
+  // an already-tracked overflow candidate's clock/alert state — the unit-
+  // level guarantee is in candidateAlertStore.test.ts; this exercises it
+  // through the real poll cycle wiring, with a task DYNAMICALLY moving in
+  // and out of the top-30 window across cycles (the array is mutated in
+  // place between polls, so the fake requester's live reference sees the
+  // reordering, matching how a real tasklist's ordering can shift).
+  it("preserves a candidate's tracking clock (and alert flag) across a cycle where MAX_CANDIDATES truncation pushes it out of view, then restores it correctly when it reappears", async () => {
+    // 31 tasks — one more than MAX_CANDIDATES (30) — so ordering determines
+    // which single task gets truncated away each cycle.
+    const tasks = Array.from({ length: 31 }, (_, i) => ({ guid: `t${i + 1}`, summary: `任务${i + 1}` }));
+    const { requester } = makeFakeRequester({ tasks });
+    const client = new TaskListClient(requester);
+    const alertStore = await CandidateAlertStore.load(path.join(tmpDir, "alerts.json"));
+    const poller = new TasklistPoller(
+      { client, tasklistGuid: "guid-1", isClaimedByAnyBot: () => false, candidateAlertStore: alertStore },
+      { candidateUnboundAlertMs: 60 * 60_000 },
+    );
+
+    // Cycle 1: t1 is first in the list — within the 30-item cap, tracked.
+    // Mark it alerted (simulating it having aged past threshold and already
+    // gotten its one-time comment on an earlier cycle).
+    await poller.pollOnceForTest();
+    const firstSeenAt = Date.now();
+    await alertStore.markAlerted("t1", firstSeenAt);
+    expect(alertStore.isAlerted("t1")).toBe(true);
+
+    // Move t1 to the END of the list (index 30, the 31st item) — it's now
+    // truncated away by MAX_CANDIDATES=30 this cycle (never scanned at all).
+    tasks.push(tasks.shift()!);
+    vi.setSystemTime(Date.now() + 10 * 60_000);
+    await poller.pollOnceForTest();
+    expect(poller.getCandidates().some((c) => c.guid === "t1")).toBe(false); // confirms it really was truncated away
+
+    // Its tracking must be UNTOUCHED, not reset — it was never confirmed
+    // bound/completed, just not looked at this cycle.
+    expect(alertStore.isAlerted("t1")).toBe(true);
+    expect(alertStore.unboundDurationMs("t1", Date.now())).toBe(Date.now() - firstSeenAt);
+
+    // Move t1 back to the front — it reappears in `fresh` on the next cycle.
+    tasks.unshift(tasks.pop()!);
+    vi.setSystemTime(Date.now() + 5 * 60_000);
+    await poller.pollOnceForTest();
+    expect(poller.getCandidates().some((c) => c.guid === "t1")).toBe(true); // confirms it's back in view
+
+    // Still measured from the ORIGINAL first sighting, not reset to this
+    // cycle's reappearance — and still alerted (never dropped in between).
+    expect(alertStore.unboundDurationMs("t1", Date.now())).toBe(Date.now() - firstSeenAt);
+    expect(alertStore.isAlerted("t1")).toBe(true);
   });
 });

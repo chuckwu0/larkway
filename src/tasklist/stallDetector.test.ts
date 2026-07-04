@@ -338,6 +338,167 @@ describe("StallDetector", () => {
     expect(store.get("t1")?.stallNudge?.count).toBe(1); // exactly one confirmed nudge, not two
   });
 
+  describe("round 2 adversarial review: pending-confirm timeout checks queue evidence before declaring lost", () => {
+    it("does NOT declare a pending nudge lost (and does NOT resend) when this bot's own thread genuinely received the synthetic event after pendingSince — it's just still queued behind the semaphore", async () => {
+      const store = await TaskHandleStore.load(join(dir, "task-handles.json"));
+      const claimedAt = Date.now();
+      await store.put({ threadId: "t1", taskGuid: "g1", chatId: "oc_1", claimedTs: claimedAt });
+      const { requester } = makeFakeRequester({ g1: { guid: "g1", summary: "任务A" } });
+      const client = new TaskListClient(requester);
+      const enqueueNudgeTurn = vi.fn();
+      const detector = new StallDetector(
+        {
+          store,
+          client,
+          getLastActiveTs: () => claimedAt, // never advances — the queued turn hasn't completed
+          enqueueNudgeTurn,
+          // The synthetic nudge event WAS received by this bot's own bridge
+          // shortly after being enqueued — it's just stuck behind
+          // handler.ts's MAX_CONCURRENT=5 semaphore, not lost.
+          getOwnThreadReceivedAt: () => claimedAt + DAY + 5_000,
+        },
+        { stallThresholdMs: DAY, pendingConfirmTimeoutMs: 30 * 60_000 },
+      );
+
+      vi.setSystemTime(claimedAt + DAY + 1);
+      await detector.pollOnceForTest(); // nudge #1 enqueued, pendingSince = claimedAt+DAY+1
+      expect(enqueueNudgeTurn).toHaveBeenCalledTimes(1);
+
+      // Past the 30min pending-confirm timeout, with queue evidence present.
+      vi.setSystemTime(claimedAt + DAY + 31 * 60_000);
+      await detector.pollOnceForTest();
+
+      expect(enqueueNudgeTurn).toHaveBeenCalledTimes(1); // NOT resent — the receipt evidence extended the wait
+      expect(store.get("t1")?.stallNudge?.pendingSince).toBeDefined(); // still pending, not cleared
+    });
+
+    it("still declares a pending nudge lost and resends when there is NO receipt evidence at all (genuinely lost, e.g. a restart before dispatch)", async () => {
+      const store = await TaskHandleStore.load(join(dir, "task-handles.json"));
+      const claimedAt = Date.now();
+      await store.put({ threadId: "t1", taskGuid: "g1", chatId: "oc_1", claimedTs: claimedAt });
+      const { requester } = makeFakeRequester({ g1: { guid: "g1", summary: "任务A" } });
+      const client = new TaskListClient(requester);
+      const enqueueNudgeTurn = vi.fn();
+      const detector = new StallDetector(
+        {
+          store,
+          client,
+          getLastActiveTs: () => claimedAt,
+          enqueueNudgeTurn,
+          getOwnThreadReceivedAt: () => undefined, // never received at all — this process has no record of it
+        },
+        { stallThresholdMs: DAY, pendingConfirmTimeoutMs: 30 * 60_000 },
+      );
+
+      vi.setSystemTime(claimedAt + DAY + 1);
+      await detector.pollOnceForTest();
+      expect(enqueueNudgeTurn).toHaveBeenCalledTimes(1);
+
+      vi.setSystemTime(claimedAt + DAY + 31 * 60_000);
+      await detector.pollOnceForTest();
+
+      expect(enqueueNudgeTurn).toHaveBeenCalledTimes(2); // genuinely lost — resent, same as pre-fix behavior
+    });
+
+    it("omitting getOwnThreadReceivedAt keeps the pre-fix behavior (declare lost purely on elapsed time, backward compatible)", async () => {
+      const store = await TaskHandleStore.load(join(dir, "task-handles.json"));
+      const claimedAt = Date.now();
+      await store.put({ threadId: "t1", taskGuid: "g1", chatId: "oc_1", claimedTs: claimedAt });
+      const { requester } = makeFakeRequester({ g1: { guid: "g1", summary: "任务A" } });
+      const client = new TaskListClient(requester);
+      const enqueueNudgeTurn = vi.fn();
+      const detector = new StallDetector(
+        { store, client, getLastActiveTs: () => claimedAt, enqueueNudgeTurn }, // no getOwnThreadReceivedAt at all
+        { stallThresholdMs: DAY, pendingConfirmTimeoutMs: 30 * 60_000 },
+      );
+
+      vi.setSystemTime(claimedAt + DAY + 1);
+      await detector.pollOnceForTest();
+      vi.setSystemTime(claimedAt + DAY + 31 * 60_000);
+      await detector.pollOnceForTest();
+
+      expect(enqueueNudgeTurn).toHaveBeenCalledTimes(2); // unchanged from before this fix
+    });
+  });
+
+  describe("round 2 adversarial review: escalate() only marks escalated on a genuinely successful comment post", () => {
+    it("does NOT mark escalated (and retries later) when the escalation comment post fails", async () => {
+      const store = await TaskHandleStore.load(join(dir, "task-handles.json"));
+      const claimedAt = Date.now();
+      await store.put({
+        threadId: "t1",
+        taskGuid: "g1",
+        chatId: "oc_1",
+        claimedTs: claimedAt,
+        stallNudge: { count: 2, lastNudgeSentAt: claimedAt, lastNudgeTurnActivityAt: claimedAt, escalated: false },
+      });
+      const client = new TaskListClient({
+        request: vi.fn(async (config: LarkTaskRequestConfig) => {
+          if (config.method === "GET" && config.url.includes("/tasks/")) {
+            return { data: { task: { guid: "g1", summary: "任务A" } } };
+          }
+          if (config.method === "POST" && config.url.includes("/comments")) {
+            throw new Error("network blip");
+          }
+          return { data: {} };
+        }) as unknown as LarkTaskRequester["request"],
+      });
+      const enqueueNudgeTurn = vi.fn();
+      const detector = new StallDetector(
+        { store, client, getLastActiveTs: () => claimedAt, enqueueNudgeTurn },
+        { stallThresholdMs: DAY, escalateAfterNudges: 2, nudgeCooldownMs: 0 },
+      );
+
+      vi.setSystemTime(claimedAt + 60_000);
+      await detector.pollOnceForTest();
+
+      // The comment failed to post, so escalated must stay false — a
+      // permanently-silent task with NO human ever notified would be exactly
+      // the 静默漏管 this feature exists to prevent.
+      expect(store.get("t1")?.stallNudge?.escalated).toBe(false);
+    });
+
+    it("marks escalated only once the comment genuinely succeeds (on a later retry)", async () => {
+      const store = await TaskHandleStore.load(join(dir, "task-handles.json"));
+      const claimedAt = Date.now();
+      await store.put({
+        threadId: "t1",
+        taskGuid: "g1",
+        chatId: "oc_1",
+        claimedTs: claimedAt,
+        stallNudge: { count: 2, lastNudgeSentAt: claimedAt, lastNudgeTurnActivityAt: claimedAt, escalated: false },
+      });
+      let shouldFail = true;
+      const client = new TaskListClient({
+        request: vi.fn(async (config: LarkTaskRequestConfig) => {
+          if (config.method === "GET" && config.url.includes("/tasks/")) {
+            return { data: { task: { guid: "g1", summary: "任务A" } } };
+          }
+          if (config.method === "POST" && config.url.includes("/comments")) {
+            if (shouldFail) throw new Error("network blip");
+            return { data: {} };
+          }
+          return { data: {} };
+        }) as unknown as LarkTaskRequester["request"],
+      });
+      const enqueueNudgeTurn = vi.fn();
+      const detector = new StallDetector(
+        { store, client, getLastActiveTs: () => claimedAt, enqueueNudgeTurn },
+        { stallThresholdMs: DAY, escalateAfterNudges: 2, nudgeCooldownMs: 0 },
+      );
+
+      vi.setSystemTime(claimedAt + 60_000);
+      await detector.pollOnceForTest(); // fails, not escalated
+      expect(store.get("t1")?.stallNudge?.escalated).toBe(false);
+
+      shouldFail = false;
+      vi.setSystemTime(claimedAt + 5 * 60_000); // past the intervalMs-based backoff (first failure backs off ~intervalMs=60s)
+      await detector.pollOnceForTest();
+
+      expect(store.get("t1")?.stallNudge?.escalated).toBe(true);
+    });
+  });
+
   it("discovering a task is independently completed (while about to nudge) clears tracking and suppresses future polling", async () => {
     const store = await TaskHandleStore.load(join(dir, "task-handles.json"));
     const claimedAt = Date.now();
@@ -837,6 +998,114 @@ describe("StallDetector", () => {
         expect(enqueueNudgeTurn).toHaveBeenCalledTimes(1);
       });
     });
+
+    describe("round 2 adversarial review: tier 1 accepts a persisted completion, not just a fresh receipt", () => {
+      it("does NOT fire a spurious handoff nudge after a restart when the peer already completed the handoff pre-restart (disk-persisted, receipt map empty)", async () => {
+        const store = await TaskHandleStore.load(join(dir, "task-handles.json"));
+        const claimedAt = Date.now();
+        await store.put({
+          threadId: "t1",
+          taskGuid: "g1",
+          chatId: "oc_1",
+          claimedTs: claimedAt,
+          lastTurnMentions: ["peer-bot"],
+          lastTurnMentionsAt: claimedAt,
+        });
+        const { requester } = makeFakeRequester({ g1: { guid: "g1", summary: "任务A" } });
+        const client = new TaskListClient(requester);
+        const enqueueNudgeTurn = vi.fn();
+        // Simulates: A @'d B, B received AND completed the turn — all healthy
+        // — but then the bridge restarted. getPeerReceivedAt's in-memory map
+        // is empty post-restart (undefined forever, this process never saw a
+        // NEW event for B in this thread), but getPeerLastActiveTs (disk-
+        // persisted SessionStore) shows the completion that already happened.
+        const detector = new StallDetector(
+          {
+            store,
+            client,
+            getLastActiveTs: () => claimedAt,
+            enqueueNudgeTurn,
+            getPeerReceivedAt: () => undefined,
+            getPeerLastActiveTs: () => claimedAt + 30_000, // completed shortly after the mention, pre-restart
+          },
+          { stallThresholdMs: DAY, stallHandoffThresholdMs: HANDOFF, handoffStartupQuietMs: 0 },
+        );
+
+        // Well past the handoff threshold — without the fix, tier 1 would
+        // declare "never received" purely because the receipt map is empty.
+        vi.setSystemTime(claimedAt + HANDOFF + 60_000);
+        await detector.pollOnceForTest();
+
+        expect(enqueueNudgeTurn).not.toHaveBeenCalled();
+      });
+
+      it("still fires when the peer neither received NOR ever completed anything (genuine break, regression check)", async () => {
+        const store = await TaskHandleStore.load(join(dir, "task-handles.json"));
+        const claimedAt = Date.now();
+        await store.put({
+          threadId: "t1",
+          taskGuid: "g1",
+          chatId: "oc_1",
+          claimedTs: claimedAt,
+          lastTurnMentions: ["peer-bot"],
+          lastTurnMentionsAt: claimedAt,
+        });
+        const { requester } = makeFakeRequester({ g1: { guid: "g1", summary: "任务A" } });
+        const client = new TaskListClient(requester);
+        const enqueueNudgeTurn = vi.fn();
+        const detector = new StallDetector(
+          {
+            store,
+            client,
+            getLastActiveTs: () => claimedAt,
+            enqueueNudgeTurn,
+            getPeerReceivedAt: () => undefined,
+            getPeerLastActiveTs: () => undefined, // no completion signal either — truly broken
+          },
+          { stallThresholdMs: DAY, stallHandoffThresholdMs: HANDOFF, handoffStartupQuietMs: 0 },
+        );
+
+        vi.setSystemTime(claimedAt + HANDOFF + 60_000);
+        await detector.pollOnceForTest();
+
+        expect(enqueueNudgeTurn).toHaveBeenCalledTimes(1);
+      });
+
+      it("does NOT fire when the peer's completion is stale (BEFORE the mention, not after) — a pre-existing unrelated completion doesn't count", async () => {
+        // Wait — this is the inverse: a completion timestamp at/before mentionAt
+        // must NOT be treated as resolving the mention (it predates it, so it
+        // can't possibly be evidence of picking up THIS handoff).
+        const store = await TaskHandleStore.load(join(dir, "task-handles.json"));
+        const claimedAt = Date.now();
+        await store.put({
+          threadId: "t1",
+          taskGuid: "g1",
+          chatId: "oc_1",
+          claimedTs: claimedAt,
+          lastTurnMentions: ["peer-bot"],
+          lastTurnMentionsAt: claimedAt,
+        });
+        const { requester } = makeFakeRequester({ g1: { guid: "g1", summary: "任务A" } });
+        const client = new TaskListClient(requester);
+        const enqueueNudgeTurn = vi.fn();
+        const detector = new StallDetector(
+          {
+            store,
+            client,
+            getLastActiveTs: () => claimedAt,
+            enqueueNudgeTurn,
+            getPeerReceivedAt: () => undefined,
+            getPeerLastActiveTs: () => claimedAt - 60_000, // completion BEFORE the mention — stale, doesn't resolve it
+          },
+          { stallThresholdMs: DAY, stallHandoffThresholdMs: HANDOFF, handoffStartupQuietMs: 0 },
+        );
+
+        vi.setSystemTime(claimedAt + HANDOFF + 60_000);
+        await detector.pollOnceForTest();
+
+        expect(enqueueNudgeTurn).toHaveBeenCalledTimes(1); // still fires — the stale completion doesn't count
+      });
+    });
   });
 
   describe("v3.3 due-date stall detection (docs/task-handle.md §14)", () => {
@@ -928,6 +1197,48 @@ describe("StallDetector", () => {
       await detector.pollOnceForTest();
 
       expect(enqueueNudgeTurn).toHaveBeenCalledTimes(1); // cooldown correctly gates the repeat
+    });
+
+    it("P0 invariant (adversarial review round 2): repeated REAL progress on an overdue task still only nudges once per cooldown — progress-reset must not defeat the due tier's cooldown anchor", async () => {
+      const store = await TaskHandleStore.load(join(dir, "task-handles.json"));
+      const claimedAt = Date.now();
+      const dueMs = claimedAt + 60_000;
+      await store.put({ threadId: "t1", taskGuid: "g1", chatId: "oc_1", claimedTs: claimedAt });
+      const { requester } = makeFakeRequester({ g1: { guid: "g1", summary: "任务A" } });
+      const client = new TaskListClient(requester);
+      const enqueueNudgeTurn = vi.fn();
+      let lastActiveTs = claimedAt;
+      const detector = new StallDetector(
+        { store, client, getLastActiveTs: () => lastActiveTs, enqueueNudgeTurn, getTaskDueMs: () => dueMs },
+        { stallThresholdMs: DAY }, // default 24h nudgeCooldownMs — the invariant under test
+      );
+
+      // First due-based nudge fires.
+      vi.setSystemTime(dueMs + 1_000);
+      await detector.pollOnceForTest();
+      expect(enqueueNudgeTurn).toHaveBeenCalledTimes(1);
+
+      // Confirm it (activity bump after pendingSince).
+      lastActiveTs = dueMs + 2_000;
+      vi.setSystemTime(dueMs + 3_000);
+      await detector.pollOnceForTest();
+      expect(store.get("t1")?.stallNudge?.count).toBe(1);
+
+      // Three rounds of REAL further progress (human @, agent turn completing,
+      // etc.) — WITHOUT the P0 fix, each of these would wipe stallNudge
+      // entirely, and the very next 60s cycle would immediately re-nudge
+      // (threshold=0 for an overdue task, no cooldown consulted). The task is
+      // STILL overdue throughout — only lastActiveTs is advancing.
+      for (let round = 0; round < 3; round++) {
+        lastActiveTs = dueMs + 10_000 + round * 10_000;
+        vi.setSystemTime(lastActiveTs + 1_000);
+        await detector.pollOnceForTest(); // progress-reset cycle: count -> 0, cooldown anchor preserved
+        vi.setSystemTime(lastActiveTs + 2_000);
+        await detector.pollOnceForTest(); // immediate re-evaluation: must NOT re-nudge
+      }
+
+      expect(enqueueNudgeTurn).toHaveBeenCalledTimes(1); // still just the one nudge, despite 3 rounds of real progress
+      expect(store.get("t1")?.stallNudge?.count).toBe(0); // count did reset (escalation restarts), unlike the cooldown anchor
     });
   });
 

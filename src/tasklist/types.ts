@@ -54,6 +54,20 @@ export interface TaskHandleLifecyclePatch {
    * the mention?" using a much shorter threshold than the general one.
    */
   mentionedPeerBotIds?: string[];
+  /**
+   * v3.2 revision (adversarial review round 2, docs/task-handle.md §13.4):
+   * THIS turn's own `threadReceivedAt` (handler.ts), captured at turn START
+   * — before the agent subprocess ran, before writeback's own `getTask`
+   * round-trip. Used as the handoff-break anchor (`lastTurnMentionsAt`)
+   * instead of writeback-time `Date.now()`, which could postdate a mid-turn
+   * `lark-cli @` the agent itself sent to the mentioned peer (guaranteed to
+   * make that peer's genuine receipt look like it preceded the mention).
+   * Only meaningful when status="completed". Undefined only if this
+   * process's in-memory receipt map somehow never recorded this thread
+   * (shouldn't happen for a real dispatched turn) — writeback.ts falls back
+   * to `Date.now()` in that case, same as before this field existed.
+   */
+  turnReceivedAt?: number;
 }
 
 /**

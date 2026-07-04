@@ -97,17 +97,33 @@ export class CandidateAlertStore {
    * Reconcile against THIS cycle's set of unclaimed candidate guids —
    * TasklistPoller calls this once per poll cycle with the guids it just
    * decided are still-eligible candidates. Any tracked guid NOT in that set
-   * anymore (claimed / completed / bridge-touched since last cycle) is
-   * dropped entirely — both its "first seen" clock and its "already alerted"
-   * flag — so a candidate that gets bound and later becomes unbound again
-   * (e.g. re-transferred) is treated as a fresh sighting, per the module doc.
-   * Any NEW guid not seen before gets a fresh `firstSeenUnboundAt`. Does not
-   * flush by itself — see {@link markAlerted}, the only mutation that must be
-   * durable before the corresponding comment is trusted to have been sent.
+   * anymore is dropped — both its "first seen" clock and its "already
+   * alerted" flag — so a candidate that gets bound and later becomes unbound
+   * again (e.g. re-transferred) is treated as a fresh sighting, per the
+   * module doc. Any NEW guid not seen before gets a fresh `firstSeenUnboundAt`.
+   * Does not flush by itself — see {@link markAlerted}, the only mutation
+   * that must be durable before the corresponding comment is trusted to have
+   * been sent.
+   *
+   * Round-2 adversarial review fix: `currentUnboundGuids` is truncated by
+   * TasklistPoller's own MAX_CANDIDATES/MAX_PAGES_PER_CYCLE caps — a guid
+   * that simply wasn't reached this cycle (page budget exhausted before
+   * getting to it) is NOT the same as a guid CONFIRMED to have left the
+   * unbound set (claimed/completed/bridge-touched). Treating "absent from
+   * the truncated set" as "confirmed gone" would silently reset the clock
+   * (and clear any alert already sent) for a candidate the poller never
+   * actually looked at this cycle — exactly the "静默漏管" this feature
+   * exists to prevent, worst exactly when a backlog is large enough that
+   * truncation kicks in. `scannedGuids` is every guid this cycle's fetched
+   * pages actually contained (claimed/completed/bridge-touched ones
+   * included) — a tracked guid is only dropped if it WAS scanned and is
+   * NOT in `currentUnboundGuids` (positive confirmation it left); a tracked
+   * guid that's simply absent from `scannedGuids` (truncated away) is left
+   * completely untouched.
    */
-  reconcile(currentUnboundGuids: ReadonlySet<string>, now: number): void {
+  reconcile(currentUnboundGuids: ReadonlySet<string>, scannedGuids: ReadonlySet<string>, now: number): void {
     for (const guid of this.#map.keys()) {
-      if (!currentUnboundGuids.has(guid)) this.#map.delete(guid);
+      if (scannedGuids.has(guid) && !currentUnboundGuids.has(guid)) this.#map.delete(guid);
     }
     for (const guid of currentUnboundGuids) {
       if (!this.#map.has(guid)) this.#map.set(guid, { firstSeenUnboundAt: now });

@@ -244,6 +244,35 @@
  *    window, which is an accepted, deliberately cheap trade-off for a
  *    fuse whose entire job is "never fire on the happy path."
  *
+ * ## Adversarial review round 2 fixes (2026-07, docs/task-handle.md §14)
+ *
+ * Two related fixes to tier 1 of the handoff check:
+ *
+ * 1. **Tier 1 now accepts a persisted completion, not just a fresh receipt.**
+ *    `getPeerReceivedAt`'s backing map is in-memory and per-process — right
+ *    after a bridge restart it's empty for EVERY thread, even ones whose
+ *    handoff was completely healthy pre-restart and simply has no reason to
+ *    receive a NEW event afterward. Tier 1 now also checks
+ *    `getPeerLastActiveTs(peer, thread) > mentionAt` (the peer's own
+ *    disk-persisted completion) before declaring "never received" — without
+ *    this, every restart falsely re-armed tier 1 for every already-resolved
+ *    handoff. This is a genuinely different check from tier 3's use of the
+ *    same dep (tier 3 requires completion AFTER a receipt within the grace
+ *    window; this is completion at all, any time after the mention).
+ * 2. **The mention anchor moved from writeback-time to turn-start.** Before
+ *    this fix, `TaskHandleRecord.lastTurnMentionsAt` was stamped via
+ *    `Date.now()` inside writeback.ts's `applyTaskHandleWriteback` — which
+ *    runs AFTER the agent subprocess finished AND after writeback's own
+ *    `getTask` round-trip. A common, entirely healthy pattern — the agent
+ *    @-mentioning peer B via `lark-cli` MID-turn — would then guarantee B's
+ *    genuine receipt timestamp predates that (too-late) anchor, so tier 1
+ *    misread a currently-healthy handoff as broken. The anchor is now
+ *    `TaskHandleLifecyclePatch.turnReceivedAt` — THIS turn's own receipt
+ *    timestamp, captured by handler.ts at turn START, before either the
+ *    subprocess or the getTask round-trip. Combined with fix 1 above (peer
+ *    completion also resolves tier 1), a mid-turn `lark-cli @` no longer
+ *    misfires even in the timing window these two fixes don't fully close.
+ *
  * Class shape (timer/start/stop/jitter) mirrors commentPoller.ts.
  */
 
@@ -329,6 +358,20 @@ export interface StallDetectorDeps {
    * Omit to disable due-date-based early stall entirely.
    */
   getTaskDueMs?: (taskGuid: string) => number | undefined;
+  /**
+   * Round-2 adversarial review fix: THIS bot's OWN `BridgeHandler.
+   * getThreadReceivedAt` (the same "received" signal used cross-bot for
+   * handoff detection, here read for the claiming bot's own thread). Used
+   * ONLY to disambiguate a pending-nudge confirmation timeout: a synthetic
+   * nudge turn can sit queued behind handler.ts's global MAX_CONCURRENT=5
+   * semaphore for longer than `pendingConfirmTimeoutMs` even though it was
+   * genuinely received and isn't lost — declaring it "lost" in that case
+   * causes a duplicate wake-up turn once the first one finally runs. If this
+   * shows the synthetic event WAS received after `pendingSince`, the pending
+   * wait is extended instead of declaring it lost. Omit to keep the
+   * pre-fix behavior (declare lost purely on elapsed time).
+   */
+  getOwnThreadReceivedAt?: (threadId: string) => number | undefined;
 }
 
 export interface StallDetectorOptions {
@@ -423,6 +466,16 @@ export class StallDetector {
   #inFlight: Promise<void> = Promise.resolve();
   /** Mirrors commentPoller.ts's permission-denied backoff — see its doc comment. */
   readonly #permissionBackoff = new Map<string, { nextAttemptAt: number; backoffMs: number }>();
+  /**
+   * Round-2 adversarial review fix: `#escalate`'s `addComment` failing must
+   * NOT set `escalated: true` (that would permanently silence a task whose
+   * human-facing escalation comment never actually landed — the exact
+   * "静默漏管" this feature exists to prevent). Same doubling-backoff shape
+   * as `#permissionBackoff`, kept separate because it's a distinct failure
+   * class (a transient API error posting a comment, not a scope/permission
+   * problem reading a task).
+   */
+  readonly #escalationCommentBackoff = new Map<string, { nextAttemptAt: number; backoffMs: number }>();
   /** v3.3 全局唤醒保险丝: ms-epoch timestamps of every synthetic nudge turn THIS instance has enqueued, pruned to the trailing hour on each check — see `#tripFuseOrRecord`. In-memory, per-instance (per-bot); a restart clears it, an accepted trade-off for a fuse that should never trip on the happy path anyway. */
   #recentNudgeSendTimestamps: number[] = [];
 
@@ -519,6 +572,15 @@ export class StallDetector {
       return; // silent otherwise — escalated tasks don't auto-nudge again
     }
 
+    // Tracks whether THIS cycle just cleared a pending-nudge timeout below —
+    // that fall-through retry must stay immediate (bounded only by
+    // pendingConfirmTimeoutMs having already elapsed) regardless of reason,
+    // never gated by the due-tier cooldown-preservation check further down
+    // (see its own comment for why those two states are otherwise
+    // indistinguishable by shape alone: both end up count:0 with a residual
+    // lastNudgeSentAt).
+    let justClearedPendingTimeout = false;
+
     if (record.stallNudge?.pendingSince !== undefined) {
       const pendingSince = record.stallNudge.pendingSince;
       if (lastActiveTs > pendingSince) {
@@ -544,21 +606,63 @@ export class StallDetector {
       if (now - pendingSince <= this.#pendingConfirmTimeoutMs) {
         return; // still waiting to see if it lands
       }
-      // Timed out — treat as lost. Clear pendingSince WITHOUT incrementing
-      // count (module doc fix #3), then keep evaluating below with the
-      // refreshed record (may re-send this same cycle).
+      // Round-2 adversarial review fix: the synthetic nudge turn's own
+      // event can sit queued behind handler.ts's global MAX_CONCURRENT=5
+      // semaphore for longer than pendingConfirmTimeoutMs even though it
+      // was genuinely received — a busy deployment with a few long
+      // (5-15min) turns in flight makes >30min queue wait realistic.
+      // Declaring it "lost" here would #sendNudge a DUPLICATE wake-up this
+      // same cycle, and the first turn's eventual completion would then
+      // read as "real further progress" and wipe the state, resetting the
+      // escalation counter for a task that made zero real progress. Before
+      // declaring lost, check whether this bot's OWN thread genuinely
+      // received the synthetic event after pendingSince — if so, that's
+      // queue evidence it isn't lost, just still waiting on the semaphore;
+      // extend the wait instead of resending.
+      const ownReceivedAt = this.#deps.getOwnThreadReceivedAt?.(threadId);
+      if (ownReceivedAt !== undefined && ownReceivedAt > pendingSince) {
+        return; // received, still queued — keep waiting, do not declare lost
+      }
+      // No receipt evidence at all (or the dep isn't wired) — genuinely
+      // treat as lost. Clear pendingSince WITHOUT incrementing count
+      // (module doc fix #3), then keep evaluating below with the refreshed
+      // record (may re-send this same cycle).
       const updated = await this.#deps.store.update(threadId, (r) =>
         r?.stallNudge ? { ...r, stallNudge: { ...r.stallNudge, pendingSince: undefined } } : r,
       );
       if (!updated) return;
       record = updated;
+      justClearedPendingTimeout = true;
     }
 
     const nudge = record.stallNudge;
-    const { ms: threshold } = this.#effectiveThreshold(record, threadId);
+    const { ms: threshold, reason } = this.#effectiveThreshold(record, threadId);
 
     if (!nudge || nudge.count === 0) {
       if (now - lastActiveTs < threshold) return; // not stalled yet
+      // v3.3 adversarial review round 2 (P0, docs/task-handle.md §14.2): a
+      // due-tier progress-reset (below) preserves lastNudgeSentAt instead of
+      // wiping stallNudge — so count can be 0 here with a cooldown anchor
+      // still present. Due is a STANDING condition, not a silence measure;
+      // the invariant is "the same task's due-based wake-ups are still ≥
+      // nudgeCooldownMs apart, no matter how much real progress happens in
+      // between" — without this check, threshold=0 would fire again within
+      // one poll cycle of any progress bump, defeating the cooldown entirely.
+      // Gated to reason==="due" AND !justClearedPendingTimeout: a lost
+      // pending nudge (any tier, including due) must still retry immediately
+      // once its own timeout has elapsed — that's a DIFFERENT guarantee
+      // ("don't silently drop a nudge nobody ever saw") than "don't nudge
+      // again within one cooldown period of the last CONFIRMED send", and
+      // conflating them would turn a lost due-nudge into a genuine
+      // under-detection (waiting a full cooldown to even retry once).
+      if (
+        reason === "due" &&
+        !justClearedPendingTimeout &&
+        nudge?.lastNudgeSentAt !== undefined &&
+        now - nudge.lastNudgeSentAt < this.#nudgeCooldownMs
+      ) {
+        return;
+      }
       await this.#sendNudge(threadId);
       return;
     }
@@ -566,7 +670,27 @@ export class StallDetector {
     // count >= 1 with no pending nudge: lastNudgeTurnActivityAt is always
     // set here — confirmation (above) always sets both fields together.
     if (lastActiveTs > nudge.lastNudgeTurnActivityAt!) {
-      await this.#deps.store.update(threadId, (r) => (r ? { ...r, stallNudge: undefined } : r)); // real further progress
+      await this.#deps.store.update(threadId, (r) => {
+        if (!r) return r;
+        if (reason === "due") {
+          // P0 fix: due tier survives progress-reset. Only the escalation
+          // COUNT resets (real progress genuinely means "start counting
+          // escalation attempts over") — lastNudgeSentAt (the cooldown
+          // anchor) is preserved, so the count===0 branch above still gates
+          // the next send by the full cooldown instead of firing immediately.
+          return {
+            ...r,
+            stallNudge: {
+              count: 0,
+              lastNudgeSentAt: r.stallNudge?.lastNudgeSentAt ?? now,
+              lastNudgeTurnActivityAt: undefined,
+              escalated: false,
+              pendingSince: undefined,
+            },
+          };
+        }
+        return { ...r, stallNudge: undefined }; // real further progress (non-due tiers unaffected)
+      });
       return;
     }
 
@@ -649,6 +773,17 @@ export class StallDetector {
     for (const peerBotId of record.lastTurnMentions) {
       const receivedAt = this.#deps.getPeerReceivedAt!(peerBotId, threadId);
       if (receivedAt === undefined || receivedAt <= mentionAt) {
+        // Adversarial review round 2 (docs/task-handle.md §13.4): a
+        // disk-persisted COMPLETED turn since the mention is equally strong
+        // evidence the handoff succeeded as a fresh receipt would be — and
+        // it's the ONLY evidence available across a bridge restart (the
+        // receipt map is in-memory and empty right after restart, so
+        // `receivedAt === undefined` there means "this process hasn't seen
+        // one YET", not "the peer never got it"). Without this check, EVERY
+        // bridge restart falsely re-arms tier 1 for any already-resolved
+        // handoff whose peer has no reason to receive a LATER event.
+        const completedAt = this.#deps.getPeerLastActiveTs?.(peerBotId, threadId);
+        if (completedAt !== undefined && completedAt > mentionAt) continue; // resolved via persisted completion
         // Tier 1: never received — broken only once the handoff threshold
         // has actually elapsed since the mention (not the instant it lands).
         if (now - mentionAt >= this.#stallHandoffThresholdMs) {
@@ -816,21 +951,44 @@ export class StallDetector {
     }
   }
 
-  /** Only called when `#pollOne` has already decided nudges are exhausted with no progress. */
+  /**
+   * Only called when `#pollOne` has already decided nudges are exhausted
+   * with no progress. Round-2 adversarial review fix: `escalated: true` is
+   * now set ONLY after `addComment` genuinely succeeds — a failed post used
+   * to still mark the task escalated (permanently silent, per #pollOne's
+   * "escalated tasks don't auto-nudge again"), meaning a transient API
+   * failure at exactly the escalation moment silently dropped the ONE
+   * human-facing signal this feature ever posts. A backoff (mirroring
+   * `#fetchTaskOrHandle`'s permission-denied backoff) prevents hammering
+   * `addComment` every poll cycle during an outage while still retrying.
+   */
   async #escalate(threadId: string): Promise<void> {
     const record = this.#deps.store.get(threadId);
     if (!record) return;
+
+    const backoff = this.#escalationCommentBackoff.get(threadId);
+    if (backoff && Date.now() < backoff.nextAttemptAt) return; // still backing off a prior comment failure
+
     const task = await this.#fetchTaskOrHandle(threadId, record.taskGuid);
     if (task === null) return;
 
-    await this.#deps.client
-      .addComment(
+    try {
+      await this.#deps.client.addComment(
         record.taskGuid,
         renderStallEscalationComment({ summary: task.summary, escalateAfterNudges: this.#escalateAfterNudges }),
-      )
-      .catch((err) => {
-        console.warn(`[tasklist.stallDetector] escalation comment failed for task ${record.taskGuid} (continuing):`, err);
-      });
+      );
+      this.#escalationCommentBackoff.delete(threadId); // a successful post clears any prior backoff
+    } catch (err) {
+      const nextBackoffMs = Math.min(backoff ? backoff.backoffMs * 2 : this.#intervalMs, PERMISSION_BACKOFF_CEILING_MS);
+      this.#escalationCommentBackoff.set(threadId, { nextAttemptAt: Date.now() + nextBackoffMs, backoffMs: nextBackoffMs });
+      console.warn(
+        `[tasklist.stallDetector] escalation comment failed for task ${record.taskGuid} — NOT marking escalated ` +
+          `(the human-facing notice never landed), retrying with backoff:`,
+        err,
+      );
+      return; // do NOT set escalated:true — #pollOne will retry once the backoff/cooldown allows
+    }
+
     await this.#deps.store.update(threadId, (r) =>
       r?.stallNudge ? { ...r, stallNudge: { ...r.stallNudge, escalated: true, pendingSince: undefined } } : r,
     );

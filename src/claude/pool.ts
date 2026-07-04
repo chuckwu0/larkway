@@ -208,6 +208,19 @@ export class ClaudeProcessPool implements AgentRunner {
    * guaranteed to be the LAST rename to land on disk.
    */
   #pidListWriteChain: Promise<void> = Promise.resolve();
+  /**
+   * Round-2 adversarial review fix: entries `#destroyEntry` has removed from
+   * `#entries` (SIGTERM sent) but whose OS-confirmed exit hasn't landed yet
+   * (`#onEntryExit` hasn't fired). `#writePidListSnapshot` must still include
+   * these — without this set, ANY unrelated pid-list rewrite fired while a
+   * SIGTERM'd child is still dying (LRU eviction spawning its replacement,
+   * key-drift supersession, another entry's own exit during shutdown with
+   * N>1 entries) would snapshot `#entries` alone and drop the dying child's
+   * pid from disk BEFORE the OS confirms it's actually gone — invisible to
+   * `reapOrphanedWarmClaudeProcesses` at next boot if the bridge is then hard
+   * -killed while that child still lives. Removed in `#onEntryExit`.
+   */
+  readonly #dying = new Set<PoolEntry>();
 
   constructor(opts: ClaudeProcessPoolOptions) {
     this.#botId = opts.botId;
@@ -687,7 +700,10 @@ export class ClaudeProcessPool implements AgentRunner {
     if (this.#entries.get(entry.key) === entry) this.#entries.delete(entry.key);
     // The OS has now confirmed this child is actually gone — safe to drop it
     // from the on-disk list (see #destroyEntry's doc for why that must NOT
-    // happen any earlier, e.g. at the moment SIGTERM is merely sent).
+    // happen any earlier, e.g. at the moment SIGTERM is merely sent) — and
+    // out of #dying (round-2 adversarial review fix), since no future
+    // snapshot needs to keep including it anymore.
+    this.#dying.delete(entry);
     this.#rewritePidListBestEffort();
     void this.#deleteRunnerPidFileIfMine(entry);
 
@@ -723,6 +739,10 @@ export class ClaudeProcessPool implements AgentRunner {
     if (entry.destroyed) return;
     entry.destroyed = true;
     if (this.#entries.get(entry.key) === entry) this.#entries.delete(entry.key);
+    // Round-2 adversarial review fix: track this entry as "dying" so ANY
+    // OTHER pid-list rewrite fired before the OS confirms its exit still
+    // includes its pid — see #dying's own doc.
+    this.#dying.add(entry);
     // Deliberately NOT rewriting the on-disk pid list here: that would drop
     // this pid from the list the instant SIGTERM is SENT, before the child
     // has actually exited. A child that ignores/slow-handles SIGTERM would
@@ -829,7 +849,11 @@ export class ClaudeProcessPool implements AgentRunner {
   async #writePidListSnapshot(): Promise<void> {
     if (this.#pidListFilePath == null) return;
     try {
-      const list = [...this.#entries.values()]
+      // Round-2 adversarial review fix: include #dying alongside #entries —
+      // a SIGTERM'd-but-not-yet-OS-confirmed-exited child must still appear
+      // on disk (see #dying's own doc for why omitting it here is exactly
+      // the invisible-orphan bug this pid list exists to prevent).
+      const list = [...this.#entries.values(), ...this.#dying]
         .filter((e) => e.child.pid != null)
         .map((e) => ({ pid: e.child.pid, key: e.key, startedAt: e.spawnedAt }));
       await mkdir(path.dirname(this.#pidListFilePath), { recursive: true });

@@ -308,15 +308,26 @@ export async function applyTaskHandleWriteback(
         // into the SAME update() call as lastTurnOutcome (one write, not two).
         // Always REPLACES (never accumulates) — only the latest completed
         // turn's mention intent matters.
+        //
+        // Adversarial review round 2 (§13.4): the anchor is `turnReceivedAt`
+        // (THIS turn's own receipt timestamp, captured at turn START by
+        // handler.ts) — NOT writeback-time Date.now(), which lands after the
+        // agent subprocess ran AND after this function's own getTask()
+        // round-trip above. A common healthy pattern — the agent @-mentions
+        // peer B via lark-cli MID-turn — would otherwise guarantee B's
+        // genuine receipt timestamp predates this (too-late) anchor, making
+        // tier 1 misread an intact handoff as "never received". Falls back
+        // to Date.now() only if turnReceivedAt is somehow unavailable.
         const mentionedPeerBotIds =
           patch.mentionedPeerBotIds && patch.mentionedPeerBotIds.length > 0 ? patch.mentionedPeerBotIds : undefined;
+        const mentionAnchorMs = patch.turnReceivedAt ?? Date.now();
         await deps.store.update(patch.threadId, (current) =>
           current
             ? {
                 ...current,
                 lastTurnOutcome: "completed",
                 lastTurnMentions: mentionedPeerBotIds,
-                lastTurnMentionsAt: mentionedPeerBotIds ? Date.now() : undefined,
+                lastTurnMentionsAt: mentionedPeerBotIds ? mentionAnchorMs : undefined,
               }
             : current,
         );

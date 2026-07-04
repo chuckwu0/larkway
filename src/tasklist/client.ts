@@ -130,13 +130,31 @@ export interface TaskSnapshot {
   dueMs?: number;
 }
 
-/** Shared `due.timestamp` extraction for both getTask and listTasklistTasks — see TaskSnapshot.dueMs's doc. */
+const MS_PER_DAY = 24 * 60 * 60_000;
+
+/**
+ * Shared `due.timestamp` extraction for both getTask and listTasklistTasks —
+ * see TaskSnapshot.dueMs's doc.
+ *
+ * Round-2 adversarial review fix: `is_all_day: true` means `timestamp` only
+ * encodes the DATE part (per `lark-cli schema task tasks get`'s own
+ * description: "如果设为true，timestamp中只有日期的部分会被解析和存储") — i.e.
+ * the stored value is that day's START (00:00), not its end. Left
+ * unadjusted, stallDetector.ts's `Date.now() >= dueMs` check would treat an
+ * all-day task as overdue from the very first moment of its due DATE — up
+ * to ~24h before a human would actually call it late, and (combined with the
+ * due tier's immediate-fire, no-idle-wait design) meaning a task worked hard
+ * on right up to its real deadline gets nudged all day long. For an all-day
+ * due date, the effective cutoff is pushed to the END of that day
+ * (`+ MS_PER_DAY`) instead.
+ */
 function parseDueMs(task: Record<string, unknown>): number | undefined {
   const due = asRecord(task["due"]);
   const timestamp = due["timestamp"];
   if (typeof timestamp !== "string") return undefined;
   const ms = Number(timestamp);
-  return Number.isFinite(ms) ? ms : undefined;
+  if (!Number.isFinite(ms)) return undefined;
+  return due["is_all_day"] === true ? ms + MS_PER_DAY : ms;
 }
 
 export interface TaskMember {
@@ -178,7 +196,30 @@ function wrapErr(label: string, err: unknown): never {
 }
 
 /** Distinct marker so a timeout is never mistaken for a not-found response (isTaskNotFoundError doesn't match it). */
-class TaskRequestTimeoutError extends Error {}
+export class TaskRequestTimeoutError extends Error {}
+
+/**
+ * Detects a LOCAL timeout ({@link withTimeout} racing its own deadline) as
+ * distinct from a genuine transport/API failure. The underlying HTTP request
+ * is NOT aborted by `withTimeout` (`Promise.race` doesn't cancel the loser) —
+ * so a timeout here means the OUTCOME is genuinely unknown: the request may
+ * have already been accepted server-side and just responded slowly. Callers
+ * that would otherwise retry-and-risk-duplicate on ANY failure (e.g.
+ * tasklistPoller.ts's black-hole alert `addComment`) can use this to treat a
+ * timeout as "probably sent" instead of blindly retrying every poll cycle
+ * until the network recovers.
+ *
+ * Every public method here funnels a raw `TaskRequestTimeoutError` through
+ * `wrapErr` (same as any other failure), which re-wraps it into a
+ * `TaskApiError` with the original preserved as `.cause` — so this checks
+ * BOTH the direct instance (in case a future caller ever sees the raw error)
+ * and the wrapped `.cause` chain (the actual shape callers observe today).
+ */
+export function isTaskRequestTimeoutError(err: unknown): boolean {
+  if (err instanceof TaskRequestTimeoutError) return true;
+  if (err instanceof TaskApiError && err.cause instanceof TaskRequestTimeoutError) return true;
+  return false;
+}
 
 /**
  * Race a task-API call against a fixed deadline so a hung request (no

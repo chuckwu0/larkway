@@ -8,9 +8,10 @@
 import { mkdtemp, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { describe, it, expect, vi } from "vitest";
+import { describe, it, expect, vi, afterEach } from "vitest";
 import {
   channelMsgToLarkEvent,
+  resolveOpenChatDiscoveryMs,
   resolveRecoveredThreadId,
   synthesizeCardActionEvent,
   type ChannelCardAction,
@@ -21,6 +22,39 @@ function rawEvent(message: Record<string, unknown>, openId = "ou_sender") {
     raw: { event: { message, sender: { sender_id: { open_id: openId } } } },
   };
 }
+
+// Round-2 adversarial review fix: exported so main.ts's v3.2 handoff-
+// threshold floor warning checks against the REAL resolved discovery
+// cadence (env-override-aware), not the raw compile-time default constant.
+describe("resolveOpenChatDiscoveryMs", () => {
+  const ENV_KEY = "LARKWAY_OPEN_CHAT_DISCOVERY_MS";
+  const original = process.env[ENV_KEY];
+
+  afterEach(() => {
+    if (original === undefined) delete process.env[ENV_KEY];
+    else process.env[ENV_KEY] = original;
+  });
+
+  it("returns the 300s default when neither a ctor value nor the env var is set", () => {
+    delete process.env[ENV_KEY];
+    expect(resolveOpenChatDiscoveryMs(undefined)).toBe(300_000);
+  });
+
+  it("prefers the env var override when no ctor value is given", () => {
+    process.env[ENV_KEY] = "900000";
+    expect(resolveOpenChatDiscoveryMs(undefined)).toBe(900_000);
+  });
+
+  it("prefers an explicit ctor value over the env var", () => {
+    process.env[ENV_KEY] = "900000";
+    expect(resolveOpenChatDiscoveryMs(60_000)).toBe(60_000);
+  });
+
+  it("falls back to the default when the env var is present but not a valid number", () => {
+    process.env[ENV_KEY] = "not-a-number";
+    expect(resolveOpenChatDiscoveryMs(undefined)).toBe(300_000);
+  });
+});
 
 describe("channelMsgToLarkEvent", () => {
   it("reconstructs a lark-cli-shaped event from the raw body (post + mentions preserved)", () => {

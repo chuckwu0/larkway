@@ -174,7 +174,17 @@ function resolveGraceMs(ctorValue: number | undefined): number {
   return Number.isFinite(raw) && raw > 0 ? raw : 0;
 }
 
-function resolveOpenChatDiscoveryMs(ctorValue: number | undefined): number {
+/**
+ * Exported (round-2 adversarial review fix) so main.ts's v3.2 handoff-
+ * threshold floor warning (docs/task-handle.md §13.4) checks against the
+ * REAL resolved discovery cadence — main.ts never passes `openChatDiscoveryMs`
+ * to the constructor, so `LARKWAY_OPEN_CHAT_DISCOVERY_MS` (a documented,
+ * actually-deployed override knob) always takes effect for it. Comparing
+ * against the raw `DEFAULT_OPEN_CHAT_DISCOVERY_MS` constant instead would
+ * silently mismatch the doc's own stated basis ("部署实际的 gap-fill 周期")
+ * whenever that env var is set.
+ */
+export function resolveOpenChatDiscoveryMs(ctorValue: number | undefined): number {
   let raw: number;
   if (ctorValue !== undefined) {
     raw = ctorValue;
