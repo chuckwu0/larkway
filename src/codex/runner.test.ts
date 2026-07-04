@@ -16,6 +16,7 @@ import {
   _buildCodexEnv as buildCodexEnv,
   _CodexAppServerLineParser as CodexAppServerLineParser,
   _CodexLineParser as CodexLineParser,
+  codexEffortFromLarkway,
   productizeCodexFailure,
 } from "./runner.js";
 
@@ -424,6 +425,22 @@ describe("buildCodexEnv", () => {
   });
 });
 
+describe("codexEffortFromLarkway", () => {
+  it("maps low/medium/high straight through (identical vocab)", () => {
+    expect(codexEffortFromLarkway("low")).toBe("low");
+    expect(codexEffortFromLarkway("medium")).toBe("medium");
+    expect(codexEffortFromLarkway("high")).toBe("high");
+  });
+
+  it("maps larkway's 'max' to codex's 'xhigh' — codex has no 'max' tier", () => {
+    expect(codexEffortFromLarkway("max")).toBe("xhigh");
+  });
+
+  it("passes an unrecognized value through unchanged (forward-compat, matches botLoader's advisory-only warn)", () => {
+    expect(codexEffortFromLarkway("ultrathink")).toBe("ultrathink");
+  });
+});
+
 describe("productizeCodexFailure", () => {
   it("turns readonly state DB stderr into a user-facing repair hint", () => {
     const msg = productizeCodexFailure(
@@ -750,6 +767,66 @@ describe("runCodex() — spawn-level integration", () => {
 
     const turnStart = requests.find((request) => request.method === "turn/start");
     expect(turnStart?.params).toMatchObject({ model: "gpt-5.4-codex" });
+  });
+
+  it("passes opts.effort through as turn/start.effort, mapped through codexEffortFromLarkway (max → xhigh)", async () => {
+    const fake = makeFakeCodexChild();
+    __nextFakeCodexChild = fake;
+
+    const { runCodex } = await import("./runner.js");
+    const handle = runCodex({ prompt: "continue the task", effort: "max" });
+
+    const eventsPromise = collectEvents(handle.events);
+    await new Promise<void>((res) => setImmediate(() => {
+      fake.stdout.write(APP_INIT_RESPONSE + "\n");
+      fake.stdout.write(APP_THREAD_RESPONSE + "\n");
+      fake.stdout.write(APP_TURN_RESPONSE + "\n");
+      fake.stdout.write(APP_TURN_COMPLETED + "\n");
+      res();
+    }));
+
+    await eventsPromise;
+    await handle.done;
+
+    const stdinText: string = fake.child.stdin.read()?.toString("utf8") ?? "";
+    const requests: Array<{ method?: string; params?: Record<string, unknown> }> = stdinText
+      .trim()
+      .split("\n")
+      .filter(Boolean)
+      .map((line: string) => JSON.parse(line) as { method?: string; params?: Record<string, unknown> });
+
+    const turnStart = requests.find((request) => request.method === "turn/start");
+    expect(turnStart?.params).toMatchObject({ effort: "xhigh" });
+  });
+
+  it("omits turn/start.effort when opts.effort is unset — byte-identical to pre-existing behavior", async () => {
+    const fake = makeFakeCodexChild();
+    __nextFakeCodexChild = fake;
+
+    const { runCodex } = await import("./runner.js");
+    const handle = runCodex({ prompt: "continue the task" });
+
+    const eventsPromise = collectEvents(handle.events);
+    await new Promise<void>((res) => setImmediate(() => {
+      fake.stdout.write(APP_INIT_RESPONSE + "\n");
+      fake.stdout.write(APP_THREAD_RESPONSE + "\n");
+      fake.stdout.write(APP_TURN_RESPONSE + "\n");
+      fake.stdout.write(APP_TURN_COMPLETED + "\n");
+      res();
+    }));
+
+    await eventsPromise;
+    await handle.done;
+
+    const stdinText: string = fake.child.stdin.read()?.toString("utf8") ?? "";
+    const requests: Array<{ method?: string; params?: Record<string, unknown> }> = stdinText
+      .trim()
+      .split("\n")
+      .filter(Boolean)
+      .map((line: string) => JSON.parse(line) as { method?: string; params?: Record<string, unknown> });
+
+    const turnStart = requests.find((request) => request.method === "turn/start");
+    expect(turnStart?.params).not.toHaveProperty("effort");
   });
 
   it("批C: omits turn/start.model when opts.model is unset — byte-identical to pre-existing behavior", async () => {

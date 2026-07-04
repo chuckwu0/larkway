@@ -73,9 +73,11 @@ export interface RunOptions {
   /**
    * Optional per-bot reasoning-effort override (perf plan 批C). The claude
    * CLI supports `--effort <low|medium|high|max>` (confirmed, incl. in
-   * non-interactive `-p` mode). Codex app-server support for a per-turn
-   * effort override is unconfirmed — see src/codex/runner.ts — so setting
-   * this on a codex bot is currently a no-op there, not an error.
+   * non-interactive `-p` mode). Codex app-server also supports a per-turn
+   * override via `turn/start.effort` (confirmed against the live app-server
+   * protocol + model catalog — see codexEffortFromLarkway in
+   * src/codex/runner.ts for the low/medium/high/max → low/medium/high/xhigh
+   * mapping).
    * @default undefined
    */
   effort?: string;

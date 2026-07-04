@@ -139,6 +139,42 @@ function codexApprovalPolicy(mode: NonNullable<RunOptions["permissionMode"]>): s
 }
 
 // ---------------------------------------------------------------------------
+// codexEffortFromLarkway — larkway effort vocab → codex ReasoningEffort
+// ---------------------------------------------------------------------------
+
+/**
+ * Maps larkway's canonical effort vocabulary (low/medium/high/max — see
+ * KNOWN_EFFORT_VALUES in src/config/botLoader.ts) to the codex app-server's
+ * `ReasoningEffort` values.
+ *
+ * Confirmed live (2026-07-04) via `model/list` against every model currently
+ * in the catalog (gpt-5.5, gpt-5.4, gpt-5.4-mini, gpt-5.3-codex, gpt-5.2):
+ * each exposes exactly `low` / `medium` / `high` / `xhigh` in
+ * `supportedReasoningEfforts` — the same four tiers as the official Codex
+ * desktop client's "Reasoning: Light / Medium / High / Extra High" picker.
+ * Codex has no "max" tier, so larkway's "max" (its ceiling) maps to codex's
+ * ceiling, "xhigh".
+ *
+ * `effort` is set on `TurnStartParams` (confirmed field, per-turn override —
+ * `ThreadStartParams` has no such field, so this is NOT settable at
+ * thread/start time).
+ *
+ * Unrecognized larkway values pass through unchanged (forward-compatible,
+ * best-effort) — botLoader's advisory warn already flags anything outside
+ * the known set before it gets here.
+ */
+const CODEX_EFFORT_FROM_LARKWAY: Record<string, string> = {
+  low: "low",
+  medium: "medium",
+  high: "high",
+  max: "xhigh",
+};
+
+export function codexEffortFromLarkway(effort: string): string {
+  return CODEX_EFFORT_FROM_LARKWAY[effort] ?? effort;
+}
+
+// ---------------------------------------------------------------------------
 // parseCodexLine — normalise a single NDJSON line from codex --json
 // ---------------------------------------------------------------------------
 
@@ -632,13 +668,12 @@ export function runCodex(opts: RunOptions, codexBinPath = "codex"): RunHandle {
                 sandboxPolicy: codexTurnSandboxPolicy(mode),
               };
               if (opts.cwd != null) turnParams["cwd"] = opts.cwd;
-              // Per-bot model override (perf plan 批C): `turn/start` params
-              // confirmed to accept an optional `model` override. `effort` is
-              // NOT wired here — no confirmed equivalent per-turn override
-              // field in the app-server JSON-RPC schema as of this writing
-              // (unlike the claude CLI's `--effort` flag); setting
-              // botConfig.effort on a codex bot is currently a harmless no-op.
+              // Per-bot model/effort override (perf plan 批C): `turn/start`
+              // params confirmed to accept optional `model` and `effort`
+              // overrides (see codexEffortFromLarkway above for the mapping
+              // + how this was confirmed against the live model catalog).
               if (opts.model) turnParams["model"] = opts.model;
+              if (opts.effort) turnParams["effort"] = codexEffortFromLarkway(opts.effort);
               sendRequest("turn/start", turnParams);
             }
             continue;

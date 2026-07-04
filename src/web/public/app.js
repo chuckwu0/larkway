@@ -827,14 +827,26 @@ function modelSuggestionsForBackend(backendId) {
   ];
 }
 
-/** effort <select> 的 <option> HTML(闭集,与底座无关 —— 只在 claude 时可见)。 */
-function effortOptionsHTML(effortVal) {
+/**
+ * effort <select> 的 <option> HTML。两家底座共用同一套 value(low/medium/high/max)
+ * ——claude 直接透传给 --effort;codex 经 codexEffortFromLarkway 映射成它自己的
+ * low/medium/high/xhigh(即官方 Codex 客户端 Reasoning 选择器里的
+ * Light/Medium/High/Extra High,已用 model/list 实测确认)。value 保持一致只是
+ * 为了 larkway 配置层统一,label 按底座换成对应措辞,避免用户以为 codex 也有个
+ * 叫 "max" 的档位。
+ * @param {string} effortVal
+ * @param {string} backendId
+ */
+function effortOptionsHTML(effortVal, backendId) {
+  const labels = backendId === "codex"
+    ? { low: "low (Light)", medium: "medium (Medium)", high: "high (High)", max: "max (Extra High)" }
+    : { low: "low", medium: "medium", high: "high", max: "max" };
   return [
     ["", "默认（不覆盖）"],
-    ["low", "low"],
-    ["medium", "medium"],
-    ["high", "high"],
-    ["max", "max"],
+    ["low", labels.low],
+    ["medium", labels.medium],
+    ["high", labels.high],
+    ["max", labels.max],
   ].map(([v, label]) => `<option value="${esc(v)}"${v === effortVal ? " selected" : ""}>${esc(label)}</option>`).join("");
 }
 
@@ -852,9 +864,6 @@ function buildModelEffortHTML(bot) {
   const modelListHTML = modelSuggestionsForBackend(backendId)
     .map(([v, label]) => `<option value="${esc(v)}">${esc(label)}</option>`)
     .join("");
-  // effort 只对 claude 生效 —— 底座=codex 时整个隐藏而不是只提示,避免用户
-  // 以为它对 codex 也生效。
-  const effortHidden = backendId !== "claude";
   return (
     `<div class="ac-field" id="lk-bk-model-effort" style="margin-top:14px;padding-top:14px;border-top:1px solid var(--border)">` +
     `<label class="ac-label" for="ac-model">Model / Effort 覆盖 <span class="ac-optional">可选</span></label>` +
@@ -862,8 +871,8 @@ function buildModelEffortHTML(bot) {
     `<div style="display:flex;gap:12px;flex-wrap:wrap;align-items:center">` +
     `<input list="ac-model-list" id="ac-model" name="model" class="ac-input" style="width:210px" value="${esc(modelVal)}" placeholder="默认（不覆盖）" autocomplete="off" />` +
     `<datalist id="ac-model-list">${modelListHTML}</datalist>` +
-    `<span id="ac-effort-field" style="${effortHidden ? "display:none" : ""}">` +
-    `<select id="ac-effort" name="effort" class="ac-input" style="width:150px">${effortOptionsHTML(effortVal)}</select>` +
+    `<span id="ac-effort-field">` +
+    `<select id="ac-effort" name="effort" class="ac-input" style="width:150px">${effortOptionsHTML(effortVal, backendId)}</select>` +
     `</span>` +
     `</div>` +
     `</div>`
@@ -871,7 +880,8 @@ function buildModelEffortHTML(bot) {
 }
 
 /**
- * 底座切换时实时刷新 model 建议项 + effort 控件的显隐。
+ * 底座切换时实时刷新 model 建议项 + effort 选项的措辞。effort 两家底座都生效
+ * (见 effortOptionsHTML 顶部注释),这里只换 label,不再隐藏控件。
  * @param {HTMLElement} panel
  * @param {string} backendId
  */
@@ -882,8 +892,11 @@ function refreshModelEffortForBackend(panel, backendId) {
       .map(([v, label]) => `<option value="${esc(v)}">${esc(label)}</option>`)
       .join("");
   }
-  const effortField = panel.querySelector("#ac-effort-field");
-  if (effortField) effortField.style.display = backendId === "claude" ? "" : "none";
+  const effortSelect = panel.querySelector("#ac-effort");
+  if (effortSelect) {
+    const currentVal = effortSelect.value;
+    effortSelect.innerHTML = effortOptionsHTML(currentVal, backendId);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -3512,8 +3525,8 @@ function wireDetailEvents(panel, id, bot) {
         const rosterChipEl = rosterLi.querySelector(".roster-state > span[style*='margin-left:auto']");
         if (rosterChipEl) rosterChipEl.innerHTML = lkBackendChipHTML(newId, { size: "sm" });
       }
-      // model 建议项(claude/codex 模型完全不是一回事)+ effort 控件显隐(只对
-      // claude 有意义)随底座即时切换,不用等保存。
+      // model 建议项(claude/codex 模型完全不是一回事)+ effort 选项措辞(两家
+      // 底座都生效,只是值域映射不同)随底座即时切换,不用等保存。
       refreshModelEffortForBackend(panel, newId);
       toast(`底座已切换为 ${lkBackend(newId).name}（保存后生效）`, "info");
     });

@@ -24,9 +24,13 @@ import { ResponseSurfacePrototypeConfigSchema } from "../responseSurface.js";
 // ---------------------------------------------------------------------------
 
 /**
- * Known claude CLI `--effort` values (confirmed via docs, see src/claude/
- * runner.ts). Advisory only — `effort` itself stays an open zod string so an
- * unrecognized value never fails validation, it's just flagged with a warn.
+ * Larkway's canonical effort vocabulary — confirmed supported by both
+ * backends: the claude CLI's `--effort <value>` flag verbatim (see
+ * src/claude/runner.ts), and codex's `turn/start.effort` via the
+ * codexEffortFromLarkway low/medium/high/max → low/medium/high/xhigh mapping
+ * (see src/codex/runner.ts). Advisory only — `effort` itself stays an open
+ * zod string so an unrecognized value never fails validation, it's just
+ * flagged with a warn.
  */
 const KNOWN_EFFORT_VALUES = new Set(["low", "medium", "high", "max"]);
 
@@ -287,11 +291,11 @@ export const BotConfigSchema = z.object({
   /**
    * Per-bot reasoning-effort override (perf plan 批 C 旋钮). Passed through
    * verbatim as `--effort <value>` on the claude CLI (confirmed supported:
-   * `claude --effort low|medium|high|max`, also non-interactive). Codex
-   * app-server support for a per-turn effort override is unconfirmed as of
-   * this writing (only `model` is confirmed in `turn/start` params) — set
-   * on a codex bot is currently a harmless no-op there, not an error.
-   * Omitted = unchanged default behavior.
+   * `claude --effort low|medium|high|max`, also non-interactive). Also
+   * confirmed supported on codex via `turn/start.effort`, mapped through
+   * codexEffortFromLarkway (src/codex/runner.ts) since codex's own value
+   * space is low/medium/high/xhigh, not low/medium/high/max. Omitted =
+   * unchanged default behavior.
    */
   effort: z.string().min(1).optional(),
 
@@ -398,8 +402,8 @@ export async function loadBots(botsDir: string): Promise<BotConfig[]> {
       console.warn(
         `[botLoader] Bot "${bot.id}" effort "${bot.effort}" is not one of the known values ` +
           `(${[...KNOWN_EFFORT_VALUES].join(", ")}). Continuing — the value is still passed ` +
-          `through to the backend CLI verbatim, but a typo here will silently fail the bot's ` +
-          `spawn every turn. Double-check it against the claude CLI's --effort flag.`,
+          `through to the backend CLI verbatim (claude: --effort; codex: mapped through ` +
+          `codexEffortFromLarkway), but a typo here will silently fail the bot's spawn every turn.`,
       );
     }
 

@@ -71,6 +71,7 @@ import {
   buildCodexEnv,
   CodexAppServerLineParser,
   codexApprovalPolicy,
+  codexEffortFromLarkway,
   codexThreadSandboxMode,
   codexTurnSandboxPolicy,
   extractThreadIdFromThreadResponse,
@@ -368,6 +369,7 @@ export class CodexProcessPool implements AgentRunner {
     };
     if (state.opts.cwd != null) turnParams["cwd"] = state.opts.cwd;
     if (state.opts.model) turnParams["model"] = state.opts.model;
+    if (state.opts.effort) turnParams["effort"] = codexEffortFromLarkway(state.opts.effort);
     try {
       this.#send("turn/start", turnParams, { turnKey: state.turnKey, kind: "turn" });
     } catch (err) {

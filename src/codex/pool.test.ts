@@ -284,6 +284,46 @@ describe("CodexProcessPool — wire protocol", () => {
     expect(turnStart?.params).toMatchObject({ threadId: "thread-a", cwd: "/repo/wt", approvalPolicy: "on-request" });
   });
 
+  it("sends state.opts.effort through turn/start.effort, mapped through codexEffortFromLarkway (max → xhigh)", async () => {
+    const pool = new CodexProcessPool({});
+    const handle = pool.run({ prompt: "hi", effort: "max" });
+    await flush();
+    const child = spawnedChildren[0]!;
+
+    child.stdout.write(initResponse(1) + "\n");
+    await flush();
+    child.stdout.write(threadResponse(2, "thread-a") + "\n");
+    await flush();
+    child.stdout.write(turnStartResponse(3, "turn-a") + "\n");
+    child.stdout.write(turnCompleted("thread-a", "turn-a") + "\n");
+    await flush();
+    await handle.done;
+
+    const requests = readOutboundRequests(child);
+    const turnStart = requests.find((r) => r.method === "turn/start");
+    expect(turnStart?.params).toMatchObject({ effort: "xhigh" });
+  });
+
+  it("omits turn/start.effort when opts.effort is unset — byte-identical to pre-existing behavior", async () => {
+    const pool = new CodexProcessPool({});
+    const handle = pool.run({ prompt: "hi" });
+    await flush();
+    const child = spawnedChildren[0]!;
+
+    child.stdout.write(initResponse(1) + "\n");
+    await flush();
+    child.stdout.write(threadResponse(2, "thread-a") + "\n");
+    await flush();
+    child.stdout.write(turnStartResponse(3, "turn-a") + "\n");
+    child.stdout.write(turnCompleted("thread-a", "turn-a") + "\n");
+    await flush();
+    await handle.done;
+
+    const requests = readOutboundRequests(child);
+    const turnStart = requests.find((r) => r.method === "turn/start");
+    expect(turnStart?.params).not.toHaveProperty("effort");
+  });
+
   it("resume: sends thread/resume with the resumeSessionId, marks resumeMode same-process", async () => {
     const pool = new CodexProcessPool({});
     const handle = pool.run({ prompt: "continue", resumeSessionId: "prior-thread-id" });
