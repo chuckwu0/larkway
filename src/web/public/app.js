@@ -798,6 +798,95 @@ function lkHexA(hex, alpha) {
 }
 
 // ---------------------------------------------------------------------------
+// Model / Effort 覆盖(perf plan 批 C 旋钮)—— 挂在底座卡片下方,因为可选的
+// model 建议项直接取决于选了哪个底座。
+// ---------------------------------------------------------------------------
+
+/**
+ * model 输入的建议项(datalist,非枚举)。按底座区分,因为两家模型名字完全不同:
+ * claude 是 --model 接受的别名;codex 是 OpenAI 模型 slug(取自本机
+ * ~/.codex/models_cache.json 当前可见模型,按 priority 升序的前三个:
+ * gpt-5.5(默认/最强)· gpt-5.4-mini(更快更省)· gpt-5.3-codex(编程特化),
+ * 不是瞎猜的名字)。input 本身允许自由输入任意值 —— 两家模型都在演进,建议项
+ * 只是省得手打,不是白名单。
+ * @param {string} backendId
+ * @returns {Array<[string,string]>} [value, label][]
+ */
+function modelSuggestionsForBackend(backendId) {
+  if (backendId === "codex") {
+    return [
+      ["gpt-5.5", "gpt-5.5 · 当前默认，最强"],
+      ["gpt-5.4-mini", "gpt-5.4-mini · 更快更省"],
+      ["gpt-5.3-codex", "gpt-5.3-codex · 编程特化"],
+    ];
+  }
+  return [
+    ["fable", "fable"],
+    ["opus", "opus"],
+    ["sonnet", "sonnet"],
+  ];
+}
+
+/** effort <select> 的 <option> HTML(闭集,与底座无关 —— 只在 claude 时可见)。 */
+function effortOptionsHTML(effortVal) {
+  return [
+    ["", "默认（不覆盖）"],
+    ["low", "low"],
+    ["medium", "medium"],
+    ["high", "high"],
+    ["max", "max"],
+  ].map(([v, label]) => `<option value="${esc(v)}"${v === effortVal ? " selected" : ""}>${esc(label)}</option>`).join("");
+}
+
+/**
+ * Model / Effort 覆盖块的 HTML —— 嵌进「用哪个底座驱动它」卡片(lk-bk-card),
+ * 紧跟在 lkBackendSelectHTML(...) 后面。只在编辑态渲染(调用方 buildDetailHTML
+ * 只服务已存在的 bot);新建流程走 /api/onboard/finalize,那条路径尚不转发
+ * 这两个字段,建完再来编辑页配即可。
+ * @param {{model?:string, effort?:string, backend?:string}} bot
+ */
+function buildModelEffortHTML(bot) {
+  const modelVal = bot.model ?? "";
+  const effortVal = bot.effort ?? "";
+  const backendId = bot.backend || LK_BACKEND_DEFAULT;
+  const modelListHTML = modelSuggestionsForBackend(backendId)
+    .map(([v, label]) => `<option value="${esc(v)}">${esc(label)}</option>`)
+    .join("");
+  // effort 只对 claude 生效 —— 底座=codex 时整个隐藏而不是只提示,避免用户
+  // 以为它对 codex 也生效。
+  const effortHidden = backendId !== "claude";
+  return (
+    `<div class="ac-field" id="lk-bk-model-effort" style="margin-top:14px;padding-top:14px;border-top:1px solid var(--border)">` +
+    `<label class="ac-label" for="ac-model">Model / Effort 覆盖 <span class="ac-optional">可选</span></label>` +
+    `<p class="ac-hint">不覆盖 = 用账号默认；降低 effort 会牺牲判断深度。</p>` +
+    `<div style="display:flex;gap:12px;flex-wrap:wrap;align-items:center">` +
+    `<input list="ac-model-list" id="ac-model" name="model" class="ac-input" style="width:210px" value="${esc(modelVal)}" placeholder="默认（不覆盖）" autocomplete="off" />` +
+    `<datalist id="ac-model-list">${modelListHTML}</datalist>` +
+    `<span id="ac-effort-field" style="${effortHidden ? "display:none" : ""}">` +
+    `<select id="ac-effort" name="effort" class="ac-input" style="width:150px">${effortOptionsHTML(effortVal)}</select>` +
+    `</span>` +
+    `</div>` +
+    `</div>`
+  );
+}
+
+/**
+ * 底座切换时实时刷新 model 建议项 + effort 控件的显隐。
+ * @param {HTMLElement} panel
+ * @param {string} backendId
+ */
+function refreshModelEffortForBackend(panel, backendId) {
+  const datalist = panel.querySelector("#ac-model-list");
+  if (datalist) {
+    datalist.innerHTML = modelSuggestionsForBackend(backendId)
+      .map(([v, label]) => `<option value="${esc(v)}">${esc(label)}</option>`)
+      .join("");
+  }
+  const effortField = panel.querySelector("#ac-effort-field");
+  if (effortField) effortField.style.display = backendId === "claude" ? "" : "none";
+}
+
+// ---------------------------------------------------------------------------
 // BL-17: 运行态 vs 配置态底座不一致 badge
 // ---------------------------------------------------------------------------
 
@@ -2400,34 +2489,6 @@ function buildAgentConfigHTML(bot, memContent, mode, prefill) {
   const chatsVal = Array.isArray(bot.chats) ? bot.chats.join("\n") : (bot.chats || "");
   const turnLimit = bot.turn_taking_limit ?? 10;
 
-  // model / effort 覆盖(perf plan 批 C 旋钮)。仅编辑态渲染 —— 新建流程走
-  // /api/onboard/finalize,那条路径尚不转发这两个字段,建完再来编辑页配即可。
-  const modelVal = bot.model ?? "";
-  const effortVal = bot.effort ?? "";
-  const modelOptionsHTML = [
-    ["", "默认（不覆盖）"],
-    ["fable", "fable"],
-    ["opus", "opus"],
-    ["sonnet", "sonnet"],
-  ].map(([v, label]) => `<option value="${esc(v)}"${v === modelVal ? " selected" : ""}>${esc(label)}</option>`).join("");
-  const effortOptionsHTML = [
-    ["", "默认（不覆盖）"],
-    ["low", "low"],
-    ["medium", "medium"],
-    ["high", "high"],
-    ["max", "max"],
-  ].map(([v, label]) => `<option value="${esc(v)}"${v === effortVal ? " selected" : ""}>${esc(label)}</option>`).join("");
-  const modelEffortHTML = isCreate ? "" : (
-    `<div class="ac-field">` +
-    `<label class="ac-label" for="ac-model">Model / Effort 覆盖 <span class="ac-optional">可选</span></label>` +
-    `<p class="ac-hint">effort 只对 claude 基座生效；换更快模型或降低 effort 都能提速，但降 effort 会牺牲判断深度——判断类角色建议保持默认。</p>` +
-    `<div style="display:flex;gap:12px;flex-wrap:wrap">` +
-    `<select id="ac-model" name="model" class="ac-input" style="width:170px">${modelOptionsHTML}</select>` +
-    `<select id="ac-effort" name="effort" class="ac-input" style="width:170px">${effortOptionsHTML}</select>` +
-    `</div>` +
-    `</div>`
-  );
-
   const appId = isCreate ? (prefill?.appId ?? "") : (bot.app_id ?? "");
   const openId = isCreate ? (prefill?.openId ?? "") : (bot.bot_open_id ?? "");
 
@@ -2590,7 +2651,6 @@ function buildAgentConfigHTML(bot, memContent, mode, prefill) {
     `<p class="ac-hint">防止它一口气干太多步；默认 10。</p>` +
     `<input id="ac-turn-limit" name="turn_taking_limit" class="ac-input" type="number" min="1" value="${esc(turnLimit)}" style="width:130px" />` +
     `</div>` +
-    modelEffortHTML +
     `<div class="ac-field">` +
     `<label class="ac-label" for="ac-chats">谁能 @ 它（哪些群）</label>` +
     `<p class="ac-hint">留空 = 任何群 @ 它都会回复（最省事，推荐）。只想限定 → 填群号 oc_…，一行一个。</p>` +
@@ -2855,12 +2915,13 @@ function readAgentConfigValues(panel) {
     turn_taking_limit: turnLimit,
     _memContent: memContent, // 带出,由调用方分别 PUT /api/memory
   };
-  // model/effort:仅编辑态渲染这两个 select(create 模式下查不到,值为 undefined
-  // 时不带字段)。带 "" 是有意的 ——「默认（不覆盖）」选项要让后端把已有覆盖值删掉,
+  // model/effort:控件挂在底座卡片(lk-bk-card)里,在 #ac-panel 之外,所以从
+  // panel(而非 ac)查找;仅编辑态渲染(create 模式下查不到,值为 undefined 时
+  // 不带字段)。带 "" 是有意的 ——「默认（不覆盖）」选项要让后端把已有覆盖值删掉,
   // 不是不发这个字段(不发 = 后端保留原值,详见 api.ts putBot 的合并逻辑)。
-  const modelSel = ac.querySelector("#ac-model");
-  const effortSel = ac.querySelector("#ac-effort");
-  if (modelSel) config.model = modelSel.value;
+  const modelInput = panel.querySelector("#ac-model");
+  const effortSel = panel.querySelector("#ac-effort");
+  if (modelInput) config.model = modelInput.value.trim();
   if (effortSel) config.effort = effortSel.value;
   if (botId) config.id = botId;
   // ① 新保存契约:_gitlabTokenValue === undefined 表示「不带字段」(保留现有)
@@ -3262,6 +3323,7 @@ function buildDetailHTML(id, bot, memContent) {
     `<h4 class="lk-bk-card-title">${ICONS.box} 用哪个底座驱动它</h4>` +
     `<p class="lk-bk-card-desc">底座决定这个助手背后跑哪个 CLI agent。默认 Codex；切换后需重启服务生效。</p>` +
     lkBackendSelectHTML(_configuredBk4, `bk-edit-${id}`) +
+    buildModelEffortHTML(bot) +
     bkMismatchDetail +
     `</div>`;
 
@@ -3450,7 +3512,17 @@ function wireDetailEvents(panel, id, bot) {
         const rosterChipEl = rosterLi.querySelector(".roster-state > span[style*='margin-left:auto']");
         if (rosterChipEl) rosterChipEl.innerHTML = lkBackendChipHTML(newId, { size: "sm" });
       }
+      // model 建议项(claude/codex 模型完全不是一回事)+ effort 控件显隐(只对
+      // claude 有意义)随底座即时切换,不用等保存。
+      refreshModelEffortForBackend(panel, newId);
       toast(`底座已切换为 ${lkBackend(newId).name}（保存后生效）`, "info");
+    });
+
+    // model(input)/effort(select)挂在 lk-bk-card 里、在 #ac-panel 之外 ——
+    // #ac-panel 的 input 脏检测监听器(见上)碰不到它们,这里单独接一份。
+    bkCard.addEventListener("input", () => {
+      state.formDirty = acFormSnapshot(panel) !== panel._acBaseline;
+      updateFormDirty(panel);
     });
   }
 
