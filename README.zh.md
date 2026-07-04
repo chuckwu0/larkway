@@ -124,6 +124,26 @@ Larkway 不注入 `ANTHROPIC_API_KEY` 或任何其他 API key。子进程继承�
 - **Session 续接** —— 每个飞书话题映射到持久 `session_id`，agent 记得之前做了什么
 - **Agent Workspace** —— 每个话题独立 git worktree，agent 并发处理多个话题不冲突
 - **Codex 运行时预检** —— `larkway doctor` 在启动前验证 Codex 状态目录可写
+- **话题↔飞书任务句柄** —— 把话题转成飞书任务，agent 自动认领并自己维护整个生命周期（完成/失败重开/停滞唤醒/协作断链检测/过期催更）——详见下方
+
+---
+
+## 话题↔飞书任务句柄（可选功能）
+
+把一个飞书话题转成任务，agent 会自动认领它，然后自己维护整个生命周期——完成、
+失败/reopen、停滞唤醒、协作 bot 之间的断链检测、任务过期催更——不需要额外提示。
+
+```bash
+# 1. 先在飞书任务中心自己手动建一个清单（名字随便起）
+# 2. adopt 它 —— 把你的 bot 加为 editor，所有权还是归你自己：
+larkway tasklist-init --adopt "<清单名>" --team <bot1,bot2,…>
+# 3. 在 bot 所在的群里，对任意话题消息右键「转任务」进这个清单——
+#    大约一分钟内自动认领，不用再聊。
+```
+
+`larkway doctor` 的常规检查里会包含每个 bot 的话题↔任务句柄配置状态（是否配置、
+scope 是否健康）。完整设计、配置项、平台事实排查记录见：
+[docs/task-handle.md](docs/task-handle.md)。
 
 ---
 
@@ -162,6 +182,7 @@ Larkway 不注入 `ANTHROPIC_API_KEY` 或任何其他 API key。子进程继承�
 | Agent workspace 运行时（v0.3） | [docs/agent-workspace.md](docs/agent-workspace.md) |
 | 版本历史与 semver 映射 | [docs/versioning.md](docs/versioning.md) |
 | Bridge ↔ Agent Prompt 契约 | [docs/prompt-contract.md](docs/prompt-contract.md) |
+| 话题↔飞书任务句柄（设计 + 配置） | [docs/task-handle.md](docs/task-handle.md) |
 | Bot 配置 + memory 模板 | [bots-examples/](bots-examples/) |
 
 ---

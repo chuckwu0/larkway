@@ -544,6 +544,135 @@ async function checkWsConnectivity(ctx: CliContext, opts: { lint: boolean }): Pr
   };
 }
 
+/**
+ * Cheap real probe: `listTasklistTasks(guid, {pageSize: 1})` — the smallest
+ * real call that exercises the app's actual granted task scopes (a scope
+ * error surfaces at request time, not at token-fetch time). Mirrors
+ * probeWsConnect's posture: never throws, always returns a result.
+ */
+async function probeTaskScope(
+  appId: string,
+  appSecret: string,
+  tasklistGuid: string,
+): Promise<{ ok: boolean; message?: string }> {
+  try {
+    const { Client: LarkSdkClient } = await import("@larksuiteoapi/node-sdk");
+    const { TaskListClient } = await import("../../tasklist/client.js");
+    const sdkClient = new LarkSdkClient({ appId, appSecret });
+    const taskClient = new TaskListClient({
+      request: (config) => sdkClient.request(config as Parameters<typeof sdkClient.request>[0]),
+    });
+    await taskClient.listTasklistTasks(tasklistGuid, { pageSize: 1 });
+    return { ok: true };
+  } catch (err) {
+    return { ok: false, message: err instanceof Error ? err.message : String(err) };
+  }
+}
+
+/** Required task v2 scopes for the task-handle feature (docs/task-handle.md §7). */
+const TASK_HANDLE_REQUIRED_SCOPES = [
+  "task:tasklist:read",
+  "task:tasklist:write",
+  "task:task:read",
+  "task:comment:write",
+];
+
+/**
+ * 7. 话题↔任务句柄配置状态 + task scope 探测 (v3.4 发现性, docs/task-handle.md §7).
+ * A bot with no resolvable tasklistGuid is NOT an error — the feature is
+ * opt-in by design (§6: no claim = same as disabled) — but an operator who
+ * never knew it existed has no way to discover it; this surfaces a pointer
+ * to `tasklist-init --adopt` instead of staying silent. A bot that DOES have
+ * a guid gets a cheap real probe (same LARKWAY_SKIP_WS_PROBE opt-out and
+ * lint-downgrades-network-failures-to-warn posture as checkWsConnectivity)
+ * so a missing scope grant surfaces here, with the exact scope list AND an
+ * open-platform grant-link template, instead of only showing up later as a
+ * cryptic runtime warning from tasklistPoller/stallDetector/writeback.
+ */
+async function checkTaskHandle(ctx: CliContext, opts: { lint: boolean }): Promise<CheckResult[]> {
+  const results: CheckResult[] = [];
+  const botIds = await ctx.botsStore.listBots();
+  if (botIds.length === 0) return results; // nothing to check — checkBotYaml already reports "no bots"
+
+  const { resolveTaskTeamRegistryPath } = await import("../../config/paths.js");
+  const { readTeamTasklistGuid } = await import("../../tasklist/teamRegistry.js");
+  const registryGuid = await readTeamTasklistGuid(resolveTaskTeamRegistryPath());
+
+  let anyConfigured = false;
+  for (const id of botIds) {
+    let bot;
+    try {
+      bot = await ctx.botsStore.readBot(id);
+    } catch {
+      continue; // schema errors already reported by checkBotYaml
+    }
+    const guid = bot.taskHandle?.tasklistGuid ?? registryGuid;
+    if (!guid) continue; // feature dormant for this bot — summarized once below, not per-bot noise
+    anyConfigured = true;
+
+    if (process.env["LARKWAY_SKIP_WS_PROBE"] === "1") {
+      results.push({
+        id: `task-handle-${id}`,
+        label: `bot "${id}" 话题↔任务句柄`,
+        status: "ok",
+        message: `已配置(guid=${guid}),scope 探测已跳过(LARKWAY_SKIP_WS_PROBE=1)。`,
+      });
+      continue;
+    }
+
+    const appSecret = await ctx.hostConfig.readSecret(bot.app_secret_env);
+    if (!appSecret) {
+      results.push({
+        id: `task-handle-${id}`,
+        label: `bot "${id}" 话题↔任务句柄`,
+        status: "warn",
+        message: `已配置 guid=${guid},但 AppSecret 缺失,跳过 scope 探测(见飞书凭据检查项)。`,
+      });
+      continue;
+    }
+
+    const probe = await probeTaskScope(bot.app_id, appSecret, guid);
+    if (probe.ok) {
+      results.push({
+        id: `task-handle-${id}`,
+        label: `bot "${id}" 话题↔任务句柄`,
+        status: "ok",
+        message: `已配置(guid=${guid}),task scope 探测成功。`,
+      });
+    } else {
+      const scopeLink =
+        `https://open.feishu.cn/app/${bot.app_id}/auth?q=${TASK_HANDLE_REQUIRED_SCOPES.join(",")}` +
+        "&op_from=doctor&token_type=tenant";
+      // Network/timeout errors shouldn't fail CI (same posture as the WS
+      // probe) — but a scope/permission error is a real, actionable
+      // misconfiguration even in --lint mode, so it stays error there too.
+      const looksLikeScopeError = /scope|permission|无权限|未授权|access.denied/i.test(probe.message ?? "");
+      results.push({
+        id: `task-handle-${id}`,
+        label: `bot "${id}" 话题↔任务句柄`,
+        status: opts.lint && !looksLikeScopeError ? "warn" : "error",
+        message:
+          `已配置 guid=${guid},但 task scope 探测失败:${probe.message ?? "未知错误"}\n` +
+          `  需要以下 scope:${TASK_HANDLE_REQUIRED_SCOPES.join(", ")}\n` +
+          `  开通链接:${scopeLink}`,
+      });
+    }
+  }
+
+  if (!anyConfigured) {
+    results.push({
+      id: "task-handle-not-configured",
+      label: "话题↔任务句柄 (可选)",
+      status: "ok",
+      message:
+        "未配置任何 bot 的话题↔任务句柄(可选功能)。想启用:" +
+        'larkway tasklist-init --adopt "<清单名>" --team <bot1,bot2,…>(见 docs/task-handle.md §7)。',
+    });
+  }
+
+  return results;
+}
+
 // ---------------------------------------------------------------------------
 // Run all checks
 // ---------------------------------------------------------------------------
@@ -572,6 +701,10 @@ async function runAllChecks(ctx: CliContext, opts: { lint: boolean }): Promise<C
   // 6. Codex CLI availability (required only if a bot uses backend: codex)
   const codexChecks = await checkCodex(ctx);
   results.push(...codexChecks);
+
+  // 7. Task-handle config status + scope probe (v3.4 discoverability)
+  const taskHandleChecks = await checkTaskHandle(ctx, opts);
+  results.push(...taskHandleChecks);
 
   return results;
 }

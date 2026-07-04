@@ -651,6 +651,21 @@ async function runV2Mode({
           );
           stallDetector.start();
         }
+      } else {
+        // v3.4 discoverability (docs/task-handle.md §7): a bot with no
+        // resolvable tasklistGuid (no yaml config, no shared registry entry)
+        // has the whole task-handle feature dormant — silently, by design
+        // (§6: no claim = same as disabled). That's the RIGHT default
+        // behavior, but an operator who never even knew this feature existed
+        // has no way to discover it short of reading docs cover-to-cover.
+        // One line at startup, printed once per bot (this block runs exactly
+        // once per bot during the startup loop, never on a timer) — points
+        // at the CLI that turns it on and where to read more.
+        console.log(
+          `[larkway] bot "${bot.id}": 话题↔任务句柄未配置(taskHandle.tasklistGuid 缺失,` +
+            `共享注册文件里也没有)。想启用请跑 larkway tasklist-init --adopt "<清单名>" ` +
+            `--team ${bot.id}(见 docs/task-handle.md §7)。`,
+        );
       }
     }
 

@@ -17,6 +17,12 @@
  * tests that spawn real subprocesses); resolveOwnerOpenId itself has its own
  * dedicated test file (../ownerIdentity.test.ts) covering the spawn/parse
  * logic with an injected fake spawnSync.
+ *
+ * v3.4 `--adopt` mode (docs/task-handle.md §7) never touches the SDK Client
+ * mock above at all — it goes entirely through ../userTasklistOps.js's
+ * lark-cli-shelling functions, ALSO mocked here for the same "never spawn a
+ * real subprocess in a unit test" reason; that module has its own dedicated
+ * test file (../userTasklistOps.test.ts) covering the spawn/parse logic.
  */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
@@ -28,6 +34,7 @@ import * as botsStore from "../botsStore.js";
 import * as hostConfig from "../hostConfig.js";
 import type { CliContext } from "../types.js";
 import type { BotConfig } from "../../config/botLoader.js";
+import type { UserOpResult, UserTasklistSummary } from "../userTasklistOps.js";
 
 type FakeMember = { id: string; type: string; role: string };
 
@@ -40,6 +47,12 @@ let mockedAutoResolvedOwner: string | undefined;
 let currentMembers: FakeMember[];
 /** When true, the fake GET .../tasklists/:guid handler throws instead of responding. */
 let mockGetTasklistThrows: boolean;
+
+// v3.4 --adopt mode: controllable results for the mocked userTasklistOps.js functions.
+let mockedListUserTasklists: UserOpResult<UserTasklistSummary[]>;
+let mockedAddTasklistMembersAsUser: UserOpResult<unknown>;
+let mockedGetUserTasklistMembers: UserOpResult<Array<{ id: string; type?: string; role?: string }>>;
+let capturedAddMembersAsUserCall: { profile: string; tasklistGuid: string; members: unknown[] } | undefined;
 
 function makeCtx(overrides: Partial<CliContext["flags"]> = {}): CliContext {
   const botsDir = path.join(tmpDir, "bots");
@@ -85,6 +98,11 @@ beforeEach(async () => {
   currentMembers = [];
   mockGetTasklistThrows = false;
   mockedAutoResolvedOwner = undefined; // default: auto-detect finds nothing, same as no lark-cli user login
+  // v3.4 --adopt mode defaults — individual tests override to exercise each branch.
+  mockedListUserTasklists = { ok: true, data: [] };
+  mockedAddTasklistMembersAsUser = { ok: true, data: {} };
+  mockedGetUserTasklistMembers = { ok: true, data: [] };
+  capturedAddMembersAsUserCall = undefined;
   vi.resetModules();
   vi.doMock("@larksuiteoapi/node-sdk", () => ({
     Client: class {
@@ -114,6 +132,14 @@ beforeEach(async () => {
   vi.doMock("../ownerIdentity.js", () => ({
     resolveOwnerOpenId: () => mockedAutoResolvedOwner,
   }));
+  vi.doMock("../userTasklistOps.js", () => ({
+    listUserTasklists: () => mockedListUserTasklists,
+    addTasklistMembersAsUser: (profile: string, tasklistGuid: string, members: unknown[]) => {
+      capturedAddMembersAsUserCall = { profile, tasklistGuid, members };
+      return mockedAddTasklistMembersAsUser;
+    },
+    getUserTasklistMembers: () => mockedGetUserTasklistMembers,
+  }));
 
   vi.spyOn(ui, "print").mockImplementation(() => {});
   vi.spyOn(ui, "printErr").mockImplementation(() => {});
@@ -129,6 +155,7 @@ afterEach(async () => {
   else process.env.LARKWAY_HOME = origLarkwayHome;
   vi.doUnmock("@larksuiteoapi/node-sdk");
   vi.doUnmock("../ownerIdentity.js");
+  vi.doUnmock("../userTasklistOps.js");
   vi.resetModules();
   vi.restoreAllMocks();
   await rm(tmpDir, { recursive: true, force: true });
@@ -407,5 +434,153 @@ describe("tasklist-init --team", () => {
         reused: false,
       }),
     );
+  });
+});
+
+describe("tasklist-init --adopt (v3.4, docs/task-handle.md §7)", () => {
+  it("fails with usage when --adopt is passed an empty name", async () => {
+    await makeBot("bot-a", "cli_a", "BOT_A_SECRET");
+    const { run } = await import("./tasklistInit.js");
+    const code = await run(makeCtx(), ["--adopt", "", "--team", "bot-a"]);
+    expect(code).toBe(1);
+    expect(ui.failure).toHaveBeenCalled();
+  });
+
+  it("still requires --team even in adopt mode", async () => {
+    const { run } = await import("./tasklistInit.js");
+    const code = await run(makeCtx(), ["--adopt", "Agent Team"]);
+    expect(code).toBe(1);
+    expect(ui.failure).toHaveBeenCalledWith(expect.stringContaining("--team"));
+  });
+
+  it("fails with an actionable auth-login hint when listUserTasklists fails (no user identity / missing scope)", async () => {
+    await makeBot("bot-a", "cli_a", "BOT_A_SECRET");
+    mockedListUserTasklists = { ok: false, error: "need_user_authorization" };
+    const { run } = await import("./tasklistInit.js");
+    const code = await run(makeCtx(), ["--adopt", "Agent Team", "--team", "bot-a"]);
+    expect(code).toBe(1);
+    expect(ui.failure).toHaveBeenCalledWith(expect.stringContaining("lark-cli auth login"));
+    expect(ui.failure).toHaveBeenCalledWith(expect.stringContaining("--domain task"));
+  });
+
+  it("fails clearly when no tasklist matches the given name", async () => {
+    await makeBot("bot-a", "cli_a", "BOT_A_SECRET");
+    mockedListUserTasklists = { ok: true, data: [{ guid: "tl-other", name: "Some Other List" }] };
+    const { run } = await import("./tasklistInit.js");
+    const code = await run(makeCtx(), ["--adopt", "Agent Team", "--team", "bot-a"]);
+    expect(code).toBe(1);
+    expect(ui.failure).toHaveBeenCalledWith(expect.stringContaining("没找到"));
+  });
+
+  it("fails clearly (listing every guid) when MULTIPLE tasklists share the given name", async () => {
+    await makeBot("bot-a", "cli_a", "BOT_A_SECRET");
+    mockedListUserTasklists = {
+      ok: true,
+      data: [
+        { guid: "tl-dup-1", name: "Agent Team" },
+        { guid: "tl-dup-2", name: "Agent Team" },
+      ],
+    };
+    const { run } = await import("./tasklistInit.js");
+    const code = await run(makeCtx(), ["--adopt", "Agent Team", "--team", "bot-a"]);
+    expect(code).toBe(1);
+    expect(ui.failure).toHaveBeenCalledWith(expect.stringContaining("tl-dup-1"));
+    expect(ui.failure).toHaveBeenCalledWith(expect.stringContaining("tl-dup-2"));
+    expect(ui.failure).toHaveBeenCalledWith(expect.stringContaining("--guid"));
+  });
+
+  it("--guid bypasses the by-name lookup entirely, even when listUserTasklists would fail", async () => {
+    await makeBot("bot-a", "cli_a", "BOT_A_SECRET");
+    mockedListUserTasklists = { ok: false, error: "should never be consulted" };
+    mockedGetUserTasklistMembers = { ok: true, data: [{ id: "cli_a", type: "app", role: "editor" }] };
+    const { run } = await import("./tasklistInit.js");
+    const code = await run(makeCtx(), ["--adopt", "Agent Team", "--team", "bot-a", "--guid", "tl-explicit"]);
+    expect(code).toBe(0);
+    expect(capturedAddMembersAsUserCall?.tasklistGuid).toBe("tl-explicit");
+  });
+
+  it("happy path: finds the single match, adds every --team bot as editor, writes the registry, confirms readback", async () => {
+    await makeBot("bot-a", "cli_a", "BOT_A_SECRET");
+    await makeBot("bot-b", "cli_b", "BOT_B_SECRET");
+    mockedListUserTasklists = { ok: true, data: [{ guid: "tl-adopted-1", name: "Agent Team" }] };
+    mockedGetUserTasklistMembers = {
+      ok: true,
+      data: [
+        { id: "cli_a", type: "app", role: "editor" },
+        { id: "cli_b", type: "app", role: "editor" },
+      ],
+    };
+    const { run } = await import("./tasklistInit.js");
+    const code = await run(makeCtx({ json: true }), ["--adopt", "Agent Team", "--team", "bot-a,bot-b"]);
+
+    expect(code).toBe(0);
+    expect(capturedAddMembersAsUserCall?.tasklistGuid).toBe("tl-adopted-1");
+    expect(capturedAddMembersAsUserCall?.members).toEqual([
+      { id: "cli_a", type: "app", role: "editor" },
+      { id: "cli_b", type: "app", role: "editor" },
+    ]);
+    expect(ui.emitJson).toHaveBeenCalledWith(
+      expect.objectContaining({
+        ok: true,
+        mode: "adopt",
+        adoptedName: "Agent Team",
+        tasklistGuid: "tl-adopted-1",
+        missingBots: [],
+        registryMismatch: false,
+      }),
+    );
+
+    const { readTeamTasklistGuid } = await import("../../tasklist/teamRegistry.js");
+    const { resolveTaskTeamRegistryPath } = await import("../../config/paths.js");
+    await expect(readTeamTasklistGuid(resolveTaskTeamRegistryPath())).resolves.toBe("tl-adopted-1");
+  });
+
+  it("warns (does not fail) when a bot is missing from the post-add readback", async () => {
+    await makeBot("bot-a", "cli_a", "BOT_A_SECRET");
+    mockedListUserTasklists = { ok: true, data: [{ guid: "tl-adopted-1", name: "Agent Team" }] };
+    mockedGetUserTasklistMembers = { ok: true, data: [] }; // bot-a never actually landed
+    const { run } = await import("./tasklistInit.js");
+    const code = await run(makeCtx(), ["--adopt", "Agent Team", "--team", "bot-a"]);
+    expect(code).toBe(0);
+    expect(ui.warning).toHaveBeenCalledWith(expect.stringContaining("bot-a")); // reports the bot's config id
+  });
+
+  it("fails clearly (actionable scope hint) when addTasklistMembersAsUser fails", async () => {
+    await makeBot("bot-a", "cli_a", "BOT_A_SECRET");
+    mockedListUserTasklists = { ok: true, data: [{ guid: "tl-adopted-1", name: "Agent Team" }] };
+    mockedAddTasklistMembersAsUser = { ok: false, error: "no permission" };
+    const { run } = await import("./tasklistInit.js");
+    const code = await run(makeCtx(), ["--adopt", "Agent Team", "--team", "bot-a"]);
+    expect(code).toBe(1);
+    expect(ui.failure).toHaveBeenCalledWith(expect.stringContaining("task:tasklist:write"));
+  });
+
+  it("does NOT overwrite an already-registered DIFFERENT guid without --force — warns about the mismatch instead", async () => {
+    const { claimTeamTasklistGuid, readTeamTasklistGuid } = await import("../../tasklist/teamRegistry.js");
+    const { resolveTaskTeamRegistryPath } = await import("../../config/paths.js");
+    await claimTeamTasklistGuid(resolveTaskTeamRegistryPath(), "tl-preexisting");
+
+    await makeBot("bot-a", "cli_a", "BOT_A_SECRET");
+    mockedListUserTasklists = { ok: true, data: [{ guid: "tl-adopted-new", name: "Agent Team" }] };
+    const { run } = await import("./tasklistInit.js");
+    const code = await run(makeCtx(), ["--adopt", "Agent Team", "--team", "bot-a"]);
+
+    expect(code).toBe(0); // members were still added to the adopted list — only the registry write is skipped
+    expect(ui.warning).toHaveBeenCalledWith(expect.stringContaining("--force"));
+    await expect(readTeamTasklistGuid(resolveTaskTeamRegistryPath())).resolves.toBe("tl-preexisting"); // unchanged
+  });
+
+  it("--force overwrites an already-registered guid with the newly adopted one", async () => {
+    const { claimTeamTasklistGuid, readTeamTasklistGuid } = await import("../../tasklist/teamRegistry.js");
+    const { resolveTaskTeamRegistryPath } = await import("../../config/paths.js");
+    await claimTeamTasklistGuid(resolveTaskTeamRegistryPath(), "tl-preexisting");
+
+    await makeBot("bot-a", "cli_a", "BOT_A_SECRET");
+    mockedListUserTasklists = { ok: true, data: [{ guid: "tl-adopted-new", name: "Agent Team" }] };
+    const { run } = await import("./tasklistInit.js");
+    const code = await run(makeCtx(), ["--adopt", "Agent Team", "--team", "bot-a", "--force"]);
+
+    expect(code).toBe(0);
+    await expect(readTeamTasklistGuid(resolveTaskTeamRegistryPath())).resolves.toBe("tl-adopted-new");
   });
 });

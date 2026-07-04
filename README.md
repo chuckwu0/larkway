@@ -124,6 +124,28 @@ Secrets live only in `~/.larkway/.env` (mode 0600). Config and memory contain no
 - **Session continuity** — every Feishu thread maps to a persistent `session_id`; the agent remembers what it did in prior turns
 - **Agent Workspace** — per-thread git worktrees; the agent can run multiple threads concurrently without git conflicts
 - **Codex runtime pre-checks** — `larkway doctor` validates Codex state directory writability before start
+- **Topic ↔ Feishu task handle** — turn a topic into a Feishu task and the agent claims it, then keeps its lifecycle (done/failed/reopened, stalled, handed off, overdue) in sync automatically — see below
+
+---
+
+## Task handle: topic ↔ Feishu task (optional)
+
+Turn a Feishu topic into a task and the agent will claim it, then keep its whole
+lifecycle in sync on its own — completion, failure/reopen, stall wake-ups,
+handoff-break detection between collaborating bots, and overdue nudges — no
+extra prompting needed.
+
+```bash
+# 1. In the Feishu Task Center, create a tasklist yourself (any name).
+# 2. Adopt it — adds your bot(s) as editors, ownership stays yours:
+larkway tasklist-init --adopt "<tasklist name>" --team <bot1,bot2,…>
+# 3. Right-click "转任务" (convert to task) on any topic message in a group
+#    the bot is in — it auto-claims within about a minute, no further chat needed.
+```
+
+`larkway doctor` reports each bot's task-handle status (configured/scope
+health) as part of its regular checks. Full design, configuration knobs, and
+platform-fact writeups: [docs/task-handle.md](docs/task-handle.md).
 
 ---
 
@@ -162,6 +184,7 @@ Secrets live only in `~/.larkway/.env` (mode 0600). Config and memory contain no
 | Agent workspace runtime (v0.3) | [docs/agent-workspace.md](docs/agent-workspace.md) |
 | Version history and semver mapping | [docs/versioning.md](docs/versioning.md) |
 | Bridge ↔ Agent prompt contract | [docs/prompt-contract.md](docs/prompt-contract.md) |
+| Topic ↔ Feishu task handle (design + config) | [docs/task-handle.md](docs/task-handle.md) |
 | Bot config + memory templates | [bots-examples/](bots-examples/) |
 
 ---

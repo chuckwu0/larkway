@@ -61,6 +61,13 @@ beforeEach(async () => {
 
   // Make botsStore.resolveBotsDir() use our tmp dir
   process.env.LARKWAY_BOTS_DIR = botsDir;
+  // v3.4 task-handle check: resolveTaskTeamRegistryPath()/readTeamTasklistGuid()
+  // (config/paths.ts) go through the GLOBAL larkwayHome() (process.env.
+  // LARKWAY_HOME), NOT ctx.hostConfig's per-test override — without this, the
+  // task-handle check would read the REAL ~/.larkway/task-team.json on
+  // whatever machine runs the tests. Isolate it the same way LARKWAY_BOTS_DIR
+  // isolates botsStore.
+  process.env.LARKWAY_HOME = larkwayDir;
   // Skip real WS probe in unit tests — fake credentials can't reach Feishu.
   // The probe logic itself is exercised by ws-connectivity-specific tests below.
   process.env.LARKWAY_SKIP_WS_PROBE = "1";
@@ -68,6 +75,7 @@ beforeEach(async () => {
 
 afterEach(async () => {
   delete process.env.LARKWAY_BOTS_DIR;
+  delete process.env.LARKWAY_HOME;
   delete process.env.LARKWAY_SKIP_WS_PROBE;
   await rm(tmpRoot, { recursive: true, force: true });
 });
@@ -88,6 +96,11 @@ function validBotYaml(id = "test-bot"): string {
     `chats:`,
     `  - "oc_test_chat_123"`,
   ].join("\n");
+}
+
+/** Same as validBotYaml, but with taskHandle.tasklistGuid set (v3.4 task-handle check tests). */
+function botYamlWithTaskHandle(id = "test-bot", tasklistGuid = "tl-test-guid"): string {
+  return validBotYaml(id) + `\ntaskHandle:\n  tasklistGuid: "${tasklistGuid}"\n`;
 }
 
 /** Write a bot yaml */
@@ -660,4 +673,117 @@ describe("doctor ws-connectivity probe", () => {
       expect(wsCheck?.status).toBe("ok");
     });
   });
+});
+
+describe("doctor task-handle check (v3.4 discoverability, docs/task-handle.md §7)", () => {
+  it("reports 'ok' informationally when no bot has a resolvable tasklistGuid (feature is optional, not misconfigured)", async () => {
+    await withFakeHome(async () => {
+      await writeBotYaml("test-bot", validBotYaml("test-bot")); // no taskHandle field
+      await writeEnvFile({ TEST_APP_SECRET: "any" });
+      await writeFakeClaude();
+
+      const output: unknown[] = [];
+      const ctx = buildCtx({ json: true, nonInteractive: true }, { captureJson: output });
+      const code = await run(ctx, ["--lint"]);
+
+      const result = output[0] as { checks: Array<{ id: string; status: string; message?: string }> };
+      const check = result.checks.find((c) => c.id === "task-handle-not-configured");
+      expect(check?.status).toBe("ok");
+      expect(check?.message).toContain("tasklist-init --adopt");
+      expect(code).not.toBe(2);
+    });
+  });
+
+  it("resolves the guid from yaml (taskHandle.tasklistGuid) and reports ok with the probe skipped", async () => {
+    await withFakeHome(async () => {
+      await writeBotYaml("test-bot", botYamlWithTaskHandle("test-bot", "tl-from-yaml"));
+      await writeEnvFile({ TEST_APP_SECRET: "any" });
+      await writeFakeClaude();
+      // LARKWAY_SKIP_WS_PROBE=1 already set by beforeEach
+
+      const output: unknown[] = [];
+      const ctx = buildCtx({ json: true, nonInteractive: true }, { captureJson: output });
+      await run(ctx, ["--lint"]);
+
+      const result = output[0] as { checks: Array<{ id: string; status: string; message?: string }> };
+      const check = result.checks.find((c) => c.id === "task-handle-test-bot");
+      expect(check?.status).toBe("ok");
+      expect(check?.message).toContain("tl-from-yaml");
+    });
+  });
+
+  it("resolves the guid from the shared team registry when yaml has none", async () => {
+    await withFakeHome(async () => {
+      await writeBotYaml("test-bot", validBotYaml("test-bot")); // no taskHandle field
+      await writeEnvFile({ TEST_APP_SECRET: "any" });
+      await writeFakeClaude();
+      const { claimTeamTasklistGuid } = await import("../../tasklist/teamRegistry.js");
+      const { resolveTaskTeamRegistryPath } = await import("../../config/paths.js");
+      await claimTeamTasklistGuid(resolveTaskTeamRegistryPath(), "tl-from-registry");
+
+      const output: unknown[] = [];
+      const ctx = buildCtx({ json: true, nonInteractive: true }, { captureJson: output });
+      await run(ctx, ["--lint"]);
+
+      const result = output[0] as { checks: Array<{ id: string; status: string; message?: string }> };
+      const check = result.checks.find((c) => c.id === "task-handle-test-bot");
+      expect(check?.status).toBe("ok");
+      expect(check?.message).toContain("tl-from-registry");
+    });
+  });
+
+  it("warns (not errors) when AppSecret is missing, skipping the probe", async () => {
+    await withFakeHome(async () => {
+      await writeBotYaml("test-bot", botYamlWithTaskHandle("test-bot"));
+      // No .env written at all — AppSecret unresolvable
+      await writeFakeClaude();
+      delete process.env.LARKWAY_SKIP_WS_PROBE; // must fall through to the appSecret check, not the skip branch
+
+      const output: unknown[] = [];
+      const ctx = buildCtx({ json: true, nonInteractive: true }, { captureJson: output });
+      const code = await run(ctx, ["--lint"]);
+
+      const result = output[0] as { checks: Array<{ id: string; status: string }> };
+      const check = result.checks.find((c) => c.id === "task-handle-test-bot");
+      expect(check?.status).toBe("warn");
+      expect(code).not.toBe(2);
+    });
+  });
+
+  it("--lint mode: a non-scope-shaped probe failure (fake creds) downgrades to warn, not error (CI stays green)", async () => {
+    await withFakeHome(async () => {
+      await writeBotYaml("test-bot", botYamlWithTaskHandle("test-bot"));
+      await writeEnvFile({ TEST_APP_SECRET: "fake-secret-for-probe-test" });
+      await writeFakeClaude();
+      delete process.env.LARKWAY_SKIP_WS_PROBE; // let the real probe run (will fail — fake creds)
+
+      const output: unknown[] = [];
+      const ctx = buildCtx({ json: true, nonInteractive: true }, { captureJson: output });
+      const code = await run(ctx, ["--lint"]);
+
+      const result = output[0] as { checks: Array<{ id: string; status: string; message?: string }> };
+      const check = result.checks.find((c) => c.id === "task-handle-test-bot");
+      expect(check?.status).toBe("warn");
+      expect(code).not.toBe(2);
+    });
+  }, 15000);
+
+  it("outside --lint, a probe failure is a real error and includes the required scope list + grant-link template", async () => {
+    await withFakeHome(async () => {
+      await writeBotYaml("test-bot", botYamlWithTaskHandle("test-bot"));
+      await writeEnvFile({ TEST_APP_SECRET: "fake-secret-for-probe-test" });
+      await writeFakeClaude();
+      delete process.env.LARKWAY_SKIP_WS_PROBE;
+
+      const output: unknown[] = [];
+      const ctx = buildCtx({ json: true, nonInteractive: true }, { captureJson: output });
+      await run(ctx, []); // NOT --lint
+
+      const result = output[0] as { checks: Array<{ id: string; status: string; message?: string }> };
+      const check = result.checks.find((c) => c.id === "task-handle-test-bot");
+      expect(check?.status).toBe("error");
+      expect(check?.message).toContain("task:tasklist:read");
+      expect(check?.message).toContain("open.feishu.cn");
+    });
+  }, 15000);
 });

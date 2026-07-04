@@ -82,8 +82,17 @@
 ### 5.3 归属与隐私边界(v2:团队共享单清单)
 
 - **一个 owner 一个「Agent Team」清单,跨群跨 agent 共用**。清单归 owner 所有,人类成员**只有 owner**(默认不共享给任何群);owner 想给谁看,自己在飞书里手动分享/加权限,**bridge 不管可见范围**。隐私天然干净:清单不自动暴露给任何群,不管话题来自哪个群,板都只有 owner 看得到。
-  > 平台细节:task v2 API 的 `owner`/`creator` 字段是建清单时调用身份自动生成的(此实现无 user-token 流程,实际调用身份是 team 里第一个 bot 的 app,而非 owner 本人的账号)。owner 能在自己的飞书任务中心**看到并管理**这个清单,靠的不是这个 API 字段,而是 `tasklist-init` CLI 把 owner 的 open_id 作为**人类成员**(role=editor)显式加入清单(见 §7)——这是 F2 修复项,早期实现遗漏过这一步,导致清单建成后 owner 反而看不到。
+  > 平台细节(v3.4 更新):`--adopt` 模式(推荐路径,见 §7)下 owner/creator 语义**天然正确**——
+  > 清单本来就是 owner 自己在飞书任务中心手动建的,task v2 API 的 `owner`/`creator` 字段从创建那
+  > 一刻起就是 owner 本人,不需要额外补人类成员。`--team`-only 回退模式(lark-cli 用户身份不可用
+  > 时)则不同:建清单时调用身份是 team 里第一个 bot 的 app(此路径无 user-token 流程),`owner`/
+  > `creator` 字段会是那个 bot,owner 能在自己的飞书任务中心**看到并管理**这个清单,靠的是
+  > `tasklist-init` CLI 额外把 owner 的 open_id 作为**人类成员**(role=editor)显式加入清单(见
+  > §7)——这是 F2 修复项,早期实现遗漏过这一步,导致清单建成后 owner 反而看不到。
 - **写入方 = owner 这一组 agent 的 app**。这些 agent 是不同 app 身份,要都能往清单写任务/评论,provisioning 时把它们的 app 都加为清单 **editor**(这是给「自己的 agent」写权限,不是共享给外人,隐私不变)。
+- **分享给同事看 ≠ 给 viewer**(v3.4 澄清):owner 想让同事也能把话题转任务进这个清单,必须手动
+  在飞书任务中心把对方加为 **editor**——`role=viewer` 只能看不能转任务进来(转任务本质是往清单
+  写一条新任务,viewer 没有写权限)。这条边界完全在飞书平台侧由角色决定,bridge 不参与也管不了。
 - **只收 owner 转的任务**:owner 右键转的话题才进这个清单;非 owner(群里其他人)转的任务不进 owner 的板(那是他自己的任务,在他「我负责的」里,与本清单无关)。owner 语义沿用 agent-workspace.md §6 的 `sender_open_id / is_owner`。
 - **认领护栏**:agent 只认领「源话题确实是自己 session」的任务;对不上就静默跳过,不告诉用户。
 - **哪些 agent 算「一组」**:配了同一个 `tasklistGuid` 的那几个 bot(默认可以是同一部署上的全部 bot);跨部署由 provisioning 把同一 guid 写进各 bot 配置。
@@ -116,9 +125,52 @@ taskHandle:
 - 所需飞书 scope(开放平台后台勾选,这就是 opt-in 动作):`task:task:read`、`task:task:write`、`task:tasklist:write`。
 - 应用显示名要可辨识(评论创建者显示为应用名)。
 
-**Provisioning(唯一路径:人手动跑一次 CLI)**:
+**Provisioning(唯一路径:人手动跑一次 CLI,两种模式)**:
+
+**推荐:`--adopt` 模式(v3.4)**——所有权语义天然正确,清单从一开始就归你,bot 只是 editor:
+
+```bash
+# 1. 先在飞书任务中心自己手动建一个清单(名字随便起)
+# 2. adopt 它 —— 把 --team 里的 bot app 加为它的 editor:
+larkway tasklist-init --adopt "<清单名>" --team <bot1,bot2,…> [--guid <guid>] [--force]
+```
+
+- 前置条件:`--team` 里第一个 bot 的 lark-cli profile,必须已经用**用户身份**登录过、且申请了 `task`
+  域的 OAuth 权限:`lark-cli auth login --profile <profile> --domain task`(没做这一步,命令会在
+  第一步报错,报错信息里带这条命令作为提示)。
+- 以你(操作者)的**用户身份**按名字精确匹配你能看到的清单(重名 → 列出全部 guid 报错,用 `--guid`
+  消歧;一个都找不到 → 报错提示先去任务中心建一个)。
+- 把 `--team` 列出的每个 bot 的 app 加为清单成员(`type=app, role=editor`),幂等(已是成员的跳过/
+  无害重复)。
+- 写入共享注册文件(`<LARKWAY_HOME>/task-team.json`),与下面 `--team`-only 模式**同一套**
+  first-writer-wins / `--force` 覆盖语义——已经绑定了另一个 guid 且未传 `--force` 时不会覆盖,只
+  warning 提示加 `--force` 重跑。
+- 读回成员列表,核实每个 bot 真的加入成功(未加入只 warning,不让命令失败)。
+- **为什么推荐这条路**:owner/creator 语义天然正确——这个清单从被创建的那一刻起就归操作者所有,
+  bot 只是被加进去的 editor,不需要像 `--team`-only 模式那样额外把人类 owner 补成员进去(那是因为
+  那条路径用 BOT 的 app 身份建清单,API 层面的 creator 是 bot,不加人类成员操作者根本看不到板)。
+- **平台可行性(v3.4 调研,2026-07 只读实测,未改动任何真实数据)**:
+  1. `lark-cli task tasklists list --as user`(用户身份,非 `--as bot`)支持列出当前用户可见的清单;
+     实测(未授权 task 域权限的 profile 上)报 `need_user_authorization`,`hint` 里明确点名缺
+     `task:tasklist:read` scope——证实机制存在且能准确指路,不是平台不支持。
+  2. `lark-cli schema task.tasklists.list` 的输出 schema 确认 `items[]` 每一项同时带 `guid` 和
+     `name`——按名字查 guid 是平台原生支持的能力,不需要退化方案。
+  3. `lark-cli task tasklists add_members --as user --dry-run` 打印出的请求形状(`{members:
+     [{id,type,role}]}`)与既有 bot 身份路径**完全一致**,只有 `--as` 一个字段不同——CLI 层面对
+     user/bot 两种身份的操作无形状差异,不需要单独适配。
+  4. `lark-cli auth login --help` 的 `--domain` 支持 `task`(`--domain task`)——平台侧确实开放
+     task 域的用户 OAuth 授权,不是只有 app/租户级授权这一条路。
+  - **结论:adopt 路线在 CLI/平台层完全可行**,唯一的前置成本是操作者需要对目标 profile 跑一次
+    `lark-cli auth login --domain task`(一次性,类似 bot app 需要在开放平台后台勾 scope)。
+- ⚠️ **留给 dogfood 验证的一步**:上面 4 点是通过 `--help`/`--dry-run`/`schema` 核实的机制存在性
+  和请求形状,不是一次真实的、带 task 域权限的用户身份端到端调用(本次调研环境里没有一个 profile
+  当场具备 `task:tasklist:*` scope,补授权本身是写操作、按规则不允许在只读排查里做)。首次跑完
+  `--adopt` 后,请实际打开飞书任务中心确认清单可见、bot 确实出现在 editor 列表里。
+
+**回退:`--team`-only 模式**(lark-cli 用户身份不可用时)——用 bot 的 APP 身份建一个新清单:
+
 - `larkway tasklist-init --team <bot1,bot2,…> [--name "Agent Team"] [--owner <open_id>] [--force]`。
-- **owner open_id 解析**(建清单/复用清单前必须先拿到,拿不到直接报错退出,不建、不动任何清单):优先用显式 `--owner`;省略时尝试从 `lark-cli auth status --profile <profile> --json` 读团队第一个 bot 的 lark-cli profile 下已登录的用户身份(`identities.user.openId`)—— larkway 自己没有 OAuth 用户登录流程,这是本机唯一现成的人类身份来源,依赖 owner 之前对该 profile 跑过 `lark-cli auth login`;两者都拿不到就必须显式传 `--owner`。
+- **owner open_id 解析**(建清单/复用清单前必须先拿到,拿不到直接报错退出,不建、不动任何清单):优先用显式 `--owner`;省略时尝试从 `lark-cli auth status --profile <profile> --json` 读团队第一个 bot 的 lark-cli profile 下已登录的用户身份(`identities.user.openId`)——这是本机唯一现成的人类身份来源,依赖 owner 之前对该 profile 跑过 `lark-cli auth login`;两者都拿不到就必须显式传 `--owner`。
 - **先查共享注册表,再决定建不建**(重要:防止重复跑出多个板):
   - 共享注册文件(`<LARKWAY_HOME>/task-team.json`)里**已有** guid 且未传 `--force` → **复用**这个清单,只对**已有清单**调 `add_members` 把 owner + 这组 bot 的 app 补为成员(幂等)——绝不再 `createTasklist`,避免 owner 重新跑一次 CLI(比如给团队新增一个 bot)就意外建出第二个「Agent Team」板,导致某些 bot 写的任务、owner 转的任务分裂在两个不同的板上。
   - 注册表**为空**,或显式传了 `--force` → 建一个新清单(默认名 "Agent Team");`--force` 额外**覆盖**注册表里已有的 guid(默认不覆盖,避免误操作把整个团队切到一个新板——这是显式、需要人确认的动作)。
@@ -128,6 +180,15 @@ taskHandle:
 - **bot 在 startup 时绝不建清单**——只做上面这两处(yaml / 注册文件)的只读解析 + 已知 guid 时的 self-join;没有清单就保持休眠,零网络调用、不注入 prompt,直到 owner 跑一次这条 CLI。
 - 跨部署:provisioning 产出的 guid 手工同步进各部署的共享注册文件或 bot 配置。
 - ⚠️ **留给 dogfood 验证的一步**:「editor 成员能否在飞书任务中心看到板」目前未经真机验证(本实现开发环境无网络/API 访问,只核对了 schema 接受 `type=user` 成员形状,见 §5.3 平台细节框)。首次跑完 `tasklist-init` 后,请实际打开飞书任务中心确认这个清单确实可见、可管理,再判定 provisioning 走通。
+
+**v3.4 发现性补充**:
+- bot 启动时若解析不到任何 guid(yaml 和共享注册文件都没有),打一行一次性提示日志,指向
+  `tasklist-init --adopt` 和本节文档——功能保持休眠是正确的默认行为,但至少让操作者知道这个功能
+  存在。
+- `larkway doctor` 的常规检查里加了 task-handle 状态项:每个 bot 报告"是否已配置 guid"(未配置=
+  可选功能未启用,`ok` 级别,不是问题);已配置的额外做一次廉价的真实探测(`listTasklistTasks`
+  拉第一页,验证 scope 真的生效),探测失败会列出所需 scope 清单 + 对应 app 的开放平台授权链接
+  模板,不用等到真跑起来才在日志里看到一条难懂的 403。
 
 ## 8. 明确不做(边界)
 
@@ -155,6 +216,36 @@ taskHandle:
    > 第一版调研记录(已被上面的方案取代,保留供参考):`SessionRecord` 和 `TaskHandleRecord`(`src/tasklist/store.ts`)都不存标题/正文字段;`handler.ts` 里离得最近的是 `RuntimeEventRecord.textPreview`(120 字符截断,滚动日志上限 20 条,不是稳定的 per-thread 索引)。若要在 THREAD 早已存在、poller 独立定时器触发的场景下事后补一次"这个 thread 的根消息是什么",确实只能像 gap-fill(`channelClient.ts` 的 `+chat-messages-list`)那样现查,不便宜——但这个顾虑只适用于"事后补查",不适用于"分发时顺手记一次",第二版方案绕开了这个假设。
 10. **共享 guid 组的 TaskListClient 固定绑定首个到达的 bot,是个已知的残余降级点**(v3 三次修订):`main.ts` 的 `tasklistGuidGroups` 按 guid 去重时,`group.client` 永远是数组顺序里第一个解析到该 guid 的 bot 的凭据,不会轮换/健康检查。若这个 bot 的 scope 或清单成员资格出问题,整个 guid 组的候选发现 + auto-bind 确认都会失败,即使组内其他 bot 的凭据完全正常。本次只加了"连续失败 N 次后,日志明确点名是哪个 bot 的凭据在拖累整组"(`TasklistPoller` 的 `clientOwnerBotId`),**没有做完整的 client 轮换/故障转移**——那需要更大的改动(检测哪个 client 健康、动态切换),权衡后判断当前"降级为可见的日志"已经把最糟的情况(静默失效)排除了,完整方案留作已知 TODO。
 11. **auto-bind 的"该 thread 当前没有任何已有 claim"防劫持,之前只堵了任务侧,没堵话题侧**(round-2 adversarial review 修正)。上一轮修订(见第 9 条)的表述"claim() 本身现在也会拒绝…"只准确覆盖了**任务侧**方向(同一个 taskGuid 不能被两个 thread 同时认领);但反方向的窗口一直存在:`listRootTexts` 的快照和 `bindThreadToTask` 真正调 `claim()` 之间隔着真实的 `await`(前面每个候选自己的 claim + 确认写入),这段时间里完全可能有一个 agent turn 的 finalize 抢先给同一个 thread 认领了另一个任务 X——auto-bind 随后对这个 thread 调 `claim({taskGuid: Y})` 时,`claim()` 的默认语义(为了兼容 agent 每轮重新声明 guid 的正常场景)会**直接用 Y 替换掉 X**,把 X 静默孤立(X 的描述已经写过 `STATUS_SNAPSHOT_MARKER`,从此被候选过滤器永久排除,没人再管)。修法:`claim()` 新增 `onlyIfThreadUnclaimed` 选项——真时只要这个 thread 已经持有*任何*claim(不只是"持有 Y 之外的另一个 claim"),就直接拒绝,不做替换;只有 `TasklistPoller` 的自动绑定回调会传这个选项,agent 每轮重新声明 guid 的默认路径不受影响、行为不变。
+12. **v3.4 `--adopt` 平台可行性调研,原始命令 + 响应(2026-07,只读实测,未改动任何真实数据)**——
+    §7 已给出结论摘要,这里是那四点结论各自的原始证据:
+    - `lark-cli task tasklists list --as user --profile <profile>`(该 profile 只有 bot 身份、无用户
+      OAuth 授权时)返回:
+      ```json
+      {"ok": false, "identity": "user", "error": {"type": "authentication",
+       "subtype": "token_missing", "message": "need_user_authorization (user: )",
+       "hint": "run: lark-cli auth login to re-authorize\ncurrent command requires scope(s): task:tasklist:read"}}
+      ```
+      exit code 3。`hint` 精确点名 `task:tasklist:read`——证实命令本身是通的,只是这个 profile 的用户
+      身份没申请这个 scope,不是平台不支持用户身份读清单列表。
+    - `lark-cli schema task.tasklists.list` 的 `outputSchema.items[]` 同时含 `guid`
+      (`"example": "cc371766-6584-cf50-a222-c22cd9055004"`)和 `name`
+      (`"example": "年会总结工作任务清单"`)两个字段——按名字找 guid 是 schema 原生支持的形状。
+    - `lark-cli task tasklists add_members --as user --tasklist-guid <guid> --data
+      '{"members":[{"id":"<app_id>","type":"app","role":"editor"}]}' --dry-run` 打印:
+      ```json
+      {"api":[{"method":"POST","url":"/open-apis/task/v2/tasklists/<guid>/add_members",
+       "body":{"members":[{"id":"<app_id>","role":"editor","type":"app"}]}}],"as":"user"}
+      ```
+      与既有 bot 身份路径(`TaskListClient.addTasklistMembers`)构造的请求体完全同形——只有
+      `"as":"user"` 这一个字段不同,证实两种身份在这个端点上没有形状差异。
+    - `lark-cli auth login --help` 的 `--domain` flag 帮助文本里列出的可选值包含 `task`
+      (`--domain strings   domain (repeatable or comma-separated, e.g. --domain calendar,task)
+      available: ..., task, ..., all`)——平台侧确实开放 task 域的用户 OAuth 授权申请,不是只有
+      app/租户级授权这一条路。
+    - **未能验证的部分**:调研环境里没有任何一个 profile 当场具备已授权的 `task:tasklist:*` 用户
+      scope,所以以上四点是通过 `--help`/`--dry-run`/`schema`(均为只读/不执行请求)核实的**机制
+      存在性**,不是一次真实的、带 task 域权限的用户身份端到端调用——真实调用的行为(尤其
+      `add_members --as user` 在真正持有 scope 时的响应形状)留给 dogfood 验证(见 §7 的同名提示)。
 
 ## 10. 开源定位与路线
 

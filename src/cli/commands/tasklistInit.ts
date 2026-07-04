@@ -63,12 +63,17 @@ import {
 } from "../../tasklist/teamRegistry.js";
 import { resolveOwnerOpenId } from "../ownerIdentity.js";
 import { deriveLarkCliProfile } from "../../lark/profileBootstrap.js";
+import { listUserTasklists, addTasklistMembersAsUser, getUserTasklistMembers } from "../userTasklistOps.js";
 
 interface ParsedFlags {
   team: string[];
   name: string;
   owner?: string;
   force: boolean;
+  /** v3.4 --adopt "<清单名>": adopt a tasklist the operator already created themselves via the Task Center UI, instead of creating one via a bot's app credentials. */
+  adopt?: string;
+  /** v3.4: disambiguates --adopt when multiple visible tasklists share the same name. */
+  guid?: string;
 }
 
 function parseArgs(args: string[]): ParsedFlags {
@@ -76,6 +81,8 @@ function parseArgs(args: string[]): ParsedFlags {
   let name = "Agent Team";
   let owner: string | undefined;
   let force = false;
+  let adopt: string | undefined;
+  let guid: string | undefined;
 
   for (let i = 0; i < args.length; i++) {
     const arg = args[i];
@@ -93,45 +100,71 @@ function parseArgs(args: string[]): ParsedFlags {
       owner = arg.slice("--owner=".length);
     } else if (arg === "--force") {
       force = true;
+    } else if (arg === "--adopt" && i + 1 < args.length) {
+      adopt = args[++i];
+    } else if (arg.startsWith("--adopt=")) {
+      adopt = arg.slice("--adopt=".length);
+    } else if (arg === "--guid" && i + 1 < args.length) {
+      guid = args[++i];
+    } else if (arg.startsWith("--guid=")) {
+      guid = arg.slice("--guid=".length);
     }
   }
-  return { team, name, owner, force };
+  return { team, name, owner, force, adopt, guid };
 }
 
 const USAGE = `larkway tasklist-init --team <bot1,bot2,…> [--name <清单名>] [--owner <open_id>] [--force]
+larkway tasklist-init --adopt "<清单名>" --team <bot1,bot2,…> [--guid <guid>] [--force]
 
-为话题↔任务句柄 feature(docs/task-handle.md,v2 团队共享单清单)一次性 provisioning
-(只能由人手动跑一次;bot 自己在 startup 时只读、从不自动建清单):
-  1. 先查共享注册文件 <LARKWAY_HOME>/task-team.json:
-     - 已有 guid 且未传 --force → **复用**已有清单,只把 owner + --team 里的 bot app
-       补为成员(不会建出第二个「Agent Team」板)
-     - 还没有 guid,或传了 --force → 建一个新清单(默认名 "Agent Team")
+**推荐路径是 --adopt**(所有权语义正确:清单天然归你,bot 只是 editor;--team-only
+创建模式仍保留,作为 lark-cli 用户身份不可用时的回退——见下方两种模式各自的说明):
+
+── 模式一(推荐):--adopt "<清单名>" ──
+先在飞书任务中心手动新建一个清单(名字自己取),再用这个命令把 --team 里的 bot app
+加为它的 editor 成员:
+  1. 以你(操作者)的用户身份按名字精确匹配你能看到的清单(重名 → 报错列出全部
+     guid,让你用 --guid 消歧;一个都找不到 → 报错提示先去任务中心建一个)
+  2. 把 --team 列出的每个 bot 的 app 加为清单成员(role=editor,幂等,已是成员的
+     跳过/无害重复)
+  3. 写入共享注册文件 <LARKWAY_HOME>/task-team.json(与 --team-only 模式同一套
+     first-writer-wins / --force 覆盖语义)
+  4. 读回成员列表,核实每个 bot 真的加入成功
+
+前置条件:这个 profile 必须已经用**用户身份**登录过 lark-cli 且申请了 task 域权限:
+  lark-cli auth login --profile <profile> --domain task
+(用哪个 profile:--team 里第一个 bot 的 lark_cli_profile,缺省时用它的 app_id)。
+没有事先登录会在第一步报错,报错信息会带上面这条命令作为提示。
+
+── 模式二(回退):--team(不带 --adopt)──
+lark-cli 用户身份不可用时的旧路径——用第一个 bot 的 APP 身份建一个新清单:
+  1. 先查共享注册文件:已有 guid 且未传 --force → 复用;否则建一个新清单
   2. 把你(owner)加为人类成员(role=editor)—— 否则你在飞书任务中心看不到这个清单
   3. 把 --team 列出的每个 bot 的 app 都加为清单成员(role=editor)
   4. 读回成员列表,若 owner 未成功加入会打印一条 warning(不会让命令失败)
-  5. (仅新建时)把 guid 写进共享注册文件 —— 团队里的 bot 下次重启会自动从这个文件
-     发现并使用同一个 guid,**不需要**手工改 yaml;也可以选择手写进各 bot 的
-     bots/<id>.yaml 的 taskHandle.tasklistGuid 固定绑定
+  5. (仅新建时)把 guid 写进共享注册文件
 
-owner open_id 解析顺序:显式 --owner 优先;省略时尝试从 lark-cli 当前登录的用户身份
-自动解析(团队第一个 bot 的 lark-cli profile,需要你之前对该 profile 跑过
-\`lark-cli auth login\`);两者都拿不到会直接报错退出,不建/不动任何清单。
+owner open_id 解析顺序(仅模式二用到):显式 --owner 优先;省略时尝试从 lark-cli
+当前登录的用户身份自动解析(团队第一个 bot 的 lark-cli profile,需要你之前对该
+profile 跑过 \`lark-cli auth login\`);两者都拿不到会直接报错退出,不建/不动任何清单。
 
---force:显式要求建一个新清单并覆盖共享注册文件里已有的 guid(默认不覆盖,
-避免误操作把整个团队切到一个新板)。
+--force:两种模式下都表示"覆盖共享注册文件里已有的 guid"(默认不覆盖,避免误操作
+把整个团队切到一个新板)。
 
-不会把任何群加为成员 —— v2 清单默认只对 owner 私有。
+不会把任何群加为成员 —— v2 清单默认只对 owner 私有;分享给同事看,要给 editor 权限
+对方才能把话题转任务进来,给 viewer 只能看不能转(见 docs/task-handle.md §5.3)。
 
 ⚠️ 首次跑完后,请在飞书任务中心确认这个清单确实可见(见 docs/task-handle.md §7 —
 本实现无法在无网络环境下端到端验证 editor 成员的可见性,留给这一步人工确认)。
 
 示例:
+  larkway tasklist-init --adopt "Agent Team" --team larkway-devops,larkway-marketing
+  larkway tasklist-init --adopt "Agent Team" --team larkway-devops --guid abc-123-guid
   larkway tasklist-init --team larkway-devops,larkway-marketing --name "Agent Team"
   larkway tasklist-init --team larkway-devops --owner ou_1234567890abcdef
   larkway tasklist-init --team larkway-devops --force`;
 
 export async function run(ctx: CliContext, args: string[]): Promise<number> {
-  const { team, name, owner: explicitOwner, force } = parseArgs(args);
+  const { team, name, owner: explicitOwner, force, adopt, guid: explicitGuid } = parseArgs(args);
 
   if (team.length === 0) {
     const msg = "缺少必需参数:--team <bot1,bot2,…>";
@@ -165,8 +198,20 @@ export async function run(ctx: CliContext, args: string[]): Promise<number> {
   }
 
   // First bot in --team is used for every task-API call (creates the
-  // tasklist when creating one, or drives addTasklistMembers when reusing).
+  // tasklist when creating one, or drives addTasklistMembers when reusing;
+  // in --adopt mode, its lark_cli_profile is also the profile the human
+  // operator's own `lark-cli auth login --domain task` must have targeted).
   const creator = bots[0]!;
+
+  // v3.4 --adopt: entirely separate flow (docs/task-handle.md §7) — the
+  // tasklist already exists (operator made it via the Task Center UI), so
+  // there's no create/reuse-registry-guid branching, no bot-app API client,
+  // and no --owner resolution (the operator running this command already IS
+  // the tasklist's real owner by construction — that's the whole point of
+  // adopting instead of creating via a bot's app credentials).
+  if (adopt !== undefined) {
+    return runAdopt(ctx, { adoptName: adopt, bots, force, explicitGuid });
+  }
 
   // F2: resolve the human owner's open_id BEFORE touching any tasklist — a
   // tasklist with no human member is useless (owner can't see it in their
@@ -324,5 +369,175 @@ export async function run(ctx: CliContext, args: string[]): Promise<number> {
   ctx.ui.print(
     ctx.ui.bold("⚠️ 请手动确认:") + " 去飞书任务中心确认这个清单确实可见(见 docs/task-handle.md §7)。",
   );
+  return 0;
+}
+
+/**
+ * v3.4 `--adopt "<清单名>"` (docs/task-handle.md §7): adopt a tasklist the
+ * operator already created themselves via the Feishu Task Center UI, instead
+ * of creating one via a bot's app credentials. Ownership is correct by
+ * construction (the operator IS the tasklist's real owner the moment they
+ * made it) — this flow only ever ADDS bot apps as editor members, never
+ * creates/deletes/renames anything, and never resolves/adds a human owner
+ * member (unlike the --team-only create path, which has to, since ITS
+ * tasklist's API-level creator is a bot app with no human member by default).
+ *
+ * Every read/write here goes through userTasklistOps.ts's lark-cli
+ * subprocess calls (AS THE HUMAN USER, `--as user`) — `TaskListClient`'s SDK-
+ * based app-credential flow has no user-identity mode at all, so this
+ * deliberately does NOT touch it.
+ */
+async function runAdopt(
+  ctx: CliContext,
+  opts: {
+    adoptName: string;
+    bots: { id: string; app_id: string; appSecret: string; lark_cli_profile?: string }[];
+    force: boolean;
+    explicitGuid?: string;
+  },
+): Promise<number> {
+  const { adoptName, bots, force, explicitGuid } = opts;
+
+  if (adoptName.trim().length === 0) {
+    const msg = "--adopt 需要一个非空的清单名字,例如 --adopt \"Agent Team\"。";
+    if (ctx.flags.json) ctx.ui.emitJson({ ok: false, error: msg });
+    else {
+      ctx.ui.failure(msg);
+      ctx.ui.print(USAGE);
+    }
+    return 1;
+  }
+
+  const creator = bots[0]!;
+  const creatorProfile = deriveLarkCliProfile(creator.lark_cli_profile, creator.app_id);
+  const loginHint = `lark-cli auth login --profile ${creatorProfile} --domain task`;
+
+  let tasklistGuid: string;
+  let matchedName: string;
+
+  if (explicitGuid) {
+    // Skip the by-name lookup entirely — the operator already disambiguated.
+    tasklistGuid = explicitGuid;
+    matchedName = adoptName;
+  } else {
+    const listResult = listUserTasklists(creatorProfile);
+    if (!listResult.ok) {
+      const msg =
+        `无法以你的用户身份列出清单:${listResult.error}\n\n` +
+        `请先确认已用这个 profile 登录过用户身份、且申请了 task 域权限:\n  ${loginHint}\n` +
+        `(可用 \`lark-cli auth status --profile ${creatorProfile} --json\` 检查当前状态)`;
+      if (ctx.flags.json) ctx.ui.emitJson({ ok: false, error: msg });
+      else {
+        ctx.ui.failure(msg);
+        ctx.ui.print(USAGE);
+      }
+      return 1;
+    }
+    const matches = listResult.data.filter((t) => t.name === adoptName);
+    if (matches.length === 0) {
+      const msg =
+        `在你能看到的清单里没找到名为 "${adoptName}" 的清单。请先去飞书任务中心新建一个同名清单,` +
+        "再重跑这个命令;或者检查名字是否完全一致(注意全半角字符、多余空格)。";
+      if (ctx.flags.json) ctx.ui.emitJson({ ok: false, error: msg });
+      else ctx.ui.failure(msg);
+      return 1;
+    }
+    if (matches.length > 1) {
+      const msg =
+        `找到 ${matches.length} 个同名清单 "${adoptName}",无法确定要 adopt 哪一个:\n` +
+        matches.map((t) => `  - ${t.guid}`).join("\n") +
+        "\n请用 --guid <guid> 显式指定其中一个,或去飞书任务中心把其中一个改名后再重跑。";
+      if (ctx.flags.json) ctx.ui.emitJson({ ok: false, error: msg });
+      else ctx.ui.failure(msg);
+      return 1;
+    }
+    tasklistGuid = matches[0]!.guid;
+    matchedName = matches[0]!.name;
+  }
+
+  const members: TaskMember[] = bots.map((b) => ({ id: b.app_id, type: "app", role: "editor" }));
+  const addResult = addTasklistMembersAsUser(creatorProfile, tasklistGuid, members);
+  if (!addResult.ok) {
+    const msg =
+      `把 bot app 加为清单 ${tasklistGuid} 的 editor 失败:${addResult.error}\n\n` +
+      `常见原因:这个 profile 的用户身份缺 task:tasklist:write scope —— 重新登录并申请 task 域权限:\n  ${loginHint}`;
+    if (ctx.flags.json) ctx.ui.emitJson({ ok: false, error: msg });
+    else ctx.ui.failure(msg);
+    return 1;
+  }
+
+  // Registry write — same first-writer-wins / --force semantics as the
+  // --team-only create path. Unlike that path, the operator here explicitly
+  // picked ONE SPECIFIC existing tasklist to adopt — silently keeping some
+  // OTHER already-registered guid (claimTeamTasklistGuid's normal behavior)
+  // would defeat that explicit intent without saying so, so this checks the
+  // outcome and reports a mismatch clearly instead of staying silent about it.
+  const registryPath = resolveTaskTeamRegistryPath();
+  let registeredGuid: string;
+  if (force) {
+    await overwriteTeamTasklistGuid(registryPath, tasklistGuid);
+    registeredGuid = tasklistGuid;
+  } else {
+    registeredGuid = await claimTeamTasklistGuid(registryPath, tasklistGuid);
+  }
+  const registryMismatch = registeredGuid !== tasklistGuid;
+
+  // Safety net: read the membership back and warn (never fail) for any bot
+  // that didn't actually land — mirrors the --team-only path's ownerConfirmedMember check.
+  const membersResult = getUserTasklistMembers(creatorProfile, tasklistGuid);
+  const missingBots: string[] = [];
+  let membershipCheckError: string | undefined;
+  if (membersResult.ok) {
+    for (const b of bots) {
+      if (!membersResult.data.some((m) => m.id === b.app_id)) missingBots.push(b.id);
+    }
+  } else {
+    membershipCheckError = membersResult.error;
+  }
+
+  if (ctx.flags.json) {
+    ctx.ui.emitJson({
+      ok: true,
+      mode: "adopt",
+      adoptedName: matchedName,
+      tasklistGuid,
+      addedMembers: bots.map((b) => b.id),
+      missingBots,
+      membershipCheckError: membershipCheckError ?? null,
+      registeredGuid,
+      registryMismatch,
+    });
+    return 0;
+  }
+
+  ctx.ui.success(`已 adopt 清单 "${matchedName}": ${tasklistGuid}`);
+  ctx.ui.print(`已加入成员(editor): ${bots.map((b) => b.id).join(", ")}`);
+  ctx.ui.print("");
+  if (missingBots.length > 0) {
+    ctx.ui.warning(
+      `以下 bot 的 app 未出现在清单成员列表里——可能被静默丢弃:${missingBots.join(", ")}。` +
+        "请检查 app_id 是否正确,或手动在飞书任务中心把它们加为该清单的 editor。",
+    );
+  } else if (membershipCheckError) {
+    ctx.ui.warning(`无法读回清单 ${tasklistGuid} 的成员列表以核实是否加入成功(继续,不影响本次结果): ${membershipCheckError}`);
+  }
+  if (registryMismatch) {
+    ctx.ui.warning(
+      `共享注册文件里已经绑定了另一个清单(${registeredGuid}),这次 adopt 的清单(${tasklistGuid})` +
+        "未写入共享注册文件——避免破坏现有团队绑定。如果确实想切换到这个新清单,加 --force 重跑。",
+    );
+  } else {
+    ctx.ui.print(
+      `已写入共享注册文件 ${registryPath} —— 团队里的 bot 下次重启会自动发现并使用这个 guid,` +
+        "不需要手工改 yaml。",
+    );
+  }
+  ctx.ui.print("");
+  ctx.ui.print(
+    ctx.ui.bold("可选:") +
+      " 如果想固定绑定、不依赖共享注册文件的自动发现,也可以把 guid 手写进各 bot 的 bots/<id>.yaml:",
+  );
+  ctx.ui.print(`  taskHandle:`);
+  ctx.ui.print(`    tasklistGuid: "${tasklistGuid}"`);
   return 0;
 }
