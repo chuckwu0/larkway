@@ -291,6 +291,16 @@ class CodexLineParser {
     return;
   }
 
+  // ── reasoning → thinking_delta (COT) — extension point ──────────────────
+  // TODO(cot): map Codex reasoning items to `thinking_delta` (see
+  // src/agent/runner.ts + src/bridge/cotProgress.ts) once the exact
+  // `codex exec --json` reasoning item schema is confirmed. Candidate shapes
+  // observed but NOT yet verified: item.started/completed with
+  // item.type === "reasoning" (+ a text/summary field), or a dedicated
+  // reasoning delta type. Left unmapped on purpose — do not guess the field
+  // names; reasoning currently falls through to `raw` (dropped), byte-
+  // identical to pre-COT behavior.
+
   // ── everything else (turn.started, error, reasoning, file_change, …) ────
   yield { type: "raw", raw: obj };
   }
@@ -359,6 +369,14 @@ class CodexAppServerLineParser {
       }
       return;
     }
+
+    // ── reasoning → thinking_delta (COT) — extension point ────────────────
+    // TODO(cot): map Codex app-server reasoning notifications to
+    // `thinking_delta` (see src/agent/runner.ts + src/bridge/cotProgress.ts)
+    // once the exact method name is confirmed. Candidate methods observed but
+    // NOT yet verified: "item/agentReasoning/delta", "item/reasoning/delta".
+    // Left unmapped on purpose — do not guess; reasoning currently falls
+    // through to `raw` (dropped), byte-identical to pre-COT behavior.
 
     yield { type: "raw", raw: obj };
   }

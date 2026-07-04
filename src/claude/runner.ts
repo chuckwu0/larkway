@@ -226,6 +226,14 @@ function* parseLinesMulti(
         if (block["type"] === "text" && typeof block["text"] === "string") {
           yield* answerExtractor.ingestGrowingSnapshot(block["text"], obj);
           emitted = true;
+        } else if (block["type"] === "thinking" && typeof block["thinking"] === "string") {
+          // Reasoning content block. Distinct from the answer channel — no
+          // marker gate. Emitted as a full-block snapshot; the COT consumer
+          // treats it as a catch-up only when no thinking_delta streamed this
+          // run (see src/bridge/cotProgress.ts), so with --include-partial-
+          // messages on (always, see buildCommand) this never double-renders.
+          yield { type: "thinking_snapshot", text: block["thinking"], raw: obj };
+          emitted = true;
         } else if (block["type"] === "tool_use") {
           yield {
             type: "tool_use",
@@ -257,6 +265,18 @@ function* parseLinesMulti(
           typeof deltaRecord["text"] === "string"
         ) {
           yield* answerExtractor.ingestDelta(deltaRecord["text"], obj);
+          return;
+        }
+        // Incremental reasoning. A thinking content block streams its text as
+        // content_block_delta events carrying delta.type "thinking_delta" +
+        // delta.thinking — the reasoning counterpart of text_delta above.
+        // Surfaced only in the COT bubble, never the answer card.
+        if (
+          streamEvent["type"] === "content_block_delta" &&
+          deltaRecord["type"] === "thinking_delta" &&
+          typeof deltaRecord["thinking"] === "string"
+        ) {
+          yield { type: "thinking_delta", text: deltaRecord["thinking"], raw: obj };
           return;
         }
       }
