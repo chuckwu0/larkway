@@ -161,12 +161,34 @@ afterEach(async () => {
   await rm(tmpDir, { recursive: true, force: true });
 });
 
+describe("tasklist-init help (v3.4: --help routed here as [\"help\"] by cli/index.ts)", () => {
+  it("prints the detailed USAGE and exits 0, with zero config/bots required", async () => {
+    const { run } = await import("./tasklistInit.js");
+    const code = await run(makeCtx(), ["help"]);
+    expect(code).toBe(0);
+    expect(ui.print).toHaveBeenCalledWith(expect.stringContaining("帮我配置一下 Agent Team"));
+    expect(ui.print).toHaveBeenCalledWith(expect.stringContaining("--adopt-guid"));
+    expect(ui.failure).not.toHaveBeenCalled();
+  });
+});
+
 describe("tasklist-init --team", () => {
-  it("fails with usage when --team is missing", async () => {
+  it("v3.4: --team omitted with NO bots configured anywhere → clear failure (nothing to provision for)", async () => {
     const { run } = await import("./tasklistInit.js");
     const code = await run(makeCtx(), []);
     expect(code).toBe(1);
-    expect(ui.failure).toHaveBeenCalled();
+    expect(ui.failure).toHaveBeenCalledWith(expect.stringContaining("没有配置任何 bot"));
+  });
+
+  it("v3.4: --team omitted defaults to every configured bot (zero-arg happy path, create fallback)", async () => {
+    await makeBot("bot-a", "cli_a", "BOT_A_SECRET");
+    await makeBot("bot-b", "cli_b", "BOT_B_SECRET");
+    mockedListUserTasklists = { ok: true, data: [] }; // no same-named tasklist → auto-select falls through to create
+    mockedAutoResolvedOwner = "ou_owner1234567890";
+    const { run } = await import("./tasklistInit.js");
+    const code = await run(makeCtx({ json: true }), []);
+    expect(code).toBe(0);
+    expect(ui.emitJson).toHaveBeenCalledWith(expect.objectContaining({ ok: true, team: ["bot-a", "bot-b"], reused: false }));
   });
 
   it("fails cleanly (no tasklist created) when owner can't be resolved and --owner is omitted (F2)", async () => {
@@ -446,11 +468,11 @@ describe("tasklist-init --adopt (v3.4, docs/task-handle.md §7)", () => {
     expect(ui.failure).toHaveBeenCalled();
   });
 
-  it("still requires --team even in adopt mode", async () => {
+  it("v3.4: --team still defaults to every configured bot in explicit --adopt mode (no bots → clear failure)", async () => {
     const { run } = await import("./tasklistInit.js");
     const code = await run(makeCtx(), ["--adopt", "Agent Team"]);
     expect(code).toBe(1);
-    expect(ui.failure).toHaveBeenCalledWith(expect.stringContaining("--team"));
+    expect(ui.failure).toHaveBeenCalledWith(expect.stringContaining("没有配置任何 bot"));
   });
 
   it("fails with an actionable auth-login hint when listUserTasklists fails (no user identity / missing scope)", async () => {
@@ -486,17 +508,28 @@ describe("tasklist-init --adopt (v3.4, docs/task-handle.md §7)", () => {
     expect(code).toBe(1);
     expect(ui.failure).toHaveBeenCalledWith(expect.stringContaining("tl-dup-1"));
     expect(ui.failure).toHaveBeenCalledWith(expect.stringContaining("tl-dup-2"));
-    expect(ui.failure).toHaveBeenCalledWith(expect.stringContaining("--guid"));
+    expect(ui.failure).toHaveBeenCalledWith(expect.stringContaining("--adopt-guid"));
   });
 
-  it("--guid bypasses the by-name lookup entirely, even when listUserTasklists would fail", async () => {
+  it("--adopt-guid bypasses the by-name lookup entirely, even when listUserTasklists would fail", async () => {
     await makeBot("bot-a", "cli_a", "BOT_A_SECRET");
     mockedListUserTasklists = { ok: false, error: "should never be consulted" };
     mockedGetUserTasklistMembers = { ok: true, data: [{ id: "cli_a", type: "app", role: "editor" }] };
     const { run } = await import("./tasklistInit.js");
-    const code = await run(makeCtx(), ["--adopt", "Agent Team", "--team", "bot-a", "--guid", "tl-explicit"]);
+    const code = await run(makeCtx(), ["--adopt", "Agent Team", "--team", "bot-a", "--adopt-guid", "tl-explicit"]);
     expect(code).toBe(0);
     expect(capturedAddMembersAsUserCall?.tasklistGuid).toBe("tl-explicit");
+  });
+
+  it("--adopt-guid alone (no --adopt) forces adopt mode, skipping the create/reuse path entirely", async () => {
+    await makeBot("bot-a", "cli_a", "BOT_A_SECRET");
+    mockedGetUserTasklistMembers = { ok: true, data: [{ id: "cli_a", type: "app", role: "editor" }] };
+    const { run } = await import("./tasklistInit.js");
+    const code = await run(makeCtx(), ["--team", "bot-a", "--adopt-guid", "tl-explicit"]);
+    expect(code).toBe(0);
+    expect(capturedAddMembersAsUserCall?.tasklistGuid).toBe("tl-explicit");
+    // Never touched the SDK-based create/reuse path.
+    expect(capturedRequests.find((r) => r.url.endsWith("/tasklists"))).toBeUndefined();
   });
 
   it("happy path: finds the single match, adds every --team bot as editor, writes the registry, confirms readback", async () => {
@@ -582,5 +615,57 @@ describe("tasklist-init --adopt (v3.4, docs/task-handle.md §7)", () => {
 
     expect(code).toBe(0);
     await expect(readTeamTasklistGuid(resolveTaskTeamRegistryPath())).resolves.toBe("tl-adopted-new");
+  });
+});
+
+describe("tasklist-init auto-select adopt-vs-create (v3.4 north star, no explicit --adopt/--adopt-guid)", () => {
+  it("auto-adopts when the operator's own identity finds a same-named tasklist — no --owner needed", async () => {
+    await makeBot("bot-a", "cli_a", "BOT_A_SECRET");
+    mockedListUserTasklists = { ok: true, data: [{ guid: "tl-auto-adopted", name: "Agent Team" }] };
+    mockedGetUserTasklistMembers = { ok: true, data: [{ id: "cli_a", type: "app", role: "editor" }] };
+    const { run } = await import("./tasklistInit.js");
+    const code = await run(makeCtx({ json: true }), ["--team", "bot-a"]);
+    expect(code).toBe(0);
+    expect(capturedAddMembersAsUserCall?.tasklistGuid).toBe("tl-auto-adopted");
+    expect(ui.emitJson).toHaveBeenCalledWith(expect.objectContaining({ ok: true, mode: "adopt", tasklistGuid: "tl-auto-adopted" }));
+    // Never touched the SDK-based create/reuse path.
+    expect(capturedRequests.find((r) => r.url.endsWith("/tasklists"))).toBeUndefined();
+  });
+
+  it("silently falls back to the create path when the user-identity lookup fails (not logged in / missing scope)", async () => {
+    await makeBot("bot-a", "cli_a", "BOT_A_SECRET");
+    mockedListUserTasklists = { ok: false, error: "need_user_authorization" };
+    mockedAutoResolvedOwner = "ou_owner1234567890";
+    const { run } = await import("./tasklistInit.js");
+    const code = await run(makeCtx({ json: true }), ["--team", "bot-a"]);
+    expect(code).toBe(0); // no hard failure — silent fallback, not the "list-failed" error
+    expect(ui.emitJson).toHaveBeenCalledWith(expect.objectContaining({ ok: true, tasklistGuid: "tl-created-1" }));
+  });
+
+  it("silently falls back to the create path when no same-named tasklist is visible", async () => {
+    await makeBot("bot-a", "cli_a", "BOT_A_SECRET");
+    mockedListUserTasklists = { ok: true, data: [{ guid: "tl-other", name: "Some Other List" }] };
+    mockedAutoResolvedOwner = "ou_owner1234567890";
+    const { run } = await import("./tasklistInit.js");
+    const code = await run(makeCtx({ json: true }), ["--team", "bot-a"]);
+    expect(code).toBe(0);
+    expect(ui.emitJson).toHaveBeenCalledWith(expect.objectContaining({ ok: true, tasklistGuid: "tl-created-1" }));
+  });
+
+  it("still hard-fails on a genuinely ambiguous same-named match, even with no explicit --adopt (never guesses)", async () => {
+    await makeBot("bot-a", "cli_a", "BOT_A_SECRET");
+    mockedListUserTasklists = {
+      ok: true,
+      data: [
+        { guid: "tl-dup-1", name: "Agent Team" },
+        { guid: "tl-dup-2", name: "Agent Team" },
+      ],
+    };
+    const { run } = await import("./tasklistInit.js");
+    const code = await run(makeCtx(), ["--team", "bot-a"]);
+    expect(code).toBe(1);
+    expect(ui.failure).toHaveBeenCalledWith(expect.stringContaining("--adopt-guid"));
+    // Never fell through to create — no POST to /tasklists.
+    expect(capturedRequests.find((r) => r.url.endsWith("/tasklists"))).toBeUndefined();
   });
 });

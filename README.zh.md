@@ -141,6 +141,9 @@ larkway tasklist-init --adopt "<清单名>" --team <bot1,bot2,…>
 #    大约一分钟内自动认领，不用再聊。
 ```
 
+也可以直接对 Claude Code / Codex 说：帮我配置 Agent Team —— 不带任何参数跑
+`larkway tasklist-init` 就会自动对本机所有已配置的 bot 做对的事。
+
 `larkway doctor` 的常规检查里会包含每个 bot 的话题↔任务句柄配置状态（是否配置、
 scope 是否健康）。完整设计、配置项、平台事实排查记录见：
 [docs/task-handle.md](docs/task-handle.md)。

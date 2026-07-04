@@ -178,6 +178,16 @@ export async function main(argv: string[]): Promise<number> {
   }
 
   if (help) {
+    // v3.4: `larkway <command> --help` should show that command's OWN
+    // detailed help, not just the one-line blurb in the top-level USAGE
+    // below — this is `tasklist-init`'s primary documentation entry point
+    // (docs/task-handle.md §7: an agent's first move is always --help).
+    // Scoped to tasklist-init only for now (it's the one command whose
+    // USAGE is written to be read this way); every other command keeps its
+    // existing top-level-USAGE-on-any---help behavior unchanged.
+    if (command === "tasklist-init") {
+      return tasklistInitRun(buildContext(flags), ["help"]);
+    }
     ui.print(USAGE);
     return 0;
   }

@@ -125,30 +125,46 @@ taskHandle:
 - 所需飞书 scope(开放平台后台勾选,这就是 opt-in 动作):`task:task:read`、`task:task:write`、`task:tasklist:write`。
 - 应用显示名要可辨识(评论创建者显示为应用名)。
 
-**Provisioning(唯一路径:人手动跑一次 CLI,两种模式)**:
+**Provisioning(唯一路径:跑一次 CLI——可以是人手动跑,也可以只是对 Claude Code / Codex 说一句
+「帮我配置一下 Agent Team」让 agent 替你跑)**:
 
-**推荐:`--adopt` 模式(v3.4)**——所有权语义天然正确,清单从一开始就归你,bot 只是 editor:
+**v3.4 零参数北极星**:`larkway tasklist-init` 不带任何参数就该做对的事——`--team` 缺省 = 本机
+`bots/` 目录下**全部已配置 bot**(不再要求手工枚举);`--name` 缺省 `"Agent Team"`;**adopt 与
+create 的选择本身也自动**——先以操作者的用户身份按名字查一遍能看到的清单,查到同名的就 adopt(把
+这些 bot 加为 editor,所有权天然正确);查不到、或查询本身失败(没登录/缺 scope)就静默回退到下面
+的 create/reuse 路径(用第一个 bot 的 app 身份建清单,并自动解析/添加人类 owner)。**唯一在自动模式
+下仍会硬失败的情况是"同名清单有多个"**——歧义不猜,报错列出全部候选 guid,提示加 `--adopt-guid
+<guid>` 重跑。全程非交互,没有任何交互式提问,适合 agent 在 headless 环境里直接跑。
+
+`--adopt "<名字>"` / `--adopt-guid <guid>` / `--team` / `--owner` / `--force` 全部保留作显式覆盖
+(见 `larkway tasklist-init --help` 的完整参考——**这份 help 文本本身就是主要文档入口**,一个没读过
+这份 docs 的 agent 跑 `--help` 就能学会整套用法)。
+
+**推荐:`--adopt` 模式**(自动选中,或显式传 `--adopt`/`--adopt-guid` 强制)——所有权语义天然正确,
+清单从一开始就归你,bot 只是 editor:
 
 ```bash
-# 1. 先在飞书任务中心自己手动建一个清单(名字随便起)
-# 2. adopt 它 —— 把 --team 里的 bot app 加为它的 editor:
-larkway tasklist-init --adopt "<清单名>" --team <bot1,bot2,…> [--guid <guid>] [--force]
+# 1. 先在飞书任务中心自己手动建一个清单(名字随便起,默认按 "Agent Team" 查找)
+# 2. 零参数即可 —— 自动查到同名清单就 adopt,把每个已配置 bot 的 app 加为 editor:
+larkway tasklist-init
+# 或显式指定:
+larkway tasklist-init --adopt "<清单名>" --team <bot1,bot2,…> [--adopt-guid <guid>] [--force]
 ```
 
-- 前置条件:`--team` 里第一个 bot 的 lark-cli profile,必须已经用**用户身份**登录过、且申请了 `task`
-  域的 OAuth 权限:`lark-cli auth login --profile <profile> --domain task`(没做这一步,命令会在
-  第一步报错,报错信息里带这条命令作为提示)。
-- 以你(操作者)的**用户身份**按名字精确匹配你能看到的清单(重名 → 列出全部 guid 报错,用 `--guid`
-  消歧;一个都找不到 → 报错提示先去任务中心建一个)。
-- 把 `--team` 列出的每个 bot 的 app 加为清单成员(`type=app, role=editor`),幂等(已是成员的跳过/
-  无害重复)。
-- 写入共享注册文件(`<LARKWAY_HOME>/task-team.json`),与下面 `--team`-only 模式**同一套**
+- 前置条件:第一个团队 bot 的 lark-cli profile,必须已经用**用户身份**登录过、且申请了 `task`
+  域的 OAuth 权限:`lark-cli auth login --profile <profile> --domain task`(没做这一步,查询会失败——
+  显式 `--adopt` 下报错并带这条命令作为提示;自动模式下静默回退到下面的 create 路径)。
+- 以你(操作者)的**用户身份**按名字精确匹配你能看到的清单(重名 → 列出全部 guid 报错,用
+  `--adopt-guid` 消歧——这是自动模式唯一仍会硬失败的情况;一个都找不到 → 显式 `--adopt` 下报错
+  提示先去任务中心建一个,自动模式下静默回退创建路径)。
+- 把每个 bot 的 app 加为清单成员(`type=app, role=editor`),幂等(已是成员的跳过/无害重复)。
+- 写入共享注册文件(`<LARKWAY_HOME>/task-team.json`),与下面 create 路径**同一套**
   first-writer-wins / `--force` 覆盖语义——已经绑定了另一个 guid 且未传 `--force` 时不会覆盖,只
   warning 提示加 `--force` 重跑。
 - 读回成员列表,核实每个 bot 真的加入成功(未加入只 warning,不让命令失败)。
 - **为什么推荐这条路**:owner/creator 语义天然正确——这个清单从被创建的那一刻起就归操作者所有,
-  bot 只是被加进去的 editor,不需要像 `--team`-only 模式那样额外把人类 owner 补成员进去(那是因为
-  那条路径用 BOT 的 app 身份建清单,API 层面的 creator 是 bot,不加人类成员操作者根本看不到板)。
+  bot 只是被加进去的 editor,不需要像 create 路径那样额外把人类 owner 补成员进去(那是因为那条
+  路径用 BOT 的 app 身份建清单,API 层面的 creator 是 bot,不加人类成员操作者根本看不到板)。
 - **平台可行性(v3.4 调研,2026-07 只读实测,未改动任何真实数据)**:
   1. `lark-cli task tasklists list --as user`(用户身份,非 `--as bot`)支持列出当前用户可见的清单;
      实测(未授权 task 域权限的 profile 上)报 `need_user_authorization`,`hint` 里明确点名缺
@@ -167,9 +183,11 @@ larkway tasklist-init --adopt "<清单名>" --team <bot1,bot2,…> [--guid <guid
   当场具备 `task:tasklist:*` scope,补授权本身是写操作、按规则不允许在只读排查里做)。首次跑完
   `--adopt` 后,请实际打开飞书任务中心确认清单可见、bot 确实出现在 editor 列表里。
 
-**回退:`--team`-only 模式**(lark-cli 用户身份不可用时)——用 bot 的 APP 身份建一个新清单:
+**回退:create 路径**(adopt 未显式指定、且自动查询没找到同名清单或查询本身失败时静默触发)——用
+bot 的 APP 身份建一个新清单:
 
-- `larkway tasklist-init --team <bot1,bot2,…> [--name "Agent Team"] [--owner <open_id>] [--force]`。
+- `larkway tasklist-init --team <bot1,bot2,…> [--name "Agent Team"] [--owner <open_id>] [--force]`
+  (`--team` 同样缺省 = 全部已配置 bot)。
 - **owner open_id 解析**(建清单/复用清单前必须先拿到,拿不到直接报错退出,不建、不动任何清单):优先用显式 `--owner`;省略时尝试从 `lark-cli auth status --profile <profile> --json` 读团队第一个 bot 的 lark-cli profile 下已登录的用户身份(`identities.user.openId`)——这是本机唯一现成的人类身份来源,依赖 owner 之前对该 profile 跑过 `lark-cli auth login`;两者都拿不到就必须显式传 `--owner`。
 - **先查共享注册表,再决定建不建**(重要:防止重复跑出多个板):
   - 共享注册文件(`<LARKWAY_HOME>/task-team.json`)里**已有** guid 且未传 `--force` → **复用**这个清单,只对**已有清单**调 `add_members` 把 owner + 这组 bot 的 app 补为成员(幂等)——绝不再 `createTasklist`,避免 owner 重新跑一次 CLI(比如给团队新增一个 bot)就意外建出第二个「Agent Team」板,导致某些 bot 写的任务、owner 转的任务分裂在两个不同的板上。
@@ -183,8 +201,8 @@ larkway tasklist-init --adopt "<清单名>" --team <bot1,bot2,…> [--guid <guid
 
 **v3.4 发现性补充**:
 - bot 启动时若解析不到任何 guid(yaml 和共享注册文件都没有),打一行一次性提示日志,指向
-  `tasklist-init --adopt` 和本节文档——功能保持休眠是正确的默认行为,但至少让操作者知道这个功能
-  存在。
+  `larkway tasklist-init`(以及"对你的 agent 说帮我配置 Agent Team"这条最短路径)和本节文档——
+  功能保持休眠是正确的默认行为,但至少让操作者知道这个功能存在、且知道最短的启用方式。
 - `larkway doctor` 的常规检查里加了 task-handle 状态项:每个 bot 报告"是否已配置 guid"(未配置=
   可选功能未启用,`ok` 级别,不是问题);已配置的额外做一次廉价的真实探测(`listTasklistTasks`
   拉第一页,验证 scope 真的生效),探测失败会列出所需 scope 清单 + 对应 app 的开放平台授权链接

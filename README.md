@@ -143,6 +143,10 @@ larkway tasklist-init --adopt "<tasklist name>" --team <bot1,bot2,…>
 #    the bot is in — it auto-claims within about a minute, no further chat needed.
 ```
 
+You can also just tell Claude Code / Codex: "set up Agent Team for me" — running
+`larkway tasklist-init` with no arguments already does the right thing for
+every bot configured on this machine.
+
 `larkway doctor` reports each bot's task-handle status (configured/scope
 health) as part of its regular checks. Full design, configuration knobs, and
 platform-fact writeups: [docs/task-handle.md](docs/task-handle.md).

@@ -663,8 +663,8 @@ async function runV2Mode({
         // at the CLI that turns it on and where to read more.
         console.log(
           `[larkway] bot "${bot.id}": 话题↔任务句柄未配置(taskHandle.tasklistGuid 缺失,` +
-            `共享注册文件里也没有)。想启用请跑 larkway tasklist-init --adopt "<清单名>" ` +
-            `--team ${bot.id}(见 docs/task-handle.md §7)。`,
+            `共享注册文件里也没有)。想启用:运行 larkway tasklist-init(或对你的 agent 说` +
+            `"帮我配置 Agent Team")(见 docs/task-handle.md §7)。`,
         );
       }
     }
