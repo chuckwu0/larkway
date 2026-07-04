@@ -31,6 +31,16 @@ export type AgentStreamEvent =
   | { type: "answer_snapshot"; text: string; raw: unknown; seq?: number }
   /** @deprecated Backend text without answer-channel proof. Treat as internal. */
   | { type: "text_delta"; text: string; raw: unknown }
+  /**
+   * The model's reasoning / chain-of-thought narration — Claude "thinking"
+   * content blocks, Codex reasoning items. Distinct from `internal_text`: it
+   * is surfaced only in the collapsible COT (思维链) bubble, never in the
+   * answer card. `thinking_delta` appends to the reasoning buffer;
+   * `thinking_snapshot` carries a complete thinking block, used only as a
+   * catch-up when a run streamed no deltas (partial-message streaming off).
+   */
+  | { type: "thinking_delta"; text: string; raw: unknown }
+  | { type: "thinking_snapshot"; text: string; raw: unknown }
   | { type: "tool_use"; toolName: string; toolInput: unknown; raw: unknown }
   | { type: "tool_result"; raw: unknown }
   | { type: "result"; stopReason: string; raw: unknown }

@@ -327,6 +327,79 @@ describe("parseLinesMulti", () => {
     // positive (2 increments, 1 decrement) for the rest of the turn.
     expect(toolResultEvents).toHaveLength(2);
   });
+
+  it("emits thinking_delta from stream_event thinking_delta (COT reasoning)", () => {
+    const extractor = new AnswerChannelExtractor();
+    // Real claude stream-json shape for streamed reasoning under
+    // --include-partial-messages: a content_block_delta carrying a
+    // thinking_delta whose text lives in `delta.thinking`, not `delta.text`.
+    const line = JSON.stringify({
+      type: "stream_event",
+      event: {
+        type: "content_block_delta",
+        index: 0,
+        delta: { type: "thinking_delta", thinking: "Let me weigh the options" },
+      },
+    });
+
+    const events = [...parseLinesMulti(line, extractor)];
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({ type: "thinking_delta", text: "Let me weigh the options" });
+    // Reasoning must not leak into the answer channel.
+    expect(events.some((e) => e.type === "answer_delta" || e.type === "answer_snapshot")).toBe(false);
+  });
+
+  it("emits thinking_snapshot from an assistant thinking content block", () => {
+    const extractor = new AnswerChannelExtractor();
+    // The final assistant message carries the complete thinking block; its
+    // text is in `thinking` (with a `signature`), a sibling of text/tool_use.
+    const line = JSON.stringify({
+      type: "assistant",
+      message: {
+        content: [
+          { type: "thinking", thinking: "Full reasoning trace", signature: "sig-abc" },
+        ],
+      },
+    });
+
+    const events = [...parseLinesMulti(line, extractor)];
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({ type: "thinking_snapshot", text: "Full reasoning trace" });
+    expect(events.some((e) => e.type === "answer_delta" || e.type === "answer_snapshot")).toBe(false);
+  });
+
+  it("emits thinking + tool_use + answer from a mixed assistant message in block order", () => {
+    const extractor = new AnswerChannelExtractor();
+    const line = JSON.stringify({
+      type: "assistant",
+      message: {
+        content: [
+          { type: "thinking", thinking: "think first", signature: "s" },
+          { type: "tool_use", id: "call_1", name: "Read", input: { file_path: "/x" } },
+          { type: "text", text: "LARKWAY_ANSWER_BEGIN\nHi there\nLARKWAY_ANSWER_END" },
+        ],
+      },
+    });
+
+    const events = [...parseLinesMulti(line, extractor)];
+    expect(events.map((e) => e.type)).toEqual([
+      "thinking_snapshot",
+      "tool_use",
+      "answer_delta",
+    ]);
+  });
+
+  it("does not treat a thinking block as tool_use or text", () => {
+    const extractor = new AnswerChannelExtractor();
+    const line = JSON.stringify({
+      type: "assistant",
+      message: { content: [{ type: "thinking", thinking: "x", signature: "s" }] },
+    });
+    const events = [...parseLinesMulti(line, extractor)];
+    expect(events.some((e) => e.type === "tool_use")).toBe(false);
+    expect(events.some((e) => e.type === "text_delta")).toBe(false);
+    expect(events.some((e) => e.type === "raw")).toBe(false);
+  });
 });
 
 // ---------------------------------------------------------------------------

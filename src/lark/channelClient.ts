@@ -35,6 +35,11 @@ import {
   type OutboundCardKitLarkChannel,
 } from "./channelCardKitClient.js";
 import { ChannelPostClient, type OutboundPostLarkChannel } from "./channelPostClient.js";
+import {
+  ChannelCotClient,
+  type OutboundCotClient,
+  type OutboundCotLarkChannel,
+} from "./channelCotClient.js";
 import type { OutboundCardClient } from "./outboundCardClient.js";
 import type { OutboundPostClient } from "./outboundPostClient.js";
 
@@ -556,6 +561,8 @@ export class ChannelClient {
   private cardKitClient: ChannelCardKitClient | null = null;
   /** Lazily built and only requested by main.ts when post outbound gates are configured. */
   private postClient: ChannelPostClient | null = null;
+  /** Lazily built COT (思维链) client; only requested when a bot enables cot != off. */
+  private cotClient: ChannelCotClient | null = null;
 
   constructor(opts: LarkClientOptions) {
     if (!opts.appId || !opts.appSecret) {
@@ -857,6 +864,24 @@ export class ChannelClient {
       });
     }
     return this.cardKitClient;
+  }
+
+  /**
+   * Return an OutboundCotClient bound to this client's channel handle.
+   *
+   * main.ts only calls this when the bot's `cot` config is not "off". The COT
+   * bubble uses the SDK's generic rawClient.request() (tenant token auto-
+   * injected via the same token manager as every other outbound call), so it
+   * adds no auth surface. Resolves the live channel lazily at call time.
+   */
+  outboundCotClient(): OutboundCotClient {
+    if (!this.cotClient) {
+      this.cotClient = new ChannelCotClient({
+        resolveChannel: () =>
+          this.channel as unknown as OutboundCotLarkChannel | null,
+      });
+    }
+    return this.cotClient;
   }
 
   /**

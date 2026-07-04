@@ -327,6 +327,19 @@ export const BotConfigSchema = z.object({
   backend: z.string().min(1).default("claude"),
 
   /**
+   * COT (思维链) 气泡:把 agent 的 thinking 思考过程 + 工具调用摘要实时推到飞书
+   * 原生的可折叠思维链气泡(与最终答案卡片互不干扰,最终答案永远只走卡片)。
+   *
+   * - "off":完全不调用 message_cot API(零网络、零副作用)。
+   * - "brief"(默认):思考过程 + 工具名摘要。
+   * - "detailed":额外推工具入参(TOOL_CALL_ARGS)与截断后的工具结果。
+   *
+   * message_cot 是无公开文档的 API —— 任何一步失败都会在本次会话内自动降级、
+   * 只记 warn,绝不影响卡片和最终答案(见 src/bridge/cotProgress.ts)。
+   */
+  cot: z.enum(["off", "brief", "detailed"]).default("brief"),
+
+  /**
    * 话题 ↔ 飞书任务句柄(docs/task-handle.md,v2)。省略此字段不代表关闭,但也
    * 不会触发任何自动建清单——main.ts 在 startup 时只做只读解析(yaml 里的
    * tasklistGuid,或共享注册文件里已有的 guid);清单本身只由

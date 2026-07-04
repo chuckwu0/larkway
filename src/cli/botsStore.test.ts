@@ -29,6 +29,7 @@ const sampleBot = (): BotConfig =>
     response_surface_prototype: DEFAULT_RESPONSE_SURFACE_PROTOTYPE,
     runtime: "legacy",
     backend: "claude",
+    cot: "brief",
   }) as BotConfig;
 
 beforeEach(async () => {

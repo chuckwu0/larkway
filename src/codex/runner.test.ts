@@ -164,6 +164,59 @@ function appAgentCompleted(text: string): string {
   });
 }
 
+// Reasoning fixtures — shapes taken verbatim from a real codex-cli 0.140.0
+// app-server capture (ids replaced with obvious fakes).
+const APP_REASONING_ITEM_ID = "rs_fakereasoning01";
+
+function appReasoningDelta(delta: string, summaryIndex = 0): string {
+  return JSON.stringify({
+    method: "item/reasoning/summaryTextDelta",
+    params: {
+      threadId: APP_THREAD_ID,
+      turnId: "turn-1",
+      itemId: APP_REASONING_ITEM_ID,
+      delta,
+      summaryIndex,
+    },
+  });
+}
+
+function appReasoningPartAdded(summaryIndex: number): string {
+  return JSON.stringify({
+    method: "item/reasoning/summaryPartAdded",
+    params: {
+      threadId: APP_THREAD_ID,
+      turnId: "turn-1",
+      itemId: APP_REASONING_ITEM_ID,
+      summaryIndex,
+    },
+  });
+}
+
+function appReasoningStarted(): string {
+  return JSON.stringify({
+    method: "item/started",
+    params: {
+      item: { type: "reasoning", id: APP_REASONING_ITEM_ID, summary: [], content: [] },
+      threadId: APP_THREAD_ID,
+      turnId: "turn-1",
+      startedAtMs: 1,
+    },
+  });
+}
+
+function appReasoningCompleted(summary: string[]): string {
+  return JSON.stringify({
+    method: "item/completed",
+    params: {
+      item: { type: "reasoning", id: APP_REASONING_ITEM_ID, summary, content: [] },
+      threadId: APP_THREAD_ID,
+      turnId: "turn-1",
+      completedAtMs: 2,
+    },
+  });
+}
+
 const APP_TURN_COMPLETED = JSON.stringify({
   method: "turn/completed",
   params: {
@@ -329,6 +382,61 @@ describe("CodexAppServerLineParser", () => {
     expect(events.filter((event) => event.type === "answer_delta")).not.toHaveLength(0);
     expect(events.filter((event) => event.type === "answer_snapshot")).toHaveLength(0);
   });
+
+  it("maps reasoning summaryTextDelta to thinking_delta (not the answer channel)", () => {
+    const parser = new CodexAppServerLineParser();
+    const events = [
+      ...parser.parseMessage(JSON.parse(appReasoningDelta("**Analyzing the riddle**\n\nI"))),
+      ...parser.parseMessage(JSON.parse(appReasoningDelta(" need to think"))),
+    ];
+
+    const thinking = events.filter((e) => e.type === "thinking_delta");
+    expect(thinking.map((e) => (e as { text: string }).text).join("")).toBe(
+      "**Analyzing the riddle**\n\nI need to think",
+    );
+    expect(events.some((e) => e.type === "answer_delta" || e.type === "answer_snapshot")).toBe(false);
+  });
+
+  it("ignores an empty reasoning delta", () => {
+    const parser = new CodexAppServerLineParser();
+    const events = [...parser.parseMessage(JSON.parse(appReasoningDelta("")))];
+    expect(events).toHaveLength(0);
+  });
+
+  it("inserts a blank-line separator only between reasoning summary parts", () => {
+    const parser = new CodexAppServerLineParser();
+    const first = [...parser.parseMessage(JSON.parse(appReasoningPartAdded(0)))];
+    const second = [...parser.parseMessage(JSON.parse(appReasoningPartAdded(1)))];
+
+    // Part 0 opens the first summary — no leading separator.
+    expect(first).toHaveLength(0);
+    // Part 1+ gets a "\n\n" separator delta so parts don't run together.
+    expect(second).toEqual([{ type: "thinking_delta", text: "\n\n", raw: expect.anything() }]);
+  });
+
+  it("emits nothing for a started (empty-shell) reasoning item", () => {
+    const parser = new CodexAppServerLineParser();
+    const events = [...parser.parseMessage(JSON.parse(appReasoningStarted()))];
+    expect(events).toHaveLength(0);
+  });
+
+  it("emits completed reasoning summary as a thinking_snapshot fallback", () => {
+    const parser = new CodexAppServerLineParser();
+    const events = [
+      ...parser.parseMessage(
+        JSON.parse(appReasoningCompleted(["**Analyzing**\n\nfull trace here", "second part"])),
+      ),
+    ];
+    expect(events).toEqual([
+      { type: "thinking_snapshot", text: "**Analyzing**\n\nfull trace here\n\nsecond part", raw: expect.anything() },
+    ]);
+  });
+
+  it("tolerates a completed reasoning item with an empty summary (no event)", () => {
+    const parser = new CodexAppServerLineParser();
+    const events = [...parser.parseMessage(JSON.parse(appReasoningCompleted([])))];
+    expect(events).toHaveLength(0);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -339,7 +447,7 @@ describe("buildCodexCommand", () => {
   it("fresh session: runs codex app-server over stdio", () => {
     const [bin, args] = buildCodexCommand({ prompt: "hello" });
     expect(bin).toBe("codex");
-    expect(args).toEqual(["app-server", "--stdio"]);
+    expect(args).toEqual(["-c", "model_reasoning_summary=detailed", "app-server", "--stdio"]);
   });
 
   it("resume session: still uses app-server; resume is a JSON-RPC request", () => {
@@ -348,12 +456,12 @@ describe("buildCodexCommand", () => {
       resumeSessionId: "019eabc123def456",
     });
     expect(bin).toBe("codex");
-    expect(args).toEqual(["app-server", "--stdio"]);
+    expect(args).toEqual(["-c", "model_reasoning_summary=detailed", "app-server", "--stdio"]);
   });
 
   it("cwd is not encoded in argv; it is sent through app-server params", () => {
     const [, args] = buildCodexCommand({ prompt: "hello", cwd: "/wt" });
-    expect(args).toEqual(["app-server", "--stdio"]);
+    expect(args).toEqual(["-c", "model_reasoning_summary=detailed", "app-server", "--stdio"]);
   });
 
   it("permission mode is not encoded in argv; it is sent through app-server params", () => {
@@ -361,7 +469,7 @@ describe("buildCodexCommand", () => {
       prompt: "hello",
       permissionMode: "acceptEdits",
     });
-    expect(args).toEqual(["app-server", "--stdio"]);
+    expect(args).toEqual(["-c", "model_reasoning_summary=detailed", "app-server", "--stdio"]);
   });
 
   it("custom codexBinPath overrides default 'codex'", () => {
@@ -706,7 +814,7 @@ describe("runCodex() — spawn-level integration", () => {
     await handle.done;
 
     expect(__lastSpawnArgs).not.toBeNull();
-    expect(__lastSpawnArgs!.args).toEqual(["app-server", "--stdio"]);
+    expect(__lastSpawnArgs!.args).toEqual(["-c", "model_reasoning_summary=detailed", "app-server", "--stdio"]);
 
     const stdinText: string = fake.child.stdin.read()?.toString("utf8") ?? "";
     const requests: Array<{
@@ -883,7 +991,7 @@ describe("runCodex() — spawn-level integration", () => {
 
     // Verify spawn received correct argv for resume
     expect(__lastSpawnArgs).not.toBeNull();
-    expect(__lastSpawnArgs!.args).toEqual(["app-server", "--stdio"]);
+    expect(__lastSpawnArgs!.args).toEqual(["-c", "model_reasoning_summary=detailed", "app-server", "--stdio"]);
     const stdinText = fake.child.stdin.read()?.toString("utf8") ?? "";
     expect(stdinText).toContain('"method":"thread/resume"');
     expect(stdinText).toContain('"threadId":"019eabc123def456"');
