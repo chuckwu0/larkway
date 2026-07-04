@@ -77,6 +77,76 @@ function types(rec: RecordingClient): string[] {
   return rec.events.map((e) => e.eventType);
 }
 
+describe("CotProgressHandle finalize reliability (complete must fire)", () => {
+  it("handler timing: void finalize() then immediate close() still calls complete", async () => {
+    // Mimics handler.ts: the success path fire-and-forgets finalize, then the
+    // finally block calls close(). complete() must still be sent (close() only
+    // cancels the throttle timer; it must not suppress an in-flight finalize).
+    const rec = recordingCotClient();
+    const handle = await startHandle(rec);
+    handle.handle({ type: "thinking_delta", text: "x", raw: {} });
+    const finalizing = handle.finalize("done"); // not awaited (handler `void`)
+    handle.close(); // handler `finally` runs concurrently
+    await finalizing;
+    expect(rec.completeReason).toBe("done");
+  });
+
+  it("with a flush genuinely in flight when finalize()+close() race, complete still fires", async () => {
+    const resolvers: Array<() => void> = [];
+    const rec: RecordingClient = {
+      events: [], completeReason: undefined, createCalls: 0, createTargets: [],
+      client: undefined as unknown as OutboundCotClient,
+    };
+    rec.client = {
+      async create() { return { cotId: "c", messageId: "m" }; },
+      async resolveThreadId() { return undefined; },
+      update(_ref, events) {
+        for (const e of events) rec.events.push({ eventType: e.event_type, content: {} });
+        return new Promise<void>((res) => resolvers.push(res)); // caller-controlled
+      },
+      async complete(_ref, reason) { rec.completeReason = reason; },
+    };
+    const handle = await createCotProgressHandle({
+      cotClient: rec.client, target: TARGET, detail: "brief", runId: "r",
+      scope: "s", inputPreview: "hi", throttleMs: 0,
+    });
+    handle.handle({ type: "thinking_delta", text: "x", raw: {} });
+    await new Promise((r) => setTimeout(r, 1)); // let the first flush go in-flight
+    const finalizing = handle.finalize("done");
+    handle.close();
+    // Drain every deferred update so finalize can progress to complete.
+    while (resolvers.length) resolvers.shift()!();
+    await new Promise((r) => setTimeout(r, 1));
+    while (resolvers.length) resolvers.shift()!();
+    await finalizing;
+    expect(rec.completeReason).toBe("done");
+  });
+
+  it("still attempts complete even if the final RUN_FINISHED flush fails (transient PUT blip)", async () => {
+    // The real gap behind "scrolls fine then never completes": a single failed
+    // finalize-flush used to disable the handle and skip complete. complete must
+    // be attempted regardless (it's bounded + caught).
+    let updateCalls = 0;
+    let completeCalled = false;
+    const client: OutboundCotClient = {
+      async create() { return { cotId: "c", messageId: "m" }; },
+      async resolveThreadId() { return undefined; },
+      async update() {
+        updateCalls += 1;
+        throw new Error("COT API failed: code=500 transient PUT blip");
+      },
+      async complete() { completeCalled = true; },
+    };
+    const handle = await createCotProgressHandle({
+      cotClient: client, target: TARGET, detail: "brief", runId: "r",
+      scope: "s", inputPreview: "hi", throttleMs: 10_000,
+    });
+    await handle.finalize("done");
+    expect(updateCalls).toBeGreaterThan(0); // the RUN_FINISHED flush was tried and failed
+    expect(completeCalled).toBe(true); // …but complete was STILL attempted
+  });
+});
+
 describe("CotProgressHandle event mapping", () => {
   it("opens with RUN_STARTED and closes with RUN_FINISHED + complete(done)", async () => {
     const rec = recordingCotClient();
@@ -249,7 +319,11 @@ describe("CotProgressHandle degradation (bypass rule)", () => {
     expect(rec.completeReason).toBeUndefined();
   });
 
-  it("an update failure disables the handle and skips complete, without throwing", async () => {
+  it("an update failure during finalize does NOT suppress the complete attempt", async () => {
+    // A transient failure on the finalize flush (the RUN_FINISHED PUT) must not
+    // also skip complete — otherwise a bubble that scrolled fine hangs forever
+    // in "thinking". finalize swallows the flush error and still best-effort
+    // completes.
     const rec = recordingCotClient({
       update: async () => {
         throw new Error("network reset");
@@ -257,13 +331,11 @@ describe("CotProgressHandle degradation (bypass rule)", () => {
     });
     const handle = await startHandle(rec);
     handle.handle({ type: "thinking_delta", text: "x", raw: {} });
-    // finalize triggers the flush that throws; must swallow + skip complete.
     await expect(handle.finalize("done")).resolves.toBeUndefined();
-    expect(handle.disabled).toBe(true);
-    expect(rec.completeReason).toBeUndefined();
+    expect(rec.completeReason).toBe("done");
   });
 
-  it("a complete failure is swallowed", async () => {
+  it("a complete failure is swallowed (finalize never throws)", async () => {
     const rec = recordingCotClient({
       complete: async () => {
         throw new Error("complete blew up");
@@ -271,7 +343,6 @@ describe("CotProgressHandle degradation (bypass rule)", () => {
     });
     const handle = await startHandle(rec);
     await expect(handle.finalize("done")).resolves.toBeUndefined();
-    expect(handle.disabled).toBe(true);
   });
 
   it("feeding an unknown/raw event never throws", async () => {

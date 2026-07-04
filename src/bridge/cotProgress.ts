@@ -359,11 +359,16 @@ class LiveCotProgressHandle implements CotProgressHandle {
     }
     await this.flush();
     this.closed = true;
-    if (this._disabled || !this.ref) return;
+    // Always ATTEMPT complete when a bubble exists — do NOT gate on _disabled.
+    // The flush above can disable us on a single transient RUN_FINISHED PUT
+    // failure; gating complete on that (the old `if (_disabled) return`) is
+    // exactly what left a bubble that scrolled fine hung in its "thinking"
+    // state. complete is bounded (8s timeout in ChannelCotClient) and caught,
+    // so a best-effort attempt can only help the bubble finish — never blocks.
+    if (!this.ref) return;
     try {
       await this.cotClient.complete(this.ref, reason);
     } catch (err) {
-      this._disabled = true;
       console.warn("[cot_progress] complete failed (continuing):", summarizeError(err));
     }
   }
