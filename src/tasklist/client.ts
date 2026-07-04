@@ -284,7 +284,10 @@ export class TaskListClient {
             resource_type: "task",
             resource_id: taskGuid,
             page_size: opts.pageSize ?? 50,
-            page_token: opts.pageToken,
+            // Spread-omit: the SDK serializes a literal `undefined` value into
+            // the query string ("page_token=undefined"), which strict endpoints
+            // reject with 1470400 — only send the key when we hold a real token.
+            ...(opts.pageToken ? { page_token: opts.pageToken } : {}),
           },
         },
         label,
@@ -385,15 +388,12 @@ export class TaskListClient {
   /**
    * List tasks belonging to a tasklist (used by TasklistPoller,
    * src/tasklist/tasklistPoller.ts, for the v3 "候选注入" candidate
-   * discovery). URL pattern (`GET /tasklists/:tasklist_guid/tasks`) mirrors
-   * the already-verified `/tasklists/:tasklist_guid/members` shape used by
-   * {@link addTasklistMembers}, and the returned task shape is the same one
-   * `getTask` already maps — but unlike get/patch/members, this exact
-   * endpoint was NOT independently checked against a live response (this
-   * feature's dev environment has no network access, per docs/task-handle.md
-   * §9's standing caveat). Treat as best-effort like every other tasklist
-   * call: TasklistPoller swallows failures and keeps its previous candidate
-   * snapshot rather than propagating.
+   * discovery). `GET /tasklists/:tasklist_guid/tasks` verified live
+   * 2026-07-04 against a real tasklist (200 + items[]); note this endpoint
+   * strictly validates `page_token` (a literal "undefined" query value is a
+   * hard 1470400), hence the spread-omit below. Treat as best-effort like
+   * every other tasklist call: TasklistPoller swallows failures and keeps
+   * its previous candidate snapshot rather than propagating.
    */
   async listTasklistTasks(
     tasklistGuid: string,
@@ -409,7 +409,10 @@ export class TaskListClient {
           params: {
             user_id_type: "open_id",
             page_size: opts.pageSize ?? 50,
-            page_token: opts.pageToken,
+            // Same spread-omit as listComments: "page_token=undefined" in the
+            // query string is a hard 400 (1470400) on this endpoint — verified
+            // live 2026-07-04 against a real tasklist.
+            ...(opts.pageToken ? { page_token: opts.pageToken } : {}),
           },
         },
         label,
