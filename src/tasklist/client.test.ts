@@ -64,6 +64,29 @@ describe("TaskListClient.getTask", () => {
     );
     await expect(client.getTask("real-guid")).resolves.toMatchObject({ guid: "real-guid" });
   });
+
+  it("parses due.timestamp into dueMs (v3.3 due-date stall detection)", async () => {
+    const client = new TaskListClient(
+      fakeRequester(() => ({
+        data: { task: { guid: "guid-1", due: { is_all_day: false, timestamp: "1675454764000" } } },
+      })),
+    );
+    await expect(client.getTask("guid-1")).resolves.toMatchObject({ dueMs: 1675454764000 });
+  });
+
+  it("leaves dueMs undefined when the task has no due date at all", async () => {
+    const client = new TaskListClient(fakeRequester(() => ({ data: { task: { guid: "guid-1" } } })));
+    const task = await client.getTask("guid-1");
+    expect(task?.dueMs).toBeUndefined();
+  });
+
+  it("leaves dueMs undefined for a malformed due.timestamp instead of throwing", async () => {
+    const client = new TaskListClient(
+      fakeRequester(() => ({ data: { task: { guid: "guid-1", due: { timestamp: "not-a-number" } } } })),
+    );
+    const task = await client.getTask("guid-1");
+    expect(task?.dueMs).toBeUndefined();
+  });
 });
 
 describe("TaskListClient patch operations", () => {
@@ -297,6 +320,19 @@ describe("TaskListClient.listTasklistTasks", () => {
     const { tasks, hasMore } = await client.listTasklistTasks("tl-1");
     expect(tasks).toEqual([{ guid: "t1", summary: "标题", description: "描述", completedAt: "0" }]);
     expect(hasMore).toBe(false);
+  });
+
+  it("parses due.timestamp into dueMs for list items too (v3.3 — free with the same page fetch, claimed tasks included)", async () => {
+    const client = new TaskListClient(
+      fakeRequester(() => ({
+        data: {
+          items: [{ guid: "t1", summary: "标题", due: { timestamp: "1675454764000" } }],
+          has_more: false,
+        },
+      })),
+    );
+    const { tasks } = await client.listTasklistTasks("tl-1");
+    expect(tasks[0]?.dueMs).toBe(1675454764000);
   });
 
   it("requests the tasklist's own /tasks sub-resource", async () => {

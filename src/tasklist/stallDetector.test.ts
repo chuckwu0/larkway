@@ -4,7 +4,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { TaskHandleStore } from "./store.js";
 import { TaskListClient, type LarkTaskRequestConfig, type LarkTaskRequester } from "./client.js";
-import { StallDetector, formatDurationLabel, renderStallEscalationComment, renderStallNudgeText } from "./stallDetector.js";
+import {
+  StallDetector,
+  formatDurationLabel,
+  formatDueDate,
+  renderStallEscalationComment,
+  renderStallNudgeText,
+} from "./stallDetector.js";
 
 const HOUR = 3_600_000;
 const DAY = 24 * HOUR;
@@ -830,6 +836,234 @@ describe("StallDetector", () => {
         await detector.pollOnceForTest();
         expect(enqueueNudgeTurn).toHaveBeenCalledTimes(1);
       });
+    });
+  });
+
+  describe("v3.3 due-date stall detection (docs/task-handle.md §14)", () => {
+    it("fires IMMEDIATELY once due has passed, even with very recent activity (does not wait for the idle threshold)", async () => {
+      const store = await TaskHandleStore.load(join(dir, "task-handles.json"));
+      const claimedAt = Date.now();
+      const dueMs = claimedAt + 60_000; // due 1 minute after claim
+      await store.put({ threadId: "t1", taskGuid: "g1", chatId: "oc_1", claimedTs: claimedAt });
+      const { requester } = makeFakeRequester({ g1: { guid: "g1", summary: "任务A" } });
+      const client = new TaskListClient(requester);
+      const enqueueNudgeTurn = vi.fn();
+      const detector = new StallDetector(
+        {
+          store,
+          client,
+          getLastActiveTs: () => Date.now(), // active RIGHT NOW — the general/fast thresholds would never fire
+          enqueueNudgeTurn,
+          getTaskDueMs: () => dueMs,
+        },
+        { stallThresholdMs: DAY, stallFastThresholdMs: HOUR / 2 },
+      );
+
+      vi.setSystemTime(dueMs + 1_000); // just past due
+      await detector.pollOnceForTest();
+
+      expect(enqueueNudgeTurn).toHaveBeenCalledTimes(1);
+      const text = (enqueueNudgeTurn.mock.calls[0]![0] as { text: string }).text;
+      expect(text).toContain("已过期");
+      expect(text).toContain(formatDueDate(dueMs));
+    });
+
+    it("does NOT fire when the due date is still in the future", async () => {
+      const store = await TaskHandleStore.load(join(dir, "task-handles.json"));
+      const claimedAt = Date.now();
+      const dueMs = claimedAt + DAY; // due tomorrow
+      await store.put({ threadId: "t1", taskGuid: "g1", chatId: "oc_1", claimedTs: claimedAt });
+      const { requester } = makeFakeRequester({ g1: { guid: "g1", summary: "任务A" } });
+      const client = new TaskListClient(requester);
+      const enqueueNudgeTurn = vi.fn();
+      const detector = new StallDetector(
+        { store, client, getLastActiveTs: () => Date.now(), enqueueNudgeTurn, getTaskDueMs: () => dueMs },
+        { stallThresholdMs: DAY },
+      );
+
+      vi.setSystemTime(claimedAt + 60_000);
+      await detector.pollOnceForTest();
+
+      expect(enqueueNudgeTurn).not.toHaveBeenCalled();
+    });
+
+    it("omitting getTaskDueMs disables due-based stall entirely (backward compatible)", async () => {
+      const store = await TaskHandleStore.load(join(dir, "task-handles.json"));
+      const claimedAt = Date.now();
+      await store.put({ threadId: "t1", taskGuid: "g1", chatId: "oc_1", claimedTs: claimedAt });
+      const { requester } = makeFakeRequester({ g1: { guid: "g1", summary: "任务A" } });
+      const client = new TaskListClient(requester);
+      const enqueueNudgeTurn = vi.fn();
+      const detector = new StallDetector(
+        { store, client, getLastActiveTs: () => Date.now(), enqueueNudgeTurn }, // no getTaskDueMs at all
+        { stallThresholdMs: DAY },
+      );
+
+      vi.setSystemTime(claimedAt + 60_000);
+      await detector.pollOnceForTest();
+
+      expect(enqueueNudgeTurn).not.toHaveBeenCalled();
+    });
+
+    it("respects the existing cooldown for repeat due-based nudges (no new counter, same guardrails)", async () => {
+      const store = await TaskHandleStore.load(join(dir, "task-handles.json"));
+      const claimedAt = Date.now();
+      const dueMs = claimedAt + 60_000;
+      await store.put({ threadId: "t1", taskGuid: "g1", chatId: "oc_1", claimedTs: claimedAt });
+      const { requester } = makeFakeRequester({ g1: { guid: "g1", summary: "任务A" } });
+      const client = new TaskListClient(requester);
+      const enqueueNudgeTurn = vi.fn();
+      const detector = new StallDetector(
+        { store, client, getLastActiveTs: () => claimedAt, enqueueNudgeTurn, getTaskDueMs: () => dueMs },
+        { stallThresholdMs: DAY, nudgeCooldownMs: DAY },
+      );
+
+      vi.setSystemTime(dueMs + 1_000);
+      await detector.pollOnceForTest();
+      // Confirm the nudge (activity bump after pendingSince).
+      vi.setSystemTime(dueMs + 2_000);
+      await detector.pollOnceForTest(); // still pending-confirm window, no new send
+
+      vi.setSystemTime(dueMs + 60_000); // well past due, but within the 24h cooldown
+      await detector.pollOnceForTest();
+
+      expect(enqueueNudgeTurn).toHaveBeenCalledTimes(1); // cooldown correctly gates the repeat
+    });
+  });
+
+  describe("v3.3 nudge history in task description (docs/task-handle.md §14)", () => {
+    it("appends a rolling-log entry to the task description after a successful nudge send", async () => {
+      const store = await TaskHandleStore.load(join(dir, "task-handles.json"));
+      const claimedAt = Date.now();
+      await store.put({
+        threadId: "t1",
+        taskGuid: "g1",
+        chatId: "oc_1",
+        claimedTs: claimedAt,
+        lastTurnMentions: ["peer-bot"],
+        lastTurnMentionsAt: claimedAt,
+      });
+      const { requester, calls } = makeFakeRequester({ g1: { guid: "g1", summary: "任务A", description: "原始描述" } });
+      const client = new TaskListClient(requester);
+      const enqueueNudgeTurn = vi.fn();
+      const detector = new StallDetector(
+        { store, client, getLastActiveTs: () => claimedAt, enqueueNudgeTurn, getPeerReceivedAt: () => undefined },
+        { stallThresholdMs: DAY, stallHandoffThresholdMs: 5 * 60_000 },
+      );
+
+      vi.setSystemTime(claimedAt + 6 * 60_000);
+      await detector.pollOnceForTest();
+
+      const patchCall = calls.find((c) => c.method === "PATCH" && c.url === "/open-apis/task/v2/tasks/g1");
+      expect(patchCall).toBeDefined();
+      const patchedDescription = (patchCall!.data as { task: { description: string } }).task.description;
+      expect(patchedDescription).toContain("原始描述");
+      expect(patchedDescription).toContain("停滞唤醒 #1");
+      expect(patchedDescription).toContain("断链");
+    });
+
+    it("swallows a description-patch failure without blocking the wake-up turn itself", async () => {
+      const store = await TaskHandleStore.load(join(dir, "task-handles.json"));
+      const claimedAt = Date.now();
+      await store.put({ threadId: "t1", taskGuid: "g1", chatId: "oc_1", claimedTs: claimedAt });
+      const client = new TaskListClient({
+        request: vi.fn(async (config: LarkTaskRequestConfig) => {
+          if (config.method === "GET" && config.url.includes("/tasks/")) {
+            return { data: { task: { guid: "g1", summary: "任务A" } } };
+          }
+          if (config.method === "PATCH") throw new Error("network blip");
+          return { data: {} };
+        }) as unknown as LarkTaskRequester["request"],
+      });
+      const enqueueNudgeTurn = vi.fn();
+      const detector = new StallDetector(
+        { store, client, getLastActiveTs: () => claimedAt, enqueueNudgeTurn },
+        { stallThresholdMs: 60_000 },
+      );
+
+      vi.setSystemTime(claimedAt + 2 * 60_000);
+      await expect(detector.pollOnceForTest()).resolves.toBeUndefined(); // does not throw
+      expect(enqueueNudgeTurn).toHaveBeenCalledTimes(1); // the wake-up turn still went out
+    });
+  });
+
+  describe("v3.3 hourly nudge fuse (docs/task-handle.md §14)", () => {
+    it("suppresses a nudge once the trailing-hour cap is reached, without mutating any per-task state", async () => {
+      const store = await TaskHandleStore.load(join(dir, "task-handles.json"));
+      const claimedAt = Date.now();
+      // Two independent claims, both already past their (short) stall threshold this same cycle.
+      await store.put({ threadId: "t1", taskGuid: "g1", chatId: "oc_1", claimedTs: claimedAt });
+      await store.put({ threadId: "t2", taskGuid: "g2", chatId: "oc_1", claimedTs: claimedAt });
+      const { requester } = makeFakeRequester({
+        g1: { guid: "g1", summary: "任务A" },
+        g2: { guid: "g2", summary: "任务B" },
+      });
+      const client = new TaskListClient(requester);
+      const enqueueNudgeTurn = vi.fn();
+      const detector = new StallDetector(
+        { store, client, getLastActiveTs: () => claimedAt, enqueueNudgeTurn },
+        { stallThresholdMs: 60_000, stallNudgeHourlyCap: 1 }, // cap=1 — the second claim must be suppressed
+      );
+
+      vi.setSystemTime(claimedAt + 2 * 60_000);
+      await detector.pollOnceForTest(); // both claims are due for a nudge this cycle
+
+      expect(enqueueNudgeTurn).toHaveBeenCalledTimes(1); // fuse tripped for the second one
+
+      // t1 is inserted first, so store.list() (Map insertion order) processes
+      // it first — t1 consumes the cap=1 slot, t2 is the one the fuse
+      // suppresses. Its state must be untouched — no pendingSince recorded —
+      // so the very next cycle (fuse window unchanged) still tries it again
+      // rather than treating it as already-sent-and-lost.
+      expect(store.get("t2")?.stallNudge).toBeUndefined();
+    });
+
+    it("allows nudging again once the trailing-hour window slides past the earlier sends", async () => {
+      const store = await TaskHandleStore.load(join(dir, "task-handles.json"));
+      const claimedAt = Date.now();
+      await store.put({ threadId: "t1", taskGuid: "g1", chatId: "oc_1", claimedTs: claimedAt });
+      const { requester } = makeFakeRequester({ g1: { guid: "g1", summary: "任务A" } });
+      const client = new TaskListClient(requester);
+      const enqueueNudgeTurn = vi.fn();
+      const detector = new StallDetector(
+        { store, client, getLastActiveTs: () => claimedAt, enqueueNudgeTurn },
+        { stallThresholdMs: 60_000, stallNudgeHourlyCap: 1, nudgeCooldownMs: 0, pendingConfirmTimeoutMs: 1_000 },
+      );
+
+      vi.setSystemTime(claimedAt + 2 * 60_000);
+      await detector.pollOnceForTest();
+      expect(enqueueNudgeTurn).toHaveBeenCalledTimes(1);
+
+      // Let the pending nudge time out (treated as lost, doesn't count toward
+      // escalation) so the SAME claim is eligible to re-send, then jump past
+      // the fuse's 1h trailing window from the first send.
+      vi.setSystemTime(claimedAt + 65 * 60_000);
+      await detector.pollOnceForTest();
+
+      expect(enqueueNudgeTurn).toHaveBeenCalledTimes(2); // fuse window slid — no longer capped
+    });
+
+    it("defaults to a cap of 6 per hour when stallNudgeHourlyCap isn't configured", async () => {
+      const store = await TaskHandleStore.load(join(dir, "task-handles.json"));
+      const claimedAt = Date.now();
+      for (let i = 0; i < 7; i++) {
+        await store.put({ threadId: `t${i}`, taskGuid: `g${i}`, chatId: "oc_1", claimedTs: claimedAt });
+      }
+      const tasksByGuid = Object.fromEntries(
+        Array.from({ length: 7 }, (_, i) => [`g${i}`, { guid: `g${i}`, summary: `任务${i}` }]),
+      );
+      const { requester } = makeFakeRequester(tasksByGuid);
+      const client = new TaskListClient(requester);
+      const enqueueNudgeTurn = vi.fn();
+      const detector = new StallDetector(
+        { store, client, getLastActiveTs: () => claimedAt, enqueueNudgeTurn },
+        { stallThresholdMs: 60_000 }, // no stallNudgeHourlyCap override — exercising the real default (6)
+      );
+
+      vi.setSystemTime(claimedAt + 2 * 60_000);
+      await detector.pollOnceForTest();
+
+      expect(enqueueNudgeTurn).toHaveBeenCalledTimes(6); // the 7th claim is suppressed by the default cap
     });
   });
 });

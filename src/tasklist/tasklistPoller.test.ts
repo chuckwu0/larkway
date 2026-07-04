@@ -1,6 +1,10 @@
-import { describe, expect, it, vi } from "vitest";
+import { describe, expect, it, vi, beforeEach, afterEach } from "vitest";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import { TaskListClient, type LarkTaskRequestConfig, type LarkTaskRequester } from "./client.js";
 import { TasklistPoller, normalizeForExactMatch, type RootTextEntry } from "./tasklistPoller.js";
+import { CandidateAlertStore } from "./candidateAlertStore.js";
 import { STATUS_SNAPSHOT_MARKER } from "./writeback.js";
 
 interface FakeTask {
@@ -8,6 +12,8 @@ interface FakeTask {
   summary?: string;
   description?: string;
   completed_at?: string;
+  /** v3.3 due-date stall detection — matches the real API's `due.timestamp` shape verbatim (see client.ts's parseDueMs). */
+  due?: { timestamp: string };
 }
 
 /**
@@ -449,5 +455,153 @@ describe("TasklistPoller — exact root-text auto-bind", () => {
     await poller.pollOnceForTest();
 
     expect(poller.getCandidates().length).toBe(1);
+  });
+});
+
+describe("TasklistPoller — v3.3 due-date tracking (docs/task-handle.md §14)", () => {
+  it("getDueTimestamp reads due.timestamp for an UNCLAIMED (candidate) task", async () => {
+    const { requester } = makeFakeRequester({
+      tasks: [{ guid: "t1", summary: "标题", due: { timestamp: "1700000000000" } }],
+    });
+    const client = new TaskListClient(requester);
+    const poller = new TasklistPoller({ client, tasklistGuid: "guid-1", isClaimedByAnyBot: () => false });
+
+    await poller.pollOnceForTest();
+
+    expect(poller.getDueTimestamp("t1")).toBe(1700000000000);
+  });
+
+  it("getDueTimestamp ALSO reads due.timestamp for an already-CLAIMED task, even though it never appears in getCandidates()", async () => {
+    const { requester } = makeFakeRequester({
+      tasks: [{ guid: "t1", summary: "已认领", due: { timestamp: "1700000000000" } }],
+    });
+    const client = new TaskListClient(requester);
+    const poller = new TasklistPoller({ client, tasklistGuid: "guid-1", isClaimedByAnyBot: () => true });
+
+    await poller.pollOnceForTest();
+
+    expect(poller.getCandidates()).toEqual([]); // claimed — not a candidate
+    expect(poller.getDueTimestamp("t1")).toBe(1700000000000); // but due is still observed, free with the same page
+  });
+
+  it("returns undefined for a task with no due date at all", async () => {
+    const { requester } = makeFakeRequester({ tasks: [{ guid: "t1", summary: "无截止日期" }] });
+    const client = new TaskListClient(requester);
+    const poller = new TasklistPoller({ client, tasklistGuid: "guid-1", isClaimedByAnyBot: () => false });
+
+    await poller.pollOnceForTest();
+
+    expect(poller.getDueTimestamp("t1")).toBeUndefined();
+  });
+});
+
+describe("TasklistPoller — v3.3 候选黑洞提示 (docs/task-handle.md §14)", () => {
+  let tmpDir: string;
+
+  beforeEach(async () => {
+    tmpDir = await mkdtemp(path.join(tmpdir(), "larkway-tasklistpoller-blackhole-"));
+    vi.useFakeTimers();
+  });
+
+  afterEach(async () => {
+    vi.useRealTimers();
+    await rm(tmpDir, { recursive: true, force: true });
+  });
+
+  it("does NOT alert an unclaimed candidate before candidateUnboundAlertMs has elapsed", async () => {
+    const { requester, calls } = makeFakeRequester({ tasks: [{ guid: "t1", summary: "还没人管" }] });
+    const client = new TaskListClient(requester);
+    const alertStore = await CandidateAlertStore.load(path.join(tmpDir, "alerts.json"));
+    const poller = new TasklistPoller(
+      { client, tasklistGuid: "guid-1", isClaimedByAnyBot: () => false, candidateAlertStore: alertStore },
+      { candidateUnboundAlertMs: 60 * 60_000 },
+    );
+
+    await poller.pollOnceForTest();
+    vi.setSystemTime(Date.now() + 30 * 60_000); // only 30min in — under the 1h threshold
+    await poller.pollOnceForTest();
+
+    expect(calls.filter((c) => c.method === "POST" && c.url.includes("/comments"))).toEqual([]);
+  });
+
+  it("posts a one-time alert comment once a candidate has been continuously unbound past the threshold", async () => {
+    const { requester, calls } = makeFakeRequester({ tasks: [{ guid: "t1", summary: "还没人管" }] });
+    const client = new TaskListClient(requester);
+    const alertStore = await CandidateAlertStore.load(path.join(tmpDir, "alerts.json"));
+    const poller = new TasklistPoller(
+      { client, tasklistGuid: "guid-1", isClaimedByAnyBot: () => false, candidateAlertStore: alertStore },
+      { candidateUnboundAlertMs: 60 * 60_000 },
+    );
+
+    await poller.pollOnceForTest(); // first sighting — starts the clock
+    vi.setSystemTime(Date.now() + 61 * 60_000); // past the 1h threshold
+    await poller.pollOnceForTest();
+
+    const commentPosts = calls.filter((c) => c.method === "POST" && c.url.includes("/comments"));
+    expect(commentPosts.length).toBe(1);
+    expect(commentPosts[0]?.data).toMatchObject({ resource_id: "t1", resource_type: "task" });
+    expect((commentPosts[0]?.data as { content: string }).content).toContain("未能自动关联到任何话题");
+  });
+
+  it("does NOT re-alert the same candidate on a later cycle (once per unbound streak)", async () => {
+    const { requester, calls } = makeFakeRequester({ tasks: [{ guid: "t1", summary: "还没人管" }] });
+    const client = new TaskListClient(requester);
+    const alertStore = await CandidateAlertStore.load(path.join(tmpDir, "alerts.json"));
+    const poller = new TasklistPoller(
+      { client, tasklistGuid: "guid-1", isClaimedByAnyBot: () => false, candidateAlertStore: alertStore },
+      { candidateUnboundAlertMs: 60 * 60_000 },
+    );
+
+    await poller.pollOnceForTest();
+    vi.setSystemTime(Date.now() + 61 * 60_000);
+    await poller.pollOnceForTest(); // alerts once here
+    vi.setSystemTime(Date.now() + 60 * 60_000);
+    await poller.pollOnceForTest(); // still unbound, still past threshold — must NOT alert again
+
+    const commentPosts = calls.filter((c) => c.method === "POST" && c.url.includes("/comments"));
+    expect(commentPosts.length).toBe(1);
+  });
+
+  it("re-arms the alert (can fire again) once a candidate is claimed and later becomes unbound again", async () => {
+    let claimed = false;
+    const { requester, calls } = makeFakeRequester({ tasks: [{ guid: "t1", summary: "还没人管" }] });
+    const client = new TaskListClient(requester);
+    const alertStore = await CandidateAlertStore.load(path.join(tmpDir, "alerts.json"));
+    const poller = new TasklistPoller(
+      { client, tasklistGuid: "guid-1", isClaimedByAnyBot: () => claimed, candidateAlertStore: alertStore },
+      { candidateUnboundAlertMs: 60 * 60_000 },
+    );
+
+    await poller.pollOnceForTest();
+    vi.setSystemTime(Date.now() + 61 * 60_000);
+    await poller.pollOnceForTest(); // alerts once
+
+    claimed = true;
+    await poller.pollOnceForTest(); // now claimed — drops out of tracking
+    claimed = false;
+    vi.setSystemTime(Date.now() + 61 * 60_000);
+    await poller.pollOnceForTest(); // unbound again, fresh sighting — still under threshold from THIS sighting
+
+    let commentPosts = calls.filter((c) => c.method === "POST" && c.url.includes("/comments"));
+    expect(commentPosts.length).toBe(1); // no second alert yet — fresh clock just started
+
+    vi.setSystemTime(Date.now() + 61 * 60_000);
+    await poller.pollOnceForTest(); // now past the threshold again on the fresh sighting
+
+    commentPosts = calls.filter((c) => c.method === "POST" && c.url.includes("/comments"));
+    expect(commentPosts.length).toBe(2);
+  });
+
+  it("omitting candidateAlertStore disables the black-hole alert entirely (backward compatible, candidate injection unaffected)", async () => {
+    const { requester, calls } = makeFakeRequester({ tasks: [{ guid: "t1", summary: "还没人管" }] });
+    const client = new TaskListClient(requester);
+    const poller = new TasklistPoller({ client, tasklistGuid: "guid-1", isClaimedByAnyBot: () => false });
+
+    await poller.pollOnceForTest();
+    vi.setSystemTime(Date.now() + 25 * 60 * 60_000); // way past any reasonable threshold
+    await poller.pollOnceForTest();
+
+    expect(calls.filter((c) => c.method === "POST" && c.url.includes("/comments"))).toEqual([]);
+    expect(poller.getCandidates().length).toBe(1); // candidate injection itself still works
   });
 });

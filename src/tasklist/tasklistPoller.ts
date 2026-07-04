@@ -56,9 +56,12 @@
 import { TaskListClient } from "./client.js";
 import { STATUS_SNAPSHOT_MARKER } from "./writeback.js";
 import type { TaskCandidate } from "./types.js";
+import type { CandidateAlertStore } from "./candidateAlertStore.js";
 
 const DEFAULT_INTERVAL_MS = 60_000;
 const DEFAULT_JITTER_MS = 10_000;
+/** v3.3 候选黑洞提示 (docs/task-handle.md §14) — how long a candidate can stay continuously unclaimed before this poller posts a one-time mechanical alert comment on it. */
+const DEFAULT_CANDIDATE_UNBOUND_ALERT_MS = 60 * 60_000;
 /** Description excerpt cap for prompt injection — keep the block cheap. */
 const DESCRIPTION_EXCERPT_MAX_LEN = 200;
 /** Bound both the per-cycle candidate count and the pages fetched to reach it — a large tasklist must never make one poll cycle unbounded. */
@@ -115,6 +118,14 @@ export interface TasklistPollerDeps {
    * accepted gap (docs/task-handle.md §12), not implemented.
    */
   clientOwnerBotId?: string;
+  /**
+   * v3.3 候选黑洞提示 (docs/task-handle.md §14): persisted tracking of how
+   * long each unclaimed candidate has sat continuously unbound, and whether
+   * this poller has already posted a one-time alert comment for it. Omit to
+   * disable the black-hole alert entirely (candidate injection/auto-bind are
+   * unaffected either way).
+   */
+  candidateAlertStore?: CandidateAlertStore;
 }
 
 /** After this many consecutive poll-cycle failures, escalate the log to explicitly name the client's owning bot (see `clientOwnerBotId` above) — a transient blip stays a plain warn. */
@@ -125,6 +136,16 @@ export interface TasklistPollerOptions {
   intervalMs?: number;
   /** First-run jitter cap, clamped to intervalMs. @default 10_000 */
   jitterMs?: number;
+  /** @default 1h. v3.3 候选黑洞提示 — see DEFAULT_CANDIDATE_UNBOUND_ALERT_MS's doc. */
+  candidateUnboundAlertMs?: number;
+}
+
+/** Mechanical, one-time nudge posted on a candidate that's sat unclaimed too long (v3.3, docs/task-handle.md §14) — no judgment about WHY, just the observable fact plus the two mechanical fixes that resolve it. Exported for direct unit testing — pure, no I/O. */
+export function renderCandidateUnboundAlertComment(): string {
+  return (
+    "⚠️ 此任务未能自动关联到任何话题:请检查任务标题是否与话题根消息一致," +
+    "或在对应话题里 @ 一次 agent 让它认领这个任务。"
+  );
 }
 
 /**
@@ -196,13 +217,32 @@ export class TasklistPoller {
   #inFlight: Promise<void> = Promise.resolve();
   /** guid -> cached candidate; rebuilt (not merged) each cycle so a candidate that becomes claimed/completed/deleted disappears promptly. */
   #candidates: Map<string, CachedCandidate> = new Map();
+  /**
+   * v3.3 due-date stall detection (docs/task-handle.md §14): guid -> `due`
+   * timestamp for EVERY task this poller has seen on its most recent cycle —
+   * deliberately not filtered to unclaimed candidates the way `#candidates`
+   * is, since StallDetector needs the due date of ALREADY-CLAIMED tasks
+   * (which never appear in `#candidates` at all). Free — the same
+   * `listTasklistTasks` page fetch already returns `due` for every task on
+   * the page, claimed or not; this just doesn't discard it. Rebuilt (not
+   * merged) each cycle, same as `#candidates`. KNOWN GAP: pagination stops
+   * once `MAX_CANDIDATES` unclaimed candidates are found OR
+   * `MAX_PAGES_PER_CYCLE` pages are fetched, whichever first — a claimed
+   * task on a page beyond that cutoff simply won't have its due date
+   * refreshed this cycle. Accepted: this only delays an early due-based
+   * nudge, it never suppresses the general stall check that still applies
+   * regardless (see stallDetector.ts's `getTaskDueMs` doc).
+   */
+  #dueByGuid: Map<string, number> = new Map();
   /** Consecutive poll-cycle failures — see CONSECUTIVE_FAILURE_WARN_THRESHOLD / clientOwnerBotId. */
   #consecutiveFailures = 0;
+  readonly #candidateUnboundAlertMs: number;
 
   constructor(deps: TasklistPollerDeps, opts: TasklistPollerOptions = {}) {
     this.#deps = deps;
     this.#intervalMs = opts.intervalMs ?? DEFAULT_INTERVAL_MS;
     this.#jitterMs = Math.min(opts.jitterMs ?? DEFAULT_JITTER_MS, this.#intervalMs);
+    this.#candidateUnboundAlertMs = opts.candidateUnboundAlertMs ?? DEFAULT_CANDIDATE_UNBOUND_ALERT_MS;
   }
 
   start(): void {
@@ -236,6 +276,11 @@ export class TasklistPoller {
     }));
   }
 
+  /** v3.3 due-date stall detection (docs/task-handle.md §14) — zero-I/O read of the most recently observed `due` timestamp for ANY task this poller has seen (claimed or not), or undefined if never observed / has no due date. Main.ts wires this into StallDetector. */
+  getDueTimestamp(taskGuid: string): number | undefined {
+    return this.#dueByGuid.get(taskGuid);
+  }
+
   /** Exposed for tests — runs exactly one poll cycle. */
   async pollOnceForTest(): Promise<void> {
     await this.#pollOnce();
@@ -256,12 +301,20 @@ export class TasklistPoller {
   async #runPollCycle(): Promise<void> {
     try {
       const fresh = new Map<string, CachedCandidate>();
+      const freshDue = new Map<string, number>();
       let pageToken: string | undefined;
       let pagesFetched = 0;
       do {
         const page = await this.#deps.client.listTasklistTasks(this.#deps.tasklistGuid, { pageToken });
         pagesFetched += 1;
         for (const task of page.tasks) {
+          // v3.3 due-date stall detection: record BEFORE any continue/break
+          // below — every task on a fetched page carries `due` for free
+          // (same response, no extra call), regardless of claimed/completed/
+          // candidate-cap status. See `#dueByGuid`'s own doc for the known
+          // pagination-cutoff gap this still has.
+          if (task.guid && task.dueMs !== undefined) freshDue.set(task.guid, task.dueMs);
+
           if (fresh.size >= MAX_CANDIDATES) break;
           if (!task.guid) continue;
           if (task.completedAt && task.completedAt !== "0") continue; // completed — never a claim candidate
@@ -296,7 +349,17 @@ export class TasklistPoller {
         await this.#autoBindExactMatches(fresh, this.#deps.rootTextMatch);
       }
 
+      // v3.3 候选黑洞提示 (docs/task-handle.md §14): reconcile against THIS
+      // cycle's still-unbound set (post auto-bind removal — a candidate this
+      // cycle just bound is no longer "unbound" and must not be alerted on),
+      // then alert any that have aged past the threshold and haven't been
+      // alerted yet in their current unbound streak.
+      if (this.#deps.candidateAlertStore) {
+        await this.#alertUnboundCandidates(fresh, this.#deps.candidateAlertStore);
+      }
+
       this.#candidates = fresh;
+      this.#dueByGuid = freshDue;
       this.#consecutiveFailures = 0;
     } catch (err) {
       this.#consecutiveFailures += 1;
@@ -397,5 +460,47 @@ export class TasklistPoller {
         );
       }
     }
+  }
+
+  /**
+   * v3.3 候选黑洞提示 (docs/task-handle.md §14). `fresh` at this point is
+   * exactly "candidates still unbound after this cycle's auto-bind pass" —
+   * reconciling against it (not the pre-auto-bind set) means a candidate
+   * that just got bound this very cycle is dropped from tracking
+   * immediately, never alerted. Never throws — every failure (reconcile,
+   * addComment, markAlerted) is caught and logged, degrading to "try again
+   * next cycle" rather than losing the whole poll cycle's other work.
+   */
+  async #alertUnboundCandidates(fresh: Map<string, CachedCandidate>, alertStore: CandidateAlertStore): Promise<void> {
+    const now = Date.now();
+    try {
+      alertStore.reconcile(new Set(fresh.keys()), now);
+    } catch (err) {
+      console.warn(
+        `[tasklist.tasklistPoller] candidate-alert reconcile failed for tasklist ${this.#deps.tasklistGuid} ` +
+          "(skipping black-hole alert this cycle):",
+        err,
+      );
+      return;
+    }
+    for (const guid of fresh.keys()) {
+      if (alertStore.isAlerted(guid)) continue;
+      const unboundMs = alertStore.unboundDurationMs(guid, now);
+      if (unboundMs === undefined || unboundMs < this.#candidateUnboundAlertMs) continue;
+      try {
+        await this.#deps.client.addComment(guid, renderCandidateUnboundAlertComment());
+        await alertStore.markAlerted(guid, now);
+      } catch (err) {
+        console.warn(
+          `[tasklist.tasklistPoller] candidate-unbound alert failed for task ${guid} ` +
+            "(will retry next cycle since it isn't marked alerted):",
+          err,
+        );
+      }
+    }
+    // Persist reconciled firstSeenUnboundAt clocks even when nothing got
+    // alerted this cycle — otherwise a restart right after a NEW candidate's
+    // first sighting would reset its clock to "now" again.
+    await alertStore.flush().catch(() => {});
   }
 }

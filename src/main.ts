@@ -40,12 +40,13 @@ import {
   shouldProvideResponseSurfaceCardKitClient,
   shouldProvideResponseSurfacePostClient,
 } from "./responseSurface.js";
-import { resolveTaskHandlesPath, resolveTaskTeamRegistryPath } from "./config/paths.js";
+import { resolveTaskHandlesPath, resolveTaskTeamRegistryPath, resolveCandidateAlertsPath } from "./config/paths.js";
 import { TaskHandleStore } from "./tasklist/store.js";
 import { TaskListClient, type LarkTaskRequester } from "./tasklist/client.js";
 import { applyTaskHandleWriteback, applyAutoBindConfirmation } from "./tasklist/writeback.js";
 import { CommentPoller } from "./tasklist/commentPoller.js";
 import { TasklistPoller, type RootTextEntry } from "./tasklist/tasklistPoller.js";
+import { CandidateAlertStore } from "./tasklist/candidateAlertStore.js";
 import { StallDetector } from "./tasklist/stallDetector.js";
 import { readTeamTasklistGuid } from "./tasklist/teamRegistry.js";
 
@@ -580,6 +581,13 @@ async function runV2Mode({
               // or get queued". See stallDetector.ts's module doc revision 3.
               getPeerLastActiveTs: (peerBotId, threadId) =>
                 handlersByBotId.get(peerBotId)?.getThreadLastActiveTs(threadId),
+              // v3.3 due-date stall detection (docs/task-handle.md §14): free
+              // read of TasklistPoller's own per-guid `due` observation — same
+              // "populated after, read lazily" closure trick as
+              // taskHandleCandidatesLookup above (the poller for `guid` is
+              // constructed AFTER this whole per-bot loop finishes, but this
+              // closure is only ever INVOKED later, at poll time).
+              getTaskDueMs: (taskGuid) => tasklistPollersByGuid.get(guid)?.getDueTimestamp(taskGuid),
               enqueueNudgeTurn: (turn) => {
                 client.enqueueSyntheticEvent({
                   message_id: `synthetic-task-stall-${turn.threadId}-${Date.now()}`,
@@ -604,6 +612,7 @@ async function runV2Mode({
               handoffReceiptGraceMs: bot.taskHandle?.stallHandoffReceiptGraceMs,
               nudgeCooldownMs: bot.taskHandle?.stallNudgeCooldownMs,
               escalateAfterNudges: bot.taskHandle?.stallEscalateAfterNudges,
+              stallNudgeHourlyCap: bot.taskHandle?.stallNudgeHourlyCap,
             },
           );
           stallDetector.start();
@@ -750,63 +759,77 @@ async function runV2Mode({
   // same multi-bot-storm lesson CommentPoller already learned).
   const tasklistPollers: TasklistPoller[] = [];
   for (const [guid, group] of tasklistGuidGroups) {
-    const poller = new TasklistPoller({
-      client: group.client,
-      clientOwnerBotId: group.clientOwnerBotId,
-      tasklistGuid: guid,
-      isClaimedByAnyBot: (taskGuid) =>
-        group.bots.some((b) => b.taskHandleStore.list().some((r) => r.taskGuid === taskGuid)),
-      // v3 dispatch-time exact auto-bind (docs/task-handle.md §5.2 addendum):
-      // read-only rootText snapshot across every bot sharing this guid, and
-      // the mechanical claim+confirmation callback for a uniquely-matched
-      // (thread, task) pair. Both are pure plumbing — the poller itself
-      // (tasklistPoller.ts) does all the actual matching/uniqueness logic.
-      rootTextMatch: {
-        // Adversarial-review P1 fix (docs/task-handle.md §12/§9.9): a thread
-        // that already holds ANY claim must never be offered as an auto-bind
-        // target — otherwise a duplicate task (e.g. someone re-transfers the
-        // same root message into a new task) can exact-match the thread's
-        // rootText and silently HIJACK its existing claim, orphaning the
-        // original task (marker-excluded from candidates forever, nobody
-        // watching it). `claim()`'s own guid-uniqueness rejection (store.ts)
-        // guards the reverse direction (two threads racing for one task);
-        // this filter is the thread-side half of the same invariant.
-        listRootTexts: (): readonly RootTextEntry[] =>
-          group.bots.flatMap((b) =>
-            b.sessionStore
-              .list()
-              .filter(
-                (r) =>
-                  r.rootText !== undefined &&
-                  r.chatId !== undefined &&
-                  b.taskHandleStore.get(r.threadId) === undefined,
-              )
-              .map((r) => ({ botId: b.botId, threadId: r.threadId, chatId: r.chatId!, rootText: r.rootText! })),
-          ),
-        bindThreadToTask: async (entry) => {
-          const target = group.bots.find((b) => b.botId === entry.botId);
-          if (!target) return; // shouldn't happen — entry came from this same group's listRootTexts
-          const result = await target.taskHandleStore.claim({
-            threadId: entry.threadId,
-            taskGuid: entry.taskGuid,
-            chatId: entry.chatId,
-          });
-          if (!result.claimed) {
-            // Residual race: the thread got claimed (or the task got claimed
-            // elsewhere) between listRootTexts()'s snapshot and this await —
-            // store.claim()'s own atomic check is the real guard here, this
-            // is just visibility. Never write a confirmation for a bind that
-            // didn't actually happen.
-            console.warn(
-              `[larkway] tasklist auto-bind: thread ${entry.threadId} (bot ${entry.botId}) rejected for ` +
-                `task ${entry.taskGuid} (${result.reason ?? "unknown reason"}) — skipping confirmation write.`,
-            );
-            return;
-          }
-          await applyAutoBindConfirmation(entry.taskGuid, group.client);
+    // v3.3 候选黑洞提示 (docs/task-handle.md §14): persisted at the SAME
+    // per-guid granularity as the poller itself (one poller per unique
+    // tasklistGuid, shared across every bot configured with it).
+    const candidateAlertStore = await CandidateAlertStore.load(resolveCandidateAlertsPath(guid));
+    // Same "first bot to resolve this guid owns the config" convention as
+    // clientOwnerBotId (see TasklistGuidGroup's doc) — candidateUnboundAlertMs
+    // is a per-guid-poller setting, not per-bot, so it has to pick ONE bot's
+    // config when multiple bots share a guid.
+    const candidateUnboundAlertMs = bots.find((b) => b.id === group.clientOwnerBotId)?.taskHandle
+      ?.candidateUnboundAlertMs;
+    const poller = new TasklistPoller(
+      {
+        client: group.client,
+        clientOwnerBotId: group.clientOwnerBotId,
+        tasklistGuid: guid,
+        candidateAlertStore,
+        isClaimedByAnyBot: (taskGuid) =>
+          group.bots.some((b) => b.taskHandleStore.list().some((r) => r.taskGuid === taskGuid)),
+        // v3 dispatch-time exact auto-bind (docs/task-handle.md §5.2 addendum):
+        // read-only rootText snapshot across every bot sharing this guid, and
+        // the mechanical claim+confirmation callback for a uniquely-matched
+        // (thread, task) pair. Both are pure plumbing — the poller itself
+        // (tasklistPoller.ts) does all the actual matching/uniqueness logic.
+        rootTextMatch: {
+          // Adversarial-review P1 fix (docs/task-handle.md §12/§9.9): a thread
+          // that already holds ANY claim must never be offered as an auto-bind
+          // target — otherwise a duplicate task (e.g. someone re-transfers the
+          // same root message into a new task) can exact-match the thread's
+          // rootText and silently HIJACK its existing claim, orphaning the
+          // original task (marker-excluded from candidates forever, nobody
+          // watching it). `claim()`'s own guid-uniqueness rejection (store.ts)
+          // guards the reverse direction (two threads racing for one task);
+          // this filter is the thread-side half of the same invariant.
+          listRootTexts: (): readonly RootTextEntry[] =>
+            group.bots.flatMap((b) =>
+              b.sessionStore
+                .list()
+                .filter(
+                  (r) =>
+                    r.rootText !== undefined &&
+                    r.chatId !== undefined &&
+                    b.taskHandleStore.get(r.threadId) === undefined,
+                )
+                .map((r) => ({ botId: b.botId, threadId: r.threadId, chatId: r.chatId!, rootText: r.rootText! })),
+            ),
+          bindThreadToTask: async (entry) => {
+            const target = group.bots.find((b) => b.botId === entry.botId);
+            if (!target) return; // shouldn't happen — entry came from this same group's listRootTexts
+            const result = await target.taskHandleStore.claim({
+              threadId: entry.threadId,
+              taskGuid: entry.taskGuid,
+              chatId: entry.chatId,
+            });
+            if (!result.claimed) {
+              // Residual race: the thread got claimed (or the task got claimed
+              // elsewhere) between listRootTexts()'s snapshot and this await —
+              // store.claim()'s own atomic check is the real guard here, this
+              // is just visibility. Never write a confirmation for a bind that
+              // didn't actually happen.
+              console.warn(
+                `[larkway] tasklist auto-bind: thread ${entry.threadId} (bot ${entry.botId}) rejected for ` +
+                  `task ${entry.taskGuid} (${result.reason ?? "unknown reason"}) — skipping confirmation write.`,
+              );
+              return;
+            }
+            await applyAutoBindConfirmation(entry.taskGuid, group.client);
+          },
         },
       },
-    });
+      { candidateUnboundAlertMs },
+    );
     poller.start();
     tasklistPollersByGuid.set(guid, poller);
     tasklistPollers.push(poller);

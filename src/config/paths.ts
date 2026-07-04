@@ -147,6 +147,23 @@ export function resolveTaskTeamRegistryPath(): string {
   return join(larkwayHome(), "task-team.json");
 }
 
+/**
+ * Resolve the "candidate black-hole alert" persistence path for a shared
+ * tasklist (v3.3, docs/task-handle.md §14) — which unclaimed candidate guids
+ * TasklistPoller has already posted a "nobody bound to this" alert comment
+ * for, so a restart doesn't re-post it. Home-level and keyed by
+ * `tasklistGuid`, not by bot — TasklistPoller itself is ONE INSTANCE PER
+ * UNIQUE tasklistGuid (shared across every bot configured with that guid,
+ * see main.ts), so this state naturally lives at the same scope, mirroring
+ * {@link resolveTaskTeamRegistryPath}'s "home-level, not per-bot" reasoning.
+ *
+ * `tasklistGuid` is always a UUID (hyphens + hex), safe to interpolate
+ * directly into a filename.
+ */
+export function resolveCandidateAlertsPath(tasklistGuid: string): string {
+  return join(larkwayHome(), `candidate-alerts-${tasklistGuid}.json`);
+}
+
 function assertSafePathSegment(label: string, value: string): void {
   if (!/^[A-Za-z0-9_-]+$/.test(value)) {
     throw new Error(`${label} must be a safe path segment`);

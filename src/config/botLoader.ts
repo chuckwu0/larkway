@@ -98,6 +98,23 @@ const TaskHandleConfigSchema = z.object({
   stallEscalateAfterNudges: z.number().int().positive().optional(),
   /** 彻底关闭停滞检测(默认 false = 开启,阈值保守)。 */
   stallDetectionDisabled: z.boolean().optional(),
+  /**
+   * v3.3 候选黑洞提示(docs/task-handle.md §14):共享清单里一个未认领候选
+   * 任务连续滞留超过这个时长(ms)仍没被任何话题绑定(自动或人工认领都算解除),
+   * TasklistPoller 就在该任务下留一条机械提示评论(每个候选只提一次,绑定
+   * 成功后从"已提示"集合清除,再次滞留可再提)。默认 1h。只对同一 tasklistGuid
+   * 共享组里"首个解析出该 guid 的 bot"的配置生效(跟 TasklistPoller 本身
+   * "一个 guid 一个实例"的粒度一致,见 clientOwnerBotId 的同款约定)。
+   */
+  candidateUnboundAlertMs: z.number().positive().optional(),
+  /**
+   * v3.3 全局唤醒保险丝(docs/task-handle.md §14):这个 bot 的 StallDetector
+   * 每小时(滚动窗口,非整点分桶)最多合成几次唤醒 turn(含通用/断链/过期各
+   * 档,不含升级评论)。超限本轮抑制,只打一条点名哪个任务被抑制的 warn 日志,
+   * 不改任何持久状态,下一轮正常重新评估。默认 6——纯粹是防止未知 bug 导致
+   * 唤醒风暴烧推理额度的保险丝,正常路径永远碰不到它,不是需要调优的阈值。
+   */
+  stallNudgeHourlyCap: z.number().int().positive().optional(),
 }).strict();
 
 const GitCloneUrlSchema = z.string().min(1).refine(

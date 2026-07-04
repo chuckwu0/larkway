@@ -119,6 +119,24 @@ export interface TaskSnapshot {
   description?: string;
   /** ms-epoch string, per task v2 `completed_at`; undefined/"0" = not completed. */
   completedAt?: string;
+  /**
+   * v3.3 due-date stall detection (docs/task-handle.md §14): parsed ms-epoch
+   * from task v2's `due.timestamp` (verified against `lark-cli schema task
+   * tasks get` — `due` is `{ is_all_day?: boolean, timestamp?: string }`,
+   * present on both `getTask` and `listTasklistTasks` responses). Undefined
+   * when the task has no due date set at all — never defaults to "now" or
+   * any other sentinel.
+   */
+  dueMs?: number;
+}
+
+/** Shared `due.timestamp` extraction for both getTask and listTasklistTasks — see TaskSnapshot.dueMs's doc. */
+function parseDueMs(task: Record<string, unknown>): number | undefined {
+  const due = asRecord(task["due"]);
+  const timestamp = due["timestamp"];
+  if (typeof timestamp !== "string") return undefined;
+  const ms = Number(timestamp);
+  return Number.isFinite(ms) ? ms : undefined;
 }
 
 export interface TaskMember {
@@ -217,6 +235,7 @@ export class TaskListClient {
       summary: typeof task["summary"] === "string" ? task["summary"] : undefined,
       description: typeof task["description"] === "string" ? task["description"] : undefined,
       completedAt: typeof task["completed_at"] === "string" ? task["completed_at"] : undefined,
+      dueMs: parseDueMs(task),
     };
   }
 
@@ -426,6 +445,7 @@ export class TaskListClient {
       summary: typeof task["summary"] === "string" ? task["summary"] : undefined,
       description: typeof task["description"] === "string" ? task["description"] : undefined,
       completedAt: typeof task["completed_at"] === "string" ? task["completed_at"] : undefined,
+      dueMs: parseDueMs(task),
     }));
     return { tasks, hasMore: Boolean(resp.data?.has_more), pageToken: resp.data?.page_token };
   }

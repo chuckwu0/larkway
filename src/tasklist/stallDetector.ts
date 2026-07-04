@@ -215,12 +215,42 @@
  * as a SECONDARY, delayed confirmation is safe precisely because it's now
  * gated behind the grace window, not read the instant a mention lands.
  *
+ * ## v3.3 巡检策略加固 (docs/task-handle.md §14)
+ *
+ * Three additions to this module, all reusing the EXISTING `stallNudge` state
+ * machine and mechanical-signal discipline — none of these add a second,
+ * parallel counter or any judgment call:
+ *
+ * 1. **Due-date early stall.** `getTaskDueMs` (wired from TasklistPoller's
+ *    free-with-every-page `due` observation, see tasklistPoller.ts's
+ *    `#dueByGuid`) lets `#effectiveThreshold` treat an ALREADY-PAST due date
+ *    as an immediately-applicable threshold (`ms: 0`) — "don't wait for the
+ *    idle clock, this is late NOW" — while every guardrail (cooldown,
+ *    two-step confirmation, escalation) still applies exactly as before.
+ *    Reason `"due"` is the new shortest tier, ahead of handoff/failed/normal.
+ * 2. **Nudge history in the description.** Every successful `#sendNudge`
+ *    (any reason/tier) also appends one line to the task's rolling progress
+ *    log via `mergeDescriptionSnapshot` — so a human scanning the task center
+ *    can see how many times, and why, the bridge has had to intervene.
+ *    Best-effort: a failed patch is logged and swallowed, never blocks the
+ *    synthetic wake-up turn itself from being enqueued.
+ * 3. **Hourly nudge fuse.** A per-instance (per-bot) sliding-window cap on
+ *    how many synthetic stall/handoff/due turns THIS bot's StallDetector will
+ *    enqueue within any trailing 60 minutes (`stallNudgeHourlyCap`, default
+ *    6) — a circuit breaker against an unknown bug turning into a reasoning-
+ *    budget-burning wake-up storm, not a normal-path control. Tripping it
+ *    suppresses the send (no state mutation — next cycle just retries) and
+ *    logs which task got suppressed. In-memory only; a restart clears the
+ *    window, which is an accepted, deliberately cheap trade-off for a
+ *    fuse whose entire job is "never fire on the happy path."
+ *
  * Class shape (timer/start/stop/jitter) mirrors commentPoller.ts.
  */
 
 import type { TaskHandleRecord } from "./store.js";
 import type { TaskHandleStore } from "./store.js";
 import { TaskListClient, isPermissionDeniedError, type TaskSnapshot } from "./client.js";
+import { mergeDescriptionSnapshot } from "./writeback.js";
 
 const DEFAULT_INTERVAL_MS = 60_000;
 const DEFAULT_JITTER_MS = 10_000;
@@ -237,6 +267,9 @@ const DEFAULT_HANDOFF_STARTUP_QUIET_MS = 6 * 60_000;
 const DEFAULT_HANDOFF_RECEIPT_GRACE_MS = 30 * 60_000;
 /** Mirrors commentPoller.ts's PERMISSION_BACKOFF_CEILING_MS — same rationale (§D). */
 const PERMISSION_BACKOFF_CEILING_MS = 30 * 60_000;
+/** v3.3 全局唤醒保险丝 — see the module doc's "hourly nudge fuse" section. A circuit breaker, not a product-facing tuning knob most deployments need to touch. */
+const DEFAULT_STALL_NUDGE_HOURLY_CAP = 6;
+const HOUR_MS = 60 * 60_000;
 
 const STALL_NUDGE_PREFIX = "[停滞提醒] ";
 
@@ -285,6 +318,17 @@ export interface StallDetectorDeps {
    * behavior before this revision.
    */
   getPeerLastActiveTs?: (peerBotId: string, threadId: string) => number | undefined;
+  /**
+   * v3.3 due-date stall detection (docs/task-handle.md §14): plain in-memory
+   * read of the task's `due` timestamp, as most recently observed by
+   * TasklistPoller's `getDueTimestamp` (populated for free from the same
+   * `listTasklistTasks` pages already fetched for candidate discovery — no
+   * dedicated `getTask` call, keeping this module's "no forced network call
+   * per claim per cycle" invariant intact). Undefined = no known due date
+   * (or not yet observed this run) — the due-based tier simply doesn't apply.
+   * Omit to disable due-date-based early stall entirely.
+   */
+  getTaskDueMs?: (taskGuid: string) => number | undefined;
 }
 
 export interface StallDetectorOptions {
@@ -308,6 +352,8 @@ export interface StallDetectorOptions {
   handoffStartupQuietMs?: number;
   /** @default 30min. v3.2 revision 3 — see DEFAULT_HANDOFF_RECEIPT_GRACE_MS's doc: how long a peer's receipt alone is trusted before requiring a genuinely completed turn as confirmation. */
   handoffReceiptGraceMs?: number;
+  /** @default 6. v3.3 全局唤醒保险丝 — see DEFAULT_STALL_NUDGE_HOURLY_CAP's doc. A circuit breaker; the happy path never approaches it. */
+  stallNudgeHourlyCap?: number;
 }
 
 /** `ms` rendered as a human-friendly duration label, minutes below an hour, hours at/above — a fixed 15min threshold reading "已超过 1 小时" (rounding-to-hours) would be actively misleading. Exported for direct unit testing — pure, no I/O. */
@@ -316,22 +362,33 @@ export function formatDurationLabel(ms: number): string {
   return `${Math.max(1, Math.round(ms / 3_600_000))} 小时`;
 }
 
+/** `dueMs` rendered as a plain `YYYY-MM-DD` date (bridge machine local time, matching writeback.ts's human-facing date rendering convention) — no time-of-day, since task v2's `due.is_all_day` case is common and a precise-looking timestamp would overstate the precision. Exported for direct unit testing — pure, no I/O. */
+export function formatDueDate(dueMs: number): string {
+  const d = new Date(dueMs);
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+}
+
 /** Renders the synthesized "message" text the claiming agent sees on a nudge turn — a plain fact block, no instruction on WHAT to do (that's the SKILL's job). */
 export function renderStallNudgeText(input: {
   summary: string | undefined;
   idleMs: number;
   nudgeCount: number;
   /** @default "normal" */
-  reason?: "handoff" | "failed" | "normal";
+  reason?: "handoff" | "failed" | "normal" | "due";
+  /** v3.3 due-date stall — only meaningful (and only rendered) when reason="due". */
+  dueMs?: number;
 }): string {
   const title = input.summary ? `“${input.summary}”` : "(无标题)";
   const idleLabel = formatDurationLabel(input.idleMs);
   const situation =
-    input.reason === "handoff"
-      ? `你上一轮回复里 @ 的协作 bot,已超过 ${idleLabel}没有在这个话题接手`
-      : `已超过 ${idleLabel}没有新动态`;
+    input.reason === "due"
+      ? `已过期${input.dueMs !== undefined ? `(截止 ${formatDueDate(input.dueMs)})` : ""}`
+      : input.reason === "handoff"
+        ? `你上一轮回复里 @ 的协作 bot,已超过 ${idleLabel}没有在这个话题接手`
+        : `已超过 ${idleLabel}没有新动态`;
+  const needsComma = input.reason === "handoff" || input.reason === "due";
   return (
-    `${STALL_NUDGE_PREFIX}你认领的任务 ${title}${input.reason === "handoff" ? "," : ""} ${situation}` +
+    `${STALL_NUDGE_PREFIX}你认领的任务 ${title}${needsComma ? "," : ""} ${situation}` +
     `(第 ${input.nudgeCount} 次提醒)。请判断如何推进这项工作。`
   );
 }
@@ -357,6 +414,7 @@ export class StallDetector {
   readonly #pendingConfirmTimeoutMs: number;
   readonly #handoffStartupQuietMs: number;
   readonly #handoffReceiptGraceMs: number;
+  readonly #stallNudgeHourlyCap: number;
   /** Construction time — the baseline for the revision-2 startup quiet period, since this instance's getPeerReceivedAt-backed map starts empty either way (fresh process or fresh instance). */
   readonly #startedAt: number;
   #timer: ReturnType<typeof setTimeout> | ReturnType<typeof setInterval> | undefined;
@@ -365,6 +423,8 @@ export class StallDetector {
   #inFlight: Promise<void> = Promise.resolve();
   /** Mirrors commentPoller.ts's permission-denied backoff — see its doc comment. */
   readonly #permissionBackoff = new Map<string, { nextAttemptAt: number; backoffMs: number }>();
+  /** v3.3 全局唤醒保险丝: ms-epoch timestamps of every synthetic nudge turn THIS instance has enqueued, pruned to the trailing hour on each check — see `#tripFuseOrRecord`. In-memory, per-instance (per-bot); a restart clears it, an accepted trade-off for a fuse that should never trip on the happy path anyway. */
+  #recentNudgeSendTimestamps: number[] = [];
 
   constructor(deps: StallDetectorDeps, opts: StallDetectorOptions = {}) {
     this.#deps = deps;
@@ -378,6 +438,7 @@ export class StallDetector {
     this.#pendingConfirmTimeoutMs = opts.pendingConfirmTimeoutMs ?? DEFAULT_PENDING_CONFIRM_TIMEOUT_MS;
     this.#handoffStartupQuietMs = opts.handoffStartupQuietMs ?? DEFAULT_HANDOFF_STARTUP_QUIET_MS;
     this.#handoffReceiptGraceMs = opts.handoffReceiptGraceMs ?? DEFAULT_HANDOFF_RECEIPT_GRACE_MS;
+    this.#stallNudgeHourlyCap = opts.stallNudgeHourlyCap ?? DEFAULT_STALL_NUDGE_HOURLY_CAP;
     this.#startedAt = Date.now();
   }
 
@@ -522,13 +583,18 @@ export class StallDetector {
 
   /**
    * The effective stall threshold for this record right now, and which rule
-   * produced it (module doc's v3.2 section) — whichever applicable rule is
-   * SHORTEST always wins.
+   * produced it (module doc's v3.2/v3.3 sections) — whichever applicable
+   * rule is SHORTEST always wins.
    *
-   * Per mentioned peer (revision 3), this is a three-tier check using precise
-   * timestamps (not the coarser `now - thisBot'sOwnLastActiveTs` comparison
-   * `#pollOne` uses downstream — this method resolves the handoff verdict
-   * itself using real anchors, then returns a threshold value that is
+   * v3.3 due-date tier (checked FIRST, docs/task-handle.md §14): an
+   * ALREADY-PAST due date is immediately applicable (`ms: 0`) — "don't wait
+   * for the idle clock, this is late right now." Always the shortest
+   * possible value, so it short-circuits before even evaluating handoff.
+   *
+   * Per mentioned peer (revision 3), the handoff check is a three-tier check
+   * using precise timestamps (not the coarser `now - thisBot'sOwnLastActiveTs`
+   * comparison `#pollOne` uses downstream — this method resolves the handoff
+   * verdict itself using real anchors, then returns a threshold value that is
    * GUARANTEED to already be satisfied by that outer comparison once a tier
    * fires, since `stallHandoffThresholdMs`/`handoffReceiptGraceMs` are the
    * exact bounds this method itself already waited out):
@@ -550,11 +616,16 @@ export class StallDetector {
   #effectiveThreshold(
     record: TaskHandleRecord,
     threadId: string,
-  ): { ms: number; reason: "handoff" | "failed" | "normal" } {
+  ): { ms: number; reason: "due" | "handoff" | "failed" | "normal"; dueMs?: number } {
     const base: { ms: number; reason: "failed" | "normal" } =
       record.lastTurnOutcome === "failed"
         ? { ms: this.#stallFastThresholdMs, reason: "failed" }
         : { ms: this.#stallThresholdMs, reason: "normal" };
+
+    const dueMs = this.#deps.getTaskDueMs?.(record.taskGuid);
+    if (dueMs !== undefined && Date.now() >= dueMs) {
+      return { ms: 0, reason: "due", dueMs };
+    }
 
     if (
       !this.#deps.getPeerReceivedAt ||
@@ -644,10 +715,33 @@ export class StallDetector {
     return task;
   }
 
+  /**
+   * v3.3 全局唤醒保险丝: does THIS instance's trailing-hour nudge count already
+   * sit at/above `stallNudgeHourlyCap`? Prunes timestamps older than an hour
+   * first, so this is always evaluated against a genuinely trailing window,
+   * not a fixed clock-hour bucket. Read-only — call {@link #recordNudgeSend}
+   * separately, only after a nudge is actually about to be enqueued.
+   */
+  #isNudgeFuseTripped(now: number): boolean {
+    const cutoff = now - HOUR_MS;
+    this.#recentNudgeSendTimestamps = this.#recentNudgeSendTimestamps.filter((ts) => ts > cutoff);
+    return this.#recentNudgeSendTimestamps.length >= this.#stallNudgeHourlyCap;
+  }
+
   /** Only called when `#pollOne` has already decided (using local checks alone) that it's time to nudge. */
   async #sendNudge(threadId: string): Promise<void> {
     const record = this.#deps.store.get(threadId);
     if (!record) return;
+
+    const now = Date.now();
+    if (this.#isNudgeFuseTripped(now)) {
+      console.warn(
+        `[tasklist.stallDetector] hourly nudge fuse tripped (cap=${this.#stallNudgeHourlyCap}/hour) — ` +
+          `suppressing this cycle's wake-up for task ${record.taskGuid} (thread ${threadId}); will re-evaluate next cycle.`,
+      );
+      return; // no state mutation — next cycle re-evaluates fresh, same as if this cycle never ran
+    }
+
     const task = await this.#fetchTaskOrHandle(threadId, record.taskGuid);
     if (task === null) return;
 
@@ -661,9 +755,8 @@ export class StallDetector {
       return;
     }
 
-    const { ms: threshold, reason } = this.#effectiveThreshold(record, threadId);
+    const { ms: threshold, reason, dueMs } = this.#effectiveThreshold(record, threadId);
     const prospectiveCount = (record.stallNudge?.count ?? 0) + 1; // display only — the persisted count increments on confirm, not here
-    const now = Date.now();
     this.#deps.enqueueNudgeTurn({
       threadId: record.threadId,
       chatId: record.chatId,
@@ -672,8 +765,10 @@ export class StallDetector {
         idleMs: threshold,
         nudgeCount: prospectiveCount,
         reason,
+        dueMs,
       }),
     });
+    this.#recentNudgeSendTimestamps.push(now); // counts toward the hourly fuse only once a nudge is actually enqueued
     await this.#deps.store.update(threadId, (r) =>
       r
         ? {
@@ -688,6 +783,37 @@ export class StallDetector {
           }
         : r,
     );
+
+    // v3.3 item 2 (docs/task-handle.md §14): leave a durable trace in the
+    // task's own rolling progress log, same mechanism writeback.ts already
+    // uses for per-turn summaries — best-effort, never blocks the wake-up
+    // turn itself (which was already enqueued above regardless of this).
+    const logSummary = `停滞唤醒 #${prospectiveCount}(${this.#nudgeReasonLabel(reason, dueMs)})`;
+    const nextDescription = mergeDescriptionSnapshot(task.description, {
+      status: "in_progress",
+      summary: logSummary,
+      now: new Date(now),
+    });
+    await this.#deps.client.patchDescription(record.taskGuid, nextDescription).catch((err) => {
+      console.warn(
+        `[tasklist.stallDetector] nudge-history description patch failed for task ${record.taskGuid} (continuing):`,
+        err,
+      );
+    });
+  }
+
+  /** Compact, human-facing reason label for the description log entry — mirrors renderStallNudgeText's per-reason framing but shortened for a one-line log. */
+  #nudgeReasonLabel(reason: "due" | "handoff" | "failed" | "normal", dueMs: number | undefined): string {
+    switch (reason) {
+      case "due":
+        return `任务已过期${dueMs !== undefined ? `,截止 ${formatDueDate(dueMs)}` : ""}`;
+      case "handoff":
+        return "断链:协作 bot 未接手/未收尾";
+      case "failed":
+        return "上一轮崩溃后超时无新动态";
+      case "normal":
+        return "超时无新动态";
+    }
   }
 
   /** Only called when `#pollOne` has already decided nudges are exhausted with no progress. */
