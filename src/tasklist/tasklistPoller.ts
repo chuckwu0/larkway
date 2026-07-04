@@ -32,18 +32,23 @@
  * thread," and it's deliberately narrow. handler.ts now captures each
  * thread's ROOT message text at dispatch time, for free (src/claude/
  * sessionStore.ts's `rootText`, written once when the thread's session
- * record is first created — no new network call, no per-poll cost). Every
- * poll cycle, after building the candidate snapshot above, this module
- * compares each candidate's summary against every known thread's rootText
- * (both sides run through {@link normalizeForExactMatch} — @-mention strip +
- * whitespace collapse, NOTHING fuzzier). Only a STRICT 1:1 match — exactly
- * one thread matches this candidate, AND that thread matches no other
- * candidate — triggers an automatic bind (`rootTextMatch.bindThreadToTask`);
- * any other outcome (zero matches, or ties on either side) is left entirely
- * to the agent-path candidate injection above. This stays mechanical, not a
- * business judgment: string equality after a fixed, documented
- * normalization is a fact, not an interpretation — the same bar the rest of
- * this module already holds itself to.
+ * record is first created, gated on the message genuinely being the topic
+ * root — no new network call, no per-poll cost). Every poll cycle, after
+ * building the candidate snapshot above, this module compares each
+ * candidate's summary against every known thread's rootText (both sides run
+ * through {@link normalizeForExactMatch} — whitespace collapse ONLY, see its
+ * own doc for why an earlier @-mention-stripping version was removed after
+ * adversarial review). Only a STRICT 1:1 match — exactly one thread matches
+ * this candidate, AND that thread matches no other candidate, AND the
+ * thread does not already hold some OTHER claim (main.ts's listRootTexts
+ * excludes already-claimed threads entirely; store.ts's claim() also
+ * rejects a taskGuid already claimed elsewhere as a second, independent
+ * guard) — triggers an automatic bind (`rootTextMatch.bindThreadToTask`);
+ * any other outcome (zero matches, ties, or a claim conflict) is left
+ * entirely to the agent-path candidate injection above. This stays
+ * mechanical, not a business judgment: string equality after a fixed,
+ * documented normalization is a fact, not an interpretation — the same bar
+ * the rest of this module already holds itself to.
  *
  * Class shape (timer/start/stop/jitter) mirrors commentPoller.ts.
  */
@@ -98,7 +103,22 @@ export interface TasklistPollerDeps {
   isClaimedByAnyBot: (taskGuid: string) => boolean;
   /** Omit to disable the v3 exact-auto-bind step entirely (candidate injection alone still works). */
   rootTextMatch?: RootTextMatchDeps;
+  /**
+   * Which bot's app credentials `client` above actually authenticates as
+   * (main.ts fixes this to whichever bot in the shared guid group resolved
+   * it first — see main.ts's TasklistGuidGroup doc). Purely a logging label
+   * (adversarial review): if THAT bot's scope/tasklist-membership breaks,
+   * every OTHER bot sharing this guid silently loses candidate discovery and
+   * auto-bind too, since they all poll through this one client. Naming the
+   * bot in the escalated warning below (see CONSECUTIVE_FAILURE_WARN_THRESHOLD)
+   * is the whole fix here — full client rotation/failover is a known,
+   * accepted gap (docs/task-handle.md §12), not implemented.
+   */
+  clientOwnerBotId?: string;
 }
+
+/** After this many consecutive poll-cycle failures, escalate the log to explicitly name the client's owning bot (see `clientOwnerBotId` above) — a transient blip stays a plain warn. */
+const CONSECUTIVE_FAILURE_WARN_THRESHOLD = 3;
 
 export interface TasklistPollerOptions {
   /** @default 60_000 */
@@ -110,21 +130,40 @@ export interface TasklistPollerOptions {
 /**
  * Fixed, documented normalization applied to BOTH sides of the exact-match
  * comparison (docs/task-handle.md §5.2 v3 addendum) — deliberately NOT
- * fuzzy/prefix/similarity matching, just canonicalizing two cosmetic
- * differences that would otherwise defeat a legitimate exact match:
- *   - an @-mention token (Feishu renders a human-readable "@张三 " into a
- *     converted task's title, but our own message parsing already strips
- *     ITS placeholder form out of rootText — see lark/message.ts's
- *     AT_PLACEHOLDER_RE — so this regex covers the human-readable form the
- *     task-title side can still carry),
- *   - incidental whitespace (leading/trailing/repeated).
+ * fuzzy/prefix/similarity matching. Only canonicalizes incidental whitespace
+ * (leading/trailing/repeated); does NOT strip @-mentions.
+ *
+ * History (adversarial review, docs/task-handle.md §9.9): an earlier version
+ * also stripped a leading `@\S+` token, on the theory that Feishu renders a
+ * human-readable "@张三 " into a converted task's title while our own
+ * message parsing (lark/message.ts's AT_PLACEHOLDER_RE) already strips its
+ * placeholder form out of rootText, so the two sides needed reconciling.
+ * That regex was unanchored (matched an @-token ANYWHERE in the text) and
+ * collapsed clearly DIFFERENT messages onto the same normalized string —
+ * confirmed by execution: "帮我查 user@example.com 的账号" and "帮我查
+ * user@other.org 的账号" both collapsed to "帮我查 user的账号"; "@Elon 在吗"
+ * and "@Linus 在吗" both collapsed to "在吗". Because the bidirectional 1:1
+ * uniqueness check only catches collisions between candidates/threads
+ * PRESENT IN THE SAME CYCLE, an asymmetric collision (e.g. a manually
+ * created task whose title happens to normalize the same as some unrelated
+ * thread's rootText) would pass as a unique match and silently auto-bind the
+ * wrong pair. The theorized asymmetry (task title keeps a literal "@Name ",
+ * rootText never does) could not be verified against a live Feishu response
+ * in this dev environment, and a real fix would need a MUCH narrower rule
+ * (anchor to a genuine leading-mention prefix only, plus a minimum
+ * post-strip specificity threshold) to avoid reintroducing the same class
+ * of bug — see the finding's own P1 discussion. Given the uncertainty, the
+ * conservative choice is the one this function now implements: no
+ * @-stripping at all. The accepted cost is a real but narrow one — an exact
+ * match legitimately fails whenever a title DOES carry a literal leading
+ * mention rootText doesn't (same accepted-degradation shape as the 200-char
+ * truncation mismatch case) — which just falls back to the agent-path
+ * candidate injection, never a silent wrong bind.
+ *
  * Exported for direct unit testing — pure, no I/O.
  */
 export function normalizeForExactMatch(text: string): string {
-  return text
-    .replace(/@\S+\s*/g, "")
-    .replace(/\s+/g, " ")
-    .trim();
+  return text.replace(/\s+/g, " ").trim();
 }
 
 /** Internal cache entry — keeps the RAW description so a re-poll's marker check never operates on an already-truncated excerpt. */
@@ -157,6 +196,8 @@ export class TasklistPoller {
   #inFlight: Promise<void> = Promise.resolve();
   /** guid -> cached candidate; rebuilt (not merged) each cycle so a candidate that becomes claimed/completed/deleted disappears promptly. */
   #candidates: Map<string, CachedCandidate> = new Map();
+  /** Consecutive poll-cycle failures — see CONSECUTIVE_FAILURE_WARN_THRESHOLD / clientOwnerBotId. */
+  #consecutiveFailures = 0;
 
   constructor(deps: TasklistPollerDeps, opts: TasklistPollerOptions = {}) {
     this.#deps = deps;
@@ -256,12 +297,25 @@ export class TasklistPoller {
       }
 
       this.#candidates = fresh;
+      this.#consecutiveFailures = 0;
     } catch (err) {
-      console.warn(
-        `[tasklist.tasklistPoller] poll failed for tasklist ${this.#deps.tasklistGuid} ` +
-          "(continuing, keeping previous candidate snapshot):",
-        err,
-      );
+      this.#consecutiveFailures += 1;
+      if (this.#consecutiveFailures >= CONSECUTIVE_FAILURE_WARN_THRESHOLD) {
+        console.warn(
+          `[tasklist.tasklistPoller] ${this.#consecutiveFailures} consecutive poll failures for tasklist ` +
+            `${this.#deps.tasklistGuid} — this poller's client authenticates as bot ` +
+            `"${this.#deps.clientOwnerBotId ?? "unknown"}"; check ITS task scope grants / tasklist membership ` +
+            "(a broken client here silently kills candidate discovery + auto-bind for every OTHER bot sharing " +
+            "this tasklistGuid too, even if their own credentials are fine):",
+          err,
+        );
+      } else {
+        console.warn(
+          `[tasklist.tasklistPoller] poll failed for tasklist ${this.#deps.tasklistGuid} ` +
+            "(continuing, keeping previous candidate snapshot):",
+          err,
+        );
+      }
       // Deliberately do NOT clear #candidates on failure — a transient error
       // shouldn't blank out a snapshot the prompt layer may read moments later.
     }

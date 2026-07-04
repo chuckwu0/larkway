@@ -201,7 +201,14 @@ export class CommentPoller {
       }
 
       if (nextCursorId !== undefined && nextCursorId !== record.lastSeenCommentId) {
-        await this.#deps.store.put({ ...record, lastSeenCommentId: nextCursorId });
+        // update() (not put({...record, ...})) so this merges onto whatever
+        // writeback.ts/StallDetector's own concurrent writes left in place —
+        // `record` here was captured before the listComments() await above,
+        // so spreading it directly would clobber anything either of those
+        // wrote during that window (adversarial-review RMW fix).
+        await this.#deps.store.update(threadId, (current) =>
+          current ? { ...current, lastSeenCommentId: nextCursorId } : current,
+        );
       }
     } catch (err) {
       if (isTaskNotFoundError(err)) {

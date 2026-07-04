@@ -297,7 +297,14 @@ export async function applyTaskHandleWriteback(
         // otherwise swallow it along with everything else). "completed" here
         // means the bridge DISPATCH's turn finished without crashing — a
         // distinct dimension from `isDone`/task-business-completion below.
-        await deps.store.put({ ...record, lastTurnOutcome: "completed" });
+        // Uses update() (not put({...record, ...})) so this merges onto
+        // whatever CommentPoller/StallDetector's own concurrent writes left
+        // in place — `record` here was captured before the getTask() await
+        // above, so spreading it directly would clobber anything either of
+        // those wrote during that window (adversarial-review RMW fix).
+        await deps.store.update(patch.threadId, (current) =>
+          current ? { ...current, lastTurnOutcome: "completed" } : current,
+        );
         // dogfood fix V1: a successful turn only ticks the task complete when
         // the agent itself declared `done: true` this turn — otherwise (e.g.
         // it just handed off to a downstream agent/peer) the log is still
@@ -317,8 +324,11 @@ export async function applyTaskHandleWriteback(
         break;
       }
       case "failed": {
-        // v3.1 stall detection — see the "completed" branch's identical note above.
-        await deps.store.put({ ...record, lastTurnOutcome: "failed" });
+        // v3.1 stall detection — see the "completed" branch's identical note
+        // above (same update()-based RMW fix, same reasoning).
+        await deps.store.update(patch.threadId, (current) =>
+          current ? { ...current, lastTurnOutcome: "failed" } : current,
+        );
         // Same content-discipline preference as the completed branch above —
         // only affects the description LOG entry; the posted failure comment
         // below still uses the full failureReason (renderFailureComment is a

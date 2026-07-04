@@ -228,6 +228,18 @@ async function runV2Mode({
   interface TasklistGuidGroup {
     client: TaskListClient;
     /**
+     * Which bot's app_id/app_secret the shared `client` above actually
+     * authenticates as (whichever bot in `bots` first resolved this guid —
+     * see the assembly loop below). Purely a logging label (adversarial
+     * review, docs/task-handle.md §12): if that ONE bot's scope/membership
+     * breaks, every OTHER bot sharing this guid still can't discover
+     * candidates or auto-bind (the whole group polls through this one
+     * client) — TasklistPoller uses this to name the actual culprit instead
+     * of a generic "poll failed" warning. Full client rotation/failover is a
+     * known accepted gap, not implemented here (see TasklistPoller's doc).
+     */
+    clientOwnerBotId: string;
+    /**
      * One entry per bot sharing this guid. `sessionStore` is here (not just
      * `taskHandleStore`) so the poller's v3 auto-bind step can read every
      * such bot's rootText-bearing session records AND claim on the specific
@@ -446,7 +458,21 @@ async function runV2Mode({
         // TaskHandleStore.claim() is idempotent on an unchanged guid (see its
         // doc comment) — this is what makes it safe for handler.ts to call
         // every turn the agent re-declares task_handle.guid, not just once.
-        taskHandleClaim = (patch) => taskHandleStore.claim(patch);
+        // claim() now also rejects (adversarial review, docs/task-handle.md
+        // §12) when the agent's declared guid is already claimed by a
+        // DIFFERENT thread — the handler.ts hook contract stays Promise<void>,
+        // so a rejection here is surfaced as a log only (thin-bridge: the
+        // agent already made its declaration in state.json; the bridge just
+        // couldn't honor it, it doesn't get to "argue back" mid-turn).
+        taskHandleClaim = async (patch) => {
+          const result = await taskHandleStore.claim(patch);
+          if (!result.claimed) {
+            console.warn(
+              `[larkway] bot "${bot.id}": thread ${patch.threadId}'s declared claim on task ${patch.taskGuid} ` +
+                `was rejected (${result.reason ?? "unknown reason"}) — continuing without claiming.`,
+            );
+          }
+        };
         // Dogfood fix V2 — a plain in-memory fact lookup (no I/O, no judgment):
         // handler.ts calls this at prompt-build time to inject
         // `task_handle_claimed: yes|no` so the SKILL can offer a one-tap claim
@@ -459,7 +485,7 @@ async function runV2Mode({
         // every bot sharing this guid, not just one). The poller itself is
         // constructed once, after this whole per-bot loop, in the pass below.
         {
-          const group = tasklistGuidGroups.get(guid) ?? { client: taskListClient, bots: [] };
+          const group = tasklistGuidGroups.get(guid) ?? { client: taskListClient, clientOwnerBotId: bot.id, bots: [] };
           group.bots.push({ botId: bot.id, sessionStore, taskHandleStore });
           tasklistGuidGroups.set(guid, group);
         }
@@ -663,6 +689,7 @@ async function runV2Mode({
   for (const [guid, group] of tasklistGuidGroups) {
     const poller = new TasklistPoller({
       client: group.client,
+      clientOwnerBotId: group.clientOwnerBotId,
       tasklistGuid: guid,
       isClaimedByAnyBot: (taskGuid) =>
         group.bots.some((b) => b.taskHandleStore.list().some((r) => r.taskGuid === taskGuid)),
@@ -672,21 +699,47 @@ async function runV2Mode({
       // (thread, task) pair. Both are pure plumbing — the poller itself
       // (tasklistPoller.ts) does all the actual matching/uniqueness logic.
       rootTextMatch: {
+        // Adversarial-review P1 fix (docs/task-handle.md §12/§9.9): a thread
+        // that already holds ANY claim must never be offered as an auto-bind
+        // target — otherwise a duplicate task (e.g. someone re-transfers the
+        // same root message into a new task) can exact-match the thread's
+        // rootText and silently HIJACK its existing claim, orphaning the
+        // original task (marker-excluded from candidates forever, nobody
+        // watching it). `claim()`'s own guid-uniqueness rejection (store.ts)
+        // guards the reverse direction (two threads racing for one task);
+        // this filter is the thread-side half of the same invariant.
         listRootTexts: (): readonly RootTextEntry[] =>
           group.bots.flatMap((b) =>
             b.sessionStore
               .list()
-              .filter((r) => r.rootText !== undefined && r.chatId !== undefined)
+              .filter(
+                (r) =>
+                  r.rootText !== undefined &&
+                  r.chatId !== undefined &&
+                  b.taskHandleStore.get(r.threadId) === undefined,
+              )
               .map((r) => ({ botId: b.botId, threadId: r.threadId, chatId: r.chatId!, rootText: r.rootText! })),
           ),
         bindThreadToTask: async (entry) => {
           const target = group.bots.find((b) => b.botId === entry.botId);
           if (!target) return; // shouldn't happen — entry came from this same group's listRootTexts
-          await target.taskHandleStore.claim({
+          const result = await target.taskHandleStore.claim({
             threadId: entry.threadId,
             taskGuid: entry.taskGuid,
             chatId: entry.chatId,
           });
+          if (!result.claimed) {
+            // Residual race: the thread got claimed (or the task got claimed
+            // elsewhere) between listRootTexts()'s snapshot and this await —
+            // store.claim()'s own atomic check is the real guard here, this
+            // is just visibility. Never write a confirmation for a bind that
+            // didn't actually happen.
+            console.warn(
+              `[larkway] tasklist auto-bind: thread ${entry.threadId} (bot ${entry.botId}) rejected for ` +
+                `task ${entry.taskGuid} (${result.reason ?? "unknown reason"}) — skipping confirmation write.`,
+            );
+            return;
+          }
           await applyAutoBindConfirmation(entry.taskGuid, group.client);
         },
       },

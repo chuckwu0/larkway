@@ -163,5 +163,120 @@ describe("TaskHandleStore", () => {
       await store.claim({ threadId: "t1", taskGuid: "g1", chatId: "oc_1" });
       expect(store.get("t1")).toMatchObject({ threadId: "t1", taskGuid: "g1", chatId: "oc_1" });
     });
+
+    // Adversarial-review P2 fix: two different threads (e.g. an agent's own
+    // declared claim racing TasklistPoller's exact auto-bind for a DIFFERENT
+    // thread) must never both end up claiming the SAME task.
+    it("returns { claimed: true } on a successful new claim", async () => {
+      const store = await TaskHandleStore.load(filePath);
+      const result = await store.claim({ threadId: "t1", taskGuid: "g1", chatId: "oc_1" });
+      expect(result).toEqual({ claimed: true });
+    });
+
+    it("rejects claiming a taskGuid already held by a DIFFERENT thread", async () => {
+      const store = await TaskHandleStore.load(filePath);
+      await store.claim({ threadId: "t1", taskGuid: "g1", chatId: "oc_1" });
+
+      const result = await store.claim({ threadId: "t2", taskGuid: "g1", chatId: "oc_2" });
+
+      expect(result.claimed).toBe(false);
+      expect(result.reason).toContain("t1");
+      expect(store.get("t2")).toBeUndefined(); // t2 never got the claim
+      expect(store.get("t1")?.taskGuid).toBe("g1"); // t1's claim is untouched
+    });
+
+    it("does not reject a thread re-declaring or switching its OWN claim to an unclaimed guid", async () => {
+      const store = await TaskHandleStore.load(filePath);
+      await store.claim({ threadId: "t1", taskGuid: "g1", chatId: "oc_1" });
+
+      const result = await store.claim({ threadId: "t1", taskGuid: "g2", chatId: "oc_1" }); // switching its OWN claim, g2 unclaimed elsewhere
+
+      expect(result.claimed).toBe(true);
+      expect(store.get("t1")?.taskGuid).toBe("g2");
+    });
+  });
+
+  // Adversarial-review P1 fix: writeback.ts/commentPoller.ts/stallDetector.ts
+  // all do "read a record → await a network call → write back one changed
+  // field" — with three concurrent writers sharing one store, the OLD
+  // put({...staleSnapshot, field}) pattern lost whatever another writer
+  // changed during the await. update() re-reads the CURRENT value INSIDE its
+  // synchronous callback (called at write time, never a pre-await snapshot).
+  describe("update (atomic read-modify-write)", () => {
+    it("invokes updateFn synchronously with the CURRENT value and persists its result", async () => {
+      const store = await TaskHandleStore.load(filePath);
+      await store.put({ threadId: "t1", taskGuid: "g1", chatId: "oc_1", claimedTs: 1 });
+
+      const result = await store.update("t1", (current) =>
+        current ? { ...current, lastSeenCommentId: "c1" } : current,
+      );
+
+      expect(result?.lastSeenCommentId).toBe("c1");
+      expect(store.get("t1")?.lastSeenCommentId).toBe("c1");
+    });
+
+    it("deletes the record when the callback returns undefined", async () => {
+      const store = await TaskHandleStore.load(filePath);
+      await store.put({ threadId: "t1", taskGuid: "g1", chatId: "oc_1", claimedTs: 1 });
+
+      await store.update("t1", () => undefined);
+
+      expect(store.get("t1")).toBeUndefined();
+    });
+
+    it("no-ops (does not throw) when the target doesn't exist and the callback returns undefined", async () => {
+      const store = await TaskHandleStore.load(filePath);
+      await expect(store.update("missing", () => undefined)).resolves.toBeUndefined();
+      expect(store.get("missing")).toBeUndefined();
+    });
+
+    it("two interleaved writers each merging their own field via update() — neither clobbers the other (the fix)", async () => {
+      const store = await TaskHandleStore.load(filePath);
+      await store.put({ threadId: "t1", taskGuid: "g1", chatId: "oc_1", claimedTs: 1 });
+
+      // Writer A: a SLOWER "network call" before its write.
+      const writerA = (async () => {
+        await new Promise((r) => setTimeout(r, 20));
+        await store.update("t1", (current) => (current ? { ...current, lastSeenCommentId: "c-from-A" } : current));
+      })();
+
+      // Writer B: a FASTER "network call" — its write lands in the middle of A's wait.
+      const writerB = (async () => {
+        await new Promise((r) => setTimeout(r, 5));
+        await store.update("t1", (current) => (current ? { ...current, lastTurnOutcome: "completed" as const } : current));
+      })();
+
+      await Promise.all([writerA, writerB]);
+
+      // Both fields survive regardless of interleaving order.
+      expect(store.get("t1")?.lastSeenCommentId).toBe("c-from-A");
+      expect(store.get("t1")?.lastTurnOutcome).toBe("completed");
+    });
+
+    // Characterizes the BUG update() replaces: capturing a snapshot via
+    // get() BEFORE an await, then put()-ing that stale snapshot + one field
+    // AFTER the await, silently loses whatever a concurrent writer changed
+    // during the gap — exactly the class of bug adversarial review found in
+    // writeback.ts/commentPoller.ts/stallDetector.ts before this fix.
+    it("characterizes the fixed bug: get-then-await-then-put(stale spread) loses a concurrent writer's field", async () => {
+      const store = await TaskHandleStore.load(filePath);
+      await store.put({ threadId: "t1", taskGuid: "g1", chatId: "oc_1", claimedTs: 1 });
+
+      const staleSnapshotWriter = (async () => {
+        const snapshot = store.get("t1")!; // captured BEFORE the await — the old bug
+        await new Promise((r) => setTimeout(r, 20));
+        await store.put({ ...snapshot, lastSeenCommentId: "c-from-A" }); // stale spread clobbers whatever changed during the await
+      })();
+
+      const writerB = (async () => {
+        await new Promise((r) => setTimeout(r, 5));
+        await store.update("t1", (current) => (current ? { ...current, lastTurnOutcome: "completed" as const } : current));
+      })();
+
+      await Promise.all([staleSnapshotWriter, writerB]);
+
+      expect(store.get("t1")?.lastSeenCommentId).toBe("c-from-A");
+      expect(store.get("t1")?.lastTurnOutcome).toBeUndefined(); // lost — this is the bug update() fixes
+    });
   });
 });

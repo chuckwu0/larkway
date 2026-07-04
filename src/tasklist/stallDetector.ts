@@ -53,6 +53,39 @@
  * need to be: the synthetic-event queue path bypasses real-message ingestion
  * entirely, so self-mention's likely anti-loop filtering is moot.
  *
+ * ## Adversarial-review fixes (docs/task-handle.md §12)
+ *
+ * Three correctness bugs found by review, all fixed in this version:
+ *
+ *   1. **Cooldown no longer gates observation.** The nudge cooldown now ONLY
+ *      gates the ACTION of sending another nudge/escalation — attribution
+ *      and progress-reset run every cycle regardless of cooldown state. The
+ *      earlier version gated attribution/reset behind the cooldown check,
+ *      which meant real human progress that happened DURING the cooldown
+ *      window got misattributed as "the nudge's own reply" the moment the
+ *      cooldown finally elapsed, instead of being recognized immediately.
+ *
+ *   2. **getTask is now called only when about to act.** All local,
+ *      in-memory checks (suppression / escalated-progress / threshold /
+ *      attribution / cooldown) run BEFORE any network call — `getTask` fires
+ *      only on the rare cycle where we're actually about to send a nudge or
+ *      post an escalation comment. Combined with `stallSuppressUntilActivityAfter`
+ *      (set once a task is confirmed completed, cleared only by new
+ *      activity), a claim's steady-state API cost is ~zero once it's either
+ *      actively worked or done — not one `getTask` per claim per cycle
+ *      forever, which is what the earlier version did.
+ *
+ *   3. **Nudge count only increments on CONFIRMED dispatch.** `enqueueNudgeTurn`
+ *      is fire-and-forget (an in-memory queue push, see channelClient.ts) —
+ *      a bridge restart between enqueue and actual dispatch used to still
+ *      count as "one real nudge" toward escalation, so two unlucky restarts
+ *      could reach escalation without the agent ever having been woken up
+ *      even once. `stallNudge.pendingSince` now marks a nudge as
+ *      "sent, not yet confirmed"; `count` only increments once activity is
+ *      actually observed after it (which also serves as the attribution
+ *      step in one move); a pending nudge that gets no confirming activity
+ *      within a bounded window is treated as lost and doesn't count.
+ *
  * Class shape (timer/start/stop/jitter) mirrors commentPoller.ts.
  */
 
@@ -66,6 +99,8 @@ const DEFAULT_STALL_THRESHOLD_MS = 24 * 60 * 60_000; // 24h
 const DEFAULT_STALL_FAST_THRESHOLD_MS = 30 * 60_000; // 30min — last turn crashed
 const DEFAULT_NUDGE_COOLDOWN_MS = 24 * 60 * 60_000; // 24h
 const DEFAULT_ESCALATE_AFTER_NUDGES = 2;
+/** How long a nudge can sit "pending" (enqueued, unconfirmed) before being treated as lost — see the module doc's fix #3. Generous relative to a normal turn's duration, short relative to the 24h cooldown. Not exposed via bot yaml — an implementation detail of delivery confirmation, not a product-facing threshold. */
+const DEFAULT_PENDING_CONFIRM_TIMEOUT_MS = 30 * 60_000;
 /** Mirrors commentPoller.ts's PERMISSION_BACKOFF_CEILING_MS — same rationale (§D). */
 const PERMISSION_BACKOFF_CEILING_MS = 30 * 60_000;
 
@@ -105,6 +140,8 @@ export interface StallDetectorOptions {
   nudgeCooldownMs?: number;
   /** @default 2 */
   escalateAfterNudges?: number;
+  /** @default 30min. Primarily for tests — see DEFAULT_PENDING_CONFIRM_TIMEOUT_MS's doc. */
+  pendingConfirmTimeoutMs?: number;
 }
 
 /** Renders the synthesized "message" text the claiming agent sees on a nudge turn — a plain fact block, no instruction on WHAT to do (that's the SKILL's job). */
@@ -137,6 +174,7 @@ export class StallDetector {
   readonly #stallFastThresholdMs: number;
   readonly #nudgeCooldownMs: number;
   readonly #escalateAfterNudges: number;
+  readonly #pendingConfirmTimeoutMs: number;
   #timer: ReturnType<typeof setTimeout> | ReturnType<typeof setInterval> | undefined;
   #running = false;
   /** See CommentPoller's identical field for why stop() must await this. */
@@ -152,6 +190,7 @@ export class StallDetector {
     this.#stallFastThresholdMs = opts.stallFastThresholdMs ?? DEFAULT_STALL_FAST_THRESHOLD_MS;
     this.#nudgeCooldownMs = opts.nudgeCooldownMs ?? DEFAULT_NUDGE_COOLDOWN_MS;
     this.#escalateAfterNudges = opts.escalateAfterNudges ?? DEFAULT_ESCALATE_AFTER_NUDGES;
+    this.#pendingConfirmTimeoutMs = opts.pendingConfirmTimeoutMs ?? DEFAULT_PENDING_CONFIRM_TIMEOUT_MS;
   }
 
   start(): void {
@@ -199,127 +238,194 @@ export class StallDetector {
     }
   }
 
+  /**
+   * All local (in-memory, zero-I/O) checks run FIRST, cheapest first; a
+   * network call (`getTask`, inside `#sendNudge`/`#escalate`) only happens
+   * on the cycle where we're actually about to act. See the module doc's
+   * fixes #1 (cooldown ordering) and #2 (getTask deferral) for why.
+   */
   async #pollOne(threadId: string): Promise<void> {
-    const record = this.#deps.store.get(threadId);
+    let record = this.#deps.store.get(threadId);
     if (!record) return; // dropped between list() snapshot and now
 
+    const lastActiveTs = this.#deps.getLastActiveTs(threadId) ?? record.claimedTs;
+    const now = Date.now();
+
+    // Cheapest check: a task already confirmed completed, with nothing new
+    // since — skip entirely, no getTask, no further evaluation.
+    if (
+      record.stallSuppressUntilActivityAfter !== undefined &&
+      lastActiveTs <= record.stallSuppressUntilActivityAfter
+    ) {
+      return;
+    }
+
+    if (record.stallNudge?.escalated) {
+      const nudge = record.stallNudge;
+      if (nudge.lastNudgeTurnActivityAt !== undefined && lastActiveTs > nudge.lastNudgeTurnActivityAt) {
+        await this.#deps.store.update(threadId, (r) =>
+          r ? { ...r, stallNudge: undefined, stallSuppressUntilActivityAfter: undefined } : r,
+        );
+      }
+      return; // silent otherwise — escalated tasks don't auto-nudge again
+    }
+
+    if (record.stallNudge?.pendingSince !== undefined) {
+      const pendingSince = record.stallNudge.pendingSince;
+      if (lastActiveTs > pendingSince) {
+        // Confirmed: this bump IS the nudge's own turn replying. Promote the
+        // count and attribute the baseline in the SAME update (module doc
+        // fix #3 — this merges "confirm dispatch" and "attribute the reply"
+        // into one step, since they're the same observation).
+        await this.#deps.store.update(threadId, (r) => {
+          if (!r?.stallNudge) return r;
+          return {
+            ...r,
+            stallNudge: {
+              count: r.stallNudge.count + 1,
+              lastNudgeSentAt: pendingSince,
+              lastNudgeTurnActivityAt: lastActiveTs,
+              escalated: false,
+              pendingSince: undefined,
+            },
+          };
+        });
+        return; // don't also evaluate escalate/re-nudge this same cycle
+      }
+      if (now - pendingSince <= this.#pendingConfirmTimeoutMs) {
+        return; // still waiting to see if it lands
+      }
+      // Timed out — treat as lost. Clear pendingSince WITHOUT incrementing
+      // count (module doc fix #3), then keep evaluating below with the
+      // refreshed record (may re-send this same cycle).
+      const updated = await this.#deps.store.update(threadId, (r) =>
+        r?.stallNudge ? { ...r, stallNudge: { ...r.stallNudge, pendingSince: undefined } } : r,
+      );
+      if (!updated) return;
+      record = updated;
+    }
+
+    const nudge = record.stallNudge;
+    const threshold = record.lastTurnOutcome === "failed" ? this.#stallFastThresholdMs : this.#stallThresholdMs;
+
+    if (!nudge || nudge.count === 0) {
+      if (now - lastActiveTs < threshold) return; // not stalled yet
+      await this.#sendNudge(threadId);
+      return;
+    }
+
+    // count >= 1 with no pending nudge: lastNudgeTurnActivityAt is always
+    // set here — confirmation (above) always sets both fields together.
+    if (lastActiveTs > nudge.lastNudgeTurnActivityAt!) {
+      await this.#deps.store.update(threadId, (r) => (r ? { ...r, stallNudge: undefined } : r)); // real further progress
+      return;
+    }
+
+    // No progress since the confirmed nudge. NOW gate the actual action by
+    // cooldown (module doc fix #1) — observation above never waits on this.
+    if (now - nudge.lastNudgeSentAt < this.#nudgeCooldownMs) return;
+
+    if (nudge.count >= this.#escalateAfterNudges) {
+      await this.#escalate(threadId);
+    } else {
+      await this.#sendNudge(threadId);
+    }
+  }
+
+  /**
+   * Single choke point for every `getTask` call in this class — permission
+   * backoff, not-found handling, and generic-failure logging all live here
+   * once. Returns null on ANY failure (already logged/handled internally);
+   * callers just bail out when they see null.
+   */
+  async #fetchTaskOrHandle(threadId: string, taskGuid: string): Promise<TaskSnapshot | null> {
     const backoff = this.#permissionBackoff.get(threadId);
-    if (backoff && Date.now() < backoff.nextAttemptAt) return; // still backing off a known scope denial (§D pattern)
+    if (backoff && Date.now() < backoff.nextAttemptAt) return null; // still backing off a known scope denial
 
     let task: TaskSnapshot | null;
     try {
-      task = await this.#deps.client.getTask(record.taskGuid);
+      task = await this.#deps.client.getTask(taskGuid);
       this.#permissionBackoff.delete(threadId); // a successful call clears any prior backoff
     } catch (err) {
       if (isPermissionDeniedError(err)) {
         const nextBackoffMs = Math.min(backoff ? backoff.backoffMs * 2 : this.#intervalMs, PERMISSION_BACKOFF_CEILING_MS);
         this.#permissionBackoff.set(threadId, { nextAttemptAt: Date.now() + nextBackoffMs, backoffMs: nextBackoffMs });
         console.warn(
-          `[tasklist.stallDetector] permission denied reading task ${record.taskGuid} (thread ${threadId}) — ` +
+          `[tasklist.stallDetector] permission denied reading task ${taskGuid} (thread ${threadId}) — ` +
             `likely a missing task:task:read scope grant. Backing off for ${Math.round(nextBackoffMs / 1000)}s.`,
           err,
         );
-        return;
+        return null;
       }
       console.warn(`[tasklist.stallDetector] poll failed for thread ${threadId} (continuing):`, err);
-      return;
+      return null;
     }
     // getTask() itself already resolves 404-shaped errors to null (client.ts's
     // isNotFoundLikeRaw pre-check) rather than throwing — so this, not a
     // caught exception, is where "task deleted" surfaces here.
     if (task === null) {
       console.warn(
-        `[tasklist.stallDetector] task ${record.taskGuid} (thread ${threadId}) not found or inaccessible` +
+        `[tasklist.stallDetector] task ${taskGuid} (thread ${threadId}) not found or inaccessible` +
           " — dropping claim mapping (no auto-recreate, per docs/task-handle.md §6.2)",
       );
       await this.#deps.store.delete(threadId).catch(() => {});
+      return null;
+    }
+    return task;
+  }
+
+  /** Only called when `#pollOne` has already decided (using local checks alone) that it's time to nudge. */
+  async #sendNudge(threadId: string): Promise<void> {
+    const record = this.#deps.store.get(threadId);
+    if (!record) return;
+    const task = await this.#fetchTaskOrHandle(threadId, record.taskGuid);
+    if (task === null) return;
+
+    if (task.completedAt && task.completedAt !== "0") {
+      // Discovered completed only now (getTask is deferred — module doc fix
+      // #2) — stand down and suppress until real new activity.
+      const activity = this.#deps.getLastActiveTs(threadId) ?? record.claimedTs;
+      await this.#deps.store.update(threadId, (r) =>
+        r ? { ...r, stallNudge: undefined, stallSuppressUntilActivityAfter: activity } : r,
+      );
       return;
     }
 
-    const isCompleted = !!task.completedAt && task.completedAt !== "0";
-    if (isCompleted) {
-      // Strongest possible "activity" signal — a completed task is never
-      // stalled by definition. Clear any tracking so a future reopen starts fresh.
-      if (record.stallNudge !== undefined) {
-        await this.#deps.store.put({ ...record, stallNudge: undefined });
-      }
-      return;
-    }
-
-    const lastActiveTs = this.#deps.getLastActiveTs(threadId) ?? record.claimedTs;
+    const threshold = record.lastTurnOutcome === "failed" ? this.#stallFastThresholdMs : this.#stallThresholdMs;
+    const prospectiveCount = (record.stallNudge?.count ?? 0) + 1; // display only — the persisted count increments on confirm, not here
     const now = Date.now();
-    const nudge = record.stallNudge;
-
-    if (nudge?.escalated) {
-      if (this.#hasProgressSinceNudge(nudge, lastActiveTs)) {
-        await this.#deps.store.put({ ...record, stallNudge: undefined }); // real progress — full reset
-      }
-      return; // silent otherwise — escalated tasks don't auto-nudge again
-    }
-
-    const threshold = record.lastTurnOutcome === "failed" ? this.#stallFastThresholdMs : this.#stallThresholdMs;
-
-    if (!nudge || nudge.count === 0) {
-      if (now - lastActiveTs < threshold) return; // not stalled yet
-      await this.#sendNudge(record, task, 1);
-      return;
-    }
-
-    if (now - nudge.lastNudgeSentAt < this.#nudgeCooldownMs) return; // still cooling down since the last nudge
-
-    if (nudge.lastNudgeTurnActivityAt === undefined) {
-      // Haven't yet attributed a reply to this nudge's own triggered turn.
-      if (lastActiveTs > nudge.lastNudgeSentAt) {
-        // Exactly one bump observed since the nudge was sent — almost
-        // certainly the nudge's OWN turn replying. Attribute it as the new
-        // baseline (deliberately NOT counted as "progress" by itself — see
-        // module doc) and wait for a further cycle to see whether anything
-        // ELSE happens beyond it.
-        await this.#deps.store.put({ ...record, stallNudge: { ...nudge, lastNudgeTurnActivityAt: lastActiveTs } });
-        return;
-      }
-      // No activity at all since the nudge was sent — falls through to
-      // escalate/re-nudge below, same as "attributed but no further bump".
-    } else if (this.#hasProgressSinceNudge(nudge, lastActiveTs)) {
-      await this.#deps.store.put({ ...record, stallNudge: undefined }); // activity beyond the nudge's own turn — real progress
-      return;
-    }
-
-    if (nudge.count >= this.#escalateAfterNudges) {
-      await this.#escalate(record, task);
-      return;
-    }
-
-    await this.#sendNudge(record, task, nudge.count + 1);
-  }
-
-  /** True when `lastActiveTs` reflects something beyond the nudge's own already-attributed turn. Requires `lastNudgeTurnActivityAt` to be set — a caller with an unattributed nudge must go through the attribution step first (see `#pollOne`). */
-  #hasProgressSinceNudge(
-    nudge: NonNullable<TaskHandleRecord["stallNudge"]>,
-    lastActiveTs: number,
-  ): boolean {
-    const baseline = nudge.lastNudgeTurnActivityAt ?? nudge.lastNudgeSentAt;
-    return lastActiveTs > baseline;
-  }
-
-  async #sendNudge(record: TaskHandleRecord, task: TaskSnapshot, nudgeCount: number): Promise<void> {
-    const threshold = record.lastTurnOutcome === "failed" ? this.#stallFastThresholdMs : this.#stallThresholdMs;
     this.#deps.enqueueNudgeTurn({
       threadId: record.threadId,
       chatId: record.chatId,
       text: renderStallNudgeText({
         summary: task.summary,
         idleHours: Math.max(1, Math.round(threshold / 3_600_000)),
-        nudgeCount,
+        nudgeCount: prospectiveCount,
       }),
     });
-    await this.#deps.store.put({
-      ...record,
-      stallNudge: { count: nudgeCount, lastNudgeSentAt: Date.now(), lastNudgeTurnActivityAt: undefined, escalated: false },
-    });
+    await this.#deps.store.update(threadId, (r) =>
+      r
+        ? {
+            ...r,
+            stallNudge: {
+              count: r.stallNudge?.count ?? 0,
+              lastNudgeSentAt: r.stallNudge?.lastNudgeSentAt ?? now,
+              lastNudgeTurnActivityAt: r.stallNudge?.lastNudgeTurnActivityAt,
+              escalated: false,
+              pendingSince: now,
+            },
+          }
+        : r,
+    );
   }
 
-  async #escalate(record: TaskHandleRecord, task: TaskSnapshot): Promise<void> {
+  /** Only called when `#pollOne` has already decided nudges are exhausted with no progress. */
+  async #escalate(threadId: string): Promise<void> {
+    const record = this.#deps.store.get(threadId);
+    if (!record) return;
+    const task = await this.#fetchTaskOrHandle(threadId, record.taskGuid);
+    if (task === null) return;
+
     await this.#deps.client
       .addComment(
         record.taskGuid,
@@ -328,9 +434,8 @@ export class StallDetector {
       .catch((err) => {
         console.warn(`[tasklist.stallDetector] escalation comment failed for task ${record.taskGuid} (continuing):`, err);
       });
-    await this.#deps.store.put({
-      ...record,
-      stallNudge: { ...(record.stallNudge ?? { count: this.#escalateAfterNudges, lastNudgeSentAt: Date.now() }), escalated: true },
-    });
+    await this.#deps.store.update(threadId, (r) =>
+      r?.stallNudge ? { ...r, stallNudge: { ...r.stallNudge, escalated: true, pendingSince: undefined } } : r,
+    );
   }
 }

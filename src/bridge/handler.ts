@@ -1828,11 +1828,23 @@ export class BridgeHandler {
 
           if (sessionId !== undefined && currentExisting === undefined) {
             // New thread — create record. rootText/chatId (v3 task-handle
-            // dispatch-time capture, docs/task-handle.md §5.2) are captured
-            // ONLY here — this message IS the thread's root message, the one
-            // a human later right-clicks → 转任务 on. Truncated defensively;
-            // TasklistPoller's exact-match tolerates (doesn't need to
-            // recover from) a truncated value — see its own doc comment.
+            // dispatch-time capture, docs/task-handle.md §5.2/§9.9) are
+            // captured ONLY here, and ONLY when `isTopLevel` (computed above
+            // from the absence of `root_id`) confirms THIS message truly is
+            // the topic's own root — not merely the first turn the BOT
+            // happened to see. (Adversarial-review fix: an earlier version
+            // captured unconditionally on "this bot's first completed turn
+            // in the thread," which is wrong whenever a human opens a topic
+            // and only @-mentions the bot in a LATER reply — that reply's
+            // text got stored as if it were the root, and could then exact-
+            // match an unrelated task and auto-bind the wrong pair. When
+            // `isTopLevel` is false here, rootText/chatId are simply left
+            // undefined — the same safe "no auto-bind candidate for this
+            // thread" degradation already documented for other rootText
+            // gaps; the agent-path candidate injection is unaffected.)
+            // Truncated defensively when captured; TasklistPoller's exact-
+            // match tolerates (doesn't need to recover from) a truncated
+            // value — see its own doc comment.
             await this.deps.sessionStore.put({
               threadId,
               sessionId,
@@ -1840,8 +1852,7 @@ export class BridgeHandler {
               createdTs: now,
               lastActiveTs: now,
               senderOpenId,
-              rootText: parsed.text.slice(0, 200),
-              chatId: parsed.chatId,
+              ...(isTopLevel ? { rootText: parsed.text.slice(0, 200), chatId: parsed.chatId } : {}),
             });
           } else if (sessionId !== undefined && currentExisting !== undefined) {
             // Existing thread — update, preserving createdTs AND rootText/

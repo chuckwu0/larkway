@@ -59,21 +59,28 @@ export interface SessionRecord {
   lastActiveTs: number;
   senderOpenId?: string;
   /**
-   * v3 task-handle dispatch-time capture (docs/task-handle.md §5.2 "dispatch
-   * 时捕获根消息文本"): the thread's ROOT message text (the first @-mention
-   * that opened this topic), truncated to ~200 chars, captured ONLY when the
-   * bridge creates this thread's session record for the first time (handler.ts
-   * "New thread" branch) — never recomputed or overwritten on later turns,
-   * since only the original message is "the topic" a human would later
-   * right-click → 转任务 on. Used by src/tasklist/tasklistPoller.ts to
-   * exact-match a shared tasklist's candidate task summaries against threads
-   * across every bot sharing that tasklist, entirely bridge-mechanical (no
-   * fuzzy/prefix matching — see tasklistPoller.ts's normalizeForExactMatch).
-   * Absent for any session created before this field existed, or for a
-   * thread whose FIRST message the bridge never saw (gap-fill replay edge
-   * case) — both degrade to "no auto-bind candidate for this thread," which
-   * is the same as the feature being off for that one thread; the agent-side
-   * candidate-injection path is unaffected and still covers it.
+   * v3 task-handle dispatch-time capture (docs/task-handle.md §5.2/§9.9
+   * "dispatch 时捕获根消息文本"): the thread's ROOT message text, truncated
+   * to ~200 chars, captured ONLY when the bridge creates this thread's
+   * session record for the first time (handler.ts "New thread" branch) AND
+   * `isTopLevel` (no `root_id` on the raw event) confirms that specific
+   * message is genuinely the topic's root — never recomputed or overwritten
+   * on later turns. Used by src/tasklist/tasklistPoller.ts to exact-match a
+   * shared tasklist's candidate task summaries against threads across every
+   * bot sharing that tasklist, entirely bridge-mechanical (no fuzzy/prefix
+   * matching — see tasklistPoller.ts's normalizeForExactMatch).
+   *
+   * Absent (never overclaimed as a fallback) whenever the root can't be
+   * confirmed: sessions created before this field existed; a thread whose
+   * FIRST message the bridge never saw (gap-fill replay edge case); and —
+   * adversarial-review fix — a human opening a topic and only @-mentioning
+   * the bot in a LATER reply, where an earlier version of this field
+   * wrongly captured that reply's text as if it were the root (a real bug:
+   * the reply text could then exact-match some unrelated task and
+   * auto-bind the wrong pair). All of these degrade to "no auto-bind
+   * candidate for this thread," identical to the feature being off for that
+   * one thread; the agent-side candidate-injection path is unaffected and
+   * still covers it.
    */
   rootText?: string;
   /**

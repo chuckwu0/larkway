@@ -149,8 +149,11 @@ taskHandle:
 6. **清单成员支持 `type=chat`**:一次调用把整个群加为清单成员;任务级成员仅 user/app。
 7. **任务评论会触发任务助手推送**(对创建者/关注者)—— agent 发里程碑评论即免费获得「主动通知人」的通道。
 8. **清单下任务列表接口未经真机核实**(v3 新增,待验证项):`GET /tasklists/:tasklist_guid/tasks`(TasklistPoller 用来发现候选)是照着已验证的 `/tasklists/:tasklist_guid/members` 的 URL 形状 + `getTask` 已验证的任务对象形状拼出来的,本实现开发环境无网络访问,没能像 get/patch/members 那样对一次真实响应核实过。首次跑起来后建议观察一次真实候选是否正确出现。
-9. **话题根消息文本在 bridge 侧没有持久化落点 —— 已通过 dispatch 时捕获解决(v3 二次修订)**。第一版调研结论(仍如实保留在下方作为排查记录)是「没有廉价的读法」;但那个结论遗漏了一条零成本路径:**handler 分发消息时手里本来就有这一轮的消息文本**,不需要事后再查。修法:`SessionRecord`(`src/claude/sessionStore.ts`)新增可选字段 `rootText`(截断至 ~200 字符)+ `chatId`,只在 `handler.ts` 首次为一个 thread 建 session 记录时写入(那一条消息就是话题的根消息,此后的 turn 永不重写这两个字段)——零额外网络调用,复用已经在内存里的 `parsed.text`/`parsed.chatId`。`TasklistPoller` 每轮在候选快照之外,新增一步机械比对:候选 `summary` 与任一 thread 的 `rootText`(两侧都过 `normalizeForExactMatch`——去 @提及 token + 压空白,**不做任何模糊/前缀/相似度**)做字符串完全相等;要求**严格双向 1:1**(该任务只匹配到一个 thread,且该 thread 只匹配到一个任务)才自动绑定,否则一律留给 agent 路径、只打一条 debug 级日志说明,不阻塞、不报错。命中后 bridge 直接调对应 bot 的 `TaskHandleStore.claim()`(等价认领)并调用 `applyAutoBindConfirmation` 立即在任务描述里写一条确认(因为这次绑定发生在 poller 自己的定时器上,不搭在任何 agent turn 上,没有天然的「completed」事件可以顺带写确认)。**已知且接受的降级**:飞书「转任务」时任务标题 = 消息文本,可能被平台按其自身规则截断;若截断点与我们的 200 字符截断点不一致,两侧归一化后仍不相等 → 不绑定,留给 agent 路径兜底——这是有意选择,不为了追平这类边界情况去加前缀/模糊匹配(那会违反"机械匹配,不做业务判断"的边界)。
+9. **话题根消息文本在 bridge 侧没有持久化落点 —— 已通过 dispatch 时捕获解决(v3 二次修订,v3 三次修订加固)**。第一版调研结论(仍如实保留在下方作为排查记录)是「没有廉价的读法」;但那个结论遗漏了一条零成本路径:**handler 分发消息时手里本来就有这一轮的消息文本**,不需要事后再查。修法:`SessionRecord`(`src/claude/sessionStore.ts`)新增可选字段 `rootText`(截断至 ~200 字符)+ `chatId`,只在 `handler.ts` 首次为一个 thread 建 session 记录时写入——零额外网络调用,复用已经在内存里的 `parsed.text`/`parsed.chatId`。
+   > **三次修订(adversarial review 修正)**:「那一条消息就是话题的根消息」这句断言原本不成立——bot 首次在某 thread 完成的 turn,可能只是人已经开了话题、之后才 @ bot 的一条回复,把回复文本错当根消息存起来,后续可能精确匹配到无关任务、造成错误 auto-bind。修法:只在 `isTopLevel`(`handler.ts` 里已经算出的信号——`root_id` 缺失代表这条消息本身没有父消息,即真的是话题根)为真时才捕获 `rootText`/`chatId`;不是根消息时两个字段保持 absent(和"没看到根消息""字段建立之前的老 session"走同一条已文档化的降级路径——退化为"这个 thread 没有 auto-bind 候选",agent 路径不受影响)。这是一次零成本加固:`isTopLevel` 早已算好,只是之前没用在这里。
+   `TasklistPoller` 每轮在候选快照之外,新增一步机械比对:候选 `summary` 与任一 thread 的 `rootText`(两侧都过 `normalizeForExactMatch`——**只做空白归一化,不做任何 @提及剥离/模糊/前缀/相似度**;三次修订前的版本还会剥离 @-mention token,但那条正则不锚定位置、会把明显不同的文本归一化成同一个串——比如 `user@example.com` 和 `user@other.org` 的域名部分,或「@Elon 在吗」和「@Linus 在吗」都会被剥成一样的短语,详见 `tasklistPoller.ts` 里 `normalizeForExactMatch` 的完整事故记录)做字符串完全相等;要求**严格双向 1:1**(该任务只匹配到一个 thread,且该 thread 只匹配到一个任务,**且该 thread 当前没有任何已有 claim**——见下一条修订)才自动绑定,否则一律留给 agent 路径、只打一条 debug 级日志说明,不阻塞、不报错。命中后 bridge 直接调对应 bot 的 `TaskHandleStore.claim()`(等价认领,`claim()` 本身现在也会拒绝"这个 taskGuid 已经被另一个 thread 认领"这种情况——见 §12 附带修的存储层加固)并调用 `applyAutoBindConfirmation` 立即在任务描述里写一条确认(因为这次绑定发生在 poller 自己的定时器上,不搭在任何 agent turn 上,没有天然的「completed」事件可以顺带写确认)。**已知且接受的降级**:飞书「转任务」时任务标题 = 消息文本,可能被平台按其自身规则截断;若截断点与我们的 200 字符截断点不一致,两侧归一化后仍不相等 → 不绑定,留给 agent 路径兜底——这是有意选择,不为了追平这类边界情况去加前缀/模糊匹配(那会违反"机械匹配,不做业务判断"的边界)。
    > 第一版调研记录(已被上面的方案取代,保留供参考):`SessionRecord` 和 `TaskHandleRecord`(`src/tasklist/store.ts`)都不存标题/正文字段;`handler.ts` 里离得最近的是 `RuntimeEventRecord.textPreview`(120 字符截断,滚动日志上限 20 条,不是稳定的 per-thread 索引)。若要在 THREAD 早已存在、poller 独立定时器触发的场景下事后补一次"这个 thread 的根消息是什么",确实只能像 gap-fill(`channelClient.ts` 的 `+chat-messages-list`)那样现查,不便宜——但这个顾虑只适用于"事后补查",不适用于"分发时顺手记一次",第二版方案绕开了这个假设。
+10. **共享 guid 组的 TaskListClient 固定绑定首个到达的 bot,是个已知的残余降级点**(v3 三次修订):`main.ts` 的 `tasklistGuidGroups` 按 guid 去重时,`group.client` 永远是数组顺序里第一个解析到该 guid 的 bot 的凭据,不会轮换/健康检查。若这个 bot 的 scope 或清单成员资格出问题,整个 guid 组的候选发现 + auto-bind 确认都会失败,即使组内其他 bot 的凭据完全正常。本次只加了"连续失败 N 次后,日志明确点名是哪个 bot 的凭据在拖累整组"(`TasklistPoller` 的 `clientOwnerBotId`),**没有做完整的 client 轮换/故障转移**——那需要更大的改动(检测哪个 client 健康、动态切换),权衡后判断当前"降级为可见的日志"已经把最糟的情况(静默失效)排除了,完整方案留作已知 TODO。
 
 ## 10. 开源定位与路线
 
@@ -238,10 +241,15 @@ CommentPoller 合成的任务评论 turn,还是本 feature自己发的唤醒 tur
 **两步归因(为什么"进展重置"不能简单地用"唤醒后有活动"判断)**:唤醒本身几乎必然会导致
 认领的 agent 跑一轮 turn 去回应,而这一轮 turn 会跟任何其他 turn 一样更新 `lastActiveTs`——如果
 "唤醒后有活动"就算进展,提醒计数永远会被自己触发的那一轮立刻清零,升级机制形同虚设。所以
-`StallDetector` 分两步:① 冷却期满后,第一次观测到"唤醒发出后出现了活动"时,把这次活动的
+`StallDetector` 分两步:① 第一次观测到"唤醒发出后出现了活动"时,把这次活动的
 `lastActiveTs` 值**归因**为"唤醒自己那一轮的回复",记下来但不算进展;② 只有**在归因之后再观测
 到一次更晚的活动**,才算真进展、才清空整个 `stallNudge` 状态。这个算法是纯时间戳比较(见
 `stallDetector.test.ts` 的完整 4 阶段测试:唤醒 → 归因 → 再唤醒 → 升级),不涉及任何语义判断。
+
+> ⚠️ **adversarial review 修正(§12.7 第 1 条)**:归因/进展重置现在**在冷却门之前**跑,每个
+> poll cycle 都会检查——冷却只挡"要不要真的发一次新提醒/升级"这个动作。v3.1 初版曾把归因/重置
+> 也挡在冷却门后面,导致冷却窗口内(默认 24h)真实发生的进展会被误判成"唤醒自己的回复",详见
+> §12.7。
 
 ### 12.5 组件
 
@@ -249,7 +257,7 @@ CommentPoller 合成的任务评论 turn,还是本 feature自己发的唤醒 tur
 |---|---|---|
 | **StallDetector** | `src/tasklist/stallDetector.ts`(仿 CommentPoller 的 class+timer 形状,但**per-bot**,不像 TasklistPoller 那样跨 bot 按 guid 去重——`TaskHandleStore` 本来就是 per-bot 的,不存在"谁来唤醒"的多 bot 竞争) | 每轮扫这个 bot 名下"已认领+未完成"的任务,machinery 判定停滞/进展/升级,触发唤醒或升级评论 |
 | **SessionStore 扩展** | `src/claude/sessionStore.ts`(复用 v3 §5.2 已经加过的字段,无新增) | `lastActiveTs` 就是活动信号 |
-| **TaskHandleRecord 扩展** | `src/tasklist/store.ts` | 新增 `lastTurnOutcome`(completed/failed,由 writeback.ts 顺手记)+ `stallNudge`(count/lastNudgeSentAt/lastNudgeTurnActivityAt/escalated) |
+| **TaskHandleRecord 扩展** | `src/tasklist/store.ts` | 新增 `lastTurnOutcome`(completed/failed,由 writeback.ts 顺手记)、`stallNudge`(count/lastNudgeSentAt/lastNudgeTurnActivityAt/escalated/**pendingSince**——见 §12.7)、`stallSuppressUntilActivityAfter`(见 §12.7) |
 | **writeback.ts 扩展** | `src/tasklist/writeback.ts` | `applyTaskHandleWriteback` 的 completed/failed 分支各多一行:把这轮结局写进 `lastTurnOutcome`(在任何网络调用之前写,即使后续 API 调用失败也不丢) |
 | **配置** | `src/config/botLoader.ts` 的 `TaskHandleConfigSchema` | 新增 5 个可选字段(见 §7 的 yaml 示例),全部有保守默认值,不是新的 enable 开关 |
 | **bridge 改动(极小)** | `src/main.ts` | 每个已启用 task-handle 的 bot 额外构造一个 `StallDetector`(除非 `stallDetectionDisabled`),复用该 bot 已有的 `TaskHandleStore`/`TaskListClient`/`SessionStore`,唤醒走 `client.enqueueSyntheticEvent`(`larkway_trigger_type: "task_stall"`) |
@@ -260,3 +268,39 @@ CommentPoller 合成的任务评论 turn,还是本 feature自己发的唤醒 tur
 - ❌ 不做通用的任务字段 diff 当活动信号(见 §12.2 的范围裁剪说明)。
 - ❌ 不做"@ 话题里的人类"这条升级路径——选择了任务评论(复用已有的 `addComment` + 飞书任务助手推送
   给创建者/关注者的通道),因为已经有先例(§9.7)、不需要额外解析"该 @ 谁"。
+
+### 12.7 adversarial review 加固(修的 3 个正确性问题,均已修复+测试)
+
+1. **冷却门顺序错了,真实进展会被冷却窗口"吞掉"**。v3.1 初版把归因/进展重置的判断挡在冷却门
+   (默认 24h)后面——意味着唤醒发出后,整个冷却窗口期间,不管期间发生了什么真实活动,都要等到
+   冷却期满的那一刻才被"看到",而那一刻看到的（唯一的）活动会被无条件归因成"唤醒自己的回复",
+   永远没有机会被识别成"真实进展"。结果是:哪怕人类在唤醒后 1 小时就认真回复处理了,只要话题
+   此后不再有新动静,24 小时后系统仍会照常发第 2 次提醒、48 小时后仍会照常升级——对一个其实已经
+   在推进的任务发出事实错误的骚扰和升级评论。**修法**:归因和进展重置现在在每个 poll cycle 都跑,
+   不等冷却;冷却只用来挡"真的要不要发下一次提醒/升级"这个动作本身。
+2. **每轮无条件调用 `getTask`,已完成的任务永远占着轮询名额**。v3.1 初版是"先打网络、后做本地
+   判断"——活跃线程、冷却中的线程、甚至早就完成的任务,每 60 秒都要打一次 `getTask`,且完成态
+   除了清掉 `stallNudge` 不做别的,记录本身永久留着继续被扫描,叠加 CommentPoller 对同一批记录
+   的轮询,per-claim 的稳态 API 负载只增不减。**修法**:把所有本地判断(悬念/已升级进展/阈值/
+   归因/冷却)都挪到 `getTask` 之前,只有真的要发提醒或升级时才打网络;新增
+   `TaskHandleRecord.stallSuppressUntilActivityAfter`,一旦确认某任务已完成就记下当时的
+   `lastActiveTs`,此后只要活动信号没有超过这个值就整个跳过(零网络调用),直到真的有新动静
+   (比如任务被重新打开)才恢复正常检查。
+3. **`enqueueNudgeTurn` 是纯内存 fire-and-forget,计数却提前落盘**。`ChannelClient.
+   enqueueSyntheticEvent` 只是 push 进内存队列,bridge 在这条合成 turn 真正被消费前重启(或该
+   turn 本身崩溃),agent 从未真正被唤醒过,但 v3.1 初版已经把 `stallNudge.count +1` 落了盘——
+   连续两次这种时运不济,能在 agent 一次都没被真正唤醒的情况下就走到升级、贴一条"已连续提醒 N
+   次"的评论,而这个说法是假的。**修法**:`stallNudge` 新增 `pendingSince`(发出但未确认),
+   `count` 只有在观测到"发出之后真的出现了活动"时才 +1(这一步同时兼任"归因",详见 §12.4 的
+   两步归因说明——确认与归因本来就是同一次观测);如果 `pendingSince` 超过一个内部固定的确认
+   超时窗口(默认 30 分钟,不对外暴露配置项,纯实现细节)仍未等到任何活动,视为这次唤醒丢了,
+   不计入次数,后续正常按阈值判断要不要重试。
+
+此外,`TaskHandleRecord` 的三个写者(`writeback.ts`/`commentPoller.ts`/`stallDetector.ts`)原本
+各自都是"读记录快照 → await 一次网络调用 → 用快照 + 一个改动字段整条 `put()` 覆盖"——三个并发
+写者共享同一个 store,任何一个写者的网络等待窗口内,只要另一个写者也写了一次,前者随后的整条
+覆盖就会把后者的改动悄悄冲掉(`lastSeenCommentId` 被冲回旧值会导致任务评论重放、`stallNudge`
+被冲掉或复活都会导致计数/静默状态错乱)。修法是给 `TaskHandleStore` 加一个真正原子的
+`update(threadId, updateFn)` API——`updateFn` 在**当前**值上同步执行,不允许调用方在读和写之间
+夹 await,三个写者全部切过去调用它(`src/tasklist/store.ts`,测试见 `store.test.ts` 的
+"两个交错写者"用例,以及一个反向用例证明旧的 `put({...过期快照, 字段})` 写法确实会丢更新)。

@@ -194,22 +194,39 @@ describe("TasklistPoller", () => {
 });
 
 describe("normalizeForExactMatch", () => {
-  it("strips a human-readable @-mention token and trims", () => {
-    expect(normalizeForExactMatch("@张三 帮我修一下登录页")).toBe("帮我修一下登录页");
-  });
+  // Adversarial-review fix: an earlier version also stripped a leading
+  // @-mention token, but the regex was unanchored and collapsed clearly
+  // DIFFERENT messages onto the same string (see the function's own doc
+  // comment for the full incident writeup). These tests pin the fixed
+  // behavior: no @-stripping at all, whitespace-only normalization.
 
   it("collapses repeated/incidental whitespace", () => {
     expect(normalizeForExactMatch("帮我修一下   登录页\n\n")).toBe("帮我修一下 登录页");
   });
 
-  it("is a no-op on text with neither mentions nor extra whitespace", () => {
+  it("is a no-op on text with no extra whitespace", () => {
     expect(normalizeForExactMatch("帮我修一下登录页")).toBe("帮我修一下登录页");
   });
 
-  it("two differently-formatted strings normalize to the same value", () => {
-    const a = normalizeForExactMatch("@张三  帮我修一下登录页");
-    const b = normalizeForExactMatch("帮我修一下登录页 ");
-    expect(a).toBe(b);
+  it("does NOT strip a leading @-mention — a mention prefix makes two messages genuinely different", () => {
+    expect(normalizeForExactMatch("@张三 帮我修一下登录页")).toBe("@张三 帮我修一下登录页");
+    expect(normalizeForExactMatch("@张三 帮我修一下登录页")).not.toBe(
+      normalizeForExactMatch("帮我修一下登录页"),
+    );
+  });
+
+  it("regression: @Elon 在吗 vs @Linus 在吗 must never normalize equal (the exact case adversarial review flagged)", () => {
+    expect(normalizeForExactMatch("@Elon 在吗")).not.toBe(normalizeForExactMatch("@Linus 在吗"));
+  });
+
+  it("regression: email-domain collision must never normalize equal", () => {
+    expect(normalizeForExactMatch("帮我查 user@example.com 的账号")).not.toBe(
+      normalizeForExactMatch("帮我查 user@other.org 的账号"),
+    );
+  });
+
+  it("regression: CJK no-space mid-sentence mentions must never normalize equal", () => {
+    expect(normalizeForExactMatch("请@张三处理登录崩溃")).not.toBe(normalizeForExactMatch("请@李四买咖啡"));
   });
 });
 
@@ -248,8 +265,8 @@ describe("TasklistPoller — exact root-text auto-bind", () => {
     expect(poller.getCandidates()).toEqual([]);
   });
 
-  it("matches across @-mention/whitespace cosmetic differences", async () => {
-    const { requester } = makeFakeRequester({ tasks: [{ guid: "task-1", summary: "@张三  帮我修一下登录页" }] });
+  it("matches across incidental whitespace differences only (no @-mention stripping — see normalizeForExactMatch)", async () => {
+    const { requester } = makeFakeRequester({ tasks: [{ guid: "task-1", summary: "帮我修一下   登录页" }] });
     const client = new TaskListClient(requester);
     const bindThreadToTask = vi.fn(async () => {});
     const poller = new TasklistPoller({
@@ -257,7 +274,7 @@ describe("TasklistPoller — exact root-text auto-bind", () => {
       tasklistGuid: "guid-1",
       isClaimedByAnyBot: () => false,
       rootTextMatch: {
-        listRootTexts: () => [rootTextEntry({ rootText: "帮我修一下登录页 " })],
+        listRootTexts: () => [rootTextEntry({ rootText: "帮我修一下 登录页 " })],
         bindThreadToTask,
       },
     });
@@ -265,6 +282,26 @@ describe("TasklistPoller — exact root-text auto-bind", () => {
     await poller.pollOnceForTest();
 
     expect(bindThreadToTask).toHaveBeenCalledTimes(1);
+  });
+
+  it("does NOT bind when the task title carries a leading @-mention the rootText lacks (accepted degradation, not a false match)", async () => {
+    const { requester } = makeFakeRequester({ tasks: [{ guid: "task-1", summary: "@张三 帮我修一下登录页" }] });
+    const client = new TaskListClient(requester);
+    const bindThreadToTask = vi.fn(async () => {});
+    const poller = new TasklistPoller({
+      client,
+      tasklistGuid: "guid-1",
+      isClaimedByAnyBot: () => false,
+      rootTextMatch: {
+        listRootTexts: () => [rootTextEntry({ rootText: "帮我修一下登录页" })],
+        bindThreadToTask,
+      },
+    });
+
+    await poller.pollOnceForTest();
+
+    expect(bindThreadToTask).not.toHaveBeenCalled();
+    expect(poller.getCandidates().length).toBe(1); // left for the agent path
   });
 
   it("does NOT bind when a candidate matches more than one thread (ambiguous)", async () => {

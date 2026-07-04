@@ -51,22 +51,50 @@ export interface TaskHandleRecord {
    * mirroring how `lastSeenCommentId` already piggybacks on this same record.
    */
   stallNudge?: {
-    /** How many nudges have been sent since the last confirmed real progress. */
+    /**
+     * How many nudges have been CONFIRMED dispatched (i.e. StallDetector
+     * observed activity resulting from them) since the last real progress.
+     * Only incremented on confirmation — see `pendingSince` below — so a
+     * bridge restart that loses an in-flight nudge turn never inflates this
+     * toward escalation for a wake-up the agent never actually saw.
+     */
     count: number;
-    /** ms epoch — when the most recent nudge was sent (drives the cooldown gate). */
+    /** ms epoch — when the most recently CONFIRMED nudge was sent (drives the cooldown gate). */
     lastNudgeSentAt: number;
     /**
-     * ms epoch — the thread's `lastActiveTs` value StallDetector has
-     * attributed to the nudge's OWN triggered turn (as opposed to further,
-     * independent activity). Undefined until that attribution happens (see
-     * stallDetector.ts's doc comment for why this two-step capture exists —
+     * ms epoch — the thread's `lastActiveTs` value at the moment the most
+     * recent nudge was confirmed (the bump that confirmed it IS attributed
+     * to the nudge's own turn, not counted as further progress by itself —
+     * see stallDetector.ts's module doc for why this attribution exists:
      * without it, a nudge's own agent reply would look like "progress" and
-     * silently defeat the escalation counter).
+     * silently defeat the escalation counter). Always defined whenever
+     * `count >= 1` — confirmation sets both fields in the same update.
      */
     lastNudgeTurnActivityAt?: number;
     /** True once nudges have been exhausted and the escalation comment was posted. StallDetector goes silent for this task until real progress resets it. */
     escalated: boolean;
+    /**
+     * ms epoch — set right after enqueuing a nudge turn, cleared once either
+     * (a) confirmed: activity is observed after this timestamp (that bump
+     * IS the confirmation, see `count`/`lastNudgeTurnActivityAt` above), or
+     * (b) timed out: no activity observed within StallDetector's
+     * confirmation window, treated as a lost/never-dispatched nudge (e.g. a
+     * bridge restart between enqueue and actual dispatch) — `count` is NOT
+     * incremented for a timed-out attempt, so escalation can't be reached
+     * by nudges the agent never actually saw.
+     */
+    pendingSince?: number;
   };
+  /**
+   * ms epoch — set once StallDetector confirms (via `getTask`) that this
+   * claim's task is independently completed. While the thread's
+   * `lastActiveTs` stays at or below this value (i.e. nothing has happened
+   * since), StallDetector skips the task entirely — no `getTask` call, no
+   * nudge/escalate evaluation — instead of polling a done task forever.
+   * Cleared (and normal checking resumes) the moment `lastActiveTs` advances
+   * past it, e.g. a new turn reopens the task.
+   */
+  stallSuppressUntilActivityAfter?: number;
 }
 
 interface StoreFile {
@@ -81,7 +109,8 @@ function isStallNudgeState(value: unknown): value is NonNullable<TaskHandleRecor
     typeof v["count"] === "number" &&
     typeof v["lastNudgeSentAt"] === "number" &&
     (v["lastNudgeTurnActivityAt"] === undefined || typeof v["lastNudgeTurnActivityAt"] === "number") &&
-    typeof v["escalated"] === "boolean"
+    typeof v["escalated"] === "boolean" &&
+    (v["pendingSince"] === undefined || typeof v["pendingSince"] === "number")
   );
 }
 
@@ -95,7 +124,8 @@ function isTaskHandleRecord(value: unknown): value is TaskHandleRecord {
     typeof v["claimedTs"] === "number" &&
     (v["lastSeenCommentId"] === undefined || typeof v["lastSeenCommentId"] === "string") &&
     (v["lastTurnOutcome"] === undefined || v["lastTurnOutcome"] === "completed" || v["lastTurnOutcome"] === "failed") &&
-    (v["stallNudge"] === undefined || isStallNudgeState(v["stallNudge"]))
+    (v["stallNudge"] === undefined || isStallNudgeState(v["stallNudge"])) &&
+    (v["stallSuppressUntilActivityAfter"] === undefined || typeof v["stallSuppressUntilActivityAfter"] === "number")
   );
 }
 
@@ -205,15 +235,58 @@ export class TaskHandleStore {
     return this.#map.get(threadId);
   }
 
-  /** Upsert a claim and immediately atomic-flush to disk. */
+  /** Upsert a claim and immediately atomic-flush to disk. Prefer {@link update} when the new value depends on the current one — see its doc for why. */
   async put(record: TaskHandleRecord): Promise<void> {
     this.#map.set(record.threadId, record);
     await this.#flush();
   }
 
   /**
+   * Atomically read-modify-write ONE record in a single synchronous critical
+   * section (adversarial-review fix, docs/task-handle.md §12/§9.9). `updateFn`
+   * is invoked SYNCHRONOUSLY with whatever the CURRENT value is at the exact
+   * moment `update()` is called — never a value a caller captured earlier,
+   * before an `await`.
+   *
+   * This is the fix for a real lost-update race: writeback.ts, commentPoller.ts,
+   * and stallDetector.ts each used to do "read a record → await a network call
+   * → put back the record + one changed field." With three concurrent writers
+   * sharing one store, whichever writer's network `await` was in flight when
+   * ANOTHER writer's `put()` landed would get silently clobbered the moment
+   * the first writer's OWN `put()` finally ran — it was still holding the
+   * pre-await snapshot, so its write reverted the other writer's change.
+   *
+   * Callers MUST do all async work (network calls, etc.) BEFORE calling
+   * `update()`, then pass a synchronous `updateFn` that merges onto whatever
+   * `current` actually turns out to be — not a variable captured earlier.
+   * Node's single-threaded event loop makes the read-transform-write here
+   * genuinely atomic: nothing else can run between `this.#map.get()` and the
+   * synchronous `updateFn` call.
+   *
+   * Returning `undefined` deletes the record (mirrors {@link delete}).
+   * Returning `current` unchanged (e.g. because the caller decided this
+   * update no longer applies) is a harmless no-op flush.
+   */
+  async update(
+    threadId: string,
+    updateFn: (current: TaskHandleRecord | undefined) => TaskHandleRecord | undefined,
+  ): Promise<TaskHandleRecord | undefined> {
+    const current = this.#map.get(threadId);
+    const next = updateFn(current);
+    if (next === undefined) {
+      if (current === undefined) return undefined; // nothing to delete — no-op, skip the flush
+      this.#map.delete(threadId);
+    } else {
+      this.#map.set(threadId, next);
+    }
+    await this.#flush();
+    return next;
+  }
+
+  /**
    * Idempotent claim declaration — the entry point handler.ts's
-   * taskHandleClaim hook should call (docs/task-handle.md §5.2).
+   * taskHandleClaim hook should call (docs/task-handle.md §5.2), and the one
+   * TasklistPoller's exact auto-bind also calls directly.
    *
    * The agent re-declares `task_handle.guid` in state.json EVERY turn once a
    * thread has claimed a task, not just on the first claim — handler.ts fires
@@ -224,18 +297,41 @@ export class TaskHandleStore {
    * posted since the claim was last re-declared (B2 regression). Re-declaring
    * the SAME guid is therefore a no-op (preserves lastSeenCommentId + the
    * original claimedTs); only a genuinely new/changed guid rebuilds the record.
+   *
+   * P2 guardrail (adversarial review): also rejects — no-op, `claimed: false`
+   * — when `taskGuid` is ALREADY claimed by a DIFFERENT thread in this same
+   * store. Without this, two threads could both independently end up
+   * claiming the SAME task (e.g. an agent's own turn declaring a claim,
+   * racing TasklistPoller's exact auto-bind for a different thread, both
+   * targeting the same taskGuid) and nothing would ever notice — both
+   * threads would then fight over the one task's description/comments.
+   * Scoped to THIS store (one bot) — a cross-bot double-claim on a shared
+   * tasklistGuid across two different bots' stores is a known, documented
+   * residual gap (docs/task-handle.md §12); closing that needs a cross-store
+   * coordination primitive this per-bot store doesn't have.
    */
-  async claim(input: { threadId: string; taskGuid: string; chatId: string }): Promise<void> {
-    const existing = this.#map.get(input.threadId);
-    if (existing && existing.taskGuid === input.taskGuid) {
-      return;
-    }
-    await this.put({
-      threadId: input.threadId,
-      taskGuid: input.taskGuid,
-      chatId: input.chatId,
-      claimedTs: Date.now(),
+  async claim(input: {
+    threadId: string;
+    taskGuid: string;
+    chatId: string;
+  }): Promise<{ claimed: boolean; reason?: string }> {
+    let claimed = false;
+    let reason: string | undefined;
+    await this.update(input.threadId, (existing) => {
+      if (existing && existing.taskGuid === input.taskGuid) {
+        claimed = true;
+        return existing; // true no-op — see doc above for why this must not rebuild
+      }
+      for (const [otherThreadId, record] of this.#map) {
+        if (otherThreadId !== input.threadId && record.taskGuid === input.taskGuid) {
+          reason = `taskGuid ${input.taskGuid} is already claimed by thread ${otherThreadId}`;
+          return existing; // reject — leave this thread's own claim (if any) untouched
+        }
+      }
+      claimed = true;
+      return { threadId: input.threadId, taskGuid: input.taskGuid, chatId: input.chatId, claimedTs: Date.now() };
     });
+    return { claimed, reason };
   }
 
   /**
