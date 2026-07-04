@@ -351,4 +351,40 @@ export async function applyTaskHandleWriteback(
   }
 }
 
+/** Fixed system note for {@link applyAutoBindConfirmation} — never user-facing chat text, always this exact string. */
+const AUTO_BIND_CONFIRMATION_NOTE = "已自动绑定本话题(标题精确匹配)";
+
+/**
+ * Bridge-mechanical confirmation write for the v3 dispatch-time auto-bind
+ * path (docs/task-handle.md §5.2 addendum) — called by main.ts's
+ * `bindThreadToTask` closure right after `TaskHandleStore.claim()`, NOT by
+ * applyTaskHandleWriteback. An exact root-text bind happens on
+ * TasklistPoller's own timer, independent of any agent turn, so none of the
+ * three lifecycle events above (received/completed/failed) naturally fire
+ * for it — without this, the user would see nothing in the task description
+ * until whatever thread's NEXT turn happens to run. This writes ONE fixed
+ * system note directly so the bind is visible immediately.
+ *
+ * Best-effort: swallows and warns, same posture as applyTaskHandleWriteback.
+ * A failure here must never undo the store.claim() that already succeeded —
+ * the claim itself is the source of truth; this is just a courtesy heads-up.
+ */
+export async function applyAutoBindConfirmation(taskGuid: string, client: TaskListClient): Promise<void> {
+  try {
+    const task = await client.getTask(taskGuid);
+    if (!task) return; // task vanished between the poller's list and now — nothing to confirm into
+    const description = mergeDescriptionSnapshot(task.description, {
+      status: "in_progress",
+      summary: AUTO_BIND_CONFIRMATION_NOTE,
+    });
+    await client.patchDescription(taskGuid, description);
+  } catch (err) {
+    console.warn(
+      `[tasklist.writeback] auto-bind confirmation write failed for task ${taskGuid} ` +
+        "(continuing — the claim itself already succeeded and is not affected):",
+      err,
+    );
+  }
+}
+
 export { TaskListClient };

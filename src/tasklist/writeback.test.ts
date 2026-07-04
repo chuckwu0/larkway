@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { TaskHandleStore } from "./store.js";
 import { TaskListClient, type LarkTaskRequestConfig, type LarkTaskRequester } from "./client.js";
 import {
+  applyAutoBindConfirmation,
   applyTaskHandleWriteback,
   mergeDescriptionSnapshot,
   parseStatusSnapshotStatus,
@@ -403,5 +404,43 @@ describe("applyTaskHandleWriteback", () => {
     await expect(
       applyTaskHandleWriteback({ botId: "b1", threadId: "t1", status: "completed" }, { store, client }),
     ).resolves.toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// applyAutoBindConfirmation — v3 dispatch-time exact auto-bind (§5.2 addendum)
+// ---------------------------------------------------------------------------
+
+describe("applyAutoBindConfirmation", () => {
+  it("writes a fixed system note into the task description", async () => {
+    const { requester, calls } = makeFakeRequester({ task: { description: "原始需求" } });
+    const client = new TaskListClient(requester);
+
+    await applyAutoBindConfirmation("guid-1", client);
+
+    const patchCall = calls.find((c) => c.config.method === "PATCH");
+    expect(patchCall).toBeDefined();
+    const descBody = (patchCall!.config.data as { task: { description: string } }).task.description;
+    expect(descBody).toContain("原始需求"); // human content preserved
+    expect(descBody).toContain("已自动绑定本话题");
+    expect(descBody).toContain("**状态**:进行中 (in_progress)");
+  });
+
+  it("no-ops when the task is gone (best-effort, never throws)", async () => {
+    const { requester } = makeFakeRequester({ task: null });
+    const client = new TaskListClient(requester);
+
+    await expect(applyAutoBindConfirmation("guid-1", client)).resolves.toBeUndefined();
+  });
+
+  it("never throws even when the client rejects unexpectedly", async () => {
+    const requester: LarkTaskRequester = {
+      request: vi.fn(async () => {
+        throw new Error("network exploded");
+      }),
+    };
+    const client = new TaskListClient(requester);
+
+    await expect(applyAutoBindConfirmation("guid-1", client)).resolves.toBeUndefined();
   });
 });

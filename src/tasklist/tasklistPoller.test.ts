@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { TaskListClient, type LarkTaskRequestConfig, type LarkTaskRequester } from "./client.js";
-import { TasklistPoller } from "./tasklistPoller.js";
+import { TasklistPoller, normalizeForExactMatch, type RootTextEntry } from "./tasklistPoller.js";
 import { STATUS_SNAPSHOT_MARKER } from "./writeback.js";
 
 interface FakeTask {
@@ -190,5 +190,227 @@ describe("TasklistPoller", () => {
     claimed = true;
     await poller.pollOnceForTest();
     expect(poller.getCandidates()).toEqual([]);
+  });
+});
+
+describe("normalizeForExactMatch", () => {
+  it("strips a human-readable @-mention token and trims", () => {
+    expect(normalizeForExactMatch("@张三 帮我修一下登录页")).toBe("帮我修一下登录页");
+  });
+
+  it("collapses repeated/incidental whitespace", () => {
+    expect(normalizeForExactMatch("帮我修一下   登录页\n\n")).toBe("帮我修一下 登录页");
+  });
+
+  it("is a no-op on text with neither mentions nor extra whitespace", () => {
+    expect(normalizeForExactMatch("帮我修一下登录页")).toBe("帮我修一下登录页");
+  });
+
+  it("two differently-formatted strings normalize to the same value", () => {
+    const a = normalizeForExactMatch("@张三  帮我修一下登录页");
+    const b = normalizeForExactMatch("帮我修一下登录页 ");
+    expect(a).toBe(b);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// v3 dispatch-time exact auto-bind (docs/task-handle.md §5.2 addendum)
+// ---------------------------------------------------------------------------
+
+describe("TasklistPoller — exact root-text auto-bind", () => {
+  function rootTextEntry(overrides: Partial<RootTextEntry> = {}): RootTextEntry {
+    return { botId: "bot-a", threadId: "t1", chatId: "oc_1", rootText: "帮我修一下登录页", ...overrides };
+  }
+
+  it("binds a unique 1:1 exact match", async () => {
+    const { requester } = makeFakeRequester({ tasks: [{ guid: "task-1", summary: "帮我修一下登录页" }] });
+    const client = new TaskListClient(requester);
+    const bindThreadToTask = vi.fn(async () => {});
+    const poller = new TasklistPoller({
+      client,
+      tasklistGuid: "guid-1",
+      isClaimedByAnyBot: () => false,
+      rootTextMatch: {
+        listRootTexts: () => [rootTextEntry()],
+        bindThreadToTask,
+      },
+    });
+
+    await poller.pollOnceForTest();
+
+    expect(bindThreadToTask).toHaveBeenCalledWith({
+      botId: "bot-a",
+      threadId: "t1",
+      chatId: "oc_1",
+      taskGuid: "task-1",
+    });
+    // Bound candidate must not also surface for the agent-path candidate injection.
+    expect(poller.getCandidates()).toEqual([]);
+  });
+
+  it("matches across @-mention/whitespace cosmetic differences", async () => {
+    const { requester } = makeFakeRequester({ tasks: [{ guid: "task-1", summary: "@张三  帮我修一下登录页" }] });
+    const client = new TaskListClient(requester);
+    const bindThreadToTask = vi.fn(async () => {});
+    const poller = new TasklistPoller({
+      client,
+      tasklistGuid: "guid-1",
+      isClaimedByAnyBot: () => false,
+      rootTextMatch: {
+        listRootTexts: () => [rootTextEntry({ rootText: "帮我修一下登录页 " })],
+        bindThreadToTask,
+      },
+    });
+
+    await poller.pollOnceForTest();
+
+    expect(bindThreadToTask).toHaveBeenCalledTimes(1);
+  });
+
+  it("does NOT bind when a candidate matches more than one thread (ambiguous)", async () => {
+    const { requester } = makeFakeRequester({ tasks: [{ guid: "task-1", summary: "帮我修一下登录页" }] });
+    const client = new TaskListClient(requester);
+    const bindThreadToTask = vi.fn(async () => {});
+    const poller = new TasklistPoller({
+      client,
+      tasklistGuid: "guid-1",
+      isClaimedByAnyBot: () => false,
+      rootTextMatch: {
+        listRootTexts: () => [
+          rootTextEntry({ threadId: "t1" }),
+          rootTextEntry({ threadId: "t2" }),
+        ],
+        bindThreadToTask,
+      },
+    });
+
+    await poller.pollOnceForTest();
+
+    expect(bindThreadToTask).not.toHaveBeenCalled();
+    expect(poller.getCandidates().length).toBe(1); // left for the agent path
+  });
+
+  it("does NOT bind when a thread matches more than one candidate (ambiguous)", async () => {
+    const { requester } = makeFakeRequester({
+      tasks: [
+        { guid: "task-1", summary: "帮我修一下登录页" },
+        { guid: "task-2", summary: "帮我修一下登录页" },
+      ],
+    });
+    const client = new TaskListClient(requester);
+    const bindThreadToTask = vi.fn(async () => {});
+    const poller = new TasklistPoller({
+      client,
+      tasklistGuid: "guid-1",
+      isClaimedByAnyBot: () => false,
+      rootTextMatch: {
+        listRootTexts: () => [rootTextEntry()],
+        bindThreadToTask,
+      },
+    });
+
+    await poller.pollOnceForTest();
+
+    expect(bindThreadToTask).not.toHaveBeenCalled();
+    expect(poller.getCandidates().length).toBe(2);
+  });
+
+  it("does NOT bind when there is no matching root text at all", async () => {
+    const { requester } = makeFakeRequester({ tasks: [{ guid: "task-1", summary: "完全不相关的标题" }] });
+    const client = new TaskListClient(requester);
+    const bindThreadToTask = vi.fn(async () => {});
+    const poller = new TasklistPoller({
+      client,
+      tasklistGuid: "guid-1",
+      isClaimedByAnyBot: () => false,
+      rootTextMatch: { listRootTexts: () => [rootTextEntry()], bindThreadToTask },
+    });
+
+    await poller.pollOnceForTest();
+
+    expect(bindThreadToTask).not.toHaveBeenCalled();
+    expect(poller.getCandidates().length).toBe(1);
+  });
+
+  it("a truncated task title (platform truncation) no longer exact-matches — accepted degradation, left to the agent path", async () => {
+    const { requester } = makeFakeRequester({ tasks: [{ guid: "task-1", summary: "帮我修一下登录" }] }); // truncated by 1 char
+    const client = new TaskListClient(requester);
+    const bindThreadToTask = vi.fn(async () => {});
+    const poller = new TasklistPoller({
+      client,
+      tasklistGuid: "guid-1",
+      isClaimedByAnyBot: () => false,
+      rootTextMatch: { listRootTexts: () => [rootTextEntry({ rootText: "帮我修一下登录页" })], bindThreadToTask },
+    });
+
+    await poller.pollOnceForTest();
+
+    expect(bindThreadToTask).not.toHaveBeenCalled();
+    expect(poller.getCandidates().length).toBe(1);
+  });
+
+  it("never crashes when listRootTexts throws — skips auto-bind for that cycle, candidates still populate", async () => {
+    const { requester } = makeFakeRequester({ tasks: [{ guid: "task-1", summary: "帮我修一下登录页" }] });
+    const client = new TaskListClient(requester);
+    const poller = new TasklistPoller({
+      client,
+      tasklistGuid: "guid-1",
+      isClaimedByAnyBot: () => false,
+      rootTextMatch: {
+        listRootTexts: () => {
+          throw new Error("boom");
+        },
+        bindThreadToTask: vi.fn(async () => {}),
+      },
+    });
+
+    await expect(poller.pollOnceForTest()).resolves.toBeUndefined();
+    expect(poller.getCandidates().length).toBe(1);
+  });
+
+  it("never crashes when bindThreadToTask rejects — candidate stays available for the agent path", async () => {
+    const { requester } = makeFakeRequester({ tasks: [{ guid: "task-1", summary: "帮我修一下登录页" }] });
+    const client = new TaskListClient(requester);
+    const poller = new TasklistPoller({
+      client,
+      tasklistGuid: "guid-1",
+      isClaimedByAnyBot: () => false,
+      rootTextMatch: {
+        listRootTexts: () => [rootTextEntry()],
+        bindThreadToTask: vi.fn(async () => {
+          throw new Error("network exploded");
+        }),
+      },
+    });
+
+    await expect(poller.pollOnceForTest()).resolves.toBeUndefined();
+    expect(poller.getCandidates().length).toBe(1);
+  });
+
+  it("old sessions with no rootText simply contribute no entries — no crash, candidate injection unaffected", async () => {
+    const { requester } = makeFakeRequester({ tasks: [{ guid: "task-1", summary: "帮我修一下登录页" }] });
+    const client = new TaskListClient(requester);
+    const bindThreadToTask = vi.fn(async () => {});
+    const poller = new TasklistPoller({
+      client,
+      tasklistGuid: "guid-1",
+      isClaimedByAnyBot: () => false,
+      rootTextMatch: { listRootTexts: () => [], bindThreadToTask }, // simulates a fleet where no session has rootText yet
+    });
+
+    await poller.pollOnceForTest();
+
+    expect(bindThreadToTask).not.toHaveBeenCalled();
+    expect(poller.getCandidates().length).toBe(1);
+  });
+
+  it("omitting rootTextMatch entirely disables auto-bind but candidate injection still works (backward compatible)", async () => {
+    const { requester } = makeFakeRequester({ tasks: [{ guid: "task-1", summary: "帮我修一下登录页" }] });
+    const client = new TaskListClient(requester);
+    const poller = new TasklistPoller({ client, tasklistGuid: "guid-1", isClaimedByAnyBot: () => false });
+
+    await poller.pollOnceForTest();
+
+    expect(poller.getCandidates().length).toBe(1);
   });
 });

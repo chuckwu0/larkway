@@ -1824,7 +1824,12 @@ export class BridgeHandler {
           const now = Date.now();
 
           if (sessionId !== undefined && currentExisting === undefined) {
-            // New thread — create record
+            // New thread — create record. rootText/chatId (v3 task-handle
+            // dispatch-time capture, docs/task-handle.md §5.2) are captured
+            // ONLY here — this message IS the thread's root message, the one
+            // a human later right-clicks → 转任务 on. Truncated defensively;
+            // TasklistPoller's exact-match tolerates (doesn't need to
+            // recover from) a truncated value — see its own doc comment.
             await this.deps.sessionStore.put({
               threadId,
               sessionId,
@@ -1832,9 +1837,13 @@ export class BridgeHandler {
               createdTs: now,
               lastActiveTs: now,
               senderOpenId,
+              rootText: parsed.text.slice(0, 200),
+              chatId: parsed.chatId,
             });
           } else if (sessionId !== undefined && currentExisting !== undefined) {
-            // Existing thread — update, preserving createdTs
+            // Existing thread — update, preserving createdTs AND rootText/
+            // chatId verbatim from whenever this thread was first created
+            // (never recomputed from a later turn's message).
             await this.deps.sessionStore.put({
               threadId,
               sessionId,
@@ -1842,6 +1851,8 @@ export class BridgeHandler {
               createdTs: currentExisting.createdTs,
               lastActiveTs: now,
               senderOpenId,
+              rootText: currentExisting.rootText,
+              chatId: currentExisting.chatId,
             });
           } else if (currentExisting !== undefined && sessionId === undefined) {
             // Anomaly: no system_init seen; touch to update lastActiveTs at minimum.

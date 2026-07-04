@@ -58,6 +58,32 @@ export interface SessionRecord {
   createdTs: number;
   lastActiveTs: number;
   senderOpenId?: string;
+  /**
+   * v3 task-handle dispatch-time capture (docs/task-handle.md §5.2 "dispatch
+   * 时捕获根消息文本"): the thread's ROOT message text (the first @-mention
+   * that opened this topic), truncated to ~200 chars, captured ONLY when the
+   * bridge creates this thread's session record for the first time (handler.ts
+   * "New thread" branch) — never recomputed or overwritten on later turns,
+   * since only the original message is "the topic" a human would later
+   * right-click → 转任务 on. Used by src/tasklist/tasklistPoller.ts to
+   * exact-match a shared tasklist's candidate task summaries against threads
+   * across every bot sharing that tasklist, entirely bridge-mechanical (no
+   * fuzzy/prefix matching — see tasklistPoller.ts's normalizeForExactMatch).
+   * Absent for any session created before this field existed, or for a
+   * thread whose FIRST message the bridge never saw (gap-fill replay edge
+   * case) — both degrade to "no auto-bind candidate for this thread," which
+   * is the same as the feature being off for that one thread; the agent-side
+   * candidate-injection path is unaffected and still covers it.
+   */
+  rootText?: string;
+  /**
+   * Companion to {@link rootText}, captured at the same time (same "New
+   * thread" branch) for the same reason: the auto-bind path needs a chatId
+   * to actually claim a task on this thread's behalf (TaskHandleStore.claim
+   * requires one), and nothing else in the bridge persists a threadId→chatId
+   * mapping independent of a live in-flight turn.
+   */
+  chatId?: string;
 }
 
 /** The shape actually persisted to disk — botId required. */
@@ -68,6 +94,8 @@ interface StoredRecord {
   createdTs: number;
   lastActiveTs: number;
   senderOpenId?: string;
+  rootText?: string;
+  chatId?: string;
 }
 
 interface StoreFile {
@@ -273,6 +301,8 @@ export class SessionStore {
       createdTs: record.createdTs,
       lastActiveTs: record.lastActiveTs,
       ...(record.senderOpenId !== undefined ? { senderOpenId: record.senderOpenId } : {}),
+      ...(record.rootText !== undefined ? { rootText: record.rootText } : {}),
+      ...(record.chatId !== undefined ? { chatId: record.chatId } : {}),
     };
     this.#map.set(key, stored);
     await this.#flush();
@@ -381,6 +411,8 @@ function isStoredRecord(value: unknown): value is StoredRecord {
     typeof v["botId"] === "string" &&
     typeof v["createdTs"] === "number" &&
     typeof v["lastActiveTs"] === "number" &&
-    (v["senderOpenId"] === undefined || typeof v["senderOpenId"] === "string")
+    (v["senderOpenId"] === undefined || typeof v["senderOpenId"] === "string") &&
+    (v["rootText"] === undefined || typeof v["rootText"] === "string") &&
+    (v["chatId"] === undefined || typeof v["chatId"] === "string")
   );
 }

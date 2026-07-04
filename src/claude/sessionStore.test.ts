@@ -295,3 +295,50 @@ describe("double-key CRUD", () => {
     expect(store.get("om_shared", "bot-b")?.sessionId).toBe("sess-bot-b");
   });
 });
+
+// ---------------------------------------------------------------------------
+// rootText / chatId (v3 task-handle dispatch-time capture)
+// ---------------------------------------------------------------------------
+
+describe("rootText / chatId (v3 task-handle dispatch-time capture)", () => {
+  it("persists rootText and chatId when set", async () => {
+    const store = await SessionStore.load(sessionsPath);
+    await store.put({
+      threadId: "om_t1",
+      sessionId: "sess-1",
+      botId: "bot-a",
+      createdTs: 100,
+      lastActiveTs: 200,
+      rootText: "帮我修一下登录页",
+      chatId: "oc_1",
+    });
+
+    const rec = store.get("om_t1", "bot-a");
+    expect(rec?.rootText).toBe("帮我修一下登录页");
+    expect(rec?.chatId).toBe("oc_1");
+
+    // Also verify it round-trips through a fresh load from disk.
+    const reloaded = await SessionStore.load(sessionsPath);
+    expect(reloaded.get("om_t1", "bot-a")?.rootText).toBe("帮我修一下登录页");
+    expect(reloaded.get("om_t1", "bot-a")?.chatId).toBe("oc_1");
+  });
+
+  it("leaves rootText/chatId absent when not provided (old records / no capture)", async () => {
+    const store = await SessionStore.load(sessionsPath);
+    await store.put({ threadId: "om_t2", sessionId: "sess-2", botId: "bot-a", createdTs: 100, lastActiveTs: 200 });
+
+    const rec = store.get("om_t2", "bot-a");
+    expect(rec?.rootText).toBeUndefined();
+    expect(rec?.chatId).toBeUndefined();
+  });
+
+  it("a v1-migrated record has no rootText/chatId (predates the field, degrades to absent)", async () => {
+    await writeV1Fixture({
+      "om_legacy": { threadId: "om_legacy", sessionId: "sess-legacy", createdTs: 1, lastActiveTs: 2 },
+    });
+    const store = await SessionStore.load(sessionsPath);
+    const rec = store.getLegacy("om_legacy");
+    expect(rec).toBeDefined();
+    expect(rec?.rootText).toBeUndefined();
+  });
+});

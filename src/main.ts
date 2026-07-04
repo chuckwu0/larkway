@@ -42,9 +42,9 @@ import {
 import { resolveTaskHandlesPath, resolveTaskTeamRegistryPath } from "./config/paths.js";
 import { TaskHandleStore } from "./tasklist/store.js";
 import { TaskListClient, type LarkTaskRequester } from "./tasklist/client.js";
-import { applyTaskHandleWriteback } from "./tasklist/writeback.js";
+import { applyTaskHandleWriteback, applyAutoBindConfirmation } from "./tasklist/writeback.js";
 import { CommentPoller } from "./tasklist/commentPoller.js";
-import { TasklistPoller } from "./tasklist/tasklistPoller.js";
+import { TasklistPoller, type RootTextEntry } from "./tasklist/tasklistPoller.js";
 import { readTeamTasklistGuid } from "./tasklist/teamRegistry.js";
 
 /** How often the bridge rewrites each bot's status.json liveness heartbeat. */
@@ -216,7 +216,18 @@ async function runV2Mode({
   // real poller even though it's populated after the loop finishes — nothing
   // reads a candidate snapshot before the bridge's main loop starts.
   const tasklistPollersByGuid = new Map<string, TasklistPoller>();
-  const tasklistGuidGroups = new Map<string, { client: TaskListClient; stores: TaskHandleStore[] }>();
+  interface TasklistGuidGroup {
+    client: TaskListClient;
+    /**
+     * One entry per bot sharing this guid. `sessionStore` is here (not just
+     * `taskHandleStore`) so the poller's v3 auto-bind step can read every
+     * such bot's rootText-bearing session records AND claim on the specific
+     * bot's TaskHandleStore that owns whichever thread matches — see
+     * `listRootTexts`/`bindThreadToTask` below.
+     */
+    bots: Array<{ botId: string; sessionStore: SessionStore; taskHandleStore: TaskHandleStore }>;
+  }
+  const tasklistGuidGroups = new Map<string, TasklistGuidGroup>();
 
   for (const bot of healthyBots) {
     const appSecret = process.env[bot.app_secret_env]!;
@@ -431,14 +442,15 @@ async function runV2Mode({
         // `task_handle_claimed: yes|no` so the SKILL can offer a one-tap claim
         // button only when this thread genuinely has no claim yet.
         taskHandleClaimedLookup = (threadId) => taskHandleStore.get(threadId) !== undefined;
-        // Dedup group for the shared TasklistPoller (v3) — this bot's store
-        // joins whichever group already exists for `guid` (first bot to see
-        // it seeds the group's client; every later bot just adds its store so
-        // isClaimedByAnyBot checks ALL of them). The poller itself is
+        // Dedup group for the shared TasklistPoller (v3) — this bot joins
+        // whichever group already exists for `guid` (first bot to see it
+        // seeds the group's client; every later bot just adds itself so
+        // isClaimedByAnyBot / listRootTexts / bindThreadToTask below all see
+        // every bot sharing this guid, not just one). The poller itself is
         // constructed once, after this whole per-bot loop, in the pass below.
         {
-          const group = tasklistGuidGroups.get(guid) ?? { client: taskListClient, stores: [] };
-          group.stores.push(taskHandleStore);
+          const group = tasklistGuidGroups.get(guid) ?? { client: taskListClient, bots: [] };
+          group.bots.push({ botId: bot.id, sessionStore, taskHandleStore });
           tasklistGuidGroups.set(guid, group);
         }
         taskHandleCandidatesLookup = () => tasklistPollersByGuid.get(guid)?.getCandidates() ?? [];
@@ -583,7 +595,32 @@ async function runV2Mode({
     const poller = new TasklistPoller({
       client: group.client,
       tasklistGuid: guid,
-      isClaimedByAnyBot: (taskGuid) => group.stores.some((s) => s.list().some((r) => r.taskGuid === taskGuid)),
+      isClaimedByAnyBot: (taskGuid) =>
+        group.bots.some((b) => b.taskHandleStore.list().some((r) => r.taskGuid === taskGuid)),
+      // v3 dispatch-time exact auto-bind (docs/task-handle.md §5.2 addendum):
+      // read-only rootText snapshot across every bot sharing this guid, and
+      // the mechanical claim+confirmation callback for a uniquely-matched
+      // (thread, task) pair. Both are pure plumbing — the poller itself
+      // (tasklistPoller.ts) does all the actual matching/uniqueness logic.
+      rootTextMatch: {
+        listRootTexts: (): readonly RootTextEntry[] =>
+          group.bots.flatMap((b) =>
+            b.sessionStore
+              .list()
+              .filter((r) => r.rootText !== undefined && r.chatId !== undefined)
+              .map((r) => ({ botId: b.botId, threadId: r.threadId, chatId: r.chatId!, rootText: r.rootText! })),
+          ),
+        bindThreadToTask: async (entry) => {
+          const target = group.bots.find((b) => b.botId === entry.botId);
+          if (!target) return; // shouldn't happen — entry came from this same group's listRootTexts
+          await target.taskHandleStore.claim({
+            threadId: entry.threadId,
+            taskGuid: entry.taskGuid,
+            chatId: entry.chatId,
+          });
+          await applyAutoBindConfirmation(entry.taskGuid, group.client);
+        },
+      },
     });
     poller.start();
     tasklistPollersByGuid.set(guid, poller);

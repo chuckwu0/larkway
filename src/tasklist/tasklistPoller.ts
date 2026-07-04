@@ -27,6 +27,24 @@
  *     ({@link STATUS_SNAPSHOT_MARKER}) — a task the bridge has never written
  *     back to has never actually been claimed by anyone, even transiently.
  *
+ * v3 addendum — dispatch-time exact auto-bind (docs/task-handle.md §5.2): this
+ * is the ONE exception to "never decides which candidate belongs to which
+ * thread," and it's deliberately narrow. handler.ts now captures each
+ * thread's ROOT message text at dispatch time, for free (src/claude/
+ * sessionStore.ts's `rootText`, written once when the thread's session
+ * record is first created — no new network call, no per-poll cost). Every
+ * poll cycle, after building the candidate snapshot above, this module
+ * compares each candidate's summary against every known thread's rootText
+ * (both sides run through {@link normalizeForExactMatch} — @-mention strip +
+ * whitespace collapse, NOTHING fuzzier). Only a STRICT 1:1 match — exactly
+ * one thread matches this candidate, AND that thread matches no other
+ * candidate — triggers an automatic bind (`rootTextMatch.bindThreadToTask`);
+ * any other outcome (zero matches, or ties on either side) is left entirely
+ * to the agent-path candidate injection above. This stays mechanical, not a
+ * business judgment: string equality after a fixed, documented
+ * normalization is a fact, not an interpretation — the same bar the rest of
+ * this module already holds itself to.
+ *
  * Class shape (timer/start/stop/jitter) mirrors commentPoller.ts.
  */
 
@@ -42,11 +60,44 @@ const DESCRIPTION_EXCERPT_MAX_LEN = 200;
 const MAX_CANDIDATES = 30;
 const MAX_PAGES_PER_CYCLE = 5;
 
+/** One thread's captured root text, tagged with enough to act on a match (docs/task-handle.md §5.2 v3 addendum). */
+export interface RootTextEntry {
+  botId: string;
+  threadId: string;
+  chatId: string;
+  rootText: string;
+}
+
+export interface RootTextMatchDeps {
+  /**
+   * Read-only snapshot of every (botId, threadId, chatId, rootText) tuple
+   * across every bot sharing this poller's tasklistGuid — main.ts wires this
+   * from each bot's SessionStore.list(), filtered to records that have a
+   * rootText. Called once per poll cycle; must not throw (a throw here is
+   * caught and logged, skipping auto-bind for that cycle only).
+   */
+  listRootTexts: () => readonly RootTextEntry[];
+  /**
+   * Bridge-mechanical claim + confirmation for a uniquely-matched
+   * (thread, task) pair. main.ts's implementation calls the owning bot's
+   * `TaskHandleStore.claim()` then `applyAutoBindConfirmation` — this module
+   * never touches a TaskHandleStore or TaskListClient directly for binding,
+   * keeping the "who owns which store" wiring entirely in main.ts. Best-
+   * effort from this module's perspective: a rejection is caught and logged,
+   * never thrown back to the poll cycle (the agent-path candidate injection
+   * still covers this task next cycle since the failed bind never removed
+   * it from #candidates in that case).
+   */
+  bindThreadToTask: (entry: { botId: string; threadId: string; chatId: string; taskGuid: string }) => Promise<void>;
+}
+
 export interface TasklistPollerDeps {
   client: TaskListClient;
   tasklistGuid: string;
   /** True if ANY bot sharing this tasklistGuid has already claimed taskGuid. */
   isClaimedByAnyBot: (taskGuid: string) => boolean;
+  /** Omit to disable the v3 exact-auto-bind step entirely (candidate injection alone still works). */
+  rootTextMatch?: RootTextMatchDeps;
 }
 
 export interface TasklistPollerOptions {
@@ -54,6 +105,26 @@ export interface TasklistPollerOptions {
   intervalMs?: number;
   /** First-run jitter cap, clamped to intervalMs. @default 10_000 */
   jitterMs?: number;
+}
+
+/**
+ * Fixed, documented normalization applied to BOTH sides of the exact-match
+ * comparison (docs/task-handle.md §5.2 v3 addendum) — deliberately NOT
+ * fuzzy/prefix/similarity matching, just canonicalizing two cosmetic
+ * differences that would otherwise defeat a legitimate exact match:
+ *   - an @-mention token (Feishu renders a human-readable "@张三 " into a
+ *     converted task's title, but our own message parsing already strips
+ *     ITS placeholder form out of rootText — see lark/message.ts's
+ *     AT_PLACEHOLDER_RE — so this regex covers the human-readable form the
+ *     task-title side can still carry),
+ *   - incidental whitespace (leading/trailing/repeated).
+ * Exported for direct unit testing — pure, no I/O.
+ */
+export function normalizeForExactMatch(text: string): string {
+  return text
+    .replace(/@\S+\s*/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
 }
 
 /** Internal cache entry — keeps the RAW description so a re-poll's marker check never operates on an already-truncated excerpt. */
@@ -175,6 +246,15 @@ export class TasklistPoller {
         }
         pageToken = page.hasMore && fresh.size < MAX_CANDIDATES ? page.pageToken : undefined;
       } while (pageToken !== undefined && pagesFetched < MAX_PAGES_PER_CYCLE);
+
+      // v3 addendum: exact root-text auto-bind, BEFORE freezing #candidates —
+      // a successful bind removes its candidate from `fresh` immediately so
+      // the SAME cycle's getCandidates() (read moments later by a prompt
+      // build) never surfaces a task the bridge just bound.
+      if (this.#deps.rootTextMatch) {
+        await this.#autoBindExactMatches(fresh, this.#deps.rootTextMatch);
+      }
+
       this.#candidates = fresh;
     } catch (err) {
       console.warn(
@@ -184,6 +264,84 @@ export class TasklistPoller {
       );
       // Deliberately do NOT clear #candidates on failure — a transient error
       // shouldn't blank out a snapshot the prompt layer may read moments later.
+    }
+  }
+
+  /**
+   * Exact bidirectional root-text auto-bind (docs/task-handle.md §5.2 v3
+   * addendum). Mutates `fresh` in place, removing any candidate it
+   * successfully binds. Never throws — every failure is caught and logged,
+   * leaving the candidate for the agent path to pick up instead.
+   */
+  async #autoBindExactMatches(
+    fresh: Map<string, CachedCandidate>,
+    rootTextMatch: RootTextMatchDeps,
+  ): Promise<void> {
+    if (fresh.size === 0) return;
+
+    let entries: readonly RootTextEntry[];
+    try {
+      entries = rootTextMatch.listRootTexts();
+    } catch (err) {
+      console.warn(
+        `[tasklist.tasklistPoller] listRootTexts failed for tasklist ${this.#deps.tasklistGuid} ` +
+          "(skipping auto-bind this cycle, candidate injection unaffected):",
+        err,
+      );
+      return;
+    }
+    if (entries.length === 0) return;
+
+    // Build both directions of the match index up front — a candidate only
+    // auto-binds when EXACTLY one thread matches it AND that thread matches
+    // no other candidate (strict 1:1, both ways).
+    const matchingThreadsByGuid = new Map<string, RootTextEntry[]>();
+    const matchingGuidsByThreadKey = new Map<string, string[]>();
+
+    for (const [guid, candidate] of fresh) {
+      const normalizedSummary = normalizeForExactMatch(candidate.summary);
+      if (!normalizedSummary) continue;
+      for (const entry of entries) {
+        if (normalizeForExactMatch(entry.rootText) !== normalizedSummary) continue;
+        const threadKey = `${entry.botId}::${entry.threadId}`;
+        matchingThreadsByGuid.set(guid, [...(matchingThreadsByGuid.get(guid) ?? []), entry]);
+        matchingGuidsByThreadKey.set(threadKey, [...(matchingGuidsByThreadKey.get(threadKey) ?? []), guid]);
+      }
+    }
+
+    for (const [guid, threads] of matchingThreadsByGuid) {
+      if (threads.length !== 1) {
+        console.info(
+          `[tasklist.tasklistPoller] candidate ${guid} exact-matched ${threads.length} threads by root text ` +
+            "— ambiguous, leaving to the agent-path candidate injection.",
+        );
+        continue;
+      }
+      const entry = threads[0]!;
+      const threadKey = `${entry.botId}::${entry.threadId}`;
+      const guidsForThread = matchingGuidsByThreadKey.get(threadKey) ?? [];
+      if (guidsForThread.length !== 1) {
+        console.info(
+          `[tasklist.tasklistPoller] thread ${threadKey} exact-matched ${guidsForThread.length} candidates by root ` +
+            "text — ambiguous, leaving to the agent-path candidate injection.",
+        );
+        continue;
+      }
+      try {
+        await rootTextMatch.bindThreadToTask({
+          botId: entry.botId,
+          threadId: entry.threadId,
+          chatId: entry.chatId,
+          taskGuid: guid,
+        });
+        fresh.delete(guid);
+      } catch (err) {
+        console.warn(
+          `[tasklist.tasklistPoller] bindThreadToTask failed for candidate ${guid} / thread ${threadKey} ` +
+            "(continuing — candidate stays available for the agent path):",
+          err,
+        );
+      }
     }
   }
 }
