@@ -145,6 +145,99 @@ describe("CotProgressHandle finalize reliability (complete must fire)", () => {
     expect(updateCalls).toBeGreaterThan(0); // the RUN_FINISHED flush was tried and failed
     expect(completeCalled).toBe(true); // …but complete was STILL attempted
   });
+
+  it("Round B: a mid-run PUT 400 disables the handle, but finalize STILL terminal-PUTs + completes", async () => {
+    // The confirmed real-machine bug: chat bubble created + scrolling, then a
+    // mid-stream PUT 400 disables the handle. The old finalize entry guard
+    // `if (_disabled) return` then skipped RUN_FINISHED AND complete → bubble
+    // orphaned in 思考中. finalize must instead best-effort terminal-PUT + complete.
+    let updateAttempts = 0;
+    let completeReason: string | undefined;
+    const client: OutboundCotClient = {
+      async create() { return { cotId: "c", messageId: "m" }; },
+      async resolveThreadId() { return undefined; },
+      async update() {
+        updateAttempts += 1;
+        throw new Error("COT API failed: code=400 invalid");
+      },
+      async complete(_ref, reason) { completeReason = reason; },
+    };
+    const handle = await createCotProgressHandle({
+      cotClient: client, target: TARGET, detail: "brief", runId: "r",
+      scope: "s", inputPreview: "hi", throttleMs: 0,
+    });
+    handle.handle({ type: "thinking_delta", text: "x", raw: {} });
+    await new Promise((r) => setTimeout(r, 1)); // mid-run flush fails → _disabled
+    expect(handle.disabled).toBe(true);
+    const midRunAttempts = updateAttempts;
+
+    await handle.finalize("done");
+    // finalize attempted a terminal PUT even though already disabled…
+    expect(updateAttempts).toBeGreaterThan(midRunAttempts);
+    // …and completed the bubble regardless.
+    expect(completeReason).toBe("done");
+  });
+});
+
+describe("CotProgressHandle event-sequence legality (START/END balance)", () => {
+  // Every *_START must be closed by its *_END, depth never goes negative, and
+  // the stream terminates with RUN_FINISHED (or RUN_ERROR) — the shape the
+  // client state machine needs to leave 思考中 (see cot-write-probe.md).
+  function assertBalancedAndTerminated(seq: string[], terminal: "RUN_FINISHED" | "RUN_ERROR") {
+    const pairs: Record<string, string> = {
+      REASONING_MESSAGE_START: "REASONING_MESSAGE_END",
+      REASONING_START: "REASONING_END",
+      TOOL_CALL_START: "TOOL_CALL_END",
+    };
+    const opens = new Set(Object.keys(pairs));
+    const closes = new Set(Object.values(pairs));
+    const depth: Record<string, number> = {
+      REASONING_MESSAGE_START: 0,
+      REASONING_START: 0,
+      TOOL_CALL_START: 0,
+    };
+    const closeToOpen: Record<string, string> = Object.fromEntries(
+      Object.entries(pairs).map(([o, c]) => [c, o]),
+    );
+    for (const t of seq) {
+      if (opens.has(t)) depth[t] += 1;
+      else if (closes.has(t)) {
+        const o = closeToOpen[t]!;
+        depth[o] -= 1;
+        expect(depth[o], `${t} without matching open`).toBeGreaterThanOrEqual(0);
+      }
+    }
+    for (const k of Object.keys(depth)) {
+      expect(depth[k], `${k} left unbalanced`).toBe(0);
+    }
+    expect(seq[seq.length - 1]).toBe(terminal);
+  }
+
+  it("keeps START/END balanced across a thinking↔tool interleaving and terminates with RUN_FINISHED", async () => {
+    const rec = recordingCotClient();
+    const handle = await startHandle(rec, "detailed");
+    handle.handle({ type: "thinking_delta", text: "reason a", raw: {} });
+    handle.handle({ type: "thinking_delta", text: "reason b", raw: {} });
+    handle.handle({ type: "tool_use", toolName: "Bash", toolInput: { command: "ls" }, raw: {} });
+    handle.handle({ type: "tool_result", raw: { message: { content: [{ type: "tool_result", content: "ok" }] } } });
+    handle.handle({ type: "thinking_delta", text: "reason c", raw: {} });
+    // tool_use with NO following tool_result — START/END must still be balanced.
+    handle.handle({ type: "tool_use", toolName: "Read", toolInput: { file_path: "/x" }, raw: {} });
+    // reasoning left OPEN at turn end — finalize must close it.
+    handle.handle({ type: "thinking_delta", text: "reason d", raw: {} });
+    await handle.finalize("done");
+
+    assertBalancedAndTerminated(types(rec), "RUN_FINISHED");
+    expect(rec.completeReason).toBe("done");
+  });
+
+  it("closes an open reasoning block on the error path and terminates with RUN_ERROR", async () => {
+    const rec = recordingCotClient();
+    const handle = await startHandle(rec, "brief");
+    handle.handle({ type: "thinking_delta", text: "mid-thought", raw: {} }); // reasoning open
+    await handle.finalize("error", { message: "boom" });
+    assertBalancedAndTerminated(types(rec), "RUN_ERROR");
+  });
 });
 
 describe("CotProgressHandle event mapping", () => {

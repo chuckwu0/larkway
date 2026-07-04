@@ -119,6 +119,19 @@ function summarizeError(err: unknown): string {
   return message.replace(/\s+/g, " ").trim().slice(0, 240) || "unknown error";
 }
 
+function makeEvent(eventType: string, content: unknown): CotEvent {
+  return { event_type: eventType, content: JSON.stringify(content), timestamp: Date.now() };
+}
+
+/**
+ * A content-free summary of a failed PUT's payload for the warn log: the
+ * event_type list + each content's length only (never the content itself).
+ * Enough to diagnose a rejected batch shape without logging user text.
+ */
+function payloadSummary(events: readonly CotEvent[]): string {
+  return `payload=[${events.map((e) => `${e.event_type}:${e.content.length}`).join(",")}]`;
+}
+
 /**
  * A short tool title for the brief tier — just the tool name plus, for shell
  * commands, a clipped command preview. Never renders full arbitrary input.
@@ -240,8 +253,16 @@ class LiveCotProgressHandle implements CotProgressHandle {
    */
   private async createWithFallback(attempts: readonly CotTarget[]): Promise<CotRef | undefined> {
     for (let i = 0; i < attempts.length; i++) {
+      const attempt = attempts[i]!;
       try {
-        return await this.cotClient.create(attempts[i]!);
+        const ref = await this.cotClient.create(attempt);
+        console.info(
+          "[cot_progress] created",
+          `cotId=${ref.cotId}`,
+          `channel=${attempt.threadId ? "thread" : "chat_id"}`,
+          `messageId=${ref.messageId}`,
+        );
+        return ref;
       } catch (err) {
         if (i < attempts.length - 1) {
           console.info(
@@ -341,36 +362,84 @@ class LiveCotProgressHandle implements CotProgressHandle {
     this.enqueue("REASONING_END", { messageId: this.reasoningMessageId });
   }
 
+  /**
+   * Terminal-state invariant: once a bubble exists (ref set), finalize ALWAYS
+   * best-effort tears it down — even if a mid-run PUT already disabled us. A
+   * "half-way self-disable" must never equal "bubble orphaned forever in
+   * 思考中" (the real-machine Round B bug: a mid-stream PUT 400 disabled the
+   * handle, and the old `if (_disabled) return` guards then skipped BOTH
+   * RUN_FINISHED and complete). We stop accepting new stream events, then drive
+   * teardown directly, each step independently try/caught:
+   *   (1) flush the backlog — only while still healthy (a disabled handle
+   *       abandons the backlog and jumps straight to the terminal PUT);
+   *   (2) a MINIMAL, balanced terminal PUT (close any open reasoning block +
+   *       RUN_FINISHED/RUN_ERROR) sent DIRECTLY, bypassing the _disabled gate;
+   *   (3) complete.
+   * Any step failing warns and continues — the bubble must leave 思考中.
+   */
   async finalize(reason: "done" | "error", opts?: { message?: string }): Promise<void> {
-    if (this.closed) return;
-    if (this._disabled || !this.ref) {
+    if (this.closed || !this.ref) {
       this.closed = true;
       return;
     }
-    this.closeReasoning();
-    if (reason === "error") {
-      this.enqueue("RUN_ERROR", { message: truncate(opts?.message ?? "run failed", COT_TEXT_MAX) });
-    } else {
-      this.enqueue("RUN_FINISHED", { threadId: this.scope, runId: this.runId, status: "done" });
-    }
+    this.closed = true;
     if (this.timer) {
       clearTimeout(this.timer);
       this.timer = undefined;
     }
-    await this.flush();
-    this.closed = true;
-    // Always ATTEMPT complete when a bubble exists — do NOT gate on _disabled.
-    // The flush above can disable us on a single transient RUN_FINISHED PUT
-    // failure; gating complete on that (the old `if (_disabled) return`) is
-    // exactly what left a bubble that scrolled fine hung in its "thinking"
-    // state. complete is bounded (8s timeout in ChannelCotClient) and caught,
-    // so a best-effort attempt can only help the bubble finish — never blocks.
-    if (!this.ref) return;
+    const ref = this.ref;
+
+    // (1) Best-effort backlog flush — only while healthy.
+    if (!this._disabled) {
+      try {
+        await this.flush();
+      } catch {
+        /* flush swallows its own errors; guard is belt-and-suspenders */
+      }
+    }
+
+    // (2) Minimal, balanced terminal PUT — sent directly so a mid-run disable
+    // can't suppress it.
+    const terminal = this.buildTerminalEvents(reason, opts);
     try {
-      await this.cotClient.complete(this.ref, reason);
+      await this.cotClient.update(ref, terminal);
+    } catch (err) {
+      console.warn(
+        "[cot_progress] terminal update failed (continuing to complete):",
+        summarizeError(err),
+        payloadSummary(terminal),
+      );
+    }
+
+    // (3) complete — independent; the bubble must finish even if (2) failed.
+    try {
+      await this.cotClient.complete(ref, reason);
+      console.info("[cot_progress] completed", `cotId=${ref.cotId}`, `reason=${reason}`);
     } catch (err) {
       console.warn("[cot_progress] complete failed (continuing):", summarizeError(err));
     }
+  }
+
+  /**
+   * The minimal terminal event batch: close any still-open reasoning block so
+   * REASONING_MESSAGE/REASONING START/END stay balanced, then the run's
+   * terminal marker. Tool calls need no closing here — onToolUse always emits
+   * TOOL_CALL_END synchronously alongside START. Built directly (not via the
+   * _disabled-gated enqueue) so it survives a mid-run disable.
+   */
+  private buildTerminalEvents(reason: "done" | "error", opts?: { message?: string }): CotEvent[] {
+    const events: CotEvent[] = [];
+    if (this.reasoningOpen) {
+      this.reasoningOpen = false;
+      events.push(makeEvent("REASONING_MESSAGE_END", { messageId: this.reasoningMessageId }));
+      events.push(makeEvent("REASONING_END", { messageId: this.reasoningMessageId }));
+    }
+    if (reason === "error") {
+      events.push(makeEvent("RUN_ERROR", { message: truncate(opts?.message ?? "run failed", COT_TEXT_MAX) }));
+    } else {
+      events.push(makeEvent("RUN_FINISHED", { threadId: this.scope, runId: this.runId, status: "done" }));
+    }
+    return events;
   }
 
   close(): void {
@@ -383,11 +452,7 @@ class LiveCotProgressHandle implements CotProgressHandle {
 
   private enqueue(eventType: string, content: unknown): void {
     if (this._disabled || !this.ref) return;
-    this.buffer.push({
-      event_type: eventType,
-      content: JSON.stringify(content),
-      timestamp: Date.now(),
-    });
+    this.buffer.push(makeEvent(eventType, content));
     this.scheduleFlush();
   }
 
@@ -413,7 +478,11 @@ class LiveCotProgressHandle implements CotProgressHandle {
       .update(this.ref, events)
       .catch((err) => {
         this._disabled = true;
-        console.warn("[cot_progress] update failed; COT disabled for this run:", summarizeError(err));
+        console.warn(
+          "[cot_progress] update failed; COT disabled for this run:",
+          summarizeError(err),
+          payloadSummary(events),
+        );
       })
       .finally(() => {
         this.flushing = undefined;
