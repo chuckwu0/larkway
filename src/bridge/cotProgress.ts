@@ -58,45 +58,55 @@ export interface CreateCotProgressHandleOpts {
 }
 
 /**
- * Resolve where the COT bubble anchors, per the om_ ≠ omt_ rule.
+ * Resolve an ORDERED list of COT-create attempts, per the om_/omt_ + tenant
+ * reality (full experiment matrix, 2026-07):
  *
- * message_cot's `receive_id_type=thread_id` channel ONLY accepts an omt_*
- * topic id. A top-level @ in a topic group arrives with an om_* message id in
- * its thread hint, which 10001s ("invalid receive_id"). So:
- *   1. omt_* hint → use it directly (thread channel).
- *   2. a non-omt_ thread hint (topic-group message) → GET the message for its
- *      real omt_* thread id (cached: this runs once at run start, not per flush).
- *   3. no usable omt_ (non-topic chat, or the GET failed/was empty) → fall back
- *      to the chat_id channel + origin_message_id (validated to be accepted).
+ *   - `receive_id_type=thread_id` only accepts an omt_* topic id, and even a
+ *     valid omt_ is rejected for our tenant (code=10002 "Bot/User can NOT be
+ *     out of the chat", regardless of origin_message_id) — the thread channel
+ *     is effectively closed for us today. We still TRY it first when we have an
+ *     omt_, so the moment the tenant opens it up the bubble anchors in-topic
+ *     with zero code change; on failure we degrade.
+ *   - `chat_id` succeeds (create/PUT/complete all code=0). With
+ *     origin_message_id set it renders as a "reply to <msg>" pointer back to
+ *     the trigger message (the bubble still lives at the group top level —
+ *     Feishu gives no in-topic anchoring here; the competitor's screenshots
+ *     show the same reply-pointer style).
  *
+ * So the attempt order is:
+ *   1. omt_ available → [thread channel, then chat_id+origin fallback].
+ *   2. no usable omt_ (non-topic chat, or the GET failed/empty) → [chat_id+origin].
+ *
+ * The caller (start()) tries them in order and keeps the first that succeeds.
  * `resolveThreadId` never throws (bypass rule), so this never throws either.
  */
-export async function resolveCotTarget(
+export async function resolveCotTargets(
   client: Pick<OutboundCotClient, "resolveThreadId">,
   hint: CotTarget,
-): Promise<CotTarget> {
-  if (hint.threadId && hint.threadId.startsWith("omt_")) {
-    return {
-      chatId: hint.chatId,
-      threadId: hint.threadId,
-      originMessageId: hint.originMessageId,
-    };
-  }
-  if (hint.threadId && hint.originMessageId) {
-    const omt = await client.resolveThreadId(hint.originMessageId);
-    if (omt && omt.startsWith("omt_")) {
-      return {
-        chatId: hint.chatId,
-        threadId: omt,
-        originMessageId: hint.originMessageId,
-      };
-    }
-  }
-  return {
+): Promise<CotTarget[]> {
+  const chatFallback: CotTarget = {
     chatId: hint.chatId,
     threadId: undefined,
     originMessageId: hint.originMessageId,
   };
+  const threadAttempt = (threadId: string): CotTarget => ({
+    chatId: hint.chatId,
+    threadId,
+    // origin is omitted on the wire for the thread channel (see
+    // ChannelCotClient.create), so keeping it here is harmless.
+    originMessageId: hint.originMessageId,
+  });
+
+  if (hint.threadId && hint.threadId.startsWith("omt_")) {
+    return [threadAttempt(hint.threadId), chatFallback];
+  }
+  if (hint.threadId && hint.originMessageId) {
+    const omt = await client.resolveThreadId(hint.originMessageId);
+    if (omt && omt.startsWith("omt_")) {
+      return [threadAttempt(omt), chatFallback];
+    }
+  }
+  return [chatFallback];
 }
 
 function truncate(value: unknown, max: number): string {
@@ -204,8 +214,12 @@ class LiveCotProgressHandle implements CotProgressHandle {
   async start(target: CotTarget, inputPreview: string): Promise<void> {
     try {
       // Resolve om_/omt_ once here (run start), not per flush.
-      const resolved = await resolveCotTarget(this.cotClient, target);
-      this.ref = await this.cotClient.create(resolved);
+      const attempts = await resolveCotTargets(this.cotClient, target);
+      this.ref = await this.createWithFallback(attempts);
+      if (!this.ref) {
+        this._disabled = true;
+        return;
+      }
       this.enqueue("RUN_STARTED", {
         threadId: this.scope,
         runId: this.runId,
@@ -215,6 +229,34 @@ class LiveCotProgressHandle implements CotProgressHandle {
       this._disabled = true;
       console.warn("[cot_progress] create failed; COT disabled for this run:", summarizeError(err));
     }
+  }
+
+  /**
+   * Try each create target in order, returning the first that succeeds. A
+   * failed attempt with a next one queued (i.e. the thread channel, which our
+   * tenant currently rejects) logs an info line and degrades to the next
+   * (chat-level) channel — NOT a disable. Only when the last attempt fails do
+   * we give up (caller disables). Never throws.
+   */
+  private async createWithFallback(attempts: readonly CotTarget[]): Promise<CotRef | undefined> {
+    for (let i = 0; i < attempts.length; i++) {
+      try {
+        return await this.cotClient.create(attempts[i]!);
+      } catch (err) {
+        if (i < attempts.length - 1) {
+          console.info(
+            "[cot_progress] thread channel rejected, falling back to chat-level bubble:",
+            summarizeError(err),
+          );
+        } else {
+          console.warn(
+            "[cot_progress] create failed on all channels; COT disabled for this run:",
+            summarizeError(err),
+          );
+        }
+      }
+    }
+    return undefined;
   }
 
   handle(event: AgentStreamEvent): void {

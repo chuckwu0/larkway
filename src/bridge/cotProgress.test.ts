@@ -11,7 +11,7 @@ import type { AgentStreamEvent } from "../agent/runner.js";
 import {
   createCotProgressHandle,
   extractToolResultText,
-  resolveCotTarget,
+  resolveCotTargets,
 } from "./cotProgress.js";
 
 interface RecordingClient {
@@ -299,15 +299,18 @@ describe("CotProgressHandle end-to-end hang guard", () => {
     const client = new ChannelCotClient({ resolveChannel: () => channel });
     const handlePromise = createCotProgressHandle({
       cotClient: client,
-      target: TARGET,
+      target: TARGET, // omt_ hint → thread attempt THEN chat fallback
       detail: "brief",
       runId: "run1",
       scope: "thread1",
       inputPreview: "hi",
       throttleMs: 10_000,
     });
-    // Drive the 8s client timeout; start()'s create() rejects → handle disabled.
-    await vi.advanceTimersByTimeAsync(8_000);
+    // TARGET has an omt_ hint, so both channels are tried in turn; each hangs
+    // and is bounded by the 8s client timeout. Drive both (thread, then chat),
+    // after which every attempt has rejected → handle disabled.
+    await vi.advanceTimersByTimeAsync(8_000); // thread attempt times out
+    await vi.advanceTimersByTimeAsync(8_000); // chat fallback times out
     const handle = await handlePromise;
     expect(handle.disabled).toBe(true);
     // A disabled handle finalizes as a no-op, again without hanging.
@@ -315,7 +318,7 @@ describe("CotProgressHandle end-to-end hang guard", () => {
   });
 });
 
-describe("resolveCotTarget (om_ ≠ omt_ anchoring)", () => {
+describe("resolveCotTargets (om_/omt_ + chat fallback ordering)", () => {
   function threadIdResolver(map: Record<string, string | undefined>) {
     const calls: string[] = [];
     return {
@@ -329,97 +332,143 @@ describe("resolveCotTarget (om_ ≠ omt_ anchoring)", () => {
     };
   }
 
-  it("uses an omt_ thread hint directly, without a GET", async () => {
+  const chatFallback = { chatId: "oc_x", threadId: undefined, originMessageId: "om_trigger" };
+
+  it("omt_ hint → [thread attempt, chat fallback], no GET", async () => {
     const r = threadIdResolver({});
-    const target = await resolveCotTarget(r.client, {
+    const targets = await resolveCotTargets(r.client, {
       chatId: "oc_x",
       threadId: "omt_topic",
       originMessageId: "om_trigger",
     });
-    expect(target).toEqual({
-      chatId: "oc_x",
-      threadId: "omt_topic",
-      originMessageId: "om_trigger",
-    });
+    expect(targets).toEqual([
+      { chatId: "oc_x", threadId: "omt_topic", originMessageId: "om_trigger" },
+      chatFallback,
+    ]);
     expect(r.calls).toHaveLength(0);
   });
 
-  it("resolves an om_ thread hint via GET to the real omt_ id", async () => {
+  it("om_ hint → GET → [thread(omt_real), chat fallback]", async () => {
     const r = threadIdResolver({ om_trigger: "omt_real" });
-    const target = await resolveCotTarget(r.client, {
+    const targets = await resolveCotTargets(r.client, {
       chatId: "oc_x",
       threadId: "om_topfloor", // topic-group top-level @ gives an om_ id
       originMessageId: "om_trigger",
     });
-    expect(target).toEqual({
-      chatId: "oc_x",
-      threadId: "omt_real",
-      originMessageId: "om_trigger",
-    });
+    expect(targets).toEqual([
+      { chatId: "oc_x", threadId: "omt_real", originMessageId: "om_trigger" },
+      chatFallback,
+    ]);
     expect(r.calls).toEqual(["om_trigger"]);
   });
 
-  it("falls back to chat_id + origin when the GET yields no omt_", async () => {
+  it("GET yields no omt_ → [chat fallback] only", async () => {
     const r = threadIdResolver({ om_trigger: undefined });
-    const target = await resolveCotTarget(r.client, {
+    const targets = await resolveCotTargets(r.client, {
       chatId: "oc_x",
       threadId: "om_topfloor",
       originMessageId: "om_trigger",
     });
-    expect(target).toEqual({
-      chatId: "oc_x",
-      threadId: undefined,
-      originMessageId: "om_trigger",
-    });
+    expect(targets).toEqual([chatFallback]);
     expect(r.calls).toEqual(["om_trigger"]);
   });
 
-  it("never routes an om_ id through the thread channel", async () => {
-    // Even if resolveThreadId erroneously returned an om_ id, it must not be used.
+  it("never puts an om_ id in a thread attempt (resolveThreadId returned non-omt_)", async () => {
     const r = threadIdResolver({ om_trigger: "om_notathread" });
-    const target = await resolveCotTarget(r.client, {
+    const targets = await resolveCotTargets(r.client, {
       chatId: "oc_x",
       threadId: "om_topfloor",
       originMessageId: "om_trigger",
     });
-    expect(target.threadId).toBeUndefined();
+    expect(targets).toEqual([chatFallback]);
+    expect(targets.every((t) => !t.threadId)).toBe(true);
   });
 
-  it("non-topic chat (no thread hint) goes straight to chat_id, no GET", async () => {
+  it("non-topic chat (no thread hint) → [chat fallback] only, no GET", async () => {
     const r = threadIdResolver({ om_trigger: "omt_should_not_be_used" });
-    const target = await resolveCotTarget(r.client, {
+    const targets = await resolveCotTargets(r.client, {
       chatId: "oc_x",
       originMessageId: "om_trigger",
     });
-    expect(target).toEqual({
-      chatId: "oc_x",
-      threadId: undefined,
-      originMessageId: "om_trigger",
-    });
+    expect(targets).toEqual([chatFallback]);
     expect(r.calls).toHaveLength(0);
   });
+});
 
-  it("routes create() through the resolved target (om_ hint → GET → omt_)", async () => {
-    const rec = recordingCotClient({
-      async resolveThreadId() {
-        return "omt_resolved";
+describe("CotProgressHandle create degradation chain (thread → chat_id)", () => {
+  // A client that records every create target and can be told which channel(s)
+  // reject — the thread channel currently 10002s for our tenant.
+  function selectiveClient(opts: { failThread?: boolean; failChat?: boolean }) {
+    const state = { targets: [] as CotTarget[], completeReason: undefined as string | undefined };
+    const client: OutboundCotClient = {
+      async create(target) {
+        state.targets.push(target);
+        if (target.threadId && opts.failThread) {
+          throw new Error("COT API failed: code=10002 Bot/User can NOT be out of the chat");
+        }
+        if (!target.threadId && opts.failChat) {
+          throw new Error("COT API failed: code=99999 chat create failed");
+        }
+        return { cotId: "cot_1", messageId: "om_1" };
       },
-    });
-    const handle = await createCotProgressHandle({
-      cotClient: rec.client,
-      target: { chatId: "oc_x", threadId: "om_topfloor", originMessageId: "om_trigger" },
+      async resolveThreadId() {
+        return undefined; // unused: these tests pass an omt_ hint directly
+      },
+      async update() {},
+      async complete(_ref, reason) {
+        state.completeReason = reason;
+      },
+    };
+    return { client, state };
+  }
+
+  async function startWithHint(client: OutboundCotClient, threadId?: string) {
+    return createCotProgressHandle({
+      cotClient: client,
+      target: { chatId: "oc_x", threadId, originMessageId: "om_trigger" },
       detail: "brief",
       runId: "run1",
       scope: "thread1",
       inputPreview: "hi",
       throttleMs: 10_000,
     });
-    await handle.finalize("done");
-    expect(rec.createTargets[0]).toEqual({
+  }
+
+  it("thread channel 10002 → retries chat_id and stays enabled", async () => {
+    const { client, state } = selectiveClient({ failThread: true });
+    const handle = await startWithHint(client, "omt_topic");
+
+    expect(handle.disabled).toBe(false);
+    // Tried thread first (no origin on the wire), then chat_id + origin.
+    expect(state.targets.map((t) => t.threadId)).toEqual(["omt_topic", undefined]);
+    expect(state.targets[1]).toEqual({
       chatId: "oc_x",
-      threadId: "omt_resolved",
+      threadId: undefined,
       originMessageId: "om_trigger",
     });
+    // Publisher works: finalize completes the (chat-level) bubble.
+    await handle.finalize("done");
+    expect(state.completeReason).toBe("done");
+  });
+
+  it("both channels fail → disabled", async () => {
+    const { client, state } = selectiveClient({ failThread: true, failChat: true });
+    const handle = await startWithHint(client, "omt_topic");
+
+    expect(handle.disabled).toBe(true);
+    expect(state.targets.map((t) => t.threadId)).toEqual(["omt_topic", undefined]);
+    await expect(handle.finalize("done")).resolves.toBeUndefined();
+    expect(state.completeReason).toBeUndefined();
+  });
+
+  it("no omt_ hint → single chat_id + origin attempt (no thread try)", async () => {
+    const { client, state } = selectiveClient({});
+    const handle = await startWithHint(client, undefined);
+
+    expect(handle.disabled).toBe(false);
+    expect(state.targets).toEqual([
+      { chatId: "oc_x", threadId: undefined, originMessageId: "om_trigger" },
+    ]);
   });
 });
 
