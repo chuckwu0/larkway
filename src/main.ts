@@ -521,6 +521,15 @@ async function runV2Mode({
           enqueueSyntheticTurn: (turn) => {
             client.enqueueSyntheticEvent({
               message_id: `synthetic-task-comment-${turn.threadId}-${Date.now()}`,
+              // Real-deployment bug fix: message_id above is a fake string
+              // (needed only for ChannelClient/handler.ts dedup — see
+              // lark/message.ts's ParsedMessage.messageId doc) — without this,
+              // the reply/card-progress calls this turn produces try to
+              // anchor on that fake id and 400 ("not a valid open_message_id"),
+              // so the turn runs and does real work but the user never sees a
+              // reply land in the topic. turn.threadId is always a genuine
+              // Feishu message id (the topic's own root message).
+              reply_anchor_message_id: turn.threadId,
               chat_id: turn.chatId,
               chat_type: "group",
               thread_id: turn.threadId,
@@ -605,6 +614,17 @@ async function runV2Mode({
               enqueueNudgeTurn: (turn) => {
                 client.enqueueSyntheticEvent({
                   message_id: `synthetic-task-stall-${turn.threadId}-${Date.now()}`,
+                  // Real-deployment bug fix (mini): message_id above is a fake
+                  // string (needed only for dedup — see lark/message.ts's
+                  // ParsedMessage.messageId doc) — the reply this wake-up turn
+                  // produces was anchoring on that fake id and 400ing ("not a
+                  // valid open_message_id"): the agent ran and did real work,
+                  // but nobody in the topic ever saw the reply. Same fix as
+                  // taskCommentPoller's enqueueSyntheticTurn above (which has
+                  // the identical latent bug, just not yet observed in this
+                  // deployment — CommentPoller only fires on a real new human
+                  // comment, a much rarer trigger than this timer).
+                  reply_anchor_message_id: turn.threadId,
                   chat_id: turn.chatId,
                   chat_type: "group",
                   thread_id: turn.threadId,

@@ -225,6 +225,22 @@ CommentPoller 合成的任务评论 turn,还是本 feature自己发的唤醒 tur
 
 `src/tasklist/stallDetector.ts` 的 `renderStallNudgeText` 是这段文本唯一的生成点。
 
+**真机事故修复**(mini 部署实测):合成事件的 `message_id` 是个假字符串
+(`synthetic-task-stall-<threadId>-<ts>`),本来只是给 ChannelClient/handler.ts 的去重 +
+在途追踪(`seenMessageIds`/`inFlightMessageIds`/`markHandled`/`markUnhandled`)当唯一 key 用——
+但这个假 id 在修复前**同时也是**这轮唤醒 turn 回帖时用来锚定的 id,飞书侧对 `.../reply` 严格校验
+`open_message_id`,假 id 直接 400("not a valid open_message_id")。后果是**agent 真的被唤醒、真的
+干了活,但回复从未落进话题**——用户完全看不到,是这套机制要防的"静默漏管"本身,只是这次漏的是
+"唤醒的结果",不是"唤醒本身"。
+
+修法:合成事件新增 `reply_anchor_message_id` 字段(值取话题的根消息 id,即 `record.threadId`——
+这本来就是一个真实的飞书消息 id),`lark/message.ts` 的 `ParsedMessage.messageId`(所有回复/卡片/
+表情回执调用实际锚定用的字段)现在优先取这个字段;`event.message_id` 那个假但唯一的值原封不动,
+继续专职去重——两件事从此彻底解耦,不会互相踩。**CommentPoller 的 task_comment 合成 turn 是同一个
+bug、同一个修法**——它当时被当作"对齐范本"来参照,但排查后发现它其实有一模一样的隐患,只是这次
+真机事故里没被触发到(人工在已认领任务下发新评论,是比停滞计时器苛刻得多的触发条件,概率低得多而
+已,不是它天然没这个问题)。
+
 ### 12.4 护栏(全部落地,否则就是骚扰机器)
 
 - **冷却**:同一任务两次提醒之间至少间隔 `taskHandle.stallNudgeCooldownMs`(默认 24h)。

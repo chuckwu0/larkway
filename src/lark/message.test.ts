@@ -231,3 +231,55 @@ describe("parseMessage — sender id normalization", () => {
     expect(parsed.senderOpenId).toBe("ou_sender_from_object");
   });
 });
+
+// Real-deployment bug fix: purely-synthetic events (StallDetector's
+// task_stall, CommentPoller's task_comment) carry a fake message_id needed
+// only for dedup — replying against it 400s ("not a valid open_message_id"),
+// so the turn ran and did real work but nobody saw the reply land. main.ts
+// now supplies reply_anchor_message_id (the topic's real root message id) on
+// these events; parseMessage must prefer it for messageId.
+describe("parseMessage — reply_anchor_message_id (synthetic-event reply anchor fix)", () => {
+  it("uses reply_anchor_message_id for messageId when present (synthetic events)", () => {
+    const parsed = parseMessage(makeEvent(
+      { text: "停滞提醒" },
+      { message_id: "synthetic-task-stall-om_realroot001-1234567890", reply_anchor_message_id: "om_realroot001" },
+    ));
+    expect(parsed.messageId).toBe("om_realroot001");
+  });
+
+  it("falls back to event.message_id when reply_anchor_message_id is absent (real inbound events, unchanged)", () => {
+    const parsed = parseMessage(makeEvent({ text: "hello" }, { message_id: "om_msg001" }));
+    expect(parsed.messageId).toBe("om_msg001");
+  });
+
+  it("does NOT change threadId or any other field — only messageId is affected", () => {
+    const parsed = parseMessage(makeEvent(
+      { text: "停滞提醒" },
+      {
+        message_id: "synthetic-task-stall-om_realroot001-1234567890",
+        reply_anchor_message_id: "om_realroot001",
+        root_id: "om_realroot001",
+      },
+    ));
+    expect(parsed.threadId).toBe("om_realroot001"); // derived from root_id, untouched by this fix
+    expect(parsed.messageId).toBe("om_realroot001");
+  });
+
+  it("ignores a non-string reply_anchor_message_id and falls back to event.message_id", () => {
+    const parsed = parseMessage(makeEvent(
+      { text: "hello" },
+      { message_id: "om_msg001", reply_anchor_message_id: 12345 as unknown as string },
+    ));
+    expect(parsed.messageId).toBe("om_msg001");
+  });
+
+  it("preserves the ORIGINAL (fake) message_id on parsed.raw — handler.ts's dedup key reads event.message_id directly, never parsed.messageId, and must not collide with a real message id", () => {
+    const parsed = parseMessage(makeEvent(
+      { text: "停滞提醒" },
+      { message_id: "synthetic-task-stall-om_realroot001-1234567890", reply_anchor_message_id: "om_realroot001" },
+    ));
+    expect(parsed.raw.message_id).toBe("synthetic-task-stall-om_realroot001-1234567890");
+    expect(parsed.messageId).toBe("om_realroot001");
+    expect(parsed.raw.message_id).not.toBe(parsed.messageId); // the two concerns stay decoupled
+  });
+});

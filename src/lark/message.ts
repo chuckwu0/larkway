@@ -23,6 +23,29 @@ export interface ParsedMessage {
   /** Non-empty: client.ts guarantees thread_id is present before dispatching */
   threadId: string;
   chatId: string;
+  /**
+   * The message id downstream reply/card/reaction calls anchor on. Real
+   * inbound events: this is just `event.message_id`, a genuine Feishu id.
+   *
+   * Bug fix (real-deployment incident, task_stall wake-ups): purely-synthetic
+   * events (StallDetector's task_stall, CommentPoller's task_comment — turns
+   * with no real antecedent Feishu message) previously ALSO fell through to
+   * `event.message_id`, but that field for them is a fake string
+   * (`synthetic-task-stall-<threadId>-<ts>`) needed only for
+   * ChannelClient's/handler.ts's dedup+in-flight tracking
+   * (seenMessageIds/inFlightMessageIds/markHandled/markUnhandled, all keyed
+   * on the RAW `event.message_id` directly — see handler.ts's
+   * `settleMessageId`, computed BEFORE parseMessage runs, deliberately NOT
+   * derived from this field). Posting `im.v1.message.reply` against that fake
+   * id 400s ("not a valid open_message_id") — the wake-up turn ran and did
+   * real work, but the user never saw a reply in the topic (静默漏管).
+   * `event.reply_anchor_message_id` (optional, only set by these two
+   * synthetic-event producers in main.ts) lets them supply a REAL id to
+   * reply against — the topic's own root message (`turn.threadId`, itself
+   * always a genuine Feishu message id) — while `event.message_id` keeps its
+   * fake-but-unique value for dedup, so this never collides with real
+   * seenMessageIds/inFlightMessageIds tracking.
+   */
   messageId: string;
   senderOpenId: string;
   /** Plain text with @-mention placeholders stripped */
@@ -309,7 +332,14 @@ export function parseMessage(event: LarkMessageEvent): ParsedMessage {
                 ? event.root_id
                 : event.message_id,
     chatId: event.chat_id,
-    messageId: event.message_id,
+    // Deliberately NOT always event.message_id — see reply_anchor_message_id's
+    // own doc comment below. `event.message_id` itself is left untouched here
+    // (handler.ts reads it directly, separately, for markHandled/markUnhandled
+    // dedup) — this only changes what downstream reply/card/reaction calls
+    // anchor on.
+    messageId:
+      (typeof event.reply_anchor_message_id === "string" && event.reply_anchor_message_id) ||
+      event.message_id,
     senderOpenId: senderOpenIdOf(event.sender_id),
     text,
     attachments,

@@ -35,6 +35,16 @@ export interface LarkMessageEvent {
   /** Raw JSON string — downstream lark/message.ts is responsible for parsing */
   content: string;
   create_time: string;
+  /**
+   * Bug fix (real-deployment incident): a REAL Feishu message id for purely-
+   * synthetic events (StallDetector's task_stall, CommentPoller's
+   * task_comment) to anchor their reply/card/reaction calls on, since
+   * `message_id` for these is a fake string needed only for dedup — see
+   * `lark/message.ts`'s `ParsedMessage.messageId` doc for the full story.
+   * Only ever set by main.ts's synthetic-event construction; absent on every
+   * real inbound event.
+   */
+  reply_anchor_message_id?: string;
   [key: string]: unknown;
 }
 

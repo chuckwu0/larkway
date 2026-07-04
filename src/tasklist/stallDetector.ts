@@ -53,6 +53,24 @@
  * need to be: the synthetic-event queue path bypasses real-message ingestion
  * entirely, so self-mention's likely anti-loop filtering is moot.
  *
+ * **Real-deployment bug fix**: the synthetic event's `message_id` is a fake
+ * string (`synthetic-task-stall-<threadId>-<ts>`), needed only so
+ * ChannelClient's/handler.ts's dedup and in-flight tracking
+ * (seenMessageIds/inFlightMessageIds/markHandled/markUnhandled) have a
+ * unique key. It was ALSO — before this fix — the id the wake-up turn's
+ * reply anchored on, which 400s against Feishu ("not a valid
+ * open_message_id"): the agent ran and did real work, but nobody in the
+ * topic ever saw the reply (静默漏管). `enqueueNudgeTurn`'s event now also
+ * carries `reply_anchor_message_id` (the topic's own root message id,
+ * `record.threadId`, always a genuine Feishu id) — `lark/message.ts`
+ * prefers this for `ParsedMessage.messageId` (what every reply/card/reaction
+ * call downstream actually anchors on) while `event.message_id` keeps its
+ * fake-but-unique value for dedup, so the two concerns never collide.
+ * CommentPoller's task_comment synthetic turns had the identical bug and
+ * got the identical fix (main.ts) — it just hadn't been observed yet in
+ * the deployment that caught this, since a new human task comment is a much
+ * rarer trigger than this module's unconditional stall timer.
+ *
  * ## Adversarial-review fixes (docs/task-handle.md §12)
  *
  * Three correctness bugs found by review, all fixed in this version:
