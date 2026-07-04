@@ -70,6 +70,14 @@ export interface OutboundCotClient {
   create(target: CotTarget): Promise<CotRef>;
   update(ref: CotRef, events: readonly CotEvent[]): Promise<void>;
   complete(ref: CotRef, reason: string): Promise<void>;
+  /**
+   * Resolve a message's real Feishu thread id (omt_*) by GET-ing the message.
+   * Returns undefined for anything that isn't a usable omt_ id (non-topic
+   * message, GET failure/timeout, empty field) — the caller then falls back to
+   * the chat_id channel. Never throws: this is on the create hot path and must
+   * obey the same bypass rule as every other COT call.
+   */
+  resolveThreadId(messageId: string): Promise<string | undefined>;
 }
 
 // ---------------------------------------------------------------------------
@@ -177,6 +185,33 @@ export class ChannelCotClient implements OutboundCotClient {
       params: { message_id: ref.messageId, reason },
     });
     assertOk(res, "complete");
+  }
+
+  async resolveThreadId(messageId: string): Promise<string | undefined> {
+    try {
+      // GET /im/v1/messages/{id} → data.items[].thread_id. A topic-group
+      // message carries an omt_* thread id here even when the inbound event
+      // only gave us the om_* message id.
+      const res = await this.request({
+        url: `/open-apis/im/v1/messages/${encodeURIComponent(messageId)}`,
+        method: "GET",
+      });
+      if (res.code !== undefined && res.code !== 0) return undefined;
+      const items = res.data?.["items"];
+      if (!Array.isArray(items)) return undefined;
+      for (const item of items) {
+        if (item && typeof item === "object") {
+          const threadId = (item as Record<string, unknown>)["thread_id"];
+          if (typeof threadId === "string" && threadId.startsWith("omt_")) {
+            return threadId;
+          }
+        }
+      }
+      return undefined;
+    } catch {
+      // Bypass rule: a GET failure/timeout must never block create — fall back.
+      return undefined;
+    }
   }
 }
 

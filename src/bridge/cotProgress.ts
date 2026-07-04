@@ -57,6 +57,48 @@ export interface CreateCotProgressHandleOpts {
   throttleMs?: number;
 }
 
+/**
+ * Resolve where the COT bubble anchors, per the om_ ≠ omt_ rule.
+ *
+ * message_cot's `receive_id_type=thread_id` channel ONLY accepts an omt_*
+ * topic id. A top-level @ in a topic group arrives with an om_* message id in
+ * its thread hint, which 10001s ("invalid receive_id"). So:
+ *   1. omt_* hint → use it directly (thread channel).
+ *   2. a non-omt_ thread hint (topic-group message) → GET the message for its
+ *      real omt_* thread id (cached: this runs once at run start, not per flush).
+ *   3. no usable omt_ (non-topic chat, or the GET failed/was empty) → fall back
+ *      to the chat_id channel + origin_message_id (validated to be accepted).
+ *
+ * `resolveThreadId` never throws (bypass rule), so this never throws either.
+ */
+export async function resolveCotTarget(
+  client: Pick<OutboundCotClient, "resolveThreadId">,
+  hint: CotTarget,
+): Promise<CotTarget> {
+  if (hint.threadId && hint.threadId.startsWith("omt_")) {
+    return {
+      chatId: hint.chatId,
+      threadId: hint.threadId,
+      originMessageId: hint.originMessageId,
+    };
+  }
+  if (hint.threadId && hint.originMessageId) {
+    const omt = await client.resolveThreadId(hint.originMessageId);
+    if (omt && omt.startsWith("omt_")) {
+      return {
+        chatId: hint.chatId,
+        threadId: omt,
+        originMessageId: hint.originMessageId,
+      };
+    }
+  }
+  return {
+    chatId: hint.chatId,
+    threadId: undefined,
+    originMessageId: hint.originMessageId,
+  };
+}
+
 function truncate(value: unknown, max: number): string {
   const text = String(value ?? "");
   return text.length > max ? `${text.slice(0, max)}...` : text;
@@ -161,7 +203,9 @@ class LiveCotProgressHandle implements CotProgressHandle {
 
   async start(target: CotTarget, inputPreview: string): Promise<void> {
     try {
-      this.ref = await this.cotClient.create(target);
+      // Resolve om_/omt_ once here (run start), not per flush.
+      const resolved = await resolveCotTarget(this.cotClient, target);
+      this.ref = await this.cotClient.create(resolved);
       this.enqueue("RUN_STARTED", {
         threadId: this.scope,
         runId: this.runId,

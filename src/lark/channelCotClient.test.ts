@@ -120,6 +120,58 @@ describe("ChannelCotClient", () => {
   });
 });
 
+describe("ChannelCotClient.resolveThreadId", () => {
+  it("returns the omt_ thread id from GET /messages/{id} items", async () => {
+    const { channel, requests } = fakeChannel(() => ({
+      code: 0,
+      data: { items: [{ message_id: "om_1", thread_id: "omt_real", root_id: "om_1" }] },
+    }));
+    const client = new ChannelCotClient({ resolveChannel: () => channel });
+
+    await expect(client.resolveThreadId("om_1")).resolves.toBe("omt_real");
+    expect(requests[0]).toMatchObject({
+      url: "/open-apis/im/v1/messages/om_1",
+      method: "GET",
+    });
+  });
+
+  it("returns undefined when thread_id is absent (non-topic message)", async () => {
+    const { channel } = fakeChannel(() => ({
+      code: 0,
+      data: { items: [{ message_id: "om_1" }] },
+    }));
+    const client = new ChannelCotClient({ resolveChannel: () => channel });
+    await expect(client.resolveThreadId("om_1")).resolves.toBeUndefined();
+  });
+
+  it("returns undefined for a non-omt_ thread_id", async () => {
+    const { channel } = fakeChannel(() => ({
+      code: 0,
+      data: { items: [{ message_id: "om_1", thread_id: "om_notathread" }] },
+    }));
+    const client = new ChannelCotClient({ resolveChannel: () => channel });
+    await expect(client.resolveThreadId("om_1")).resolves.toBeUndefined();
+  });
+
+  it("returns undefined (never throws) on a non-zero API code", async () => {
+    const { channel } = fakeChannel(() => ({ code: 230002, msg: "bad message id" }));
+    const client = new ChannelCotClient({ resolveChannel: () => channel });
+    await expect(client.resolveThreadId("om_bad")).resolves.toBeUndefined();
+  });
+
+  it("returns undefined (never throws) when the request rejects", async () => {
+    const channel: OutboundCotLarkChannel = {
+      rawClient: {
+        async request<T>(): Promise<T> {
+          throw new Error("network down");
+        },
+      },
+    };
+    const client = new ChannelCotClient({ resolveChannel: () => channel });
+    await expect(client.resolveThreadId("om_1")).resolves.toBeUndefined();
+  });
+});
+
 describe("ChannelCotClient timeout (hang guard)", () => {
   afterEach(() => {
     vi.useRealTimers();

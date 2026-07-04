@@ -8,13 +8,18 @@ import {
   type OutboundCotLarkChannel,
 } from "../lark/channelCotClient.js";
 import type { AgentStreamEvent } from "../agent/runner.js";
-import { createCotProgressHandle, extractToolResultText } from "./cotProgress.js";
+import {
+  createCotProgressHandle,
+  extractToolResultText,
+  resolveCotTarget,
+} from "./cotProgress.js";
 
 interface RecordingClient {
   client: OutboundCotClient;
   events: Array<{ eventType: string; content: Record<string, unknown> }>;
   completeReason: string | undefined;
   createCalls: number;
+  createTargets: CotTarget[];
 }
 
 function recordingCotClient(
@@ -24,12 +29,17 @@ function recordingCotClient(
     events: [],
     completeReason: undefined,
     createCalls: 0,
+    createTargets: [],
     client: undefined as unknown as OutboundCotClient,
   };
   rec.client = {
-    async create(_target: CotTarget): Promise<CotRef> {
+    async create(target: CotTarget): Promise<CotRef> {
       rec.createCalls += 1;
+      rec.createTargets.push(target);
       return { cotId: "cot_1", messageId: "om_msg_1" };
+    },
+    async resolveThreadId(): Promise<string | undefined> {
+      return undefined;
     },
     async update(_ref: CotRef, events: readonly CotEvent[]): Promise<void> {
       for (const e of events) {
@@ -302,6 +312,114 @@ describe("CotProgressHandle end-to-end hang guard", () => {
     expect(handle.disabled).toBe(true);
     // A disabled handle finalizes as a no-op, again without hanging.
     await expect(handle.finalize("done")).resolves.toBeUndefined();
+  });
+});
+
+describe("resolveCotTarget (om_ ≠ omt_ anchoring)", () => {
+  function threadIdResolver(map: Record<string, string | undefined>) {
+    const calls: string[] = [];
+    return {
+      calls,
+      client: {
+        async resolveThreadId(messageId: string): Promise<string | undefined> {
+          calls.push(messageId);
+          return map[messageId];
+        },
+      },
+    };
+  }
+
+  it("uses an omt_ thread hint directly, without a GET", async () => {
+    const r = threadIdResolver({});
+    const target = await resolveCotTarget(r.client, {
+      chatId: "oc_x",
+      threadId: "omt_topic",
+      originMessageId: "om_trigger",
+    });
+    expect(target).toEqual({
+      chatId: "oc_x",
+      threadId: "omt_topic",
+      originMessageId: "om_trigger",
+    });
+    expect(r.calls).toHaveLength(0);
+  });
+
+  it("resolves an om_ thread hint via GET to the real omt_ id", async () => {
+    const r = threadIdResolver({ om_trigger: "omt_real" });
+    const target = await resolveCotTarget(r.client, {
+      chatId: "oc_x",
+      threadId: "om_topfloor", // topic-group top-level @ gives an om_ id
+      originMessageId: "om_trigger",
+    });
+    expect(target).toEqual({
+      chatId: "oc_x",
+      threadId: "omt_real",
+      originMessageId: "om_trigger",
+    });
+    expect(r.calls).toEqual(["om_trigger"]);
+  });
+
+  it("falls back to chat_id + origin when the GET yields no omt_", async () => {
+    const r = threadIdResolver({ om_trigger: undefined });
+    const target = await resolveCotTarget(r.client, {
+      chatId: "oc_x",
+      threadId: "om_topfloor",
+      originMessageId: "om_trigger",
+    });
+    expect(target).toEqual({
+      chatId: "oc_x",
+      threadId: undefined,
+      originMessageId: "om_trigger",
+    });
+    expect(r.calls).toEqual(["om_trigger"]);
+  });
+
+  it("never routes an om_ id through the thread channel", async () => {
+    // Even if resolveThreadId erroneously returned an om_ id, it must not be used.
+    const r = threadIdResolver({ om_trigger: "om_notathread" });
+    const target = await resolveCotTarget(r.client, {
+      chatId: "oc_x",
+      threadId: "om_topfloor",
+      originMessageId: "om_trigger",
+    });
+    expect(target.threadId).toBeUndefined();
+  });
+
+  it("non-topic chat (no thread hint) goes straight to chat_id, no GET", async () => {
+    const r = threadIdResolver({ om_trigger: "omt_should_not_be_used" });
+    const target = await resolveCotTarget(r.client, {
+      chatId: "oc_x",
+      originMessageId: "om_trigger",
+    });
+    expect(target).toEqual({
+      chatId: "oc_x",
+      threadId: undefined,
+      originMessageId: "om_trigger",
+    });
+    expect(r.calls).toHaveLength(0);
+  });
+
+  it("routes create() through the resolved target (om_ hint → GET → omt_)", async () => {
+    const rec = recordingCotClient({
+      async resolveThreadId() {
+        return "omt_resolved";
+      },
+    });
+    const handle = await createCotProgressHandle({
+      cotClient: rec.client,
+      target: { chatId: "oc_x", threadId: "om_topfloor", originMessageId: "om_trigger" },
+      detail: "brief",
+      runId: "run1",
+      scope: "thread1",
+      inputPreview: "hi",
+      throttleMs: 10_000,
+    });
+    await handle.finalize("done");
+    expect(rec.createTargets[0]).toEqual({
+      chatId: "oc_x",
+      threadId: "omt_resolved",
+      originMessageId: "om_trigger",
+    });
   });
 });
 
