@@ -37,7 +37,8 @@
 | v0.3.26 | v0.3.26 | patch / 已发布 | stream marker-gated Claude and Codex answers as CardKit deltas |
 | v0.3.31 | v0.3.31 | patch / 已发布 | 批A 可靠性止血:显式失败态(重启/崩溃/卡死→「本轮被中断/未完成,请重试」)+ idle 阈值判卡死(默认 3min,退休 20min 盲砍)+ 失败可见(PR #35)。 |
 | v0.3.32 | v0.3.32 | patch / 已发布 | peer-@ 正确送达:构建 prompt 时现查 live-roster 拿本 app 作用域正确 peer open_id,缺 scope 安全回退静态 id(PR #36)。 |
-| v0.3.33 | v0.3.33 | 当前 patch / 已发布 | fix: state.json 缺 updated_at/坏字段不再丢整份 |
+| v0.3.33 | v0.3.33 | patch / 已发布 | fix: state.json 缺 updated_at/坏字段不再丢整份 |
+| v0.3.34 | v0.3.34 | 当前 patch / 已发布 | task-handle v3: auto-bind topics to tasks (bridge-side exact match + candidate injection), patrol suite (stall/handoff/due-date detection with agent wake-up, black-hole alerts, nudge fuse), user-owned tasklist adopt + zero-arg tasklist-init; claude per-thread warm process pool (batch B P2, ~1s/turn saved); permission/404 split; page_token fix |
 
 ## 使用原则
 
@@ -82,4 +83,5 @@ v0.3.30       = fix: housekeeping GC reclaims agent_workspace session dirs (was 
 v0.3.31       = 批A 可靠性止血:显式失败态 + idle 阈值判卡死 + 失败可见(PR #35)
 v0.3.32       = peer-@ 正确送达:runtime live-roster open_id resolver(PR #36)
 v0.3.33       = fix: state.json 缺 updated_at/坏字段不再丢整份
+v0.3.34       = task-handle v3: auto-bind topics to tasks (bridge-side exact match + candidate injection), patrol suite (stall/handoff/due-date detection with agent wake-up, black-hole alerts, nudge fuse), user-owned tasklist adopt + zero-arg tasklist-init; claude per-thread warm process pool (batch B P2, ~1s/turn saved); permission/404 split; page_token fix
 ```
