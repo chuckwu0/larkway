@@ -65,6 +65,7 @@ import type {
   RunOptions,
 } from "../agent/runner.js";
 import { createPerfMarker, markPerfForEventType } from "../agent/runner.js";
+import { TurnEventQueue } from "../agent/turnEventQueue.js";
 import {
   asRecord,
   buildCodexCommand,
@@ -89,49 +90,12 @@ const SIGKILL_GRACE_MS = 5_000;
 const DEFAULT_TURN_TIMEOUT_MS = 15 * 60 * 1000;
 
 // ---------------------------------------------------------------------------
-// TurnEventQueue — minimal pull-based async queue, one per in-flight turn.
-// Needed because several turns' notifications interleave on ONE shared
-// stdout stream; each turn needs its own ordered event sink independent of
-// the others.
-// ---------------------------------------------------------------------------
-
-class TurnEventQueue implements AsyncIterable<AgentStreamEvent> {
-  private readonly buffer: AgentStreamEvent[] = [];
-  private readonly waiters: Array<(v: IteratorResult<AgentStreamEvent>) => void> = [];
-  private ended = false;
-
-  push(ev: AgentStreamEvent): void {
-    if (this.ended) return;
-    const waiter = this.waiters.shift();
-    if (waiter) waiter({ value: ev, done: false });
-    else this.buffer.push(ev);
-  }
-
-  end(): void {
-    if (this.ended) return;
-    this.ended = true;
-    for (const waiter of this.waiters.splice(0)) waiter({ value: undefined as never, done: true });
-  }
-
-  async *[Symbol.asyncIterator](): AsyncGenerator<AgentStreamEvent> {
-    for (;;) {
-      const buffered = this.buffer.shift();
-      if (buffered !== undefined) {
-        yield buffered;
-        continue;
-      }
-      if (this.ended) return;
-      const next = await new Promise<IteratorResult<AgentStreamEvent>>((resolve) => {
-        this.waiters.push(resolve);
-      });
-      if (next.done) return;
-      yield next.value;
-    }
-  }
-}
-
-// ---------------------------------------------------------------------------
 // Per-turn state
+//
+// TurnEventQueue itself (several turns' notifications interleave on ONE
+// shared stdout stream; each turn needs its own ordered event sink
+// independent of the others) now lives in src/agent/turnEventQueue.ts — moved
+// there unchanged when src/claude/pool.ts needed the identical class (DRY).
 // ---------------------------------------------------------------------------
 
 interface TurnState {

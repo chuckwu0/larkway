@@ -315,29 +315,42 @@ export const BotConfigSchema = z.object({
   effort: z.string().min(1).optional(),
 
   /**
-   * docs/larkway-perf-plan.md §4, 批 B Phase 1 — opt into a persistent
-   * per-bot `codex app-server` process instead of the default one-shot
-   * cold-start-per-turn behavior. Only takes effect when `backend: "codex"`
-   * (Phase 2/claude pooling isn't implemented yet — see main.ts, which warns
-   * and no-ops this field on any other backend). Byte-identical behavior
-   * when unset, matching every other perf-plan flag in this schema.
-   * `.optional()` (not `.default(false)`, deliberately — B1 fix): a
-   * `.default()` would make every future `larkway bot` yaml write-out
-   * include `warmProcess: false` even when nobody asked for it, and —
-   * because this schema is `.strict()` — would break loading that yaml back
-   * with an OLDER larkway build that predates this field. `undefined` and
-   * `false` are treated identically at both read sites (main.ts's
-   * `bot.warmProcess && …` and the advisory warn below).
+   * docs/larkway-perf-plan.md §4 — opt into a persistent warm process
+   * instead of the default one-shot cold-start-per-turn behavior. Takes
+   * effect for `backend: "codex"` (a single bot-level `codex app-server`
+   * process — src/codex/pool.ts CodexProcessPool) and `backend: "claude"`
+   * (one warm process per active thread — src/claude/pool.ts
+   * ClaudeProcessPool). Any other backend value is a no-op (main.ts only
+   * constructs a pool for these two; botLoader's advisory warn below flags
+   * the mismatch upfront). Byte-identical behavior when unset, matching
+   * every other perf-plan flag in this schema. `.optional()` (not
+   * `.default(false)`, deliberately — B1 fix): a `.default()` would make
+   * every future `larkway bot` yaml write-out include `warmProcess: false`
+   * even when nobody asked for it, and — because this schema is `.strict()`
+   * — would break loading that yaml back with an OLDER larkway build that
+   * predates this field. `undefined` and `false` are treated identically at
+   * both read sites (main.ts's `bot.warmProcess && …` and the advisory warn
+   * below).
    */
   warmProcess: z.boolean().optional(),
 
   /**
    * Idle threshold (ms) before a warm process (see `warmProcess` above) with
    * no in-flight turn gets SIGTERM'd. Only meaningful when `warmProcess` is
-   * true. @default 10 * 60 * 1000 (10 min) — see
-   * src/codex/pool.ts DEFAULT_WARM_PROCESS_IDLE_MS.
+   * true. @default 10 * 60 * 1000 (10 min) — see DEFAULT_WARM_PROCESS_IDLE_MS
+   * in src/codex/pool.ts (backend "codex") / src/claude/pool.ts (backend
+   * "claude") — both use the same default value.
    */
   warmProcessIdleMs: z.number().int().positive().optional(),
+
+  /**
+   * `backend: "claude"` only: cap on how many warm per-thread processes
+   * ClaudeProcessPool keeps alive at once (LRU-evicts the longest-idle one
+   * past this). Meaningless for `backend: "codex"`, which only ever holds
+   * one bot-level process regardless. @default 6 — see DEFAULT_MAX_PROCESSES
+   * in src/claude/pool.ts.
+   */
+  warmProcessMaxProcesses: z.number().int().positive().optional(),
 }).strict();
 
 /**
@@ -422,15 +435,16 @@ export async function loadBots(botsDir: string): Promise<BotConfig[]> {
       );
     }
 
-    // 批B Phase 1 (perf plan §4): warmProcess only has an implementation for
-    // backend=codex today (Phase 2/claude pooling is unbuilt). Advisory only
-    // — matches the effort-typo warning style above — main.ts is the actual
-    // enforcement point (it simply never constructs a pool for a non-codex
-    // bot), this is just an upfront heads-up for a likely-surprising no-op.
-    if (bot.warmProcess && bot.backend !== "codex") {
+    // perf plan §4: warmProcess only has an implementation for backend=codex
+    // (CodexProcessPool) and backend=claude (ClaudeProcessPool) today.
+    // Advisory only — matches the effort-typo warning style above —
+    // main.ts is the actual enforcement point (it simply never constructs a
+    // pool for any other backend), this is just an upfront heads-up for a
+    // likely-surprising no-op.
+    if (bot.warmProcess && bot.backend !== "codex" && bot.backend !== "claude") {
       console.warn(
         `[botLoader] Bot "${bot.id}" sets warmProcess:true but backend is "${bot.backend}" ` +
-          `(only "codex" is supported as of this writing). warmProcess will be a no-op for this bot.`,
+          `(only "codex"/"claude" are supported as of this writing). warmProcess will be a no-op for this bot.`,
       );
     }
 

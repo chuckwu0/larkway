@@ -1584,6 +1584,9 @@ export class BridgeHandler {
           permissionMode,
           timeoutMs,
           cwd: runCwd,
+          // Only consumed by ClaudeProcessPool's per-thread warm-process cache
+          // key (src/claude/pool.ts) — every other runner ignores it.
+          threadId,
           // V2: inject per-bot git identity; absent in V1 → runner.ts uses "larkway-bot" fallback
           botGitIdentity: this.deps.botConfig?.git_identity,
           gitlabToken: this.deps.gitlabToken,

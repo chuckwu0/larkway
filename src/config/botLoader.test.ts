@@ -885,7 +885,7 @@ warmProcessIdleMs: 300000
     }
   });
 
-  it("warmProcess: true on a non-codex backend parses through but warns (Phase 2 unbuilt, main.ts no-ops it)", async () => {
+  it("warmProcess: true + backend: claude parses through with no warning", async () => {
     const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
     try {
       await createBotsDir();
@@ -894,11 +894,42 @@ warmProcessIdleMs: 300000
         `
 id: pooled-claude-bot
 name: Pooled Claude Bot
-description: bot with warmProcess enabled on the (unsupported) claude backend
+description: bot with warmProcess enabled on the claude backend
 app_id: cli_pooled_claude
 app_secret_env: POOLED_CLAUDE_SECRET
 bot_open_id: ou_pooled_claude
 backend: claude
+warmProcess: true
+warmProcessIdleMs: 300000
+warmProcessMaxProcesses: 3
+`,
+      );
+
+      const bots = await loadBots(botsDir());
+      expect(bots).toHaveLength(1);
+      expect(bots[0]?.warmProcess).toBe(true);
+      expect(bots[0]?.warmProcessIdleMs).toBe(300000);
+      expect(bots[0]?.warmProcessMaxProcesses).toBe(3);
+      expect(warnSpy).not.toHaveBeenCalled();
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+
+  it("warmProcess: true on an unsupported backend parses through but warns", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      await createBotsDir();
+      await writeYaml(
+        "pooled-other.yaml",
+        `
+id: pooled-other-bot
+name: Pooled Other Bot
+description: bot with warmProcess enabled on an unsupported backend
+app_id: cli_pooled_other
+app_secret_env: POOLED_OTHER_SECRET
+bot_open_id: ou_pooled_other
+backend: gemini
 warmProcess: true
 `,
       );
@@ -908,8 +939,8 @@ warmProcess: true
       expect(bots[0]?.warmProcess).toBe(true); // not blocked/coerced — advisory only
       expect(warnSpy).toHaveBeenCalledTimes(1);
       const [warnMessage] = warnSpy.mock.calls[0]!;
-      expect(String(warnMessage)).toContain("pooled-claude-bot");
-      expect(String(warnMessage)).toContain("claude");
+      expect(String(warnMessage)).toContain("pooled-other-bot");
+      expect(String(warnMessage)).toContain("gemini");
     } finally {
       warnSpy.mockRestore();
     }

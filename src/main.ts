@@ -28,6 +28,7 @@ import { reconcileOrphanedCards } from "./bridge/reconcile.js";
 import { writeStatusFile } from "./bridge/statusFile.js";
 import { registerRunner } from "./agent/runner.js";
 import { ClaudeRunner } from "./claude/runner.js";
+import { ClaudeProcessPool, reapOrphanedWarmClaudeProcesses } from "./claude/pool.js";
 import { CodexRunner } from "./codex/runner.js";
 import { CodexProcessPool, reapOrphanedWarmProcess } from "./codex/pool.js";
 import { ensureLarkCliProfile, deriveLarkCliProfile } from "./lark/profileBootstrap.js";
@@ -195,6 +196,8 @@ async function runV2Mode({
      * the overwhelming common case stays byte-identical to pre-Phase-1.
      */
     codexPool: CodexProcessPool | undefined;
+    /** Same opt-in, claude-backend counterpart — one warm process per active thread (src/claude/pool.ts). */
+    claudePool: ClaudeProcessPool | undefined;
     /** Task-handle comment poller (docs/task-handle.md) — undefined when the bot doesn't enable the feature. */
     taskCommentPoller: CommentPoller | undefined;
     /** Task-handle v3.1 stall detector (docs/task-handle.md §12) — undefined when the bot doesn't enable the feature or has stallDetectionDisabled set. */
@@ -524,14 +527,16 @@ async function runV2Mode({
       }
     }
 
-    // 批B Phase 1 (perf plan §4): a per-bot warm codex app-server process,
-    // opt-in via bots/*.yaml `warmProcess: true`. Only implemented for
-    // backend=codex (Phase 2/claude pooling is unbuilt — botLoader already
-    // warned at load time if warmProcess is set on any other backend).
-    // Registered under a PER-BOT registry key (not the shared "codex" key)
-    // so two codex bots on the same larkway instance can independently be
-    // pooled or not — see botConfig.runnerKey's doc in bridge/handler.ts.
+    // 批B Phase 1 (perf plan §4): a per-bot warm codex app-server process, or
+    // (Phase 2) a per-thread warm claude process pool — opt-in via
+    // bots/*.yaml `warmProcess: true`. Only implemented for backend=codex /
+    // backend=claude (botLoader already warned at load time if warmProcess
+    // is set on any other backend). Registered under a PER-BOT registry key
+    // (not the shared "codex"/"claude" key) so two bots on the same larkway
+    // instance can independently be pooled or not — see
+    // botConfig.runnerKey's doc in bridge/handler.ts.
     let codexPool: CodexProcessPool | undefined;
+    let claudePool: ClaudeProcessPool | undefined;
     let runnerKey: string | undefined;
     if (bot.warmProcess && bot.backend === "codex") {
       const pidFilePath = path.join(botDir, "warm-codex.pid");
@@ -553,6 +558,25 @@ async function runV2Mode({
       });
       runnerKey = `codex-pool:${bot.id}`;
       registerRunner(runnerKey, () => codexPool!);
+    } else if (bot.warmProcess && bot.backend === "claude") {
+      const pidListFilePath = path.join(botDir, "warm-claude.pids.json");
+      // Same orphan-sweep rationale as the codex branch above, adapted for a
+      // multi-process pid LIST rather than a single pid file.
+      try {
+        await reapOrphanedWarmClaudeProcesses(pidListFilePath);
+      } catch (err) {
+        console.warn(`[larkway] bot "${bot.id}": orphaned warm-process sweep failed (continuing):`, err);
+      }
+      claudePool = new ClaudeProcessPool({
+        botId: bot.id,
+        botGitIdentity: bot.git_identity,
+        gitlabToken: effectiveGitlabToken,
+        idleMs: bot.warmProcessIdleMs,
+        maxProcesses: bot.warmProcessMaxProcesses,
+        pidListFilePath,
+      });
+      runnerKey = `claude-pool:${bot.id}`;
+      registerRunner(runnerKey, () => claudePool!);
     }
 
     const handler = new BridgeHandler({
@@ -615,7 +639,7 @@ async function runV2Mode({
 
     const inst: BotInstance = {
       bot, client, sessionStore, cardRenderer, handler, housekeeping,
-      taskCommentPoller, stallDetector, codexPool,
+      taskCommentPoller, stallDetector, codexPool, claudePool,
       statusTimer: null, avatar: undefined,
     };
     instances.push(inst);
@@ -718,7 +742,7 @@ async function runV2Mode({
   async function shutdown(signal: string): Promise<void> {
     console.log(`\n[larkway] Received ${signal}, shutting down V2 bots…`);
     await Promise.all(
-      instances.map(async ({ bot, statusTimer, housekeeping, taskCommentPoller, stallDetector, handler, sessionStore, client, avatar, codexPool }) => {
+      instances.map(async ({ bot, statusTimer, housekeeping, taskCommentPoller, stallDetector, handler, sessionStore, client, avatar, codexPool, claudePool }) => {
         if (statusTimer) clearInterval(statusTimer);
         // Await drain (M1): stop() only cancels the NEXT scheduled cycle —
         // without awaiting, a cycle already in flight would keep running
@@ -740,8 +764,9 @@ async function runV2Mode({
         }).catch(() => {});
         housekeeping.stop();
         // 批B Phase 1: drain in-flight turns (bounded) then SIGTERM the warm
-        // process, if this bot has one. undefined for every non-pooled bot.
+        // process(es), if this bot has any. undefined for every non-pooled bot.
         await codexPool?.shutdown();
+        await claudePool?.shutdown();
         await handler.close();
         await sessionStore.close();
         await client.close();
@@ -765,12 +790,13 @@ async function runV2Mode({
   if (dryRun) {
     console.log("[dry-run] V2 mode — all bots wired OK, exiting.");
     await Promise.all(
-      instances.map(async ({ housekeeping, taskCommentPoller, stallDetector, sessionStore, client, codexPool }) => {
+      instances.map(async ({ housekeeping, taskCommentPoller, stallDetector, sessionStore, client, codexPool, claudePool }) => {
         housekeeping.stop();
         await taskCommentPoller?.stop();
         await stallDetector?.stop();
         // No-op: dry-run never calls .run(), so no process was ever spawned.
         await codexPool?.shutdown();
+        await claudePool?.shutdown();
         await sessionStore.close();
         await client.close();
       }),

@@ -47,6 +47,15 @@ export interface RunOptions {
   permissionMode?: "acceptEdits" | "ask" | "bypassPermissions";
   /** Only passed as --cwd if explicitly provided; omit to let agent cd itself */
   cwd?: string;
+  /**
+   * The Feishu thread this turn belongs to. Only consumed by a per-thread
+   * pooled runner (src/claude/pool.ts) as part of its warm-process cache key
+   * — every other runner (cold ClaudeRunner/CodexRunner, CodexProcessPool's
+   * bot-level pool) ignores it. Omitted in V1 (no bots/*.yaml) and by any
+   * caller that hasn't opted into per-thread pooling; harmless when unset.
+   * @default undefined
+   */
+  threadId?: string;
   /** @default 15 * 60 * 1000 (15 min) */
   timeoutMs?: number;
   abortSignal?: AbortSignal;

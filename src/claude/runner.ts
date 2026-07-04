@@ -122,6 +122,50 @@ function buildCommand(opts: RunOptions): [string, string[]] {
 }
 
 /**
+ * Build [bin, args] for a WARM pool child (src/claude/pool.ts) — same flags
+ * as buildCommand() above, EXCEPT:
+ *  - `--input-format stream-json` is added (turns arrive over stdin, one
+ *    `{"type":"user",...}` JSON line per turn, instead of a single `-p
+ *    <prompt>` CLI argument), and
+ *  - the prompt itself is NOT an argv entry — the pool writes it to stdin
+ *    per turn, since a warm child outlives many turns and each needs its own
+ *    prompt text (spike-verified: `-p` used as a bare flag + stream-json
+ *    stdin keeps the CLI in non-interactive print mode across turns).
+ * `opts.resumeSessionId`/`model`/`effort` are spawn-time-only (like
+ * buildCommand()) — a warm process cannot change these mid-life; a change in
+ * any of them means a new key in ClaudeProcessPool's process map, i.e. a
+ * brand-new child, never an in-place mutation of this one.
+ */
+export function buildWarmCommand(opts: RunOptions): [string, string[]] {
+  const bin = opts.agentBinPath ?? "claude";
+  const mode = opts.permissionMode ?? "acceptEdits";
+
+  const args: string[] = [
+    "-p",
+    "--input-format",
+    "stream-json",
+    "--output-format",
+    "stream-json",
+    "--verbose",
+    "--include-partial-messages",
+    "--permission-mode",
+    mode,
+  ];
+
+  if (opts.resumeSessionId != null) {
+    args.push("--resume", opts.resumeSessionId);
+  }
+  if (opts.model) {
+    args.push("--model", opts.model);
+  }
+  if (opts.effort) {
+    args.push("--effort", opts.effort);
+  }
+
+  return [bin, args];
+}
+
+/**
  * Like parseLine but yields *all* events from a single NDJSON line.
  * An `assistant` message with multiple content blocks (e.g. text + tool_use)
  * would emit one event per block.
@@ -609,3 +653,9 @@ export {
   buildEnv as _buildEnv,
   buildCommand as _buildCommand,
 };
+
+// Real (non-underscore) exports for src/claude/pool.ts: the pool speaks the
+// same NDJSON event shape and env-building rules as runClaude() above and
+// must not fork a second copy of these small pure helpers (DRY) — same
+// precedent as src/codex/runner.ts's exports for src/codex/pool.ts.
+export { buildEnv, parseLinesMulti };
