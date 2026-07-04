@@ -635,6 +635,7 @@ async function runCreateBot(
     response_surface_prototype: DEFAULT_RESPONSE_SURFACE_PROTOTYPE,
     runtime: "agent_workspace",
     backend: basics.backend,
+    cot: "brief",
     memory_file: memoryFile,
     ...(basics.gitlabTokenEnv ? { gitlab_token_env: basics.gitlabTokenEnv } : {}),
     ...(basics.gitName && basics.gitEmail

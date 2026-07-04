@@ -429,6 +429,10 @@ async function runV2Mode({
     )
       ? client.outboundCardKitClient()
       : undefined;
+    // COT (思维链) bubble transport — provisioned only when the bot opts in
+    // (cot != "off"). Uses the SDK's generic rawClient.request(), so no new
+    // auth surface; the handler degrades silently on any failure.
+    const cotClient = bot.cot !== "off" ? client.outboundCotClient() : undefined;
 
     // Task-handle (docs/task-handle.md v2: team-shared single tasklist).
     // No `enabled` flag gates this — the real gate is whether a LIVE guid
@@ -747,8 +751,10 @@ async function runV2Mode({
         taskHandle: effectiveTaskHandleTasklistGuid ? { tasklistGuid: effectiveTaskHandleTasklistGuid } : undefined,
         model: bot.model,
         effort: bot.effort,
+        cot: bot.cot,
       },
       cardKitClient,
+      cotClient,
       postClient,
       gitlabToken: effectiveGitlabToken,
       agentMemory: bot.agent_memory,

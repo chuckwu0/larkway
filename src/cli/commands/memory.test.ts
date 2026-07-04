@@ -47,6 +47,7 @@ const sampleBot = (id = "test-bot"): BotConfig =>
     response_surface_prototype: DEFAULT_RESPONSE_SURFACE_PROTOTYPE,
     runtime: "legacy",
     backend: "claude",
+    cot: "brief",
   }) as BotConfig;
 
 /** Collected output lines (stdout / stderr) across a run. */

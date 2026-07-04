@@ -55,6 +55,11 @@ import {
   type CardKitProgressHandle,
   type CardKitLiveMetrics,
 } from "./cardkitProgress.js";
+import {
+  createCotProgressHandle,
+  type CotProgressHandle,
+} from "./cotProgress.js";
+import type { OutboundCotClient } from "../lark/channelCotClient.js";
 import type { RuntimeEventPatch } from "./eventLog.js";
 import type { PerfSample } from "./perfLog.js";
 import type { RuntimeRequirement } from "../runtimeRequirements.js";
@@ -624,6 +629,11 @@ export interface BridgeHandlerDeps {
     /** Perf plan 批C model/effort knobs — passed through to RunOptions verbatim. */
     model?: string;
     effort?: string;
+    /**
+     * COT (思维链) 气泡档位。"off" = 不推;"brief"/"detailed" 见 BotConfig.cot。
+     * 缺省视为 "brief"。仅在非 "off" 时 main.ts 才注入 cotClient。
+     */
+    cot?: "off" | "brief" | "detailed";
   };
   /**
    * Optional outbound post transport. main.ts only injects this when the bot's
@@ -638,6 +648,12 @@ export interface BridgeHandlerDeps {
    * fallback.
    */
   cardKitClient?: OutboundCardKitClient;
+  /**
+   * Optional COT (思维链) transport. main.ts injects it only when the bot's
+   * `cot` config is not "off". Drives the client-native collapsible reasoning
+   * bubble alongside the answer card; every failure degrades silently.
+   */
+  cotClient?: OutboundCotClient;
   /**
    * V2: L2 Agent Memory content (职能定义) — loaded from the bot's memory_file by
    * botLoader. Injected into the prompt as a `<agent-memory>` role preamble.
@@ -915,6 +931,11 @@ export class BridgeHandler {
     // raw event (== parsed.messageId) so it's available even before parsing.
     const settleMessageId = event.message_id;
     let settled = false;
+    // COT (思维链) side channel — declared at function scope so the finally
+    // safety net below can close() it on any exit path. Created once per turn
+    // inside the try, fed every event, finalized on success/error. Always
+    // best-effort; a disabled handle is a no-op (see src/bridge/cotProgress.ts).
+    let cotPublisher: CotProgressHandle | undefined;
     const settle = (ok: boolean): void => {
       if (settled) return;
       settled = true;
@@ -1544,6 +1565,33 @@ export class BridgeHandler {
         }
       }
 
+      // COT (思维链) bubble — a parallel side channel to the answer card,
+      // created ONCE per turn here (outside the retry loop, so a stale-session
+      // respawn never opens a second bubble). Best-effort in every respect:
+      // createCotProgressHandle never throws (a create failure returns a
+      // disabled no-op handle), and each handle()/finalize() below degrades
+      // silently. Only reasoning + tool activity flow here; the final answer
+      // stays exclusively on the card. Topic groups anchor on the omt_ thread
+      // id; other chats fall back to chat_id + the trigger message.
+      const cotDetail = this.deps.botConfig?.cot ?? "brief";
+      if (this.deps.cotClient && cotDetail !== "off") {
+        cotPublisher = await createCotProgressHandle({
+          cotClient: this.deps.cotClient,
+          detail: cotDetail,
+          runId: messageId,
+          scope: threadId,
+          inputPreview: parsed.text,
+          target: {
+            chatId: parsed.chatId,
+            threadId:
+              typeof parsed.raw.thread_id === "string" && parsed.raw.thread_id
+                ? parsed.raw.thread_id
+                : undefined,
+            originMessageId: messageId,
+          },
+        });
+      }
+
       // Step 4b–4f: spawn + stream + finalize, with one stale-session retry.
       // `currentExisting` may be reset to undefined on retry (ghost session cleared).
       let currentExisting = existing;
@@ -1769,6 +1817,9 @@ export class BridgeHandler {
             }
             if (cardKitProgress) cardKitProgress.handle(ev);
             else if (card) card.handle(ev);
+            // COT is a parallel channel, not an either/or with the card: feed
+            // it every event regardless of which primary surface is live.
+            if (cotPublisher) cotPublisher.handle(ev);
             if (ev.type === "system_init") {
               sessionId = ev.sessionId;
             }
@@ -1783,6 +1834,16 @@ export class BridgeHandler {
           if (idleWatchdog) {
             clearInterval(idleWatchdog);
             idleWatchdog = undefined;
+          }
+
+          // Complete the COT bubble for this (successful/idle-cut) turn. An
+          // idle-watchdog kill is a real hang → complete as error; otherwise
+          // done. finalize() is idempotent + never throws.
+          if (cotPublisher) {
+            await cotPublisher.finalize(
+              interruptedByIdle ? "error" : "done",
+              interruptedByIdle ? { message: "idle timeout" } : undefined,
+            );
           }
 
           // M3 regression fix (Workflow review of 批B Phase 1): a POOLED
@@ -2279,6 +2340,12 @@ export class BridgeHandler {
       }
     } catch (err) {
       console.error("[bridge.handler] handleOne failed for thread", threadId, err);
+      // Close the COT bubble as errored (idempotent + never throws). The turn
+      // crashed before its success-path finalize, so complete it with reason
+      // error so the client-side bubble doesn't hang open.
+      if (cotPublisher) {
+        await cotPublisher.finalize("error", { message: String(err) });
+      }
       await this.deps.client.removeProcessingReaction?.(messageId);
       await recordEvent({
         status: "failed",
@@ -2374,6 +2441,11 @@ export class BridgeHandler {
       }
     }
     } finally {
+      // COT safety net: cancel any pending flush on every exit path. If a
+      // finalize already ran (success/error site), this is a no-op; if the
+      // turn escaped both (e.g. threw before finalize), close() at least stops
+      // a dangling throttle timer. Never completes the bubble on its own.
+      cotPublisher?.close();
       // Safety net for EVERY exit path of handleOne. The success site calls
       // settle(true) and the failure catch calls settle(false); both make
       // settled=true so this is a no-op for them. But if anything threw BEFORE
