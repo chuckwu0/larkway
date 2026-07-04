@@ -1838,12 +1838,22 @@ export class BridgeHandler {
 
           // Complete the COT bubble for this (successful/idle-cut) turn. An
           // idle-watchdog kill is a real hang → complete as error; otherwise
-          // done. finalize() is idempotent + never throws.
+          // done. Fire-and-forget on PURPOSE: COT is a best-effort side channel
+          // and must never sit in front of the real deliverables that follow
+          // (final answer card finalize + session persistence). Even with the
+          // per-call timeout in ChannelCotClient, we don't want up to 8s of COT
+          // teardown delaying the card. finalize() is idempotent + never throws;
+          // the finally's close() only cancels the throttle timer, so it stays
+          // compatible with an in-flight finalize.
           if (cotPublisher) {
-            await cotPublisher.finalize(
-              interruptedByIdle ? "error" : "done",
-              interruptedByIdle ? { message: "idle timeout" } : undefined,
-            );
+            void cotPublisher
+              .finalize(
+                interruptedByIdle ? "error" : "done",
+                interruptedByIdle ? { message: "idle timeout" } : undefined,
+              )
+              .catch(() => {
+                /* best-effort COT completion — never affects the turn */
+              });
           }
 
           // M3 regression fix (Workflow review of 批B Phase 1): a POOLED
@@ -2340,11 +2350,15 @@ export class BridgeHandler {
       }
     } catch (err) {
       console.error("[bridge.handler] handleOne failed for thread", threadId, err);
-      // Close the COT bubble as errored (idempotent + never throws). The turn
-      // crashed before its success-path finalize, so complete it with reason
-      // error so the client-side bubble doesn't hang open.
+      // Close the COT bubble as errored. Fire-and-forget (same rationale as the
+      // success path): the error teardown below — reaction removal, event log,
+      // markUnhandled self-heal — must not wait on a best-effort COT call.
+      // finalize() is idempotent + never throws; the finally's close() only
+      // cancels the throttle timer.
       if (cotPublisher) {
-        await cotPublisher.finalize("error", { message: String(err) });
+        void cotPublisher.finalize("error", { message: String(err) }).catch(() => {
+          /* best-effort COT completion — never affects error teardown */
+        });
       }
       await this.deps.client.removeProcessingReaction?.(messageId);
       await recordEvent({

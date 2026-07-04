@@ -1,9 +1,11 @@
-import { describe, expect, it } from "vitest";
-import type {
-  CotEvent,
-  CotRef,
-  CotTarget,
-  OutboundCotClient,
+import { afterEach, describe, expect, it, vi } from "vitest";
+import {
+  ChannelCotClient,
+  type CotEvent,
+  type CotRef,
+  type CotTarget,
+  type OutboundCotClient,
+  type OutboundCotLarkChannel,
 } from "../lark/channelCotClient.js";
 import type { AgentStreamEvent } from "../agent/runner.js";
 import { createCotProgressHandle, extractToolResultText } from "./cotProgress.js";
@@ -268,6 +270,38 @@ describe("CotProgressHandle degradation (bypass rule)", () => {
     const raw: AgentStreamEvent = { type: "raw", raw: { anything: true } };
     expect(() => handle.handle(raw)).not.toThrow();
     await handle.finalize("done");
+  });
+});
+
+describe("CotProgressHandle end-to-end hang guard", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("a hanging COT API is bounded by the client timeout and degrades the publisher", async () => {
+    vi.useFakeTimers();
+    // Real client over a channel whose request never settles: the per-call
+    // timeout in ChannelCotClient must turn the hang into a rejection so the
+    // publisher's create-failure path disables it — proving hang never blocks.
+    const channel: OutboundCotLarkChannel = {
+      rawClient: { request: <T>() => new Promise<T>(() => {}) },
+    };
+    const client = new ChannelCotClient({ resolveChannel: () => channel });
+    const handlePromise = createCotProgressHandle({
+      cotClient: client,
+      target: TARGET,
+      detail: "brief",
+      runId: "run1",
+      scope: "thread1",
+      inputPreview: "hi",
+      throttleMs: 10_000,
+    });
+    // Drive the 8s client timeout; start()'s create() rejects → handle disabled.
+    await vi.advanceTimersByTimeAsync(8_000);
+    const handle = await handlePromise;
+    expect(handle.disabled).toBe(true);
+    // A disabled handle finalizes as a no-op, again without hanging.
+    await expect(handle.finalize("done")).resolves.toBeUndefined();
   });
 });
 

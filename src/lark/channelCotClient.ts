@@ -76,6 +76,31 @@ export interface OutboundCotClient {
 // Implementation
 // ---------------------------------------------------------------------------
 
+/**
+ * Hard ceiling on every COT network call. message_cot is undocumented — a hung
+ * request (never resolves, never rejects) would otherwise sit forever, and the
+ * caller's degrade-on-throw path only fires on rejection. Racing a timer that
+ * REJECTS converts any hang (network stall, token-fetch stall inside the SDK,
+ * or a silently-dropped connection) into a normal failure → degrade.
+ */
+const COT_REQUEST_TIMEOUT_MS = 8_000;
+
+async function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(
+      () => reject(new Error(`[channel.cot] ${label} timed out after ${ms}ms`)),
+      ms,
+    );
+    timer.unref?.();
+  });
+  try {
+    return await Promise.race([p, timeout]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
 function assertOk(res: RawCotResponse, label: string): void {
   if (res.code !== undefined && res.code !== 0) {
     throw new Error(
@@ -99,10 +124,19 @@ export class ChannelCotClient implements OutboundCotClient {
     return ch;
   }
 
+  /** Every COT call goes through here, so all get the same hard timeout. */
+  private request(opts: RawCotRequestOptions): Promise<RawCotResponse> {
+    return withTimeout(
+      this.channel().rawClient.request<RawCotResponse>(opts),
+      COT_REQUEST_TIMEOUT_MS,
+      `${opts.method} ${opts.url}`,
+    );
+  }
+
   async create(target: CotTarget): Promise<CotRef> {
     const receiveIdType = target.threadId ? "thread_id" : "chat_id";
     const receiveId = target.threadId ?? target.chatId;
-    const res = await this.channel().rawClient.request<RawCotResponse>({
+    const res = await this.request({
       url: "/open-apis/im/v1/message_cot",
       method: "POST",
       params: { receive_id_type: receiveIdType },
@@ -128,7 +162,7 @@ export class ChannelCotClient implements OutboundCotClient {
 
   async update(ref: CotRef, events: readonly CotEvent[]): Promise<void> {
     if (events.length === 0) return;
-    const res = await this.channel().rawClient.request<RawCotResponse>({
+    const res = await this.request({
       url: "/open-apis/im/v1/message_cot",
       method: "PUT",
       data: { cot_id: ref.cotId, message_id: ref.messageId, events: [...events] },
@@ -137,7 +171,7 @@ export class ChannelCotClient implements OutboundCotClient {
   }
 
   async complete(ref: CotRef, reason: string): Promise<void> {
-    const res = await this.channel().rawClient.request<RawCotResponse>({
+    const res = await this.request({
       url: `/open-apis/im/v1/message_cot/complete/${encodeURIComponent(ref.cotId)}`,
       method: "POST",
       params: { message_id: ref.messageId, reason },

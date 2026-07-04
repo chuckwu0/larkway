@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   ChannelCotClient,
   type OutboundCotLarkChannel,
@@ -117,5 +117,49 @@ describe("ChannelCotClient", () => {
     await expect(
       client.create({ chatId: "oc_x", threadId: "omt_x" }),
     ).rejects.toThrow(/before the Channel SDK connected/);
+  });
+});
+
+describe("ChannelCotClient timeout (hang guard)", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  function hangingChannel(): OutboundCotLarkChannel {
+    // A request that never settles — the exact failure mode the timer guards.
+    return { rawClient: { request: <T>() => new Promise<T>(() => {}) } };
+  }
+
+  it("create rejects (not hangs) once the request exceeds the timeout", async () => {
+    vi.useFakeTimers();
+    const client = new ChannelCotClient({ resolveChannel: () => hangingChannel() });
+    const p = client.create({ chatId: "oc_x", threadId: "omt_x" });
+    const expectation = expect(p).rejects.toThrow(/timed out after 8000ms/);
+    await vi.advanceTimersByTimeAsync(8_000);
+    await expectation;
+  });
+
+  it("complete rejects once the request exceeds the timeout", async () => {
+    vi.useFakeTimers();
+    const client = new ChannelCotClient({ resolveChannel: () => hangingChannel() });
+    const p = client.complete({ cotId: "cot_1", messageId: "om_1" }, "done");
+    const expectation = expect(p).rejects.toThrow(/timed out after 8000ms/);
+    await vi.advanceTimersByTimeAsync(8_000);
+    await expectation;
+  });
+
+  it("does not time out a request that resolves in time", async () => {
+    vi.useFakeTimers();
+    const channel: OutboundCotLarkChannel = {
+      rawClient: {
+        async request<T>() {
+          return { code: 0, data: { cot_id: "cot_1", message_id: "om_1" } } as T;
+        },
+      },
+    };
+    const client = new ChannelCotClient({ resolveChannel: () => channel });
+    await expect(
+      client.create({ chatId: "oc_x", threadId: "omt_x" }),
+    ).resolves.toEqual({ cotId: "cot_1", messageId: "om_1" });
   });
 });
