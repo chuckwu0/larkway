@@ -120,7 +120,17 @@ export function buildCodexCommand(
   codexBinPath = "codex",
 ): [string, string[]] {
   void opts;
-  return [codexBinPath, ["app-server", "--stdio"]];
+  // `-c model_reasoning_summary=detailed`: a per-invocation config override
+  // (global codex flag, so it precedes the subcommand) that makes the model
+  // emit its reasoning summary as item/reasoning/summaryTextDelta events —
+  // without it, app-server yields zero reasoning output and the COT bubble
+  // stays empty. `detailed` is the richest of auto/concise/detailed. This is
+  // a CLI flag, NOT a mutation of the user's ~/.codex/config.toml (confirmed
+  // supported, codex-cli 0.140.0).
+  return [
+    codexBinPath,
+    ["-c", "model_reasoning_summary=detailed", "app-server", "--stdio"],
+  ];
 }
 
 type JsonRecord = Record<string, unknown>;
@@ -292,14 +302,13 @@ class CodexLineParser {
   }
 
   // ── reasoning → thinking_delta (COT) — extension point ──────────────────
-  // TODO(cot): map Codex reasoning items to `thinking_delta` (see
-  // src/agent/runner.ts + src/bridge/cotProgress.ts) once the exact
-  // `codex exec --json` reasoning item schema is confirmed. Candidate shapes
-  // observed but NOT yet verified: item.started/completed with
-  // item.type === "reasoning" (+ a text/summary field), or a dedicated
-  // reasoning delta type. Left unmapped on purpose — do not guess the field
-  // names; reasoning currently falls through to `raw` (dropped), byte-
-  // identical to pre-COT behavior.
+  // NOTE: this parser handles the legacy `codex exec --json` surface, which
+  // is NOT the live path — buildCodexCommand always spawns `app-server`, whose
+  // reasoning IS mapped (see CodexAppServerLineParser: item/reasoning/
+  // summaryTextDelta → thinking_delta, completed reasoning summary →
+  // thinking_snapshot). The `codex exec --json` reasoning item schema is
+  // unconfirmed, so it is deliberately NOT guessed here; reasoning falls
+  // through to `raw` (dropped), byte-identical to pre-COT behavior.
 
   // ── everything else (turn.started, error, reasoning, file_change, …) ────
   yield { type: "raw", raw: obj };
@@ -343,6 +352,28 @@ class CodexAppServerLineParser {
       return;
     }
 
+    // ── reasoning summary deltas → thinking_delta (COT) ──────────────────
+    // Enabled by `-c model_reasoning_summary=detailed` (see buildCodexCommand).
+    // Mirrors item/agentMessage/delta exactly: incremental text in
+    // params.delta. params.summaryIndex segments the summary into parts; a
+    // new part is announced by summaryPartAdded below. Confirmed live shape,
+    // codex-cli 0.140.0.
+    if (method === "item/reasoning/summaryTextDelta") {
+      const delta = typeof params?.["delta"] === "string" ? params["delta"] : "";
+      if (delta) yield { type: "thinking_delta", text: delta, raw: obj };
+      return;
+    }
+
+    // A new reasoning summary part begins. Insert a blank line between parts
+    // so concatenated segments in the COT bubble stay readable. summaryIndex 0
+    // is the first part — no separator before it.
+    if (method === "item/reasoning/summaryPartAdded") {
+      const summaryIndex =
+        typeof params?.["summaryIndex"] === "number" ? params["summaryIndex"] : 0;
+      if (summaryIndex > 0) yield { type: "thinking_delta", text: "\n\n", raw: obj };
+      return;
+    }
+
     if (method === "item/started") {
       const item = asRecord(params?.["item"]);
       if (item?.["type"] === "commandExecution" && typeof item["command"] === "string") {
@@ -367,19 +398,34 @@ class CodexAppServerLineParser {
         yield* this.answerExtractor.ingestSnapshot(item["text"], obj);
         return;
       }
+      // Completed reasoning item: the full summary lives in item.summary (a
+      // string array, one element per part; item.content is always empty —
+      // raw thoughts are never exposed). Emit as a thinking_snapshot catch-up
+      // for trivial turns where the model produced no summaryTextDelta at all;
+      // cotProgress ignores it when deltas already streamed. Tolerates an
+      // empty summary (a short task can complete an empty reasoning shell).
+      if (item?.["type"] === "reasoning") {
+        const summary = reasoningSummaryText(item["summary"]);
+        if (summary) yield { type: "thinking_snapshot", text: summary, raw: obj };
+        return;
+      }
       return;
     }
 
-    // ── reasoning → thinking_delta (COT) — extension point ────────────────
-    // TODO(cot): map Codex app-server reasoning notifications to
-    // `thinking_delta` (see src/agent/runner.ts + src/bridge/cotProgress.ts)
-    // once the exact method name is confirmed. Candidate methods observed but
-    // NOT yet verified: "item/agentReasoning/delta", "item/reasoning/delta".
-    // Left unmapped on purpose — do not guess; reasoning currently falls
-    // through to `raw` (dropped), byte-identical to pre-COT behavior.
-
     yield { type: "raw", raw: obj };
   }
+}
+
+/**
+ * Join a codex reasoning item's `summary` (a string array, one entry per
+ * summary part) into a single reasoning trace. Non-string / empty entries are
+ * dropped; returns "" when there is nothing to show.
+ */
+function reasoningSummaryText(summary: unknown): string {
+  if (!Array.isArray(summary)) return "";
+  return summary
+    .filter((s): s is string => typeof s === "string" && s.length > 0)
+    .join("\n\n");
 }
 
 function asRecord(value: unknown): JsonRecord | undefined {
