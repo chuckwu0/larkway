@@ -653,72 +653,26 @@ describe("tasklist-init --adopt (v3.4, docs/task-handle.md §7)", () => {
   });
 });
 
-describe("tasklist-init auto-select adopt-vs-create (v3.4 north star, no explicit --adopt/--adopt-guid)", () => {
-  it("auto-adopts when the operator's own identity finds a same-named tasklist — no --owner needed", async () => {
+describe("tasklist-init zero-arg = CREATE by design (adopt is explicit-only, 2026-07 ownership decision)", () => {
+  it("CREATES a bot-app-owned board and does NOT auto-adopt, even when a same-named list is visible", async () => {
     await makeBot("bot-a", "cli_a", "BOT_A_SECRET");
-    mockedListUserTasklists = { ok: true, data: [{ guid: "tl-auto-adopted", name: "Agent Team" }] };
-    mockedGetUserTasklistMembers = { ok: true, data: [{ id: "cli_a", type: "app", role: "editor" }] };
-    const { run } = await import("./tasklistInit.js");
-    const code = await run(makeCtx({ json: true }), ["--team", "bot-a"]);
-    expect(code).toBe(0);
-    expect(capturedAddMembersAsUserCall?.tasklistGuid).toBe("tl-auto-adopted");
-    expect(ui.emitJson).toHaveBeenCalledWith(expect.objectContaining({ ok: true, mode: "adopt", tasklistGuid: "tl-auto-adopted" }));
-    // Never touched the SDK-based create/reuse path.
-    expect(capturedRequests.find((r) => r.url.endsWith("/tasklists"))).toBeUndefined();
-  });
-
-  it("silently falls back to the create path when the user-identity lookup fails (not logged in / missing scope)", async () => {
-    await makeBot("bot-a", "cli_a", "BOT_A_SECRET");
-    mockedListUserTasklists = { ok: false, error: "need_user_authorization" };
+    // A same-named board the operator could see — pre-decision this would have
+    // been auto-adopted. Now zero-arg must ignore it and CREATE (owner=bot app).
+    mockedListUserTasklists = { ok: true, data: [{ guid: "tl-visible", name: "Agent Team" }] };
     mockedAutoResolvedOwner = "ou_owner1234567890";
     const { run } = await import("./tasklistInit.js");
     const code = await run(makeCtx({ json: true }), ["--team", "bot-a"]);
-    expect(code).toBe(0); // no hard failure — silent fallback, not the "list-failed" error
+    expect(code).toBe(0);
+    // Went through the SDK create path, NOT the user-identity adopt path.
+    expect(capturedRequests.find((r) => r.url.endsWith("/tasklists") && r.method === "POST")).toBeDefined();
+    expect(capturedAddMembersAsUserCall).toBeUndefined(); // adopt's user-identity add never ran
     expect(ui.emitJson).toHaveBeenCalledWith(expect.objectContaining({ ok: true, tasklistGuid: "tl-created-1" }));
   });
 
-  it("BL-32 #4: LOUD warns (not a silent dim note) when the auto-select query FAILS before falling back", async () => {
-    // A failed adopt query that silently creates can accrete a duplicate board;
-    // the operator must be told (non-JSON mode).
+  it("CREATES even when MULTIPLE same-named lists are visible — no ambiguity failure (never queries)", async () => {
     await makeBot("bot-a", "cli_a", "BOT_A_SECRET");
-    mockedListUserTasklists = { ok: false, error: "need_user_authorization" };
-    mockedAutoResolvedOwner = "ou_owner1234567890";
-    const { run } = await import("./tasklistInit.js");
-    const code = await run(makeCtx(), ["--team", "bot-a"]); // non-JSON
-    expect(code).toBe(0);
-    expect(ui.warning).toHaveBeenCalled();
-    const warnedText = (ui.warning as unknown as { mock: { calls: unknown[][] } }).mock.calls
-      .map((c) => String(c[0]))
-      .join("\n");
-    expect(warnedText).toContain("重复");
-  });
-
-  it("does NOT loud-warn on the not-found path (a genuinely new team is expected)", async () => {
-    await makeBot("bot-a", "cli_a", "BOT_A_SECRET");
-    mockedListUserTasklists = { ok: true, data: [{ guid: "tl-other", name: "Some Other List" }] };
-    mockedAutoResolvedOwner = "ou_owner1234567890";
-    const { run } = await import("./tasklistInit.js");
-    const code = await run(makeCtx(), ["--team", "bot-a"]); // non-JSON
-    expect(code).toBe(0);
-    // not-found is expected for a new team → no scary duplicate warning.
-    const warnedText = (ui.warning as unknown as { mock: { calls: unknown[][] } }).mock.calls
-      .map((c) => String(c[0]))
-      .join("\n");
-    expect(warnedText).not.toContain("重复");
-  });
-
-  it("silently falls back to the create path when no same-named tasklist is visible", async () => {
-    await makeBot("bot-a", "cli_a", "BOT_A_SECRET");
-    mockedListUserTasklists = { ok: true, data: [{ guid: "tl-other", name: "Some Other List" }] };
-    mockedAutoResolvedOwner = "ou_owner1234567890";
-    const { run } = await import("./tasklistInit.js");
-    const code = await run(makeCtx({ json: true }), ["--team", "bot-a"]);
-    expect(code).toBe(0);
-    expect(ui.emitJson).toHaveBeenCalledWith(expect.objectContaining({ ok: true, tasklistGuid: "tl-created-1" }));
-  });
-
-  it("still hard-fails on a genuinely ambiguous same-named match, even with no explicit --adopt (never guesses)", async () => {
-    await makeBot("bot-a", "cli_a", "BOT_A_SECRET");
+    // Pre-decision this hard-failed as ambiguous; now zero-arg never queries, so
+    // it just creates.
     mockedListUserTasklists = {
       ok: true,
       data: [
@@ -726,11 +680,23 @@ describe("tasklist-init auto-select adopt-vs-create (v3.4 north star, no explici
         { guid: "tl-dup-2", name: "Agent Team" },
       ],
     };
+    mockedAutoResolvedOwner = "ou_owner1234567890";
     const { run } = await import("./tasklistInit.js");
-    const code = await run(makeCtx(), ["--team", "bot-a"]);
-    expect(code).toBe(1);
-    expect(ui.failure).toHaveBeenCalledWith(expect.stringContaining("--adopt-guid"));
-    // Never fell through to create — no POST to /tasklists.
-    expect(capturedRequests.find((r) => r.url.endsWith("/tasklists"))).toBeUndefined();
+    const code = await run(makeCtx({ json: true }), ["--team", "bot-a"]);
+    expect(code).toBe(0);
+    expect(ui.emitJson).toHaveBeenCalledWith(expect.objectContaining({ ok: true, tasklistGuid: "tl-created-1" }));
+  });
+
+  it("CREATES with no loud duplicate-warning (zero-arg has no adopt query to fail)", async () => {
+    await makeBot("bot-a", "cli_a", "BOT_A_SECRET");
+    mockedListUserTasklists = { ok: false, error: "should never be consulted in zero-arg" };
+    mockedAutoResolvedOwner = "ou_owner1234567890";
+    const { run } = await import("./tasklistInit.js");
+    const code = await run(makeCtx(), ["--team", "bot-a"]); // non-JSON
+    expect(code).toBe(0);
+    const warnedText = (ui.warning as unknown as { mock: { calls: unknown[][] } }).mock.calls
+      .map((c) => String(c[0]))
+      .join("\n");
+    expect(warnedText).not.toContain("重复"); // no duplicate scare — zero-arg doesn't query
   });
 });

@@ -17,16 +17,14 @@
  *   - `--team` defaults to EVERY bot under `bots/` (ctx.botsStore.listBots())
  *     — no manual enumeration required. Only a truly bot-less machine fails.
  *   - `--name` defaults to "Agent Team".
- *   - The choice between **adopt** (operator already made a same-named
- *     tasklist via the Task Center UI — ownership is correct by
- *     construction) and **create** (fall back to a bot's app credentials) is
- *     itself automatic: try a by-name lookup under the operator's own
- *     lark-cli user identity first; a match → adopt it; no match or the
- *     lookup itself fails (not logged in, missing scope) → silently fall
- *     through to the existing create/reuse-registry path below. Multiple
- *     same-named matches is the ONE case that hard-fails even in
- *     auto-select mode — see resolveAdoptTarget's "ambiguous" branch —
- *     because guessing which board to adopt is unsafe to automate.
+ *   - Zero-arg CREATES a bot-app-owned board by default (ownership decision,
+ *     2026-07). **adopt** — taking over a tasklist the operator built
+ *     themselves in the Task Center, so THEY own it — is opt-in only, via
+ *     `--adopt "<name>"` / `--adopt-guid <guid>`. Auto-adopting by name was
+ *     removed: a company running multiple Larkway fleets would have the
+ *     second fleet silently adopt the first's same-named board. Explicit
+ *     adopt hard-fails loudly on any lookup problem (not logged in, missing
+ *     scope, no match, ambiguous) — never a silent create.
  *   - `--adopt "<name>"` / `--adopt-guid <guid>` / `--team` / `--owner` /
  *     `--force` all remain valid EXPLICIT overrides of the above.
  *
@@ -98,7 +96,7 @@ interface ParsedFlags {
   force: boolean;
   /** v3.4 --adopt "<清单名>": adopt a tasklist the operator already created themselves via the Task Center UI, instead of creating one via a bot's app credentials. Explicit — forces adopt mode even if lookup fails (no silent fallback to create). */
   adopt?: string;
-  /** v3.4: disambiguates the by-name lookup when multiple visible tasklists share the same name (in either explicit --adopt mode or the zero-arg auto-select path) — also usable alone to force adopt mode with a known guid, skipping the lookup entirely. */
+  /** --adopt-guid: disambiguates the by-name lookup when multiple visible tasklists share the same name in --adopt mode — also usable alone to enter (explicit) adopt mode with a known guid, skipping the lookup entirely. */
   adoptGuid?: string;
 }
 
@@ -146,33 +144,41 @@ const USAGE = `larkway tasklist-init [--team <bot1,bot2,…>] [--name <清单名
 帮助的 agent,第一步必然会跑 \`larkway tasklist-init --help\`(就是你正在看的这段),
 从这里就能学会怎么把本机所有已配置的 bot 都配成清单成员,不需要你再手动传任何参数。
 
-零参数三步 Quickstart:
-  1. (可选)先在飞书任务中心手动建一个清单,名字随便取,比如 "Agent Team"。
-  2. 跑:larkway tasklist-init
+零参数 Quickstart:
+  1. 跑:larkway tasklist-init
      —— 会自动:--team = 本机 bots/ 目录下全部已配置 bot;--name = "Agent Team";
-     用你的 lark-cli 用户身份按名字查一遍能看到的清单 —— 查到同名的就 adopt(把这些
-     bot 加为 editor);查不到(或没登录/缺 scope)就静默回退到旧的创建路径(用第一个
-     bot 的 app 身份新建一个清单,并自动把你加为 owner)。
-  3. 去飞书任务中心确认这个清单在你的列表里可见,之后右键话题消息选"转任务"即可。
+     用第一个 bot 的 app 身份**新建**一个清单(清单 owner = 该 bot app),并把你
+     加为 editor 成员(方便在任务中心看到并编辑)。零参数**不会**自动去认领同名清单。
+  2. 去飞书任务中心确认这个清单在你的列表里可见,之后右键话题消息选"转任务"即可。
+
+想让清单归**你自己**所有(而不是 bot app)?先在任务中心自己建一个,再用
+\`--adopt "<清单名>"\` 认领(见下)。多套 Larkway 部署时,给每套用 --name 改个不同
+名字做隔离,避免混用。
 
 以上全部是缺省行为,以下 flag 仅用于覆盖:
 
   --team <bot1,bot2,…>   显式指定要加入清单的 bot(默认 = 全部已配置 bot)
-  --name <清单名>          显式指定清单名(默认 "Agent Team"),仅在自动/显式 create
-                          路径里生效;--adopt/--adopt-guid 会忽略它,按名字/guid 查
-  --adopt "<清单名>"       强制走 adopt 模式并用这个名字查找——查不到/查出多个都会
-                          直接报错退出,不会静默回退到创建路径(你已经明确要 adopt了)
-  --adopt-guid <guid>     跳过按名字查找,直接 adopt 这个 guid 的清单(单独使用也
-                          等价于强制 adopt 模式);多个同名清单时用它消歧
+  --name <清单名>          显式指定要创建/复用的清单名(默认 "Agent Team");多团队
+                          部署用它隔离。--adopt/--adopt-guid 会忽略它,按名字/guid 查
+  --adopt "<清单名>"       认领你自己在任务中心建好的同名清单(把这些 bot 加为 editor)——
+                          查不到/查出多个都直接报错退出,绝不静默回退到创建路径
+  --adopt-guid <guid>     跳过按名字查找,直接认领这个 guid 的清单;多个同名清单时消歧
   --owner <open_id>       显式指定人类 owner(仅创建路径用到,adopt 模式下你本来就是
                           owner,不需要这个)
   --force                 覆盖共享注册文件里已有的 guid(默认不覆盖,避免误操作把
                           整个团队切到一个新板)
 
-── adopt 模式内部步骤(自动选中,或显式 --adopt/--adopt-guid 触发)──
+── 删除/清理(暂无自动子命令)──
+  零参数创建的清单 owner 是 bot app,你的用户身份删不掉它。要删除本机注册的清单:
+  用创建它的 bot 的 app 凭证(bridge 自己用的那套,tenant_access_token)调
+  \`DELETE /open-apis/task/v2/tasklists/{guid}\`(guid 见 <LARKWAY_HOME>/task-team.json),
+  再删掉本机状态文件:task-team.json、candidate-alerts-<guid>.json、各 bot 的
+  task-handles.json 里对应记录。(自动 --delete 子命令按需再加。)
+
+── adopt 模式内部步骤(仅显式 --adopt/--adopt-guid 触发)──
   1. 以你(操作者)的用户身份按名字精确匹配你能看到的清单(重名 → 报错列出全部
-     guid,让你加 --adopt-guid <guid> 消歧重跑;一个都找不到 → 自动模式下静默回退
-     创建路径,显式 --adopt 下报错提示先去任务中心建一个)
+     guid,让你加 --adopt-guid <guid> 消歧重跑;一个都找不到 → 报错提示先去任务
+     中心建一个,绝不静默创建)
   2. 把每个 bot 的 app 加为清单成员(role=editor,幂等,已是成员的跳过/无害重复)
   3. 写入共享注册文件 <LARKWAY_HOME>/task-team.json(与创建路径同一套
      first-writer-wins / --force 覆盖语义)
@@ -271,19 +277,15 @@ export async function run(ctx: CliContext, args: string[]): Promise<number> {
   const creatorProfile = deriveLarkCliProfile(creator.lark_cli_profile, creator.app_id);
   const loginHint = `lark-cli auth login --profile ${creatorProfile} --domain task`;
 
-  // v3.4 mode selection — three ways in:
-  //   1. Explicit --adopt/--adopt-guid: the operator asked for adopt mode by
-  //      name, so ANY lookup problem (not logged in, missing scope, no
-  //      match, ambiguous match) is a hard failure — never silently fall
-  //      back to creating a DIFFERENT tasklist than the one they named.
-  //   2. Implicit (neither flag passed): try the exact same by-name lookup
-  //      quietly first — a match adopts it (ownership is correct by
-  //      construction, no --owner needed); "ambiguous" still hard-fails
-  //      (guessing which board is unsafe to automate — see
-  //      resolveAdoptTarget's doc comment); but "list-failed" (not logged
-  //      in / missing scope) or "not-found" (no same-named tasklist visible)
-  //      silently fall through into the create/reuse-registry path below,
-  //      unchanged since before v3.4.
+  // Mode selection — two ways in (user-owned ownership decision, 2026-07):
+  //   1. Explicit --adopt/--adopt-guid: adopt the tasklist the operator already
+  //      created themselves (they become its true owner). ANY lookup problem
+  //      (not logged in, missing scope, no match, ambiguous match) is a HARD
+  //      failure — they asked to adopt, so we never silently create a
+  //      different/duplicate board instead.
+  //   2. Neither flag (zero-arg): CREATE a bot-app-owned board. Auto-adopting
+  //      by name is deliberately NOT done — see the create fall-through below
+  //      for why (multi-fleet cross-team mixing).
   if (adopt !== undefined || explicitAdoptGuid !== undefined) {
     const adoptName = adopt ?? name;
     if (adoptName.trim().length === 0) {
@@ -314,45 +316,22 @@ export async function run(ctx: CliContext, args: string[]): Promise<number> {
     });
   }
 
-  const autoTarget = resolveAdoptTarget(creatorProfile, name, undefined, loginHint);
-  if (autoTarget.ok) {
-    return runAdoptWithGuid(ctx, {
-      guid: autoTarget.guid,
-      matchedName: autoTarget.matchedName,
-      bots,
-      force,
-      creatorProfile,
-      loginHint,
-    });
-  }
-  if (autoTarget.reason === "ambiguous") {
-    // Even in auto-select mode this must hard-fail — silently picking one of
-    // several same-named boards would non-deterministically wire the team
-    // into whichever guid happened to sort first.
-    if (ctx.flags.json) ctx.ui.emitJson({ ok: false, error: autoTarget.message });
-    else ctx.ui.failure(autoTarget.message);
-    return 1;
-  }
-  // "list-failed" or "not-found" → fall through to the create/reuse path below.
-  // Never emitted in --json mode (not part of that machine-readable contract).
-  //   - list-failed: a LOUD warn — the adopt query failed despite the user
-  //     possibly having the scope, so falling back to create can silently
-  //     accrete a DUPLICATE "Agent Team" board (the BL-32 root cause). Point at
-  //     the fix so the operator can re-auth and re-run instead of piling up dups.
-  //   - not-found: expected on a genuinely new team — a quiet note is enough.
+  // Zero-arg (no --adopt/--adopt-guid): CREATE a bot-app-owned board by design
+  // (user-owned ownership decision, 2026-07). Auto-adopting by name is
+  // deliberately GONE: a company running MULTIPLE Larkway fleets would have the
+  // second fleet silently adopt the first's same-named board (cross-team
+  // mixing). Adoption is now opt-in only, via --adopt/--adopt-guid above (which
+  // hard-fails loudly on any lookup error — the operator asked to adopt, so a
+  // failed lookup must never quietly create). So fall straight through to the
+  // create/reuse-registry path below; the tasklist's owner is the creating bot
+  // app (the human is added as an editor for visibility — see the output).
   if (!ctx.flags.json) {
-    if (autoTarget.reason === "list-failed") {
-      ctx.ui.warning(
-        `无法以你的用户身份查询同名清单,已回退到用 bot app 身份创建/复用 —— ` +
-          `如果你其实已经有一个名为 "${name}" 的清单,这次很可能会新建一个重复的板。\n` +
-          `建议先确认用户身份已登录且有 task:tasklist 权限,再重跑:\n  ${loginHint}\n` +
-          `或用 \`--adopt "${name}"\` / \`--adopt-guid <guid>\` 强制走 adopt。`,
-      );
-    } else {
-      ctx.ui.print(
-        ctx.ui.dim(`(没找到同名清单 "${name}",回退到用 bot app 身份创建——如需强制 adopt 见 --adopt)`),
-      );
-    }
+    ctx.ui.print(
+      ctx.ui.dim(
+        `(用 bot app 身份创建/复用清单 "${name}"。想认领你自己在任务中心建的清单请用 ` +
+          `--adopt "<清单名>" / --adopt-guid <guid>;多团队部署建议用 --name 改名隔离。)`,
+      ),
+    );
   }
 
   // F2: resolve the human owner's open_id BEFORE touching any tasklist — a
@@ -554,15 +533,12 @@ type AdoptTargetResult =
   | { ok: false; reason: "ambiguous"; message: string; matches: UserTasklistSummary[] };
 
 /**
- * v3.4 (docs/task-handle.md §7): resolve WHICH existing tasklist an adopt
- * should target, without doing any writes. Used from two call sites in
- * `run()` with different failure-handling policy attached to the SAME three
- * failure reasons:
- *   - explicit `--adopt`/`--adopt-guid`: every failure reason is fatal (the
- *     operator asked for adopt mode by name — no silent fallback).
- *   - implicit auto-select: only "ambiguous" is fatal; "list-failed" and
- *     "not-found" are meant to be swallowed by the caller and treated as
- *     "try the create path instead" (see run()'s auto-select branch).
+ * docs/task-handle.md §7: resolve WHICH existing tasklist an EXPLICIT adopt
+ * (`--adopt`/`--adopt-guid`) should target, without doing any writes. The
+ * operator asked to adopt by name/guid, so EVERY failure reason is fatal
+ * (list-failed / not-found / ambiguous) — we never silently create a
+ * different or duplicate board instead. (Zero-arg no longer calls this: it
+ * creates a bot-app-owned board by design, see run().)
  *
  * `explicitGuid`, when given, skips the by-name lookup entirely — the
  * operator (or a previous ambiguous-match error's suggested rerun) already
