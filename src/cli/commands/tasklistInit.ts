@@ -71,7 +71,7 @@
  * as `larkway bot add` / `larkway perms`.
  */
 
-import { Client as LarkSdkClient } from "@larksuiteoapi/node-sdk";
+import { Client as LarkSdkClient, LoggerLevel } from "@larksuiteoapi/node-sdk";
 import type { CliContext } from "../types.js";
 import {
   TaskListClient,
@@ -358,7 +358,16 @@ export async function run(ctx: CliContext, args: string[]): Promise<number> {
     return 1;
   }
 
-  const sdkClient = new LarkSdkClient({ appId: creator.app_id, appSecret: creator.appSecret });
+  // loggerLevel: fatal — the node-sdk Client otherwise logs the FULL raw
+  // AxiosError to stdout (its default `error` level) before our own catch runs,
+  // dumping a long, alarming object (and corrupting --json). We surface every
+  // failure ourselves with a clean message (and the benign app-member 404 is
+  // handled structurally), so the SDK's raw error logging is pure noise here.
+  const sdkClient = new LarkSdkClient({
+    appId: creator.app_id,
+    appSecret: creator.appSecret,
+    loggerLevel: LoggerLevel.fatal,
+  });
   const requester: LarkTaskRequester = {
     request: (config) => sdkClient.request(config as Parameters<typeof sdkClient.request>[0]),
   };

@@ -1,7 +1,7 @@
 import { mkdirSync } from "node:fs";
 import path from "node:path";
 import { resolveLarkwayVersion } from "./version.js";
-import { Client as LarkSdkClient } from "@larksuiteoapi/node-sdk";
+import { Client as LarkSdkClient, LoggerLevel } from "@larksuiteoapi/node-sdk";
 import { loadConfig, loadConfigJson } from "./config.js";
 import type { Config, ConfigJsonType } from "./config.js";
 import { ChannelClient, resolveOpenChatDiscoveryMs } from "./lark/channelClient.js";
@@ -466,7 +466,15 @@ async function runV2Mode({
     {
       const guid = bot.taskHandle?.tasklistGuid ?? (await readTeamTasklistGuid(resolveTaskTeamRegistryPath()));
       if (guid) {
-        const taskSdkClient = new LarkSdkClient({ appId: bot.app_id, appSecret });
+        // loggerLevel: fatal — the node-sdk Client otherwise dumps the full raw
+        // AxiosError (default `error` level) to stdout/the bridge log on every
+        // request failure, before our own .catch. The self-join 404 below is
+        // best-effort and warned cleanly, so that raw dump is pure log noise.
+        const taskSdkClient = new LarkSdkClient({
+          appId: bot.app_id,
+          appSecret,
+          loggerLevel: LoggerLevel.fatal,
+        });
         const taskRequester: LarkTaskRequester = {
           request: (config) => taskSdkClient.request(config as Parameters<typeof taskSdkClient.request>[0]),
         };
