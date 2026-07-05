@@ -85,7 +85,7 @@ import {
 import { resolveOwnerOpenId } from "../ownerIdentity.js";
 import { deriveLarkCliProfile } from "../../lark/profileBootstrap.js";
 import {
-  listUserTasklists,
+  searchUserTasklists,
   addTasklistMembersAsUser,
   getUserTasklistMembers,
   type UserTasklistSummary,
@@ -333,13 +333,26 @@ export async function run(ctx: CliContext, args: string[]): Promise<number> {
     else ctx.ui.failure(autoTarget.message);
     return 1;
   }
-  // "list-failed" or "not-found" → silently fall through to the create/reuse
-  // path below. A short non-JSON note explains why, for anyone watching (a
-  // human at a terminal, or an agent relaying progress) — never emitted in
-  // --json mode since it isn't part of that machine-readable contract.
+  // "list-failed" or "not-found" → fall through to the create/reuse path below.
+  // Never emitted in --json mode (not part of that machine-readable contract).
+  //   - list-failed: a LOUD warn — the adopt query failed despite the user
+  //     possibly having the scope, so falling back to create can silently
+  //     accrete a DUPLICATE "Agent Team" board (the BL-32 root cause). Point at
+  //     the fix so the operator can re-auth and re-run instead of piling up dups.
+  //   - not-found: expected on a genuinely new team — a quiet note is enough.
   if (!ctx.flags.json) {
-    const why = autoTarget.reason === "list-failed" ? "无法以你的用户身份查询清单" : `没找到同名清单 "${name}"`;
-    ctx.ui.print(ctx.ui.dim(`(${why},回退到用 bot app 身份创建/复用清单——如需强制 adopt 见 --adopt)`));
+    if (autoTarget.reason === "list-failed") {
+      ctx.ui.warning(
+        `无法以你的用户身份查询同名清单,已回退到用 bot app 身份创建/复用 —— ` +
+          `如果你其实已经有一个名为 "${name}" 的清单,这次很可能会新建一个重复的板。\n` +
+          `建议先确认用户身份已登录且有 task:tasklist 权限,再重跑:\n  ${loginHint}\n` +
+          `或用 \`--adopt "${name}"\` / \`--adopt-guid <guid>\` 强制走 adopt。`,
+      );
+    } else {
+      ctx.ui.print(
+        ctx.ui.dim(`(没找到同名清单 "${name}",回退到用 bot app 身份创建——如需强制 adopt 见 --adopt)`),
+      );
+    }
   }
 
   // F2: resolve the human owner's open_id BEFORE touching any tasklist — a
@@ -396,13 +409,28 @@ export async function run(ctx: CliContext, args: string[]): Promise<number> {
     try {
       await taskClient.addTasklistMembers(tasklistGuid, members);
     } catch (err) {
-      const msg = `复用已有清单 ${tasklistGuid} 时补充成员失败: ${err instanceof Error ? err.message : String(err)}`;
-      if (ctx.flags.json) ctx.ui.emitJson({ ok: false, error: msg });
-      else {
-        ctx.ui.failure(msg);
-        ctx.ui.print("常见原因:app 未在开放平台后台勾选 task:tasklist:write / task:task:write scope(见 docs/task-handle.md §7)。");
+      const errMsg = err instanceof Error ? err.message : String(err);
+      if (isMembersEndpoint404(errMsg)) {
+        // Same 404 the bridge's self-join treats as best-effort continuing
+        // (main.ts) — the app-type members endpoint 404s (app self-add isn't
+        // supported there), but the bots are already members, so the reused
+        // list is fully usable. Degrade to a warn instead of a fatal exit;
+        // don't blame a scope the app already has.
+        if (!ctx.flags.json) {
+          ctx.ui.warning(
+            `复用清单 ${tasklistGuid} 时 add_members 返回 404(app 类型成员端点不支持自助加入,` +
+              "bot 通常已经是成员)——已忽略,不影响使用(与 bridge 启动的自助加入同款降级)。",
+          );
+        }
+      } else {
+        const msg = `复用已有清单 ${tasklistGuid} 时补充成员失败: ${errMsg}`;
+        if (ctx.flags.json) ctx.ui.emitJson({ ok: false, error: msg });
+        else {
+          ctx.ui.failure(msg);
+          ctx.ui.print("常见原因:app 未在开放平台后台勾选 task:tasklist:write / task:task:write scope(见 docs/task-handle.md §7)。");
+        }
+        return 1;
       }
-      return 1;
     }
   } else {
     reused = false;
@@ -477,8 +505,16 @@ export async function run(ctx: CliContext, args: string[]): Promise<number> {
   } else {
     ctx.ui.success(`清单 "${name}" 已创建: ${tasklistGuid}`);
   }
-  ctx.ui.print(`owner 成员: ${ownerOpenId}${explicitOwner ? "" : "(从 lark-cli 当前登录用户自动解析)"}`);
-  ctx.ui.print(`已加入成员(editor): ${bots.map((b) => b.id).join(", ")}`);
+  // This is the bot-app CREATE/REUSE path: the tasklist's real owner is the
+  // bot app that created it (app-only credentials), NOT the human. The human is
+  // added as an EDITOR member so they can see + edit it in their Task Center.
+  // (True user ownership only happens on the --adopt path, where the operator
+  // created the board themselves in the UI.)
+  ctx.ui.print(
+    `你(${ownerOpenId})已作为 editor 加入${explicitOwner ? "" : "(open_id 从 lark-cli 当前登录用户自动解析)"} —— ` +
+      "清单 owner 是创建它的 bot app;你是 editor 成员(可在任务中心看到并编辑)。",
+  );
+  ctx.ui.print(`已加入(editor)的 bot: ${bots.map((b) => b.id).join(", ")}`);
   ctx.ui.print("");
   if (!reused) {
     ctx.ui.print(
@@ -498,6 +534,16 @@ export async function run(ctx: CliContext, args: string[]): Promise<number> {
     ctx.ui.bold("⚠️ 请手动确认:") + " 去飞书任务中心确认这个清单确实可见(见 docs/task-handle.md §7)。",
   );
   return 0;
+}
+
+/**
+ * True for the app-type members-endpoint 404 (`POST /tasklists/{guid}/members`
+ * returns "404 page not found" for an app self-add — the bot is already a
+ * member). Message-based because TaskListClient wraps the raw error before it
+ * reaches here. Matches the bridge's best-effort treatment of the same failure.
+ */
+function isMembersEndpoint404(errMsg: string): boolean {
+  return /\b404\b|page not found|not.?found|不存在|resource_not_exist/i.test(errMsg);
 }
 
 /** Discriminated result of resolveAdoptTarget — see its doc comment. */
@@ -532,18 +578,20 @@ function resolveAdoptTarget(
     return { ok: true, guid: explicitGuid, matchedName: name };
   }
 
-  const listResult = listUserTasklists(creatorProfile);
+  const listResult = searchUserTasklists(creatorProfile, name);
   if (!listResult.ok) {
     return {
       ok: false,
       reason: "list-failed",
       message:
-        `无法以你的用户身份列出清单:${listResult.error}\n\n` +
+        `无法以你的用户身份查询清单:${listResult.error}\n\n` +
         `请先确认已用这个 profile 登录过用户身份、且申请了 task 域权限:\n  ${loginHint}\n` +
         `(可用 \`lark-cli auth status --profile ${creatorProfile} --json\` 检查当前状态)`,
     };
   }
 
+  // The search filters by keyword server-side; still require an EXACT name
+  // match so a fuzzy/substring hit never adopts the wrong board.
   const matches = listResult.data.filter((t) => t.name === name);
   if (matches.length === 0) {
     return {

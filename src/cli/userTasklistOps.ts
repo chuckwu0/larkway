@@ -22,19 +22,18 @@
  * the operator hasn't run `lark-cli auth login --domain task` for this
  * profile yet) surfaced to the CLI's error output, not silently swallowed.
  *
- * Verified against a real `lark-cli` install (2026-07, read-only — see
- * docs/task-handle.md §9 platform facts for the full investigation):
- *   - `lark-cli task tasklists list --as user` supports the user identity
- *     (fails cleanly with a scope-missing hint when the profile's user token
- *     lacks `task:tasklist:read`, confirming the mechanism exists and names
- *     the exact scope needed).
- *   - `lark-cli schema task.tasklists.list`'s output shape confirms each item
- *     carries both `guid` AND `name` — name-based lookup is genuinely
- *     supported by the API, not something this module has to fake.
- *   - `lark-cli task tasklists add_members --as user --dry-run` prints the
- *     exact same request shape (`{members:[{id,type,role}]}`) the existing
- *     bot-identity path already uses — no shape difference between
- *     identities, only the `--as` flag and which OAuth token authenticates.
+ * Command choice (2026-07, real-machine BL-32):
+ *   - The QUERY uses the `+tasklist-search` SKILL, NOT the raw
+ *     `task tasklists list`. On a machine whose user token DOES carry
+ *     `task:tasklist:read`, `tasklists list --as user` still rejects with its
+ *     own client-side scope precheck ("user authorization does not cover the
+ *     required scope(s)") while `+tasklist-search --as user` succeeds — the two
+ *     lark-cli code paths disagree, and adopt must use the one that reaches the
+ *     API. See searchUserTasklists's own comment.
+ *   - The WRITE (add_members) stays on the raw `task tasklists add_members`
+ *     command: it accepts the `{members:[{id,type:"app",role:"editor"}]}` shape
+ *     the bot-identity path uses, which the `+tasklist-members` skill (open_ids
+ *     only, no app/role) cannot express.
  */
 
 import { spawnSync, type SpawnSyncOptions, type SpawnSyncReturns } from "node:child_process";
@@ -98,36 +97,81 @@ function runLarkCliJson(args: string[], spawnSyncFn: SpawnSyncFn): UserOpResult<
 }
 
 /**
- * List every tasklist visible to the human user logged into `profile`
- * (`lark-cli task tasklists list --as user --page-all --json`). The most
- * common failure — no user identity, or one missing the `task:tasklist:read`
- * scope — surfaces lark-cli's own actionable hint (points at `auth login`).
+ * Search the tasklists visible to the human user logged into `profile`, by
+ * name keyword — `lark-cli task +tasklist-search --as user --query <q>`.
+ *
+ * Why the `+tasklist-search` SKILL and not the raw `task tasklists list`
+ * command (real-machine BL-32, 2026-07-05): with a freshly re-authorized user
+ * token that DOES carry `task:tasklist:read`, `tasklists list --as user` still
+ * rejects with a CLIENT-SIDE precheck ("user authorization does not cover the
+ * required scope(s): task:tasklist:read") — its scope table lags a fresh grant
+ * — while `+tasklist-search --as user` with the same profile/token succeeds.
+ * lark-cli's own behavior is inconsistent between the two; adopt must use the
+ * one that actually reaches the API. `--query` is also a better fit for adopt-
+ * by-name (server-side filter) than listing everything; the caller still does
+ * an exact-name match on top.
  */
-export function listUserTasklists(
+export function searchUserTasklists(
   profile: string,
+  query: string,
   spawnSyncFn: SpawnSyncFn = spawnSync,
 ): UserOpResult<UserTasklistSummary[]> {
   const result = runLarkCliJson(
-    ["task", "tasklists", "list", "--as", "user", "--profile", profile, "--page-all", "--json"],
+    ["task", "+tasklist-search", "--as", "user", "--profile", profile, "--query", query, "--page-all", "--json"],
     spawnSyncFn,
   );
   if (!result.ok) return result;
-  const data = result.data;
-  const items =
-    typeof data === "object" && data !== null ? (data as Record<string, unknown>)["items"] : undefined;
-  if (!Array.isArray(items)) {
-    return { ok: false, error: `lark-cli 返回的清单列表形状不对(缺少 items 数组):${JSON.stringify(data).slice(0, 300)}` };
+  return extractTasklistSummaries(result.data);
+}
+
+/**
+ * Pull {guid, name} pairs out of a `+tasklist-search` JSON envelope. The
+ * skill's exact wrapper key could not be verified locally (every local profile
+ * is scope-gated), so this checks the likely array locations in order — a
+ * top-level array, or `items`/`tasklists`/`results` at the root or under
+ * `data` — and uses the FIRST array it finds (even if empty: an empty search
+ * result is a valid "no match", distinct from an unrecognized shape). If NONE
+ * of those locations holds an array, the shape is unrecognized → return an
+ * error rather than a silent empty list, so the caller does not fall through to
+ * CREATE and accrete a duplicate board on a shape we failed to parse (BL-32).
+ */
+function extractTasklistSummaries(data: unknown): UserOpResult<UserTasklistSummary[]> {
+  const rec = typeof data === "object" && data !== null ? (data as Record<string, unknown>) : {};
+  const nested =
+    typeof rec["data"] === "object" && rec["data"] !== null ? (rec["data"] as Record<string, unknown>) : {};
+  let arr: unknown[] | undefined;
+  for (const candidate of [
+    data,
+    rec["items"],
+    rec["tasklists"],
+    rec["results"],
+    nested["items"],
+    nested["tasklists"],
+    nested["results"],
+  ]) {
+    if (Array.isArray(candidate)) {
+      arr = candidate;
+      break;
+    }
   }
-  const tasklists: UserTasklistSummary[] = [];
-  for (const raw of items) {
+  if (!arr) {
+    return {
+      ok: false,
+      error: `lark-cli +tasklist-search 返回的形状无法识别(找不到清单数组):${JSON.stringify(data).slice(0, 300)}`,
+    };
+  }
+  const out: UserTasklistSummary[] = [];
+  const seen = new Set<string>();
+  for (const raw of arr) {
     if (typeof raw !== "object" || raw === null) continue;
     const guid = (raw as Record<string, unknown>)["guid"];
     const name = (raw as Record<string, unknown>)["name"];
-    if (typeof guid === "string" && guid.length > 0) {
-      tasklists.push({ guid, name: typeof name === "string" ? name : "(无标题)" });
+    if (typeof guid === "string" && guid.length > 0 && !seen.has(guid)) {
+      seen.add(guid);
+      out.push({ guid, name: typeof name === "string" ? name : "(无标题)" });
     }
   }
-  return { ok: true, data: tasklists };
+  return { ok: true, data: out };
 }
 
 /**

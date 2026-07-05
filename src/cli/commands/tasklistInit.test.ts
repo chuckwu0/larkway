@@ -47,6 +47,8 @@ let mockedAutoResolvedOwner: string | undefined;
 let currentMembers: FakeMember[];
 /** When true, the fake GET .../tasklists/:guid handler throws instead of responding. */
 let mockGetTasklistThrows: boolean;
+let mockAddMembersThrows404: boolean;
+let mockAddMembersThrowsScope: boolean;
 
 // v3.4 --adopt mode: controllable results for the mocked userTasklistOps.js functions.
 let mockedListUserTasklists: UserOpResult<UserTasklistSummary[]>;
@@ -97,6 +99,8 @@ beforeEach(async () => {
   capturedRequests = [];
   currentMembers = [];
   mockGetTasklistThrows = false;
+  mockAddMembersThrows404 = false;
+  mockAddMembersThrowsScope = false;
   mockedAutoResolvedOwner = undefined; // default: auto-detect finds nothing, same as no lark-cli user login
   // v3.4 --adopt mode defaults — individual tests override to exercise each branch.
   mockedListUserTasklists = { ok: true, data: [] };
@@ -114,6 +118,8 @@ beforeEach(async () => {
           return { data: { tasklist: { guid: "tl-created-1", members: currentMembers } } };
         }
         if (config.url.includes("/members") && config.method === "POST") {
+          if (mockAddMembersThrows404) throw new Error("404 page not found");
+          if (mockAddMembersThrowsScope) throw new Error("permission denied: missing task:tasklist:write");
           const data = config.data as { members?: FakeMember[] };
           for (const m of data.members ?? []) {
             if (!currentMembers.some((existing) => existing.id === m.id)) currentMembers.push(m);
@@ -133,7 +139,7 @@ beforeEach(async () => {
     resolveOwnerOpenId: () => mockedAutoResolvedOwner,
   }));
   vi.doMock("../userTasklistOps.js", () => ({
-    listUserTasklists: () => mockedListUserTasklists,
+    searchUserTasklists: () => mockedListUserTasklists,
     addTasklistMembersAsUser: (profile: string, tasklistGuid: string, members: unknown[]) => {
       capturedAddMembersAsUserCall = { profile, tasklistGuid, members };
       return mockedAddTasklistMembersAsUser;
@@ -328,6 +334,35 @@ describe("tasklist-init --team", () => {
 
       // Registry still points at the same pre-existing guid — untouched.
       await expect(readTeamTasklistGuid(resolveTaskTeamRegistryPath())).resolves.toBe("tl-pre-existing");
+    });
+
+    it("BL-32 #2: a 404 from add_members on the reuse path warns + continues (exit 0), not fatal", async () => {
+      await makeBot("bot-a", "cli_a", "BOT_A_SECRET");
+      const { claimTeamTasklistGuid, readTeamTasklistGuid } = await import("../../tasklist/teamRegistry.js");
+      const { resolveTaskTeamRegistryPath } = await import("../../config/paths.js");
+      await claimTeamTasklistGuid(resolveTaskTeamRegistryPath(), "tl-pre-existing");
+      mockAddMembersThrows404 = true; // app-type members endpoint 404s (bot already a member)
+
+      const { run } = await import("./tasklistInit.js");
+      const code = await run(makeCtx(), ["--team", "bot-a", "--owner", "ou_owner"]);
+      // Same best-effort posture as the bridge self-join — the reused list is fine.
+      expect(code).toBe(0);
+      expect(ui.warning).toHaveBeenCalled();
+      // Did NOT create a duplicate board on the way.
+      expect(capturedRequests.find((r) => r.url.endsWith("/tasklists") && r.method === "POST")).toBeUndefined();
+      await expect(readTeamTasklistGuid(resolveTaskTeamRegistryPath())).resolves.toBe("tl-pre-existing");
+    });
+
+    it("BL-32 #2: a NON-404 add_members failure on the reuse path still fails hard (exit 1)", async () => {
+      await makeBot("bot-a", "cli_a", "BOT_A_SECRET");
+      const { claimTeamTasklistGuid } = await import("../../tasklist/teamRegistry.js");
+      const { resolveTaskTeamRegistryPath } = await import("../../config/paths.js");
+      await claimTeamTasklistGuid(resolveTaskTeamRegistryPath(), "tl-pre-existing");
+      mockAddMembersThrowsScope = true; // a real scope failure (not a 404) must still surface
+
+      const { run } = await import("./tasklistInit.js");
+      const code = await run(makeCtx(), ["--team", "bot-a", "--owner", "ou_owner"]);
+      expect(code).toBe(1);
     });
 
     it("reports reused:true in JSON mode when reusing", async () => {
@@ -640,6 +675,36 @@ describe("tasklist-init auto-select adopt-vs-create (v3.4 north star, no explici
     const code = await run(makeCtx({ json: true }), ["--team", "bot-a"]);
     expect(code).toBe(0); // no hard failure — silent fallback, not the "list-failed" error
     expect(ui.emitJson).toHaveBeenCalledWith(expect.objectContaining({ ok: true, tasklistGuid: "tl-created-1" }));
+  });
+
+  it("BL-32 #4: LOUD warns (not a silent dim note) when the auto-select query FAILS before falling back", async () => {
+    // A failed adopt query that silently creates can accrete a duplicate board;
+    // the operator must be told (non-JSON mode).
+    await makeBot("bot-a", "cli_a", "BOT_A_SECRET");
+    mockedListUserTasklists = { ok: false, error: "need_user_authorization" };
+    mockedAutoResolvedOwner = "ou_owner1234567890";
+    const { run } = await import("./tasklistInit.js");
+    const code = await run(makeCtx(), ["--team", "bot-a"]); // non-JSON
+    expect(code).toBe(0);
+    expect(ui.warning).toHaveBeenCalled();
+    const warnedText = (ui.warning as unknown as { mock: { calls: unknown[][] } }).mock.calls
+      .map((c) => String(c[0]))
+      .join("\n");
+    expect(warnedText).toContain("重复");
+  });
+
+  it("does NOT loud-warn on the not-found path (a genuinely new team is expected)", async () => {
+    await makeBot("bot-a", "cli_a", "BOT_A_SECRET");
+    mockedListUserTasklists = { ok: true, data: [{ guid: "tl-other", name: "Some Other List" }] };
+    mockedAutoResolvedOwner = "ou_owner1234567890";
+    const { run } = await import("./tasklistInit.js");
+    const code = await run(makeCtx(), ["--team", "bot-a"]); // non-JSON
+    expect(code).toBe(0);
+    // not-found is expected for a new team → no scary duplicate warning.
+    const warnedText = (ui.warning as unknown as { mock: { calls: unknown[][] } }).mock.calls
+      .map((c) => String(c[0]))
+      .join("\n");
+    expect(warnedText).not.toContain("重复");
   });
 
   it("silently falls back to the create path when no same-named tasklist is visible", async () => {
