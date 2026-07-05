@@ -1167,21 +1167,29 @@ export class BridgeHandler {
           ? { detail: cotDetail as "brief" | "detailed" }
           : undefined;
 
-      // COT (思维链) bubble — created BEFORE the answer card so it lands FIRST
-      // in the timeline (competitor parity: reasoning bubble on top, answer
-      // below). Created ONCE per turn (before the retry loop, so a stale-session
-      // respawn never opens a second bubble). 方案 B: the bubble is the
-      // EXPERIMENTAL surface, only built for cotSurface="bubble" (the default
-      // "card" folds reasoning into the card panel via `cot` above).
-      //
-      // Bypass rule preserved: createCotProgressHandle never throws (a create
-      // failure returns a disabled no-op handle). To keep a SLOW bubble create
-      // off the card's critical path — worst case is a hung GET + two-tier
-      // create, each 8s-bounded — race it against a 3s budget: if it's slow,
-      // send the card now and adopt the bubble handle when it finally resolves.
-      // Events don't start until after spawn (well after the card), so a late
-      // handle still catches the run; a fast business reject (10002) is ms.
-      if (this.deps.cotClient && cotDetail !== "off" && cotSurface === "bubble") {
+      // COT (思维链) bubble — 方案 B experimental surface (cotSurface="bubble";
+      // the default "card" folds reasoning into the panel via `cot` above).
+      // Extracted to a closure because its position relative to the answer card
+      // depends on whether this is the FIRST turn of a NEW topic:
+      //   - existing topic (later turns): create the bubble BEFORE the card so
+      //     the reasoning bubble lands first in the timeline (competitor parity).
+      //   - new topic (first @): the Feishu topic does not exist until the
+      //     card's reply CREATES it — a bubble made now would anchor to the bare
+      //     group message and land OUTSIDE the topic (real-machine bug). So for
+      //     a new topic we DEFER the bubble to after the card; by then the
+      //     trigger message is inside the topic and the bubble anchors like
+      //     every later turn. A first-turn bubble slightly below the card is the
+      //     correct trade here (users want "bubble inside the topic" over "on top").
+      // Created ONCE per turn (before the retry loop). Bypass rule preserved:
+      // createCotProgressHandle never throws. To keep a SLOW create off the
+      // card's critical path (worst case = hung GET + two-tier create, each
+      // 8s-bounded), race a 3s budget — past it, proceed and adopt the handle in
+      // the background (the finally's anti-orphan finalize completes a late
+      // handle). This holds for BOTH orderings (a first-turn, post-card create
+      // can be slow/fail too).
+      const createCotBubble = async (): Promise<void> => {
+        if (!(this.deps.cotClient && cotDetail !== "off" && cotSurface === "bubble")) return;
+        if (bubbleCreate) return; // once per turn
         bubbleCreate = createCotProgressHandle({
           cotClient: this.deps.cotClient,
           detail: cotDetail,
@@ -1210,13 +1218,17 @@ export class BridgeHandler {
         if (raced.ready) {
           cotPublisher = raced.handle;
         } else {
-          // Slow create — proceed to the card now; adopt the handle in the
-          // background once it resolves (never throws).
+          // Slow create — proceed now; adopt the handle in the background once
+          // it resolves (never throws; the finally guarantees it's finalized).
           void bubbleCreate.then((handle) => {
             cotPublisher = handle;
           });
         }
-      }
+      };
+
+      // Existing topic → bubble BEFORE the card (timeline order). New topic
+      // (first turn) is deferred to AFTER the card (see closure + call below).
+      if (!isNewThread) await createCotBubble();
 
       // CardKit response surface: default main surface when the transport and
       // rollout gates are available. It streams bounded progress into a
@@ -1664,6 +1676,13 @@ export class BridgeHandler {
           console.warn("[bridge.handler] mtime fact computation failed (continuing):", err);
         }
       }
+
+      // New topic (first turn): NOW create the bubble — the card's reply above
+      // has created the Feishu topic, so the trigger message is inside it and
+      // the bubble anchors into the topic (same as every later turn) instead of
+      // landing at the group top level. No-op for existing topics (already
+      // created before the card) and for cot="off"/cotSurface="card".
+      if (isNewThread) await createCotBubble();
 
       // Step 4b–4f: spawn + stream + finalize, with one stale-session retry.
       // `currentExisting` may be reset to undefined on retry (ghost session cleared).
