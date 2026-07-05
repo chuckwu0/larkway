@@ -100,6 +100,14 @@ const DEFAULT_CARDKIT_RESPONSE_SURFACE_TIMEOUT_MS = 20 * 60 * 1000;
  */
 const DEFAULT_CARDKIT_IDLE_TIMEOUT_MS = 3 * 60 * 1000;
 
+/**
+ * Max time the COT bubble create may sit in front of the answer card's first
+ * frame. The bubble is created before the card (timeline ordering), but a slow
+ * create (hung GET / multi-tier create) must not delay the card — past this
+ * budget, the card is sent and the bubble handle is adopted in the background.
+ */
+const COT_BUBBLE_CREATE_BUDGET_MS = 3_000;
+
 function summarizeMentionPolicyRules(rules: string[]): string {
   const counts = new Map<string, number>();
   for (const rule of rules) {
@@ -577,6 +585,12 @@ export interface BridgeHandlerDeps {
    * duration. @default 3 * 60 * 1000 (3 min), overridable per bot.
    */
   responseSurfaceIdleTimeoutMs?: number;
+  /**
+   * Max ms the COT bubble create may precede the answer card (timeline
+   * ordering). Past this, the card is sent and the bubble handle is adopted in
+   * the background. @default COT_BUBBLE_CREATE_BUDGET_MS (3s). Test seam.
+   */
+  cotBubbleCreateBudgetMs?: number;
   /**
    * V2: fully-resolved peer bot list for this bot.
    * Pre-resolved by runV2Mode: each entry has the peer bot's open_id, name, description.
@@ -1146,6 +1160,57 @@ export class BridgeHandler {
           ? { detail: cotDetail as "brief" | "detailed" }
           : undefined;
 
+      // COT (思维链) bubble — created BEFORE the answer card so it lands FIRST
+      // in the timeline (competitor parity: reasoning bubble on top, answer
+      // below). Created ONCE per turn (before the retry loop, so a stale-session
+      // respawn never opens a second bubble). 方案 B: the bubble is the
+      // EXPERIMENTAL surface, only built for cotSurface="bubble" (the default
+      // "card" folds reasoning into the card panel via `cot` above).
+      //
+      // Bypass rule preserved: createCotProgressHandle never throws (a create
+      // failure returns a disabled no-op handle). To keep a SLOW bubble create
+      // off the card's critical path — worst case is a hung GET + two-tier
+      // create, each 8s-bounded — race it against a 3s budget: if it's slow,
+      // send the card now and adopt the bubble handle when it finally resolves.
+      // Events don't start until after spawn (well after the card), so a late
+      // handle still catches the run; a fast business reject (10002) is ms.
+      if (this.deps.cotClient && cotDetail !== "off" && cotSurface === "bubble") {
+        const bubbleCreate = createCotProgressHandle({
+          cotClient: this.deps.cotClient,
+          detail: cotDetail,
+          runId: messageId,
+          scope: threadId,
+          inputPreview: parsed.text,
+          target: {
+            chatId: parsed.chatId,
+            threadId:
+              typeof parsed.raw.thread_id === "string" && parsed.raw.thread_id
+                ? parsed.raw.thread_id
+                : undefined,
+            originMessageId: messageId,
+          },
+        });
+        const raced = await Promise.race([
+          bubbleCreate.then((handle) => ({ ready: true as const, handle })),
+          new Promise<{ ready: false }>((resolve) => {
+            const t = setTimeout(
+              () => resolve({ ready: false }),
+              this.deps.cotBubbleCreateBudgetMs ?? COT_BUBBLE_CREATE_BUDGET_MS,
+            );
+            t.unref?.();
+          }),
+        ]);
+        if (raced.ready) {
+          cotPublisher = raced.handle;
+        } else {
+          // Slow create — proceed to the card now; adopt the handle in the
+          // background once it resolves (never throws).
+          void bubbleCreate.then((handle) => {
+            cotPublisher = handle;
+          });
+        }
+      }
+
       // CardKit response surface: default main surface when the transport and
       // rollout gates are available. It streams bounded progress into a
       // thinking area during execution, then replaces the card entity with a
@@ -1591,37 +1656,6 @@ export class BridgeHandler {
         } catch (err) {
           console.warn("[bridge.handler] mtime fact computation failed (continuing):", err);
         }
-      }
-
-      // COT (思维链) bubble — a parallel side channel to the answer card,
-      // created ONCE per turn here (outside the retry loop, so a stale-session
-      // respawn never opens a second bubble). Best-effort in every respect:
-      // createCotProgressHandle never throws (a create failure returns a
-      // disabled no-op handle), and each handle()/finalize() below degrades
-      // silently. Only reasoning + tool activity flow here; the final answer
-      // stays exclusively on the card. Topic groups anchor on the omt_ thread
-      // id; other chats fall back to chat_id + the trigger message.
-      // 方案 B: the reasoning bubble is now the EXPERIMENTAL surface — only
-      // built when the bot opts into cotSurface="bubble". The default
-      // ("card") streams reasoning into the answer card's collapsible panel
-      // (wired into createCardKitProgressHandle above via `cot`), no bubble.
-      // `cotDetail`/`cotSurface` are resolved once above (shared with the panel).
-      if (this.deps.cotClient && cotDetail !== "off" && cotSurface === "bubble") {
-        cotPublisher = await createCotProgressHandle({
-          cotClient: this.deps.cotClient,
-          detail: cotDetail,
-          runId: messageId,
-          scope: threadId,
-          inputPreview: parsed.text,
-          target: {
-            chatId: parsed.chatId,
-            threadId:
-              typeof parsed.raw.thread_id === "string" && parsed.raw.thread_id
-                ? parsed.raw.thread_id
-                : undefined,
-            originMessageId: messageId,
-          },
-        });
       }
 
       // Step 4b–4f: spawn + stream + finalize, with one stale-session retry.

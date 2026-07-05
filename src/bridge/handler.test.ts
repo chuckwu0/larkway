@@ -17,6 +17,7 @@ import { derivePostIdempotencyKey, digestPostContent } from "../lark/idempotency
 import type { OutboundPostClient } from "../lark/outboundPostClient.js";
 import type { OutboundCardKitClient } from "../lark/channelCardKitClient.js";
 import { CardKitReplyConversionError } from "../lark/channelCardKitClient.js";
+import type { OutboundCotClient } from "../lark/channelCotClient.js";
 import type { PerfSample } from "./perfLog.js";
 
 // ---------------------------------------------------------------------------
@@ -2977,6 +2978,138 @@ describe("handleOne — thin-channel finalize", () => {
     expect(unhandled).toEqual(["om_msg"]);
     // And it must NOT be marked handled/seen (that would permanently bury it).
     expect(acked).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// COT bubble timeline ordering (bubble created before the answer card)
+// ---------------------------------------------------------------------------
+
+describe("handleOne — COT bubble ordering (before the card)", () => {
+  const READY_STATE = {
+    status: "ready",
+    last_message: "答案正文",
+    updated_at: "2026-07-05T10:00:00.000Z",
+  };
+
+  function bubbleBotConfig() {
+    return {
+      id: "frontend",
+      name: "Frontend",
+      turn_taking_limit: 10,
+      backend: "claude",
+      cot: "brief" as const,
+      cotSurface: "bubble" as const,
+      response_surface_prototype: {
+        enabled: true,
+        allowed_chats: [],
+        allowed_threads: ["om_msg"],
+        kill_switch: false,
+        post_outbound_enabled: false,
+        cardkit_streaming_enabled: true,
+        allow_agent_mentions: true,
+        denied_mention_open_ids: [],
+        allowed_mention_open_ids: [],
+      },
+    };
+  }
+
+  async function runTurn(opts: {
+    cotClient: OutboundCotClient;
+    cotBubbleCreateBudgetMs?: number;
+    onCardCreate?: () => void;
+  }) {
+    const threadId = "om_msg";
+    const wt = await seedWorktree(threadId);
+    await seedRepoCachePath();
+    const { client: cardKitClient, calls: cardKitCalls } = makeCardKitClient();
+    if (opts.onCardCreate) {
+      const orig = cardKitClient.createCardEntity.bind(cardKitClient);
+      cardKitClient.createCardEntity = async (card) => {
+        opts.onCardCreate!();
+        return orig(card);
+      };
+    }
+    runClaudeImpl = () => ({
+      events: (async function* () {
+        yield { type: "system_init", sessionId: "sess_order", raw: {} };
+        await writeFile(stateFileMod.stateFilePathOf(wt), JSON.stringify(READY_STATE, null, 2), "utf8");
+      })(),
+      done: Promise.resolve({ exitCode: 0, sessionId: "sess_order" }),
+      kill: () => {},
+    });
+    const { renderer } = makeCardRenderer();
+    const { store } = makeSessionStore();
+    const { client, acked } = makeClient(makeEvent());
+    const handler = new BridgeHandler({
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      client: client as any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      cardRenderer: renderer as any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      sessionStore: store as any,
+      conventions: makeConventions(),
+      botConfig: bubbleBotConfig(),
+      cardKitClient,
+      cotClient: opts.cotClient,
+      cotBubbleCreateBudgetMs: opts.cotBubbleCreateBudgetMs,
+    });
+    await handler.run();
+    for (let i = 0; i < 200 && acked.length === 0; i++) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    return { acked, cardKitCalls };
+  }
+
+  it("creates the COT bubble BEFORE sending the answer card", async () => {
+    const order: string[] = [];
+    const cotClient: OutboundCotClient = {
+      async create() {
+        order.push("cot_create");
+        return { cotId: "cot_1", messageId: "om_cot_1" };
+      },
+      async resolveThreadId() {
+        return undefined;
+      },
+      async update() {},
+      async complete() {},
+    };
+    const { acked } = await runTurn({ cotClient, onCardCreate: () => order.push("card_create") });
+    expect(acked).toEqual(["om_msg"]);
+    expect(order).toContain("cot_create");
+    expect(order).toContain("card_create");
+    expect(order.indexOf("cot_create")).toBeLessThan(order.indexOf("card_create"));
+  });
+
+  it("still sends the card when the COT bubble create throws (bypass rule)", async () => {
+    const cotClient: OutboundCotClient = {
+      async create() {
+        throw new Error("code=10002 bubble create rejected");
+      },
+      async resolveThreadId() {
+        return undefined;
+      },
+      async update() {},
+      async complete() {},
+    };
+    const { acked, cardKitCalls } = await runTurn({ cotClient });
+    expect(acked).toEqual(["om_msg"]);
+    expect(cardKitCalls.map((c) => c.kind)).toContain("createCard");
+  });
+
+  it("sends the card without waiting when the COT bubble create is slow (budget)", async () => {
+    // create never resolves; the budget must let the card proceed anyway.
+    const cotClient: OutboundCotClient = {
+      create: () => new Promise(() => {}),
+      async resolveThreadId() {
+        return undefined;
+      },
+      async update() {},
+      async complete() {},
+    };
+    const { acked, cardKitCalls } = await runTurn({ cotClient, cotBubbleCreateBudgetMs: 20 });
+    expect(acked).toEqual(["om_msg"]);
+    expect(cardKitCalls.map((c) => c.kind)).toContain("createCard");
   });
 });
 
