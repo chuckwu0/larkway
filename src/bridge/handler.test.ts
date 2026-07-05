@@ -3019,6 +3019,8 @@ describe("handleOne — COT bubble ordering (before the card)", () => {
     cotBubbleCreateBudgetMs?: number;
     onCardCreate?: () => void;
     errorTurn?: boolean;
+    /** true → the topic already exists (isNewThread=false → bubble before card). */
+    existingTopic?: boolean;
   }) {
     const threadId = "om_msg";
     const wt = await seedWorktree(threadId);
@@ -3045,6 +3047,11 @@ describe("handleOne — COT bubble ordering (before the card)", () => {
     });
     const { renderer } = makeCardRenderer();
     const { store } = makeSessionStore();
+    if (opts.existingTopic) {
+      // Non-empty get() → existing = truthy → isNewThread=false → bubble first.
+      store.get = (() =>
+        ({ threadId, sessionId: "prev", lastActiveTs: 0 })) as unknown as typeof store.get;
+    }
     const { client, acked, unhandled } = makeClient(makeEvent());
     const handler = new BridgeHandler({
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -3066,7 +3073,7 @@ describe("handleOne — COT bubble ordering (before the card)", () => {
     return { acked, unhandled, cardKitCalls };
   }
 
-  it("creates the COT bubble BEFORE sending the answer card", async () => {
+  it("existing topic: creates the COT bubble BEFORE the answer card (timeline order)", async () => {
     const order: string[] = [];
     const cotClient: OutboundCotClient = {
       async create() {
@@ -3079,11 +3086,41 @@ describe("handleOne — COT bubble ordering (before the card)", () => {
       async update() {},
       async complete() {},
     };
-    const { acked } = await runTurn({ cotClient, onCardCreate: () => order.push("card_create") });
+    const { acked } = await runTurn({
+      cotClient,
+      existingTopic: true,
+      onCardCreate: () => order.push("card_create"),
+    });
     expect(acked).toEqual(["om_msg"]);
     expect(order).toContain("cot_create");
     expect(order).toContain("card_create");
     expect(order.indexOf("cot_create")).toBeLessThan(order.indexOf("card_create"));
+  });
+
+  it("new topic (first turn): sends the card BEFORE creating the bubble (so it anchors in the topic)", async () => {
+    // The card's reply creates the topic; the bubble must be created AFTER that,
+    // or it lands outside the not-yet-existing topic (real-machine bug).
+    const order: string[] = [];
+    const cotClient: OutboundCotClient = {
+      async create() {
+        order.push("cot_create");
+        return { cotId: "cot_1", messageId: "om_cot_1" };
+      },
+      async resolveThreadId() {
+        return undefined;
+      },
+      async update() {},
+      async complete() {},
+    };
+    const { acked } = await runTurn({
+      cotClient,
+      existingTopic: false, // new thread
+      onCardCreate: () => order.push("card_create"),
+    });
+    expect(acked).toEqual(["om_msg"]);
+    expect(order).toContain("cot_create");
+    expect(order).toContain("card_create");
+    expect(order.indexOf("card_create")).toBeLessThan(order.indexOf("cot_create"));
   });
 
   it("still sends the card when the COT bubble create throws (bypass rule)", async () => {
@@ -3136,7 +3173,9 @@ describe("handleOne — COT bubble ordering (before the card)", () => {
         completeReason = reason;
       },
     };
-    const { acked } = await runTurn({ cotClient, cotBubbleCreateBudgetMs: 20 });
+    // existingTopic → the (slow) create runs BEFORE the card, exercising the
+    // pre-card ordering's anti-orphan path.
+    const { acked } = await runTurn({ cotClient, cotBubbleCreateBudgetMs: 20, existingTopic: true });
     expect(acked).toEqual(["om_msg"]);
     // The turn is long done; wait for the late create + finally finalize.
     for (let i = 0; i < 100 && completeReason === undefined; i++) {
@@ -3145,7 +3184,7 @@ describe("handleOne — COT bubble ordering (before the card)", () => {
     expect(completeReason).toBe("done");
   });
 
-  it("anti-orphan: a late-adopted bubble is finalized as error on a failed turn", async () => {
+  it("anti-orphan: a late-adopted bubble is finalized as error on a failed turn (new topic, post-card)", async () => {
     let completeReason: string | undefined;
     const cotClient: OutboundCotClient = {
       create: () =>
