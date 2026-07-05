@@ -516,13 +516,18 @@ export async function run(ctx: CliContext, args: string[]): Promise<number> {
 }
 
 /**
- * True for the app-type members-endpoint 404 (`POST /tasklists/{guid}/members`
- * returns "404 page not found" for an app self-add — the bot is already a
- * member). Message-based because TaskListClient wraps the raw error before it
- * reaches here. Matches the bridge's best-effort treatment of the same failure.
+ * True ONLY for the app-type members-endpoint's raw HTTP 404 — `POST
+ * /tasklists/{guid}/members` responds "404 page not found" for an app self-add
+ * (the bot is already a member). Deliberately narrow: a bare "not found" /
+ * 不存在 / resource_not_exist is a DIFFERENT, API-level failure — e.g. the
+ * reused tasklist guid was deleted out from under us (TOCTOU) — which must NOT
+ * be swallowed as benign. So we key on the endpoint-not-found body string only,
+ * not on any generic not-found marker. Message-based because TaskListClient
+ * wraps the raw error before it reaches here; the call site guarantees this is
+ * an addTasklistMembers failure.
  */
 function isMembersEndpoint404(errMsg: string): boolean {
-  return /\b404\b|page not found|not.?found|不存在|resource_not_exist/i.test(errMsg);
+  return /page not found/i.test(errMsg);
 }
 
 /** Discriminated result of resolveAdoptTarget — see its doc comment. */

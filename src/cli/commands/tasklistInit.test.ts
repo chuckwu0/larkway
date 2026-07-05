@@ -49,6 +49,7 @@ let currentMembers: FakeMember[];
 let mockGetTasklistThrows: boolean;
 let mockAddMembersThrows404: boolean;
 let mockAddMembersThrowsScope: boolean;
+let mockAddMembersThrowsDeleted: boolean;
 
 // v3.4 --adopt mode: controllable results for the mocked userTasklistOps.js functions.
 let mockedListUserTasklists: UserOpResult<UserTasklistSummary[]>;
@@ -101,6 +102,7 @@ beforeEach(async () => {
   mockGetTasklistThrows = false;
   mockAddMembersThrows404 = false;
   mockAddMembersThrowsScope = false;
+  mockAddMembersThrowsDeleted = false;
   mockedAutoResolvedOwner = undefined; // default: auto-detect finds nothing, same as no lark-cli user login
   // v3.4 --adopt mode defaults — individual tests override to exercise each branch.
   mockedListUserTasklists = { ok: true, data: [] };
@@ -120,6 +122,7 @@ beforeEach(async () => {
         if (config.url.includes("/members") && config.method === "POST") {
           if (mockAddMembersThrows404) throw new Error("404 page not found");
           if (mockAddMembersThrowsScope) throw new Error("permission denied: missing task:tasklist:write");
+          if (mockAddMembersThrowsDeleted) throw new Error("resource_not_exist: tasklist not found (1470404)");
           const data = config.data as { members?: FakeMember[] };
           for (const m of data.members ?? []) {
             if (!currentMembers.some((existing) => existing.id === m.id)) currentMembers.push(m);
@@ -359,6 +362,21 @@ describe("tasklist-init --team", () => {
       const { resolveTaskTeamRegistryPath } = await import("../../config/paths.js");
       await claimTeamTasklistGuid(resolveTaskTeamRegistryPath(), "tl-pre-existing");
       mockAddMembersThrowsScope = true; // a real scope failure (not a 404) must still surface
+
+      const { run } = await import("./tasklistInit.js");
+      const code = await run(makeCtx(), ["--team", "bot-a", "--owner", "ou_owner"]);
+      expect(code).toBe(1);
+    });
+
+    it("BL-32 #2 (narrowed): a DELETED-tasklist 'not found' (TOCTOU, not the app-member 404) still fails hard", async () => {
+      // The narrowed isMembersEndpoint404 must NOT swallow a resource_not_exist /
+      // "tasklist not found" — that means the reused guid was deleted, a real
+      // error the operator needs to see, not the benign app-member endpoint 404.
+      await makeBot("bot-a", "cli_a", "BOT_A_SECRET");
+      const { claimTeamTasklistGuid } = await import("../../tasklist/teamRegistry.js");
+      const { resolveTaskTeamRegistryPath } = await import("../../config/paths.js");
+      await claimTeamTasklistGuid(resolveTaskTeamRegistryPath(), "tl-pre-existing");
+      mockAddMembersThrowsDeleted = true;
 
       const { run } = await import("./tasklistInit.js");
       const code = await run(makeCtx(), ["--team", "bot-a", "--owner", "ou_owner"]);
