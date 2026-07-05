@@ -111,6 +111,7 @@ beforeEach(async () => {
   capturedAddMembersAsUserCall = undefined;
   vi.resetModules();
   vi.doMock("@larksuiteoapi/node-sdk", () => ({
+    LoggerLevel: { fatal: 0, error: 1, warn: 2, info: 3, debug: 4, trace: 5 },
     Client: class {
       async request(config: { method: string; url: string; data?: unknown }) {
         capturedRequests.push(config);
@@ -453,6 +454,7 @@ describe("tasklist-init --team", () => {
       // module is evaluated its already-resolved imports can't be swapped out
       // by a later doMock call (no re-import happens inside run()).
       vi.doMock("@larksuiteoapi/node-sdk", () => ({
+        LoggerLevel: { fatal: 0, error: 1, warn: 2, info: 3, debug: 4, trace: 5 },
         Client: class {
           async request(config: { method: string; url: string; data?: unknown }) {
             capturedRequests.push(config);
@@ -476,6 +478,7 @@ describe("tasklist-init --team", () => {
     it("reports ownerConfirmedMember:false in JSON mode when the owner is missing from the readback", async () => {
       await makeBot("bot-a", "cli_a", "BOT_A_SECRET");
       vi.doMock("@larksuiteoapi/node-sdk", () => ({
+        LoggerLevel: { fatal: 0, error: 1, warn: 2, info: 3, debug: 4, trace: 5 },
         Client: class {
           async request(config: { method: string; url: string; data?: unknown }) {
             capturedRequests.push(config);

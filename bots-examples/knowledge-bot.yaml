@@ -77,9 +77,9 @@ cot: brief
 #             currently render the card panel as plain text (no collapse), so
 #             "bubble" is recommended.
 # Behavior: the answer always lands on its own card/message (never only in the
-# bubble). On the FIRST turn of a NEW topic the bubble appears just AFTER the
-# card (a platform anchoring constraint); in every other case the thinking
-# shows first. Any COT failure degrades silently and never affects the answer.
+# bubble). Inside a topic every turn shows the card first, then the thinking
+# bubble (Feishu orders the topic view); only a non-topic group reply shows the
+# thinking first. Any COT failure degrades silently and never affects the answer.
 cotSurface: bubble
 
 # L2 Agent Memory file (relative to the bots/ directory at runtime).
