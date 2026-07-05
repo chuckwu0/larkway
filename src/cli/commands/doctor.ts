@@ -556,9 +556,11 @@ async function probeTaskScope(
   tasklistGuid: string,
 ): Promise<{ ok: boolean; message?: string }> {
   try {
-    const { Client: LarkSdkClient } = await import("@larksuiteoapi/node-sdk");
+    const { Client: LarkSdkClient, LoggerLevel } = await import("@larksuiteoapi/node-sdk");
     const { TaskListClient } = await import("../../tasklist/client.js");
-    const sdkClient = new LarkSdkClient({ appId, appSecret });
+    // loggerLevel: fatal — silence the node-sdk Client's raw AxiosError dump to
+    // stdout on request failure; doctor reports its own clean pass/fail line.
+    const sdkClient = new LarkSdkClient({ appId, appSecret, loggerLevel: LoggerLevel.fatal });
     const taskClient = new TaskListClient({
       request: (config) => sdkClient.request(config as Parameters<typeof sdkClient.request>[0]),
     });
