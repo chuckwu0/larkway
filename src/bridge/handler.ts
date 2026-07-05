@@ -1187,7 +1187,13 @@ export class BridgeHandler {
       // the background (the finally's anti-orphan finalize completes a late
       // handle). This holds for BOTH orderings (a first-turn, post-card create
       // can be slow/fail too).
-      const createCotBubble = async (): Promise<void> => {
+      // `originMessageId` is the message_cot anchor. Its POSITION in the topic
+      // decides where the bubble lands (control-var experiment, cot-write-probe
+      // §F/F2): origin = the topic ROOT (首楼, pos=-1) → the bubble quote-replies
+      // at the GROUP top level (thread_id=None); origin = an IN-topic message
+      // (pos≥0) → the bubble inherits its thread and lands INSIDE the topic. So
+      // callers pass an in-topic message id whenever they have one.
+      const createCotBubble = async (originMessageId: string): Promise<void> => {
         if (!(this.deps.cotClient && cotDetail !== "off" && cotSurface === "bubble")) return;
         if (bubbleCreate) return; // once per turn
         bubbleCreate = createCotProgressHandle({
@@ -1202,7 +1208,7 @@ export class BridgeHandler {
               typeof parsed.raw.thread_id === "string" && parsed.raw.thread_id
                 ? parsed.raw.thread_id
                 : undefined,
-            originMessageId: messageId,
+            originMessageId,
           },
         });
         const raced = await Promise.race([
@@ -1226,9 +1232,10 @@ export class BridgeHandler {
         }
       };
 
-      // Existing topic → bubble BEFORE the card (timeline order). New topic
-      // (first turn) is deferred to AFTER the card (see closure + call below).
-      if (!isNewThread) await createCotBubble();
+      // Existing topic → bubble BEFORE the card, anchored on the TRIGGER message
+      // — a user follow-up inside an existing topic is itself an in-topic
+      // message (pos≥0), so the bubble lands in the topic (verified in prod).
+      if (!isNewThread) await createCotBubble(messageId);
 
       // CardKit response surface: default main surface when the transport and
       // rollout gates are available. It streams bounded progress into a
@@ -1677,12 +1684,18 @@ export class BridgeHandler {
         }
       }
 
-      // New topic (first turn): NOW create the bubble — the card's reply above
-      // has created the Feishu topic, so the trigger message is inside it and
-      // the bubble anchors into the topic (same as every later turn) instead of
-      // landing at the group top level. No-op for existing topics (already
-      // created before the card) and for cot="off"/cotSurface="card".
-      if (isNewThread) await createCotBubble();
+      // New topic (first turn): NOW create the bubble, anchored on the ANSWER
+      // CARD's message. The trigger @ is the topic root (pos=-1) — anchoring on
+      // it quote-replies at the group top level (cot-write-probe §F). The card
+      // we just sent replied reply_in_thread, so it is an in-topic message
+      // (pos=0) whose thread the bubble inherits → the bubble lands INSIDE the
+      // topic (probe §F2). Fall back to the trigger message if no card id is
+      // available (both surfaces failed) — origin=首楼 lands at the top level
+      // but is still usable; never block the turn.
+      if (isNewThread) {
+        const anchorMessageId = cardKitProgress?.messageId ?? card?.messageId ?? messageId;
+        await createCotBubble(anchorMessageId);
+      }
 
       // Step 4b–4f: spawn + stream + finalize, with one stale-session retry.
       // `currentExisting` may be reset to undefined on retry (ghost session cleared).
