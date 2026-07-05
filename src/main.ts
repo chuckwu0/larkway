@@ -1,11 +1,12 @@
 import { mkdirSync } from "node:fs";
 import path from "node:path";
 import { resolveLarkwayVersion } from "./version.js";
-import { Client as LarkSdkClient, LoggerLevel } from "@larksuiteoapi/node-sdk";
+import { Client as LarkSdkClient } from "@larksuiteoapi/node-sdk";
 import { loadConfig, loadConfigJson } from "./config.js";
 import type { Config, ConfigJsonType } from "./config.js";
 import { ChannelClient, resolveOpenChatDiscoveryMs } from "./lark/channelClient.js";
 import { CardRenderer } from "./lark/card.js";
+import { silentSdkLogger, compactErrorText } from "./lark/sdkLogger.js";
 import { SessionStore } from "./claude/sessionStore.js";
 import { BridgeHandler } from "./bridge/handler.js";
 import { upsertRuntimeEvent } from "./bridge/eventLog.js";
@@ -95,7 +96,10 @@ function printExternalCliProbe(bots: BotConfig[]): void {
  */
 async function fetchBotAvatar(appId: string, appSecret: string): Promise<string | undefined> {
   try {
-    const client = new LarkSdkClient({ appId, appSecret });
+    // logger: silentSdkLogger — this fetch is fire-and-forget with a silent
+    // catch below; without it the SDK dumps the raw AxiosError to stdout (per
+    // bot) on any failure before we swallow it. See lark/sdkLogger.ts.
+    const client = new LarkSdkClient({ appId, appSecret, logger: silentSdkLogger });
     const resp = (await client.request({
       method: "GET",
       url: "/open-apis/bot/v3/info",
@@ -466,14 +470,16 @@ async function runV2Mode({
     {
       const guid = bot.taskHandle?.tasklistGuid ?? (await readTeamTasklistGuid(resolveTaskTeamRegistryPath()));
       if (guid) {
-        // loggerLevel: fatal — the node-sdk Client otherwise dumps the full raw
-        // AxiosError (default `error` level) to stdout/the bridge log on every
-        // request failure, before our own .catch. The self-join 404 below is
-        // best-effort and warned cleanly, so that raw dump is pure log noise.
+        // silentSdkLogger — the node-sdk Client otherwise dumps the full raw
+        // AxiosError (config + ClientRequest + response) to stdout/the bridge
+        // log on every request failure, before our own .catch. The self-join
+        // 404 below is best-effort and warned cleanly, so that raw dump is pure
+        // log noise. `loggerLevel: fatal` does NOT work here (falsy-zero bug in
+        // the vendored SDK — see lark/sdkLogger.ts); a no-op logger does.
         const taskSdkClient = new LarkSdkClient({
           appId: bot.app_id,
           appSecret,
-          loggerLevel: LoggerLevel.fatal,
+          logger: silentSdkLogger,
         });
         const taskRequester: LarkTaskRequester = {
           request: (config) => taskSdkClient.request(config as Parameters<typeof taskSdkClient.request>[0]),
@@ -488,9 +494,11 @@ async function runV2Mode({
         await taskListClient
           .addTasklistMembers(guid, [{ id: bot.app_id, type: "app", role: "editor" }])
           .catch((err) => {
+            // compactErrorText, not the raw err: a TaskApiError carries the
+            // axios error on .cause, and console.warn(msg, err) would expand
+            // that cause chain into the same multi-KB AxiosError dump.
             console.warn(
-              `[larkway] bot "${bot.id}": self-join tasklist ${guid} as editor failed (continuing, best-effort):`,
-              err,
+              `[larkway] bot "${bot.id}": self-join tasklist ${guid} as editor failed (continuing, best-effort): ${compactErrorText(err)}`,
             );
           });
         effectiveTaskHandleTasklistGuid = guid;
