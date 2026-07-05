@@ -8,7 +8,7 @@
 
 import { describe, it, expect } from "vitest";
 import {
-  listUserTasklists,
+  searchUserTasklists,
   addTasklistMembersAsUser,
   getUserTasklistMembers,
   type SpawnSyncFn,
@@ -28,19 +28,45 @@ function makeSpawn(result: { status: number | null; stdout?: string; stderr?: st
   });
 }
 
-describe("listUserTasklists", () => {
-  it("parses guid + name out of a successful list response", () => {
+describe("searchUserTasklists", () => {
+  it("calls the +tasklist-search skill (not the raw list) with --as user + --query (BL-32)", () => {
+    let capturedArgs: string[] = [];
+    const spawn: SpawnSyncFn = (_cmd, args) => {
+      capturedArgs = args;
+      return { status: 0, stdout: JSON.stringify({ items: [] }), stderr: "", pid: 0, signal: null, output: [], error: undefined };
+    };
+    searchUserTasklists(PROFILE, "Agent Team", spawn);
+    // The raw `tasklists list` command false-negatives its own scope precheck;
+    // the working call is the skill + a name query.
+    expect(capturedArgs).toContain("+tasklist-search");
+    expect(capturedArgs).not.toContain("list");
+    expect(capturedArgs).toEqual(expect.arrayContaining(["--as", "user", "--query", "Agent Team", "--profile", PROFILE]));
+  });
+
+  it("parses guid + name out of a successful search response (items shape)", () => {
     const spawn = makeSpawn({
       status: 0,
       stdout: JSON.stringify({ items: [{ guid: "tl-1", name: "Agent Team" }, { guid: "tl-2", name: "个人清单" }] }),
     });
-    const result = listUserTasklists(PROFILE, spawn);
+    const result = searchUserTasklists(PROFILE, "Agent Team", spawn);
     expect(result).toEqual({ ok: true, data: [{ guid: "tl-1", name: "Agent Team" }, { guid: "tl-2", name: "个人清单" }] });
+  });
+
+  it("also parses a `tasklists`-keyed or top-level-array envelope (shape-robust)", () => {
+    const keyed = makeSpawn({ status: 0, stdout: JSON.stringify({ tasklists: [{ guid: "tl-1", name: "Agent Team" }] }) });
+    expect(searchUserTasklists(PROFILE, "Agent Team", keyed)).toEqual({ ok: true, data: [{ guid: "tl-1", name: "Agent Team" }] });
+    const topArray = makeSpawn({ status: 0, stdout: JSON.stringify([{ guid: "tl-9", name: "Agent Team" }]) });
+    expect(searchUserTasklists(PROFILE, "Agent Team", topArray)).toEqual({ ok: true, data: [{ guid: "tl-9", name: "Agent Team" }] });
+  });
+
+  it("treats an empty result array as a valid no-match (not an error)", () => {
+    const spawn = makeSpawn({ status: 0, stdout: JSON.stringify({ items: [] }) });
+    expect(searchUserTasklists(PROFILE, "Agent Team", spawn)).toEqual({ ok: true, data: [] });
   });
 
   it("falls back to a placeholder name when an item has no name", () => {
     const spawn = makeSpawn({ status: 0, stdout: JSON.stringify({ items: [{ guid: "tl-1" }] }) });
-    const result = listUserTasklists(PROFILE, spawn);
+    const result = searchUserTasklists(PROFILE, "Agent Team", spawn);
     expect(result).toEqual({ ok: true, data: [{ guid: "tl-1", name: "(无标题)" }] });
   });
 
@@ -49,7 +75,7 @@ describe("listUserTasklists", () => {
       status: 0,
       stdout: JSON.stringify({ items: [{ name: "no guid here" }, { guid: "tl-2", name: "ok" }] }),
     });
-    const result = listUserTasklists(PROFILE, spawn);
+    const result = searchUserTasklists(PROFILE, "Agent Team", spawn);
     expect(result).toEqual({ ok: true, data: [{ guid: "tl-2", name: "ok" }] });
   });
 
@@ -64,7 +90,7 @@ describe("listUserTasklists", () => {
         },
       }),
     });
-    const result = listUserTasklists(PROFILE, spawn);
+    const result = searchUserTasklists(PROFILE, "Agent Team", spawn);
     expect(result.ok).toBe(false);
     if (!result.ok) {
       expect(result.error).toContain("need_user_authorization");
@@ -72,21 +98,22 @@ describe("listUserTasklists", () => {
     }
   });
 
-  it("fails clearly when items is missing/malformed rather than silently returning an empty list", () => {
-    const spawn = makeSpawn({ status: 0, stdout: JSON.stringify({ notItems: [] }) });
-    const result = listUserTasklists(PROFILE, spawn);
+  it("fails clearly on an unrecognized shape (no array anywhere) rather than silently returning empty", () => {
+    // Silent-empty here would fall through to CREATE and accrete a duplicate.
+    const spawn = makeSpawn({ status: 0, stdout: JSON.stringify({ notItems: "nope" }) });
+    const result = searchUserTasklists(PROFILE, "Agent Team", spawn);
     expect(result.ok).toBe(false);
   });
 
   it("fails clearly on malformed JSON stdout", () => {
     const spawn = makeSpawn({ status: 0, stdout: "not json" });
-    const result = listUserTasklists(PROFILE, spawn);
+    const result = searchUserTasklists(PROFILE, "Agent Team", spawn);
     expect(result.ok).toBe(false);
   });
 
   it("fails clearly on empty stdout", () => {
     const spawn = makeSpawn({ status: 1, stdout: "" });
-    const result = listUserTasklists(PROFILE, spawn);
+    const result = searchUserTasklists(PROFILE, "Agent Team", spawn);
     expect(result.ok).toBe(false);
   });
 
@@ -94,8 +121,8 @@ describe("listUserTasklists", () => {
     const throwingSpawn: SpawnSyncFn = () => {
       throw new Error("spawnSync ENOENT");
     };
-    expect(() => listUserTasklists(PROFILE, throwingSpawn)).not.toThrow();
-    const result = listUserTasklists(PROFILE, throwingSpawn);
+    expect(() => searchUserTasklists(PROFILE, "Agent Team", throwingSpawn)).not.toThrow();
+    const result = searchUserTasklists(PROFILE, "Agent Team", throwingSpawn);
     expect(result.ok).toBe(false);
     if (!result.ok) expect(result.error).toContain("lark-cli");
   });
@@ -125,7 +152,7 @@ describe("addTasklistMembersAsUser", () => {
     expect(JSON.parse(dataArg)).toEqual({ members: [{ id: "cli_app1", type: "app", role: "editor" }] });
   });
 
-  it("surfaces a scope-missing error the same way listUserTasklists does", () => {
+  it("surfaces a scope-missing error the same way searchUserTasklists does", () => {
     const spawn = makeSpawn({
       status: 3,
       stdout: JSON.stringify({

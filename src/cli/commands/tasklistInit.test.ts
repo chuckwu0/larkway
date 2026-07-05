@@ -47,6 +47,9 @@ let mockedAutoResolvedOwner: string | undefined;
 let currentMembers: FakeMember[];
 /** When true, the fake GET .../tasklists/:guid handler throws instead of responding. */
 let mockGetTasklistThrows: boolean;
+let mockAddMembersThrows404: boolean;
+let mockAddMembersThrowsScope: boolean;
+let mockAddMembersThrowsDeleted: boolean;
 
 // v3.4 --adopt mode: controllable results for the mocked userTasklistOps.js functions.
 let mockedListUserTasklists: UserOpResult<UserTasklistSummary[]>;
@@ -97,6 +100,9 @@ beforeEach(async () => {
   capturedRequests = [];
   currentMembers = [];
   mockGetTasklistThrows = false;
+  mockAddMembersThrows404 = false;
+  mockAddMembersThrowsScope = false;
+  mockAddMembersThrowsDeleted = false;
   mockedAutoResolvedOwner = undefined; // default: auto-detect finds nothing, same as no lark-cli user login
   // v3.4 --adopt mode defaults — individual tests override to exercise each branch.
   mockedListUserTasklists = { ok: true, data: [] };
@@ -114,6 +120,26 @@ beforeEach(async () => {
           return { data: { tasklist: { guid: "tl-created-1", members: currentMembers } } };
         }
         if (config.url.includes("/members") && config.method === "POST") {
+          // Throw axios-shaped errors so the REAL TaskListClient.wrapErr path
+          // constructs a realistic TaskApiError (status/code) — mirroring the
+          // real machine, where the members-endpoint gateway 404 body is plain
+          // text (no parseable code) and the message is axios's generic one.
+          if (mockAddMembersThrows404) {
+            const e = new Error("Request failed with status code 404");
+            (e as { response?: unknown }).response = { status: 404, data: "404 page not found" };
+            throw e;
+          }
+          if (mockAddMembersThrowsScope) {
+            const e = new Error("Request failed with status code 403");
+            (e as { response?: unknown }).response = { status: 403, data: { code: 1470403, msg: "no permission" } };
+            throw e;
+          }
+          if (mockAddMembersThrowsDeleted) {
+            // TOCTOU: reused guid deleted → business resource-not-exist WITH a code.
+            const e = new Error("Request failed with status code 404");
+            (e as { response?: unknown }).response = { status: 404, data: { code: 1470404, msg: "resource not exist" } };
+            throw e;
+          }
           const data = config.data as { members?: FakeMember[] };
           for (const m of data.members ?? []) {
             if (!currentMembers.some((existing) => existing.id === m.id)) currentMembers.push(m);
@@ -133,7 +159,7 @@ beforeEach(async () => {
     resolveOwnerOpenId: () => mockedAutoResolvedOwner,
   }));
   vi.doMock("../userTasklistOps.js", () => ({
-    listUserTasklists: () => mockedListUserTasklists,
+    searchUserTasklists: () => mockedListUserTasklists,
     addTasklistMembersAsUser: (profile: string, tasklistGuid: string, members: unknown[]) => {
       capturedAddMembersAsUserCall = { profile, tasklistGuid, members };
       return mockedAddTasklistMembersAsUser;
@@ -328,6 +354,50 @@ describe("tasklist-init --team", () => {
 
       // Registry still points at the same pre-existing guid — untouched.
       await expect(readTeamTasklistGuid(resolveTaskTeamRegistryPath())).resolves.toBe("tl-pre-existing");
+    });
+
+    it("BL-32 #2: a 404 from add_members on the reuse path warns + continues (exit 0), not fatal", async () => {
+      await makeBot("bot-a", "cli_a", "BOT_A_SECRET");
+      const { claimTeamTasklistGuid, readTeamTasklistGuid } = await import("../../tasklist/teamRegistry.js");
+      const { resolveTaskTeamRegistryPath } = await import("../../config/paths.js");
+      await claimTeamTasklistGuid(resolveTaskTeamRegistryPath(), "tl-pre-existing");
+      mockAddMembersThrows404 = true; // app-type members endpoint 404s (bot already a member)
+
+      const { run } = await import("./tasklistInit.js");
+      const code = await run(makeCtx(), ["--team", "bot-a", "--owner", "ou_owner"]);
+      // Same best-effort posture as the bridge self-join — the reused list is fine.
+      expect(code).toBe(0);
+      expect(ui.warning).toHaveBeenCalled();
+      // Did NOT create a duplicate board on the way.
+      expect(capturedRequests.find((r) => r.url.endsWith("/tasklists") && r.method === "POST")).toBeUndefined();
+      await expect(readTeamTasklistGuid(resolveTaskTeamRegistryPath())).resolves.toBe("tl-pre-existing");
+    });
+
+    it("BL-32 #2: a NON-404 add_members failure on the reuse path still fails hard (exit 1)", async () => {
+      await makeBot("bot-a", "cli_a", "BOT_A_SECRET");
+      const { claimTeamTasklistGuid } = await import("../../tasklist/teamRegistry.js");
+      const { resolveTaskTeamRegistryPath } = await import("../../config/paths.js");
+      await claimTeamTasklistGuid(resolveTaskTeamRegistryPath(), "tl-pre-existing");
+      mockAddMembersThrowsScope = true; // a real scope failure (not a 404) must still surface
+
+      const { run } = await import("./tasklistInit.js");
+      const code = await run(makeCtx(), ["--team", "bot-a", "--owner", "ou_owner"]);
+      expect(code).toBe(1);
+    });
+
+    it("BL-32 #2 (narrowed): a DELETED-tasklist 'not found' (TOCTOU, not the app-member 404) still fails hard", async () => {
+      // The narrowed isMembersEndpoint404 must NOT swallow a resource_not_exist /
+      // "tasklist not found" — that means the reused guid was deleted, a real
+      // error the operator needs to see, not the benign app-member endpoint 404.
+      await makeBot("bot-a", "cli_a", "BOT_A_SECRET");
+      const { claimTeamTasklistGuid } = await import("../../tasklist/teamRegistry.js");
+      const { resolveTaskTeamRegistryPath } = await import("../../config/paths.js");
+      await claimTeamTasklistGuid(resolveTaskTeamRegistryPath(), "tl-pre-existing");
+      mockAddMembersThrowsDeleted = true;
+
+      const { run } = await import("./tasklistInit.js");
+      const code = await run(makeCtx(), ["--team", "bot-a", "--owner", "ou_owner"]);
+      expect(code).toBe(1);
     });
 
     it("reports reused:true in JSON mode when reusing", async () => {
@@ -618,42 +688,26 @@ describe("tasklist-init --adopt (v3.4, docs/task-handle.md §7)", () => {
   });
 });
 
-describe("tasklist-init auto-select adopt-vs-create (v3.4 north star, no explicit --adopt/--adopt-guid)", () => {
-  it("auto-adopts when the operator's own identity finds a same-named tasklist — no --owner needed", async () => {
+describe("tasklist-init zero-arg = CREATE by design (adopt is explicit-only, 2026-07 ownership decision)", () => {
+  it("CREATES a bot-app-owned board and does NOT auto-adopt, even when a same-named list is visible", async () => {
     await makeBot("bot-a", "cli_a", "BOT_A_SECRET");
-    mockedListUserTasklists = { ok: true, data: [{ guid: "tl-auto-adopted", name: "Agent Team" }] };
-    mockedGetUserTasklistMembers = { ok: true, data: [{ id: "cli_a", type: "app", role: "editor" }] };
-    const { run } = await import("./tasklistInit.js");
-    const code = await run(makeCtx({ json: true }), ["--team", "bot-a"]);
-    expect(code).toBe(0);
-    expect(capturedAddMembersAsUserCall?.tasklistGuid).toBe("tl-auto-adopted");
-    expect(ui.emitJson).toHaveBeenCalledWith(expect.objectContaining({ ok: true, mode: "adopt", tasklistGuid: "tl-auto-adopted" }));
-    // Never touched the SDK-based create/reuse path.
-    expect(capturedRequests.find((r) => r.url.endsWith("/tasklists"))).toBeUndefined();
-  });
-
-  it("silently falls back to the create path when the user-identity lookup fails (not logged in / missing scope)", async () => {
-    await makeBot("bot-a", "cli_a", "BOT_A_SECRET");
-    mockedListUserTasklists = { ok: false, error: "need_user_authorization" };
-    mockedAutoResolvedOwner = "ou_owner1234567890";
-    const { run } = await import("./tasklistInit.js");
-    const code = await run(makeCtx({ json: true }), ["--team", "bot-a"]);
-    expect(code).toBe(0); // no hard failure — silent fallback, not the "list-failed" error
-    expect(ui.emitJson).toHaveBeenCalledWith(expect.objectContaining({ ok: true, tasklistGuid: "tl-created-1" }));
-  });
-
-  it("silently falls back to the create path when no same-named tasklist is visible", async () => {
-    await makeBot("bot-a", "cli_a", "BOT_A_SECRET");
-    mockedListUserTasklists = { ok: true, data: [{ guid: "tl-other", name: "Some Other List" }] };
+    // A same-named board the operator could see — pre-decision this would have
+    // been auto-adopted. Now zero-arg must ignore it and CREATE (owner=bot app).
+    mockedListUserTasklists = { ok: true, data: [{ guid: "tl-visible", name: "Agent Team" }] };
     mockedAutoResolvedOwner = "ou_owner1234567890";
     const { run } = await import("./tasklistInit.js");
     const code = await run(makeCtx({ json: true }), ["--team", "bot-a"]);
     expect(code).toBe(0);
+    // Went through the SDK create path, NOT the user-identity adopt path.
+    expect(capturedRequests.find((r) => r.url.endsWith("/tasklists") && r.method === "POST")).toBeDefined();
+    expect(capturedAddMembersAsUserCall).toBeUndefined(); // adopt's user-identity add never ran
     expect(ui.emitJson).toHaveBeenCalledWith(expect.objectContaining({ ok: true, tasklistGuid: "tl-created-1" }));
   });
 
-  it("still hard-fails on a genuinely ambiguous same-named match, even with no explicit --adopt (never guesses)", async () => {
+  it("CREATES even when MULTIPLE same-named lists are visible — no ambiguity failure (never queries)", async () => {
     await makeBot("bot-a", "cli_a", "BOT_A_SECRET");
+    // Pre-decision this hard-failed as ambiguous; now zero-arg never queries, so
+    // it just creates.
     mockedListUserTasklists = {
       ok: true,
       data: [
@@ -661,11 +715,23 @@ describe("tasklist-init auto-select adopt-vs-create (v3.4 north star, no explici
         { guid: "tl-dup-2", name: "Agent Team" },
       ],
     };
+    mockedAutoResolvedOwner = "ou_owner1234567890";
     const { run } = await import("./tasklistInit.js");
-    const code = await run(makeCtx(), ["--team", "bot-a"]);
-    expect(code).toBe(1);
-    expect(ui.failure).toHaveBeenCalledWith(expect.stringContaining("--adopt-guid"));
-    // Never fell through to create — no POST to /tasklists.
-    expect(capturedRequests.find((r) => r.url.endsWith("/tasklists"))).toBeUndefined();
+    const code = await run(makeCtx({ json: true }), ["--team", "bot-a"]);
+    expect(code).toBe(0);
+    expect(ui.emitJson).toHaveBeenCalledWith(expect.objectContaining({ ok: true, tasklistGuid: "tl-created-1" }));
+  });
+
+  it("CREATES with no loud duplicate-warning (zero-arg has no adopt query to fail)", async () => {
+    await makeBot("bot-a", "cli_a", "BOT_A_SECRET");
+    mockedListUserTasklists = { ok: false, error: "should never be consulted in zero-arg" };
+    mockedAutoResolvedOwner = "ou_owner1234567890";
+    const { run } = await import("./tasklistInit.js");
+    const code = await run(makeCtx(), ["--team", "bot-a"]); // non-JSON
+    expect(code).toBe(0);
+    const warnedText = (ui.warning as unknown as { mock: { calls: unknown[][] } }).mock.calls
+      .map((c) => String(c[0]))
+      .join("\n");
+    expect(warnedText).not.toContain("重复"); // no duplicate scare — zero-arg doesn't query
   });
 });
