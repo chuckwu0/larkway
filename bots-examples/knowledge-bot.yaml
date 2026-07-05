@@ -63,6 +63,25 @@ runtime: agent_workspace
 # "claude" = local Claude Code (reads ~/.claude/.credentials.json).
 backend: claude
 
+# Chain-of-thought (COT) display — surface the agent's thinking + tool activity
+# while it works, so the user isn't left staring at a bare "working…" card.
+#   off       no thinking shown, no extra message (pick this if you find the
+#             extra message noisy).
+#   brief     (default) thinking text + tool names.
+#   detailed  also shows tool arguments + truncated tool results.
+cot: brief
+
+# Where the thinking is shown:
+#   bubble    (default) Feishu's native, collapsible chain-of-thought bubble.
+#   card      experimental — folded into the answer card. NOTE: Feishu clients
+#             currently render the card panel as plain text (no collapse), so
+#             "bubble" is recommended.
+# Behavior: the answer always lands on its own card/message (never only in the
+# bubble). On the FIRST turn of a NEW topic the bubble appears just AFTER the
+# card (a platform anchoring constraint); in every other case the thinking
+# shows first. Any COT failure degrades silently and never affects the answer.
+cotSurface: bubble
+
 # L2 Agent Memory file (relative to the bots/ directory at runtime).
 # Loaded at startup and injected as <agent-memory> role preamble.
 # Keep it thin: WHO the bot is + what it must NOT do.
