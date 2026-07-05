@@ -8,8 +8,11 @@ import {
   buildCardKitFinalCard,
   buildCardKitFinalMarkdown,
   buildCardKitInitialCard,
+  buildCotPanelElement,
   CARDKIT_FOOTER_ELEMENT_ID,
   CARDKIT_FINAL_ELEMENT_ID,
+  CARDKIT_COT_PANEL_ELEMENT_ID,
+  CARDKIT_COT_INNER_ELEMENT_ID,
   type BuildCardKitFinalCardOpts,
 } from "../lark/cardkitSurface.js";
 
@@ -23,6 +26,17 @@ const DEFAULT_PATCH_INTERVAL_MS = 250;
 const DEFAULT_MAX_PROGRESS_UPDATES = 240;
 /** A6: patch-interval backoff ladder once the soft budget is exceeded, capped at the last entry. */
 const BACKOFF_LADDER_MS = [250, 1_000, 2_000, 5_000];
+
+/**
+ * COT-in-card (方案 B): hard cap on reasoning-panel text to keep the card small.
+ * NOTE (accepted nit): the COT patch channel reuses patchIntervalMs but is NOT
+ * on the answer's A6 soft-budget/backoff ladder. That's fine here — this
+ * char budget bounds total panel writes far below where backoff would matter.
+ */
+const COT_PANEL_BUDGET_CHARS = 4_000;
+/** Detailed-tier tool arg / result caps inside the panel. */
+const COT_TOOL_ARGS_MAX = 200;
+const COT_TOOL_RESULT_MAX = 1_200;
 
 export interface CardKitLiveMetrics {
   answerDeltaCount: number;
@@ -50,6 +64,8 @@ export interface CardKitProgressHandle {
   drain(): Promise<void>;
   finalize(opts: BuildCardKitFinalCardOpts): Promise<void>;
   close(): void;
+  /** COT-in-card: mark this turn errored so the panel's settled title reflects it. */
+  markCotError(): void;
 }
 
 export interface CreateCardKitProgressHandleOpts {
@@ -65,6 +81,16 @@ export interface CreateCardKitProgressHandleOpts {
   patchIntervalMs?: number;
   /** Soft budget before patch cadence backs off (A6) — no longer a hard stop. */
   maxProgressUpdates?: number;
+  /**
+   * COT-in-card (方案 B): when present (cotSurface="card" && cot!="off"), the
+   * handle lazily inserts a collapsible reasoning panel on the FIRST thinking/
+   * tool event and streams reasoning + tool activity into it. Absent = no
+   * panel (the bubble path or cot="off"). `detail` mirrors bot config: brief =
+   * tool name only, detailed = + truncated args + truncated result.
+   */
+  cot?: { detail: "brief" | "detailed" };
+  /** Fired once when the panel element is first created — persists the id for resume. */
+  onCotPanelCreated?: (elementId: string) => void;
   onSequenceCommitted?: (sequence: number) => Promise<void>;
   onLiveMetricsChanged?: (metrics: CardKitLiveMetrics & { sequence: number }) => void;
 }
@@ -118,6 +144,50 @@ function toolStatusText(toolUseCount: number): string {
     : "努力回答中...";
 }
 
+function clip(value: unknown, max: number): string {
+  const text = String(value ?? "");
+  return text.length > max ? `${text.slice(0, max)}…` : text;
+}
+
+/**
+ * Brief-tier tool title for the panel: the tool NAME only — never the command
+ * args. Fixes the bubble version's leak of full command parameters at the
+ * brief tier (方案 B spec item 3).
+ */
+function cotBriefToolTitle(name: string): string {
+  return String(name ?? "tool");
+}
+
+/**
+ * Best-effort text of a tool_result for the detailed tier — larkway's
+ * tool_result event carries only `raw` (a claude `user` message). Any miss
+ * returns "" and the caller renders no result line.
+ */
+function cotExtractToolResultText(raw: unknown): string {
+  if (typeof raw !== "object" || raw === null) return "";
+  const message = (raw as Record<string, unknown>)["message"];
+  if (typeof message !== "object" || message === null) return "";
+  const content = (message as Record<string, unknown>)["content"];
+  if (!Array.isArray(content)) return "";
+  const parts: string[] = [];
+  for (const item of content) {
+    if (typeof item !== "object" || item === null) continue;
+    const block = item as Record<string, unknown>;
+    if (block["type"] !== "tool_result") continue;
+    const inner = block["content"];
+    if (typeof inner === "string") parts.push(inner);
+    else if (Array.isArray(inner)) {
+      for (const piece of inner) {
+        if (typeof piece === "object" && piece !== null) {
+          const text = (piece as Record<string, unknown>)["text"];
+          if (typeof text === "string") parts.push(text);
+        }
+      }
+    }
+  }
+  return parts.join("\n").trim();
+}
+
 class LiveCardKitProgressHandle implements CardKitProgressHandle {
   readonly cardId: string;
   readonly messageId: string;
@@ -139,6 +209,18 @@ class LiveCardKitProgressHandle implements CardKitProgressHandle {
   private metrics: CardKitLiveMetrics = initialLiveMetrics();
   sequence = 0;
 
+  // COT-in-card (方案 B) state. All no-ops when cotDetail is undefined.
+  private readonly cotDetail?: "brief" | "detailed";
+  private readonly onCotPanelCreated?: (elementId: string) => void;
+  private cotBuffer = "";
+  private cotTruncated = false;
+  private cotPanelCreated = false;
+  private cotPendingPatch: ReturnType<typeof setTimeout> | null = null;
+  private cotSawThinkingDelta = false;
+  private cotToolIndex = 0;
+  private readonly cotPendingTools: string[] = [];
+  private cotErrored = false;
+
   constructor(opts: {
     cardKitClient: OutboundCardKitClient;
     cardId: string;
@@ -146,6 +228,8 @@ class LiveCardKitProgressHandle implements CardKitProgressHandle {
     idempotencyKey: string;
     patchIntervalMs: number;
     maxProgressUpdates: number;
+    cot?: { detail: "brief" | "detailed" };
+    onCotPanelCreated?: (elementId: string) => void;
     onSequenceCommitted?: (sequence: number) => Promise<void>;
     onLiveMetricsChanged?: (metrics: CardKitLiveMetrics & { sequence: number }) => void;
   }) {
@@ -155,6 +239,8 @@ class LiveCardKitProgressHandle implements CardKitProgressHandle {
     this.idempotencyKey = opts.idempotencyKey;
     this.patchIntervalMs = opts.patchIntervalMs;
     this.maxProgressUpdates = opts.maxProgressUpdates;
+    this.cotDetail = opts.cot?.detail;
+    this.onCotPanelCreated = opts.onCotPanelCreated;
     this.onSequenceCommitted = opts.onSequenceCommitted;
     this.onLiveMetricsChanged = opts.onLiveMetricsChanged;
   }
@@ -169,6 +255,10 @@ class LiveCardKitProgressHandle implements CardKitProgressHandle {
 
   handle(event: AgentStreamEvent): void {
     if (this.closed) return;
+    // COT-in-card panel (方案 B): reasoning + tool activity into the collapsible
+    // panel, in parallel with the status/answer handling below. No-op unless
+    // cotDetail is set. Best-effort — a panel error never touches the answer.
+    if (this.cotDetail) this.handleCot(event);
     if (event.type === "tool_use") {
       this.recordToolUse();
       this.patchStatus(toolStatusText(this.metrics.toolUseCount));
@@ -188,6 +278,11 @@ class LiveCardKitProgressHandle implements CardKitProgressHandle {
   }
 
   async drain(): Promise<void> {
+    if (this.cotPendingPatch) {
+      clearTimeout(this.cotPendingPatch);
+      this.cotPendingPatch = null;
+      await this.cotPatch();
+    }
     if (this.pendingPatch) {
       clearTimeout(this.pendingPatch);
       this.pendingPatch = null;
@@ -199,6 +294,9 @@ class LiveCardKitProgressHandle implements CardKitProgressHandle {
   async finalize(opts: BuildCardKitFinalCardOpts): Promise<void> {
     await this.drain();
     this.closed = true;
+    // Embed the collapsed reasoning panel INTO the final card (updateCardEntity
+    // rebuilds the whole card, so a separate PATCH would be clobbered).
+    const finalOpts: BuildCardKitFinalCardOpts = { ...opts, cotPanel: this.cotPanelForFinalCard() };
     const finalMarkdown = buildCardKitFinalMarkdown(opts);
     if (finalMarkdown !== this.answerBuffer) {
       await this.withAnswerElement(finalMarkdown);
@@ -216,7 +314,7 @@ class LiveCardKitProgressHandle implements CardKitProgressHandle {
       this.answerBuffer = finalMarkdown;
     }
     await this.next((sequence) =>
-      this.cardKitClient.updateCardEntity(this.cardId, buildCardKitFinalCard(opts), {
+      this.cardKitClient.updateCardEntity(this.cardId, buildCardKitFinalCard(finalOpts), {
         sequence,
         uuid: sequenceUuid(this.cardId, "final-card", sequence),
       }),
@@ -244,6 +342,142 @@ class LiveCardKitProgressHandle implements CardKitProgressHandle {
       clearTimeout(this.pendingPatch);
       this.pendingPatch = null;
     }
+    if (this.cotPendingPatch) {
+      clearTimeout(this.cotPendingPatch);
+      this.cotPendingPatch = null;
+    }
+  }
+
+  /** Mark the reasoning panel's turn as errored so its settled title reflects it. */
+  markCotError(): void {
+    this.cotErrored = true;
+  }
+
+  // ── COT-in-card (方案 B) ────────────────────────────────────────────────
+  //
+  // Reasoning + tool activity stream into a collapsible_panel that is created
+  // LAZILY on the first such event (a thinking-free short turn shows no panel),
+  // inserted above the answer, then collapsed + retitled inside the final card
+  // (buildCardKitFinalCard, not a separate PATCH — the full-card rebuild would
+  // clobber a PATCH). Every step is best-effort: a panel failure never touches
+  // the answer stream.
+
+  private handleCot(event: AgentStreamEvent): void {
+    switch (event.type) {
+      case "thinking_delta":
+        this.cotSawThinkingDelta = true;
+        this.cotAppendReasoning(event.text);
+        break;
+      case "thinking_snapshot":
+        // Catch-up only (same rule as the bubble): deltas are the source of
+        // truth when partial streaming is on; snapshot renders only if none.
+        if (this.cotSawThinkingDelta) break;
+        this.cotAppendReasoning(event.text);
+        break;
+      case "tool_use":
+        this.cotAppendToolUse(event.toolName, event.toolInput);
+        break;
+      case "tool_result":
+        this.cotAppendToolResult(event.raw);
+        break;
+      default:
+        break;
+    }
+  }
+
+  private cotAppendReasoning(text: string): void {
+    this.cotAppend(text);
+  }
+
+  private cotAppendToolUse(toolName: string, toolInput: unknown): void {
+    this.cotPendingTools.push(`tool-${++this.cotToolIndex}`);
+    let line = `\n\n🔧 ${cotBriefToolTitle(toolName)}`;
+    if (this.cotDetail === "detailed" && toolInput !== undefined && toolInput !== null) {
+      line += `\n\`\`\`\n${clip(JSON.stringify(toolInput), COT_TOOL_ARGS_MAX)}\n\`\`\``;
+    }
+    this.cotAppend(line);
+  }
+
+  private cotAppendToolResult(raw: unknown): void {
+    this.cotPendingTools.shift();
+    if (this.cotDetail !== "detailed") return;
+    const text = cotExtractToolResultText(raw);
+    if (!text) return;
+    this.cotAppend(`\n> ${clip(text, COT_TOOL_RESULT_MAX).replace(/\n/g, "\n> ")}`);
+  }
+
+  /** Append to the panel buffer under the hard char budget, then schedule a patch. */
+  private cotAppend(text: string): void {
+    if (this.closed || this.cotTruncated) return;
+    const remaining = COT_PANEL_BUDGET_CHARS - this.cotBuffer.length;
+    if (text.length >= remaining) {
+      // This append reaches the budget: keep what fits, add a truncation
+      // marker, and stop accepting further reasoning for the rest of the turn.
+      this.cotBuffer += text.slice(0, Math.max(0, remaining)) + "\n\n_…思考内容较长，后续省略_";
+      this.cotTruncated = true;
+    } else {
+      this.cotBuffer += text;
+    }
+    this.cotSchedulePatch();
+  }
+
+  private cotSchedulePatch(): void {
+    if (this.cotPendingPatch || this.closed) return;
+    this.cotPendingPatch = setTimeout(() => {
+      this.cotPendingPatch = null;
+      void this.cotPatch();
+    }, this.patchIntervalMs);
+    this.cotPendingPatch.unref?.();
+  }
+
+  private async cotPatch(): Promise<void> {
+    if (this.closed || !this.cotBuffer) return;
+    this.inFlight = this.inFlight
+      .then(() => this.cotEnsurePanel())
+      .then(() =>
+        this.next((sequence) =>
+          this.cardKitClient.streamElementContent(
+            this.cardId,
+            CARDKIT_COT_INNER_ELEMENT_ID,
+            this.cotBuffer,
+            { sequence, uuid: sequenceUuid(this.cardId, "cot-inner", sequence) },
+          ),
+        ),
+      )
+      .catch((err) => {
+        console.warn("[cardkit_progress] COT panel patch failed (continuing):", err);
+      });
+    await this.inFlight;
+  }
+
+  /** Lazily insert the expanded reasoning panel, once, above the answer/footer. */
+  private async cotEnsurePanel(): Promise<void> {
+    if (this.cotPanelCreated) return;
+    this.cotPanelCreated = true;
+    const target = this.answerElementCreated
+      ? CARDKIT_FINAL_ELEMENT_ID
+      : CARDKIT_FOOTER_ELEMENT_ID;
+    await this.next((sequence) =>
+      this.cardKitClient.createElements(
+        this.cardId,
+        [buildCotPanelElement({ expanded: true, title: "思考中…", content: this.cotBuffer || "…" })],
+        {
+          sequence,
+          uuid: sequenceUuid(this.cardId, "cot-panel", sequence),
+          type: "insert_before",
+          targetElementId: target,
+        },
+      ),
+    );
+    this.onCotPanelCreated?.(CARDKIT_COT_PANEL_ELEMENT_ID);
+  }
+
+  private cotPanelForFinalCard(): BuildCardKitFinalCardOpts["cotPanel"] {
+    if (!this.cotPanelCreated) return undefined;
+    return {
+      title: this.cotErrored ? "思考过程（本轮出错）" : "思考过程",
+      content: this.cotBuffer,
+    };
   }
 
   private recordAnswerEvent(type: "answer_delta" | "answer_snapshot"): void {
@@ -436,11 +670,20 @@ export async function createCardKitProgressHandle(
     idempotencyKey: key,
     patchIntervalMs: opts.patchIntervalMs ?? DEFAULT_PATCH_INTERVAL_MS,
     maxProgressUpdates: opts.maxProgressUpdates ?? DEFAULT_MAX_PROGRESS_UPDATES,
+    cot: opts.cot,
+    onCotPanelCreated: opts.onCotPanelCreated,
     onSequenceCommitted: opts.onSequenceCommitted,
     onLiveMetricsChanged: opts.onLiveMetricsChanged,
   });
 }
 
+/**
+ * Boot-reconcile finalize for a card orphaned by a bridge crash.
+ * NOTE (accepted nit): the streamed reasoning-panel content lives only in the
+ * in-process handle, so a crash-recovery finalize rebuilds the final card
+ * WITHOUT the COT panel (the reasoning is dropped). Acceptable degradation —
+ * the panel is cosmetic; the answer itself is reconciled from state.json.
+ */
 export async function finalizeExistingCardKitCard(opts: {
   cardKitClient: OutboundCardKitClient;
   cardId: string;

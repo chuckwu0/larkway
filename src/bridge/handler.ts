@@ -634,6 +634,8 @@ export interface BridgeHandlerDeps {
      * 缺省视为 "brief"。仅在非 "off" 时 main.ts 才注入 cotClient。
      */
     cot?: "off" | "brief" | "detailed";
+    /** COT 展示形态(方案 B):"card"(默认,折叠进卡片)| "bubble"(实验,message_cot 气泡)。 */
+    cotSurface?: "card" | "bubble";
   };
   /**
    * Optional outbound post transport. main.ts only injects this when the bot's
@@ -1133,6 +1135,17 @@ export class BridgeHandler {
         });
       };
 
+      // COT (方案 B) surface resolution — shared by the CardKit panel (below)
+      // and the experimental bubble (further down). "card" (default) folds
+      // reasoning into the answer card's collapsible panel; "bubble" uses the
+      // message_cot side channel.
+      const cotDetail = this.deps.botConfig?.cot ?? "brief";
+      const cotSurface = this.deps.botConfig?.cotSurface ?? "card";
+      const cotCardOption =
+        cotDetail !== "off" && cotSurface === "card"
+          ? { detail: cotDetail as "brief" | "detailed" }
+          : undefined;
+
       // CardKit response surface: default main surface when the transport and
       // rollout gates are available. It streams bounded progress into a
       // thinking area during execution, then replaces the card entity with a
@@ -1153,6 +1166,21 @@ export class BridgeHandler {
                 triggerMessageId: messageId,
               },
               initialStatusText: "努力回答中...",
+              cot: cotCardOption,
+              onCotPanelCreated: (elementId) => {
+                // Persist the reasoning panel's element id (cardkitFile's
+                // reserved `thinking` slot) so a crash-recovery reconcile knows
+                // the panel exists. Best-effort; shallow-merge keeps footer/final.
+                void updateCardKitRecord({
+                  elements: {
+                    ...(cardKitRecord?.elements ?? {
+                      footer: { elementId: "footer_md" },
+                      final: { elementId: "final_md" },
+                    }),
+                    thinking: { elementId },
+                  },
+                }).catch(() => {});
+              },
               onSequenceCommitted: async (sequence) => {
                 await updateCardKitRecord({ status: "streaming", sequence });
               },
@@ -1573,8 +1601,12 @@ export class BridgeHandler {
       // silently. Only reasoning + tool activity flow here; the final answer
       // stays exclusively on the card. Topic groups anchor on the omt_ thread
       // id; other chats fall back to chat_id + the trigger message.
-      const cotDetail = this.deps.botConfig?.cot ?? "brief";
-      if (this.deps.cotClient && cotDetail !== "off") {
+      // 方案 B: the reasoning bubble is now the EXPERIMENTAL surface — only
+      // built when the bot opts into cotSurface="bubble". The default
+      // ("card") streams reasoning into the answer card's collapsible panel
+      // (wired into createCardKitProgressHandle above via `cot`), no bubble.
+      // `cotDetail`/`cotSurface` are resolved once above (shared with the panel).
+      if (this.deps.cotClient && cotDetail !== "off" && cotSurface === "bubble") {
         cotPublisher = await createCotProgressHandle({
           cotClient: this.deps.cotClient,
           detail: cotDetail,
@@ -2168,6 +2200,10 @@ export class BridgeHandler {
               });
             }
             try {
+              // COT-in-card: a failed turn (bot-reported failure OR idle-timeout
+              // interrupt — both set success=false) settles the reasoning panel
+              // with the errored title. No-op when no panel was created.
+              if (!success) cardKitProgress.markCotError();
               await cardKitProgress.finalize({
                 title: baseCardPayload.titleOverride,
                 finalText: baseCardPayload.finalText,
@@ -2405,6 +2441,9 @@ export class BridgeHandler {
       };
       if (!card && cardKitProgress) {
         try {
+          // COT-in-card: this is the hard-crash path — settle the reasoning
+          // panel with the errored title. No-op when no panel was created.
+          cardKitProgress.markCotError();
           await cardKitProgress.finalize({
             finalText: hardFailureText,
           });

@@ -350,3 +350,170 @@ describe("CardKitProgressHandle", () => {
     });
   });
 });
+
+// ---------------------------------------------------------------------------
+// COT-in-card collapsible panel (方案 B)
+// ---------------------------------------------------------------------------
+
+describe("CardKitProgressHandle — COT-in-card panel (方案 B)", () => {
+  function makeHandle(detail: "brief" | "detailed", extra: Record<string, unknown> = {}) {
+    const { client, calls } = fakeCardKitClient();
+    return { client, calls, promise: createCardKitProgressHandle({
+      cardKitClient: client,
+      replyToMessageId: "trigger_message",
+      replyInThread: true,
+      facts: { botId: "bot", threadId: "thread", triggerMessageId: "trigger_message" },
+      patchIntervalMs: 0,
+      cot: { detail },
+      ...extra,
+    }) };
+  }
+
+  it("lazily creates NO panel when no thinking/tool events arrive", async () => {
+    const { calls, promise } = makeHandle("brief");
+    const handle = await promise;
+    handle.handle({ type: "answer_snapshot", text: "答案", raw: {} });
+    await handle.drain();
+    const panelCreate = calls.find(
+      (c) => c.name === "createElements" &&
+        JSON.stringify(c.args[1]).includes("collapsible_panel"),
+    );
+    expect(panelCreate).toBeUndefined();
+  });
+
+  it("lazily creates the panel on first thinking and streams reasoning into cot_inner_md", async () => {
+    let panelElementId: string | undefined;
+    const { calls, promise } = makeHandle("brief", {
+      onCotPanelCreated: (id: string) => { panelElementId = id; },
+    });
+    const handle = await promise;
+    handle.handle({ type: "thinking_delta", text: "让我想想", raw: {} });
+    await handle.drain();
+
+    const panelCreate = calls.find(
+      (c) => c.name === "createElements" &&
+        JSON.stringify(c.args[1]).includes("collapsible_panel"),
+    );
+    expect(panelCreate).toBeDefined();
+    // Panel is expanded with a "思考中…" title, inserted above the answer/footer.
+    expect(JSON.stringify(panelCreate!.args[1])).toContain("思考中");
+    expect(JSON.stringify(panelCreate!.args[1])).toContain("cot_inner_md");
+    expect(panelCreate!.args[2]).toMatchObject({ type: "insert_before" });
+    // Reasoning streamed into the inner element.
+    const innerStream = calls.filter(
+      (c) => c.name === "streamElementContent" && c.args[1] === "cot_inner_md",
+    );
+    expect(innerStream.length).toBeGreaterThan(0);
+    expect(innerStream.at(-1)!.args[2]).toContain("让我想想");
+    // Resume hook fired with the panel id.
+    expect(panelElementId).toBe("cot_panel");
+  });
+
+  it("brief tier renders the tool NAME only — never the command args (bubble leak fix)", async () => {
+    const { calls, promise } = makeHandle("brief");
+    const handle = await promise;
+    handle.handle({ type: "thinking_delta", text: "先看看", raw: {} });
+    handle.handle({
+      type: "tool_use",
+      toolName: "Bash",
+      toolInput: { command: "cat /etc/secret.txt", token: "SUPERSECRET" },
+      raw: {},
+    });
+    await handle.drain();
+    const inner = calls
+      .filter((c) => c.name === "streamElementContent" && c.args[1] === "cot_inner_md")
+      .at(-1)!.args[2] as string;
+    expect(inner).toContain("Bash");
+    expect(inner).not.toContain("cat /etc/secret.txt");
+    expect(inner).not.toContain("SUPERSECRET");
+  });
+
+  it("detailed tier includes truncated args + result", async () => {
+    const { calls, promise } = makeHandle("detailed");
+    const handle = await promise;
+    handle.handle({ type: "thinking_delta", text: "读文件", raw: {} });
+    handle.handle({ type: "tool_use", toolName: "Read", toolInput: { file_path: "/x" }, raw: {} });
+    handle.handle({
+      type: "tool_result",
+      raw: { message: { content: [{ type: "tool_result", content: "文件内容 abc" }] } },
+    });
+    await handle.drain();
+    const inner = calls
+      .filter((c) => c.name === "streamElementContent" && c.args[1] === "cot_inner_md")
+      .at(-1)!.args[2] as string;
+    expect(inner).toContain("Read");
+    expect(inner).toContain("/x");
+    expect(inner).toContain("文件内容 abc");
+  });
+
+  it("caps the panel text at the char budget with an ellipsis marker", async () => {
+    const { calls, promise } = makeHandle("brief");
+    const handle = await promise;
+    for (let i = 0; i < 60; i++) {
+      handle.handle({ type: "thinking_delta", text: "x".repeat(100), raw: {} });
+    }
+    await handle.drain();
+    const inner = calls
+      .filter((c) => c.name === "streamElementContent" && c.args[1] === "cot_inner_md")
+      .at(-1)!.args[2] as string;
+    expect(inner.length).toBeLessThan(4200); // ~4000 cap + short marker
+    expect(inner).toContain("省略");
+  });
+
+  it("finalize embeds the COLLAPSED panel (title 思考过程) into the final card", async () => {
+    const { calls, promise } = makeHandle("brief");
+    const handle = await promise;
+    handle.handle({ type: "thinking_delta", text: "推理内容", raw: {} });
+    handle.handle({ type: "answer_snapshot", text: "答案", raw: {} });
+    await handle.finalize({ finalText: "答案" });
+
+    const finalCardCall = calls.filter((c) => c.name === "updateCardEntity").at(-1)!;
+    const cardJson = JSON.stringify(finalCardCall.args[1]);
+    expect(cardJson).toContain("collapsible_panel");
+    expect(cardJson).toContain("思考过程");
+    expect(cardJson).not.toContain("思考中"); // no longer the streaming title
+    expect(cardJson).toContain("推理内容"); // reasoning preserved
+    // collapsed
+    const card = finalCardCall.args[1] as { body: { elements: Array<Record<string, unknown>> } };
+    const panel = card.body.elements.find((e) => e["tag"] === "collapsible_panel")!;
+    expect(panel["expanded"]).toBe(false);
+    // panel sits ABOVE the answer element
+    const panelIdx = card.body.elements.findIndex((e) => e["tag"] === "collapsible_panel");
+    const answerIdx = card.body.elements.findIndex((e) => e["element_id"] === "final_md");
+    expect(panelIdx).toBeLessThan(answerIdx);
+  });
+
+  it("markCotError sets the errored panel title", async () => {
+    const { calls, promise } = makeHandle("brief");
+    const handle = await promise;
+    handle.handle({ type: "thinking_delta", text: "推理", raw: {} });
+    handle.markCotError();
+    await handle.finalize({ finalText: "出错了" });
+    const cardJson = JSON.stringify(calls.filter((c) => c.name === "updateCardEntity").at(-1)!.args[1]);
+    expect(cardJson).toContain("思考过程（本轮出错）");
+  });
+
+  it("a panel streaming failure never breaks the answer finalize (best-effort)", async () => {
+    const { client, calls } = fakeCardKitClient();
+    // Make ONLY the cot_inner stream throw; the answer path must still finalize.
+    const origStream = client.streamElementContent;
+    client.streamElementContent = async (cardId, elementId, content, opts) => {
+      if (elementId === "cot_inner_md") throw new Error("panel stream boom");
+      return origStream(cardId, elementId, content, opts);
+    };
+    const handle = await createCardKitProgressHandle({
+      cardKitClient: client,
+      replyToMessageId: "trigger_message",
+      replyInThread: true,
+      facts: { botId: "bot", threadId: "thread", triggerMessageId: "trigger_message" },
+      patchIntervalMs: 0,
+      cot: { detail: "brief" },
+    });
+    handle.handle({ type: "thinking_delta", text: "推理", raw: {} });
+    handle.handle({ type: "answer_snapshot", text: "答案", raw: {} });
+    await expect(handle.finalize({ finalText: "答案" })).resolves.toBeUndefined();
+    // Answer still streamed + final card written.
+    expect(calls.some((c) => c.name === "streamElementContent" && c.args[1] === "final_md")).toBe(true);
+    expect(calls.some((c) => c.name === "updateCardEntity")).toBe(true);
+  });
+});

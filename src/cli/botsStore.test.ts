@@ -30,6 +30,7 @@ const sampleBot = (): BotConfig =>
     runtime: "legacy",
     backend: "claude",
     cot: "brief",
+    cotSurface: "card",
   }) as BotConfig;
 
 beforeEach(async () => {

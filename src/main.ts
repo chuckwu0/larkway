@@ -429,10 +429,14 @@ async function runV2Mode({
     )
       ? client.outboundCardKitClient()
       : undefined;
-    // COT (思维链) bubble transport — provisioned only when the bot opts in
-    // (cot != "off"). Uses the SDK's generic rawClient.request(), so no new
-    // auth surface; the handler degrades silently on any failure.
-    const cotClient = bot.cot !== "off" ? client.outboundCotClient() : undefined;
+    // COT (思维链) bubble transport — 方案 B made the bubble the EXPERIMENTAL
+    // surface, so this is provisioned only when the bot opts into
+    // cotSurface="bubble" (and cot != "off"). The default "card" surface folds
+    // reasoning into the answer card and needs no message_cot client.
+    const cotClient =
+      bot.cot !== "off" && bot.cotSurface === "bubble"
+        ? client.outboundCotClient()
+        : undefined;
 
     // Task-handle (docs/task-handle.md v2: team-shared single tasklist).
     // No `enabled` flag gates this — the real gate is whether a LIVE guid
@@ -752,6 +756,7 @@ async function runV2Mode({
         model: bot.model,
         effort: bot.effort,
         cot: bot.cot,
+        cotSurface: bot.cotSurface,
       },
       cardKitClient,
       cotClient,

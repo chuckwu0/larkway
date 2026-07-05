@@ -1141,6 +1141,9 @@ describe("handleOne — thin-channel finalize", () => {
       return {
         events: (async function* () {
           yield { type: "system_init", sessionId: "sess_idle", raw: {} };
+          // Emit one reasoning delta so a COT-in-card panel exists this turn —
+          // lets us assert the failure-path panel title below.
+          yield { type: "thinking_delta", text: "思考中断测试", raw: {} };
           while (!killed) await new Promise((r) => setTimeout(r, 5));
         })(),
         done,
@@ -1203,6 +1206,15 @@ describe("handleOne — thin-channel finalize", () => {
     expect(stream?.content).not.toContain("请再 @ 我一次");
     const settings = cardKitCalls.find((c) => c.kind === "settings");
     expect(JSON.stringify(settings?.payload)).toContain("本轮被中断");
+    // COT-in-card: the failed (idle-interrupted) turn settles the reasoning
+    // panel with the errored title — proves handler wires markCotError() on the
+    // failure path (was production-unreachable before).
+    const panelCreate = cardKitCalls.find(
+      (c) => c.kind === "createElements" && JSON.stringify(c.payload).includes("collapsible_panel"),
+    );
+    expect(panelCreate).toBeDefined();
+    const finalCard = cardKitCalls.filter((c) => c.kind === "updateCard").at(-1);
+    expect(JSON.stringify(finalCard?.payload)).toContain("思考过程（本轮出错）");
   });
 
   it("A3: does not kill an idle-stuck turn while a real tool call is in flight (tool_use with no matching tool_result yet)", async () => {
