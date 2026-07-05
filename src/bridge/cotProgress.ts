@@ -261,6 +261,9 @@ class LiveCotProgressHandle implements CotProgressHandle {
           `cotId=${ref.cotId}`,
           `channel=${attempt.threadId ? "thread" : "chat_id"}`,
           `messageId=${ref.messageId}`,
+          // origin decides in-topic vs group-top anchoring (see handler) — log it
+          // so a future anchoring failure is diagnosable from the create line.
+          `origin=${attempt.originMessageId ?? "none"}`,
         );
         return ref;
       } catch (err) {

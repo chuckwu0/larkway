@@ -3021,11 +3021,15 @@ describe("handleOne — COT bubble ordering (before the card)", () => {
     errorTurn?: boolean;
     /** true → the topic already exists (isNewThread=false → bubble before card). */
     existingTopic?: boolean;
+    /** true → both card surfaces fail so no card message id exists (fallback path). */
+    noCard?: boolean;
   }) {
     const threadId = "om_msg";
     const wt = await seedWorktree(threadId);
     await seedRepoCachePath();
-    const { client: cardKitClient, calls: cardKitCalls } = makeCardKitClient();
+    const { client: cardKitClient, calls: cardKitCalls } = makeCardKitClient(
+      opts.noCard ? { failCreate: true } : {},
+    );
     if (opts.onCardCreate) {
       const orig = cardKitClient.createCardEntity.bind(cardKitClient);
       cardKitClient.createCardEntity = async (card) => {
@@ -3045,7 +3049,7 @@ describe("handleOne — COT bubble ordering (before the card)", () => {
         : Promise.resolve({ exitCode: 0, sessionId: "sess_order" }),
       kill: () => {},
     });
-    const { renderer } = makeCardRenderer();
+    const { renderer } = makeCardRenderer(opts.noCard ? { failStart: true } : {});
     const { store } = makeSessionStore();
     if (opts.existingTopic) {
       // Non-empty get() → existing = truthy → isNewThread=false → bubble first.
@@ -3121,6 +3125,66 @@ describe("handleOne — COT bubble ordering (before the card)", () => {
     expect(order).toContain("cot_create");
     expect(order).toContain("card_create");
     expect(order.indexOf("card_create")).toBeLessThan(order.indexOf("cot_create"));
+  });
+
+  it("new topic: anchors the bubble on the answer CARD message (so it lands in the topic)", async () => {
+    // The trigger @ is the topic root (pos=-1) → anchoring on it lands the
+    // bubble at the group top level. The card (reply_in_thread, pos=0) is the
+    // correct in-topic anchor, so origin must be the card message id.
+    let createdOrigin: string | undefined;
+    const cotClient: OutboundCotClient = {
+      async create(target) {
+        createdOrigin = target.originMessageId;
+        return { cotId: "cot_1", messageId: "om_cot_1" };
+      },
+      async resolveThreadId() {
+        return undefined;
+      },
+      async update() {},
+      async complete() {},
+    };
+    const { acked } = await runTurn({ cotClient, existingTopic: false });
+    expect(acked).toEqual(["om_msg"]);
+    // Fake replyCardEntity returns "om_cardkit"; the trigger message is "om_msg".
+    expect(createdOrigin).toBe("om_cardkit");
+    expect(createdOrigin).not.toBe("om_msg");
+  });
+
+  it("new topic: falls back to the trigger message when no card id is available", async () => {
+    let createdOrigin: string | undefined;
+    const cotClient: OutboundCotClient = {
+      async create(target) {
+        createdOrigin = target.originMessageId;
+        return { cotId: "cot_1", messageId: "om_cot_1" };
+      },
+      async resolveThreadId() {
+        return undefined;
+      },
+      async update() {},
+      async complete() {},
+    };
+    // noCard → both cardkit create and legacy card start fail → no card message id.
+    // The bubble create still runs (post-card) and falls back to the trigger id.
+    await runTurn({ cotClient, existingTopic: false, noCard: true });
+    expect(createdOrigin).toBe("om_msg");
+  });
+
+  it("existing topic: anchors the bubble on the trigger message (unchanged)", async () => {
+    let createdOrigin: string | undefined;
+    const cotClient: OutboundCotClient = {
+      async create(target) {
+        createdOrigin = target.originMessageId;
+        return { cotId: "cot_1", messageId: "om_cot_1" };
+      },
+      async resolveThreadId() {
+        return undefined;
+      },
+      async update() {},
+      async complete() {},
+    };
+    const { acked } = await runTurn({ cotClient, existingTopic: true });
+    expect(acked).toEqual(["om_msg"]);
+    expect(createdOrigin).toBe("om_msg"); // the in-topic follow-up, not the card
   });
 
   it("still sends the card when the COT bubble create throws (bypass rule)", async () => {
