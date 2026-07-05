@@ -952,6 +952,13 @@ export class BridgeHandler {
     // inside the try, fed every event, finalized on success/error. Always
     // best-effort; a disabled handle is a no-op (see src/bridge/cotProgress.ts).
     let cotPublisher: CotProgressHandle | undefined;
+    // The bubble-create promise itself (see the ordering block below). Held at
+    // function scope so the finally can guarantee a late-resolving handle —
+    // adopted in the BACKGROUND after the 3s budget — still gets finalized:
+    // without this a slow create + a trivial (fast) turn would leave the bubble
+    // orphaned (created + RUN_STARTED, but nobody ever completes it).
+    let bubbleCreate: Promise<CotProgressHandle> | undefined;
+    let cotTurnOutcome: "done" | "error" = "done";
     const settle = (ok: boolean): void => {
       if (settled) return;
       settled = true;
@@ -1175,7 +1182,7 @@ export class BridgeHandler {
       // Events don't start until after spawn (well after the card), so a late
       // handle still catches the run; a fast business reject (10002) is ms.
       if (this.deps.cotClient && cotDetail !== "off" && cotSurface === "bubble") {
-        const bubbleCreate = createCotProgressHandle({
+        bubbleCreate = createCotProgressHandle({
           cotClient: this.deps.cotClient,
           detail: cotDetail,
           runId: messageId,
@@ -1911,6 +1918,9 @@ export class BridgeHandler {
           // teardown delaying the card. finalize() is idempotent + never throws;
           // the finally's close() only cancels the throttle timer, so it stays
           // compatible with an in-flight finalize.
+          // Record the outcome for the finally's late-adoption finalize (a
+          // background-adopted bubble may not exist as cotPublisher yet here).
+          cotTurnOutcome = interruptedByIdle ? "error" : "done";
           if (cotPublisher) {
             void cotPublisher
               .finalize(
@@ -2425,6 +2435,7 @@ export class BridgeHandler {
       // markUnhandled self-heal — must not wait on a best-effort COT call.
       // finalize() is idempotent + never throws; the finally's close() only
       // cancels the throttle timer.
+      cotTurnOutcome = "error";
       if (cotPublisher) {
         void cotPublisher.finalize("error", { message: String(err) }).catch(() => {
           /* best-effort COT completion — never affects error teardown */
@@ -2533,6 +2544,16 @@ export class BridgeHandler {
       // turn escaped both (e.g. threw before finalize), close() at least stops
       // a dangling throttle timer. Never completes the bubble on its own.
       cotPublisher?.close();
+      // Anti-orphan for the background-adopted bubble: a create slower than the
+      // 3s budget resolves AFTER the turn ended, so cotPublisher was still
+      // undefined at both finalize sites (and above) — the bubble would be
+      // created (RUN_STARTED sent) but never completed. Attach an idempotent
+      // finalize to the create promise itself: an already-finalized (early-
+      // adopted) handle no-ops via its closed guard; a late one gets completed
+      // when it resolves. Never throws.
+      if (bubbleCreate) {
+        void bubbleCreate.then((handle) => handle.finalize(cotTurnOutcome).catch(() => {}));
+      }
       // Safety net for EVERY exit path of handleOne. The success site calls
       // settle(true) and the failure catch calls settle(false); both make
       // settled=true so this is a no-op for them. But if anything threw BEFORE

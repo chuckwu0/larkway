@@ -3018,6 +3018,7 @@ describe("handleOne — COT bubble ordering (before the card)", () => {
     cotClient: OutboundCotClient;
     cotBubbleCreateBudgetMs?: number;
     onCardCreate?: () => void;
+    errorTurn?: boolean;
   }) {
     const threadId = "om_msg";
     const wt = await seedWorktree(threadId);
@@ -3033,14 +3034,18 @@ describe("handleOne — COT bubble ordering (before the card)", () => {
     runClaudeImpl = () => ({
       events: (async function* () {
         yield { type: "system_init", sessionId: "sess_order", raw: {} };
-        await writeFile(stateFileMod.stateFilePathOf(wt), JSON.stringify(READY_STATE, null, 2), "utf8");
+        if (!opts.errorTurn) {
+          await writeFile(stateFileMod.stateFilePathOf(wt), JSON.stringify(READY_STATE, null, 2), "utf8");
+        }
       })(),
-      done: Promise.resolve({ exitCode: 0, sessionId: "sess_order" }),
+      done: opts.errorTurn
+        ? Promise.reject(new Error("mock runner crash"))
+        : Promise.resolve({ exitCode: 0, sessionId: "sess_order" }),
       kill: () => {},
     });
     const { renderer } = makeCardRenderer();
     const { store } = makeSessionStore();
-    const { client, acked } = makeClient(makeEvent());
+    const { client, acked, unhandled } = makeClient(makeEvent());
     const handler = new BridgeHandler({
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       client: client as any,
@@ -3055,10 +3060,10 @@ describe("handleOne — COT bubble ordering (before the card)", () => {
       cotBubbleCreateBudgetMs: opts.cotBubbleCreateBudgetMs,
     });
     await handler.run();
-    for (let i = 0; i < 200 && acked.length === 0; i++) {
+    for (let i = 0; i < 200 && acked.length === 0 && unhandled.length === 0; i++) {
       await new Promise((r) => setTimeout(r, 10));
     }
-    return { acked, cardKitCalls };
+    return { acked, unhandled, cardKitCalls };
   }
 
   it("creates the COT bubble BEFORE sending the answer card", async () => {
@@ -3098,9 +3103,10 @@ describe("handleOne — COT bubble ordering (before the card)", () => {
   });
 
   it("sends the card without waiting when the COT bubble create is slow (budget)", async () => {
-    // create never resolves; the budget must let the card proceed anyway.
+    // create resolves LATE (past the budget) — the card must proceed anyway.
     const cotClient: OutboundCotClient = {
-      create: () => new Promise(() => {}),
+      create: () =>
+        new Promise((resolve) => setTimeout(() => resolve({ cotId: "cot_1", messageId: "om_cot_1" }), 60)),
       async resolveThreadId() {
         return undefined;
       },
@@ -3110,6 +3116,54 @@ describe("handleOne — COT bubble ordering (before the card)", () => {
     const { acked, cardKitCalls } = await runTurn({ cotClient, cotBubbleCreateBudgetMs: 20 });
     expect(acked).toEqual(["om_msg"]);
     expect(cardKitCalls.map((c) => c.kind)).toContain("createCard");
+  });
+
+  it("anti-orphan: a bubble adopted AFTER the turn ends is still finalized (done)", async () => {
+    // The reviewer's blocker: create slower than the budget resolves after a
+    // trivial turn has already finished — cotPublisher was undefined at every
+    // finalize site, so without the finally's late-adoption finalize the bubble
+    // is created (RUN_STARTED) but never completed = orphan. Model a create that
+    // EVENTUALLY resolves (a never-resolving promise would hide the bug).
+    let completeReason: string | undefined;
+    const cotClient: OutboundCotClient = {
+      create: () =>
+        new Promise((resolve) => setTimeout(() => resolve({ cotId: "cot_1", messageId: "om_cot_1" }), 60)),
+      async resolveThreadId() {
+        return undefined;
+      },
+      async update() {},
+      async complete(_ref, reason) {
+        completeReason = reason;
+      },
+    };
+    const { acked } = await runTurn({ cotClient, cotBubbleCreateBudgetMs: 20 });
+    expect(acked).toEqual(["om_msg"]);
+    // The turn is long done; wait for the late create + finally finalize.
+    for (let i = 0; i < 100 && completeReason === undefined; i++) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    expect(completeReason).toBe("done");
+  });
+
+  it("anti-orphan: a late-adopted bubble is finalized as error on a failed turn", async () => {
+    let completeReason: string | undefined;
+    const cotClient: OutboundCotClient = {
+      create: () =>
+        new Promise((resolve) => setTimeout(() => resolve({ cotId: "cot_1", messageId: "om_cot_1" }), 60)),
+      async resolveThreadId() {
+        return undefined;
+      },
+      async update() {},
+      async complete(_ref, reason) {
+        completeReason = reason;
+      },
+    };
+    const { unhandled } = await runTurn({ cotClient, cotBubbleCreateBudgetMs: 20, errorTurn: true });
+    expect(unhandled).toEqual(["om_msg"]); // failed turn released as unhandled
+    for (let i = 0; i < 100 && completeReason === undefined; i++) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    expect(completeReason).toBe("error");
   });
 });
 
