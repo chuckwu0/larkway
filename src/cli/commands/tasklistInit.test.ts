@@ -120,9 +120,26 @@ beforeEach(async () => {
           return { data: { tasklist: { guid: "tl-created-1", members: currentMembers } } };
         }
         if (config.url.includes("/members") && config.method === "POST") {
-          if (mockAddMembersThrows404) throw new Error("404 page not found");
-          if (mockAddMembersThrowsScope) throw new Error("permission denied: missing task:tasklist:write");
-          if (mockAddMembersThrowsDeleted) throw new Error("resource_not_exist: tasklist not found (1470404)");
+          // Throw axios-shaped errors so the REAL TaskListClient.wrapErr path
+          // constructs a realistic TaskApiError (status/code) — mirroring the
+          // real machine, where the members-endpoint gateway 404 body is plain
+          // text (no parseable code) and the message is axios's generic one.
+          if (mockAddMembersThrows404) {
+            const e = new Error("Request failed with status code 404");
+            (e as { response?: unknown }).response = { status: 404, data: "404 page not found" };
+            throw e;
+          }
+          if (mockAddMembersThrowsScope) {
+            const e = new Error("Request failed with status code 403");
+            (e as { response?: unknown }).response = { status: 403, data: { code: 1470403, msg: "no permission" } };
+            throw e;
+          }
+          if (mockAddMembersThrowsDeleted) {
+            // TOCTOU: reused guid deleted → business resource-not-exist WITH a code.
+            const e = new Error("Request failed with status code 404");
+            (e as { response?: unknown }).response = { status: 404, data: { code: 1470404, msg: "resource not exist" } };
+            throw e;
+          }
           const data = config.data as { members?: FakeMember[] };
           for (const m of data.members ?? []) {
             if (!currentMembers.some((existing) => existing.id === m.id)) currentMembers.push(m);

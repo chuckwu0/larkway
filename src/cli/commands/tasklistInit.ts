@@ -73,7 +73,12 @@
 
 import { Client as LarkSdkClient } from "@larksuiteoapi/node-sdk";
 import type { CliContext } from "../types.js";
-import { TaskListClient, type LarkTaskRequester, type TaskMember } from "../../tasklist/client.js";
+import {
+  TaskListClient,
+  TaskApiError,
+  type LarkTaskRequester,
+  type TaskMember,
+} from "../../tasklist/client.js";
 import { resolveTaskTeamRegistryPath } from "../../config/paths.js";
 import {
   claimTeamTasklistGuid,
@@ -389,7 +394,7 @@ export async function run(ctx: CliContext, args: string[]): Promise<number> {
       await taskClient.addTasklistMembers(tasklistGuid, members);
     } catch (err) {
       const errMsg = err instanceof Error ? err.message : String(err);
-      if (isMembersEndpoint404(errMsg)) {
+      if (isMembersEndpoint404(err)) {
         // Same 404 the bridge's self-join treats as best-effort continuing
         // (main.ts) — the app-type members endpoint 404s (app self-add isn't
         // supported there), but the bots are already members, so the reused
@@ -516,18 +521,26 @@ export async function run(ctx: CliContext, args: string[]): Promise<number> {
 }
 
 /**
- * True ONLY for the app-type members-endpoint's raw HTTP 404 — `POST
- * /tasklists/{guid}/members` responds "404 page not found" for an app self-add
- * (the bot is already a member). Deliberately narrow: a bare "not found" /
- * 不存在 / resource_not_exist is a DIFFERENT, API-level failure — e.g. the
- * reused tasklist guid was deleted out from under us (TOCTOU) — which must NOT
- * be swallowed as benign. So we key on the endpoint-not-found body string only,
- * not on any generic not-found marker. Message-based because TaskListClient
- * wraps the raw error before it reaches here; the call site guarantees this is
- * an addTasklistMembers failure.
+ * True ONLY for the app-type members-endpoint's raw gateway 404 — `POST
+ * /tasklists/{guid}/members` responds with a plain-text "404 page not found"
+ * body for an app self-add (the bot is already a member).
+ *
+ * STRUCTURAL, not message-based: on the real machine the gateway's body is a
+ * plain string, so TaskListClient.wrapErr can't parse a `bodyMsg` out of it and
+ * the wrapped message falls back to axios's generic "Request failed with status
+ * code 404" — a substring like "page not found" is NOT present there. So we key
+ * on the structured fields wrapErr DID capture: an HTTP 404 (`status===404`)
+ * with NO business error code (`code===undefined`, because the plain-text body
+ * has no `code`). A DELETED tasklist (TOCTOU on a reused guid) instead returns a
+ * business resource-not-exist error WITH a code (e.g. 1470404) — that keeps a
+ * code and so stays fatal, never swallowed. The message check is only a
+ * belt-and-braces fallback for a non-TaskApiError shape.
  */
-function isMembersEndpoint404(errMsg: string): boolean {
-  return /page not found/i.test(errMsg);
+function isMembersEndpoint404(err: unknown): boolean {
+  if (err instanceof TaskApiError) {
+    return err.status === 404 && err.code === undefined;
+  }
+  return /page not found/i.test(err instanceof Error ? err.message : String(err));
 }
 
 /** Discriminated result of resolveAdoptTarget — see its doc comment. */
