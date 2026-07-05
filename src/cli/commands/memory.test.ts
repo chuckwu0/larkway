@@ -48,7 +48,7 @@ const sampleBot = (id = "test-bot"): BotConfig =>
     runtime: "legacy",
     backend: "claude",
     cot: "brief",
-    cotSurface: "card",
+    cotSurface: "bubble",
   }) as BotConfig;
 
 /** Collected output lines (stdout / stderr) across a run. */

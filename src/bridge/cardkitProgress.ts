@@ -220,6 +220,12 @@ class LiveCardKitProgressHandle implements CardKitProgressHandle {
   private cotToolIndex = 0;
   private readonly cotPendingTools: string[] = [];
   private cotErrored = false;
+  // Panel formatting state: keep a tool line and following reasoning on
+  // separate lines, and collapse consecutive same-name tool calls into a count.
+  private cotAfterTool = false;
+  private cotLastToolName: string | undefined;
+  private cotLastToolCount = 0;
+  private cotLastToolLineStart = -1;
 
   constructor(opts: {
     cardKitClient: OutboundCardKitClient;
@@ -386,24 +392,59 @@ class LiveCardKitProgressHandle implements CardKitProgressHandle {
   }
 
   private cotAppendReasoning(text: string): void {
+    // A tool line and the reasoning that follows it must not run together
+    // ("🔧 shell" + "Considering…" → "🔧 shellConsidering…"): start reasoning
+    // after a tool on its own line.
+    if (this.cotAfterTool) {
+      this.cotAppend("\n");
+      this.cotAfterTool = false;
+    }
+    // Reasoning breaks a consecutive same-tool run.
+    this.cotLastToolName = undefined;
     this.cotAppend(text);
   }
 
   private cotAppendToolUse(toolName: string, toolInput: unknown): void {
     this.cotPendingTools.push(`tool-${++this.cotToolIndex}`);
-    let line = `\n\n🔧 ${cotBriefToolTitle(toolName)}`;
+    const name = cotBriefToolTitle(toolName);
+    // Collapse consecutive same-name calls into "🔧 name ×N" (brief tier only —
+    // detailed keeps each call so its args stay visible). Rewrites the last
+    // tool line in place rather than stacking "🔧 shell" seven times.
+    if (
+      this.cotDetail === "brief" &&
+      name === this.cotLastToolName &&
+      this.cotLastToolLineStart >= 0 &&
+      !this.cotTruncated
+    ) {
+      this.cotLastToolCount += 1;
+      this.cotBuffer = this.cotBuffer.slice(0, this.cotLastToolLineStart);
+      this.cotAppend(`\n\n🔧 ${name} ×${this.cotLastToolCount}`);
+      this.cotAfterTool = true;
+      return;
+    }
+    this.cotLastToolLineStart = this.cotBuffer.length;
+    this.cotLastToolName = name;
+    this.cotLastToolCount = 1;
+    let line = `\n\n🔧 ${name}`;
     if (this.cotDetail === "detailed" && toolInput !== undefined && toolInput !== null) {
       line += `\n\`\`\`\n${clip(JSON.stringify(toolInput), COT_TOOL_ARGS_MAX)}\n\`\`\``;
     }
     this.cotAppend(line);
+    this.cotAfterTool = true;
   }
 
   private cotAppendToolResult(raw: unknown): void {
     this.cotPendingTools.shift();
+    // Brief tier renders no result line, so leave the consecutive-tool run
+    // intact (the next same-name tool_use still collapses into ×N).
     if (this.cotDetail !== "detailed") return;
     const text = cotExtractToolResultText(raw);
     if (!text) return;
     this.cotAppend(`\n> ${clip(text, COT_TOOL_RESULT_MAX).replace(/\n/g, "\n> ")}`);
+    // A rendered result closes the tool block: following reasoning starts fresh
+    // and a later same-name tool is a new line (no merge across a result).
+    this.cotAfterTool = true;
+    this.cotLastToolName = undefined;
   }
 
   /** Append to the panel buffer under the hard char budget, then schedule a patch. */

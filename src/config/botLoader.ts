@@ -340,15 +340,18 @@ export const BotConfigSchema = z.object({
   cot: z.enum(["off", "brief", "detailed"]).default("brief"),
 
   /**
-   * COT 展示形态(方案 B)。`cot` 管密度(off/brief/detailed),这个管落点:
-   * - "card"(默认):思考过程折叠进答案卡片里的 collapsible_panel(懒创建、
-   *   答案上方、finalize 时折叠)。话题群里也能用,是默认形态。
-   * - "bubble":走飞书原生 message_cot 思维链气泡(src/bridge/cotProgress.ts)。
-   *   保留为实验选项 —— 已知限制:话题内锚定不可用(气泡落群顶层),且本租户
-   *   thread 通道判死、chat 通道 PUT 偶发 400。
+   * COT 展示形态。`cot` 管密度(off/brief/detailed),这个管落点:
+   * - "bubble"(默认):走飞书原生 message_cot 思维链气泡(src/bridge/cotProgress.ts)——
+   *   客户端原生渲染(工具图标列表 + 可折叠头),真机体验最好。已知限制:话题内
+   *   锚定不可用(气泡落群顶层,本租户 thread 通道判死),收尾 bug 已在 main 修复。
+   * - "card":思考过程内嵌进答案卡片里的 collapsible_panel(懒创建、答案上方)。
+   *   ⚠️ 实验选项 —— 2026-07-05 真机实测:飞书客户端**不渲染 collapsible_panel 的
+   *   折叠交互**(API 全 code=0,但面板被拍平成普通文本、无折叠箭头、终态也不可折叠;
+   *   CardKit 无 GET 读回、只能真机人眼验)。故 card 形态目前仅作纯文本内嵌展示用,
+   *   体验不如气泡,不建议作默认。见 memory feishu-message-cot-api。
    * cot="off" 时本字段无意义(两种形态都不产出)。
    */
-  cotSurface: z.enum(["card", "bubble"]).default("card"),
+  cotSurface: z.enum(["card", "bubble"]).default("bubble"),
 
   /**
    * 话题 ↔ 飞书任务句柄(docs/task-handle.md,v2)。省略此字段不代表关闭,但也

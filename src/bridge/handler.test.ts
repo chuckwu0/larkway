@@ -1171,6 +1171,10 @@ describe("handleOne — thin-channel finalize", () => {
         name: "Frontend",
         turn_taking_limit: 10,
         backend: "claude",
+        // Opt into the in-card panel (default is now "bubble") so this test
+        // still exercises the failure-path panel title.
+        cot: "brief",
+        cotSurface: "card",
         response_surface_prototype: {
           enabled: true,
           allowed_chats: [],

@@ -1140,7 +1140,7 @@ export class BridgeHandler {
       // reasoning into the answer card's collapsible panel; "bubble" uses the
       // message_cot side channel.
       const cotDetail = this.deps.botConfig?.cot ?? "brief";
-      const cotSurface = this.deps.botConfig?.cotSurface ?? "card";
+      const cotSurface = this.deps.botConfig?.cotSurface ?? "bubble";
       const cotCardOption =
         cotDetail !== "off" && cotSurface === "card"
           ? { detail: cotDetail as "brief" | "detailed" }
