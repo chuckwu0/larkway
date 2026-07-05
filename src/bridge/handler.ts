@@ -2200,6 +2200,10 @@ export class BridgeHandler {
               });
             }
             try {
+              // COT-in-card: a failed turn (bot-reported failure OR idle-timeout
+              // interrupt — both set success=false) settles the reasoning panel
+              // with the errored title. No-op when no panel was created.
+              if (!success) cardKitProgress.markCotError();
               await cardKitProgress.finalize({
                 title: baseCardPayload.titleOverride,
                 finalText: baseCardPayload.finalText,
@@ -2437,6 +2441,9 @@ export class BridgeHandler {
       };
       if (!card && cardKitProgress) {
         try {
+          // COT-in-card: this is the hard-crash path — settle the reasoning
+          // panel with the errored title. No-op when no panel was created.
+          cardKitProgress.markCotError();
           await cardKitProgress.finalize({
             finalText: hardFailureText,
           });

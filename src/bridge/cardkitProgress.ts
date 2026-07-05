@@ -27,7 +27,12 @@ const DEFAULT_MAX_PROGRESS_UPDATES = 240;
 /** A6: patch-interval backoff ladder once the soft budget is exceeded, capped at the last entry. */
 const BACKOFF_LADDER_MS = [250, 1_000, 2_000, 5_000];
 
-/** COT-in-card (方案 B): hard cap on reasoning-panel text to keep the card small. */
+/**
+ * COT-in-card (方案 B): hard cap on reasoning-panel text to keep the card small.
+ * NOTE (accepted nit): the COT patch channel reuses patchIntervalMs but is NOT
+ * on the answer's A6 soft-budget/backoff ladder. That's fine here — this
+ * char budget bounds total panel writes far below where backoff would matter.
+ */
 const COT_PANEL_BUDGET_CHARS = 4_000;
 /** Detailed-tier tool arg / result caps inside the panel. */
 const COT_TOOL_ARGS_MAX = 200;
@@ -672,6 +677,13 @@ export async function createCardKitProgressHandle(
   });
 }
 
+/**
+ * Boot-reconcile finalize for a card orphaned by a bridge crash.
+ * NOTE (accepted nit): the streamed reasoning-panel content lives only in the
+ * in-process handle, so a crash-recovery finalize rebuilds the final card
+ * WITHOUT the COT panel (the reasoning is dropped). Acceptable degradation —
+ * the panel is cosmetic; the answer itself is reconciled from state.json.
+ */
 export async function finalizeExistingCardKitCard(opts: {
   cardKitClient: OutboundCardKitClient;
   cardId: string;
