@@ -428,6 +428,53 @@ describe("CardKitProgressHandle — COT-in-card panel (方案 B)", () => {
     expect(inner).not.toContain("SUPERSECRET");
   });
 
+  it("keeps a tool line and the following reasoning on separate lines", async () => {
+    const { calls, promise } = makeHandle("brief");
+    const handle = await promise;
+    handle.handle({ type: "thinking_delta", text: "开始", raw: {} });
+    handle.handle({ type: "tool_use", toolName: "shell", toolInput: {}, raw: {} });
+    handle.handle({ type: "thinking_delta", text: "继续想", raw: {} });
+    await handle.drain();
+    const inner = calls
+      .filter((c) => c.name === "streamElementContent" && c.args[1] === "cot_inner_md")
+      .at(-1)!.args[2] as string;
+    // Regression: was "🔧 shell继续想" — the tool name ran into the next reasoning.
+    expect(inner).not.toContain("shell继续想");
+    expect(inner).toMatch(/🔧 shell\n/);
+  });
+
+  it("collapses consecutive same-name tool calls into a ×N count (brief)", async () => {
+    const { calls, promise } = makeHandle("brief");
+    const handle = await promise;
+    handle.handle({ type: "thinking_delta", text: "跑一批", raw: {} });
+    for (let i = 0; i < 7; i++) {
+      handle.handle({ type: "tool_use", toolName: "shell", toolInput: { command: `c${i}` }, raw: {} });
+      handle.handle({ type: "tool_result", raw: {} });
+    }
+    await handle.drain();
+    const inner = calls
+      .filter((c) => c.name === "streamElementContent" && c.args[1] === "cot_inner_md")
+      .at(-1)!.args[2] as string;
+    expect(inner).toContain("🔧 shell ×7");
+    // Only ONE tool line, not seven stacked "🔧 shell" lines.
+    expect(inner.match(/🔧 shell/g)).toHaveLength(1);
+  });
+
+  it("a DIFFERENT tool name breaks the count run", async () => {
+    const { calls, promise } = makeHandle("brief");
+    const handle = await promise;
+    handle.handle({ type: "thinking_delta", text: "混合", raw: {} });
+    handle.handle({ type: "tool_use", toolName: "shell", toolInput: {}, raw: {} });
+    handle.handle({ type: "tool_use", toolName: "shell", toolInput: {}, raw: {} });
+    handle.handle({ type: "tool_use", toolName: "Read", toolInput: {}, raw: {} });
+    await handle.drain();
+    const inner = calls
+      .filter((c) => c.name === "streamElementContent" && c.args[1] === "cot_inner_md")
+      .at(-1)!.args[2] as string;
+    expect(inner).toContain("🔧 shell ×2");
+    expect(inner).toContain("🔧 Read");
+  });
+
   it("detailed tier includes truncated args + result", async () => {
     const { calls, promise } = makeHandle("detailed");
     const handle = await promise;

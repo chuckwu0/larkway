@@ -458,7 +458,7 @@ export async function createBotFromCreds(
     runtime: "agent_workspace",
     backend: form.backend && form.backend.trim() ? form.backend.trim() : "codex",
     cot: "brief",
-    cotSurface: "card",
+    cotSurface: "bubble",
     // Persist the Feishu avatar URL so the Web 管理面 can show an avatar before
     // the bridge writes status.json (pre-bridge / central roster). Best-effort:
     // only set when resolveBotIdentity returned a valid url.

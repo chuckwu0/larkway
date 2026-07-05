@@ -100,6 +100,14 @@ const DEFAULT_CARDKIT_RESPONSE_SURFACE_TIMEOUT_MS = 20 * 60 * 1000;
  */
 const DEFAULT_CARDKIT_IDLE_TIMEOUT_MS = 3 * 60 * 1000;
 
+/**
+ * Max time the COT bubble create may sit in front of the answer card's first
+ * frame. The bubble is created before the card (timeline ordering), but a slow
+ * create (hung GET / multi-tier create) must not delay the card — past this
+ * budget, the card is sent and the bubble handle is adopted in the background.
+ */
+const COT_BUBBLE_CREATE_BUDGET_MS = 3_000;
+
 function summarizeMentionPolicyRules(rules: string[]): string {
   const counts = new Map<string, number>();
   for (const rule of rules) {
@@ -578,6 +586,12 @@ export interface BridgeHandlerDeps {
    */
   responseSurfaceIdleTimeoutMs?: number;
   /**
+   * Max ms the COT bubble create may precede the answer card (timeline
+   * ordering). Past this, the card is sent and the bubble handle is adopted in
+   * the background. @default COT_BUBBLE_CREATE_BUDGET_MS (3s). Test seam.
+   */
+  cotBubbleCreateBudgetMs?: number;
+  /**
    * V2: fully-resolved peer bot list for this bot.
    * Pre-resolved by runV2Mode: each entry has the peer bot's open_id, name, description.
    * When absent (V1), no peer block is rendered in the prompt.
@@ -938,6 +952,13 @@ export class BridgeHandler {
     // inside the try, fed every event, finalized on success/error. Always
     // best-effort; a disabled handle is a no-op (see src/bridge/cotProgress.ts).
     let cotPublisher: CotProgressHandle | undefined;
+    // The bubble-create promise itself (see the ordering block below). Held at
+    // function scope so the finally can guarantee a late-resolving handle —
+    // adopted in the BACKGROUND after the 3s budget — still gets finalized:
+    // without this a slow create + a trivial (fast) turn would leave the bubble
+    // orphaned (created + RUN_STARTED, but nobody ever completes it).
+    let bubbleCreate: Promise<CotProgressHandle> | undefined;
+    let cotTurnOutcome: "done" | "error" = "done";
     const settle = (ok: boolean): void => {
       if (settled) return;
       settled = true;
@@ -1140,11 +1161,62 @@ export class BridgeHandler {
       // reasoning into the answer card's collapsible panel; "bubble" uses the
       // message_cot side channel.
       const cotDetail = this.deps.botConfig?.cot ?? "brief";
-      const cotSurface = this.deps.botConfig?.cotSurface ?? "card";
+      const cotSurface = this.deps.botConfig?.cotSurface ?? "bubble";
       const cotCardOption =
         cotDetail !== "off" && cotSurface === "card"
           ? { detail: cotDetail as "brief" | "detailed" }
           : undefined;
+
+      // COT (思维链) bubble — created BEFORE the answer card so it lands FIRST
+      // in the timeline (competitor parity: reasoning bubble on top, answer
+      // below). Created ONCE per turn (before the retry loop, so a stale-session
+      // respawn never opens a second bubble). 方案 B: the bubble is the
+      // EXPERIMENTAL surface, only built for cotSurface="bubble" (the default
+      // "card" folds reasoning into the card panel via `cot` above).
+      //
+      // Bypass rule preserved: createCotProgressHandle never throws (a create
+      // failure returns a disabled no-op handle). To keep a SLOW bubble create
+      // off the card's critical path — worst case is a hung GET + two-tier
+      // create, each 8s-bounded — race it against a 3s budget: if it's slow,
+      // send the card now and adopt the bubble handle when it finally resolves.
+      // Events don't start until after spawn (well after the card), so a late
+      // handle still catches the run; a fast business reject (10002) is ms.
+      if (this.deps.cotClient && cotDetail !== "off" && cotSurface === "bubble") {
+        bubbleCreate = createCotProgressHandle({
+          cotClient: this.deps.cotClient,
+          detail: cotDetail,
+          runId: messageId,
+          scope: threadId,
+          inputPreview: parsed.text,
+          target: {
+            chatId: parsed.chatId,
+            threadId:
+              typeof parsed.raw.thread_id === "string" && parsed.raw.thread_id
+                ? parsed.raw.thread_id
+                : undefined,
+            originMessageId: messageId,
+          },
+        });
+        const raced = await Promise.race([
+          bubbleCreate.then((handle) => ({ ready: true as const, handle })),
+          new Promise<{ ready: false }>((resolve) => {
+            const t = setTimeout(
+              () => resolve({ ready: false }),
+              this.deps.cotBubbleCreateBudgetMs ?? COT_BUBBLE_CREATE_BUDGET_MS,
+            );
+            t.unref?.();
+          }),
+        ]);
+        if (raced.ready) {
+          cotPublisher = raced.handle;
+        } else {
+          // Slow create — proceed to the card now; adopt the handle in the
+          // background once it resolves (never throws).
+          void bubbleCreate.then((handle) => {
+            cotPublisher = handle;
+          });
+        }
+      }
 
       // CardKit response surface: default main surface when the transport and
       // rollout gates are available. It streams bounded progress into a
@@ -1593,37 +1665,6 @@ export class BridgeHandler {
         }
       }
 
-      // COT (思维链) bubble — a parallel side channel to the answer card,
-      // created ONCE per turn here (outside the retry loop, so a stale-session
-      // respawn never opens a second bubble). Best-effort in every respect:
-      // createCotProgressHandle never throws (a create failure returns a
-      // disabled no-op handle), and each handle()/finalize() below degrades
-      // silently. Only reasoning + tool activity flow here; the final answer
-      // stays exclusively on the card. Topic groups anchor on the omt_ thread
-      // id; other chats fall back to chat_id + the trigger message.
-      // 方案 B: the reasoning bubble is now the EXPERIMENTAL surface — only
-      // built when the bot opts into cotSurface="bubble". The default
-      // ("card") streams reasoning into the answer card's collapsible panel
-      // (wired into createCardKitProgressHandle above via `cot`), no bubble.
-      // `cotDetail`/`cotSurface` are resolved once above (shared with the panel).
-      if (this.deps.cotClient && cotDetail !== "off" && cotSurface === "bubble") {
-        cotPublisher = await createCotProgressHandle({
-          cotClient: this.deps.cotClient,
-          detail: cotDetail,
-          runId: messageId,
-          scope: threadId,
-          inputPreview: parsed.text,
-          target: {
-            chatId: parsed.chatId,
-            threadId:
-              typeof parsed.raw.thread_id === "string" && parsed.raw.thread_id
-                ? parsed.raw.thread_id
-                : undefined,
-            originMessageId: messageId,
-          },
-        });
-      }
-
       // Step 4b–4f: spawn + stream + finalize, with one stale-session retry.
       // `currentExisting` may be reset to undefined on retry (ghost session cleared).
       let currentExisting = existing;
@@ -1877,6 +1918,9 @@ export class BridgeHandler {
           // teardown delaying the card. finalize() is idempotent + never throws;
           // the finally's close() only cancels the throttle timer, so it stays
           // compatible with an in-flight finalize.
+          // Record the outcome for the finally's late-adoption finalize (a
+          // background-adopted bubble may not exist as cotPublisher yet here).
+          cotTurnOutcome = interruptedByIdle ? "error" : "done";
           if (cotPublisher) {
             void cotPublisher
               .finalize(
@@ -2391,6 +2435,7 @@ export class BridgeHandler {
       // markUnhandled self-heal — must not wait on a best-effort COT call.
       // finalize() is idempotent + never throws; the finally's close() only
       // cancels the throttle timer.
+      cotTurnOutcome = "error";
       if (cotPublisher) {
         void cotPublisher.finalize("error", { message: String(err) }).catch(() => {
           /* best-effort COT completion — never affects error teardown */
@@ -2499,6 +2544,16 @@ export class BridgeHandler {
       // turn escaped both (e.g. threw before finalize), close() at least stops
       // a dangling throttle timer. Never completes the bubble on its own.
       cotPublisher?.close();
+      // Anti-orphan for the background-adopted bubble: a create slower than the
+      // 3s budget resolves AFTER the turn ended, so cotPublisher was still
+      // undefined at both finalize sites (and above) — the bubble would be
+      // created (RUN_STARTED sent) but never completed. Attach an idempotent
+      // finalize to the create promise itself: an already-finalized (early-
+      // adopted) handle no-ops via its closed guard; a late one gets completed
+      // when it resolves. Never throws.
+      if (bubbleCreate) {
+        void bubbleCreate.then((handle) => handle.finalize(cotTurnOutcome).catch(() => {}));
+      }
       // Safety net for EVERY exit path of handleOne. The success site calls
       // settle(true) and the failure catch calls settle(false); both make
       // settled=true so this is a no-op for them. But if anything threw BEFORE

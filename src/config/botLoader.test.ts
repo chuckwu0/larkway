@@ -662,6 +662,27 @@ runtime: agent_workspace
     expect(bots[0]?.runtime).toBe("agent_workspace");
   });
 
+  it("cot defaults to brief and cotSurface defaults to bubble (real-machine reversal 2026-07-05)", async () => {
+    await createBotsDir();
+    await writeYaml(
+      "cot-defaults.yaml",
+      `
+id: cot-defaults-bot
+name: COT Defaults Bot
+description: cot/cotSurface 未设时的默认值
+app_id: cli_cot_defaults
+app_secret_env: COT_DEFAULTS_SECRET
+bot_open_id: ou_cot_defaults
+`,
+    );
+
+    const bots = await loadBots(botsDir());
+    expect(bots).toHaveLength(1);
+    expect(bots[0]?.cot).toBe("brief");
+    // 方案 B 卡片形态真机体验差(collapsible_panel 客户端不渲染折叠) → 默认回退气泡。
+    expect(bots[0]?.cotSurface).toBe("bubble");
+  });
+
   // ---------------------------------------------------------------------------
   // Backward compat: git_token_env / gitlab_token_env field migration
   // ---------------------------------------------------------------------------
