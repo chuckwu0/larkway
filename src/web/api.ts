@@ -65,9 +65,20 @@ type EventExecFile = (
 ) => Promise<{ stdout: string; stderr: string }>;
 let eventExecFile: EventExecFile = execFileAsync as EventExecFile;
 
+type UpdateExecFile = (
+  file: string,
+  args: string[],
+  opts: { timeout: number; maxBuffer?: number },
+) => Promise<{ stdout: string; stderr: string }>;
+let updateExecFile: UpdateExecFile = execFileAsync as UpdateExecFile;
+
 export function _setEventNameResolverExecForTest(fn?: EventExecFile): void {
   chatNameCache.clear();
   eventExecFile = fn ?? (execFileAsync as EventExecFile);
+}
+
+export function _setUpdateVersionExecForTest(fn?: UpdateExecFile): void {
+  updateExecFile = fn ?? (execFileAsync as UpdateExecFile);
 }
 
 /**
@@ -75,6 +86,9 @@ export function _setEventNameResolverExecForTest(fn?: EventExecFile): void {
  * 避免版本号漂移)。模块加载时读一次;失败回退 "0.0.0"。
  */
 const LARKWAY_VERSION: string = resolveLarkwayVersion(import.meta.url, "0.0.0");
+const UPDATE_CHECK_TIMEOUT_MS = 5000;
+const UPDATE_RUN_TIMEOUT_MS = 5 * 60 * 1000;
+const UPDATE_MAX_BUFFER = 2 * 1024 * 1024;
 
 // ---------------------------------------------------------------------------
 // ManagementContext — the local / central abstraction
@@ -267,6 +281,43 @@ function badBotId(id: string): ApiResponse | null {
   return BOT_ID_RE.test(id) ? null : { status: 400, json: { error: `非法的助手 id "${id}"` } };
 }
 
+function firstVersion(text: string): string | null {
+  return text.match(/\b\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?\b/)?.[0] ?? null;
+}
+
+function compareVersion(a: string, b: string): number {
+  const aa = a.split(/[+-]/)[0].split(".").map((n) => Number.parseInt(n, 10) || 0);
+  const bb = b.split(/[+-]/)[0].split(".").map((n) => Number.parseInt(n, 10) || 0);
+  for (let i = 0; i < 3; i++) {
+    if ((aa[i] ?? 0) !== (bb[i] ?? 0)) return (aa[i] ?? 0) - (bb[i] ?? 0);
+  }
+  return 0;
+}
+
+async function readGlobalLarkwayVersion(): Promise<string> {
+  try {
+    const { stdout, stderr } = await updateExecFile("larkway", ["--version"], {
+      timeout: UPDATE_CHECK_TIMEOUT_MS,
+      maxBuffer: UPDATE_MAX_BUFFER,
+    });
+    return firstVersion(`${stdout}\n${stderr}`) ?? LARKWAY_VERSION;
+  } catch {
+    return LARKWAY_VERSION;
+  }
+}
+
+async function readLatestLarkwayVersion(): Promise<string | null> {
+  try {
+    const { stdout, stderr } = await updateExecFile("npm", ["view", "larkway", "version"], {
+      timeout: UPDATE_CHECK_TIMEOUT_MS,
+      maxBuffer: UPDATE_MAX_BUFFER,
+    });
+    return firstVersion(`${stdout}\n${stderr}`);
+  } catch {
+    return null;
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Route handlers
 // ---------------------------------------------------------------------------
@@ -280,6 +331,56 @@ const getContext: ApiHandler = async (req) => {
     status: 200,
     json: { mode: ctx.mode, centralAvailable: false, version: LARKWAY_VERSION },
   };
+};
+
+/**
+ * GET /api/update_version — compare the globally installed larkway with npm latest.
+ */
+const getUpdateVersion: ApiHandler = async () => {
+  const [currentVersion, latestVersion] = await Promise.all([
+    readGlobalLarkwayVersion(),
+    readLatestLarkwayVersion(),
+  ]);
+  return {
+    status: 200,
+    json: {
+      currentVersion,
+      latestVersion,
+      updateAvailable: latestVersion ? compareVersion(latestVersion, currentVersion) > 0 : false,
+    },
+  };
+};
+
+/**
+ * POST /api/update_version — run the existing updater: npm latest + bridge restart.
+ */
+const postUpdateVersion: ApiHandler = async () => {
+  try {
+    const { stdout, stderr } = await updateExecFile("larkway", ["update", "--latest", "--json"], {
+      timeout: UPDATE_RUN_TIMEOUT_MS,
+      maxBuffer: UPDATE_MAX_BUFFER,
+    });
+    return {
+      status: 200,
+      json: {
+        ok: true,
+        message: "larkway 已更新，bridge 已重启。刷新管理页后会使用新版 UI。",
+        stdout: stdout.trim(),
+        stderr: stderr.trim(),
+      },
+    };
+  } catch (e) {
+    const err = e as NodeJS.ErrnoException & { stdout?: string; stderr?: string };
+    return {
+      status: 500,
+      json: {
+        ok: false,
+        error: err.message ?? String(e),
+        stdout: typeof err.stdout === "string" ? err.stdout.trim() : "",
+        stderr: typeof err.stderr === "string" ? err.stderr.trim() : "",
+      },
+    };
+  }
 };
 
 /**
@@ -1328,6 +1429,8 @@ const getBackends: ApiHandler = async (_req) => {
  */
 export const ROUTES: Record<string, ApiHandler> = {
   "GET /api/context": getContext,
+  "GET /api/update_version": getUpdateVersion,
+  "POST /api/update_version": postUpdateVersion,
   "GET /api/bots": getBots,
   "GET /api/bot/:id": getBot,
   "GET /api/bot/:id/events": getBotEvents,
