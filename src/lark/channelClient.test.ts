@@ -1528,19 +1528,28 @@ describe("ChannelClient — in-flight self-heal (markHandled/markUnhandled)", ()
 
     const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
 
-    // Attempt accounting (cap = MAX_MESSAGE_ATTEMPTS = 5):
-    //   WS dispatch          → 1
-    //   markUnhandled #1     → 2  (below cap: still re-dispatchable)
-    //   markUnhandled #2     → 3
-    //   markUnhandled #3     → 4
-    //   markUnhandled #4     → 5  (>= cap: GIVE UP — promote to seen + warn)
-    client.markUnhandled(messageId); // 2
-    client.markUnhandled(messageId); // 3
-    client.markUnhandled(messageId); // 4
-    expect(warnSpy).not.toHaveBeenCalled(); // still below cap → no give-up yet
-    client.markUnhandled(messageId); // 5 → give up
+    // Attempt accounting (cap = MAX_MESSAGE_ATTEMPTS = 5): the counter is
+    // bumped ONCE PER DISPATCH — never on failure — so the cap means "5 real
+    // tries" (dispatch → fail → re-dispatch, five times), not the 2-3 the old
+    // double-counting allowed. Cycle: fail the current dispatch, then a
+    // gap-fill re-dispatches it.
+    client.markUnhandled(messageId); // fail #1 (dispatches=1 < 5 → re-dispatchable)
+    for (let n = 2; n <= 5; n++) {
+      expect(warnSpy).not.toHaveBeenCalled(); // below cap → no give-up yet
+      triggerGapFill(chObj);
+      for (
+        let i = 0;
+        i < 50 && dispatched.filter((d) => d.messageId === messageId).length < n;
+        i++
+      ) {
+        await new Promise((r) => setTimeout(r, 10));
+      }
+      expect(dispatched.filter((d) => d.messageId === messageId)).toHaveLength(n);
+      client.markUnhandled(messageId); // fail #n
+    }
 
-    // The give-up warning must be visible and name the message + attempt count.
+    // fail #5 hit the cap → give up. The warning must be visible and name the
+    // message + attempt count.
     expect(warnSpy).toHaveBeenCalledTimes(1);
     const warnMsg = String(warnSpy.mock.calls[0]?.[0] ?? "");
     expect(warnMsg).toContain(messageId);
@@ -1550,7 +1559,7 @@ describe("ChannelClient — in-flight self-heal (markHandled/markUnhandled)", ()
     // returning the same message must NOT re-dispatch it (no infinite loop).
     triggerGapFill(chObj);
     await new Promise((r) => setTimeout(r, 150));
-    expect(dispatched.filter((d) => d.messageId === messageId)).toHaveLength(1);
+    expect(dispatched.filter((d) => d.messageId === messageId)).toHaveLength(5);
 
     warnSpy.mockRestore();
     await client.close();

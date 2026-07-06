@@ -53,7 +53,17 @@ export type AgentStreamEvent =
 export interface RunOptions {
   prompt: string;
   resumeSessionId?: string;
-  /** @default 'acceptEdits' */
+  /**
+   * Permission posture for the agent subprocess. The words are CLAUDE
+   * semantics; each runner translates for its backend — note codex maps
+   * everything except "ask" to danger-full-access (there is no codex
+   * equivalent of acceptEdits), so "acceptEdits" is NOT a tightening there.
+   *
+   * Runner-level default is 'acceptEdits', but the bridge (handler.ts)
+   * explicitly passes 'bypassPermissions' unless config.permissions.mode
+   * overrides it — that is the EFFECTIVE production default (v0.3.18+,
+   * see README "Security model").
+   */
   permissionMode?: "acceptEdits" | "ask" | "bypassPermissions";
   /** Only passed as --cwd if explicitly provided; omit to let agent cd itself */
   cwd?: string;

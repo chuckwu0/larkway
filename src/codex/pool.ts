@@ -483,6 +483,13 @@ export class CodexProcessPool implements AgentRunner {
     this.#threadOwners.clear();
     this.#currentSpawnReadyResolved = false;
 
+    // A write after the child has died (e.g. a turn racing the process's own
+    // exit) would otherwise surface as an unhandled 'error' on the stdin
+    // stream and crash the whole bridge process (same guard as claude/pool.ts).
+    child.stdin?.on("error", () => {
+      /* surfaced via the child's own 'error'/'exit' handlers below */
+    });
+
     void this.#writePidFileBestEffort(child.pid);
 
     this.#ready = new Promise<void>((resolve, reject) => {

@@ -122,6 +122,18 @@ function summarizeMentionPolicyRules(rules: string[]): string {
 // Private helpers — worktree bootstrap
 // ---------------------------------------------------------------------------
 
+/**
+ * Ceiling for any single pre-spawn git operation (clone/fetch/worktree).
+ * git itself has NO network timeout: a half-open TCP path hangs a fetch
+ * indefinitely, and these run BEFORE the runner spawns — outside both the
+ * idle watchdog and the subprocess timeout — so an un-bounded hang here
+ * permanently occupied the thread's serial queue AND one of the
+ * MAX_CONCURRENT slots (5 such threads = the whole bot stalls until
+ * restart). Generous: a cold clone of a large repo legitimately takes
+ * minutes; this only cuts true black holes.
+ */
+const GIT_OP_TIMEOUT_MS = 10 * 60 * 1000;
+
 function execGit(cwd: string, args: string[]): Promise<void> {
   return new Promise((resolve, reject) => {
     const child = child_process.spawn("git", args, {
@@ -129,17 +141,35 @@ function execGit(cwd: string, args: string[]): Promise<void> {
       stdio: ["ignore", "pipe", "pipe"],
     });
     let stderr = "";
+    let timedOut = false;
+    const timer = setTimeout(() => {
+      timedOut = true;
+      child.kill("SIGTERM");
+      const killTimer = setTimeout(() => child.kill("SIGKILL"), 5_000);
+      killTimer.unref();
+    }, GIT_OP_TIMEOUT_MS);
+    timer.unref();
     child.stderr.on("data", (c: Buffer) => {
       stderr += c.toString();
     });
     child.on("close", (code: number | null) => {
-      if (code === 0) resolve();
+      clearTimeout(timer);
+      if (timedOut) {
+        reject(
+          new Error(
+            `git ${args.join(" ")} timed out after ${GIT_OP_TIMEOUT_MS / 1000}s (killed)\nstderr: ${stderr}`,
+          ),
+        );
+      } else if (code === 0) resolve();
       else
         reject(
           new Error(`git ${args.join(" ")} exited ${code ?? "null"}\nstderr: ${stderr}`)
         );
     });
-    child.on("error", reject);
+    child.on("error", (err) => {
+      clearTimeout(timer);
+      reject(err);
+    });
   });
 }
 
@@ -192,7 +222,35 @@ async function isWorktreeGitHealthy(worktreePath: string): Promise<boolean> {
  * @param token     GitLab PAT used for auth. Never written to disk.
  * @param label     Human-readable name for log messages (e.g. slug).
  */
-async function ensureRepoClone(
+/**
+ * Per-basePath serialization for clone-if-missing + timeout cleanup. The
+ * shared repo cache is used across threads AND bots (main.ts sharedReposDir),
+ * while handler-level serialization is per session key only — so two turns
+ * can race ensureRepoClone on the SAME basePath. That was mostly benign until
+ * the timeout path gained a destructive rm of a partial clone: an unserialized
+ * rm racing a fresh concurrent clone could delete the new clone's files from
+ * under it (valid-looking .git, missing objects — a poisoned cache needing
+ * manual repair). Chain entries are bounded by the number of configured repos.
+ */
+const repoCloneLocks = new Map<string, Promise<void>>();
+
+function ensureRepoClone(
+  basePath: string,
+  url: string | undefined,
+  token: string | undefined,
+  label: string,
+): Promise<void> {
+  const prev = repoCloneLocks.get(basePath) ?? Promise.resolve();
+  // A failed predecessor must not fail (or block) this attempt — swallow it
+  // for chaining purposes; each caller still sees its OWN attempt's outcome.
+  const next = prev
+    .catch(() => {})
+    .then(() => ensureRepoCloneImpl(basePath, url, token, label));
+  repoCloneLocks.set(basePath, next.catch(() => {}));
+  return next;
+}
+
+async function ensureRepoCloneImpl(
   basePath: string,
   url: string | undefined,
   token: string | undefined,
@@ -247,20 +305,54 @@ async function ensureRepoClone(
       GIT_TERMINAL_PROMPT: "0",
       [tokenEnvVar]: token ?? "",
     };
-    await new Promise<void>((resolve, reject) => {
-      const child = child_process.spawn(
-        "git",
-        ["clone", "--quiet", url, basePath],
-        { stdio: ["ignore", "pipe", "pipe"], env },
-      );
-      let stderr = "";
-      child.stderr.on("data", (b: Buffer) => { stderr += b.toString(); });
-      child.on("close", (code) => {
-        if (code === 0) resolve();
-        else reject(new Error(`git clone ${url} exited ${code ?? "null"}\nstderr: ${stderr}`));
+    // Same black-hole ceiling as execGit (see GIT_OP_TIMEOUT_MS): the cold
+    // clone is the single most network-exposed pre-spawn git op, runs inside
+    // the thread serial queue AND holds a MAX_CONCURRENT slot — an un-bounded
+    // half-open TCP hang here stalled the whole bot until restart.
+    let timedOut = false;
+    try {
+      await new Promise<void>((resolve, reject) => {
+        const child = child_process.spawn(
+          "git",
+          ["clone", "--quiet", url, basePath],
+          { stdio: ["ignore", "pipe", "pipe"], env },
+        );
+        let stderr = "";
+        const timer = setTimeout(() => {
+          timedOut = true;
+          child.kill("SIGTERM");
+          const killTimer = setTimeout(() => child.kill("SIGKILL"), 5_000);
+          killTimer.unref();
+        }, GIT_OP_TIMEOUT_MS);
+        timer.unref();
+        child.stderr.on("data", (b: Buffer) => { stderr += b.toString(); });
+        child.on("close", (code) => {
+          clearTimeout(timer);
+          if (timedOut) {
+            reject(new Error(
+              `git clone ${url} timed out after ${GIT_OP_TIMEOUT_MS / 1000}s (killed)\nstderr: ${stderr}`,
+            ));
+          } else if (code === 0) resolve();
+          else reject(new Error(`git clone ${url} exited ${code ?? "null"}\nstderr: ${stderr}`));
+        });
+        child.on("error", (err) => {
+          clearTimeout(timer);
+          reject(err);
+        });
       });
-      child.on("error", reject);
-    });
+    } catch (err) {
+      if (timedOut) {
+        // A SIGKILL'd clone can leave a partial basePath (incl. a partial
+        // .git that would fool the "already a repo" fast-path next turn).
+        // Only the timeout path may own this dir: a pre-existing non-empty
+        // dir makes clone fail fast with exit≠0 long before the ceiling.
+        // AWAITED before the error propagates (and the per-basePath lock
+        // releases), so a queued concurrent clone can never start while this
+        // destructive rm is still scanning.
+        await fs.rm(basePath, { recursive: true, force: true }).catch(() => {});
+      }
+      throw err;
+    }
     console.log(`[bridge.handler] clone of ${label} complete.`);
 
     // Rewrite remote URL to credential-free form so .git/config stays clean.
@@ -858,7 +950,8 @@ export class BridgeHandler {
   /**
    * Enter the main loop: for-await over client.events(), per-thread concurrent dispatch.
    *
-   * Each unique thread_id (or message_id for top-level msgs) gets its own serial
+   * Each unique session key (root_id, or message_id for top-level msgs — the
+   * same normalization parseLarkMessage uses for threadId) gets its own serial
    * promise chain, so the same thread stays ordered while different threads run
    * concurrently. This fixes the UX problem where multiple operators sending
    * requests simultaneously would block each other for the duration of each
@@ -898,7 +991,19 @@ export class BridgeHandler {
       if (this.closed) break;
       if (signal?.aborted) break;
 
-      const key = event.thread_id ?? event.message_id;
+      // Queue key MUST equal the session key handleOne derives via
+      // parseLarkMessage (message.ts: `root_id ?? message_id`). It previously
+      // used `thread_id ?? message_id`, which diverges for in-thread replies:
+      // the root turn keyed by om_<root> while its follow-ups keyed by
+      // omt_<thread> — so a follow-up arriving mid-turn skipped the serial
+      // chain and ran CONCURRENTLY against the same workspace/session
+      // (fresh session instead of --resume, interleaved state.json writes).
+      // It also broke getThreadReceivedAt(threadId) lookups, which use the
+      // session key.
+      const key =
+        (typeof event.root_id === "string" && event.root_id)
+          ? event.root_id
+          : event.message_id;
       // Stamp "received" here — synchronously, before acquire()/handleOne()
       // — so this reflects arrival, not dispatch. See threadReceivedAt above.
       this.threadReceivedAt.set(key, Date.now());
@@ -947,6 +1052,14 @@ export class BridgeHandler {
     // raw event (== parsed.messageId) so it's available even before parsing.
     const settleMessageId = event.message_id;
     let settled = false;
+    // Set once the agent subprocess has finished a full run (handle.done
+    // resolved). A failure AFTER this point (finalize/render/teardown blips)
+    // must NOT trigger the proactive gap-fill replay: the agent already did
+    // the work (possibly with side effects — commits, MRs, messages), and
+    // re-running the whole turn up to the poison cap multiplies those side
+    // effects. Such messages stay re-dispatchable only via a reconnect
+    // gap-fill window (pre-existing behavior), not the steady-state replay.
+    let agentRunCompleted = false;
     // COT (思维链) side channel — declared at function scope so the finally
     // safety net below can close() it on any exit path. Created once per turn
     // inside the try, fed every event, finalized on success/error. Always
@@ -963,7 +1076,7 @@ export class BridgeHandler {
       if (settled) return;
       settled = true;
       if (ok) this.deps.client.markHandled?.(settleMessageId);
-      else this.deps.client.markUnhandled?.(settleMessageId);
+      else this.deps.client.markUnhandled?.(settleMessageId, { replay: !agentRunCompleted });
     };
     try {
     // Step 1: parse
@@ -1854,7 +1967,12 @@ export class BridgeHandler {
         // ever grows, for the perf sample recorded once the turn completes.
         let toolUseTotalCount = 0;
         let idleWatchdog: ReturnType<typeof setInterval> | undefined;
-        if (cardKitProgress) {
+        // Armed for EVERY response surface, not just CardKit: the idle
+        // judgment (activity timestamps + toolsInFlight exemption) is
+        // surface-independent, and the legacy-card / post fallback paths are
+        // exactly the ones already degraded — leaving them with only the
+        // 60-min subprocess timeout meant the worst path waited the longest.
+        {
           const cadenceMs = Math.max(50, Math.min(Math.floor(idleTimeoutMs / 4), 15_000));
           idleWatchdog = setInterval(() => {
             if (toolsInFlight > 0) return; // real tool call pending — exempt from idle judgment
@@ -1936,6 +2054,9 @@ export class BridgeHandler {
           }
 
           const result = await handle.done;
+          // From here on the agent's work is done — a later failure must not
+          // proactively re-run the whole turn (see agentRunCompleted doc).
+          agentRunCompleted = true;
           if (idleWatchdog) {
             clearInterval(idleWatchdog);
             idleWatchdog = undefined;
@@ -2022,10 +2143,12 @@ export class BridgeHandler {
             pooled: result.pooled,
             resumeMode: result.resumeMode,
           });
-          // PRB-9: a CardKit turn is "interrupted" when the idle watchdog killed
-          // it (real hang), NOT when total wall-clock elapsed. Routed to the same
-          // explicit-failure sink as crash/restart (§12.2).
-          const cardKitTurnTimedOut = cardKitProgress != null && interruptedByIdle;
+          // PRB-9: a turn is "interrupted" when the idle watchdog killed it
+          // (real hang), NOT when total wall-clock elapsed. Routed to the same
+          // explicit-failure sink as crash/restart (§12.2). Surface-independent:
+          // the watchdog now arms for legacy-card/post turns too, and an idle
+          // kill there must finalize as 已中断 — not fall through to the
+          // exitCode branch and get mislabeled "可能崩溃".
 
           // Step 4d-ii: read state.json the bot wrote during the response.
           const reportedStateRead = await readStateFileDetailed(worktreePath);
@@ -2156,7 +2279,7 @@ export class BridgeHandler {
           const reportedStatus = reportedState?.status;
           const reportedError = reportedState?.error;
           const cardKitTimeoutFailure =
-            cardKitTurnTimedOut && reportedStatus !== "ready" && reportedStatus !== "failed";
+            interruptedByIdle && reportedStatus !== "ready" && reportedStatus !== "failed";
           let success: boolean;
           let failureReason: string | undefined;
 
@@ -2440,14 +2563,36 @@ export class BridgeHandler {
           // Success — exit the retry loop
           break;
         } catch (spawnErr) {
-          // Stale-session fallback: if Claude rejected --resume with a ghost session,
-          // purge the record and retry once without --resume (fresh session).
+          // The watchdog interval is created BEFORE this try; the success path
+          // clears it after handle.done, but this path used to leak it — worst
+          // when toolsInFlight>0 froze the tick (a tool_use whose subprocess
+          // died never sends tool_result), leaving a permanent interval.
+          if (idleWatchdog) {
+            clearInterval(idleWatchdog);
+            idleWatchdog = undefined;
+          }
+          // Stale-session fallback: if the backend rejected --resume/thread
+          // resume with a ghost session, purge the record and retry once
+          // without resume (fresh session).
           const errMsg = String((spawnErr as Error).message ?? spawnErr);
-          if (
-            attempt === 1 &&
-            currentExisting != null &&
-            errMsg.includes("No conversation found")
-          ) {
+          // Backend-specific ghost-session signatures:
+          //   claude: `--resume` of a purged session → "No conversation found"
+          //   codex:  thread/resume of a purged/rotated ~/.codex thread →
+          //           "codex app-server thread/resume failed: no rollout found
+          //           for thread id …" (empirically verified against codex-cli
+          //           0.140.0 app-server: bogus threadId → JSON-RPC error
+          //           -32600 "no rollout found …").
+          // The codex arm requires BOTH substrings: matching any thread/resume
+          // failure would let a TRANSIENT error (locked rollout file during a
+          // codex self-upgrade, app-server hiccup) irreversibly purge a valid
+          // session mapping. A transient still fails this turn — recoverable —
+          // while the record survives. Without the codex arm at all, a bot
+          // whose owner cleaned ~/.codex failed EVERY @ on old threads forever.
+          const isStaleSessionErr =
+            errMsg.includes("No conversation found") ||
+            (errMsg.includes("thread/resume failed") &&
+              errMsg.includes("no rollout found"));
+          if (attempt === 1 && currentExisting != null && isStaleSessionErr) {
             console.warn(
               `[bridge.handler] stale session ${currentExisting.sessionId} for thread ${threadId}` +
                 ` — removing and retrying without --resume`

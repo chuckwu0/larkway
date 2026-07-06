@@ -377,9 +377,17 @@ export function runClaude(opts: RunOptions): RunHandle {
   function doKill(): void {
     if (child.killed || killScheduled) return;
     killScheduled = true;
+    // `child.killed` flips true synchronously the instant .kill() is called
+    // (it means "a signal was sent", not "the process exited"), so it cannot
+    // detect "still alive after the grace period" — track the real 'exit'
+    // event instead (same as the B4 fix in codex/pool.ts).
+    let exited = false;
+    child.once("exit", () => {
+      exited = true;
+    });
     child.kill("SIGTERM");
     killTimer = setTimeout(() => {
-      if (!child.killed) child.kill("SIGKILL");
+      if (!exited) child.kill("SIGKILL");
     }, SIGKILL_GRACE_MS);
     // Unref so the timer does not prevent Node from exiting if nothing else holds
     killTimer.unref();

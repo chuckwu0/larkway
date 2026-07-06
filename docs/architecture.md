@@ -1,6 +1,6 @@
 # Larkway 架构
 
-> **状态**:🗄 v1 基础架构(bridge / runner / card / session)。V2 多 bot 扩展是 v0.2 系列历史口径,其中 V2.2 = v0.2.2,见 [versioning.md](versioning.md);v0.3 新方向见 [agent-workspace.md](agent-workspace.md) 和 [provisioning-model.md](provisioning-model.md)。核心模块边界仍适用。
+> **状态**:🗄 v1 基础架构(bridge / runner / card / session)。V2 多 bot 扩展是 v0.2 系列历史口径,其中 V2.2 = v0.2.2,见 [versioning.md](versioning.md);v0.3 当前权威见 [agent-workspace.md](agent-workspace.md)、[principles.md](principles.md) 和 [provisioning-model.md](provisioning-model.md)。核心模块**边界**(bridge/runner/card/session 的职责划分)仍适用,但**具体细节请以代码为准**——本文已知与现状不符的点:入口是 `src/main.ts`(TypeScript,非 main.py);默认 permission mode 是 `bypassPermissions`(非 acceptEdits,v0.3.18 起,见 README Security model);sessions.json 是 version-2、key 为 `threadId::botId`(非单 thread_id);`logs/<thread_id>.jsonl` 全量事件流从未实现(实际只有 `perf.jsonl`);housekeeping GC 在 v0.3.30 起会杀进程并删除 idle session 目录(非只读)。
 
 ## 高层架构图
 

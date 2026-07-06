@@ -215,9 +215,22 @@ describe("v2 normal load", () => {
     await expect(SessionStore.load(sessionsPath)).rejects.toThrow(/version 99/);
   });
 
-  it("throws on corrupt JSON", async () => {
+  it("self-heals corrupt JSON: .corrupt-* backup + empty store (bridge must still boot)", async () => {
     await writeFile(sessionsPath, "{{not json", "utf-8");
-    await expect(SessionStore.load(sessionsPath)).rejects.toThrow(/not valid JSON/);
+
+    const store = await SessionStore.load(sessionsPath);
+    expect(store.list()).toHaveLength(0);
+
+    // The bad file is preserved as a timestamped backup, never silently lost.
+    const files = await readdir(tmpDir);
+    const backup = files.find((f) => f.includes(".corrupt-"));
+    expect(backup).toBeDefined();
+    expect(await readFile(path.join(tmpDir, backup!), "utf-8")).toBe("{{not json");
+
+    // A fresh valid v2 file replaces it.
+    const current = await readCurrentFile();
+    expect(current.version).toBe(2);
+    expect(current.records).toEqual({});
   });
 });
 

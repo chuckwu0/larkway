@@ -105,6 +105,45 @@ Larkway never injects `ANTHROPIC_API_KEY` or any other API key. The subprocess i
 
 ---
 
+## Security model — read this before inviting the bot anywhere
+
+Larkway runs a real coding agent **on your machine, with your permissions**. Be
+explicit about what that means:
+
+**Who can trigger it.** By default a bot ships with `chats: []` — *open mode*:
+it responds to an @-mention in **any** group it has been added to. Anyone who
+can add the bot to a group (or is in a group with it) can make it act. To
+narrow this, list allowed group ids in the bot's yaml (`chats: [oc_…]`); the
+bot then ignores every other chat.
+
+**What a triggered agent can do.** The agent subprocess is not sandboxed by
+Larkway. With the default permission mode (`bypassPermissions` — required for
+unattended headless operation, where an interactive permission prompt would
+silently hang the turn), a Claude-backend agent can read/write files, run
+commands, and use the network as your OS user. The Codex backend's equivalent
+default is full access. You can tighten this globally via `permissions.mode`
+in `~/.larkway/config.json` (`acceptEdits` / `ask`), at the cost of turns
+stalling on operations the mode blocks. **Note the mode words are Claude
+semantics; on Codex anything other than `ask` currently maps to full access.**
+
+**Prompt injection is real.** Everything in the triggering message — and
+thread history / attachments the agent chooses to read — becomes agent input.
+A malicious group member can try to steer the agent ("ignore your instructions
+and run …"). L2 memory and your repo's `CLAUDE.md`/`AGENTS.md` are guidance,
+not enforcement.
+
+**Practical posture.**
+- Treat "which groups is this bot in" as the primary security boundary; use
+  `chats:` allowlists for any bot with write access.
+- Run write-capable bots against repos where an unwanted commit/MR is
+  reviewable and revertable; keep production credentials out of the host's
+  environment.
+- Secrets in `~/.larkway/.env` are shared across all bots on the bridge and
+  visible to any agent that can read your home directory — don't mix a
+  low-trust open bot and high-value credentials on the same host.
+
+---
+
 ## Defining a bot (three layers)
 
 | Layer | What it is | Where it lives |
@@ -122,7 +161,7 @@ Secrets live only in `~/.larkway/.env` (mode 0600). Config and memory contain no
 - **Multiple bots on one bridge** — a read-only Q&A bot and a write-capable engineering bot can share the same process, each with its own L1/L2/L3 definition
 - **Web UI** — `larkway ui` opens a local management dashboard (127.0.0.1 + token); create bots, edit memory, watch live logs
 - **Session continuity** — every Feishu thread maps to a persistent `session_id`; the agent remembers what it did in prior turns
-- **Agent Workspace** — per-thread git worktrees; the agent can run multiple threads concurrently without git conflicts
+- **Agent Workspace** — each bot gets its own workspace where the agent clones the repo itself, with per-thread session dirs; concurrent threads don't trip over each other's git state (expect disk usage and a slower first turn on large repos — clones are per-session, GC'd after 24h idle)
 - **Codex runtime pre-checks** — `larkway doctor` validates Codex state directory writability before start
 - **Topic ↔ Feishu task handle** — turn a topic into a Feishu task and the agent claims it, then keeps its lifecycle (done/failed/reopened, stalled, handed off, overdue) in sync automatically — see below
 
@@ -157,7 +196,7 @@ platform-fact writeups: [docs/task-handle.md](docs/task-handle.md).
 
 - **Node.js 20+ LTS**
 - **A Claude Code or Codex subscription** with local CLI installed and logged in
-- **`lark-cli`** — Feishu long-connection client and message utilities
+- **`lark-cli`** — Feishu long-connection client and message utilities: `npm i -g @larksuite/cli`, then `lark-cli auth login` (the agent uses it to read thread history and attachments; `larkway doctor` checks it's present)
 - **`glab` + `git`** — for bots that open MRs (optional for read-only bots)
 - **An always-on host machine** — the bridge must stay running to receive Feishu events; a laptop that sleeps will miss messages; a small server or desktop works well
 

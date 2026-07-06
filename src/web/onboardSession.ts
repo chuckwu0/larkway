@@ -88,6 +88,10 @@ async function defaultRegisterApp(opts: RegisterAppOptions): Promise<RegisterApp
  *   polling        — user scanned / SDK is polling for confirmation.
  *   awaiting-name  — registerApp resolved; creds held in-memory; waiting for
  *                    the front-end to POST /finalize with the form.
+ *   finalizing     — a finalize (or no-orphan cancel) is writing the bot to
+ *                    disk. Claimed SYNCHRONOUSLY before the async write so a
+ *                    concurrent finalize/cancel pair can't both pass the
+ *                    awaiting-name check and land TWO bots from one Feishu app.
  *   done           — bot written to disk (botId set); terminal.
  *   error          — registerApp rejected or 落盘 failed (error message set); terminal.
  *   cancelled      — caller aborted via cancelOnboard before creds were obtained;
@@ -99,6 +103,7 @@ export type OnboardStatus =
   | "awaiting-scan"
   | "polling"
   | "awaiting-name"
+  | "finalizing"
   | "done"
   | "error"
   | "cancelled";
@@ -706,6 +711,11 @@ export async function finalizeOnboard(
     throw new Error("内部错误:creds 未持有");
   }
 
+  // Claim the session SYNCHRONOUSLY before the async disk write, so a
+  // concurrent cancel (or duplicate finalize) sees "finalizing" and backs off
+  // instead of racing a second createBotFromCreds from the same creds.
+  s.status = "finalizing";
+
   try {
     const { botId } = await createBotFromCreds({
       creds: s._creds,
@@ -745,7 +755,15 @@ export async function cancelOnboard(sessionId: string): Promise<{
 }> {
   const s = sessions.get(sessionId);
   if (!s) return { cancelled: false };
-  if (s.status === "done" || s.status === "error" || s.status === "cancelled") {
+  if (
+    s.status === "done" ||
+    s.status === "error" ||
+    s.status === "cancelled" ||
+    // A finalize is already writing this session's bot to disk — treat like a
+    // terminal state (racing a SECOND createBotFromCreds here would land two
+    // bots from one Feishu app). The finalize's own outcome stands.
+    s.status === "finalizing"
+  ) {
     return { cancelled: false };
   }
 
@@ -756,6 +774,9 @@ export async function cancelOnboard(sessionId: string): Promise<{
     // "已用默认名创建" outcome).
     const defaultName = s.prefill?.suggestedName || "新助手";
     const form: OnboardForm = { name: defaultName };
+    // Same synchronous claim as finalizeOnboard — a finalize arriving while
+    // this default-name write is in flight must 409, not double-create.
+    s.status = "finalizing";
     try {
       const { botId } = await createBotFromCreds({
         creds: s._creds,

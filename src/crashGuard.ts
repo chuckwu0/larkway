@@ -18,6 +18,9 @@
  *   the full error (incl. stack) and DELIBERATELY DO NOT call process.exit — the
  *   bridge must stay alive ("bridge never suicides" 铁律). A transient WS handshake
  *   timeout must not take the whole fleet offline.
+ *   ONE exception: a sustained crash STORM (see createCrashStormBreaker below)
+ *   trips a circuit breaker and exits 1 — that pattern means "wedged", not
+ *   "weathering a transient", and a supervisor restart is the better outcome.
  *
  * HONEST TRADE-OFF (not zero-risk):
  *   uncaughtException is, in the general case, a signal that the process MAY be in
@@ -73,16 +76,67 @@ export function handleUnhandledRejection(reason: unknown, log: CrashGuardLogger 
   );
 }
 
+// ── crash-storm circuit breaker ──────────────────────────────────────────────
+// "Never suicide" is right for the common case (one benign transient every now
+// and then), but with NO lower bound a genuinely wedged process — a corrupted
+// state throwing the same error on every tick — would sit forever logging while
+// the status.json heartbeat keeps reporting green ("僵而不死"). The breaker
+// puts a floor under that: a sustained storm (far above anything a WS
+// handshake blip can produce) exits non-zero so a supervisor restarts us with
+// a clean process. Hosts running bare `larkway start` still fare better with a
+// visible dead process than an invisible wedged one.
+
+// Threshold sizing: the benign trigger produces ~0.5 hits/min/bot (one raw WS
+// 'error' per handshake-timeout abort; the SDK reconnects at 120s + jitter, no
+// tight loop — verified against node-sdk 1.67.0). Even 10 simultaneously
+// black-holed bots ≈ 5-10 hits/min. A wedged process throwing per tick
+// produces hundreds/min, so 50 keeps a wide benign margin without hurting
+// detection.
+const BREAKER_THRESHOLD = 50; // crashes…
+const BREAKER_WINDOW_MS = 60_000; // …within this window → trip
+
+/**
+ * Returns a `note()` that records one crash and reports whether the breaker
+ * tripped. Exported for testing; registerCrashGuard wires it to process.exit.
+ */
+export function createCrashStormBreaker(
+  threshold = BREAKER_THRESHOLD,
+  windowMs = BREAKER_WINDOW_MS,
+): () => boolean {
+  const hits: number[] = [];
+  return function note(): boolean {
+    const now = Date.now();
+    hits.push(now);
+    // Drop entries older than the window before judging. (The array can
+    // briefly exceed the threshold under a sub-second storm; bounded by the
+    // trip itself — once note() returns true the process exits.)
+    while (hits.length > 0 && hits[0]! < now - windowMs) hits.shift();
+    return hits.length >= threshold;
+  };
+}
+
 /**
  * Register the process-level crash guard. Idempotent-friendly: callers should
  * invoke once near startup (main.ts). Does not return a teardown — the guard is
  * meant to live for the whole process lifetime.
  */
 export function registerCrashGuard(log: CrashGuardLogger = console): void {
+  const noteCrash = createCrashStormBreaker();
+  const maybeTrip = (): void => {
+    if (!noteCrash()) return;
+    log.error(
+      `[larkway] crash-storm breaker TRIPPED: ≥${BREAKER_THRESHOLD} crash-guard hits ` +
+        `within ${BREAKER_WINDOW_MS / 1000}s — the process is likely wedged, not weathering ` +
+        `a transient. Exiting 1 so a supervisor can restart with a clean process.`,
+    );
+    process.exit(1);
+  };
   process.on("uncaughtException", (err: Error, origin: string) => {
     handleUncaughtException(err, origin, log);
+    maybeTrip();
   });
   process.on("unhandledRejection", (reason: unknown) => {
     handleUnhandledRejection(reason, log);
+    maybeTrip();
   });
 }

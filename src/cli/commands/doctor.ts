@@ -102,6 +102,28 @@ async function checkClaude(ctx: CliContext): Promise<CheckResult> {
 }
 
 /**
+ * lark-cli 可用性探测 — 硬依赖(README Requirements 列明):agent 拉话题
+ * 历史/附件、gap-fill 补抓都走 lark-cli 子进程(WS 长连接本身走 node-sdk,
+ * 与 lark-cli 无关)。缺失时 bot 表面能启动,但第一次让 agent 读话题历史
+ * 就会以晦涩的 spawn 错误失败在第一印象上 —— 所以这里是 error 不是 warn。
+ */
+async function checkLarkCli(): Promise<CheckResult> {
+  try {
+    await execFileAsync("lark-cli", ["--version"], { timeout: 10_000 });
+    return { id: "lark-cli-binary", label: "lark-cli", status: "ok" };
+  } catch {
+    return {
+      id: "lark-cli-binary",
+      label: "lark-cli",
+      status: "error",
+      message:
+        "未找到 `lark-cli`(飞书长连接/消息工具,larkway 硬依赖)。" +
+        "安装:`npm i -g @larksuite/cli`,然后 `lark-cli auth login` 完成授权。",
+    };
+  }
+}
+
+/**
  * 6. codex CLI 可用性探测
  *
  * - If any loaded bot has backend: codex → required (error on missing, warn on no login).
@@ -690,6 +712,10 @@ async function runAllChecks(ctx: CliContext, opts: { lint: boolean }): Promise<C
   // 2. Feishu credentials
   const credChecks = await checkFeishuCreds(ctx);
   results.push(...credChecks);
+
+  // 2b. lark-cli binary (hard dependency — README promises doctor lists
+  // missing dependencies, and lark-cli was the one it didn't check)
+  results.push(await checkLarkCli());
 
   // 3. Bot yaml schema
   const yamlChecks = await checkBotYaml(ctx);

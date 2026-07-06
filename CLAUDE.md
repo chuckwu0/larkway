@@ -50,10 +50,14 @@ Things Larkway must NOT do:
 - Parse or interpret the agent's text output beyond card rendering
 - Make multi-step workflow decisions
 
-**2. Reuse CLIs, not SDKs.**
-Spawn `lark-cli`, `claude`, `codex`, `glab`, `git` as child processes. Do not
-import their Node.js SDK packages. This keeps deps minimal and avoids auth
-surface duplication.
+**2. Reuse CLIs, not SDKs — with one deliberate exception.**
+Spawn `lark-cli`, `claude`, `codex`, `glab`, `git` as child processes rather
+than importing their SDK packages. This keeps deps minimal and avoids auth
+surface duplication. Existing exception: the inbound WS channel uses the
+version-pinned `@larksuiteoapi/node-sdk@1.67.0` (`lark/channelClient.ts`,
+`main.ts`) because the lark-cli subscribe subprocess was unrecoverably flaky —
+that swap is settled; don't "fix" it back. Do not add NEW SDK dependencies
+without the same level of justification.
 
 **3. Subscription auth, not API keys.**
 The `claude` subprocess reads `~/.claude/.credentials.json` (local subscription

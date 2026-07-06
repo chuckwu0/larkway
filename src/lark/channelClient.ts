@@ -485,15 +485,27 @@ export class ChannelClient {
   private readonly inFlightMessageIds = new Set<string>();
   /**
    * Per-message (re-)dispatch counter for the poison-message guard. Incremented
-   * every time a message_id is pushed onto the inbound queue (live WS or either
-   * gap-fill branch) and once more when a turn is released as unhandled. When the
-   * count reaches {@link MAX_MESSAGE_ATTEMPTS}, markUnhandled GIVES UP: it
-   * promotes the message to seen (so it stops being re-dispatched) and logs a
-   * warning. markHandled clears the entry on terminal success. Not persisted:
+   * ONCE per dispatch — every time a message_id is pushed onto the inbound
+   * queue (live WS or either gap-fill branch), and nowhere else, so the cap
+   * really means "N dispatches". When a turn fails and the count has reached
+   * {@link MAX_MESSAGE_ATTEMPTS}, markUnhandled GIVES UP: it promotes the
+   * message to seen (so it stops being re-dispatched) and logs a warning.
+   * markHandled clears the entry on terminal success. Not persisted:
    * post-restart, an interrupted message starts fresh — same policy as
    * inFlightMessageIds.
    */
   private readonly messageAttempts = new Map<string, number>();
+  /**
+   * chatId + create_time for every in-flight message, captured at dispatch.
+   * Consumed by {@link markUnhandled}: a FAILED turn records an unresolved gap
+   * window for its chat so a later replay actually re-pulls (and re-dispatches)
+   * it. Without this there is no steady-state trigger for the re-dispatch that
+   * markUnhandled promises — chats-mode bots have no discovery timer at all,
+   * and open-mode steady-state discovery pulls 0 for already-known chats — so
+   * a turn failing before any visible surface existed was silently dropped.
+   * Cleared in markHandled / markUnhandled; bounded by the in-flight set.
+   */
+  private readonly inFlightMessageMeta = new Map<string, { chatId: string; createTimeMs: number }>();
   /**
    * Chats observed from live WS events during this process lifetime.
    *
@@ -528,6 +540,17 @@ export class ChannelClient {
   private openChatDiscoveryTimer: NodeJS.Timeout | null = null;
   private openChatDiscoveryRunning = false;
   private openChatDiscoveryBootstrapped = false;
+  /**
+   * Chats-mode (allowedChatIds non-empty) counterpart of the open-mode
+   * discovery cycle's unresolved-window replay: those bots never start
+   * discovery, so without this timer a window recorded by markUnhandled had
+   * NO trigger to replay it (the only other gapFill source is a WS reconnect,
+   * which a healthy network may not produce for days). Steady state with no
+   * pending windows does nothing — zero API calls — so the 0.3.28 storm fix
+   * is preserved.
+   */
+  private unresolvedReplayTimer: NodeJS.Timeout | null = null;
+  private unresolvedReplayRunning = false;
   /**
    * Consecutive discovery-cycle failures. Used to SKIP cycles with exponential
    * backoff (storm: a failing +chat-list/gap-fill shouldn't re-fire every
@@ -756,6 +779,7 @@ export class ChannelClient {
         return;
       }
       this.inFlightMessageIds.add(ev.message_id);
+      this.noteInFlightMeta(ev);
       this.noteDispatchAttempt(ev.message_id);
       log(`dispatching (channel-sdk): message_id=${ev.message_id} thread=${ev.thread_id ?? "?"}`);
       this.queue.push(ev);
@@ -792,6 +816,7 @@ export class ChannelClient {
     this.connected = true;
     log(`connected as ${channel.botIdentity?.name ?? "?"} (${channel.botIdentity?.openId ?? "?"})`);
     this.startOpenChatDiscovery(log);
+    this.startUnresolvedReplayTimer(log);
   }
 
   /**
@@ -1103,6 +1128,7 @@ export class ChannelClient {
             // seen happens on terminal success (handler.markHandled); a failed
             // turn is released (handler.markUnhandled) and re-dispatchable.
             this.inFlightMessageIds.add(fallbackEv.message_id);
+            this.noteInFlightMeta(fallbackEv);
             this.noteDispatchAttempt(fallbackEv.message_id);
             log(`gap-fill dispatching (fallback): message_id=${fallbackEv.message_id} chat=${chatId}`);
             this.queue.push(fallbackEv);
@@ -1112,6 +1138,7 @@ export class ChannelClient {
 
           // Mark in-flight (NOT seen): see fallback branch above.
           this.inFlightMessageIds.add(ev.message_id);
+          this.noteInFlightMeta(ev);
           this.noteDispatchAttempt(ev.message_id);
           log(`gap-fill dispatching: message_id=${ev.message_id} thread=${ev.thread_id ?? "?"} chat=${chatId}`);
           this.queue.push(ev);
@@ -1222,6 +1249,39 @@ export class ChannelClient {
     const tracked = this.unresolvedGapWindowByChat.get(chatId);
     if (tracked === undefined) return;
     if (coveredFrom <= tracked) this.unresolvedGapWindowByChat.delete(chatId);
+  }
+
+  /**
+   * Chats-mode replay loop (see {@link unresolvedReplayTimer}): every discovery
+   * interval, IF any unresolved gap window is pending, gapFill exactly those
+   * chats. Open-mode bots don't need this — their discovery cycle already
+   * includes unresolved-window chats in its target set.
+   */
+  private startUnresolvedReplayTimer(log: (s: string) => void): void {
+    if (this.opts.allowedChatIds.size === 0) return; // open mode: discovery covers replay
+    if (this.unresolvedReplayTimer) return;
+    const intervalMs = resolveOpenChatDiscoveryMs(this.opts.openChatDiscoveryMs);
+    if (intervalMs <= 0) return;
+    this.unresolvedReplayTimer = setInterval(() => {
+      void this.replayUnresolvedWindows(log);
+    }, intervalMs);
+    this.unresolvedReplayTimer.unref?.();
+  }
+
+  private async replayUnresolvedWindows(log: (s: string) => void): Promise<void> {
+    if (this.closed || this.unresolvedReplayRunning) return;
+    this.pruneUnresolvedGapWindows(Date.now());
+    if (this.unresolvedGapWindowByChat.size === 0) return; // steady state: no API calls
+    this.unresolvedReplayRunning = true;
+    try {
+      const chats = new Set(this.unresolvedGapWindowByChat.keys());
+      log(`unresolved-window replay: re-pulling ${chats.size} chat(s)`);
+      await this.gapFill(Date.now(), log, chats);
+    } catch (e) {
+      log(`unresolved-window replay failed: ${e instanceof Error ? e.message : String(e)}`);
+    } finally {
+      this.unresolvedReplayRunning = false;
+    }
   }
 
   private startOpenChatDiscovery(log: (s: string) => void): void {
@@ -1562,6 +1622,7 @@ export class ChannelClient {
    */
   markHandled(messageId: string): void {
     this.inFlightMessageIds.delete(messageId);
+    this.inFlightMessageMeta.delete(messageId);
     this.messageAttempts.delete(messageId);
     this.noteSeenMessage(messageId);
   }
@@ -1572,15 +1633,21 @@ export class ChannelClient {
    * self-heal — one transient blip no longer swallows the @ forever). Does not
    * touch persisted seen state.
    *
-   * Poison-message guard: count this failed turn as one more attempt. If the
-   * message has now failed {@link MAX_MESSAGE_ATTEMPTS} times, GIVE UP — promote
-   * it to seen (so it stops being re-dispatched on every gap-fill) and log a
-   * visible warning instead of silently looping forever.
+   * Poison-message guard: if the message has already been dispatched
+   * {@link MAX_MESSAGE_ATTEMPTS} times, GIVE UP — promote it to seen (so it
+   * stops being re-dispatched on every gap-fill) and log a visible warning
+   * instead of silently looping forever. Otherwise, record an unresolved gap
+   * window for the message's chat so the next replay cycle re-dispatches it.
    */
-  markUnhandled(messageId: string): void {
+  markUnhandled(messageId: string, opts?: { replay?: boolean }): void {
     this.inFlightMessageIds.delete(messageId);
-    const attempts = (this.messageAttempts.get(messageId) ?? 0) + 1;
-    this.messageAttempts.set(messageId, attempts);
+    const meta = this.inFlightMessageMeta.get(messageId);
+    this.inFlightMessageMeta.delete(messageId);
+    // Poison-message guard: the counter is bumped once per DISPATCH
+    // (noteDispatchAttempt) — deliberately NOT again here, otherwise each
+    // dispatch+failure cycle counted double and a message got only 2-3 real
+    // tries instead of the documented MAX_MESSAGE_ATTEMPTS.
+    const attempts = this.messageAttempts.get(messageId) ?? 0;
     if (attempts >= MAX_MESSAGE_ATTEMPTS) {
       console.warn(
         `[channel.client] giving up on message_id=${messageId} after ${attempts} failed attempts` +
@@ -1588,17 +1655,45 @@ export class ChannelClient {
       );
       this.messageAttempts.delete(messageId);
       this.noteSeenMessage(messageId);
+      return;
+    }
+    // Make the promised re-dispatch actually happen: record an unresolved gap
+    // window at (just before) this message's create_time so the next replay —
+    // open-mode discovery cycle, chats-mode unresolved-replay timer, or a
+    // reconnect gapFill — re-pulls this chat far enough back to re-dispatch it.
+    // Skipped when the caller says replay:false (agent run already completed;
+    // re-running would multiply its side effects — see InboundClient doc).
+    if (meta && opts?.replay !== false) {
+      this.recordUnresolvedGapWindow(
+        meta.chatId,
+        meta.createTimeMs - 1_000,
+        (s) => console.log(`[channel.client] ${s}`),
+      );
     }
   }
 
   /**
    * Increment the per-message dispatch counter (poison-message guard). Called
-   * each time a message_id is pushed onto the inbound queue. The counter is also
-   * bumped in {@link markUnhandled} so both dispatch and failed settlement
-   * contribute toward the cap.
+   * each time a message_id is pushed onto the inbound queue — and ONLY then;
+   * {@link markUnhandled} deliberately reads without bumping, so the cap means
+   * "N real dispatches" (see the messageAttempts field doc).
    */
   private noteDispatchAttempt(messageId: string): void {
     this.messageAttempts.set(messageId, (this.messageAttempts.get(messageId) ?? 0) + 1);
+  }
+
+  /**
+   * Capture chatId + create_time for an in-flight message at dispatch time, so
+   * {@link markUnhandled} can queue an unresolved gap window that reaches back
+   * to the message itself. An unparseable create_time falls back to "1 min ago"
+   * — wide enough to cover the message without flooding the replay pull.
+   */
+  private noteInFlightMeta(ev: LarkMessageEvent): void {
+    const t = Number(ev.create_time);
+    const createTimeMs = Number.isFinite(t) && t > 0
+      ? (t < 1e12 ? t * 1000 : t) // lark surfaces both s and ms epochs
+      : Date.now() - 60_000;
+    this.inFlightMessageMeta.set(ev.message_id, { chatId: ev.chat_id, createTimeMs });
   }
 
   async close(): Promise<void> {
@@ -1606,6 +1701,10 @@ export class ChannelClient {
     if (this.openChatDiscoveryTimer) {
       clearInterval(this.openChatDiscoveryTimer);
       this.openChatDiscoveryTimer = null;
+    }
+    if (this.unresolvedReplayTimer) {
+      clearInterval(this.unresolvedReplayTimer);
+      this.unresolvedReplayTimer = null;
     }
     this.queue.close();
     if (this.channel && this.connected) {

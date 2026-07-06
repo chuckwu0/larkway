@@ -167,6 +167,13 @@ Agent 判断分类:preference / reusable knowledge / workflow / decision / asset
 
 ## 6. Owner 与修改权限
 
+> ⚠️ **状态:规划中,未实现。** 当前代码库没有 `owner_open_id` / `is_owner`
+> 概念(见 `src/cli/ownerIdentity.ts` 的说明),每轮 prompt 不注入 sender 身份
+> 事实,也没有任何 owner-gated 写入接口。**本节描述的是目标契约,不是现有
+> 安全边界** —— 今天任何能 @ 到 bot 的群成员都可以让 agent 改写 AGENTS.md /
+> memory。在实现落地前,请按 README 的 Security model 一节理解真实暴露面
+> (chats 白名单是当前唯一的机械边界)。
+
 创建 Agent 时必须记录 owner 身份,例如 `owner_open_id`。该身份不应只写在
 `AGENTS.md` 中,还应存在 bot 配置或 Larkway 管理元数据中,因为 `AGENTS.md` 本身可被
 Agent 编辑。

@@ -24,6 +24,13 @@ export interface LarkMessageEvent {
   /** 'p2p' | 'group' | 'topic_group' etc. */
   chat_type: string;
   thread_id?: string;
+  /**
+   * Thread ROOT message id (om_…) when this message is an in-thread reply;
+   * absent on a top-level message (which IS its own root). `root_id ??
+   * message_id` is the session key — both parseLarkMessage's threadId and
+   * BridgeHandler.run()'s serial-queue key derive from it and MUST agree.
+   */
+  root_id?: string;
   /** open_id of the sender; some SDK paths may pass the raw sender_id object. */
   sender_id: string | Record<string, unknown>;
   mentions?: Array<{
@@ -82,8 +89,16 @@ export interface InboundClient {
    * Release a message from the "in-flight" set WITHOUT marking it handled: its
    * turn failed/aborted. The message becomes re-dispatchable by the next
    * gap-fill window. Optional so non-ChannelClient transports can no-op.
+   *
+   * `opts.replay` (default true): when true, the transport may PROACTIVELY
+   * queue the message's chat for a steady-state replay pull so the failed @
+   * is re-dispatched without waiting for a WS reconnect. The bridge passes
+   * false when the agent subprocess already COMPLETED its run and only the
+   * post-run surface work failed — re-running a completed turn multiplies
+   * its side effects (commits/MRs/messages), so those messages stay
+   * re-dispatchable only via reconnect gap-fill windows.
    */
-  markUnhandled?(messageId: string): void;
+  markUnhandled?(messageId: string, opts?: { replay?: boolean }): void;
   close(): Promise<void>;
 }
 

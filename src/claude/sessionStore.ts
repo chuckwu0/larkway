@@ -21,7 +21,7 @@
  *   - 将 botId 改为必填
  */
 
-import { rename, readFile, writeFile, mkdir, copyFile } from "node:fs/promises";
+import { rename, readFile, writeFile, mkdir, copyFile, unlink } from "node:fs/promises";
 import { dirname } from "node:path";
 import { LEGACY_BOT_ID } from "../config/paths.js";
 
@@ -118,6 +118,21 @@ export class SessionStore {
   readonly #filePath: string;
   readonly #map: Map<string, StoredRecord>;
 
+  /**
+   * Serializes every #flush() through one chain — mirrors TaskHandleStore's
+   * `#flushChain` (same rationale). Concurrent writers are real here: up to
+   * MAX_CONCURRENT turns call `put()`/`delete()` while the touch-debounce
+   * timer fires its own flush. Without serialization, two overlapping
+   * `writeFile(SAME tmp path)+rename` pairs can interleave (both open with
+   * O_TRUNC at their own offset 0) and land corrupt JSON as sessions.json.
+   * Each link's #writeSnapshot() takes its #map snapshot when it actually
+   * RUNS (not at enqueue time), so the LAST queued write is always the LAST
+   * to land on disk.
+   */
+  #flushChain: Promise<void> = Promise.resolve();
+  /** Monotonic suffix so no two in-flight tmp files ever share a path. */
+  #tmpCounter = 0;
+
   /** Whether a touch flush is pending */
   #touchDirty = false;
   #touchTimer: ReturnType<typeof setTimeout> | undefined;
@@ -165,10 +180,7 @@ export class SessionStore {
     try {
       parsed = JSON.parse(raw);
     } catch {
-      throw new Error(
-        `[SessionStore] ${filePath} is not valid JSON — ` +
-          `fix or delete the file and restart.`,
-      );
+      return await SessionStore.#recoverFromCorruption(filePath, "is not valid JSON");
     }
 
     if (
@@ -176,9 +188,9 @@ export class SessionStore {
       parsed === null ||
       !("records" in parsed)
     ) {
-      throw new Error(
-        `[SessionStore] ${filePath} is missing required fields (records) — ` +
-          `fix or delete the file and restart.`,
+      return await SessionStore.#recoverFromCorruption(
+        filePath,
+        "is missing required fields (records)",
       );
     }
 
@@ -201,9 +213,9 @@ export class SessionStore {
 
     // ── V2 normal load ───────────────────────────────────────────────────────
     if (typeof file.records !== "object" || file.records === null) {
-      throw new Error(
-        `[SessionStore] ${filePath} records field is not an object — ` +
-          `fix or delete the file and restart.`,
+      return await SessionStore.#recoverFromCorruption(
+        filePath,
+        "records field is not an object",
       );
     }
 
@@ -212,15 +224,52 @@ export class SessionStore {
       file.records as Record<string, unknown>,
     )) {
       if (!isStoredRecord(value)) {
-        throw new Error(
-          `[SessionStore] ${filePath} record "${key}" has unexpected shape — ` +
-            `fix or delete the file and restart.`,
+        // One bad record must not take down the whole store (let alone the
+        // whole bridge) — skip it, keep every healthy record.
+        console.warn(
+          `[SessionStore] ${filePath} record "${key}" has unexpected shape — skipping it.`,
         );
+        continue;
       }
       map.set(key, value);
     }
 
     return new SessionStore(filePath, map);
+  }
+
+  /**
+   * A corrupt sessions.json must not keep the whole bridge from booting:
+   * load() runs in main.ts startup with no surrounding try/catch, so a throw
+   * here used to take EVERY bot down and require manual file surgery.
+   * Mirror TaskHandleStore's posture instead: move the bad file to a
+   * timestamped `.corrupt-*` backup (never silently lost) and start from an
+   * empty store. Cost: threads lose their resume mapping and start fresh
+   * sessions — a safe degradation compared to a full outage.
+   *
+   * NOTE: an unknown FUTURE `version` still throws (see load) — that file is
+   * valid data written by newer code, not corruption, and must not be nuked.
+   */
+  static async #recoverFromCorruption(
+    filePath: string,
+    reason: string,
+  ): Promise<SessionStore> {
+    const ts = new Date().toISOString().replace(/[:.]/g, "-");
+    const backupPath = `${filePath}.corrupt-${ts}`;
+    try {
+      await rename(filePath, backupPath);
+      console.error(
+        `[SessionStore] ${filePath} ${reason} — moved to ${backupPath}; ` +
+          `starting with an empty store (existing threads will start fresh sessions).`,
+      );
+    } catch (err) {
+      console.error(
+        `[SessionStore] ${filePath} ${reason} — backup rename failed ` +
+          `(${String(err)}); starting with an empty store anyway.`,
+      );
+    }
+    const store = new SessionStore(filePath, new Map());
+    await store.#flush();
+    return store;
   }
 
   /**
@@ -389,19 +438,36 @@ export class SessionStore {
   // -------------------------------------------------------------------------
 
   /**
-   * Atomic write: serialize → write to <path>.tmp → fs.rename (POSIX atomic).
+   * Atomic write, serialized through #flushChain (see field doc).
+   * The caller of THIS flush still observes its own link's rejection;
+   * the chain itself swallows it so one failure can't wedge later flushes.
    */
-  async #flush(): Promise<void> {
+  #flush(): Promise<void> {
+    const next = this.#flushChain.then(() => this.#writeSnapshot());
+    this.#flushChain = next.catch(() => {});
+    return next;
+  }
+
+  /** serialize → write to a unique tmp path → fs.rename (POSIX atomic). */
+  async #writeSnapshot(): Promise<void> {
     const file: StoreFile = {
       version: STORE_VERSION,
       records: Object.fromEntries(this.#map),
     };
     const json = JSON.stringify(file, null, 2);
-    const tmpPath = `${this.#filePath}.tmp`;
+    const tmpPath = `${this.#filePath}.tmp.${process.pid}.${this.#tmpCounter++}`;
 
     await mkdir(dirname(this.#filePath), { recursive: true });
-    await writeFile(tmpPath, json, "utf8");
-    await rename(tmpPath, this.#filePath);
+    try {
+      await writeFile(tmpPath, json, "utf8");
+      await rename(tmpPath, this.#filePath);
+    } catch (err) {
+      // Unlike the old fixed `.tmp` name (self-overwriting), unique names
+      // would accumulate one orphan per failed write (worst under the exact
+      // ENOSPC condition that makes writes fail) — clean up best-effort.
+      await unlink(tmpPath).catch(() => {});
+      throw err;
+    }
   }
 }
 
