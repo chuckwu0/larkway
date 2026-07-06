@@ -21,6 +21,7 @@ import yaml from "js-yaml";
 
 import {
   _setEventNameResolverExecForTest,
+  _setPermissionAuthExecForTest,
   createManagementContext,
   matchRoute,
   ROUTES,
@@ -310,6 +311,79 @@ describe("GET /api/bot/:id", () => {
     const ctx = makeCtx(dir);
     const res = await call(ctx, "GET /api/bot/:id", { params: { id: "nonexistent" } });
     expect(res.status).toBe(404);
+  });
+});
+
+describe("POST /api/bot/:id/permission-auth", () => {
+  afterEach(() => {
+    _setPermissionAuthExecForTest();
+  });
+
+  it("generates the authorization URL with the selected bot's own profile and full scope list", async () => {
+    const dir = await makeLocalBotsDir();
+    await writeFile(
+      path.join(dir, "second-bot.yaml"),
+      `id: second-bot
+name: Second Bot
+description: Another bot used in tests
+app_id: cli_second123
+app_secret_env: SECOND_APP_SECRET_ENV
+bot_open_id: ou_second123
+lark_cli_profile: second-profile
+chats: []
+`,
+      "utf-8",
+    );
+    const ctx = makeCtx(dir);
+    ctx.stores.hostConfig = { ...ctx.stores.hostConfig, readSecret: async () => null };
+    const calls: Array<{ file: string; args: string[] }> = [];
+    _setPermissionAuthExecForTest(async (file, args) => {
+      calls.push({ file, args });
+      return {
+        stdout: JSON.stringify({
+          verification_url:
+            `https://accounts.feishu.cn/oauth/v1/device/verify?flow_id=${encodeURIComponent(args[1])}&user_code=AUTH-LINK`,
+          device_code: "device_code_must_not_leak",
+          expires_in: 600,
+          interval: 5,
+        }),
+        stderr: "",
+      };
+    });
+
+    const first = await call(ctx, "POST /api/bot/:id/permission-auth", { params: { id: "test-bot" } });
+    const second = await call(ctx, "POST /api/bot/:id/permission-auth", { params: { id: "second-bot" } });
+
+    expect(first.status).toBe(200);
+    expect(second.status).toBe(200);
+    expect(calls[0]).toMatchObject({ file: "lark-cli", args: ["--profile", "cli_test123", "auth", "login", "--scope", expect.any(String), "--no-wait", "--json"] });
+    expect(calls[1]).toMatchObject({ file: "lark-cli", args: ["--profile", "second-profile", "auth", "login", "--scope", expect.any(String), "--no-wait", "--json"] });
+    const requestedScopes = calls[1].args[5].split(/\s+/);
+    expect(requestedScopes).toContain("application:bot.basic_info:read");
+    expect(requestedScopes).toContain("task:tasklist:write");
+    expect(requestedScopes).toContain("wiki:node:retrieve");
+    expect(requestedScopes).toContain("offline_access");
+    expect((second.json as { authorizationUrl?: string }).authorizationUrl).toContain("second-profile");
+    expect(JSON.stringify(second.json)).not.toContain("device_code_must_not_leak");
+    expect(JSON.stringify(second.json)).not.toContain("SECOND_APP_SECRET_ENV");
+    expect(JSON.stringify(second.json)).not.toContain("--profile");
+  });
+
+  it("does not leak raw lark-cli failure details", async () => {
+    const dir = await makeLocalBotsDir();
+    const ctx = makeCtx(dir);
+    ctx.stores.hostConfig = { ...ctx.stores.hostConfig, readSecret: async () => null };
+    _setPermissionAuthExecForTest(async () => {
+      throw new Error("Command failed: lark-cli --profile cli_test123 auth login --scope raw_scope secret=raw_secret");
+    });
+
+    const res = await call(ctx, "POST /api/bot/:id/permission-auth", { params: { id: "test-bot" } });
+
+    expect(res.status).toBe(502);
+    const text = JSON.stringify(res.json);
+    expect(text).not.toContain("raw_secret");
+    expect(text).not.toContain("raw_scope");
+    expect(text).not.toContain("--profile");
   });
 });
 
