@@ -4585,4 +4585,49 @@ describe("handleOne — v4 task-share root probe", () => {
     expect(startArgs[0]).toMatchObject({ messageId: "om_msg2", replyInThread: false });
     expect(prompt()).not.toContain("<task-root>");
   });
+
+  it("task_root_claimed uses EXACT guid comparison — a thread that claimed a DIFFERENT task reads claimed: no", async () => {
+    let runOpts: { prompt?: string } | undefined;
+    runClaudeImpl = (opts: unknown) => {
+      runOpts = opts as { prompt?: string };
+      return {
+        events: (async function* () {
+          yield { type: "system_init", sessionId: "sess_v4g", raw: {} };
+        })(),
+        done: Promise.resolve({ exitCode: 0, sessionId: "sess_v4g" }),
+        kill: () => {},
+      };
+    };
+    const { renderer, whenFinalized } = makeCardRenderer();
+    const { store } = makeSessionStore();
+    const { client } = makeClient(makeQuoteReplyEvent());
+    await seedRepoCachePath();
+    const { lookup } = makeLookup({ msgType: "todo", content: TODO_CONTENT, threadId: "omt_x1" });
+    const handler = new BridgeHandler({
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      client: client as any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      cardRenderer: renderer as any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      sessionStore: store as any,
+      conventions: makeConventions(),
+      botConfig: { id: "frontend", name: "Frontend", turn_taking_limit: 10, backend: "claude" },
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      messageLookup: lookup as any,
+      taskHandleClaimedLookup: () => true, // boolean lookup says "some claim exists"
+      taskHandleClaimGuidLookup: () => "some-OTHER-guid", // …but on a different task
+    });
+    await handler.run();
+    await whenFinalized;
+
+    expect(runOpts?.prompt ?? "").toContain("task_root_claimed: no");
+  });
+
+  it("in-thread turn carries the topic deep link built from the event's own thread_id (not the probe cache)", async () => {
+    // probe result deliberately has NO threadId (pre-topic cached shape)
+    const { lookup } = makeLookup({ msgType: "todo", content: TODO_CONTENT });
+    const { prompt } = await runOnce(makeQuoteReplyEvent({ thread_id: "omt_live" }), lookup);
+
+    expect(prompt()).toContain("open_thread_id=omt_live");
+  });
 });

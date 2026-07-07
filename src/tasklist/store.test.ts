@@ -287,6 +287,26 @@ describe("TaskHandleStore", () => {
       expect(store.get("t1")?.mode).toBeUndefined();
     });
 
+    it("same-guid re-declaration UPGRADES an absent mode to comment (probe failed on the claim turn, recovered later)", async () => {
+      const store = await TaskHandleStore.load(filePath);
+      await store.claim({ threadId: "t1", taskGuid: "g1", chatId: "oc_1" }); // claim turn: probe failed → no mode
+      await store.put({ ...store.get("t1")!, lastSeenCommentId: "c5" }); // poller advanced meanwhile
+
+      await store.claim({ threadId: "t1", taskGuid: "g1", chatId: "oc_1", mode: "comment" }); // later turn: probe recovered
+
+      expect(store.get("t1")?.mode).toBe("comment");
+      expect(store.get("t1")?.lastSeenCommentId).toBe("c5"); // upgrade preserves the rest of the record
+    });
+
+    it("same-guid re-declaration never DOWNGRADES an established comment mode", async () => {
+      const store = await TaskHandleStore.load(filePath);
+      await store.claim({ threadId: "t1", taskGuid: "g1", chatId: "oc_1", mode: "comment" });
+
+      await store.claim({ threadId: "t1", taskGuid: "g1", chatId: "oc_1" }); // later turn: probe failed → mode undefined
+
+      expect(store.get("t1")?.mode).toBe("comment");
+    });
+
     it("doneDeclared round-trips through disk", async () => {
       const store = await TaskHandleStore.load(filePath);
       await store.claim({ threadId: "t1", taskGuid: "g1", chatId: "oc_1", mode: "comment" });

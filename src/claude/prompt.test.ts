@@ -1056,3 +1056,36 @@ describe("renderPrompt — <task-root> block", () => {
     expect(prompt).not.toContain("<task-handle>");
   });
 });
+
+describe("renderPrompt — <task-root> supersedes <task-handle> (adversarial-review fix)", () => {
+  it("suppresses the tasklist block entirely when taskRoot is present, even with a guid + claimed thread", async () => {
+    const prompt = await renderPrompt(
+      makeInput({
+        botName: "Frontend",
+        taskHandleTasklistGuid: "list-guid-1",
+        taskHandleClaimed: true,
+        taskRoot: { guid: "guid-42", summary: "修复登录页", claimed: true },
+      }),
+    );
+    expect(prompt).toContain("<task-root>");
+    // the claimed <task-handle> text states bridge behaviors that are FALSE
+    // for a comment-mode claim ("bridge 已自动维护完成/失败/reopen")
+    expect(prompt).not.toContain("<task-handle>");
+    expect(prompt).not.toContain("bridge 已自动维护完成/失败/reopen");
+  });
+
+  it("keeps the tasklist block for ordinary threads (no taskRoot) — 辅路径 unchanged", async () => {
+    const prompt = await renderPrompt(
+      makeInput({ botName: "Frontend", taskHandleTasklistGuid: "list-guid-1", taskHandleClaimed: true }),
+    );
+    expect(prompt).toContain("<task-handle>");
+  });
+
+  it("unclaimed directive includes the double-@ race guard (comments list before claiming)", async () => {
+    const prompt = await renderPrompt(
+      makeInput({ botName: "Frontend", taskRoot: { guid: "g", summary: "x", claimed: false } }),
+    );
+    expect(prompt).toContain("comments list");
+    expect(prompt).toContain("不认领");
+  });
+});

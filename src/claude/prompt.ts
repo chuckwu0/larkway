@@ -497,8 +497,11 @@ function renderTaskRootBlock(taskRoot: {
     );
   } else {
     lines.push(
-      "本轮请顺带静默认领:把上面的 task_guid 写入 state.json 的 task_handle.guid,并发一条认领评论" +
-        `(lark-cli task comments create),内容 = 一句认领声明${taskRoot.topicLink ? " + 上面的 topic_link(用户点它直达本话题)" : ""}。` +
+      "本轮请顺带静默认领,分两步:① 先读一遍该任务的现有评论(lark-cli task comments list)——如果已有" +
+        "**其他 agent** 的认领声明,说明同话题的另一个 bot 已接手,本轮不认领、不声张、正常回答即可" +
+        "(双 @ 竞态护栏:重复认领 = 双份维护 + 双份巡检骚扰);② 没有别人认领 → 把上面的 task_guid 写入" +
+        " state.json 的 task_handle.guid,并发一条认领评论(lark-cli task comments create),内容 = 一句认领声明" +
+        `${taskRoot.topicLink ? " + 上面的 topic_link(用户点它直达本话题)" : ""}。` +
         "之后维护面只有任务评论(交付/失败/等拍板才发,过程碎碎念不发);不要修改任务描述、不要勾完成——完成永远由人点。",
     );
   }
@@ -737,12 +740,16 @@ export async function renderPrompt(input: RenderPromptInput): Promise<string> {
   const turnTakingBlock = turn_taking_limit && turn_taking_limit > 0
     ? renderTurnTakingHint(turn_taking_limit)
     : [];
-  const taskHandleBlock = taskHandleTasklistGuid
-    ? renderTaskHandleBlock(taskHandleTasklistGuid, taskHandleClaimed, taskHandleCandidates)
-    : [];
-  // v4 任务派单 (§15): root-is-task-share fact block, tasklist-independent.
-  // When present it supersedes the tasklist candidate flow for this thread —
-  // the claim target is deterministic, so candidates would only distract.
+  // v4 任务派单 (§15): when this thread's root IS a task share, the
+  // <task-root> block REPLACES the tasklist <task-handle> block outright
+  // (adversarial-review fix): the claim target is deterministic so candidates
+  // only distract, and the <task-handle> claimed text ("bridge 已自动维护
+  // 完成/失败/reopen") states facts that are FALSE for a comment-mode claim —
+  // rendering both hands the agent two contradictory instruction sets.
+  const taskHandleBlock =
+    taskHandleTasklistGuid && !taskRoot
+      ? renderTaskHandleBlock(taskHandleTasklistGuid, taskHandleClaimed, taskHandleCandidates)
+      : [];
   const taskRootBlock = taskRoot ? renderTaskRootBlock(taskRoot) : [];
   const runtimeWarningsBlock = renderRuntimeWarningsBlock(runtimeWarnings);
   // Workspace warm-up block — rendered for all bots that have at least one repo.

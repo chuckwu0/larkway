@@ -390,7 +390,18 @@ export class TaskHandleStore {
     await this.update(input.threadId, (existing) => {
       if (existing && existing.taskGuid === input.taskGuid) {
         claimed = true;
-        return existing; // true no-op — see doc above for why this must not rebuild
+        // v4 adversarial-review fix: mode may UPGRADE to "comment" on a
+        // same-guid re-declaration. The handler derives mode from the
+        // best-effort root probe; if that probe happened to fail on the very
+        // turn the agent first declared the guid, the claim landed as
+        // full-maintenance and — without this — no later successful probe
+        // could ever correct it (this branch used to be a strict no-op).
+        // Upgrade only, never downgrade: a probe failure on a LATER turn
+        // yields mode=undefined and must not strip an established "comment".
+        if (input.mode === "comment" && existing.mode === undefined) {
+          return { ...existing, mode: "comment" };
+        }
+        return existing; // otherwise a true no-op — see doc above for why this must not rebuild
       }
       if (input.onlyIfThreadUnclaimed && existing !== undefined) {
         reason = `thread ${input.threadId} already holds a claim on task ${existing.taskGuid} — refusing to replace it for a mechanical auto-bind`;

@@ -859,6 +859,15 @@ export interface BridgeHandlerDeps {
    */
   taskHandleClaimedLookup?: (threadId: string) => boolean;
   /**
+   * v4 任务派单 (adversarial-review fix): the CLAIMED task guid for a thread,
+   * so <task-root>'s claimed fact means "this thread claimed THIS task" —
+   * not "this thread claimed something". Without the distinction, a thread
+   * that claimed a different task would be told task_root_claimed: yes and
+   * the agent would maintain the wrong task forever. Same zero-I/O
+   * TaskHandleStore.get() as taskHandleClaimedLookup.
+   */
+  taskHandleClaimGuidLookup?: (threadId: string) => string | undefined;
+  /**
    * v3 "候选注入" (docs/task-handle.md §5.1): reads the bridge's TasklistPoller
    * cache — a plain in-memory snapshot read, no I/O, safe to call once per
    * turn at prompt-build time. Not thread-scoped (candidates aren't matched
@@ -1202,20 +1211,30 @@ export class BridgeHandler {
     // the root with reply_in_thread. Probe is best-effort: any lookup failure
     // leaves pre-v4 behavior untouched.
     let taskRootInfo: { guid: string; summary: string; topicLink?: string } | undefined;
+    // Deferred probe for TRUE thread replies (adversarial-review fix): the
+    // anchor never changes for an in-thread turn, so its probe must not
+    // block card creation (up to the lookup timeout) — it is awaited later,
+    // just before prompt build, where its facts are actually consumed.
+    let deferredTaskRootProbe: Promise<import("../lark/messageLookupClient.js").MessageInfo | undefined> | undefined;
     {
       const rootId = typeof parsed.raw.root_id === "string" && parsed.raw.root_id ? parsed.raw.root_id : undefined;
-      const inThread = typeof parsed.raw.thread_id === "string" && !!parsed.raw.thread_id;
+      const rawThreadId = typeof parsed.raw.thread_id === "string" && parsed.raw.thread_id ? parsed.raw.thread_id : undefined;
       if (rootId && this.deps.messageLookup) {
-        const info = await this.deps.messageLookup.get(rootId).catch(() => undefined);
-        if (info?.msgType === "todo" && info.content) {
-          const todo = parseTodoShareContent(info.content);
-          if (todo) {
-            taskRootInfo = {
-              guid: todo.taskGuid,
-              summary: todo.summaryText,
-              topicLink: info.threadId ? buildTopicDeepLink(parsed.chatId, info.threadId) : undefined,
-            };
-            if (!inThread) {
+        const probe = this.deps.messageLookup.get(rootId).catch(() => undefined);
+        if (rawThreadId) {
+          deferredTaskRootProbe = probe; // in-thread: facts only, resolved pre-prompt
+        } else {
+          // Quote-reply outside any thread: the probe decides the ANCHOR, so
+          // it must resolve before the reply surfaces are created.
+          const info = await probe;
+          if (info?.msgType === "todo" && info.content) {
+            const todo = parseTodoShareContent(info.content);
+            if (todo) {
+              taskRootInfo = {
+                guid: todo.taskGuid,
+                summary: todo.summaryText,
+                topicLink: info.threadId ? buildTopicDeepLink(parsed.chatId, info.threadId) : undefined,
+              };
               replyInThread = true;
               replyAnchorId = rootId;
             }
@@ -1922,6 +1941,30 @@ export class BridgeHandler {
           }
         }
 
+        // v4 任务派单 — deferred in-thread probe (see the dispatch-site
+        // comment): resolve it here, where the <task-root> facts are consumed.
+        // The topic already exists (we're inside it), so the deep link comes
+        // straight from the event's own thread_id — no dependency on the
+        // (possibly pre-topic, cached) probe result's threadId field.
+        if (deferredTaskRootProbe) {
+          const info = await deferredTaskRootProbe;
+          if (info?.msgType === "todo" && info.content) {
+            const todo = parseTodoShareContent(info.content);
+            if (todo) {
+              const rawThreadId =
+                typeof parsed.raw.thread_id === "string" && parsed.raw.thread_id ? parsed.raw.thread_id : undefined;
+              taskRootInfo = {
+                guid: todo.taskGuid,
+                summary: todo.summaryText,
+                topicLink: rawThreadId
+                  ? buildTopicDeepLink(parsed.chatId, rawThreadId)
+                  : info.threadId
+                    ? buildTopicDeepLink(parsed.chatId, info.threadId)
+                    : undefined,
+              };
+            }
+          }
+        }
         // v4 任务派单: the topic may have JUST been created by this turn's own
         // card (quote-reply retarget path above) — re-probe the root once for
         // the fresh omt_* id so the <task-root> fact can carry the topic deep
@@ -1965,7 +2008,15 @@ export class BridgeHandler {
           taskHandleClaimed: this.deps.taskHandleClaimedLookup?.(threadId) ?? false,
           taskHandleCandidates: this.deps.taskHandleCandidatesLookup?.() ?? [],
           taskRoot: taskRootInfo
-            ? { ...taskRootInfo, claimed: this.deps.taskHandleClaimedLookup?.(threadId) ?? false }
+            ? {
+                ...taskRootInfo,
+                // Exact-guid comparison (see taskHandleClaimGuidLookup's doc);
+                // falls back to the boolean lookup only when the precise one
+                // isn't wired (older embedding code).
+                claimed: this.deps.taskHandleClaimGuidLookup
+                  ? this.deps.taskHandleClaimGuidLookup(threadId) === taskRootInfo.guid
+                  : (this.deps.taskHandleClaimedLookup?.(threadId) ?? false),
+              }
             : undefined,
           mtimeFacts,
         });

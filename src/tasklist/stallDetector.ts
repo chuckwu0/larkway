@@ -943,6 +943,16 @@ export class StallDetector {
         : r,
     );
 
+    // v4.1 comment-mode (docs/task-handle.md §15.3/§15.6): NO description
+    // writes on the 任务派单 main path, ever — "唤醒留痕在主路径不适用,略过
+    // 即可". The wake-up turn itself (above) and the escalation comment are
+    // the visible artifacts; skipping the trace here mirrors writeback.ts's
+    // comment-mode exemption. Without this gate a typical share-only claim
+    // burns a guaranteed-403 PATCH per nudge — and if the bot happens to
+    // hold editor rights via a tasklist, it would REALLY write a status
+    // block into a comment-mode task's description (拍板 violation).
+    if (record.mode === "comment") return;
+
     // v3.3 item 2 (docs/task-handle.md §14): leave a durable trace in the
     // task's own rolling progress log, same mechanism writeback.ts already
     // uses for per-turn summaries — best-effort, never blocks the wake-up

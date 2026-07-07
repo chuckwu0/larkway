@@ -464,6 +464,7 @@ async function runV2Mode({
     let taskHandleLifecycle: ((patch: import("./tasklist/types.js").TaskHandleLifecyclePatch) => Promise<void>) | undefined;
     let taskHandleClaim: ((patch: import("./tasklist/types.js").TaskHandleClaimPatch) => Promise<void>) | undefined;
     let taskHandleClaimedLookup: ((threadId: string) => boolean) | undefined;
+    let taskHandleClaimGuidLookup: ((threadId: string) => string | undefined) | undefined;
     let taskHandleCandidatesLookup: (() => readonly import("./tasklist/types.js").TaskCandidate[]) | undefined;
     let taskCommentPoller: CommentPoller | undefined;
     let stallDetector: StallDetector | undefined;
@@ -547,6 +548,7 @@ async function runV2Mode({
         // `task_handle_claimed: yes|no` so the SKILL can offer a one-tap claim
         // button only when this thread genuinely has no claim yet.
         taskHandleClaimedLookup = (threadId) => taskHandleStore.get(threadId) !== undefined;
+        taskHandleClaimGuidLookup = (threadId) => taskHandleStore.get(threadId)?.taskGuid;
         // Dedup group for the shared TasklistPoller (v3, 辅路径 only) — this
         // bot joins whichever group already exists for `guid` (first bot to
         // see it seeds the group's client; every later bot just adds itself so
@@ -807,6 +809,7 @@ async function runV2Mode({
       taskHandleLifecycle,
       taskHandleClaim,
       taskHandleClaimedLookup,
+      taskHandleClaimGuidLookup,
       taskHandleCandidatesLookup,
     });
     // v3.2 交接断链检测 (revision 2, docs/task-handle.md §13): register so

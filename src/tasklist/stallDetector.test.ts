@@ -1439,3 +1439,43 @@ describe("StallDetector — doneDeclared (v4.1 comment-mode delivery)", () => {
     expect(enqueueNudgeTurn).toHaveBeenCalledTimes(1);
   });
 });
+
+describe("StallDetector — comment-mode nudge leaves NO description trace (v4.1 §15.3)", () => {
+  it("nudges a stalled comment-mode claim but never PATCHes the task description", async () => {
+    const store = await TaskHandleStore.load(join(dir, "task-handles.json"));
+    const claimedAt = Date.now();
+    await store.put({ threadId: "t1", taskGuid: "g1", chatId: "oc_1", claimedTs: claimedAt, mode: "comment" });
+    const { requester, calls } = makeFakeRequester({ g1: { guid: "g1", summary: "任务A" } });
+    const client = new TaskListClient(requester);
+    const enqueueNudgeTurn = vi.fn();
+    const detector = new StallDetector(
+      { store, client, getLastActiveTs: () => claimedAt, enqueueNudgeTurn },
+      { stallThresholdMs: DAY },
+    );
+
+    vi.setSystemTime(claimedAt + DAY + 1);
+    await detector.pollOnceForTest();
+
+    expect(enqueueNudgeTurn).toHaveBeenCalledTimes(1); // wake-up itself still fires
+    expect(calls.some((c) => c.method === "PATCH")).toBe(false); // but no description trace
+  });
+
+  it("full-mode claims keep the v3.3 nudge-history description trace", async () => {
+    const store = await TaskHandleStore.load(join(dir, "task-handles.json"));
+    const claimedAt = Date.now();
+    await store.put({ threadId: "t1", taskGuid: "g1", chatId: "oc_1", claimedTs: claimedAt });
+    const { requester, calls } = makeFakeRequester({ g1: { guid: "g1", summary: "任务A" } });
+    const client = new TaskListClient(requester);
+    const enqueueNudgeTurn = vi.fn();
+    const detector = new StallDetector(
+      { store, client, getLastActiveTs: () => claimedAt, enqueueNudgeTurn },
+      { stallThresholdMs: DAY },
+    );
+
+    vi.setSystemTime(claimedAt + DAY + 1);
+    await detector.pollOnceForTest();
+
+    expect(enqueueNudgeTurn).toHaveBeenCalledTimes(1);
+    expect(calls.some((c) => c.method === "PATCH")).toBe(true);
+  });
+});
