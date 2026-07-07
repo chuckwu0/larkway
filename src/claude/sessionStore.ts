@@ -91,6 +91,18 @@ export interface SessionRecord {
    * mapping independent of a live in-flight turn.
    */
   chatId?: string;
+  /**
+   * BL-38 (poison-session self-heal): count of CONSECUTIVE turns on this thread
+   * that ended by the idle watchdog (a confirmed hang). Incremented on each
+   * such turn, reset to 0 by any clean-completing turn. When it reaches the
+   * threshold (handler.ts STUCK_SESSION_RESET_AFTER) the bridge drops this
+   * record so the next @ starts from a fresh session — the fix for a
+   * behaviorally-poisoned session that keeps resuming into the same silent
+   * hang (idle-kill produces no resume error, so the ghost-session purge never
+   * fires on it). Absent on records written before this field existed / on any
+   * non-stuck thread = 0 (backward compatible; only persisted when > 0).
+   */
+  consecutiveStuckCount?: number;
 }
 
 /** The shape actually persisted to disk — botId required. */
@@ -103,6 +115,7 @@ interface StoredRecord {
   senderOpenId?: string;
   rootText?: string;
   chatId?: string;
+  consecutiveStuckCount?: number;
 }
 
 interface StoreFile {
@@ -359,6 +372,9 @@ export class SessionStore {
       ...(record.senderOpenId !== undefined ? { senderOpenId: record.senderOpenId } : {}),
       ...(record.rootText !== undefined ? { rootText: record.rootText } : {}),
       ...(record.chatId !== undefined ? { chatId: record.chatId } : {}),
+      // BL-38: only persist when > 0 — a 0/undefined counter is a clean thread,
+      // so passing consecutiveStuckCount: 0 naturally clears the field on reset.
+      ...(record.consecutiveStuckCount ? { consecutiveStuckCount: record.consecutiveStuckCount } : {}),
     };
     this.#map.set(key, stored);
     await this.#flush();

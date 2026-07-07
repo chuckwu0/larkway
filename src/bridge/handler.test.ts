@@ -4256,3 +4256,224 @@ describe("handleOne — provisioning decision tree (unified model)", () => {
     expect(worktreeAddCalls).toHaveLength(0);
   });
 });
+
+// ---------------------------------------------------------------------------
+// BL-38: poison-session self-heal (consecutive idle-kills → drop the session)
+// ---------------------------------------------------------------------------
+
+describe("BL-38: poison-session self-heal", () => {
+  const threadId = "om_msg"; // makeEvent().message_id, no root_id → thread == message id
+  const botId = "frontend";
+  const key = `${botId}:${threadId}`;
+
+  function seedStore(consecutiveStuckCount?: number) {
+    const { store, records } = makePersistentSessionStore();
+    records.set(key, {
+      threadId,
+      sessionId: "sess_prev",
+      botId,
+      createdTs: 1,
+      lastActiveTs: 2,
+      senderOpenId: "ou_seed",
+      ...(consecutiveStuckCount !== undefined ? { consecutiveStuckCount } : {}),
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    } as any);
+    return { store, records };
+  }
+
+  function stuckCountOf(records: Map<string, unknown>): number | undefined {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    return (records.get(key) as any)?.consecutiveStuckCount;
+  }
+
+  function botConfig() {
+    return {
+      id: botId,
+      name: "Frontend",
+      turn_taking_limit: 10,
+      backend: "claude" as const,
+      cot: "off" as const,
+      response_surface_prototype: {
+        enabled: true,
+        allowed_chats: [],
+        allowed_threads: [threadId],
+        kill_switch: false,
+        post_outbound_enabled: false,
+        cardkit_streaming_enabled: true,
+        allow_agent_mentions: true,
+        denied_mention_open_ids: [],
+        allowed_mention_open_ids: [],
+      },
+    };
+  }
+
+  // Runner that emits system_init then STALLS forever → idle watchdog kills it.
+  function configureIdleRunner(): void {
+    let killed = false;
+    runClaudeImpl = () => {
+      let resolveDone: (r: { exitCode: number; sessionId?: string }) => void = () => {};
+      const done = new Promise<{ exitCode: number; sessionId?: string }>((res) => {
+        resolveDone = res;
+      });
+      return {
+        events: (async function* () {
+          yield { type: "system_init", sessionId: "sess_idle", raw: {} };
+          while (!killed) await new Promise((r) => setTimeout(r, 5));
+        })(),
+        done,
+        kill: () => {
+          killed = true;
+          resolveDone({ exitCode: 143, sessionId: "sess_idle" });
+        },
+      };
+    };
+  }
+
+  // Runner that writes a fresh status=ready state.json then exits 0 (clean success).
+  function configureSuccessRunner(wt: string): void {
+    runClaudeImpl = () => ({
+      events: (async function* () {
+        yield { type: "system_init", sessionId: "sess_ok", raw: {} };
+        await writeFile(
+          stateFileMod.stateFilePathOf(wt),
+          JSON.stringify(
+            { status: "ready", last_message: "完成了", updated_at: "2026-05-29T13:00:00.000Z" },
+            null,
+            2,
+          ),
+          "utf8",
+        );
+      })(),
+      done: Promise.resolve({ exitCode: 0, sessionId: "sess_ok" }),
+      kill: () => {},
+    });
+  }
+
+  // Runner that exits non-zero without writing state.json (a real crash, NOT idle).
+  function configureCrashRunner(): void {
+    runClaudeImpl = () => ({
+      events: (async function* () {
+        yield { type: "system_init", sessionId: "sess_crash", raw: {} };
+      })(),
+      done: Promise.resolve({ exitCode: 1, sessionId: "sess_crash" }),
+      kill: () => {},
+    });
+  }
+
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  async function runTurn(store: any): Promise<{ cardKitCalls: any[]; acked: string[] }> {
+    const { client: cardKitClient, calls: cardKitCalls } = makeCardKitClient();
+    const { renderer } = makeCardRenderer();
+    const { client, acked } = makeClient(makeEvent());
+    const handler = new BridgeHandler({
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      client: client as any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      cardRenderer: renderer as any,
+      sessionStore: store,
+      conventions: makeConventions(),
+      botConfig: botConfig(),
+      cardKitClient,
+      responseSurfaceIdleTimeoutMs: 30, // tiny idle threshold → fast deterministic kill
+    });
+    await handler.run();
+    for (let i = 0; i < 400 && acked.length === 0; i++) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    return { cardKitCalls, acked };
+  }
+
+  function finalCardText(cardKitCalls: Array<{ kind: string; elementId?: string; content?: string }>): string {
+    return cardKitCalls.find((c) => c.kind === "stream" && c.elementId === "final_md")?.content ?? "";
+  }
+
+  it("(a) increments + persists the counter on an idle-kill (below threshold → session kept, 请重试 card)", async () => {
+    const { store, records } = seedStore(0);
+    await seedWorktree(threadId);
+    await seedRepoCachePath();
+    configureIdleRunner();
+
+    const { cardKitCalls, acked } = await runTurn(store);
+
+    expect(acked).toEqual([threadId]); // turn completed (idle-interrupted)
+    expect(records.has(key)).toBe(true); // session NOT dropped below threshold
+    expect(stuckCountOf(records)).toBe(1);
+    const text = finalCardText(cardKitCalls);
+    expect(text).toContain("请重试");
+    expect(text).not.toContain("已重置本话题上下文");
+  });
+
+  it("(b) a clean success resets the counter to 0", async () => {
+    const { store, records } = seedStore(2);
+    const wt = await seedWorktree(threadId);
+    await seedRepoCachePath();
+    configureSuccessRunner(wt);
+
+    await runTurn(store);
+
+    expect(records.has(key)).toBe(true);
+    // Handler writes 0 on success; the real SessionStore then omits the field
+    // on disk (see sessionStore.test.ts "re-putting with 0 clears..."). The
+    // in-memory fake keeps it verbatim, so 0 here === cleared.
+    expect(stuckCountOf(records) ?? 0).toBe(0);
+  });
+
+  it("(c) a non-idle failure (crash, exit≠0) does NOT count and does NOT reset — counter unchanged", async () => {
+    const { store, records } = seedStore(2);
+    await seedWorktree(threadId);
+    await seedRepoCachePath();
+    configureCrashRunner();
+
+    await runTurn(store);
+
+    expect(records.has(key)).toBe(true);
+    expect(stuckCountOf(records)).toBe(2); // conservative: neither +1 nor reset
+  });
+
+  it("(d) reaching the threshold drops the session record + shows the reset card + logs an info line", async () => {
+    const infoSpy = vi.spyOn(console, "info").mockImplementation(() => {});
+    const { store, records } = seedStore(2); // this turn makes it 3 == default threshold
+    await seedWorktree(threadId);
+    await seedRepoCachePath();
+    configureIdleRunner();
+
+    const { cardKitCalls } = await runTurn(store);
+
+    expect(records.has(key)).toBe(false); // poisoned session dropped
+    const text = finalCardText(cardKitCalls);
+    expect(text).toContain("已重置本话题上下文");
+    expect(text).toContain("全新开始");
+    expect(
+      infoSpy.mock.calls.some((c) => String(c[0]).includes("BL-38 stuck-session reset")),
+    ).toBe(true);
+  });
+
+  it("(e) LARKWAY_STUCK_SESSION_RESET_AFTER overrides the threshold", async () => {
+    process.env.LARKWAY_STUCK_SESSION_RESET_AFTER = "2";
+    try {
+      const { store, records } = seedStore(1); // this turn makes it 2 == overridden threshold
+      await seedWorktree(threadId);
+      await seedRepoCachePath();
+      configureIdleRunner();
+
+      const { cardKitCalls } = await runTurn(store);
+
+      expect(records.has(key)).toBe(false); // dropped at the lower threshold
+      expect(finalCardText(cardKitCalls)).toContain("已重置本话题上下文");
+    } finally {
+      delete process.env.LARKWAY_STUCK_SESSION_RESET_AFTER;
+    }
+  });
+
+  it("(f) a record predating the field (no consecutiveStuckCount) counts an idle-kill as the first (backward compatible)", async () => {
+    const { store, records } = seedStore(undefined); // old record: field absent
+    await seedWorktree(threadId);
+    await seedRepoCachePath();
+    configureIdleRunner();
+
+    await runTurn(store);
+
+    expect(records.has(key)).toBe(true);
+    expect(stuckCountOf(records)).toBe(1); // absent treated as 0 → 1
+  });
+});

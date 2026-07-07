@@ -355,3 +355,81 @@ describe("rootText / chatId (v3 task-handle dispatch-time capture)", () => {
     expect(rec?.rootText).toBeUndefined();
   });
 });
+
+// ---------------------------------------------------------------------------
+// BL-38: consecutiveStuckCount persistence
+// ---------------------------------------------------------------------------
+
+describe("BL-38 consecutiveStuckCount", () => {
+  it("persists a positive count and round-trips it via get", async () => {
+    const store = await SessionStore.load(sessionsPath);
+    await store.put({
+      threadId: "om_stuck",
+      sessionId: "sess-1",
+      botId: "bot-a",
+      createdTs: 1,
+      lastActiveTs: 2,
+      consecutiveStuckCount: 2,
+    });
+    expect(store.get("om_stuck", "bot-a")?.consecutiveStuckCount).toBe(2);
+
+    // Survives a reload from disk.
+    const reloaded = await SessionStore.load(sessionsPath);
+    expect(reloaded.get("om_stuck", "bot-a")?.consecutiveStuckCount).toBe(2);
+  });
+
+  it("omits the field when the count is 0 or undefined (a clean thread stays clean on disk)", async () => {
+    const store = await SessionStore.load(sessionsPath);
+    await store.put({
+      threadId: "om_zero",
+      sessionId: "sess-1",
+      botId: "bot-a",
+      createdTs: 1,
+      lastActiveTs: 2,
+      consecutiveStuckCount: 0,
+    });
+    await store.put({
+      threadId: "om_absent",
+      sessionId: "sess-2",
+      botId: "bot-a",
+      createdTs: 1,
+      lastActiveTs: 2,
+    });
+    expect(store.get("om_zero", "bot-a")?.consecutiveStuckCount).toBeUndefined();
+    expect(store.get("om_absent", "bot-a")?.consecutiveStuckCount).toBeUndefined();
+    // Not merely undefined in memory — the key is absent on disk.
+    const onDisk = await readCurrentFile();
+    expect(onDisk.records).not.toHaveProperty(["bot-a:om_zero", "consecutiveStuckCount"]);
+  });
+
+  it("re-putting with 0 clears a previously-persisted positive count", async () => {
+    const store = await SessionStore.load(sessionsPath);
+    const base = { threadId: "om_reset", sessionId: "sess-1", botId: "bot-a", createdTs: 1, lastActiveTs: 2 };
+    await store.put({ ...base, consecutiveStuckCount: 3 });
+    expect(store.get("om_reset", "bot-a")?.consecutiveStuckCount).toBe(3);
+    await store.put({ ...base, consecutiveStuckCount: 0 });
+    expect(store.get("om_reset", "bot-a")?.consecutiveStuckCount).toBeUndefined();
+  });
+
+  it("touch preserves the count (does not clobber it while updating lastActiveTs)", async () => {
+    const store = await SessionStore.load(sessionsPath);
+    await store.put({
+      threadId: "om_touch",
+      sessionId: "sess-1",
+      botId: "bot-a",
+      createdTs: 1,
+      lastActiveTs: 2,
+      consecutiveStuckCount: 2,
+    });
+    await store.touch("om_touch", "bot-a");
+    expect(store.get("om_touch", "bot-a")?.consecutiveStuckCount).toBe(2);
+  });
+
+  it("a record predating the field reads as undefined (backward compatible)", async () => {
+    await writeV2Fixture({
+      "bot-a:om_old": { threadId: "om_old", sessionId: "s", botId: "bot-a", createdTs: 1, lastActiveTs: 2 },
+    });
+    const store = await SessionStore.load(sessionsPath);
+    expect(store.get("om_old", "bot-a")?.consecutiveStuckCount).toBeUndefined();
+  });
+});
