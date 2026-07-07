@@ -4477,3 +4477,157 @@ describe("BL-38: poison-session self-heal", () => {
     expect(stuckCountOf(records)).toBe(1); // absent treated as 0 → 1
   });
 });
+
+// ---------------------------------------------------------------------------
+// v4 任务派单 root probe (docs/task-handle.md §15.4): a quote-reply whose root
+// is a task-share (todo) opens the work topic ON the task card; every other
+// shape keeps its pre-v4 behavior.
+// ---------------------------------------------------------------------------
+
+describe("handleOne — v4 task-share root probe", () => {
+  const TODO_CONTENT = JSON.stringify({
+    task_id: "g-42",
+    summary: { title: "", content: [[{ tag: "text", text: "修复登录页" }]] },
+    due_time: "0",
+  });
+
+  function makeQuoteReplyEvent(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+    return {
+      message_id: "om_msg2",
+      chat_id: "oc_chat",
+      chat_type: "group",
+      root_id: "om_root",
+      sender_id: "ou_sender",
+      content: JSON.stringify({ text: "去干" }),
+      create_time: "1700000000000",
+      ...overrides,
+    };
+  }
+
+  function makeLookup(info: { msgType?: string; content?: string; threadId?: string } | undefined) {
+    const calls: Array<{ messageId: string; refresh?: boolean }> = [];
+    return {
+      calls,
+      lookup: {
+        get: async (messageId: string, opts?: { refresh?: boolean }) => {
+          calls.push({ messageId, refresh: opts?.refresh });
+          return info;
+        },
+      },
+    };
+  }
+
+  async function runOnce(event: Record<string, unknown>, lookup?: { get: (id: string, o?: { refresh?: boolean }) => Promise<unknown> }) {
+    let runOpts: { prompt?: string } | undefined;
+    runClaudeImpl = (opts: unknown) => {
+      runOpts = opts as { prompt?: string };
+      return {
+        events: (async function* () {
+          yield { type: "system_init", sessionId: "sess_v4", raw: {} };
+        })(),
+        done: Promise.resolve({ exitCode: 0, sessionId: "sess_v4" }),
+        kill: () => {},
+      };
+    };
+    const { renderer, startArgs, whenFinalized } = makeCardRenderer();
+    const { store } = makeSessionStore();
+    const { client } = makeClient(event);
+    await seedRepoCachePath();
+    const handler = new BridgeHandler({
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      client: client as any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      cardRenderer: renderer as any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      sessionStore: store as any,
+      conventions: makeConventions(),
+      botConfig: { id: "frontend", name: "Frontend", turn_taking_limit: 10, backend: "claude" },
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      messageLookup: lookup as any,
+    });
+    await handler.run();
+    await whenFinalized;
+    return { startArgs, prompt: () => runOpts?.prompt ?? "" };
+  }
+
+  it("quote-reply on a todo root: anchors the card on the ROOT with reply_in_thread, injects <task-root> with topic link", async () => {
+    const { calls, lookup } = makeLookup({ msgType: "todo", content: TODO_CONTENT, threadId: "omt_x1" });
+    const { startArgs, prompt } = await runOnce(makeQuoteReplyEvent(), lookup);
+
+    expect(calls[0]).toEqual({ messageId: "om_root", refresh: undefined });
+    expect(startArgs[0]).toMatchObject({ messageId: "om_root", replyInThread: true });
+    expect(prompt()).toContain("<task-root>");
+    expect(prompt()).toContain("task_guid: g-42");
+    expect(prompt()).toContain("task_summary: 修复登录页");
+    expect(prompt()).toContain("open_thread_id=omt_x1");
+  });
+
+  it("quote-reply on an ORDINARY message keeps the pre-v4 inline-reply behavior (user-decided narrowing)", async () => {
+    const { lookup } = makeLookup({ msgType: "text", content: JSON.stringify({ text: "hi" }) });
+    const { startArgs, prompt } = await runOnce(makeQuoteReplyEvent(), lookup);
+
+    expect(startArgs[0]).toMatchObject({ messageId: "om_msg2", replyInThread: false });
+    expect(prompt()).not.toContain("<task-root>");
+  });
+
+  it("in-thread reply under a todo root: anchor/threading unchanged, but <task-root> facts still injected", async () => {
+    const { lookup } = makeLookup({ msgType: "todo", content: TODO_CONTENT, threadId: "omt_x1" });
+    const { startArgs, prompt } = await runOnce(makeQuoteReplyEvent({ thread_id: "omt_x1" }), lookup);
+
+    expect(startArgs[0]).toMatchObject({ messageId: "om_msg2", replyInThread: false });
+    expect(prompt()).toContain("<task-root>");
+    expect(prompt()).toContain("task_guid: g-42");
+  });
+
+  it("no messageLookup dep: fully pre-v4 behavior (probe never fires)", async () => {
+    const { startArgs, prompt } = await runOnce(makeQuoteReplyEvent(), undefined);
+
+    expect(startArgs[0]).toMatchObject({ messageId: "om_msg2", replyInThread: false });
+    expect(prompt()).not.toContain("<task-root>");
+  });
+
+  it("task_root_claimed uses EXACT guid comparison — a thread that claimed a DIFFERENT task reads claimed: no", async () => {
+    let runOpts: { prompt?: string } | undefined;
+    runClaudeImpl = (opts: unknown) => {
+      runOpts = opts as { prompt?: string };
+      return {
+        events: (async function* () {
+          yield { type: "system_init", sessionId: "sess_v4g", raw: {} };
+        })(),
+        done: Promise.resolve({ exitCode: 0, sessionId: "sess_v4g" }),
+        kill: () => {},
+      };
+    };
+    const { renderer, whenFinalized } = makeCardRenderer();
+    const { store } = makeSessionStore();
+    const { client } = makeClient(makeQuoteReplyEvent());
+    await seedRepoCachePath();
+    const { lookup } = makeLookup({ msgType: "todo", content: TODO_CONTENT, threadId: "omt_x1" });
+    const handler = new BridgeHandler({
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      client: client as any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      cardRenderer: renderer as any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      sessionStore: store as any,
+      conventions: makeConventions(),
+      botConfig: { id: "frontend", name: "Frontend", turn_taking_limit: 10, backend: "claude" },
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      messageLookup: lookup as any,
+      taskHandleClaimedLookup: () => true, // boolean lookup says "some claim exists"
+      taskHandleClaimGuidLookup: () => "some-OTHER-guid", // …but on a different task
+    });
+    await handler.run();
+    await whenFinalized;
+
+    expect(runOpts?.prompt ?? "").toContain("task_root_claimed: no");
+  });
+
+  it("in-thread turn carries the topic deep link built from the event's own thread_id (not the probe cache)", async () => {
+    // probe result deliberately has NO threadId (pre-topic cached shape)
+    const { lookup } = makeLookup({ msgType: "todo", content: TODO_CONTENT });
+    const { prompt } = await runOnce(makeQuoteReplyEvent({ thread_id: "omt_live" }), lookup);
+
+    expect(prompt()).toContain("open_thread_id=omt_live");
+  });
+});

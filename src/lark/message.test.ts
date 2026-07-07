@@ -283,3 +283,64 @@ describe("parseMessage — reply_anchor_message_id (synthetic-event reply anchor
     expect(parsed.raw.message_id).not.toBe(parsed.messageId); // the two concerns stay decoupled
   });
 });
+
+// ---------------------------------------------------------------------------
+// v4 任务派单 (docs/task-handle.md §15/§9.13) — task-share (todo) messages
+// ---------------------------------------------------------------------------
+
+import { parseTodoShareContent } from "./message.js";
+
+describe("parseTodoShareContent", () => {
+  // Exact real-world shape captured from a live GET /im/v1/messages/:id
+  // (2026-07-07 — see docs/task-handle.md §9.13).
+  const REAL_TODO_CONTENT = JSON.stringify({
+    task_id: "ba8e2db6-0000-4fe9-a1e3-000000000000",
+    summary: { title: "", content: [[{ tag: "text", text: "hello", style: [] }]] },
+    due_time: "0000",
+  });
+
+  it("extracts the task guid and summary text from a real task-share body", () => {
+    const todo = parseTodoShareContent(REAL_TODO_CONTENT);
+    expect(todo).not.toBeNull();
+    expect(todo!.taskGuid).toBe("ba8e2db6-0000-4fe9-a1e3-000000000000");
+    expect(todo!.summaryText).toBe("hello");
+  });
+
+  it("tolerates a missing/empty summary (guid alone is enough)", () => {
+    const todo = parseTodoShareContent(JSON.stringify({ task_id: "g-1" }));
+    expect(todo).toEqual({ taskGuid: "g-1", summaryText: "" });
+  });
+
+  it("returns null for malformed JSON (the §9.13 'Invalid todo JSON' variant)", () => {
+    expect(parseTodoShareContent("not-json{{")).toBeNull();
+  });
+
+  it("returns null when task_id is absent or not a string", () => {
+    expect(parseTodoShareContent(JSON.stringify({ summary: "x" }))).toBeNull();
+    expect(parseTodoShareContent(JSON.stringify({ task_id: 42 }))).toBeNull();
+  });
+});
+
+describe("parseMessage — todo (task-share) messages", () => {
+  it("renders the task summary + guid as the message text", () => {
+    const event = makeEvent(
+      {
+        task_id: "guid-t1",
+        summary: { title: "", content: [[{ tag: "text", text: "修复登录页" }]] },
+        due_time: "0",
+      },
+      { message_type: "todo" } as Partial<LarkMessageEvent>,
+    );
+    const parsed = parseMessage(event);
+    expect(parsed.text).toContain("[飞书任务]");
+    expect(parsed.text).toContain("修复登录页");
+    expect(parsed.text).toContain("task_guid=guid-t1");
+  });
+
+  it("uses a placeholder for an empty summary", () => {
+    const event = makeEvent({ task_id: "guid-t2" }, { message_type: "todo" } as Partial<LarkMessageEvent>);
+    const parsed = parseMessage(event);
+    expect(parsed.text).toContain("(无标题)");
+    expect(parsed.text).toContain("task_guid=guid-t2");
+  });
+});

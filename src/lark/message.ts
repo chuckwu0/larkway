@@ -107,6 +107,41 @@ function extractPostText(value: unknown): string {
 }
 
 /**
+ * Parsed shape of a Feishu task-share message (`msg_type: "todo"` — what
+ * 「发送任务到会话」 posts into a chat). Ground truth (2026-07-07, real API
+ * fetch — docs/task-handle.md §9.13):
+ *
+ *   {"task_id":"<task v2 guid>","summary":{"title":"","content":[[{tag,text}]]},"due_time":"0000"}
+ *
+ * `task_id` IS the task v2 guid, directly usable with the whole task API —
+ * the deterministic-binding cornerstone of the v4 任务派单 path (§15).
+ * `summary.content` reuses the post 2-D paragraph shape, so extractPostText
+ * handles it. Variants that don't parse exist in the wild (§9.13's warning);
+ * this returns null for anything it can't positively identify.
+ */
+export interface TodoShareContent {
+  taskGuid: string;
+  summaryText: string;
+}
+
+/**
+ * Best-effort parse of a task-share message's raw content JSON. Null on any
+ * shape mismatch — callers must treat null as "not a (recognizable) task
+ * share" and fall back to their normal path, never error.
+ */
+export function parseTodoShareContent(rawContent: string): TodoShareContent | null {
+  try {
+    const parsed = JSON.parse(rawContent) as Record<string, unknown>;
+    const taskGuid = parsed["task_id"];
+    if (typeof taskGuid !== "string" || taskGuid.length === 0) return null;
+    const summaryText = extractPostText(parsed["summary"]).trim();
+    return { taskGuid, summaryText };
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Parse event.content (a JSON string) and extract plain text.
  * Falls back to the raw content string and emits a console.warn on parse error.
  */
@@ -123,6 +158,15 @@ function extractText(event: LarkMessageEvent): string {
   }
 
   let raw = "";
+
+  // msg_type = "todo" (task share, 「发送任务到会话」): render the summary +
+  // guid as text so downstream consumers (rootText capture, gap-fill preview,
+  // the agent prompt) see WHAT task this is without another API call. Checked
+  // before the generic branches — a todo body has no top-level text/content.
+  const todo = typeof parsed["task_id"] === "string" ? parseTodoShareContent(event.content) : null;
+  if (todo) {
+    return `[飞书任务] ${todo.summaryText || "(无标题)"} (task_guid=${todo.taskGuid})`;
+  }
 
   // message_type = "text": { "text": "..." }
   if (typeof parsed["text"] === "string") {

@@ -464,12 +464,31 @@ async function runV2Mode({
     let taskHandleLifecycle: ((patch: import("./tasklist/types.js").TaskHandleLifecyclePatch) => Promise<void>) | undefined;
     let taskHandleClaim: ((patch: import("./tasklist/types.js").TaskHandleClaimPatch) => Promise<void>) | undefined;
     let taskHandleClaimedLookup: ((threadId: string) => boolean) | undefined;
+    let taskHandleClaimGuidLookup: ((threadId: string) => string | undefined) | undefined;
     let taskHandleCandidatesLookup: (() => readonly import("./tasklist/types.js").TaskCandidate[]) | undefined;
     let taskCommentPoller: CommentPoller | undefined;
     let stallDetector: StallDetector | undefined;
     {
       const guid = bot.taskHandle?.tasklistGuid ?? (await readTeamTasklistGuid(resolveTaskTeamRegistryPath()));
-      if (guid) {
+      // v4 任务派单 (docs/task-handle.md §15): the per-bot machinery below
+      // (task client / store / writeback / claim hooks / CommentPoller /
+      // StallDetector) is now UNCONDITIONAL — the main path claims tasks with
+      // no tasklist at all (share-to-chat grants read+comment, §9.14). The
+      // §6.3 dormancy contract is preserved at the CALL level: an empty claim
+      // store makes zero task-API network calls. Only the tasklist-specific
+      // parts (self-join, the prompt guid pointer, TasklistPoller groups /
+      // candidates) stay gated on a resolved guid.
+      if (!guid) {
+        // v3.4 discoverability (docs/task-handle.md §7), reworded for v4: the
+        // 任务派单 main path works with zero config; only the tasklist-backed
+        // 辅路径 (话题转任务 candidates/auto-bind + 全景看板) needs the CLI.
+        console.log(
+          `[larkway] bot "${bot.id}": 任务派单主路径已就绪(建任务→发送到群→@ 本 bot,零配置)。` +
+            `话题转任务辅路径的共享清单未配置(taskHandle.tasklistGuid 缺失,共享注册文件里也没有);` +
+            `想启用:运行 larkway tasklist-init(见 docs/task-handle.md §7/§15)。`,
+        );
+      }
+      {
         // silentSdkLogger — the node-sdk Client otherwise dumps the full raw
         // AxiosError (config + ClientRequest + response) to stdout/the bridge
         // log on every request failure, before our own .catch. The self-join
@@ -485,23 +504,25 @@ async function runV2Mode({
           request: (config) => taskSdkClient.request(config as Parameters<typeof taskSdkClient.request>[0]),
         };
         const taskListClient = new TaskListClient(taskRequester);
-        // Self-join: idempotent best-effort add of this bot's app as editor
-        // (docs/task-handle.md §7 — "其他 bot 首次用时读到 guid… 把自己加为
-        // editor"). Harmless if already a member (client.ts's doc comment);
-        // swallowed on failure like every other step here — a bot that can't
-        // self-join still gets the prompt pointer/writeback wired below
-        // (best case it was already a member from `tasklist-init --team`).
-        await taskListClient
-          .addTasklistMembers(guid, [{ id: bot.app_id, type: "app", role: "editor" }])
-          .catch((err) => {
-            // compactErrorText, not the raw err: a TaskApiError carries the
-            // axios error on .cause, and console.warn(msg, err) would expand
-            // that cause chain into the same multi-KB AxiosError dump.
-            console.warn(
-              `[larkway] bot "${bot.id}": self-join tasklist ${guid} as editor failed (continuing, best-effort): ${compactErrorText(err)}`,
-            );
-          });
-        effectiveTaskHandleTasklistGuid = guid;
+        if (guid) {
+          // Self-join: idempotent best-effort add of this bot's app as editor
+          // (docs/task-handle.md §7 — "其他 bot 首次用时读到 guid… 把自己加为
+          // editor"). Harmless if already a member (client.ts's doc comment);
+          // swallowed on failure like every other step here — a bot that can't
+          // self-join still gets the prompt pointer/writeback wired below
+          // (best case it was already a member from `tasklist-init --team`).
+          await taskListClient
+            .addTasklistMembers(guid, [{ id: bot.app_id, type: "app", role: "editor" }])
+            .catch((err) => {
+              // compactErrorText, not the raw err: a TaskApiError carries the
+              // axios error on .cause, and console.warn(msg, err) would expand
+              // that cause chain into the same multi-KB AxiosError dump.
+              console.warn(
+                `[larkway] bot "${bot.id}": self-join tasklist ${guid} as editor failed (continuing, best-effort): ${compactErrorText(err)}`,
+              );
+            });
+          effectiveTaskHandleTasklistGuid = guid;
+        }
         const taskHandleStore = await TaskHandleStore.load(resolveTaskHandlesPath(bot.id));
         taskHandleLifecycle = (patch) => applyTaskHandleWriteback(patch, { store: taskHandleStore, client: taskListClient });
         // TaskHandleStore.claim() is idempotent on an unchanged guid (see its
@@ -527,18 +548,19 @@ async function runV2Mode({
         // `task_handle_claimed: yes|no` so the SKILL can offer a one-tap claim
         // button only when this thread genuinely has no claim yet.
         taskHandleClaimedLookup = (threadId) => taskHandleStore.get(threadId) !== undefined;
-        // Dedup group for the shared TasklistPoller (v3) — this bot joins
-        // whichever group already exists for `guid` (first bot to see it
-        // seeds the group's client; every later bot just adds itself so
+        taskHandleClaimGuidLookup = (threadId) => taskHandleStore.get(threadId)?.taskGuid;
+        // Dedup group for the shared TasklistPoller (v3, 辅路径 only) — this
+        // bot joins whichever group already exists for `guid` (first bot to
+        // see it seeds the group's client; every later bot just adds itself so
         // isClaimedByAnyBot / listRootTexts / bindThreadToTask below all see
         // every bot sharing this guid, not just one). The poller itself is
         // constructed once, after this whole per-bot loop, in the pass below.
-        {
+        if (guid) {
           const group = tasklistGuidGroups.get(guid) ?? { client: taskListClient, clientOwnerBotId: bot.id, bots: [] };
           group.bots.push({ botId: bot.id, sessionStore, taskHandleStore });
           tasklistGuidGroups.set(guid, group);
+          taskHandleCandidatesLookup = () => tasklistPollersByGuid.get(guid)?.getCandidates() ?? [];
         }
-        taskHandleCandidatesLookup = () => tasklistPollersByGuid.get(guid)?.getCandidates() ?? [];
         taskCommentPoller = new CommentPoller({
           store: taskHandleStore,
           client: taskListClient,
@@ -626,7 +648,7 @@ async function runV2Mode({
               // taskHandleCandidatesLookup above (the poller for `guid` is
               // constructed AFTER this whole per-bot loop finishes, but this
               // closure is only ever INVOKED later, at poll time).
-              getTaskDueMs: (taskGuid) => tasklistPollersByGuid.get(guid)?.getDueTimestamp(taskGuid),
+              getTaskDueMs: (taskGuid) => (guid ? tasklistPollersByGuid.get(guid)?.getDueTimestamp(taskGuid) : undefined),
               // Round-2 adversarial review fix: THIS bot's own receipt signal
               // (not a peer's) — disambiguates a pending-nudge confirmation
               // timeout from a nudge turn merely queued behind the semaphore.
@@ -675,21 +697,6 @@ async function runV2Mode({
           );
           stallDetector.start();
         }
-      } else {
-        // v3.4 discoverability (docs/task-handle.md §7): a bot with no
-        // resolvable tasklistGuid (no yaml config, no shared registry entry)
-        // has the whole task-handle feature dormant — silently, by design
-        // (§6: no claim = same as disabled). That's the RIGHT default
-        // behavior, but an operator who never even knew this feature existed
-        // has no way to discover it short of reading docs cover-to-cover.
-        // One line at startup, printed once per bot (this block runs exactly
-        // once per bot during the startup loop, never on a timer) — points
-        // at the CLI that turns it on and where to read more.
-        console.log(
-          `[larkway] bot "${bot.id}": 话题↔任务句柄未配置(taskHandle.tasklistGuid 缺失,` +
-            `共享注册文件里也没有)。想启用:运行 larkway tasklist-init(或对你的 agent 说` +
-            `"帮我配置 Agent Team")(见 docs/task-handle.md §7)。`,
-        );
       }
     }
 
@@ -777,6 +784,10 @@ async function runV2Mode({
       cardKitClient,
       cotClient,
       postClient,
+      // v4 任务派单 root-type probe (docs/task-handle.md §15.4) — lazy channel
+      // resolution, best-effort by the client's own contract, no config gate
+      // (the probe only ever fires on quote-reply turns).
+      messageLookup: client.outboundMessageLookupClient(),
       gitlabToken: effectiveGitlabToken,
       agentMemory: bot.agent_memory,
       larkCliProfile,
@@ -798,6 +809,7 @@ async function runV2Mode({
       taskHandleLifecycle,
       taskHandleClaim,
       taskHandleClaimedLookup,
+      taskHandleClaimGuidLookup,
       taskHandleCandidatesLookup,
     });
     // v3.2 交接断链检测 (revision 2, docs/task-handle.md §13): register so

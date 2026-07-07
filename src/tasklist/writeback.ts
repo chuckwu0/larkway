@@ -282,6 +282,59 @@ export async function applyTaskHandleWriteback(
 
     const isCompleted = !!task.completedAt && task.completedAt !== "0";
 
+    // v4 任务派单 comment-mode (docs/task-handle.md §15.3): maintenance is
+    // task-comments-only. No description patches, no complete(), no reopen —
+    // share-to-chat grants read+comment and nothing more (§9.14), and v4.1
+    // made human-ticked completion the product semantics regardless of
+    // permissions. The bridge's remaining jobs here are the LOCAL bookkeeping
+    // StallDetector/CommentPoller depend on, plus the one crash fallback the
+    // dead agent can't do for itself (failure comment — comments DO push,
+    // which is strictly better than the old description annotation anyway).
+    if (record.mode === "comment") {
+      switch (patch.status) {
+        case "received": {
+          // Re-engagement (new turn / user comment relay) resumes stall
+          // patrol — the comment-mode analog of full-mode auto-reopen.
+          if (record.doneDeclared) {
+            await deps.store.update(patch.threadId, (current) =>
+              current ? { ...current, doneDeclared: undefined } : current,
+            );
+          }
+          break;
+        }
+        case "completed": {
+          const mentionedPeerBotIds =
+            patch.mentionedPeerBotIds && patch.mentionedPeerBotIds.length > 0 ? patch.mentionedPeerBotIds : undefined;
+          const mentionAnchorMs = patch.turnReceivedAt ?? Date.now();
+          await deps.store.update(patch.threadId, (current) =>
+            current
+              ? {
+                  ...current,
+                  lastTurnOutcome: "completed",
+                  lastTurnMentions: mentionedPeerBotIds,
+                  lastTurnMentionsAt: mentionedPeerBotIds ? mentionAnchorMs : undefined,
+                  // Agent declared delivery — its own "已交付" comment is the
+                  // user-facing artifact; bridge just stops patrolling the
+                  // "delivered, human hasn't ticked complete yet" window.
+                  ...(patch.agentDeclaredDone === true ? { doneDeclared: true } : {}),
+                }
+              : current,
+          );
+          break;
+        }
+        case "failed": {
+          await deps.store.update(patch.threadId, (current) =>
+            current
+              ? { ...current, lastTurnOutcome: "failed", lastTurnMentions: undefined, lastTurnMentionsAt: undefined }
+              : current,
+          );
+          await deps.client.addComment(record.taskGuid, renderFailureComment(patch.failureReason));
+          break;
+        }
+      }
+      return;
+    }
+
     switch (patch.status) {
       case "received": {
         // 同话题新 turn 之前任务已勾完成 → 自动 reopen (§4 步骤 4)。

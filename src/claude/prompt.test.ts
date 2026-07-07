@@ -1000,3 +1000,92 @@ describe("renderPrompt — larkCliProfile --profile injection", () => {
     expect(prompt).toContain(`--chat-id oc_chat001 --profile ${PROFILE} --as bot --sort desc --page-size 20 --no-reactions`);
   });
 });
+
+// ---------------------------------------------------------------------------
+// v4 任务派单 — <task-root> fact block (docs/task-handle.md §15.3)
+// ---------------------------------------------------------------------------
+
+describe("renderPrompt — <task-root> block", () => {
+  it("renders no block when taskRoot is absent", async () => {
+    const prompt = await renderPrompt(makeInput({ botName: "Frontend" }));
+    expect(prompt).not.toContain("<task-root>");
+  });
+
+  it("unclaimed: renders guid/summary/link facts + claim-by-comment directive", async () => {
+    const prompt = await renderPrompt(
+      makeInput({
+        botName: "Frontend",
+        taskRoot: {
+          guid: "guid-42",
+          summary: "修复登录页",
+          topicLink: "https://applink.feishu.cn/client/thread/open?open_chat_id=oc_x&open_thread_id=omt_y",
+          claimed: false,
+        },
+      }),
+    );
+    expect(prompt).toContain("<task-root>");
+    expect(prompt).toContain("task_guid: guid-42");
+    expect(prompt).toContain("task_summary: 修复登录页");
+    expect(prompt).toContain("topic_link: https://applink.feishu.cn/client/thread/open");
+    expect(prompt).toContain("task_root_claimed: no");
+    // v4.1: comment-only maintenance, human ticks complete
+    expect(prompt).toContain("task_handle.guid");
+    expect(prompt).toContain("完成永远由人");
+  });
+
+  it("claimed: renders maintenance directive without the claim instruction", async () => {
+    const prompt = await renderPrompt(
+      makeInput({
+        botName: "Frontend",
+        taskRoot: { guid: "guid-42", summary: "修复登录页", claimed: true },
+      }),
+    );
+    expect(prompt).toContain("task_root_claimed: yes");
+    expect(prompt).toContain("done: true");
+    expect(prompt).not.toContain("本轮请顺带静默认领");
+  });
+
+  it("renders independently of any tasklist guid (main path needs no tasklist)", async () => {
+    const prompt = await renderPrompt(
+      makeInput({
+        botName: "Frontend",
+        taskRoot: { guid: "guid-42", summary: "x", claimed: false },
+      }),
+    );
+    expect(prompt).toContain("<task-root>");
+    expect(prompt).not.toContain("<task-handle>");
+  });
+});
+
+describe("renderPrompt — <task-root> supersedes <task-handle> (adversarial-review fix)", () => {
+  it("suppresses the tasklist block entirely when taskRoot is present, even with a guid + claimed thread", async () => {
+    const prompt = await renderPrompt(
+      makeInput({
+        botName: "Frontend",
+        taskHandleTasklistGuid: "list-guid-1",
+        taskHandleClaimed: true,
+        taskRoot: { guid: "guid-42", summary: "修复登录页", claimed: true },
+      }),
+    );
+    expect(prompt).toContain("<task-root>");
+    // the claimed <task-handle> text states bridge behaviors that are FALSE
+    // for a comment-mode claim ("bridge 已自动维护完成/失败/reopen")
+    expect(prompt).not.toContain("<task-handle>");
+    expect(prompt).not.toContain("bridge 已自动维护完成/失败/reopen");
+  });
+
+  it("keeps the tasklist block for ordinary threads (no taskRoot) — 辅路径 unchanged", async () => {
+    const prompt = await renderPrompt(
+      makeInput({ botName: "Frontend", taskHandleTasklistGuid: "list-guid-1", taskHandleClaimed: true }),
+    );
+    expect(prompt).toContain("<task-handle>");
+  });
+
+  it("unclaimed directive includes the double-@ race guard (comments list before claiming)", async () => {
+    const prompt = await renderPrompt(
+      makeInput({ botName: "Frontend", taskRoot: { guid: "g", summary: "x", claimed: false } }),
+    );
+    expect(prompt).toContain("comments list");
+    expect(prompt).toContain("不认领");
+  });
+});

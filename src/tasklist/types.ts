@@ -80,6 +80,16 @@ export interface TaskHandleClaimPatch {
   threadId: string;
   chatId: string;
   taskGuid: string;
+  /**
+   * v4 任务派单 (docs/task-handle.md §15.3): "comment" when the claimed task
+   * is the very task this thread's ROOT message shares (the 建任务→发到群→@
+   * main path). Comment-mode claims are maintained through task comments
+   * ONLY — writeback skips description patches / complete / reopen (the
+   * share-to-chat permission grant covers read+comment and nothing more, and
+   * v4.1 made human-ticked completion the product semantics regardless).
+   * Absent = the v1–v3 辅路径 (话题转任务) full-maintenance behavior.
+   */
+  mode?: "comment";
 }
 
 /**

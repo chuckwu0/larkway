@@ -568,6 +568,12 @@ export class StallDetector {
     let record = this.#deps.store.get(threadId);
     if (!record) return; // dropped between list() snapshot and now
 
+    // v4.1 comment-mode delivery (docs/task-handle.md §15.3): the agent has
+    // declared done and posted its own "已交付" comment — the human just
+    // hasn't ticked complete yet. That window is NOT a stall; patrol resumes
+    // only when writeback's "received" branch clears the flag (re-engagement).
+    if (record.doneDeclared) return;
+
     const lastActiveTs = this.#deps.getLastActiveTs(threadId) ?? record.claimedTs;
     const now = Date.now();
 
@@ -936,6 +942,16 @@ export class StallDetector {
           }
         : r,
     );
+
+    // v4.1 comment-mode (docs/task-handle.md §15.3/§15.6): NO description
+    // writes on the 任务派单 main path, ever — "唤醒留痕在主路径不适用,略过
+    // 即可". The wake-up turn itself (above) and the escalation comment are
+    // the visible artifacts; skipping the trace here mirrors writeback.ts's
+    // comment-mode exemption. Without this gate a typical share-only claim
+    // burns a guaranteed-403 PATCH per nudge — and if the bot happens to
+    // hold editor rights via a tasklist, it would REALLY write a status
+    // block into a comment-mode task's description (拍板 violation).
+    if (record.mode === "comment") return;
 
     // v3.3 item 2 (docs/task-handle.md §14): leave a durable trace in the
     // task's own rolling progress log, same mechanism writeback.ts already

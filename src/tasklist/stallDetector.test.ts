@@ -1378,3 +1378,104 @@ describe("StallDetector", () => {
     });
   });
 });
+
+// ---------------------------------------------------------------------------
+// v4.1 comment-mode delivery (docs/task-handle.md §15.3): doneDeclared stops
+// patrol until re-engagement clears it.
+// ---------------------------------------------------------------------------
+
+describe("StallDetector — doneDeclared (v4.1 comment-mode delivery)", () => {
+  it("skips a doneDeclared claim entirely — no nudge, no network — even when long past the threshold", async () => {
+    const store = await TaskHandleStore.load(join(dir, "task-handles.json"));
+    const claimedAt = Date.now();
+    await store.put({
+      threadId: "t1",
+      taskGuid: "g1",
+      chatId: "oc_1",
+      claimedTs: claimedAt,
+      mode: "comment",
+      doneDeclared: true,
+    });
+    const { requester, calls } = makeFakeRequester({ g1: { guid: "g1", summary: "任务A" } });
+    const client = new TaskListClient(requester);
+    const enqueueNudgeTurn = vi.fn();
+    const detector = new StallDetector(
+      { store, client, getLastActiveTs: () => claimedAt, enqueueNudgeTurn },
+      { stallThresholdMs: DAY },
+    );
+
+    vi.setSystemTime(claimedAt + 3 * DAY);
+    await detector.pollOnceForTest();
+
+    expect(enqueueNudgeTurn).not.toHaveBeenCalled();
+    expect(calls.length).toBe(0);
+  });
+
+  it("resumes patrol once doneDeclared is cleared (writeback's received branch)", async () => {
+    const store = await TaskHandleStore.load(join(dir, "task-handles.json"));
+    const claimedAt = Date.now();
+    await store.put({
+      threadId: "t1",
+      taskGuid: "g1",
+      chatId: "oc_1",
+      claimedTs: claimedAt,
+      mode: "comment",
+      doneDeclared: true,
+    });
+    const { requester } = makeFakeRequester({ g1: { guid: "g1", summary: "任务A" } });
+    const client = new TaskListClient(requester);
+    const enqueueNudgeTurn = vi.fn();
+    const detector = new StallDetector(
+      { store, client, getLastActiveTs: () => claimedAt, enqueueNudgeTurn },
+      { stallThresholdMs: DAY },
+    );
+
+    vi.setSystemTime(claimedAt + 3 * DAY);
+    await detector.pollOnceForTest();
+    expect(enqueueNudgeTurn).not.toHaveBeenCalled();
+
+    await store.update("t1", (r) => (r ? { ...r, doneDeclared: undefined } : r));
+    await detector.pollOnceForTest();
+    expect(enqueueNudgeTurn).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("StallDetector — comment-mode nudge leaves NO description trace (v4.1 §15.3)", () => {
+  it("nudges a stalled comment-mode claim but never PATCHes the task description", async () => {
+    const store = await TaskHandleStore.load(join(dir, "task-handles.json"));
+    const claimedAt = Date.now();
+    await store.put({ threadId: "t1", taskGuid: "g1", chatId: "oc_1", claimedTs: claimedAt, mode: "comment" });
+    const { requester, calls } = makeFakeRequester({ g1: { guid: "g1", summary: "任务A" } });
+    const client = new TaskListClient(requester);
+    const enqueueNudgeTurn = vi.fn();
+    const detector = new StallDetector(
+      { store, client, getLastActiveTs: () => claimedAt, enqueueNudgeTurn },
+      { stallThresholdMs: DAY },
+    );
+
+    vi.setSystemTime(claimedAt + DAY + 1);
+    await detector.pollOnceForTest();
+
+    expect(enqueueNudgeTurn).toHaveBeenCalledTimes(1); // wake-up itself still fires
+    expect(calls.some((c) => c.method === "PATCH")).toBe(false); // but no description trace
+  });
+
+  it("full-mode claims keep the v3.3 nudge-history description trace", async () => {
+    const store = await TaskHandleStore.load(join(dir, "task-handles.json"));
+    const claimedAt = Date.now();
+    await store.put({ threadId: "t1", taskGuid: "g1", chatId: "oc_1", claimedTs: claimedAt });
+    const { requester, calls } = makeFakeRequester({ g1: { guid: "g1", summary: "任务A" } });
+    const client = new TaskListClient(requester);
+    const enqueueNudgeTurn = vi.fn();
+    const detector = new StallDetector(
+      { store, client, getLastActiveTs: () => claimedAt, enqueueNudgeTurn },
+      { stallThresholdMs: DAY },
+    );
+
+    vi.setSystemTime(claimedAt + DAY + 1);
+    await detector.pollOnceForTest();
+
+    expect(enqueueNudgeTurn).toHaveBeenCalledTimes(1);
+    expect(calls.some((c) => c.method === "PATCH")).toBe(true);
+  });
+});
