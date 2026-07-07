@@ -43,7 +43,8 @@
 | v0.3.36 | v0.3.36 | patch / 已发布 | tasklist-init hardening: zero-arg always creates a bridge-owned board (multi-team safe), explicit --adopt/--adopt-guid with loud failures, structural 404 detection for the app-members endpoint, quiet SDK raw-error dumps (init/bridge/doctor). Docs: correct COT ordering note in bot config examples. |
 | v0.3.37 | v0.3.37 | patch / 已发布 | Actually silence vendored node-sdk raw AxiosError dumps: loggerLevel:fatal is dead code (fatal===0 is falsy, coerced back to info by the SDK) — inject a no-op logger on the four bare task REST clients instead, and print compact error text in our own warns. Regression-locked against reverting to loggerLevel. |
 | v0.3.38 | v0.3.38 | patch / 已发布 | 可靠性批修:SIGKILL 升级死代码/SessionStore 竞态+自愈/话题追问队列键失配/失败 @ 稳态重投;git 黑洞超时+熔断+onboard 竞态;README 新增 Security model;doctor 查 lark-cli |
-| v0.3.39 | v0.3.39 | 当前 patch / 已发布 | Stuck-session self-heal (BL-38): after 3 consecutive idle-watchdog kills on the same thread (configurable via LARKWAY_STUCK_SESSION_RESET_AFTER), drop the thread's session record so the next mention starts a fresh session, and tell the user the context was reset. Fixes poisoned-session loops where retry never recovers and only a new topic worked. |
+| v0.3.39 | v0.3.39 | patch / 已发布 | Stuck-session self-heal (BL-38): after 3 consecutive idle-watchdog kills on the same thread (configurable via LARKWAY_STUCK_SESSION_RESET_AFTER), drop the thread's session record so the next mention starts a fresh session, and tell the user the context was reset. Fixes poisoned-session loops where retry never recovers and only a new topic worked. |
+| v0.3.40 | v0.3.40 | 当前 patch / 已发布 | task-handle v4 任务派单主路径:建任务→发送到群→@agent 即认领;工作话题自动开在任务卡片上;认领评论带话题深链回跳;全程评论汇报里程碑(交付/失败/等拍板推送),完成由人点;零清单配置,分享到群即权限齐备 |
 
 ## 使用原则
 
@@ -94,4 +95,5 @@ v0.3.36       = tasklist-init hardening: zero-arg always creates a bridge-owned 
 v0.3.37       = Actually silence vendored node-sdk raw AxiosError dumps: loggerLevel:fatal is dead code (fatal===0 is falsy, coerced back to info by the SDK) — inject a no-op logger on the four bare task REST clients instead, and print compact error text in our own warns. Regression-locked against reverting to loggerLevel.
 v0.3.38       = 可靠性批修:SIGKILL 升级死代码/SessionStore 竞态+自愈/话题追问队列键失配/失败 @ 稳态重投;git 黑洞超时+熔断+onboard 竞态;README 新增 Security model;doctor 查 lark-cli
 v0.3.39       = Stuck-session self-heal (BL-38): after 3 consecutive idle-watchdog kills on the same thread (configurable via LARKWAY_STUCK_SESSION_RESET_AFTER), drop the thread's session record so the next mention starts a fresh session, and tell the user the context was reset. Fixes poisoned-session loops where retry never recovers and only a new topic worked.
+v0.3.40       = task-handle v4 任务派单主路径:建任务→发送到群→@agent 即认领;工作话题自动开在任务卡片上;认领评论带话题深链回跳;全程评论汇报里程碑(交付/失败/等拍板推送),完成由人点;零清单配置,分享到群即权限齐备
 ```
