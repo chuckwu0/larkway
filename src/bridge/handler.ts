@@ -108,6 +108,26 @@ const DEFAULT_CARDKIT_IDLE_TIMEOUT_MS = 3 * 60 * 1000;
  */
 const COT_BUBBLE_CREATE_BUDGET_MS = 3_000;
 
+/**
+ * BL-38 (poison-session self-heal): after this many CONSECUTIVE turns that end
+ * by the idle watchdog (a confirmed hang — the thread keeps resuming into a
+ * session that goes silent before its first tool call), the thread's session
+ * record is dropped so the next @ starts from a fresh session. A single
+ * idle-kill is often transient (the owner just retries); only a repeated,
+ * same-session hang is the "behaviorally poisoned session" this treats — and it
+ * produces no resume error, so the stale/ghost-session purge never fires on it.
+ * Env LARKWAY_STUCK_SESSION_RESET_AFTER overrides the default (kept a module
+ * constant, not a bot-config field, to stay simple). A non-positive /
+ * unparseable override falls back to the default.
+ */
+const DEFAULT_STUCK_SESSION_RESET_AFTER = 3;
+function resolveStuckSessionResetAfter(): number {
+  const raw = process.env.LARKWAY_STUCK_SESSION_RESET_AFTER;
+  if (raw === undefined) return DEFAULT_STUCK_SESSION_RESET_AFTER;
+  const n = Number.parseInt(raw, 10);
+  return Number.isFinite(n) && n > 0 ? n : DEFAULT_STUCK_SESSION_RESET_AFTER;
+}
+
 function summarizeMentionPolicyRules(rules: string[]): string {
   const counts = new Map<string, number>();
   for (const rule of rules) {
@@ -2206,83 +2226,27 @@ export class BridgeHandler {
           // only (status=failed → fail; status=ready → success; exitCode 0 →
           // success; else → fail).
 
-          // Step 4e: session persistence (3 cases).
-          const now = Date.now();
-
-          if (sessionId !== undefined && currentExisting === undefined) {
-            // New thread — create record. rootText/chatId (v3 task-handle
-            // dispatch-time capture, docs/task-handle.md §5.2/§9.9) are
-            // captured ONLY here, and ONLY when `isTopLevel` (computed above
-            // from the absence of `root_id`) confirms THIS message truly is
-            // the topic's own root — not merely the first turn the BOT
-            // happened to see. (Adversarial-review fix: an earlier version
-            // captured unconditionally on "this bot's first completed turn
-            // in the thread," which is wrong whenever a human opens a topic
-            // and only @-mentions the bot in a LATER reply — that reply's
-            // text got stored as if it were the root, and could then exact-
-            // match an unrelated task and auto-bind the wrong pair. When
-            // `isTopLevel` is false here, rootText/chatId are simply left
-            // undefined — the same safe "no auto-bind candidate for this
-            // thread" degradation already documented for other rootText
-            // gaps; the agent-path candidate injection is unaffected.)
-            // Truncated defensively when captured; TasklistPoller's exact-
-            // match tolerates (doesn't need to recover from) a truncated
-            // value — see its own doc comment.
-            await this.deps.sessionStore.put({
-              threadId,
-              sessionId,
-              botId,
-              createdTs: now,
-              lastActiveTs: now,
-              senderOpenId,
-              ...(isTopLevel ? { rootText: parsed.text.slice(0, 200), chatId: parsed.chatId } : {}),
-            });
-          } else if (sessionId !== undefined && currentExisting !== undefined) {
-            // Existing thread — update, preserving createdTs AND rootText/
-            // chatId verbatim from whenever this thread was first created
-            // (never recomputed from a later turn's message).
-            await this.deps.sessionStore.put({
-              threadId,
-              sessionId,
-              botId,
-              createdTs: currentExisting.createdTs,
-              lastActiveTs: now,
-              senderOpenId,
-              rootText: currentExisting.rootText,
-              chatId: currentExisting.chatId,
-            });
-          } else if (currentExisting !== undefined && sessionId === undefined) {
-            // Anomaly: no system_init seen; touch to update lastActiveTs at minimum.
-            await this.deps.sessionStore.put({
-              ...currentExisting,
-              lastActiveTs: now,
-            });
-          }
-
-          // Step 4f: finalize card.
-          //
-          // Bridge does NOT interpret content — all fields come from state.json
-          // (bot writes) except the header emoji derived from success/failure.
+          // Step 4e-pre: finalize outcome + BL-38 poison-session self-heal.
+          // The success/failure truth-ordering is decided HERE (moved up from
+          // Step 4f) so the consecutive-stuck counter can be folded into the
+          // session write below and the reset decided in one place. Step 4f
+          // reuses `success` / `failureReason` / `cardKitTimeoutFailure` — it
+          // does not recompute them.
           //
           // Truth ordering (most authoritative first):
-          //   1. bot wrote `status=failed` in state.json → fail (use bot's error)
-          //   2. bot wrote `status=ready` → success (regardless of exitCode —
-          //      the runner grace-timer may SIGTERM claude when a non-detached
-          //      grandchild blocks exit, but that's an OS quirk, not a real
-          //      failure if state.json says we're done)
-          //   3. exitCode === 0 → success (bot didn't update state.json but
-          //      claude exited cleanly — likely just acknowledged the message)
-          //   4. else → fail (real crash)
-          //
-          // Card body text = bot's `last_message` (preferred, productized),
-          // falling back to streamed text only when bot didn't write one.
+          //   1. bot wrote status=failed → fail (use bot's error)
+          //   2. bot wrote status=ready → success (regardless of exitCode — the
+          //      runner grace-timer may SIGTERM claude when a non-detached
+          //      grandchild blocks exit, an OS quirk, not a real failure)
+          //   3. idle watchdog fired (real hang) → fail (已中断)
+          //   4. exitCode === 0 → success (clean exit, bot wrote no status)
+          //   5. else → fail (real crash)
           const reportedStatus = reportedState?.status;
           const reportedError = reportedState?.error;
           const cardKitTimeoutFailure =
             interruptedByIdle && reportedStatus !== "ready" && reportedStatus !== "failed";
           let success: boolean;
           let failureReason: string | undefined;
-
           if (reportedStatus === "failed") {
             success = false;
             failureReason = reportedError ?? "bot 报告 failed (无 error 字段)";
@@ -2308,6 +2272,105 @@ export class BridgeHandler {
             });
           }
 
+          // BL-38 counter: a confirmed idle-stuck turn accrues (+1); a clean
+          // success resets to 0; any OTHER failure (crash / explicit `failed`)
+          // leaves it UNCHANGED — conservative, so only a proven consecutive-
+          // hang streak triggers the reset, and an ambiguous crash neither
+          // punishes nor rescues a possibly-poisoned session.
+          const stuckResetAfter = resolveStuckSessionResetAfter();
+          const prevStuckCount = currentExisting?.consecutiveStuckCount ?? 0;
+          const nextStuckCount = cardKitTimeoutFailure
+            ? prevStuckCount + 1
+            : success
+              ? 0
+              : prevStuckCount;
+          const stuckResetTriggered = cardKitTimeoutFailure && nextStuckCount >= stuckResetAfter;
+
+          // Step 4e: session persistence (3 cases).
+          const now = Date.now();
+
+          if (stuckResetTriggered) {
+            // BL-38: this thread has ended by the idle watchdog on
+            // `stuckResetAfter` consecutive turns — the session is behaviorally
+            // poisoned (resume keeps producing the same silent hang). Drop the
+            // record entirely (same delete semantics as the stale/ghost purge)
+            // so the next @ on this thread starts a brand-new session. The
+            // failure card below (Step 4f) tells the user it was reset.
+            await this.deps.sessionStore.delete(threadId, botId);
+            console.info(
+              `[bridge.handler] BL-38 stuck-session reset: thread=${threadId} bot=${botId} ` +
+                `consecutiveStuckCount=${nextStuckCount} (>= ${stuckResetAfter}) — dropped session ` +
+                `record; next @ starts fresh`,
+            );
+          } else if (sessionId !== undefined && currentExisting === undefined) {
+            // New thread — create record. rootText/chatId (v3 task-handle
+            // dispatch-time capture, docs/task-handle.md §5.2/§9.9) are
+            // captured ONLY here, and ONLY when `isTopLevel` (computed above
+            // from the absence of `root_id`) confirms THIS message truly is
+            // the topic's own root — not merely the first turn the BOT
+            // happened to see. (Adversarial-review fix: an earlier version
+            // captured unconditionally on "this bot's first completed turn
+            // in the thread," which is wrong whenever a human opens a topic
+            // and only @-mentions the bot in a LATER reply — that reply's
+            // text got stored as if it were the root, and could then exact-
+            // match an unrelated task and auto-bind the wrong pair. When
+            // `isTopLevel` is false here, rootText/chatId are simply left
+            // undefined — the same safe "no auto-bind candidate for this
+            // thread" degradation already documented for other rootText
+            // gaps; the agent-path candidate injection is unaffected.)
+            // Truncated defensively when captured; TasklistPoller's exact-
+            // match tolerates (doesn't need to recover from) a truncated
+            // value — see its own doc comment.
+            await this.deps.sessionStore.put({
+              threadId,
+              sessionId,
+              botId,
+              createdTs: now,
+              lastActiveTs: now,
+              senderOpenId,
+              // BL-38: a brand-new thread that idle-killed on its very first turn
+              // starts the counter at 1 (0 when clean; only persisted when > 0).
+              consecutiveStuckCount: nextStuckCount,
+              ...(isTopLevel ? { rootText: parsed.text.slice(0, 200), chatId: parsed.chatId } : {}),
+            });
+          } else if (sessionId !== undefined && currentExisting !== undefined) {
+            // Existing thread — update, preserving createdTs AND rootText/
+            // chatId verbatim from whenever this thread was first created
+            // (never recomputed from a later turn's message).
+            await this.deps.sessionStore.put({
+              threadId,
+              sessionId,
+              botId,
+              createdTs: currentExisting.createdTs,
+              lastActiveTs: now,
+              senderOpenId,
+              rootText: currentExisting.rootText,
+              chatId: currentExisting.chatId,
+              // BL-38: +1 on an idle-stuck turn, 0 (cleared) on any clean turn.
+              consecutiveStuckCount: nextStuckCount,
+            });
+          } else if (currentExisting !== undefined && sessionId === undefined) {
+            // Anomaly: no system_init seen; touch to update lastActiveTs at minimum.
+            // BL-38: still update the counter — the spread carries the OLD value,
+            // so set it explicitly AFTER the spread (0 clears it, +1 accrues it).
+            await this.deps.sessionStore.put({
+              ...currentExisting,
+              lastActiveTs: now,
+              consecutiveStuckCount: nextStuckCount,
+            });
+          }
+
+          // Step 4f: finalize card.
+          //
+          // Bridge does NOT interpret content — all fields come from state.json
+          // (bot writes) except the header emoji derived from success/failure.
+          // The success/failure decision (truth ordering) + its event logging
+          // were made in Step 4e-pre (BL-38); `success` / `failureReason` /
+          // `cardKitTimeoutFailure` are reused here, not recomputed.
+          //
+          // Card body text = bot's `last_message` (preferred, productized),
+          // falling back to streamed text only when bot didn't write one.
+
           // reportedState is null when the bot didn't rewrite state.json this
           // turn (stale-guard above), so this falls back to the agent's fresh
           // trusted answer-channel text instead of repeating the previous reply.
@@ -2329,13 +2392,19 @@ export class BridgeHandler {
               : "") +
             "下一步：换个说法重试，或新开一个话题继续；若反复如此，请让维护者查看该 session 日志。";
           const cardBody =
-            cardKitTimeoutFailure
-              // PRB-9/§12.2: idle-stuck → unified explicit-failure sink, never a
-              // passive wait. 批A does NOT auto-replay it — the owner retries
-              // manually (safe auto-replay + idempotency is 批B §11.6).
-              ? "⚠️ 本轮被中断（长时间无活性，判定卡死），未完成。请重试。"
-              : reportedState?.last_message ??
-                (fallbackAnswer ? fallbackAnswer : noOutputFallback);
+            stuckResetTriggered
+              // BL-38: crossed the consecutive-idle-kill threshold — we just
+              // dropped the poisoned session (Step 4e), so tell the user this
+              // topic was reset and the next @ starts clean. Distinct from the
+              // single-idle-kill "请重试" below, which keeps the session.
+              ? "⚠️ 本轮被中断（长时间无活性，判定卡死）。连续多次卡死，已重置本话题上下文 —— 下次 @ 我将全新开始，请把需求重新说一遍。"
+              : cardKitTimeoutFailure
+                // PRB-9/§12.2: idle-stuck → unified explicit-failure sink, never a
+                // passive wait. 批A does NOT auto-replay it — the owner retries
+                // manually (safe auto-replay + idempotency is 批B §11.6).
+                ? "⚠️ 本轮被中断（长时间无活性，判定卡死），未完成。请重试。"
+                : reportedState?.last_message ??
+                  (fallbackAnswer ? fallbackAnswer : noOutputFallback);
 
           // When the agent didn't report status this turn (reportedState null,
           // per stale-guard) but exited cleanly, don't let the card default to
