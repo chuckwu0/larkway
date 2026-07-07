@@ -24,7 +24,8 @@ import path from "node:path";
 import type { InboundClient } from "../lark/transport.js";
 import type { CardRenderer } from "../lark/card.js";
 import type { SessionStore } from "../claude/sessionStore.js";
-import { parseMessage } from "../lark/message.js";
+import { parseMessage, parseTodoShareContent } from "../lark/message.js";
+import { buildTopicDeepLink, type MessageLookupClient } from "../lark/messageLookupClient.js";
 import { renderPrompt } from "../claude/prompt.js";
 import { remapPeersToLiveRoster, type LiveRosterResolver } from "../lark/rosterResolver.js";
 import type { PeerBot, RepoRef } from "../claude/prompt.js";
@@ -867,6 +868,14 @@ export interface BridgeHandlerDeps {
    * confident match for ITS OWN thread context.
    */
   taskHandleCandidatesLookup?: () => readonly TaskCandidate[];
+  /**
+   * v4 任务派单 (docs/task-handle.md §15): best-effort single-message lookup,
+   * used ONLY to probe whether a quote-reply's root message is a task-share
+   * (`msg_type: "todo"`). Absent (or any lookup failure) degrades to the
+   * pre-v4 behavior: quote-replies stay plain inline replies. The probe is
+   * mechanical type inspection — no business judgment.
+   */
+  messageLookup?: MessageLookupClient;
 }
 
 // ---------------------------------------------------------------------------
@@ -1178,7 +1187,42 @@ export class BridgeHandler {
     // Top-level @bot (no root_id): pass --reply-in-thread to open a Feishu topic
     // anchored on the user's message. Thread-replies pass false.
     const isTopLevel = !(typeof parsed.raw.root_id === "string" && parsed.raw.root_id);
-    const replyInThread = isTopLevel;
+    let replyInThread = isTopLevel;
+    // The message id every reply surface (card/cardkit/post fallback) anchors
+    // on. Default: the triggering message itself. The v4 任务派单 probe below
+    // may retarget it to the thread ROOT (the task-share card).
+    let replyAnchorId = messageId;
+    // v4 任务派单 (docs/task-handle.md §15): when this turn was triggered by a
+    // reply whose ROOT message is a task-share card (msg_type "todo"), surface
+    // the task fact to the agent (`taskRootInfo` → prompt <task-root> block)
+    // and — ONLY for a quote-reply that is not already inside a topic thread
+    // (root_id set, thread_id absent; a deliberate, user-decided narrowing:
+    // quote-replies to ORDINARY messages keep their inline-reply behavior) —
+    // open the work topic ON the task card by anchoring the reply surfaces on
+    // the root with reply_in_thread. Probe is best-effort: any lookup failure
+    // leaves pre-v4 behavior untouched.
+    let taskRootInfo: { guid: string; summary: string; topicLink?: string } | undefined;
+    {
+      const rootId = typeof parsed.raw.root_id === "string" && parsed.raw.root_id ? parsed.raw.root_id : undefined;
+      const inThread = typeof parsed.raw.thread_id === "string" && !!parsed.raw.thread_id;
+      if (rootId && this.deps.messageLookup) {
+        const info = await this.deps.messageLookup.get(rootId).catch(() => undefined);
+        if (info?.msgType === "todo" && info.content) {
+          const todo = parseTodoShareContent(info.content);
+          if (todo) {
+            taskRootInfo = {
+              guid: todo.taskGuid,
+              summary: todo.summaryText,
+              topicLink: info.threadId ? buildTopicDeepLink(parsed.chatId, info.threadId) : undefined,
+            };
+            if (!inThread) {
+              replyInThread = true;
+              replyAnchorId = rootId;
+            }
+          }
+        }
+      }
+    }
     const prototypeConfig = this.deps.botConfig?.response_surface_prototype;
     const cardKitAvailable = isResponseSurfaceCardKitAvailable(
       prototypeConfig,
@@ -1194,7 +1238,7 @@ export class BridgeHandler {
     let startFailurePostFallbackSent = false;
     if (!cardKitAvailable) {
       try {
-        card = await this.deps.cardRenderer.start(messageId, { replyInThread, threadId });
+        card = await this.deps.cardRenderer.start(replyAnchorId, { replyInThread, threadId });
         await recordEvent({
           status: "running",
           startedAt: new Date().toISOString(),
@@ -1382,7 +1426,7 @@ export class BridgeHandler {
           try {
             cardKitProgress = await createCardKitProgressHandle({
               cardKitClient: this.deps.cardKitClient,
-              replyToMessageId: messageId,
+              replyToMessageId: replyAnchorId,
               replyInThread,
               facts: {
                 botId: this.deps.botConfig?.id ?? "v1-default",
@@ -1415,7 +1459,7 @@ export class BridgeHandler {
               status: "message_sent",
               cardId: cardKitProgress.cardId,
               messageId: cardKitProgress.messageId,
-              replyToMessageId: messageId,
+              replyToMessageId: replyAnchorId,
               chatId: parsed.chatId,
               threadId,
               botId: this.deps.botConfig?.id ?? "",
@@ -1461,7 +1505,7 @@ export class BridgeHandler {
 
         if (!card && cardKitStartFailed) {
           try {
-            card = await this.deps.cardRenderer.start(messageId, { replyInThread, threadId });
+            card = await this.deps.cardRenderer.start(replyAnchorId, { replyInThread, threadId });
             await this.deps.client.removeProcessingReaction?.(messageId);
             await recordEvent({
               status: "running",
@@ -1476,7 +1520,7 @@ export class BridgeHandler {
             );
             const postFallback = await createOnlyPostFallback({
               postClient: this.deps.postClient,
-              replyToMessageId: messageId,
+              replyToMessageId: replyAnchorId,
               replyInThread,
               botId: this.deps.botConfig?.id ?? "v1-default",
               threadId,
@@ -1878,6 +1922,17 @@ export class BridgeHandler {
           }
         }
 
+        // v4 任务派单: the topic may have JUST been created by this turn's own
+        // card (quote-reply retarget path above) — re-probe the root once for
+        // the fresh omt_* id so the <task-root> fact can carry the topic deep
+        // link the agent pastes into its claim comment. Best-effort.
+        if (taskRootInfo && !taskRootInfo.topicLink && replyAnchorId !== messageId && this.deps.messageLookup) {
+          const refreshed = await this.deps.messageLookup.get(replyAnchorId, { refresh: true }).catch(() => undefined);
+          if (refreshed?.threadId) {
+            taskRootInfo.topicLink = buildTopicDeepLink(parsed.chatId, refreshed.threadId);
+          }
+        }
+
         const prompt = await renderPrompt({
           parsed,
           isNewThread: currentIsNewThread,
@@ -1909,6 +1964,9 @@ export class BridgeHandler {
           taskHandleTasklistGuid: this.deps.botConfig?.taskHandle?.tasklistGuid,
           taskHandleClaimed: this.deps.taskHandleClaimedLookup?.(threadId) ?? false,
           taskHandleCandidates: this.deps.taskHandleCandidatesLookup?.() ?? [],
+          taskRoot: taskRootInfo
+            ? { ...taskRootInfo, claimed: this.deps.taskHandleClaimedLookup?.(threadId) ?? false }
+            : undefined,
           mtimeFacts,
         });
 
@@ -2215,6 +2273,13 @@ export class BridgeHandler {
                 threadId,
                 chatId: parsed.chatId,
                 taskGuid: claimedTaskGuid,
+                // v4 任务派单 (docs/task-handle.md §15.3): a claim on the very
+                // task this thread's ROOT message shares is comment-mode —
+                // maintenance goes through task comments only (share-to-chat
+                // grants read+comment; no tasklist/editor rights needed, and
+                // completion is ALWAYS ticked by the human). Mechanical
+                // equality check, not a judgment call.
+                mode: taskRootInfo?.guid === claimedTaskGuid ? "comment" : undefined,
               });
             } catch (err) {
               console.warn("[bridge.handler] taskHandleClaim hook failed (continuing):", err);
@@ -2492,7 +2557,7 @@ export class BridgeHandler {
               console.warn("[bridge.handler] CardKit finalize failed; using card fallback:", err);
               cardKitProgress.close();
               try {
-                card = await this.deps.cardRenderer.start(messageId, { replyInThread, threadId });
+                card = await this.deps.cardRenderer.start(replyAnchorId, { replyInThread, threadId });
                 await writeCardFile(worktreePath, {
                   messageId: card.messageId,
                   chatId: parsed.chatId,
@@ -2517,7 +2582,7 @@ export class BridgeHandler {
               } catch (legacyErr) {
                 const postFallback = await createOnlyPostFallback({
                   postClient: this.deps.postClient,
-                  replyToMessageId: messageId,
+                  replyToMessageId: replyAnchorId,
                   replyInThread,
                   botId: this.deps.botConfig?.id ?? "v1-default",
                   threadId,
@@ -2541,7 +2606,7 @@ export class BridgeHandler {
           } else {
             if (!card) {
               try {
-                card = await this.deps.cardRenderer.start(messageId, { replyInThread, threadId });
+                card = await this.deps.cardRenderer.start(replyAnchorId, { replyInThread, threadId });
                 try {
                   await writeCardFile(worktreePath, {
                     messageId: card.messageId,
@@ -2569,7 +2634,7 @@ export class BridgeHandler {
                   .join("; ");
                 const postFallback = await createOnlyPostFallback({
                   postClient: this.deps.postClient,
-                  replyToMessageId: messageId,
+                  replyToMessageId: replyAnchorId,
                   replyInThread,
                   botId: this.deps.botConfig?.id ?? "v1-default",
                   threadId,
@@ -2714,7 +2779,7 @@ export class BridgeHandler {
       const createHardFailurePostFallback = async (failureReason: string) => {
         const fallback = await createOnlyPostFallback({
           postClient: this.deps.postClient,
-          replyToMessageId: messageId,
+          replyToMessageId: replyAnchorId,
           replyInThread,
           botId: this.deps.botConfig?.id ?? "v1-default",
           threadId,
@@ -2745,7 +2810,7 @@ export class BridgeHandler {
             cardKitFinalizeErr,
           );
           try {
-            card = await this.deps.cardRenderer.start(messageId, { replyInThread, threadId });
+            card = await this.deps.cardRenderer.start(replyAnchorId, { replyInThread, threadId });
           } catch (cardStartErr) {
             console.error("[bridge.handler] failure card start also failed:", cardStartErr);
             await createHardFailurePostFallback(

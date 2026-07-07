@@ -40,6 +40,7 @@ import {
   type OutboundCotClient,
   type OutboundCotLarkChannel,
 } from "./channelCotClient.js";
+import { ChannelMessageLookupClient, type MessageLookupClient } from "./messageLookupClient.js";
 import type { OutboundCardClient } from "./outboundCardClient.js";
 import type { OutboundPostClient } from "./outboundPostClient.js";
 
@@ -586,6 +587,8 @@ export class ChannelClient {
   private postClient: ChannelPostClient | null = null;
   /** Lazily built COT (思维链) client; only requested when a bot enables cot != off. */
   private cotClient: ChannelCotClient | null = null;
+  /** Lazily built single-message lookup client (v4 任务派单 root-type probe). */
+  private messageLookupClient: ChannelMessageLookupClient | null = null;
 
   constructor(opts: LarkClientOptions) {
     if (!opts.appId || !opts.appSecret) {
@@ -907,6 +910,21 @@ export class ChannelClient {
       });
     }
     return this.cotClient;
+  }
+
+  /**
+   * Return a MessageLookupClient bound to this client's channel handle
+   * (docs/task-handle.md §15.4 — the v4 任务派单 root-type probe). Same lazy
+   * channel resolution and generic rawClient.request() auth path as the COT
+   * client above; strictly best-effort per the client's own contract.
+   */
+  outboundMessageLookupClient(): MessageLookupClient {
+    if (!this.messageLookupClient) {
+      this.messageLookupClient = new ChannelMessageLookupClient({
+        resolveChannel: () => this.channel as unknown as OutboundCotLarkChannel | null,
+      });
+    }
+    return this.messageLookupClient;
   }
 
   /**

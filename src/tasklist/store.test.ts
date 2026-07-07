@@ -271,6 +271,32 @@ describe("TaskHandleStore", () => {
   // put({...staleSnapshot, field}) pattern lost whatever another writer
   // changed during the await. update() re-reads the CURRENT value INSIDE its
   // synchronous callback (called at write time, never a pre-await snapshot).
+  describe("v4 comment-mode fields (docs/task-handle.md §15.3)", () => {
+    it("claim persists mode='comment' and it survives a reload", async () => {
+      const store = await TaskHandleStore.load(filePath);
+      await store.claim({ threadId: "t1", taskGuid: "g1", chatId: "oc_1", mode: "comment" });
+      expect(store.get("t1")?.mode).toBe("comment");
+
+      const reloaded = await TaskHandleStore.load(filePath);
+      expect(reloaded.get("t1")?.mode).toBe("comment");
+    });
+
+    it("claim without mode leaves the field absent (辅路径 full-maintenance default)", async () => {
+      const store = await TaskHandleStore.load(filePath);
+      await store.claim({ threadId: "t1", taskGuid: "g1", chatId: "oc_1" });
+      expect(store.get("t1")?.mode).toBeUndefined();
+    });
+
+    it("doneDeclared round-trips through disk", async () => {
+      const store = await TaskHandleStore.load(filePath);
+      await store.claim({ threadId: "t1", taskGuid: "g1", chatId: "oc_1", mode: "comment" });
+      await store.update("t1", (r) => (r ? { ...r, doneDeclared: true } : r));
+
+      const reloaded = await TaskHandleStore.load(filePath);
+      expect(reloaded.get("t1")?.doneDeclared).toBe(true);
+    });
+  });
+
   describe("update (atomic read-modify-write)", () => {
     it("invokes updateFn synchronously with the CURRENT value and persists its result", async () => {
       const store = await TaskHandleStore.load(filePath);

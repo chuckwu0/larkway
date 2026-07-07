@@ -108,6 +108,24 @@ export interface TaskHandleRecord {
   lastTurnMentions?: string[];
   /** ms epoch — when `lastTurnMentions` was recorded (the mentioning turn's completion time). Always set together with `lastTurnMentions`. */
   lastTurnMentionsAt?: number;
+  /**
+   * v4 任务派单 (docs/task-handle.md §15.3): "comment" = this claim is on the
+   * task its thread's ROOT message shares (建任务→发到群→@ main path).
+   * Maintenance is task-comments-only: writeback skips description patches /
+   * complete / reopen; completion is ticked by the human. Absent = the v1–v3
+   * 辅路径 full-maintenance behavior. Set once at claim time from the
+   * handler's mechanical root==claim equality check, never re-judged.
+   */
+  mode?: "comment";
+  /**
+   * v4.1 (docs/task-handle.md §15.3): the agent declared `done: true` for a
+   * comment-mode claim — it posted its own "已交付" comment; the bridge's only
+   * job is to STOP stall patrol for this task (the "delivered but the human
+   * hasn't ticked complete yet" window must not read as a stall). Cleared on
+   * the next "received" lifecycle event (re-engagement resumes patrol, the
+   * comment-mode analog of the full-mode auto-reopen).
+   */
+  doneDeclared?: boolean;
 }
 
 interface StoreFile {
@@ -141,7 +159,9 @@ function isTaskHandleRecord(value: unknown): value is TaskHandleRecord {
     (v["stallSuppressUntilActivityAfter"] === undefined || typeof v["stallSuppressUntilActivityAfter"] === "number") &&
     (v["lastTurnMentions"] === undefined ||
       (Array.isArray(v["lastTurnMentions"]) && v["lastTurnMentions"].every((m) => typeof m === "string"))) &&
-    (v["lastTurnMentionsAt"] === undefined || typeof v["lastTurnMentionsAt"] === "number")
+    (v["lastTurnMentionsAt"] === undefined || typeof v["lastTurnMentionsAt"] === "number") &&
+    (v["mode"] === undefined || v["mode"] === "comment") &&
+    (v["doneDeclared"] === undefined || typeof v["doneDeclared"] === "boolean")
   );
 }
 
@@ -362,6 +382,8 @@ export class TaskHandleStore {
     taskGuid: string;
     chatId: string;
     onlyIfThreadUnclaimed?: boolean;
+    /** v4 任务派单 — see TaskHandleRecord.mode. Recorded on a NEW claim only; a same-guid re-declaration keeps the original record untouched. */
+    mode?: "comment";
   }): Promise<{ claimed: boolean; reason?: string }> {
     let claimed = false;
     let reason: string | undefined;
@@ -381,7 +403,13 @@ export class TaskHandleStore {
         }
       }
       claimed = true;
-      return { threadId: input.threadId, taskGuid: input.taskGuid, chatId: input.chatId, claimedTs: Date.now() };
+      return {
+        threadId: input.threadId,
+        taskGuid: input.taskGuid,
+        chatId: input.chatId,
+        claimedTs: Date.now(),
+        ...(input.mode ? { mode: input.mode } : {}),
+      };
     });
     return { claimed, reason };
   }

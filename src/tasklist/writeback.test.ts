@@ -550,3 +550,87 @@ describe("applyAutoBindConfirmation", () => {
     await expect(applyAutoBindConfirmation("guid-1", client)).resolves.toBeUndefined();
   });
 });
+
+// ---------------------------------------------------------------------------
+// v4 任务派单 comment-mode (docs/task-handle.md §15.3): comments-only
+// maintenance — no description patches, no complete(), no reopen.
+// ---------------------------------------------------------------------------
+
+describe("applyTaskHandleWriteback — comment-mode claims (v4 任务派单)", () => {
+  async function makeCommentModeStore() {
+    const store = await TaskHandleStore.load(join(dir, "task-handles.json"));
+    await store.put({ threadId: "t1", taskGuid: "guid-1", chatId: "oc_1", claimedTs: 1, mode: "comment" });
+    return store;
+  }
+
+  it("completed + done: NO patch/complete calls; doneDeclared recorded locally", async () => {
+    const store = await makeCommentModeStore();
+    const { requester, calls } = makeFakeRequester({ task: { description: "原始需求" } });
+    const client = new TaskListClient(requester);
+
+    await applyTaskHandleWriteback(
+      { botId: "b1", threadId: "t1", status: "completed", finalText: "已交付", agentDeclaredDone: true },
+      { store, client },
+    );
+
+    // the only network call is the leading getTask (deleted-task contract)
+    expect(calls.filter((c) => c.config.method !== "GET").length).toBe(0);
+    expect(store.get("t1")?.doneDeclared).toBe(true);
+    expect(store.get("t1")?.lastTurnOutcome).toBe("completed");
+  });
+
+  it("completed without done: no writes, doneDeclared stays unset", async () => {
+    const store = await makeCommentModeStore();
+    const { requester, calls } = makeFakeRequester({ task: {} });
+    const client = new TaskListClient(requester);
+
+    await applyTaskHandleWriteback({ botId: "b1", threadId: "t1", status: "completed" }, { store, client });
+
+    expect(calls.filter((c) => c.config.method !== "GET").length).toBe(0);
+    expect(store.get("t1")?.doneDeclared).toBeUndefined();
+  });
+
+  it("failed: posts exactly one failure COMMENT (comments push; descriptions don't), never patches", async () => {
+    const store = await makeCommentModeStore();
+    const { requester, calls } = makeFakeRequester({ task: {} });
+    const client = new TaskListClient(requester);
+
+    await applyTaskHandleWriteback(
+      { botId: "b1", threadId: "t1", status: "failed", failureReason: "进程崩溃" },
+      { store, client },
+    );
+
+    const nonGet = calls.filter((c) => c.config.method !== "GET");
+    expect(nonGet.length).toBe(1);
+    expect(nonGet[0]!.config.url).toContain("/comments");
+    expect(store.get("t1")?.lastTurnOutcome).toBe("failed");
+  });
+
+  it("received clears doneDeclared (re-engagement resumes stall patrol) and never reopens", async () => {
+    const store = await makeCommentModeStore();
+    await store.update("t1", (r) => (r ? { ...r, doneDeclared: true } : r));
+    // task independently ticked complete by the human — full-mode would reopen here
+    const { requester, calls } = makeFakeRequester({ task: { completed_at: "12345" } });
+    const client = new TaskListClient(requester);
+
+    await applyTaskHandleWriteback({ botId: "b1", threadId: "t1", status: "received" }, { store, client });
+
+    expect(store.get("t1")?.doneDeclared).toBeUndefined();
+    expect(calls.some((c) => c.config.method === "PATCH")).toBe(false);
+  });
+
+  it("full-mode claims (no mode field) keep the v1–v3 behavior untouched", async () => {
+    const store = await TaskHandleStore.load(join(dir, "task-handles.json"));
+    await store.put({ threadId: "t1", taskGuid: "guid-1", chatId: "oc_1", claimedTs: 1 });
+    const { requester, calls } = makeFakeRequester({ task: { description: "原始需求" } });
+    const client = new TaskListClient(requester);
+
+    await applyTaskHandleWriteback(
+      { botId: "b1", threadId: "t1", status: "completed", finalText: "已交付", agentDeclaredDone: true },
+      { store, client },
+    );
+
+    // description patch + completed_at patch, exactly as before
+    expect(calls.filter((c) => c.config.method === "PATCH").length).toBe(2);
+  });
+});

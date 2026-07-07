@@ -266,6 +266,20 @@ export interface RenderPromptInput {
    */
   taskHandleCandidates?: readonly TaskCandidate[];
   /**
+   * v4 任务派单 (docs/task-handle.md §15): set when THIS thread's root
+   * message is a Feishu task-share card (the 建任务→发到群→@ main path).
+   * Independent of taskHandleTasklistGuid — the main path needs no tasklist.
+   * Pure injected facts (guid/summary/deep link/claimed state); what to do
+   * with them is the task-handle SKILL's 任务派单 section.
+   */
+  taskRoot?: {
+    guid: string;
+    summary: string;
+    /** client/thread/open deep link into the work topic, when resolvable this turn. */
+    topicLink?: string;
+    claimed: boolean;
+  };
+  /**
    * A2 (perf plan): neutral fact lines for agent-workspace files whose mtime
    * has advanced since the bridge last told the agent (see
    * src/agent/mtimeFacts.ts). Rendered verbatim in `<workspace-file-changes>`.
@@ -452,6 +466,44 @@ function renderTaskHandleBlock(
       "不要为了消歧义去调用 lark-cli 列清单——候选已经在这里,判断不到就是这一轮没有匹配。",
     "</task-handle>",
   ];
+}
+
+/**
+ * v4 任务派单 fact block (docs/task-handle.md §15.3) — rendered whenever the
+ * thread's root message is a task-share card, with or without a tasklist.
+ * Facts only; the behavioral contract lives in the task-handle SKILL. The
+ * inline directives below exist so a bot WITHOUT the SKILL installed still
+ * does something sane (claim + comment, never touch description/complete).
+ */
+function renderTaskRootBlock(taskRoot: {
+  guid: string;
+  summary: string;
+  topicLink?: string;
+  claimed: boolean;
+}): string[] {
+  const lines = [
+    "<task-root>",
+    "本话题的根消息是一条飞书任务分享(任务派单主路径,docs/task-handle.md §15)。",
+    `task_guid: ${taskRoot.guid}`,
+    `task_summary: ${taskRoot.summary || "(无标题)"}`,
+    ...(taskRoot.topicLink ? [`topic_link: ${taskRoot.topicLink}`] : []),
+    `task_root_claimed: ${taskRoot.claimed ? "yes" : "no"}`,
+  ];
+  if (taskRoot.claimed) {
+    lines.push(
+      "本话题已认领这个任务。维护面只有任务评论:仅在交付/失败/等拍板三类里程碑节点发任务评论" +
+        "(lark-cli task comments create);真正交付的那一轮在 state.json 的 task_handle 里声明 done: true," +
+        "并发一条「已交付,看过请点完成」评论。不要修改任务描述、不要勾完成/reopen——完成永远由人在任务中心点。",
+    );
+  } else {
+    lines.push(
+      "本轮请顺带静默认领:把上面的 task_guid 写入 state.json 的 task_handle.guid,并发一条认领评论" +
+        `(lark-cli task comments create),内容 = 一句认领声明${taskRoot.topicLink ? " + 上面的 topic_link(用户点它直达本话题)" : ""}。` +
+        "之后维护面只有任务评论(交付/失败/等拍板才发,过程碎碎念不发);不要修改任务描述、不要勾完成——完成永远由人点。",
+    );
+  }
+  lines.push("</task-root>");
+  return lines;
 }
 
 function renderRuntimeWarningsBlock(warnings: RuntimeWarning[]): string[] {
@@ -657,6 +709,7 @@ export async function renderPrompt(input: RenderPromptInput): Promise<string> {
     taskHandleTasklistGuid,
     taskHandleClaimed = false,
     taskHandleCandidates = [],
+    taskRoot,
     mtimeFacts = [],
   } = input;
   const backend = input.backend ?? "claude";
@@ -687,6 +740,10 @@ export async function renderPrompt(input: RenderPromptInput): Promise<string> {
   const taskHandleBlock = taskHandleTasklistGuid
     ? renderTaskHandleBlock(taskHandleTasklistGuid, taskHandleClaimed, taskHandleCandidates)
     : [];
+  // v4 任务派单 (§15): root-is-task-share fact block, tasklist-independent.
+  // When present it supersedes the tasklist candidate flow for this thread —
+  // the claim target is deterministic, so candidates would only distract.
+  const taskRootBlock = taskRoot ? renderTaskRootBlock(taskRoot) : [];
   const runtimeWarningsBlock = renderRuntimeWarningsBlock(runtimeWarnings);
   // Workspace warm-up block — rendered for all bots that have at least one repo.
   const extraRepos = extraRepoPaths ?? conventions.extraRepoPaths ?? [];
@@ -844,6 +901,7 @@ export async function renderPrompt(input: RenderPromptInput): Promise<string> {
       ...(peersBlock.length > 0 ? ["", ...peersBlock] : []),
       ...(turnTakingBlock.length > 0 ? ["", ...turnTakingBlock] : []),
       ...(taskHandleBlock.length > 0 ? ["", ...taskHandleBlock] : []),
+      ...(taskRootBlock.length > 0 ? ["", ...taskRootBlock] : []),
       "",
       "<user-message>",
       `${parsed.senderOpenId}: ${parsed.text}`,
@@ -904,6 +962,7 @@ export async function renderPrompt(input: RenderPromptInput): Promise<string> {
     ...(peersBlock.length > 0 ? ["", ...peersBlock] : []),
     ...(turnTakingBlock.length > 0 ? ["", ...turnTakingBlock] : []),
     ...(taskHandleBlock.length > 0 ? ["", ...taskHandleBlock] : []),
+      ...(taskRootBlock.length > 0 ? ["", ...taskRootBlock] : []),
     "",
     "<user-message>",
     `${parsed.senderOpenId}: ${parsed.text}`,

@@ -568,6 +568,12 @@ export class StallDetector {
     let record = this.#deps.store.get(threadId);
     if (!record) return; // dropped between list() snapshot and now
 
+    // v4.1 comment-mode delivery (docs/task-handle.md §15.3): the agent has
+    // declared done and posted its own "已交付" comment — the human just
+    // hasn't ticked complete yet. That window is NOT a stall; patrol resumes
+    // only when writeback's "received" branch clears the flag (re-engagement).
+    if (record.doneDeclared) return;
+
     const lastActiveTs = this.#deps.getLastActiveTs(threadId) ?? record.claimedTs;
     const now = Date.now();
 
