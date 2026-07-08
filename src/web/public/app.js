@@ -877,8 +877,21 @@ function buildModelEffortHTML(bot) {
     `<select id="ac-effort" name="effort" class="ac-input" style="width:150px">${effortOptionsHTML(effortVal, backendId)}</select>` +
     `</span>` +
     `</div>` +
+    // 常驻快选 chips:datalist 会按当前输入值过滤建议(输入框已填某个模型时,
+    // 下拉只剩它自己,像"选项丢了"——2026-07-08 mini 实测用户困惑),chips 不受
+    // 输入值影响,永远列出全部建议;点一下=填入并触发 input(保存 dirty 检测)。
+    `<div id="ac-model-chips" style="margin-top:8px;display:flex;gap:6px;flex-wrap:wrap">${modelChipsHTML(backendId)}</div>` +
     `</div>`
   );
+}
+
+/** 常驻模型快选 chips 的 HTML(见 buildModelEffortHTML 里的调用注释)。 */
+function modelChipsHTML(backendId) {
+  return modelSuggestionsForBackend(backendId)
+    .map(([v, label]) =>
+      `<button type="button" class="ac-model-chip" data-model-value="${esc(v)}" title="${esc(label)}" ` +
+      `style="font-size:12px;padding:3px 10px;border:1px solid var(--border);border-radius:999px;background:var(--bg,transparent);cursor:pointer">${esc(v)}</button>`)
+    .join("");
 }
 
 /**
@@ -894,6 +907,8 @@ function refreshModelEffortForBackend(panel, backendId) {
       .map(([v, label]) => `<option value="${esc(v)}">${esc(label)}</option>`)
       .join("");
   }
+  const chips = panel.querySelector("#ac-model-chips");
+  if (chips) chips.innerHTML = modelChipsHTML(backendId);
   const effortSelect = panel.querySelector("#ac-effort");
   if (effortSelect) {
     const currentVal = effortSelect.value;
@@ -3538,6 +3553,17 @@ function wireDetailEvents(panel, id, bot) {
     bkCard.addEventListener("input", () => {
       state.formDirty = acFormSnapshot(panel) !== panel._acBaseline;
       updateFormDirty(panel);
+    });
+
+    // 模型快选 chips:点一下 = 填入 model 输入框(委托监听,chips 会随底座
+    // 切换整体重渲染);dispatch input 让上面的脏检测同一条路生效。
+    bkCard.addEventListener("click", (e) => {
+      const chip = e.target instanceof Element ? e.target.closest(".ac-model-chip") : null;
+      if (!chip) return;
+      const input = panel.querySelector("#ac-model");
+      if (!(input instanceof HTMLInputElement)) return;
+      input.value = chip.getAttribute("data-model-value") ?? "";
+      input.dispatchEvent(new Event("input", { bubbles: true }));
     });
   }
 
