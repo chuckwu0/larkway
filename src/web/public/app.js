@@ -821,9 +821,11 @@ function modelSuggestionsForBackend(backendId) {
     ];
   }
   return [
-    ["fable", "fable"],
-    ["opus", "opus"],
-    ["sonnet", "sonnet"],
+    ["claude-sonnet-5", "claude-sonnet-5 · Sonnet 5，快/省"],
+    ["claude-opus-4-8", "claude-opus-4-8 · Opus 4.8"],
+    ["claude-fable-5", "claude-fable-5 · Fable 5，最强"],
+    ["sonnet", "sonnet · 别名=最新 Sonnet"],
+    ["opus", "opus · 别名=最新 Opus"],
   ];
 }
 
