@@ -4631,6 +4631,56 @@ describe("handleOne — v4 task-share root probe", () => {
     expect(prompt()).toContain("open_thread_id=omt_live");
   });
 
+  it("LIVE-push shape (2026-07-08 dogfood): quote reply carries ONLY parent_id (no root_id) — probe fires off parent_id and the session REKEYS onto the card", async () => {
+    let runOpts: { prompt?: string } | undefined;
+    runClaudeImpl = (opts: unknown) => {
+      runOpts = opts as { prompt?: string };
+      return {
+        events: (async function* () {
+          yield { type: "system_init", sessionId: "sess_live", raw: {} };
+        })(),
+        done: Promise.resolve({ exitCode: 0, sessionId: "sess_live" }),
+        kill: () => {},
+      };
+    };
+    const { renderer, startArgs, whenFinalized } = makeCardRenderer();
+    const { store, puts } = makeSessionStore();
+    // live push: parent_id only — root_id and thread_id entirely absent
+    const { client } = makeClient({
+      message_id: "om_msg_live",
+      chat_id: "oc_chat",
+      chat_type: "group",
+      parent_id: "om_card",
+      sender_id: "ou_sender",
+      content: JSON.stringify({ text: "接下这个任务" }),
+      create_time: "1700000000000",
+    });
+    await seedRepoCachePath();
+    const { calls, lookup } = makeLookup({ msgType: "todo", content: TODO_CONTENT, threadId: "omt_after" });
+    const handler = new BridgeHandler({
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      client: client as any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      cardRenderer: renderer as any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      sessionStore: store as any,
+      conventions: makeConventions(),
+      botConfig: { id: "frontend", name: "Frontend", turn_taking_limit: 10, backend: "claude" },
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      messageLookup: lookup as any,
+    });
+    await handler.run();
+    await whenFinalized;
+
+    expect(calls[0]).toEqual({ messageId: "om_card", refresh: undefined });
+    // reply surfaces open the topic ON the card, not on the @ message
+    expect(startArgs[0]).toMatchObject({ messageId: "om_card", replyInThread: true });
+    // session/claim rekeyed onto the card id — follow-ups inside the card's
+    // topic (root_id=card) land on the SAME session
+    expect((puts[0] as { threadId?: string } | undefined)?.threadId).toBe("om_card");
+    expect(runOpts?.prompt ?? "").toContain("task_guid: g-42");
+  });
+
   it("REAL-WORLD shape (2026-07-08 dogfood): thread_id polluted with the root's om_* id is NOT a topic — retarget still fires", async () => {
     // Regular-group quote replies (and gap-fill synthesis) carry
     // thread_id === root_id (an om_* MESSAGE id). Treating that as

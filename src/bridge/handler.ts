@@ -1029,22 +1029,32 @@ export class BridgeHandler {
       if (this.closed) break;
       if (signal?.aborted) break;
 
-      // Queue key MUST equal the session key handleOne derives via
-      // parseLarkMessage (message.ts: `root_id ?? message_id`). It previously
-      // used `thread_id ?? message_id`, which diverges for in-thread replies:
-      // the root turn keyed by om_<root> while its follow-ups keyed by
-      // omt_<thread> — so a follow-up arriving mid-turn skipped the serial
-      // chain and ran CONCURRENTLY against the same workspace/session
-      // (fresh session instead of --resume, interleaved state.json writes).
-      // It also broke getThreadReceivedAt(threadId) lookups, which use the
-      // session key.
+      // Queue key must SERIALIZE every event that can end up on the same
+      // session. Base rule: session key = `root_id ?? message_id`
+      // (message.ts). v4 任务派单 addition: a quote reply on a task-share
+      // card gets REKEYED inside handleOne to the card's id (root_id ??
+      // parent_id) — so parent_id joins the queue key here to keep that
+      // rekeyed turn and the card-topic follow-ups on one serial chain. For
+      // an ORDINARY quote reply this makes the queue key a superset of the
+      // session key (several distinct sessions serialized under the quoted
+      // chain's root) — the safe direction: less parallelism, never the
+      // concurrent-same-session hazard the original invariant guarded
+      // against (fresh session instead of --resume, interleaved state.json).
       const key =
         (typeof event.root_id === "string" && event.root_id)
           ? event.root_id
-          : event.message_id;
+          : (typeof event.parent_id === "string" && event.parent_id)
+            ? event.parent_id
+            : event.message_id;
       // Stamp "received" here — synchronously, before acquire()/handleOne()
       // — so this reflects arrival, not dispatch. See threadReceivedAt above.
+      // Stamped under BOTH the queue key and the legacy session key: an
+      // ordinary quote reply's session stays keyed by its own message_id,
+      // and its receipt lookup must still hit.
       this.threadReceivedAt.set(key, Date.now());
+      const legacySessionKey =
+        (typeof event.root_id === "string" && event.root_id) ? event.root_id : event.message_id;
+      if (legacySessionKey !== key) this.threadReceivedAt.set(legacySessionKey, Date.now());
       const prev = threadQueues.get(key) ?? Promise.resolve();
       const next = prev
         .then(() => acquire())
@@ -1119,10 +1129,56 @@ export class BridgeHandler {
     try {
     // Step 1: parse
     const parsed = parseMessage(event);
-    const { threadId, messageId, senderOpenId } = parsed;
+    const { messageId, senderOpenId } = parsed;
+    let threadId = parsed.threadId;
     const botId = this.deps.botConfig?.id;
     const eventLogId = messageId;
     const eventStartedAt = Date.now();
+
+    // v4 任务派单 root probe (docs/task-handle.md §15.4) — runs FIRST, before
+    // any threadId consumer, because a hit REKEYS this turn onto the task
+    // card's id. Real-deployment facts driving the shape (2026-07-08):
+    //   - a LIVE quote-reply push carries NO root_id at all — parent_id (the
+    //     directly-quoted message) is the only signal; gap-fill synthesis
+    //     resolves root_id itself, so `root_id ?? parent_id` covers both.
+    //   - thread_id can arrive polluted with the root's om_* id (reply-chain
+    //     normalization) — only an omt_* value means "already in a topic"
+    //     (realTopicThreadId).
+    // On a todo hit outside a real topic: the reply surfaces retarget onto
+    // the card (taskCardAnchorId) AND the session/claim key becomes the card
+    // id — so the first quote-reply @, the card-topic follow-ups, and
+    // gap-fill deliveries all converge on ONE session. run()'s queue key
+    // already includes parent_id, so the rekeyed turn stays serialized.
+    let taskRootInfo: { guid: string; summary: string; topicLink?: string } | undefined;
+    let taskCardAnchorId: string | undefined;
+    let deferredTaskRootProbe: Promise<import("../lark/messageLookupClient.js").MessageInfo | undefined> | undefined;
+    {
+      const realTopic = realTopicThreadId(parsed.raw.thread_id);
+      const rootCandidate =
+        (typeof parsed.raw.root_id === "string" && parsed.raw.root_id ? parsed.raw.root_id : undefined) ??
+        (typeof parsed.raw.parent_id === "string" && parsed.raw.parent_id ? parsed.raw.parent_id : undefined);
+      if (rootCandidate && this.deps.messageLookup) {
+        const probe = this.deps.messageLookup.get(rootCandidate).catch(() => undefined);
+        if (realTopic) {
+          deferredTaskRootProbe = probe; // already in a real topic: facts only, resolved pre-prompt
+        } else {
+          const info = await probe;
+          if (info?.msgType === "todo" && info.content) {
+            const todo = parseTodoShareContent(info.content);
+            if (todo) {
+              const probeThreadId = realTopicThreadId(info.threadId);
+              taskRootInfo = {
+                guid: todo.taskGuid,
+                summary: todo.summaryText,
+                topicLink: probeThreadId ? buildTopicDeepLink(parsed.chatId, probeThreadId) : undefined,
+              };
+              taskCardAnchorId = rootCandidate;
+              threadId = rootCandidate; // rekey: session/claim live on the task card
+            }
+          }
+        }
+      }
+    }
     // v3.3 adversarial review round 2 (docs/task-handle.md §13.4): capture
     // THIS turn's own receipt timestamp NOW, at turn start — not by re-
     // reading `this.threadReceivedAt` later at writeback/finalize time. A
@@ -1198,59 +1254,12 @@ export class BridgeHandler {
     const isTopLevel = !(typeof parsed.raw.root_id === "string" && parsed.raw.root_id);
     let replyInThread = isTopLevel;
     // The message id every reply surface (card/cardkit/post fallback) anchors
-    // on. Default: the triggering message itself. The v4 任务派单 probe below
-    // may retarget it to the thread ROOT (the task-share card).
+    // on. Default: the triggering message itself. A v4 任务派单 probe hit
+    // (dispatch-site block above) retargets it onto the task-share card.
     let replyAnchorId = messageId;
-    // v4 任务派单 (docs/task-handle.md §15): when this turn was triggered by a
-    // reply whose ROOT message is a task-share card (msg_type "todo"), surface
-    // the task fact to the agent (`taskRootInfo` → prompt <task-root> block)
-    // and — ONLY for a quote-reply that is not already inside a topic thread
-    // (root_id set, thread_id absent; a deliberate, user-decided narrowing:
-    // quote-replies to ORDINARY messages keep their inline-reply behavior) —
-    // open the work topic ON the task card by anchoring the reply surfaces on
-    // the root with reply_in_thread. Probe is best-effort: any lookup failure
-    // leaves pre-v4 behavior untouched.
-    let taskRootInfo: { guid: string; summary: string; topicLink?: string } | undefined;
-    // Deferred probe for TRUE thread replies (adversarial-review fix): the
-    // anchor never changes for an in-thread turn, so its probe must not
-    // block card creation (up to the lookup timeout) — it is awaited later,
-    // just before prompt build, where its facts are actually consumed.
-    let deferredTaskRootProbe: Promise<import("../lark/messageLookupClient.js").MessageInfo | undefined> | undefined;
-    {
-      const rootId = typeof parsed.raw.root_id === "string" && parsed.raw.root_id ? parsed.raw.root_id : undefined;
-      // Real-deployment fix (2026-07-08 dogfood): a quote-reply event in a
-      // regular group can arrive with `thread_id` set to the ROOT MESSAGE's
-      // om_* id (platform/SDK reply-chain normalization; gap-fill's
-      // channelMsgToLarkEvent does the same on purpose) — that is NOT a
-      // topic. Feishu topic ids are omt_*; only those count as "already
-      // inside a thread". Treating the om_* case as in-thread skipped the
-      // retarget (replies scattered inline instead of opening the topic on
-      // the task card) AND produced a thread/open deep link built from an
-      // om_* id, which the client cannot open at all.
-      const rawThreadId = realTopicThreadId(parsed.raw.thread_id);
-      if (rootId && this.deps.messageLookup) {
-        const probe = this.deps.messageLookup.get(rootId).catch(() => undefined);
-        if (rawThreadId) {
-          deferredTaskRootProbe = probe; // in-thread: facts only, resolved pre-prompt
-        } else {
-          // Quote-reply outside any thread: the probe decides the ANCHOR, so
-          // it must resolve before the reply surfaces are created.
-          const info = await probe;
-          if (info?.msgType === "todo" && info.content) {
-            const todo = parseTodoShareContent(info.content);
-            if (todo) {
-              const probeThreadId = realTopicThreadId(info.threadId);
-              taskRootInfo = {
-                guid: todo.taskGuid,
-                summary: todo.summaryText,
-                topicLink: probeThreadId ? buildTopicDeepLink(parsed.chatId, probeThreadId) : undefined,
-              };
-              replyInThread = true;
-              replyAnchorId = rootId;
-            }
-          }
-        }
-      }
+    if (taskCardAnchorId) {
+      replyInThread = true; // open/join the work topic ON the task card
+      replyAnchorId = taskCardAnchorId;
     }
     const prototypeConfig = this.deps.botConfig?.response_surface_prototype;
     const cardKitAvailable = isResponseSurfaceCardKitAvailable(

@@ -416,6 +416,17 @@ export function channelMsgToLarkEvent(msg: ChannelNormalizedMessage): LarkMessag
   // worktree instead of resuming the build session).
   const root_id = (m?.["root_id"] as string) ?? msg.rootId ?? undefined;
 
+  // parent_id: the directly-quoted message for a QUOTE reply. Real-deployment
+  // fact (2026-07-08): the live push omits root_id entirely for quote replies
+  // (the GET API has it; the push doesn't) — parent_id (raw) / the SDK's
+  // normalized replyToMessageId is the only live signal left. Carried onto
+  // the event for the v4 任务派单 root probe; NOT consulted for session keys
+  // (see the deliberate exclusion note above resolveThreadIdOf).
+  const parent_id =
+    (m?.["parent_id"] as string) ??
+    (msg as { replyToMessageId?: string }).replyToMessageId ??
+    undefined;
+
   // Content: prefer the RAW lark content JSON (message.ts parses text/post/
   // image_key with full fidelity). When raw isn't in the expected shape, fall
   // back to synthesizing a lark TEXT content from the SDK's normalized `content`
@@ -431,6 +442,7 @@ export function channelMsgToLarkEvent(msg: ChannelNormalizedMessage): LarkMessag
     chat_type: (m?.["chat_type"] as string) ?? msg.chatType ?? "group",
     thread_id,
     root_id,
+    parent_id,
     sender_id: senderOpenId,
     mentions: (m?.["mentions"] as LarkMessageEvent["mentions"]) ?? undefined,
     content,

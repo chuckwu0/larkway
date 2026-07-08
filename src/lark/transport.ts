@@ -31,6 +31,17 @@ export interface LarkMessageEvent {
    * BridgeHandler.run()'s serial-queue key derive from it and MUST agree.
    */
   root_id?: string;
+  /**
+   * The directly-quoted message id (om_…) for a QUOTE reply (引用回复).
+   * Real-deployment fact (2026-07-08): Feishu's LIVE push for a quote reply
+   * carries NO root_id at all (the message GET API does — the push just
+   * omits it), so parent_id is the only live signal that "this @ was aimed
+   * at that message". Used by the v4 任务派单 root probe (a quote reply on a
+   * task-share card opens the work topic ON the card) and by run()'s
+   * serial-queue key. Deliberately NOT part of the session key derivation in
+   * message.ts — an ordinary quote reply still keys its own session.
+   */
+  parent_id?: string;
   /** open_id of the sender; some SDK paths may pass the raw sender_id object. */
   sender_id: string | Record<string, unknown>;
   mentions?: Array<{
