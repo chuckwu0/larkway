@@ -910,6 +910,23 @@ export interface BridgeHandlerDeps {
    */
   taskHandleClaimGuidLookup?: (threadId: string) => string | undefined;
   /**
+   * v4.2 round-2 (blocker fix): does ANY OTHER bot in this bridge process
+   * already hold a claim on this task guid? Gates the bridge auto-claim so a
+   * peer @-ed inside a task topic (the standard A→B handoff) doesn't
+   * double-claim — double patrol/comment-relay is the 结构性骚扰 red line.
+   * In-process visibility only; simultaneous double-@ and cross-bridge
+   * remain documented residual gaps.
+   */
+  taskGuidClaimedByOtherBot?: (guid: string) => boolean;
+  /**
+   * v4.2 round-2: is this thread's comment-mode claim still owing its
+   * user-facing claim comment (the task→topic backlink)? Drives the prompt's
+   * justClaimed instruction on EVERY turn until a turn completes successfully
+   * — a first turn that crashes after the bridge claim no longer loses the
+   * backlink forever.
+   */
+  taskHandleClaimCommentPending?: (threadId: string) => boolean;
+  /**
    * v3 "候选注入" (docs/task-handle.md §5.1): reads the bridge's TasklistPoller
    * cache — a plain in-memory snapshot read, no I/O, safe to call once per
    * turn at prompt-build time. Not thread-scoped (candidates aren't matched
@@ -1270,8 +1287,26 @@ export class BridgeHandler {
       if (!this.deps.taskHandleClaim || !botId) return;
       const alreadyThis = this.deps.taskHandleClaimGuidLookup?.(threadId) === guid;
       if (alreadyThis) return;
+      // Round-2 blocker fix: another bot in this process already owns the
+      // claim (standard A→B handoff — B is @-ed INSIDE the task topic).
+      // B must not double-claim; the <task-root> fallback branch tells it to
+      // cooperate without claiming.
+      if (this.deps.taskGuidClaimedByOtherBot?.(guid)) return;
       try {
-        await this.deps.taskHandleClaim({ botId, threadId, chatId: parsed.chatId, taskGuid: guid, mode: "comment" });
+        await this.deps.taskHandleClaim({
+          botId,
+          threadId,
+          chatId: parsed.chatId,
+          taskGuid: guid,
+          mode: "comment",
+          // Round-2 fix: the mechanical auto-claim must never REPLACE an
+          // existing different-guid claim on this thread (same charter as the
+          // v3 auto-bind guard) — only the agent's own re-declaration may.
+          onlyIfThreadUnclaimed: true,
+          // Round-2 fix: persist "claim comment still owed" so a first-turn
+          // crash after the claim doesn't lose the task→topic backlink.
+          claimCommentPending: true,
+        });
         taskRootJustClaimed = this.deps.taskHandleClaimGuidLookup
           ? this.deps.taskHandleClaimGuidLookup(threadId) === guid
           : true;
@@ -2208,7 +2243,8 @@ export class BridgeHandler {
                 claimed: this.deps.taskHandleClaimGuidLookup
                   ? this.deps.taskHandleClaimGuidLookup(threadId) === taskRootInfo.guid
                   : (this.deps.taskHandleClaimedLookup?.(threadId) ?? false),
-                justClaimed: taskRootJustClaimed || undefined,
+                justClaimed:
+                  taskRootJustClaimed || this.deps.taskHandleClaimCommentPending?.(threadId) || undefined,
               }
             : undefined,
           mtimeFacts,
@@ -2990,6 +3026,11 @@ export class BridgeHandler {
       }
     } catch (err) {
       console.error("[bridge.handler] handleOne failed for thread", threadId, err);
+      // v4.2 round-2 fix: exception exits (spawn throw, pre-finalize throw)
+      // bypass the success-path outcome write — without this, a STALE
+      // "completed" from an earlier turn masks a peer whose post-mention turn
+      // died before finalize (handoff revision 5 degrades to the grace tier).
+      this.threadLastOutcome.set(threadId, "failed");
       // Close the COT bubble as errored. Fire-and-forget (same rationale as the
       // success path): the error teardown below — reaction removal, event log,
       // markUnhandled self-heal — must not wait on a best-effort COT call.

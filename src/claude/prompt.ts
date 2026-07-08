@@ -507,10 +507,12 @@ function renderTaskRootBlock(taskRoot: {
   if (taskRoot.claimed) {
     if (taskRoot.justClaimed) {
       lines.push(
-        "bridge 本轮已自动认领这个任务(机械绑定,不需要你再写 state.json 认领)。你现在要做两件事:" +
-          "① 发一条**认领评论**(lark-cli task comments create):一句认领声明" +
+        "bridge 已自动认领这个任务(机械绑定,不需要你再写 state.json 认领),但**认领评论还欠着**。" +
+          "本轮请:① 先读一遍该任务的现有评论(lark-cli task comments list)——已有**其他 agent** 的认领" +
+          "声明说明对方已接手,不要再发认领评论(重复评论=骚扰),配合干活即可;② 评论区没有别人认领 → " +
+          "发一条**认领评论**(lark-cli task comments create):一句认领声明" +
           `${taskRoot.topicLink ? " + 上面的 topic_link(用户点它直达本话题——任务→话题唯一回跳,别省略)" : ""};` +
-          "② 正常干活(任务标题/描述就是需求)。之后维护面只有任务评论(交付/失败/等拍板才发,过程碎碎念不发);" +
+          "③ 正常干活(任务标题/描述就是需求)。之后维护面只有任务评论(交付/失败/等拍板才发,过程碎碎念不发);" +
           "真正交付的那一轮在 state.json 的 task_handle 里声明 done: true 并发「已交付,看过请点完成」评论。" +
           "不要修改任务描述、不要勾完成/reopen——完成永远由人在任务中心点。",
       );
@@ -523,10 +525,11 @@ function renderTaskRootBlock(taskRoot: {
     }
   } else {
     lines.push(
-      "本轮请顺带静默认领,分两步:① 先读一遍该任务的现有评论(lark-cli task comments list)——如果已有" +
-        "**其他 agent** 的认领声明,说明同话题的另一个 bot 已接手,本轮不认领、不声张、正常回答即可" +
-        "(双 @ 竞态护栏:重复认领 = 双份维护 + 双份巡检骚扰);② 没有别人认领 → 把上面的 task_guid 写入" +
-        " state.json 的 task_handle.guid,并发一条认领评论(lark-cli task comments create),内容 = 一句认领声明" +
+      "bridge 未能自动认领这个任务——最常见的原因是它已被**另一个话题或另一个 agent** 认领(机械守卫拒绝" +
+        "重复认领),也可能是认领通道未接入。本轮请:① 先读一遍该任务的现有评论(lark-cli task comments list)" +
+        "——已有其他 agent 的认领声明 → 对方已接手,你只是被叫来协作:干好被 @ 来做的事,不要认领、不要重复" +
+        "发认领评论;② 评论区没有任何认领、且你判断该由你接手 → 把上面的 task_guid 写入 state.json 的" +
+        " task_handle.guid,并发一条认领评论(lark-cli task comments create),内容 = 一句认领声明" +
         `${taskRoot.topicLink ? " + 上面的 topic_link(用户点它直达本话题)" : ""}。` +
         "之后维护面只有任务评论(交付/失败/等拍板才发,过程碎碎念不发);不要修改任务描述、不要勾完成——完成永远由人点。",
     );

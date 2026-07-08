@@ -1614,3 +1614,43 @@ describe("StallDetector — peer failure re-arms the handoff tier (revision 5)",
     expect(enqueueNudgeTurn).not.toHaveBeenCalled();
   });
 });
+
+describe("StallDetector — due tier keeps a 24h cooldown floor (v4.2 round-2)", () => {
+  it("an overdue task under ACTIVE work is nudged at most once per 24h even with the 1h default cooldown", async () => {
+    const store = await TaskHandleStore.load(join(dir, "task-handles.json"));
+    const t0 = Date.now();
+    await store.put({ threadId: "t1", taskGuid: "g1", chatId: "oc_1", claimedTs: t0 });
+    const { requester } = makeFakeRequester({ g1: { guid: "g1", summary: "任务A" } });
+    const client = new TaskListClient(requester);
+    const enqueueNudgeTurn = vi.fn();
+    let lastActiveTs = t0;
+    const detector = new StallDetector(
+      {
+        store, client,
+        getLastActiveTs: () => lastActiveTs,
+        enqueueNudgeTurn,
+        getTaskDueMs: () => t0 - 1, // already past due
+      },
+      { stallThresholdMs: DAY }, // cooldown left at the 1h default
+    );
+
+    vi.setSystemTime(t0 + 60_000);
+    await detector.pollOnceForTest(); // due nudge #1
+    expect(enqueueNudgeTurn).toHaveBeenCalledTimes(1);
+
+    lastActiveTs = t0 + 10 * 60_000; // nudge confirmed
+    vi.setSystemTime(t0 + 20 * 60_000);
+    await detector.pollOnceForTest(); // confirmation pass
+
+    lastActiveTs = t0 + 30 * 60_000; // REAL progress (active work continues)
+    vi.setSystemTime(t0 + 2 * HOUR); // 2h later — past the 1h shared cooldown
+    await detector.pollOnceForTest(); // progress reset (count→0, anchor kept)
+    await detector.pollOnceForTest(); // would re-nudge if only the 1h cooldown gated
+
+    expect(enqueueNudgeTurn).toHaveBeenCalledTimes(1); // 24h due floor held
+
+    vi.setSystemTime(t0 + 25 * HOUR); // past the 24h floor
+    await detector.pollOnceForTest();
+    expect(enqueueNudgeTurn).toHaveBeenCalledTimes(2);
+  });
+});

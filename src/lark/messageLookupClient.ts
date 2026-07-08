@@ -98,6 +98,18 @@ export class ChannelMessageLookupClient implements MessageLookupClient {
       const cached = this.#cache.get(messageId);
       if (cached) return cached;
     }
+    // v4.2 round-2 (review finding): a single transient blip on this probe
+    // used to silently disable the WHOLE dispatch flow for that turn (no
+    // <task-root>, no auto-claim, patrol blind until a human re-@) — one
+    // in-line retry recovers the common transient case. Still best-effort:
+    // a second failure returns undefined as before (documented residual gap;
+    // a later @ on the same thread re-probes and self-heals).
+    const first = await this.#getOnce(messageId);
+    if (first) return first;
+    return this.#getOnce(messageId);
+  }
+
+  async #getOnce(messageId: string): Promise<MessageInfo | undefined> {
     try {
       const channel = this.#resolveChannel();
       if (!channel) return undefined;

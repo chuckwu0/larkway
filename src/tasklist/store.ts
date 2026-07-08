@@ -126,6 +126,14 @@ export interface TaskHandleRecord {
    * comment-mode analog of the full-mode auto-reopen).
    */
   doneDeclared?: boolean;
+  /**
+   * v4.2 round-2: the comment-mode claim was created by the bridge auto-claim
+   * and the agent has not yet had a SUCCESSFUL turn to post the user-facing
+   * claim comment (the task→topic backlink). While true, every turn's
+   * <task-root> keeps instructing the agent to post it; cleared by
+   * writeback's comment-mode "completed" branch.
+   */
+  claimCommentPending?: boolean;
 }
 
 interface StoreFile {
@@ -161,7 +169,8 @@ function isTaskHandleRecord(value: unknown): value is TaskHandleRecord {
       (Array.isArray(v["lastTurnMentions"]) && v["lastTurnMentions"].every((m) => typeof m === "string"))) &&
     (v["lastTurnMentionsAt"] === undefined || typeof v["lastTurnMentionsAt"] === "number") &&
     (v["mode"] === undefined || v["mode"] === "comment") &&
-    (v["doneDeclared"] === undefined || typeof v["doneDeclared"] === "boolean")
+    (v["doneDeclared"] === undefined || typeof v["doneDeclared"] === "boolean") &&
+    (v["claimCommentPending"] === undefined || typeof v["claimCommentPending"] === "boolean")
   );
 }
 
@@ -384,6 +393,8 @@ export class TaskHandleStore {
     onlyIfThreadUnclaimed?: boolean;
     /** v4 任务派单 — see TaskHandleRecord.mode. Recorded on a NEW claim only; a same-guid re-declaration keeps the original record untouched. */
     mode?: "comment";
+    /** v4.2 round-2 — see TaskHandleRecord.claimCommentPending. Recorded on a NEW claim only. */
+    claimCommentPending?: boolean;
   }): Promise<{ claimed: boolean; reason?: string }> {
     let claimed = false;
     let reason: string | undefined;
@@ -420,6 +431,7 @@ export class TaskHandleStore {
         chatId: input.chatId,
         claimedTs: Date.now(),
         ...(input.mode ? { mode: input.mode } : {}),
+        ...(input.claimCommentPending ? { claimCommentPending: true } : {}),
       };
     });
     return { claimed, reason };

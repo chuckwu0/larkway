@@ -1086,7 +1086,10 @@ describe("renderPrompt — <task-root> supersedes <task-handle> (adversarial-rev
       makeInput({ botName: "Frontend", taskRoot: { guid: "g", summary: "x", claimed: false } }),
     );
     expect(prompt).toContain("comments list");
-    expect(prompt).toContain("不认领");
+    expect(prompt).toContain("不要认领");
+    // v4.2 round-2: claimed:no now primarily means the bridge auto-claim was
+    // REJECTED (task owned by another thread/agent) — cooperate, don't fight.
+    expect(prompt).toContain("未能自动认领");
   });
 });
 

@@ -317,6 +317,10 @@ export async function applyTaskHandleWriteback(
                   // user-facing artifact; bridge just stops patrolling the
                   // "delivered, human hasn't ticked complete yet" window.
                   ...(patch.agentDeclaredDone === true ? { doneDeclared: true } : {}),
+                  // v4.2 round-2: a successfully completed turn ran under a
+                  // <task-root> that instructed the claim comment — consider
+                  // the backlink posted; only crashed turns keep it owed.
+                  claimCommentPending: undefined,
                 }
               : current,
           );

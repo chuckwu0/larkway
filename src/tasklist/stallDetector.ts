@@ -311,6 +311,13 @@ const DEFAULT_STALL_THRESHOLD_MS = 60 * 60_000; // 1h — general "topic went qu
 const DEFAULT_STALL_FAST_THRESHOLD_MS = 30 * 60_000; // 30min — last turn crashed
 const DEFAULT_STALL_HANDOFF_THRESHOLD_MS = 5 * 60_000; // 5min — mentioned peer hasn't received the event (v3.2 revision 1: 300s gap-fill cycle + one patrol-tick buffer)
 const DEFAULT_NUDGE_COOLDOWN_MS = 60 * 60_000; // 1h — see the threshold comment above
+// v4.2 round-2 fix: the due tier is a STANDING condition (threshold 0, never
+// suppressed by activity — §14.2), so the shared cooldown is its ONLY brake.
+// Dropping the shared default to 1h silently re-calibrated the §14.2-P0
+// invariant 24×: an overdue task under active work would get a due-nudge turn
+// every hour, forever. The due tier therefore keeps its own floor at the old
+// 24h — "you're past due" is a once-a-day reminder, not an hourly alarm.
+const DUE_NUDGE_COOLDOWN_FLOOR_MS = 24 * 60 * 60_000;
 const DEFAULT_ESCALATE_AFTER_NUDGES = 2;
 /** How long a nudge can sit "pending" (enqueued, unconfirmed) before being treated as lost — see the module doc's fix #3. Generous relative to a normal turn's duration, short relative to the 24h cooldown. Not exposed via bot yaml — an implementation detail of delivery confirmation, not a product-facing threshold. */
 const DEFAULT_PENDING_CONFIRM_TIMEOUT_MS = 30 * 60_000;
@@ -415,13 +422,13 @@ export interface StallDetectorOptions {
   intervalMs?: number;
   /** First-run jitter cap, clamped to intervalMs. @default 10_000 */
   jitterMs?: number;
-  /** @default 24h */
+  /** @default 1h (v4.2; was 24h through v4.1) */
   stallThresholdMs?: number;
   /** @default 30min */
   stallFastThresholdMs?: number;
   /** @default 5min. v3.2 交接断链检测 — see the module doc's revision 1 section for the gap-fill-cycle floor reasoning; docs/task-handle.md §13 has the operator-facing warning. */
   stallHandoffThresholdMs?: number;
-  /** @default 24h */
+  /** @default 1h (v4.2; was 24h). The due tier keeps a 24h floor regardless — see DUE_NUDGE_COOLDOWN_FLOOR_MS. */
   nudgeCooldownMs?: number;
   /** @default 2 */
   escalateAfterNudges?: number;
@@ -701,7 +708,7 @@ export class StallDetector {
         reason === "due" &&
         !justClearedPendingTimeout &&
         nudge?.lastNudgeSentAt !== undefined &&
-        now - nudge.lastNudgeSentAt < this.#nudgeCooldownMs
+        now - nudge.lastNudgeSentAt < this.#cooldownFor(reason)
       ) {
         return;
       }
@@ -738,7 +745,7 @@ export class StallDetector {
 
     // No progress since the confirmed nudge. NOW gate the actual action by
     // cooldown (module doc fix #1) — observation above never waits on this.
-    if (now - nudge.lastNudgeSentAt < this.#nudgeCooldownMs) return;
+    if (now - nudge.lastNudgeSentAt < this.#cooldownFor(reason)) return;
 
     if (nudge.count >= this.#escalateAfterNudges) {
       await this.#escalate(threadId);
@@ -779,6 +786,11 @@ export class StallDetector {
    * until gap-fill has had a chance to redeliver anything in flight across
    * a restart.
    */
+  /** Cooldown for a given tier — the due tier keeps a 24h floor (see DUE_NUDGE_COOLDOWN_FLOOR_MS). An explicit operator nudgeCooldownMs LONGER than the floor still wins. */
+  #cooldownFor(reason: "due" | "handoff" | "failed" | "normal"): number {
+    return reason === "due" ? Math.max(this.#nudgeCooldownMs, DUE_NUDGE_COOLDOWN_FLOOR_MS) : this.#nudgeCooldownMs;
+  }
+
   #effectiveThreshold(
     record: TaskHandleRecord,
     threadId: string,

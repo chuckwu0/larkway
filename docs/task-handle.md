@@ -117,7 +117,7 @@ taskHandle:
   # 以下 v3.1 停滞检测字段全部可选,不配就用括号里的默认值(见 §12):
   # stallThresholdMs: 3600000         # 1h(v4.2 起;v4.1 及以前默认 24h)
   # stallFastThresholdMs: 1800000     # 30min(上一轮 turn 失败/崩溃时用这个)
-  # stallNudgeCooldownMs: 86400000    # 24h
+  # stallNudgeCooldownMs: 3600000     # 1h(v4.2 起;v4.1 及以前默认 24h。due 档无论如何保有 24h 冷却地板,防"过期+持续推进"变成每小时骚扰)
   # stallEscalateAfterNudges: 2
   # stallDetectionDisabled: false     # true = 彻底关闭停滞检测本身
 ```
@@ -348,7 +348,7 @@ CommentPoller 合成的任务评论 turn,还是本 feature自己发的唤醒 tur
 唤醒时注入的内容是**纯事实块**,没有任何"怎么办"的指令(判断留给 agent):
 
 ```
-[停滞提醒] 你认领的任务 "帮我修一下登录页" 已超过 24 小时没有新动态(第 1 次提醒)。请判断如何推进这项工作。
+[停滞提醒] 你认领的任务 "帮我修一下登录页" 已超过 1 小时没有新动态(第 1 次提醒)。请判断如何推进这项工作。
 ```
 
 `src/tasklist/stallDetector.ts` 的 `renderStallNudgeText` 是这段文本唯一的生成点。

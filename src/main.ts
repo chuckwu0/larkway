@@ -234,6 +234,14 @@ async function runV2Mode({
   // see stallDetector.ts's module doc for why that distinction matters under
   // this bridge's queued-concurrency model.
   const handlersByBotId = new Map<string, BridgeHandler>();
+  // v4.2 round-2 review (blocker fix): cross-bot claim visibility for the
+  // bridge auto-claim. TaskHandleStore is per-bot, so without this a peer bot
+  // @-ed inside a task topic (the STANDARD A→B handoff) would auto-claim the
+  // same task in its own store — double patrol, double comment relay, the
+  // exact 双份骚扰 red line. In-process only; simultaneous double-@ races and
+  // cross-bridge deployments remain documented residual gaps (the SKILL's
+  // comment-reading guard still covers duplicate claim COMMENTS).
+  const allTaskHandleStores: Array<{ botId: string; store: TaskHandleStore }> = [];
 
   // Task-handle v3 "候选注入": one TasklistPoller per UNIQUE tasklistGuid,
   // shared by every bot configured with that guid (see the construction loop
@@ -465,6 +473,8 @@ async function runV2Mode({
     let taskHandleClaim: ((patch: import("./tasklist/types.js").TaskHandleClaimPatch) => Promise<void>) | undefined;
     let taskHandleClaimedLookup: ((threadId: string) => boolean) | undefined;
     let taskHandleClaimGuidLookup: ((threadId: string) => string | undefined) | undefined;
+    let taskGuidClaimedByOtherBot: ((guid: string) => boolean) | undefined;
+    let taskHandleClaimCommentPending: ((threadId: string) => boolean) | undefined;
     let taskHandleCandidatesLookup: (() => readonly import("./tasklist/types.js").TaskCandidate[]) | undefined;
     let taskCommentPoller: CommentPoller | undefined;
     let stallDetector: StallDetector | undefined;
@@ -524,6 +534,7 @@ async function runV2Mode({
           effectiveTaskHandleTasklistGuid = guid;
         }
         const taskHandleStore = await TaskHandleStore.load(resolveTaskHandlesPath(bot.id));
+        allTaskHandleStores.push({ botId: bot.id, store: taskHandleStore });
         taskHandleLifecycle = (patch) => applyTaskHandleWriteback(patch, { store: taskHandleStore, client: taskListClient });
         // TaskHandleStore.claim() is idempotent on an unchanged guid (see its
         // doc comment) — this is what makes it safe for handler.ts to call
@@ -549,6 +560,9 @@ async function runV2Mode({
         // button only when this thread genuinely has no claim yet.
         taskHandleClaimedLookup = (threadId) => taskHandleStore.get(threadId) !== undefined;
         taskHandleClaimGuidLookup = (threadId) => taskHandleStore.get(threadId)?.taskGuid;
+        taskGuidClaimedByOtherBot = (guid) =>
+          allTaskHandleStores.some((e) => e.botId !== bot.id && e.store.list().some((r) => r.taskGuid === guid));
+        taskHandleClaimCommentPending = (threadId) => taskHandleStore.get(threadId)?.claimCommentPending === true;
         // Dedup group for the shared TasklistPoller (v3, 辅路径 only) — this
         // bot joins whichever group already exists for `guid` (first bot to
         // see it seeds the group's client; every later bot just adds itself so
@@ -838,6 +852,8 @@ async function runV2Mode({
       taskHandleClaim,
       taskHandleClaimedLookup,
       taskHandleClaimGuidLookup,
+      taskGuidClaimedByOtherBot,
+      taskHandleClaimCommentPending,
       taskHandleCandidatesLookup,
     });
     // v3.2 交接断链检测 (revision 2, docs/task-handle.md §13): register so
