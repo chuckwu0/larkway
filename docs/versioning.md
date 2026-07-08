@@ -49,7 +49,8 @@
 | v0.3.42 | v0.3.42 | patch / 已发布 | 任务派单话题落点终修:live 推送的引用回复不带 root_id(平台坑)——改用 root_id??parent_id 探测,命中任务卡片时话题开在卡片上且 session 重键到卡片 id,首次@/话题追问/评论指挥收敛同一 session |
 | v0.3.43 | v0.3.43 | patch / 已发布 | perf 批D: warm pool default-on + blank-standby prewarm (zero cold start for new threads) + gated message coalescing (queued same-session messages merge into one turn) |
 | v0.3.44 | v0.3.44 | patch / 已发布 | 巡检自恢复加固(完成率目标):bridge 自动认领(认领 turn 崩溃不再造成巡检盲区,含跨 bot 双认领守卫+认领评论欠账持久化);交接检测区分 peer 失败收尾(下游崩溃 5 分钟内唤醒重派);一般停滞档 24h→1h(due 档保 24h 冷却地板) |
-| v0.3.45 | v0.3.45 | 当前 patch / 已发布 | 看板 model 建议列表更新为当前 Claude 模型 ID(claude-sonnet-5/claude-opus-4-8/claude-fable-5),修复找不到 Sonnet 5 选项的问题 |
+| v0.3.45 | v0.3.45 | patch / 已发布 | 看板 model 建议列表更新为当前 Claude 模型 ID(claude-sonnet-5/claude-opus-4-8/claude-fable-5),修复找不到 Sonnet 5 选项的问题 |
+| v0.3.46 | v0.3.46 | 当前 patch / 已发布 | 看板模型选择改为常驻快选 chips(datalist 会按已填值过滤导致看起来选项丢失);CI 修复(doctor 的 lark-cli 探测不再让测试退出码依赖宿主机环境) |
 
 ## 使用原则
 
@@ -106,4 +107,5 @@ v0.3.42       = 任务派单话题落点终修:live 推送的引用回复不带 
 v0.3.43       = perf 批D: warm pool default-on + blank-standby prewarm (zero cold start for new threads) + gated message coalescing (queued same-session messages merge into one turn)
 v0.3.44       = 巡检自恢复加固(完成率目标):bridge 自动认领(认领 turn 崩溃不再造成巡检盲区,含跨 bot 双认领守卫+认领评论欠账持久化);交接检测区分 peer 失败收尾(下游崩溃 5 分钟内唤醒重派);一般停滞档 24h→1h(due 档保 24h 冷却地板)
 v0.3.45       = 看板 model 建议列表更新为当前 Claude 模型 ID(claude-sonnet-5/claude-opus-4-8/claude-fable-5),修复找不到 Sonnet 5 选项的问题
+v0.3.46       = 看板模型选择改为常驻快选 chips(datalist 会按已填值过滤导致看起来选项丢失);CI 修复(doctor 的 lark-cli 探测不再让测试退出码依赖宿主机环境)
 ```
