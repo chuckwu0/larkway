@@ -108,6 +108,14 @@ async function checkClaude(ctx: CliContext): Promise<CheckResult> {
  * 就会以晦涩的 spawn 错误失败在第一印象上 —— 所以这里是 error 不是 warn。
  */
 async function checkLarkCli(): Promise<CheckResult> {
+  // Test escape hatch, same precedent as LARKWAY_SKIP_WS_PROBE: unit tests
+  // must not spawn real subprocesses (CLAUDE.md), and this probe otherwise
+  // makes doctor's exit code depend on whether the HOST running the tests
+  // happens to have lark-cli installed — green on dev Macs, exit 2 on bare
+  // CI runners (the exact 11-test CI failure this gate fixes).
+  if (process.env.LARKWAY_SKIP_BINARY_PROBES === "1") {
+    return { id: "lark-cli-binary", label: "lark-cli", status: "ok", message: "探测已跳过(LARKWAY_SKIP_BINARY_PROBES=1)" };
+  }
   try {
     await execFileAsync("lark-cli", ["--version"], { timeout: 10_000 });
     return { id: "lark-cli-binary", label: "lark-cli", status: "ok" };

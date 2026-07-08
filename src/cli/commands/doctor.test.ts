@@ -71,12 +71,17 @@ beforeEach(async () => {
   // Skip real WS probe in unit tests — fake credentials can't reach Feishu.
   // The probe logic itself is exercised by ws-connectivity-specific tests below.
   process.env.LARKWAY_SKIP_WS_PROBE = "1";
+  // Skip real binary probes (lark-cli --version spawn) — unit tests must not
+  // spawn subprocesses, and the exit code must not depend on what the host
+  // running the tests has installed (dev Macs have lark-cli; CI runners don't).
+  process.env.LARKWAY_SKIP_BINARY_PROBES = "1";
 });
 
 afterEach(async () => {
   delete process.env.LARKWAY_BOTS_DIR;
   delete process.env.LARKWAY_HOME;
   delete process.env.LARKWAY_SKIP_WS_PROBE;
+  delete process.env.LARKWAY_SKIP_BINARY_PROBES;
   await rm(tmpRoot, { recursive: true, force: true });
 });
 
