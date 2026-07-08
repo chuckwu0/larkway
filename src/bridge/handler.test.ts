@@ -4630,4 +4630,19 @@ describe("handleOne — v4 task-share root probe", () => {
 
     expect(prompt()).toContain("open_thread_id=omt_live");
   });
+
+  it("REAL-WORLD shape (2026-07-08 dogfood): thread_id polluted with the root's om_* id is NOT a topic — retarget still fires", async () => {
+    // Regular-group quote replies (and gap-fill synthesis) carry
+    // thread_id === root_id (an om_* MESSAGE id). Treating that as
+    // "already in a topic" scattered replies inline and built a dead
+    // thread/open link from the om_* id.
+    const { lookup } = makeLookup({ msgType: "todo", content: TODO_CONTENT, threadId: "omt_real" });
+    const { startArgs, prompt } = await runOnce(makeQuoteReplyEvent({ thread_id: "om_root" }), lookup);
+
+    expect(startArgs[0]).toMatchObject({ messageId: "om_root", replyInThread: true });
+    expect(prompt()).toContain("<task-root>");
+    // deep link must come from the probe's omt_* id, never the om_* pollution
+    expect(prompt()).toContain("open_thread_id=omt_real");
+    expect(prompt()).not.toContain("open_thread_id=om_root");
+  });
 });

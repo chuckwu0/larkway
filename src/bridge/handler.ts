@@ -25,7 +25,7 @@ import type { InboundClient } from "../lark/transport.js";
 import type { CardRenderer } from "../lark/card.js";
 import type { SessionStore } from "../claude/sessionStore.js";
 import { parseMessage, parseTodoShareContent } from "../lark/message.js";
-import { buildTopicDeepLink, type MessageLookupClient } from "../lark/messageLookupClient.js";
+import { buildTopicDeepLink, realTopicThreadId, type MessageLookupClient } from "../lark/messageLookupClient.js";
 import { renderPrompt } from "../claude/prompt.js";
 import { remapPeersToLiveRoster, type LiveRosterResolver } from "../lark/rosterResolver.js";
 import type { PeerBot, RepoRef } from "../claude/prompt.js";
@@ -1218,7 +1218,16 @@ export class BridgeHandler {
     let deferredTaskRootProbe: Promise<import("../lark/messageLookupClient.js").MessageInfo | undefined> | undefined;
     {
       const rootId = typeof parsed.raw.root_id === "string" && parsed.raw.root_id ? parsed.raw.root_id : undefined;
-      const rawThreadId = typeof parsed.raw.thread_id === "string" && parsed.raw.thread_id ? parsed.raw.thread_id : undefined;
+      // Real-deployment fix (2026-07-08 dogfood): a quote-reply event in a
+      // regular group can arrive with `thread_id` set to the ROOT MESSAGE's
+      // om_* id (platform/SDK reply-chain normalization; gap-fill's
+      // channelMsgToLarkEvent does the same on purpose) — that is NOT a
+      // topic. Feishu topic ids are omt_*; only those count as "already
+      // inside a thread". Treating the om_* case as in-thread skipped the
+      // retarget (replies scattered inline instead of opening the topic on
+      // the task card) AND produced a thread/open deep link built from an
+      // om_* id, which the client cannot open at all.
+      const rawThreadId = realTopicThreadId(parsed.raw.thread_id);
       if (rootId && this.deps.messageLookup) {
         const probe = this.deps.messageLookup.get(rootId).catch(() => undefined);
         if (rawThreadId) {
@@ -1230,10 +1239,11 @@ export class BridgeHandler {
           if (info?.msgType === "todo" && info.content) {
             const todo = parseTodoShareContent(info.content);
             if (todo) {
+              const probeThreadId = realTopicThreadId(info.threadId);
               taskRootInfo = {
                 guid: todo.taskGuid,
                 summary: todo.summaryText,
-                topicLink: info.threadId ? buildTopicDeepLink(parsed.chatId, info.threadId) : undefined,
+                topicLink: probeThreadId ? buildTopicDeepLink(parsed.chatId, probeThreadId) : undefined,
               };
               replyInThread = true;
               replyAnchorId = rootId;
@@ -1400,10 +1410,10 @@ export class BridgeHandler {
           inputPreview: parsed.text,
           target: {
             chatId: parsed.chatId,
-            threadId:
-              typeof parsed.raw.thread_id === "string" && parsed.raw.thread_id
-                ? parsed.raw.thread_id
-                : undefined,
+            // omt_* only (see realTopicThreadId): passing a reply-chain om_*
+            // id as receive_id_type=thread_id anchored the COT bubble onto a
+            // stray thread on the TRIGGER message (2026-07-08 dogfood).
+            threadId: realTopicThreadId(parsed.raw.thread_id),
             originMessageId,
           },
         });
@@ -1951,15 +1961,18 @@ export class BridgeHandler {
           if (info?.msgType === "todo" && info.content) {
             const todo = parseTodoShareContent(info.content);
             if (todo) {
-              const rawThreadId =
-                typeof parsed.raw.thread_id === "string" && parsed.raw.thread_id ? parsed.raw.thread_id : undefined;
+              // omt_* only on BOTH sources (realTopicThreadId + the probe's
+              // own threadId field) — a thread/open link built from an om_*
+              // id is dead on click (2026-07-08 dogfood).
+              const rawThreadId = realTopicThreadId(parsed.raw.thread_id);
+              const probeThreadId = realTopicThreadId(info.threadId);
               taskRootInfo = {
                 guid: todo.taskGuid,
                 summary: todo.summaryText,
                 topicLink: rawThreadId
                   ? buildTopicDeepLink(parsed.chatId, rawThreadId)
-                  : info.threadId
-                    ? buildTopicDeepLink(parsed.chatId, info.threadId)
+                  : probeThreadId
+                    ? buildTopicDeepLink(parsed.chatId, probeThreadId)
                     : undefined,
               };
             }
@@ -1971,8 +1984,9 @@ export class BridgeHandler {
         // link the agent pastes into its claim comment. Best-effort.
         if (taskRootInfo && !taskRootInfo.topicLink && replyAnchorId !== messageId && this.deps.messageLookup) {
           const refreshed = await this.deps.messageLookup.get(replyAnchorId, { refresh: true }).catch(() => undefined);
-          if (refreshed?.threadId) {
-            taskRootInfo.topicLink = buildTopicDeepLink(parsed.chatId, refreshed.threadId);
+          const refreshedThreadId = realTopicThreadId(refreshed?.threadId);
+          if (refreshedThreadId) {
+            taskRootInfo.topicLink = buildTopicDeepLink(parsed.chatId, refreshedThreadId);
           }
         }
 

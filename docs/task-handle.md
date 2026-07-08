@@ -281,6 +281,7 @@ bot 的 APP 身份建一个新清单:
 15. **话题级深链可程序化构造**(2026-07-07 真机点击验证;修正第 1 条的适用范围):`https://applink.feishu.cn/client/thread/open?open_chat_id=<chat_id>&open_thread_id=<thread_id>&openchatid=<chat_id>&openthreadid=<thread_id>&thread_position=-1` —— 只需 chat_id + thread_id(bridge/agent 天然都有),点击直接进入话题。第 1 条"程序化上限=群级"的结论**仅对消息级 `message/link/open?token=` 深链仍然成立**(那个 token 仍不可造)。
 16. **群内消息定位链接**:`client/chat/open?openChatId=<chat_id>&position=<N>` 真机实测能定位到群里第 N 条消息附近——适合给**还没有话题**的消息做兜底回跳(有话题一律用第 15 条)。position 值可从 lark-cli 消息列表的 `message_app_link` 字段现成拿到;如何在 bridge 侧廉价计算未调研(主路径用不到)。
 17. **任务评论里的裸 URL 在任务 UI 渲染为可点击链接**(真机实测)——评论可以承载回跳链接,这让「仅分享进群」的降级模式(只有评论可写)也能提供回跳。
+18. **普通群引用回复的事件 `thread_id` 可能 = 根消息的 om_\* id,不是话题**(2026-07-08 真机 dogfood,v0.3.41 修复依据):对任务卡片引用回复 @ bot,实时事件带 `thread_id` 且值为**根消息自己的 om\_ 消息 id**(回复链归一化;larkway 的 gap-fill 合成事件也有意做同样的 thread_id=root_id 填充)。**真话题 id 一定是 omt\_ 前缀**;om\_ 值不是话题——误当话题会跳过 §15.4 的改锚(回复散落平铺、COT 在触发消息上开出杂话题),且拿它拼 `thread/open` 深链**点击完全无效**。铁律:所有"这条消息在哪个话题里"的判断必须收敛过 `realTopicThreadId`(omt\_ 前缀窄化,`lark/messageLookupClient.ts`)。
 
 ## 10. 开源定位与路线
 

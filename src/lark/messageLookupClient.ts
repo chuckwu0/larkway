@@ -47,6 +47,21 @@ export function buildTopicDeepLink(chatId: string, threadId: string): string {
   return `https://applink.feishu.cn/client/thread/open?open_chat_id=${c}&open_thread_id=${t}&openchatid=${c}&openthreadid=${t}&thread_position=-1`;
 }
 
+/**
+ * Narrow an event's `thread_id` field to a REAL Feishu topic id (omt_*), or
+ * undefined. Real-deployment fact (2026-07-08 dogfood): quote-reply events in
+ * regular groups can carry `thread_id` = the root MESSAGE's om_* id
+ * (platform/SDK reply-chain normalization; larkway's own gap-fill synthesis
+ * sets thread_id=root_id by design too). An om_* value is NOT a topic:
+ * treating it as one suppresses the v4 task-card retarget, and feeding it to
+ * {@link buildTopicDeepLink} produces a link the client cannot open. Every
+ * consumer of raw thread_id that means "the topic this message lives in"
+ * must go through this narrowing.
+ */
+export function realTopicThreadId(threadId: unknown): string | undefined {
+  return typeof threadId === "string" && threadId.startsWith("omt_") ? threadId : undefined;
+}
+
 const LOOKUP_TIMEOUT_MS = 5_000;
 /** FIFO cache cap — enough for every live thread root without unbounded growth. */
 const CACHE_MAX = 200;
