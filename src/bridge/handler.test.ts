@@ -4623,6 +4623,53 @@ describe("handleOne — v4 task-share root probe", () => {
     expect(runOpts?.prompt ?? "").toContain("task_root_claimed: no");
   });
 
+  it("v4.2 auto-claim: the bridge claims (mode=comment) BEFORE the agent runs; prompt says justClaimed", async () => {
+    let runOpts: { prompt?: string } | undefined;
+    const claimCalls: Array<Record<string, unknown>> = [];
+    let claimed = false;
+    runClaudeImpl = (opts: unknown) => {
+      runOpts = opts as { prompt?: string };
+      // the claim must ALREADY be recorded when the runner spawns
+      expect(claimCalls.length).toBe(1);
+      return {
+        events: (async function* () {
+          yield { type: "system_init", sessionId: "sess_ac", raw: {} };
+        })(),
+        done: Promise.resolve({ exitCode: 0, sessionId: "sess_ac" }),
+        kill: () => {},
+      };
+    };
+    const { renderer, whenFinalized } = makeCardRenderer();
+    const { store } = makeSessionStore();
+    const { client } = makeClient(makeQuoteReplyEvent());
+    await seedRepoCachePath();
+    const { lookup } = makeLookup({ msgType: "todo", content: TODO_CONTENT, threadId: "omt_x1" });
+    const handler = new BridgeHandler({
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      client: client as any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      cardRenderer: renderer as any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      sessionStore: store as any,
+      conventions: makeConventions(),
+      botConfig: { id: "frontend", name: "Frontend", turn_taking_limit: 10, backend: "claude" },
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      messageLookup: lookup as any,
+      taskHandleClaim: async (patch) => {
+        claimCalls.push(patch as unknown as Record<string, unknown>);
+        claimed = true;
+      },
+      taskHandleClaimGuidLookup: () => (claimed ? "g-42" : undefined),
+    });
+    await handler.run();
+    await whenFinalized;
+
+    expect(claimCalls.length).toBe(1);
+    expect(claimCalls[0]).toMatchObject({ taskGuid: "g-42", threadId: "om_root", mode: "comment" });
+    expect(runOpts?.prompt ?? "").toContain("task_root_claimed: yes");
+    expect(runOpts?.prompt ?? "").toContain("已自动认领");
+  });
+
   it("in-thread turn carries the topic deep link built from the event's own thread_id (not the probe cache)", async () => {
     // probe result deliberately has NO threadId (pre-topic cached shape)
     const { lookup } = makeLookup({ msgType: "todo", content: TODO_CONTENT });
@@ -4949,5 +4996,74 @@ describe("run() gated coalescing — drain, merged prompt, shared settle (批D)"
     await handler.whenAllTurnsSettled();
     expect(acked).toContain("om_q1");
     expect(acked).toContain("om_q2");
+  });
+});
+
+describe("handleOne — v4.2 round-2 auto-claim guards", () => {
+  const TODO_CONTENT = JSON.stringify({
+    task_id: "g-42",
+    summary: { title: "", content: [[{ tag: "text", text: "修复登录页" }]] },
+    due_time: "0",
+  });
+  function makeQuoteReplyEvent(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+    return {
+      message_id: "om_msg2",
+      chat_id: "oc_chat",
+      chat_type: "group",
+      root_id: "om_root",
+      sender_id: "ou_sender",
+      content: JSON.stringify({ text: "去干" }),
+      create_time: "1700000000000",
+      ...overrides,
+    };
+  }
+  function makeLookup(info: { msgType?: string; content?: string; threadId?: string } | undefined) {
+    const calls: Array<{ messageId: string; refresh?: boolean }> = [];
+    return {
+      calls,
+      lookup: {
+        get: async (messageId: string, opts?: { refresh?: boolean }) => {
+          calls.push({ messageId, refresh: opts?.refresh });
+          return info;
+        },
+      },
+    };
+  }
+
+  it("does NOT auto-claim when another bot in this process already owns the task guid (A→B handoff)", async () => {
+    const claimCalls: unknown[] = [];
+    runClaudeImpl = () => ({
+      events: (async function* () {
+        yield { type: "system_init", sessionId: "sess_b", raw: {} };
+      })(),
+      done: Promise.resolve({ exitCode: 0, sessionId: "sess_b" }),
+      kill: () => {},
+    });
+    const { renderer, whenFinalized } = makeCardRenderer();
+    const { store } = makeSessionStore();
+    const { client } = makeClient(makeQuoteReplyEvent({ thread_id: "omt_x1" })); // B is @-ed INSIDE the topic
+    await seedRepoCachePath();
+    const { lookup } = makeLookup({ msgType: "todo", content: TODO_CONTENT, threadId: "omt_x1" });
+    const handler = new BridgeHandler({
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      client: client as any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      cardRenderer: renderer as any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      sessionStore: store as any,
+      conventions: makeConventions(),
+      botConfig: { id: "peer-b", name: "PeerB", turn_taking_limit: 10, backend: "claude" },
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      messageLookup: lookup as any,
+      taskHandleClaim: async (patch) => {
+        claimCalls.push(patch);
+      },
+      taskHandleClaimGuidLookup: () => undefined, // B's own store is empty
+      taskGuidClaimedByOtherBot: (guid) => guid === "g-42", // A already claimed it
+    });
+    await handler.run();
+    await whenFinalized;
+
+    expect(claimCalls.length).toBe(0);
   });
 });

@@ -115,9 +115,9 @@
 taskHandle:
   tasklistGuid: "..."      # owner 的「Agent Team」清单;同一 owner 的一组 bot 填同一个 guid
   # 以下 v3.1 停滞检测字段全部可选,不配就用括号里的默认值(见 §12):
-  # stallThresholdMs: 86400000        # 24h
+  # stallThresholdMs: 3600000         # 1h(v4.2 起;v4.1 及以前默认 24h)
   # stallFastThresholdMs: 1800000     # 30min(上一轮 turn 失败/崩溃时用这个)
-  # stallNudgeCooldownMs: 86400000    # 24h
+  # stallNudgeCooldownMs: 3600000     # 1h(v4.2 起;v4.1 及以前默认 24h。due 档无论如何保有 24h 冷却地板,防"过期+持续推进"变成每小时骚扰)
   # stallEscalateAfterNudges: 2
   # stallDetectionDisabled: false     # true = 彻底关闭停滞检测本身
 ```
@@ -348,7 +348,7 @@ CommentPoller 合成的任务评论 turn,还是本 feature自己发的唤醒 tur
 唤醒时注入的内容是**纯事实块**,没有任何"怎么办"的指令(判断留给 agent):
 
 ```
-[停滞提醒] 你认领的任务 "帮我修一下登录页" 已超过 24 小时没有新动态(第 1 次提醒)。请判断如何推进这项工作。
+[停滞提醒] 你认领的任务 "帮我修一下登录页" 已超过 1 小时没有新动态(第 1 次提醒)。请判断如何推进这项工作。
 ```
 
 `src/tasklist/stallDetector.ts` 的 `renderStallNudgeText` 是这段文本唯一的生成点。
@@ -641,6 +641,15 @@ pendingSince 之后被这个 bridge 收到过(即真进了队列),就延长等�
 修复:只有 `addComment` 真正成功才置 `escalated: true`;失败则保持 `escalated: false`(带指数退避
 重试,镜像 `#fetchTaskOrHandle` 的权限退避写法),下一轮符合条件时重试,直到评论真的发出去。
 
+#### 修订 5(2026-07-08,真实事故:派单下游被 idle-kill,巡检 24h 不闻不问)
+
+「对方跑完过一轮」不能不分结局:peer 的一轮以 **failed** 收尾(崩溃/idle-kill/API 流卡死)时,
+交接根本没有成功——修订 3/4 的"完成证据解除"会把它误判为已接手,任务掉进一般档。修法:
+StallDetector 新增 `getPeerLastTurnOutcome`(读 peer handler 的内存 finalize 结局,与
+`getThreadReceivedAt` 同族),per-peer 检查置于三档之前:**peer 结局=failed 且收尾时间晚于
+mention → 立即判定断链**(用交接档地板),收妥宽限和完成证据都不得解除。内存态,重启后 outcome
+未知 → 回退修订 4 的保守姿态(完成证据解除),与既有重启哲学一致。
+
 ### 13.5 配置
 
 ```yaml
@@ -818,6 +827,15 @@ taskHandle:
 > 一个状态,**人看到干完了自己点完成**是最可靠的完成语义;③ 权限连锁红利:改描述/勾完成是仅有的
 > 需要清单 editor 权限的动作,砍掉后整个主路径只需要「任务被分享到 bot 所在群」就权限齐备
 > (读+评论,§9.14)——**清单和 `tasklist-init` 对主路径彻底不再需要,零配置**。
+>
+> **v4.2 修订(2026-07-08,完成率目标 / 巡检自恢复 review 的产物)**:**认领由 bridge 自动完成**。
+> 真实事故:认领 turn 本身崩溃(claude exit 1)→ claim 从未落库 → 巡检对这个任务永久失明——而主
+> 路径的绑定是机械确定的(probe 已匹配任务卡片、guid 在手),把认领留给 agent 的 state 声明是沿袭
+> 辅路径模糊匹配的惯性。修法:probe 命中即 bridge 直接 claim(mode=comment,在 agent spawn **之前**),
+> 与 v3「精确匹配自动绑定」同一宪章(确定性匹配=机械动作,非业务判断);首轮崩溃后 claim 仍在,
+> 30 分钟快档自动唤醒重试,链条最前端从此闭环。agent 只负责认领**评论**(带 topic_link)和干活;
+> `<task-root>` 用 justClaimed 标记提示"本轮补发认领评论"。配套:交接解除区分 peer 收尾结局
+> (§13 修订 5),一般停滞档默认 24h→**1h**、唤醒冷却同步 24h→1h(§12,按 §14 的误报不对称原则)。
 
 ### 15.1 用户旅程(主路径)
 

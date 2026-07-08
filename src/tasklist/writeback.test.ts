@@ -634,3 +634,36 @@ describe("applyTaskHandleWriteback — comment-mode claims (v4 任务派单)", (
     expect(calls.filter((c) => c.config.method === "PATCH").length).toBe(2);
   });
 });
+
+describe("applyTaskHandleWriteback — claimCommentPending (v4.2 round-2)", () => {
+  it("comment-mode completed clears claimCommentPending (backlink comment considered posted)", async () => {
+    const store = await TaskHandleStore.load(join(dir, "task-handles.json"));
+    await store.put({
+      threadId: "t1", taskGuid: "guid-1", chatId: "oc_1", claimedTs: 1,
+      mode: "comment", claimCommentPending: true,
+    });
+    const { requester } = makeFakeRequester({ task: {} });
+    const client = new TaskListClient(requester);
+
+    await applyTaskHandleWriteback({ botId: "b1", threadId: "t1", status: "completed" }, { store, client });
+
+    expect(store.get("t1")?.claimCommentPending).toBeUndefined();
+  });
+
+  it("comment-mode FAILED keeps claimCommentPending (backlink still owed after a crash)", async () => {
+    const store = await TaskHandleStore.load(join(dir, "task-handles.json"));
+    await store.put({
+      threadId: "t1", taskGuid: "guid-1", chatId: "oc_1", claimedTs: 1,
+      mode: "comment", claimCommentPending: true,
+    });
+    const { requester } = makeFakeRequester({ task: {} });
+    const client = new TaskListClient(requester);
+
+    await applyTaskHandleWriteback(
+      { botId: "b1", threadId: "t1", status: "failed", failureReason: "崩溃" },
+      { store, client },
+    );
+
+    expect(store.get("t1")?.claimCommentPending).toBe(true);
+  });
+});

@@ -1086,7 +1086,10 @@ describe("renderPrompt — <task-root> supersedes <task-handle> (adversarial-rev
       makeInput({ botName: "Frontend", taskRoot: { guid: "g", summary: "x", claimed: false } }),
     );
     expect(prompt).toContain("comments list");
-    expect(prompt).toContain("不认领");
+    expect(prompt).toContain("不要认领");
+    // v4.2 round-2: claimed:no now primarily means the bridge auto-claim was
+    // REJECTED (task owned by another thread/agent) — cooperate, don't fight.
+    expect(prompt).toContain("未能自动认领");
   });
 });
 
@@ -1116,5 +1119,27 @@ describe("renderPrompt — queuedFollowups (批D)", () => {
     const withEmpty = await renderPrompt(makeInput({ queuedFollowups: [] }));
     expect(withEmpty).toBe(without);
     expect(without).not.toContain("追加消息");
+  });
+});
+
+describe("renderPrompt — <task-root> justClaimed (v4.2 bridge auto-claim)", () => {
+  it("claimed + justClaimed: instructs the agent to post the claim comment with the topic link", async () => {
+    const prompt = await renderPrompt(
+      makeInput({
+        botName: "Frontend",
+        taskRoot: { guid: "g", summary: "x", topicLink: "https://applink.feishu.cn/client/thread/open?x=1", claimed: true, justClaimed: true },
+      }),
+    );
+    expect(prompt).toContain("已自动认领");
+    expect(prompt).toContain("认领评论");
+    expect(prompt).toContain("topic_link");
+  });
+
+  it("claimed without justClaimed: maintenance wording only, no claim-comment instruction", async () => {
+    const prompt = await renderPrompt(
+      makeInput({ botName: "Frontend", taskRoot: { guid: "g", summary: "x", claimed: true } }),
+    );
+    expect(prompt).toContain("本话题已认领这个任务");
+    expect(prompt).not.toContain("已自动认领");
   });
 });

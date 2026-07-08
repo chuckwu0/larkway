@@ -90,6 +90,10 @@ export interface TaskHandleClaimPatch {
    * Absent = the v1–v3 辅路径 (话题转任务) full-maintenance behavior.
    */
   mode?: "comment";
+  /** v4.2 round-2: forwarded to TaskHandleStore.claim — the mechanical auto-claim must never replace an existing different-guid claim. */
+  onlyIfThreadUnclaimed?: boolean;
+  /** v4.2 round-2: record that the user-facing claim comment (task→topic backlink) is still owed — cleared by writeback on the first successfully completed turn. */
+  claimCommentPending?: boolean;
 }
 
 /**

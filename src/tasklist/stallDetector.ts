@@ -301,10 +301,23 @@ import { mergeDescriptionSnapshot } from "./writeback.js";
 
 const DEFAULT_INTERVAL_MS = 60_000;
 const DEFAULT_JITTER_MS = 10_000;
-const DEFAULT_STALL_THRESHOLD_MS = 24 * 60 * 60_000; // 24h
+// v4.2 (docs/task-handle.md §12, patrol-recovery hardening): the general
+// threshold dropped 24h → 1h. 24h was calibrated for the human-paced 转任务
+// era; 任务派单 tasks are hour-scale, and the user's own patrol principle
+// (docs/task-handle.md §14 preamble) is explicitly asymmetric — a false nudge
+// costs one cheap agent turn, a missed dead task costs the task. Cooldown
+// follows (24h → 1h) or the shorter threshold would only ever fire once.
+const DEFAULT_STALL_THRESHOLD_MS = 60 * 60_000; // 1h — general "topic went quiet"
 const DEFAULT_STALL_FAST_THRESHOLD_MS = 30 * 60_000; // 30min — last turn crashed
 const DEFAULT_STALL_HANDOFF_THRESHOLD_MS = 5 * 60_000; // 5min — mentioned peer hasn't received the event (v3.2 revision 1: 300s gap-fill cycle + one patrol-tick buffer)
-const DEFAULT_NUDGE_COOLDOWN_MS = 24 * 60 * 60_000; // 24h
+const DEFAULT_NUDGE_COOLDOWN_MS = 60 * 60_000; // 1h — see the threshold comment above
+// v4.2 round-2 fix: the due tier is a STANDING condition (threshold 0, never
+// suppressed by activity — §14.2), so the shared cooldown is its ONLY brake.
+// Dropping the shared default to 1h silently re-calibrated the §14.2-P0
+// invariant 24×: an overdue task under active work would get a due-nudge turn
+// every hour, forever. The due tier therefore keeps its own floor at the old
+// 24h — "you're past due" is a once-a-day reminder, not an hourly alarm.
+const DUE_NUDGE_COOLDOWN_FLOOR_MS = 24 * 60 * 60_000;
 const DEFAULT_ESCALATE_AFTER_NUDGES = 2;
 /** How long a nudge can sit "pending" (enqueued, unconfirmed) before being treated as lost — see the module doc's fix #3. Generous relative to a normal turn's duration, short relative to the 24h cooldown. Not exposed via bot yaml — an implementation detail of delivery confirmation, not a product-facing threshold. */
 const DEFAULT_PENDING_CONFIRM_TIMEOUT_MS = 30 * 60_000;
@@ -366,6 +379,18 @@ export interface StallDetectorDeps {
    */
   getPeerLastActiveTs?: (peerBotId: string, threadId: string) => number | undefined;
   /**
+   * v4.2 (revision 5, 2026-07-08 real case): the OUTCOME of the peer's most
+   * recent finished turn on this thread ("completed" | "failed"), from the
+   * peer handler's in-memory finalize record. A peer turn that ENDED IN
+   * FAILURE after the mention is a broken handoff RIGHT NOW — before this,
+   * #effectiveThreshold counted any finished turn as "handoff resolved", so
+   * a downstream crash (idle-kill, API-stream death) silently dropped the
+   * task to the general tier. In-memory: undefined after a bridge restart →
+   * falls back to the pre-revision-5 posture (completion evidence resolves),
+   * same conservative restart stance as revision 4.
+   */
+  getPeerLastTurnOutcome?: (peerBotId: string, threadId: string) => "completed" | "failed" | undefined;
+  /**
    * v3.3 due-date stall detection (docs/task-handle.md §14): plain in-memory
    * read of the task's `due` timestamp, as most recently observed by
    * TasklistPoller's `getDueTimestamp` (populated for free from the same
@@ -397,13 +422,13 @@ export interface StallDetectorOptions {
   intervalMs?: number;
   /** First-run jitter cap, clamped to intervalMs. @default 10_000 */
   jitterMs?: number;
-  /** @default 24h */
+  /** @default 1h (v4.2; was 24h through v4.1) */
   stallThresholdMs?: number;
   /** @default 30min */
   stallFastThresholdMs?: number;
   /** @default 5min. v3.2 交接断链检测 — see the module doc's revision 1 section for the gap-fill-cycle floor reasoning; docs/task-handle.md §13 has the operator-facing warning. */
   stallHandoffThresholdMs?: number;
-  /** @default 24h */
+  /** @default 1h (v4.2; was 24h). The due tier keeps a 24h floor regardless — see DUE_NUDGE_COOLDOWN_FLOOR_MS. */
   nudgeCooldownMs?: number;
   /** @default 2 */
   escalateAfterNudges?: number;
@@ -683,7 +708,7 @@ export class StallDetector {
         reason === "due" &&
         !justClearedPendingTimeout &&
         nudge?.lastNudgeSentAt !== undefined &&
-        now - nudge.lastNudgeSentAt < this.#nudgeCooldownMs
+        now - nudge.lastNudgeSentAt < this.#cooldownFor(reason)
       ) {
         return;
       }
@@ -720,7 +745,7 @@ export class StallDetector {
 
     // No progress since the confirmed nudge. NOW gate the actual action by
     // cooldown (module doc fix #1) — observation above never waits on this.
-    if (now - nudge.lastNudgeSentAt < this.#nudgeCooldownMs) return;
+    if (now - nudge.lastNudgeSentAt < this.#cooldownFor(reason)) return;
 
     if (nudge.count >= this.#escalateAfterNudges) {
       await this.#escalate(threadId);
@@ -761,6 +786,11 @@ export class StallDetector {
    * until gap-fill has had a chance to redeliver anything in flight across
    * a restart.
    */
+  /** Cooldown for a given tier — the due tier keeps a 24h floor (see DUE_NUDGE_COOLDOWN_FLOOR_MS). An explicit operator nudgeCooldownMs LONGER than the floor still wins. */
+  #cooldownFor(reason: "due" | "handoff" | "failed" | "normal"): number {
+    return reason === "due" ? Math.max(this.#nudgeCooldownMs, DUE_NUDGE_COOLDOWN_FLOOR_MS) : this.#nudgeCooldownMs;
+  }
+
   #effectiveThreshold(
     record: TaskHandleRecord,
     threadId: string,
@@ -795,6 +825,20 @@ export class StallDetector {
     // itself just verified, so either is safe there regardless of tier.
     let brokenFloorMs: number | undefined;
     for (const peerBotId of record.lastTurnMentions) {
+      // Revision 5 (2026-07-08 real case: 派单下游被 idle-kill,巡检 24h 不闻不问):
+      // a peer turn that finished in FAILURE after the mention is a broken
+      // handoff immediately — neither the receipt grace (tier 2) nor the
+      // finished-turn evidence (tier 1 restart check / tier 3) may resolve
+      // it. Guarded on the peer's own lastActiveTs so a STALE failure from
+      // before this mention can't re-arm.
+      {
+        const peerOutcome = this.#deps.getPeerLastTurnOutcome?.(peerBotId, threadId);
+        const peerEndedAt = this.#deps.getPeerLastActiveTs?.(peerBotId, threadId);
+        if (peerOutcome === "failed" && peerEndedAt !== undefined && peerEndedAt > mentionAt) {
+          brokenFloorMs = this.#stallHandoffThresholdMs;
+          break;
+        }
+      }
       const receivedAt = this.#deps.getPeerReceivedAt!(peerBotId, threadId);
       if (receivedAt === undefined || receivedAt <= mentionAt) {
         // Adversarial review round 2 (docs/task-handle.md §13.4): a

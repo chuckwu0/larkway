@@ -307,6 +307,18 @@ describe("TaskHandleStore", () => {
       expect(store.get("t1")?.mode).toBe("comment");
     });
 
+    it("claimCommentPending: recorded on a new auto-claim, cleared via update, round-trips disk", async () => {
+      const store = await TaskHandleStore.load(filePath);
+      await store.claim({ threadId: "t1", taskGuid: "g1", chatId: "oc_1", mode: "comment", claimCommentPending: true });
+      expect(store.get("t1")?.claimCommentPending).toBe(true);
+
+      const reloaded = await TaskHandleStore.load(filePath);
+      expect(reloaded.get("t1")?.claimCommentPending).toBe(true);
+
+      await reloaded.update("t1", (r) => (r ? { ...r, claimCommentPending: undefined } : r));
+      expect(reloaded.get("t1")?.claimCommentPending).toBeUndefined();
+    });
+
     it("doneDeclared round-trips through disk", async () => {
       const store = await TaskHandleStore.load(filePath);
       await store.claim({ threadId: "t1", taskGuid: "g1", chatId: "oc_1", mode: "comment" });
