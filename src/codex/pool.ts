@@ -195,6 +195,20 @@ export class CodexProcessPool implements AgentRunner {
     return this.#child?.pid ?? undefined;
   }
 
+  /**
+   * 批D: spawn the app-server eagerly at bridge boot instead of lazily on the
+   * first turn, so even the bot's first message hits a running process.
+   * Idempotent; no-op while shutting down or after the spawn circuit breaker
+   * (#poolDisabled) tripped. Unlike ClaudeProcessPool's blank standby there
+   * is no post-idle-reap replenish here: after the 10-min idle reap the next
+   * turn re-spawns on demand exactly as before (the reap exists to bound the
+   * app-server's per-thread memory growth — auto-respawning would defeat it).
+   */
+  prewarm(): void {
+    if (this.#shuttingDown || this.#poolDisabled) return;
+    if (this.#child == null) this.#spawnChild();
+  }
+
   run(opts: RunOptions): RunHandle {
     const turnKey = this.#nextTurnKey++;
     const queue = new TurnEventQueue();

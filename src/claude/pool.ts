@@ -135,9 +135,27 @@ interface TurnState {
 }
 
 interface PoolEntry {
-  readonly key: string;
-  readonly threadId: string;
+  /** Mutable (not readonly) because blank adoption REKEYS an entry in place — see #adoptBlankEntry. */
+  key: string;
+  threadId: string;
   readonly cwd: string | undefined;
+  /**
+   * 批D blank standby: true for a pre-warmed child spawned WITHOUT a thread
+   * (no --resume, prompt never sent) waiting to be adopted by the first
+   * new-session turn whose spawn signature matches. Blanks are exempt from
+   * idle reaping (their whole point is to be there whenever the next new
+   * thread arrives) but remain LRU-evictable when the pool needs the slot
+   * for a real thread. Flipped to false on adoption.
+   */
+  blank: boolean;
+  /**
+   * Full spawn identity — JSON of [bin, args, cwd] as actually passed to
+   * spawn(). Adoption matches on strict equality of this string, so any
+   * drift between the prewarm proto-options and a real turn's options
+   * (model, effort, permissionMode, agentBinPath, cwd…) fails SAFE: the
+   * blank simply never matches and the turn spawns its own child.
+   */
+  readonly spawnSignature: string;
   readonly child: ChildProcess;
   readonly spawnedAt: number;
   /** Bumped whenever a turn starts or ends on this entry — LRU eviction picks the smallest among idle entries. */
@@ -156,6 +174,28 @@ interface PoolEntry {
   destroyed: boolean;
   readonly stderrChunks: Buffer[];
 }
+
+/**
+ * 批D: the static, per-bot subset of RunOptions that fully determines a warm
+ * child's spawn identity for a NEW session (no --resume). main.ts derives
+ * this from the bot's own config at wire time; prewarm() turns it into a
+ * spawn signature via the SAME buildWarmCommand path a real turn uses, so
+ * the two can never disagree about what "matching" means.
+ */
+export interface ClaudePrewarmOptions {
+  cwd?: string;
+  model?: string;
+  effort?: string;
+  permissionMode?: RunOptions["permissionMode"];
+  agentBinPath?: string;
+}
+
+/** A blank that dies younger than this (before ever being adopted) counts toward the prewarm circuit breaker. */
+const BLANK_EARLY_DEATH_MS = 30_000;
+/** Consecutive early deaths after which prewarm disables itself for this bridge's lifetime. */
+const MAX_PREWARM_FAILURES = 3;
+/** Base delay before respawning a blank after an early death (doubles per consecutive failure). */
+const PREWARM_RESPAWN_BACKOFF_MS = 10_000;
 
 export interface ClaudeProcessPoolOptions {
   /** Used only to build each process's cache key and log lines — see #computeKey. */
@@ -222,6 +262,16 @@ export class ClaudeProcessPool implements AgentRunner {
    */
   readonly #dying = new Set<PoolEntry>();
 
+  // -- 批D blank-standby prewarm state ----------------------------------------
+  /** Set by prewarm(); undefined = prewarm never requested (no blank maintenance). */
+  #prewarmProto: ClaudePrewarmOptions | undefined;
+  /** Consecutive blank early-deaths — resets on a successful adoption. */
+  #prewarmFailures = 0;
+  /** True once the circuit breaker tripped (MAX_PREWARM_FAILURES) — prewarm off until bridge restart. */
+  #prewarmDisabled = false;
+  #prewarmRespawnTimer: ReturnType<typeof setTimeout> | undefined;
+  #nextBlankId = 1;
+
   constructor(opts: ClaudeProcessPoolOptions) {
     this.#botId = opts.botId;
     this.#botGitIdentity = opts.botGitIdentity;
@@ -240,6 +290,24 @@ export class ClaudeProcessPool implements AgentRunner {
     return [...this.#entries.values()]
       .map((e) => e.child.pid)
       .filter((pid): pid is number => pid != null);
+  }
+  get blankProcessCountForTesting(): number {
+    return [...this.#entries.values()].filter((e) => e.blank).length;
+  }
+
+  /**
+   * 批D: start maintaining ONE blank standby child matching `proto`'s spawn
+   * signature — spawned now, adopted by the first new-session turn whose own
+   * options produce the same signature (see PoolEntry.spawnSignature), and
+   * replenished after each adoption. Call once at bridge boot (main.ts),
+   * only for bots whose cwd is static across threads (agent_workspace
+   * runtime); calling it again replaces the proto for future respawns but
+   * never kills an existing blank. No-op after shutdown() or once the
+   * circuit breaker has tripped.
+   */
+  prewarm(proto: ClaudePrewarmOptions): void {
+    this.#prewarmProto = proto;
+    this.#maybeSpawnBlank();
   }
 
   run(opts: RunOptions): RunHandle {
@@ -307,6 +375,14 @@ export class ClaudeProcessPool implements AgentRunner {
     }
 
     let entry = this.#entries.get(key);
+    if (entry == null && opts.resumeSessionId == null) {
+      // 批D blank adoption: a NEW session (nothing to --resume) whose spawn
+      // signature matches the standby blank takes it over in place — the
+      // child is already booted (hooks/MCP init done), so this turn's first
+      // stdin write hits a fully warm process. Resume turns can never adopt
+      // (--resume is a spawn-time flag the blank wasn't given).
+      entry = this.#adoptBlankEntry(key, threadId, opts);
+    }
     if (entry == null) {
       if (this.#entries.size >= this.#maxProcesses) {
         const victim = this.#pickLruIdleVictim();
@@ -341,6 +417,10 @@ export class ClaudeProcessPool implements AgentRunner {
     if (this.#idleSweepTimer) {
       clearInterval(this.#idleSweepTimer);
       this.#idleSweepTimer = undefined;
+    }
+    if (this.#prewarmRespawnTimer) {
+      clearTimeout(this.#prewarmRespawnTimer);
+      this.#prewarmRespawnTimer = undefined;
     }
     const inFlight = [...this.#entries.values()]
       .map((e) => e.current?.done.catch(() => undefined))
@@ -407,6 +487,11 @@ export class ClaudeProcessPool implements AgentRunner {
   }
 
   #pickLruIdleVictim(): PoolEntry | undefined {
+    // 批D: a blank standby is pure convenience — under capacity pressure it
+    // always loses to keeping a real thread's warm process alive.
+    for (const entry of this.#entries.values()) {
+      if (entry.current == null && entry.blank) return entry;
+    }
     let victim: PoolEntry | undefined;
     for (const entry of this.#entries.values()) {
       if (entry.current != null) continue; // in-flight turn — never evict
@@ -605,7 +690,109 @@ export class ClaudeProcessPool implements AgentRunner {
 
   // -- process lifecycle -------------------------------------------------------
 
-  #spawnEntry(key: string, threadId: string, opts: RunOptions): PoolEntry {
+  /**
+   * The spawn identity a set of run/prewarm options resolves to. Built from
+   * the SAME buildWarmCommand path #spawnEntry actually spawns with, so an
+   * adoption match is by construction a spawn-arg-identical process.
+   * `resumeSessionId` is deliberately dropped: adoption is only ever
+   * attempted for turns with no resume (run() guards), and the blank itself
+   * is spawned without one.
+   */
+  #spawnSignatureOf(opts: {
+    cwd?: string;
+    model?: string;
+    effort?: string;
+    permissionMode?: RunOptions["permissionMode"];
+    agentBinPath?: string;
+  }): string {
+    const [bin, args] = buildWarmCommand({
+      prompt: "",
+      cwd: opts.cwd,
+      model: opts.model,
+      effort: opts.effort,
+      permissionMode: opts.permissionMode,
+      agentBinPath: opts.agentBinPath,
+    } as RunOptions);
+    return JSON.stringify([bin, args, opts.cwd ?? null]);
+  }
+
+  /**
+   * 批D: find an idle blank whose spawn signature matches this turn's options
+   * and rekey it in place onto (key, threadId). Returns undefined when no
+   * blank matches — the caller falls through to a normal spawn. Schedules a
+   * replacement blank on success.
+   */
+  #adoptBlankEntry(key: string, threadId: string, opts: RunOptions): PoolEntry | undefined {
+    let blank: PoolEntry | undefined;
+    for (const e of this.#entries.values()) {
+      if (e.blank && !e.destroyed && e.current == null) {
+        blank = e;
+        break;
+      }
+    }
+    if (blank == null) return undefined;
+
+    const wanted = this.#spawnSignatureOf(opts);
+    if (blank.spawnSignature !== wanted) {
+      // Fail-safe mismatch (see spawnSignature's doc): log once per attempt so
+      // proto/turn drift is visible instead of silently wasting the standby.
+      console.warn(
+        `[claude-pool] blank standby exists but its spawn signature doesn't match this turn's options — ` +
+          `not adopting (blank=${blank.spawnSignature} turn=${wanted}). Check the prewarm wiring in main.ts.`,
+      );
+      return undefined;
+    }
+
+    this.#entries.delete(blank.key);
+    blank.key = key;
+    blank.threadId = threadId;
+    blank.blank = false;
+    blank.lastUsedAt = Date.now();
+    this.#entries.set(key, blank);
+    // The on-disk pid list records each entry's key — refresh it now that the
+    // blank's identity changed (same pid, new key).
+    this.#rewritePidListBestEffort();
+    this.#prewarmFailures = 0; // a standby lived long enough to be useful — reset the breaker
+    console.warn(
+      `[claude-pool] blank standby pid=${blank.child.pid ?? "?"} adopted by thread=${threadId} — ` +
+        "this turn skips the cold start entirely.",
+    );
+    // Replenish AFTER this turn's entry bookkeeping settles — a synchronous
+    // spawn here would race the #entries.set above for the capacity check.
+    queueMicrotask(() => this.#maybeSpawnBlank());
+    return blank;
+  }
+
+  /**
+   * Spawn the standby blank when prewarm is configured and conditions allow:
+   * at most one blank at a time, never past maxProcesses, never while
+   * shutting down, and never after the circuit breaker tripped.
+   */
+  #maybeSpawnBlank(): void {
+    if (this.#prewarmProto == null || this.#prewarmDisabled || this.#shuttingDown) return;
+    if (this.#prewarmRespawnTimer != null) return; // a backoff respawn is already scheduled
+    if (this.#entries.size >= this.#maxProcesses) return; // real threads own every slot — retry on next exit
+    for (const e of this.#entries.values()) {
+      if (e.blank) return; // standby already present
+    }
+    const proto = this.#prewarmProto;
+    const key = `__blank__::${this.#botId}::${this.#nextBlankId++}`;
+    const opts: RunOptions = {
+      prompt: "",
+      cwd: proto.cwd,
+      model: proto.model,
+      effort: proto.effort,
+      permissionMode: proto.permissionMode,
+      agentBinPath: proto.agentBinPath,
+    } as RunOptions;
+    const entry = this.#spawnEntry(key, key, opts, { blank: true });
+    console.warn(
+      `[claude-pool] pre-warmed blank standby pid=${entry.child.pid ?? "?"} for bot=${this.#botId} ` +
+        `(signature=${entry.spawnSignature.slice(0, 120)}…)`,
+    );
+  }
+
+  #spawnEntry(key: string, threadId: string, opts: RunOptions, flags?: { blank?: boolean }): PoolEntry {
     const [bin, args] = buildWarmCommand(opts);
     const env = buildEnv(this.#botGitIdentity, this.#gitlabToken);
     const child = spawn(bin, args, {
@@ -618,6 +805,8 @@ export class ClaudeProcessPool implements AgentRunner {
       key,
       threadId,
       cwd: opts.cwd,
+      blank: flags?.blank === true,
+      spawnSignature: this.#spawnSignatureOf(opts),
       child,
       spawnedAt: Date.now(),
       lastUsedAt: Date.now(),
@@ -707,6 +896,43 @@ export class ClaudeProcessPool implements AgentRunner {
     this.#rewritePidListBestEffort();
     void this.#deleteRunnerPidFileIfMine(entry);
 
+    // 批D blank lifecycle accounting. An UNPROMPTED early death of a
+    // still-blank standby (not one we tore down ourselves) is the signature
+    // of a wire-protocol/config problem — count it toward the circuit
+    // breaker and back off before respawning, so a broken environment can't
+    // turn the standby into a spawn loop. Any other exit (adopted entry,
+    // deliberate teardown, old-age death) just frees a slot: try to
+    // replenish the standby straight away.
+    if (this.#prewarmProto != null && !this.#shuttingDown && !this.#prewarmDisabled) {
+      const earlyBlankDeath =
+        entry.blank && !wasAlreadyMarkedDestroyed && Date.now() - entry.spawnedAt < BLANK_EARLY_DEATH_MS;
+      if (earlyBlankDeath) {
+        this.#prewarmFailures += 1;
+        if (this.#prewarmFailures >= MAX_PREWARM_FAILURES) {
+          this.#prewarmDisabled = true;
+          const stderr = Buffer.concat(entry.stderrChunks).toString("utf8").trim().slice(-2_000);
+          console.warn(
+            `[claude-pool] blank standby died early ${this.#prewarmFailures} times in a row — disabling ` +
+              "prewarm until the bridge restarts (warm pooling itself stays on; turns just spawn on demand)." +
+              (stderr ? ` last stderr tail:\n${stderr}` : ""),
+          );
+        } else {
+          const delay = PREWARM_RESPAWN_BACKOFF_MS * 2 ** (this.#prewarmFailures - 1);
+          console.warn(
+            `[claude-pool] blank standby pid=${entry.child.pid ?? "?"} died within ${BLANK_EARLY_DEATH_MS}ms ` +
+              `of spawning (${this.#prewarmFailures}/${MAX_PREWARM_FAILURES}) — respawning in ${delay}ms.`,
+          );
+          this.#prewarmRespawnTimer = setTimeout(() => {
+            this.#prewarmRespawnTimer = undefined;
+            this.#maybeSpawnBlank();
+          }, delay);
+          this.#prewarmRespawnTimer.unref?.();
+        }
+      } else {
+        queueMicrotask(() => this.#maybeSpawnBlank());
+      }
+    }
+
     const state = entry.current;
     entry.current = undefined;
     if (state == null || state.settled) return;
@@ -774,6 +1000,7 @@ export class ClaudeProcessPool implements AgentRunner {
       const now = Date.now();
       for (const entry of [...this.#entries.values()]) {
         if (entry.current != null) continue;
+        if (entry.blank) continue; // 批D: the standby's whole point is to outlive idle periods
         if (now - entry.lastUsedAt >= this.#idleMs) {
           this.#destroyEntry(entry, "idle timeout");
         }

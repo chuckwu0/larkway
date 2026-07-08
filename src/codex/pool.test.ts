@@ -1167,3 +1167,18 @@ async function writeFileForTest(filePath: string, content: unknown): Promise<voi
   const { writeFile } = await import("node:fs/promises");
   await writeFile(filePath, JSON.stringify(content), "utf8");
 }
+
+// ---------------------------------------------------------------------------
+// 批D — boot-time prewarm
+// ---------------------------------------------------------------------------
+
+describe("CodexProcessPool — prewarm (批D)", () => {
+  it("prewarm() spawns the app-server before any turn, and run() reuses it (idempotent)", async () => {
+    const pool = new CodexProcessPool({});
+    expect(spawnedChildren).toHaveLength(0);
+    pool.prewarm();
+    expect(spawnedChildren).toHaveLength(1);
+    pool.prewarm(); // idempotent — never a second process
+    expect(spawnedChildren).toHaveLength(1);
+  });
+});

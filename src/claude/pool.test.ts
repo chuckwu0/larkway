@@ -850,3 +850,217 @@ describe("ClaudeProcessPool — pid-list lifecycle", () => {
     expect(listAfterAExits.some((e) => e.pid === childB.pid)).toBe(true);
   });
 });
+
+// ---------------------------------------------------------------------------
+// 批D — blank standby prewarm
+// ---------------------------------------------------------------------------
+
+describe("ClaudeProcessPool — blank standby prewarm (批D)", () => {
+  const PROTO = { cwd: "/ws/bot-a", model: "sonnet", effort: "high", permissionMode: "bypassPermissions" as const };
+  /** run() opts that resolve to the SAME spawn signature as PROTO. */
+  const MATCHING_OPTS = {
+    prompt: "hi",
+    cwd: "/ws/bot-a",
+    model: "sonnet",
+    effort: "high",
+    permissionMode: "bypassPermissions" as const,
+    threadId: "thread-new",
+  };
+
+  it("prewarm() spawns one blank; a matching NEW-session turn adopts it and a replacement blank spawns", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const pool = new ClaudeProcessPool({ botId: "bot-a" });
+      pool.prewarm(PROTO);
+      await flush();
+      expect(spawnedChildren).toHaveLength(1);
+      expect(pool.blankProcessCountForTesting).toBe(1);
+      const blank = spawnedChildren[0]!;
+      // Blank spawn args are the warm shape with NO --resume.
+      expect(spawnArgs[0]).toContain("--input-format");
+      expect(spawnArgs[0]).not.toContain("--resume");
+
+      const handle = pool.run(MATCHING_OPTS);
+      await flush();
+      // Turn runs on the ADOPTED blank (same pid), and a replacement blank
+      // has been spawned in the background.
+      expect(handle.pid).toBe(blank.pid);
+      expect(spawnedChildren).toHaveLength(2);
+      expect(pool.blankProcessCountForTesting).toBe(1);
+
+      // The adopted process serves the turn like any warm child.
+      const outbound = readOutboundLines(blank);
+      expect(outbound.some((l) => l["type"] === "user")).toBe(true);
+      blank.stdout.write(systemInit("s-new") + "\n");
+      blank.stdout.write(resultLine("success") + "\n");
+      await flush();
+      const result = await handle.done;
+      expect(result.exitCode).toBe(0);
+      expect(result.pooled).toBe(true);
+      expect(result.sessionId).toBe("s-new");
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+
+  it("a RESUME turn never adopts the blank — it spawns its own child with --resume", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const pool = new ClaudeProcessPool({ botId: "bot-a" });
+      pool.prewarm(PROTO);
+      await flush();
+      expect(spawnedChildren).toHaveLength(1);
+
+      const handle = pool.run({ ...MATCHING_OPTS, resumeSessionId: "prior" });
+      await flush();
+      expect(spawnedChildren).toHaveLength(2);
+      expect(handle.pid).toBe(spawnedChildren[1]!.pid);
+      expect(spawnArgs[1]).toEqual(expect.arrayContaining(["--resume", "prior"]));
+      expect(pool.blankProcessCountForTesting).toBe(1); // standby untouched
+
+      const child = spawnedChildren[1]!;
+      child.stdout.write(systemInit("prior") + "\n");
+      child.stdout.write(resultLine("success") + "\n");
+      await flush();
+      await handle.done;
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+
+  it("a signature MISMATCH (different model) never adopts — fail-safe spawn, blank stays", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const pool = new ClaudeProcessPool({ botId: "bot-a" });
+      pool.prewarm(PROTO);
+      await flush();
+
+      const handle = pool.run({ ...MATCHING_OPTS, model: "opus" });
+      await flush();
+      expect(spawnedChildren).toHaveLength(2);
+      expect(handle.pid).toBe(spawnedChildren[1]!.pid);
+      expect(pool.blankProcessCountForTesting).toBe(1);
+      expect(
+        warnSpy.mock.calls.some((c) => String(c[0]).includes("spawn signature doesn't match")),
+      ).toBe(true);
+
+      const child = spawnedChildren[1]!;
+      child.stdout.write(systemInit("s") + "\n");
+      child.stdout.write(resultLine("success") + "\n");
+      await flush();
+      await handle.done;
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+
+  it("the idle sweep reaps idle THREAD entries but never the blank standby", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "Date"] });
+    try {
+      const pool = new ClaudeProcessPool({ botId: "bot-a", idleMs: 1_000 });
+      pool.prewarm(PROTO);
+      await flush();
+      const blank = spawnedChildren[0]!;
+
+      // One real turn on a different signature so it can't adopt the blank.
+      const handle = pool.run({ prompt: "x", cwd: "/wt/t1", threadId: "t1" });
+      await flush();
+      const threadChild = spawnedChildren[1]!;
+      threadChild.stdout.write(systemInit("s1") + "\n");
+      threadChild.stdout.write(resultLine("success") + "\n");
+      await flush();
+      await handle.done;
+
+      await vi.advanceTimersByTimeAsync(1_500); // past idleMs; sweep cadence = idleMs/4
+      expect(threadChild.killed).toBe(true); // idle thread entry reaped
+      expect(blank.killed).toBe(false); // standby survives idleness
+      expect(pool.blankProcessCountForTesting).toBe(1);
+    } finally {
+      vi.useRealTimers();
+      warnSpy.mockRestore();
+    }
+  });
+
+  it("circuit breaker: 3 consecutive early blank deaths disable prewarm (with backoff between respawns)", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "Date"] });
+    try {
+      const pool = new ClaudeProcessPool({ botId: "bot-a" });
+      pool.prewarm(PROTO);
+      await flush();
+      expect(spawnedChildren).toHaveLength(1);
+
+      // Death 1 — early (well under BLANK_EARLY_DEATH_MS). Respawn after 10s backoff.
+      spawnedChildren[0]!.emit("exit");
+      await flush();
+      expect(spawnedChildren).toHaveLength(1); // not yet — backoff pending
+      await vi.advanceTimersByTimeAsync(10_100);
+      await flush();
+      expect(spawnedChildren).toHaveLength(2);
+
+      // Death 2 — respawn after 20s backoff.
+      spawnedChildren[1]!.emit("exit");
+      await flush();
+      await vi.advanceTimersByTimeAsync(20_100);
+      await flush();
+      expect(spawnedChildren).toHaveLength(3);
+
+      // Death 3 — breaker trips: no more respawns, ever.
+      spawnedChildren[2]!.emit("exit");
+      await flush();
+      await vi.advanceTimersByTimeAsync(120_000);
+      await flush();
+      expect(spawnedChildren).toHaveLength(3);
+      expect(pool.blankProcessCountForTesting).toBe(0);
+      expect(
+        warnSpy.mock.calls.some((c) => String(c[0]).includes("disabling prewarm")),
+      ).toBe(true);
+
+      // Warm pooling itself still works: a normal turn spawns on demand.
+      const handle = pool.run({ prompt: "x", cwd: "/wt/t1", threadId: "t1" });
+      await flush();
+      expect(spawnedChildren).toHaveLength(4);
+      const child = spawnedChildren[3]!;
+      child.stdout.write(systemInit("s") + "\n");
+      child.stdout.write(resultLine("success") + "\n");
+      await flush();
+      await handle.done;
+    } finally {
+      vi.useRealTimers();
+      warnSpy.mockRestore();
+    }
+  });
+
+  it("under capacity pressure the blank is the FIRST LRU victim (real threads keep their warm processes)", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const pool = new ClaudeProcessPool({ botId: "bot-a", maxProcesses: 2 });
+      pool.prewarm(PROTO);
+      await flush();
+      const blank = spawnedChildren[0]!;
+
+      // Fill the second slot with a real (non-matching-signature) thread.
+      const h1 = pool.run({ prompt: "a", cwd: "/wt/t1", threadId: "t1" });
+      await flush();
+      const c1 = spawnedChildren[1]!;
+      c1.stdout.write(systemInit("s1") + "\n");
+      c1.stdout.write(resultLine("success") + "\n");
+      await flush();
+      await h1.done;
+
+      // Third distinct key at capacity → evict the blank, never the thread entry.
+      const h2 = pool.run({ prompt: "b", cwd: "/wt/t2", threadId: "t2" });
+      await flush();
+      expect(blank.killed).toBe(true);
+      expect(c1.killed).toBe(false);
+      const c2 = spawnedChildren[2]!;
+      c2.stdout.write(systemInit("s2") + "\n");
+      c2.stdout.write(resultLine("success") + "\n");
+      await flush();
+      await h2.done;
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+});

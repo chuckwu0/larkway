@@ -1089,3 +1089,32 @@ describe("renderPrompt — <task-root> supersedes <task-handle> (adversarial-rev
     expect(prompt).toContain("不认领");
   });
 });
+
+// ---------------------------------------------------------------------------
+// 批D — queuedFollowups (gated coalescing) rendering
+// ---------------------------------------------------------------------------
+
+describe("renderPrompt — queuedFollowups (批D)", () => {
+  it("renders coalesced follow-ups inside <user-message> in arrival order", async () => {
+    const prompt = await renderPrompt(
+      makeInput({
+        queuedFollowups: [
+          { senderOpenId: "ou_alice", text: "补充:也看下 B 仓库" },
+          { senderOpenId: "ou_bob", text: "顺便把版本号 bump 一下" },
+        ],
+      }),
+    );
+    const userBlock = prompt.slice(prompt.indexOf("<user-message>"), prompt.indexOf("</user-message>"));
+    expect(userBlock).toContain("2 条追加消息");
+    expect(userBlock).toContain("ou_alice: 补充:也看下 B 仓库");
+    expect(userBlock).toContain("ou_bob: 顺便把版本号 bump 一下");
+    expect(userBlock.indexOf("ou_alice")).toBeLessThan(userBlock.indexOf("ou_bob"));
+  });
+
+  it("renders a byte-identical <user-message> block when absent/empty (no regression)", async () => {
+    const without = await renderPrompt(makeInput({}));
+    const withEmpty = await renderPrompt(makeInput({ queuedFollowups: [] }));
+    expect(withEmpty).toBe(without);
+    expect(without).not.toContain("追加消息");
+  });
+});

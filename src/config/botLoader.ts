@@ -382,24 +382,38 @@ export const BotConfigSchema = z.object({
   effort: z.string().min(1).optional(),
 
   /**
-   * docs/larkway-perf-plan.md §4 — opt into a persistent warm process
-   * instead of the default one-shot cold-start-per-turn behavior. Takes
-   * effect for `backend: "codex"` (a single bot-level `codex app-server`
-   * process — src/codex/pool.ts CodexProcessPool) and `backend: "claude"`
-   * (one warm process per active thread — src/claude/pool.ts
-   * ClaudeProcessPool). Any other backend value is a no-op (main.ts only
-   * constructs a pool for these two; botLoader's advisory warn below flags
-   * the mismatch upfront). Byte-identical behavior when unset, matching
-   * every other perf-plan flag in this schema. `.optional()` (not
-   * `.default(false)`, deliberately — B1 fix): a `.default()` would make
-   * every future `larkway bot` yaml write-out include `warmProcess: false`
-   * even when nobody asked for it, and — because this schema is `.strict()`
-   * — would break loading that yaml back with an OLDER larkway build that
-   * predates this field. `undefined` and `false` are treated identically at
-   * both read sites (main.ts's `bot.warmProcess && …` and the advisory warn
-   * below).
+   * docs/larkway-perf-plan.md §4 — persistent warm process instead of a
+   * one-shot cold start per turn. Takes effect for `backend: "codex"` (a
+   * single bot-level `codex app-server` process — src/codex/pool.ts
+   * CodexProcessPool) and `backend: "claude"` (one warm process per active
+   * thread — src/claude/pool.ts ClaudeProcessPool). Any other backend value
+   * is a no-op (main.ts only constructs a pool for these two; botLoader's
+   * advisory warn below flags the mismatch upfront).
+   *
+   * 批D (warm-by-default):
+   * DEFAULT IS NOW ON for the two supported backends — `undefined` means
+   * `true` when backend is codex/claude (see {@link effectiveWarmProcess},
+   * the single source of that rule). Set `warmProcess: false` explicitly to
+   * opt a bot back out. `.optional()` (not `.default(true)`) is still
+   * deliberate: a `.default()` would make every future `larkway bot` yaml
+   * write-out bake the value in, and — because this schema is `.strict()` —
+   * would break loading that yaml back with an OLDER larkway build that
+   * predates this field.
    */
   warmProcess: z.boolean().optional(),
+
+  /**
+   * 批D: pre-warm a BLANK agent process at bridge boot (and keep one on
+   * standby thereafter), so even the FIRST message of a NEW thread skips the
+   * cold start. Only meaningful when the warm pool is on (see
+   * `warmProcess`); default true. backend=claude: ClaudeProcessPool keeps
+   * one blank (no --resume) child matching the bot's static spawn signature,
+   * adopted by the first new-session turn and replenished after adoption.
+   * backend=codex: CodexProcessPool spawns its app-server eagerly at boot
+   * instead of on the first turn. Set false to keep warm pooling but skip
+   * the always-resident standby (saves ~300MB RSS per bot at idle).
+   */
+  prewarmProcess: z.boolean().optional(),
 
   /**
    * Idle threshold (ms) before a warm process (see `warmProcess` above) with
@@ -428,6 +442,28 @@ export type BotConfig = z.infer<typeof BotConfigSchema> & {
   /** Resolved content of `memory_file`, if present. Injected into the prompt. */
   agent_memory?: string;
 };
+
+/**
+ * 批D: the single source of the warm-pool default. Warm pooling is ON by
+ * default for the two backends that implement it (claude/codex) and can only
+ * be disabled with an explicit `warmProcess: false`; every other backend has
+ * no pool implementation, so the default there stays off regardless.
+ * main.ts's pool wiring must consult THIS, never `bot.warmProcess` directly.
+ */
+export function effectiveWarmProcess(bot: Pick<BotConfig, "warmProcess" | "backend">): boolean {
+  if (bot.backend !== "claude" && bot.backend !== "codex") return bot.warmProcess === true;
+  return bot.warmProcess !== false;
+}
+
+/**
+ * 批D: blank-standby prewarm default — ON whenever the warm pool itself is
+ * effectively on, unless explicitly disabled via `prewarmProcess: false`.
+ */
+export function effectivePrewarmProcess(
+  bot: Pick<BotConfig, "warmProcess" | "backend" | "prewarmProcess">,
+): boolean {
+  return effectiveWarmProcess(bot) && bot.prewarmProcess !== false;
+}
 
 // ---------------------------------------------------------------------------
 // Public API

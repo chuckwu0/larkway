@@ -13,7 +13,7 @@ import { upsertRuntimeEvent } from "./bridge/eventLog.js";
 import { appendPerfSample } from "./bridge/perfLog.js";
 import type { HandlerConventions } from "./bridge/handler.js";
 import { Housekeeping } from "./housekeeping/gc.js";
-import { loadBots } from "./config/botLoader.js";
+import { loadBots, effectiveWarmProcess, effectivePrewarmProcess } from "./config/botLoader.js";
 import type { BotConfig } from "./config/botLoader.js";
 import {
   larkwayHome,
@@ -711,7 +711,11 @@ async function runV2Mode({
     let codexPool: CodexProcessPool | undefined;
     let claudePool: ClaudeProcessPool | undefined;
     let runnerKey: string | undefined;
-    if (bot.warmProcess && bot.backend === "codex") {
+    // 批D: warm pooling is now DEFAULT-ON for the two supported backends
+    // (effectiveWarmProcess is the single source of that rule; explicit
+    // `warmProcess: false` still opts a bot out).
+    const warmProcessOn = effectiveWarmProcess(bot);
+    if (warmProcessOn && bot.backend === "codex") {
       const pidFilePath = path.join(botDir, "warm-codex.pid");
       // M2 (Workflow review): a hard kill (kill -9 / watchdog / OOM) skips
       // CodexProcessPool's own exit-time pid-file cleanup, so a stale entry
@@ -731,7 +735,9 @@ async function runV2Mode({
       });
       runnerKey = `codex-pool:${bot.id}`;
       registerRunner(runnerKey, () => codexPool!);
-    } else if (bot.warmProcess && bot.backend === "claude") {
+      // 批D: boot-time prewarm — the app-server is up before the first @.
+      if (effectivePrewarmProcess(bot)) codexPool.prewarm();
+    } else if (warmProcessOn && bot.backend === "claude") {
       const pidListFilePath = path.join(botDir, "warm-claude.pids.json");
       // Same orphan-sweep rationale as the codex branch above, adapted for a
       // multi-process pid LIST rather than a single pid file.
@@ -750,6 +756,24 @@ async function runV2Mode({
       });
       runnerKey = `claude-pool:${bot.id}`;
       registerRunner(runnerKey, () => claudePool!);
+      // 批D: blank-standby prewarm. Only agent_workspace bots qualify — their
+      // runner cwd is the SHARED per-bot workspace root (static across
+      // threads, see handler.ts's runCwd), which is exactly what makes a
+      // pre-spawned blank adoptable by ANY new thread. legacy-runtime bots
+      // run in per-thread worktrees the bridge only creates at turn time, so
+      // there is no spawn signature to pre-warm against.
+      if (effectivePrewarmProcess(bot) && bot.runtime === "agent_workspace" && agentWorkspacePath) {
+        claudePool.prewarm({
+          cwd: agentWorkspacePath,
+          model: bot.model,
+          effort: bot.effort,
+          // Mirrors handler.ts's own default ("bypassPermissions" when
+          // config.json leaves permissions.mode unset). If these two ever
+          // drift the blank's signature just stops matching — fail-safe, and
+          // the pool logs the mismatch on every missed adoption.
+          permissionMode: configJson.permissions.mode ?? "bypassPermissions",
+        });
+      }
     }
 
     const handler = new BridgeHandler({

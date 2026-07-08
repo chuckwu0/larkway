@@ -174,6 +174,14 @@ export interface RenderPromptInput {
   isNewThread: boolean;
   conventions: PromptConventions;
   /**
+   * 批D gated coalescing (bridge/handler.ts run() loop): messages that
+   * arrived on this SAME session while the previous turn was still running,
+   * merged into this turn instead of each burning a full turn of their own.
+   * Rendered inside `<user-message>` after the primary message, in arrival
+   * order. Absent/empty → byte-identical prompt to before this field existed.
+   */
+  queuedFollowups?: Array<{ senderOpenId: string; text: string }>;
+  /**
    * List of peer bots in the same chat.
    * When provided, a `<peer-bots>` block is appended to the prompt so the
    * agent knows which bots it can @ and for what purpose.
@@ -714,8 +722,25 @@ export async function renderPrompt(input: RenderPromptInput): Promise<string> {
     taskHandleCandidates = [],
     taskRoot,
     mtimeFacts = [],
+    queuedFollowups = [],
   } = input;
   const backend = input.backend ?? "claude";
+
+  // 批D gated coalescing: extra same-session messages merged into this turn.
+  // Rendered as additional lines inside <user-message> so the agent sees ONE
+  // coherent ask instead of burning a full turn per rapid-fire message.
+  const userMessageLines = [
+    "<user-message>",
+    `${parsed.senderOpenId}: ${parsed.text}`,
+    ...(queuedFollowups.length > 0
+      ? [
+          "",
+          `(以下 ${queuedFollowups.length} 条追加消息在上一轮处理期间到达,已合并进本轮 —— 按顺序一并处理,只需一次答复:)`,
+          ...queuedFollowups.map((f) => `${f.senderOpenId}: ${f.text}`),
+        ]
+      : []),
+    "</user-message>",
+  ];
 
   // Build the --profile flag suffix for lark-cli commands.
   // When a named profile is set (multi-bot), every command carries --profile <name>
@@ -910,9 +935,7 @@ export async function renderPrompt(input: RenderPromptInput): Promise<string> {
       ...(taskHandleBlock.length > 0 ? ["", ...taskHandleBlock] : []),
       ...(taskRootBlock.length > 0 ? ["", ...taskRootBlock] : []),
       "",
-      "<user-message>",
-      `${parsed.senderOpenId}: ${parsed.text}`,
-      "</user-message>",
+      ...userMessageLines,
     ].join("\n");
   }
 
@@ -971,8 +994,6 @@ export async function renderPrompt(input: RenderPromptInput): Promise<string> {
     ...(taskHandleBlock.length > 0 ? ["", ...taskHandleBlock] : []),
       ...(taskRootBlock.length > 0 ? ["", ...taskRootBlock] : []),
     "",
-    "<user-message>",
-    `${parsed.senderOpenId}: ${parsed.text}`,
-    "</user-message>",
+    ...userMessageLines,
   ].join("\n");
 }

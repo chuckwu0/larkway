@@ -4696,3 +4696,67 @@ describe("handleOne — v4 task-share root probe", () => {
     expect(prompt()).not.toContain("open_thread_id=om_root");
   });
 });
+
+// ---------------------------------------------------------------------------
+// 批D — gated coalescing (canCoalesceFollowup)
+// ---------------------------------------------------------------------------
+
+describe("canCoalesceFollowup (批D gated coalescing)", async () => {
+  const { canCoalesceFollowup } = await import("./handler.js");
+  const textContent = (t: string) => JSON.stringify({ text: t });
+  const mkEvent = (over: Record<string, unknown> = {}) => ({
+    message_id: "om_primary",
+    chat_id: "oc_1",
+    chat_type: "group",
+    thread_id: "omt_1",
+    root_id: "om_root",
+    sender_id: "ou_alice",
+    content: textContent("first ask"),
+    create_time: "1700000000000",
+    ...over,
+  });
+
+  it("coalesces a plain-text follow-up on the SAME session (root_id)", () => {
+    const primary = mkEvent();
+    const followup = mkEvent({ message_id: "om_f1", sender_id: "ou_bob", content: textContent("also do X") });
+    expect(canCoalesceFollowup(primary as never, followup as never)).toBe(true);
+  });
+
+  it("root message + its own thread replies share a session key (root ?? message_id)", () => {
+    const primary = mkEvent({ message_id: "om_root", root_id: undefined });
+    const followup = mkEvent({ message_id: "om_f1", root_id: "om_root", content: textContent("more") });
+    expect(canCoalesceFollowup(primary as never, followup as never)).toBe(true);
+  });
+
+  it("rejects a follow-up from a DIFFERENT session key", () => {
+    const primary = mkEvent();
+    const other = mkEvent({ message_id: "om_f1", root_id: "om_other_root", content: textContent("hi") });
+    expect(canCoalesceFollowup(primary as never, other as never)).toBe(false);
+  });
+
+  it("rejects synthetic events on either side (card actions / task wake-ups)", () => {
+    const primary = mkEvent();
+    const cardClick = mkEvent({ message_id: "om_f1", larkway_trigger_type: "card_action", content: textContent("choice") });
+    expect(canCoalesceFollowup(primary as never, cardClick as never)).toBe(false);
+    const stallWake = mkEvent({ message_id: "om_f2", reply_anchor_message_id: "om_anchor", content: textContent("x") });
+    expect(canCoalesceFollowup(primary as never, stallWake as never)).toBe(false);
+    expect(canCoalesceFollowup(cardClick as never, mkEvent({ message_id: "om_f3", content: textContent("y") }) as never)).toBe(false);
+  });
+
+  it("rejects an empty-text follow-up (bare @ keeps its pull-the-history contract)", () => {
+    const primary = mkEvent();
+    const bareAt = mkEvent({ message_id: "om_f1", content: textContent("") });
+    expect(canCoalesceFollowup(primary as never, bareAt as never)).toBe(false);
+  });
+
+  it("rejects a follow-up carrying attachments (image keys ride per-message prompt facts)", () => {
+    const primary = mkEvent();
+    const image = mkEvent({
+      message_id: "om_f1",
+      content: JSON.stringify({ image_key: "img_v2_abc" }),
+      message_type: "image",
+      msg_type: "image",
+    });
+    expect(canCoalesceFollowup(primary as never, image as never)).toBe(false);
+  });
+});

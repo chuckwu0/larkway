@@ -1127,3 +1127,31 @@ taskHandle:
     await expect(loadBots(botsDir())).rejects.toThrow();
   });
 });
+
+// ---------------------------------------------------------------------------
+// 批D — warm-pool defaults (effectiveWarmProcess / effectivePrewarmProcess)
+// ---------------------------------------------------------------------------
+
+describe("effectiveWarmProcess / effectivePrewarmProcess (批D default-on)", () => {
+  it("defaults ON for claude/codex, OFF for any other backend", async () => {
+    const { effectiveWarmProcess } = await import("./botLoader.js");
+    expect(effectiveWarmProcess({ backend: "claude", warmProcess: undefined })).toBe(true);
+    expect(effectiveWarmProcess({ backend: "codex", warmProcess: undefined })).toBe(true);
+    expect(effectiveWarmProcess({ backend: "gemini", warmProcess: undefined })).toBe(false);
+  });
+
+  it("explicit warmProcess:false opts out; explicit true on an unsupported backend is honored as-written (main.ts never builds a pool for it anyway)", async () => {
+    const { effectiveWarmProcess } = await import("./botLoader.js");
+    expect(effectiveWarmProcess({ backend: "claude", warmProcess: false })).toBe(false);
+    expect(effectiveWarmProcess({ backend: "codex", warmProcess: false })).toBe(false);
+    expect(effectiveWarmProcess({ backend: "gemini", warmProcess: true })).toBe(true);
+  });
+
+  it("prewarm follows the warm-pool default and honors its own opt-out", async () => {
+    const { effectivePrewarmProcess } = await import("./botLoader.js");
+    expect(effectivePrewarmProcess({ backend: "claude", warmProcess: undefined, prewarmProcess: undefined })).toBe(true);
+    expect(effectivePrewarmProcess({ backend: "claude", warmProcess: undefined, prewarmProcess: false })).toBe(false);
+    expect(effectivePrewarmProcess({ backend: "claude", warmProcess: false, prewarmProcess: true })).toBe(false);
+    expect(effectivePrewarmProcess({ backend: "gemini", warmProcess: undefined, prewarmProcess: undefined })).toBe(false);
+  });
+});

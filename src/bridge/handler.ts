@@ -244,6 +244,48 @@ async function isWorktreeGitHealthy(worktreePath: string): Promise<boolean> {
  * @param label     Human-readable name for log messages (e.g. slug).
  */
 /**
+ * 批D gated coalescing: decide whether `candidate` —
+ * a message QUEUED behind an in-flight turn on the same serial chain — may be
+ * merged into the turn `primary` is about to start, instead of burning a full
+ * turn of its own. Deliberately conservative; every reject falls back to
+ * today's behavior (its own turn), so a `false` here is never wrong, only
+ * slower.
+ *
+ * Requirements:
+ *  - Both are REAL user messages. Synthetic turns (card-button clicks, task
+ *    stall/comment wake-ups — identified by `larkway_trigger_type` /
+ *    `reply_anchor_message_id`, which no real inbound event carries) have
+ *    their own content contracts and never coalesce.
+ *  - Same SESSION key (`root_id ?? message_id` — message.ts's threadId rule).
+ *    The serial-queue key can be a superset of the session key (quote replies
+ *    keyed by parent_id), and merging across sessions would leak one
+ *    session's ask into another's turn.
+ *  - The candidate parses to plain non-empty text with no attachments: the
+ *    merged prompt represents followups as text lines only, so an image/file
+ *    followup (whose keys ride per-message prompt facts) and an empty-@
+ *    followup (whose contract is "pull the thread history first") each keep
+ *    their own turn.
+ */
+export function canCoalesceFollowup(
+  primary: import("../lark/transport.js").LarkMessageEvent,
+  candidate: import("../lark/transport.js").LarkMessageEvent,
+): boolean {
+  if (primary.larkway_trigger_type != null || candidate.larkway_trigger_type != null) return false;
+  if (primary.reply_anchor_message_id != null || candidate.reply_anchor_message_id != null) return false;
+  const sessionKeyOf = (e: import("../lark/transport.js").LarkMessageEvent): string =>
+    typeof e.root_id === "string" && e.root_id ? e.root_id : e.message_id;
+  if (sessionKeyOf(primary) !== sessionKeyOf(candidate)) return false;
+  try {
+    const parsed = parseMessage(candidate);
+    if (parsed.attachments.length > 0) return false;
+    if (parsed.text.trim() === "") return false;
+  } catch {
+    return false;
+  }
+  return true;
+}
+
+/**
  * Per-basePath serialization for clone-if-missing + timeout cleanup. The
  * shared repo cache is used across threads AND bots (main.ts sharedReposDir),
  * while handler-level serialization is per session key only — so two turns
@@ -1003,6 +1045,15 @@ export class BridgeHandler {
   async run(opts?: { abortSignal?: AbortSignal }): Promise<void> {
     const signal = opts?.abortSignal;
     const threadQueues = new Map<string, Promise<void>>();
+    // 批D gated coalescing: events wait here (in arrival order, per queue key)
+    // between being enqueued and their drain link running. A drain takes the
+    // first waiting event as its turn's PRIMARY, then greedily absorbs every
+    // immediately-following event that canCoalesceFollowup() allows — so N
+    // rapid-fire messages that piled up behind a long turn become ONE merged
+    // turn instead of N sequential ones. Drain links outnumber consumed
+    // groups by construction (one link per event); surplus links find their
+    // event already absorbed and no-op.
+    const pendingByKey = new Map<string, import("../lark/transport.js").LarkMessageEvent[]>();
 
     // Semaphore: cap concurrent handleOne() calls across all threads.
     const MAX_CONCURRENT = 5;
@@ -1055,16 +1106,38 @@ export class BridgeHandler {
       const legacySessionKey =
         (typeof event.root_id === "string" && event.root_id) ? event.root_id : event.message_id;
       if (legacySessionKey !== key) this.threadReceivedAt.set(legacySessionKey, Date.now());
+      let pendingList = pendingByKey.get(key);
+      if (pendingList == null) {
+        pendingList = [];
+        pendingByKey.set(key, pendingList);
+      }
+      pendingList.push(event);
       const prev = threadQueues.get(key) ?? Promise.resolve();
       const next = prev
         .then(() => acquire())
-        .then(() => this.handleOne(event))
+        .then(() => {
+          const pending = pendingByKey.get(key);
+          const primary = pending?.shift();
+          if (primary == null) return; // absorbed into an earlier drain's merged turn
+          const followups: import("../lark/transport.js").LarkMessageEvent[] = [];
+          while (pending != null && pending.length > 0 && canCoalesceFollowup(primary, pending[0]!)) {
+            followups.push(pending.shift()!);
+          }
+          if (followups.length > 0) {
+            console.log(
+              `[bridge.handler] coalescing ${followups.length} queued follow-up message(s) into ` +
+                `turn ${primary.message_id} on thread ${key}`,
+            );
+          }
+          return this.handleOne(primary, followups);
+        })
         .catch((err: unknown) => {
           console.error(`[bridge.handler] unhandled error on thread ${key}:`, err);
         })
         .finally(() => {
           release();
           if (threadQueues.get(key) === next) threadQueues.delete(key);
+          if ((pendingByKey.get(key)?.length ?? 0) === 0) pendingByKey.delete(key);
           this.inFlightTurns.delete(next);
         });
       // Track the true completion of this turn (handleOne + all trailing I/O) so
@@ -1086,7 +1159,17 @@ export class BridgeHandler {
   // Private: single-event lifecycle
   // ---------------------------------------------------------------------------
 
-  private async handleOne(event: import("../lark/transport.js").LarkMessageEvent): Promise<void> {
+  /**
+   * @param followups 批D gated coalescing — same-session messages that queued
+   * up behind the previous turn and are merged into THIS one (see run()'s
+   * drain loop + canCoalesceFollowup). They contribute their text to the
+   * prompt and settle together with the primary; everything else about the
+   * turn (card, session, task probes) is driven by `event` alone.
+   */
+  private async handleOne(
+    event: import("../lark/transport.js").LarkMessageEvent,
+    followups: import("../lark/transport.js").LarkMessageEvent[] = [],
+  ): Promise<void> {
     // Terminal-settle guard: EVERY exit path of handleOne must settle the
     // message exactly once (markHandled on success, markUnhandled on failure).
     // The dispatcher adds the message to inFlightMessageIds BEFORE handleOne
@@ -1123,8 +1206,13 @@ export class BridgeHandler {
     const settle = (ok: boolean): void => {
       if (settled) return;
       settled = true;
-      if (ok) this.deps.client.markHandled?.(settleMessageId);
-      else this.deps.client.markUnhandled?.(settleMessageId, { replay: !agentRunCompleted });
+      // 批D: coalesced followups share this turn's fate — all handled on
+      // success, all released for replay on failure (their content rode this
+      // turn's prompt, so a replayed primary re-absorbs them via gap-fill).
+      for (const id of [settleMessageId, ...followups.map((f) => f.message_id)]) {
+        if (ok) this.deps.client.markHandled?.(id);
+        else this.deps.client.markUnhandled?.(id, { replay: !agentRunCompleted });
+      }
     };
     try {
     // Step 1: parse
@@ -1225,6 +1313,31 @@ export class BridgeHandler {
       reason: "已进入 bridge，准备创建处理卡片。",
     });
     await this.deps.client.addProcessingReaction?.(messageId);
+
+    // 批D: make each coalesced followup visible in the runtime event log (Web
+    // UI "why didn't my message get its own reply" debugging) — best-effort,
+    // same contract as recordEvent above.
+    for (const f of followups) {
+      if (!this.deps.recordRuntimeEvent) break;
+      try {
+        await this.deps.recordRuntimeEvent({
+          id: f.message_id,
+          botId,
+          botName: this.deps.botConfig?.name,
+          messageId: f.message_id,
+          threadId,
+          chatId: parsed.chatId,
+          senderId: typeof f.sender_id === "string" ? f.sender_id : undefined,
+          triggerType,
+          status: "received",
+          receivedAt: new Date(eventStartedAt).toISOString(),
+          statusPath: ["已收到", "合并进同轮"],
+          reason: `排队期间到达,已合并进 ${messageId} 的同一轮处理。`,
+        });
+      } catch (err) {
+        console.warn("[bridge.handler] recordRuntimeEvent (coalesced followup) failed (continuing):", err);
+      }
+    }
 
     // Task-handle mechanical writeback (docs/task-handle.md §5.1) — best-effort,
     // never throws into the main dispatch. botId absent (V1/no-yaml) → no-op,
@@ -1999,9 +2112,20 @@ export class BridgeHandler {
           }
         }
 
+        // 批D: coalesced followups ride the prompt as extra <user-message>
+        // lines. Parsed here (not in run()'s drain) so a parse quirk degrades
+        // to "text missing from this turn" + the warn parseMessage itself
+        // logs, never a dropped turn — canCoalesceFollowup already vetted
+        // each of these as parseable plain text when it admitted them.
+        const queuedFollowups = followups.map((f) => {
+          const p = parseMessage(f);
+          return { senderOpenId: p.senderOpenId, text: p.text };
+        });
+
         const prompt = await renderPrompt({
           parsed,
           isNewThread: currentIsNewThread,
+          queuedFollowups,
           conventions: {
             worktreePath,
             runtime: conventions.runtime,
