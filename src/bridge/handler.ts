@@ -1898,6 +1898,17 @@ export class BridgeHandler {
         }
       }
 
+      // 批D: coalesced followups ride the prompt as extra <user-message>
+      // lines AND the transcript entry below. Parsed here (not in run()'s
+      // drain) so a parse quirk degrades to "text missing from this turn" +
+      // the warn parseMessage itself logs, never a dropped turn —
+      // canCoalesceFollowup already vetted each of these as parseable plain
+      // text when it admitted them.
+      const queuedFollowups = followups.map((f) => {
+        const p = parseMessage(f);
+        return { senderOpenId: p.senderOpenId, text: p.text };
+      });
+
       // V0.3 workspace runtime: persist only the trigger facts for this Feishu
       // topic turn. The Agent owns any reading/summarizing of broader context.
       if (isAgentWorkspace) {
@@ -1906,6 +1917,7 @@ export class BridgeHandler {
           parsed,
           isNewThread: existing === undefined,
           larkCliProfile: this.deps.larkCliProfile,
+          queuedFollowups,
         });
       }
 
@@ -2111,16 +2123,6 @@ export class BridgeHandler {
             taskRootInfo.topicLink = buildTopicDeepLink(parsed.chatId, refreshedThreadId);
           }
         }
-
-        // 批D: coalesced followups ride the prompt as extra <user-message>
-        // lines. Parsed here (not in run()'s drain) so a parse quirk degrades
-        // to "text missing from this turn" + the warn parseMessage itself
-        // logs, never a dropped turn — canCoalesceFollowup already vetted
-        // each of these as parseable plain text when it admitted them.
-        const queuedFollowups = followups.map((f) => {
-          const p = parseMessage(f);
-          return { senderOpenId: p.senderOpenId, text: p.text };
-        });
 
         const prompt = await renderPrompt({
           parsed,

@@ -190,11 +190,9 @@ export interface ClaudePrewarmOptions {
   agentBinPath?: string;
 }
 
-/** A blank that dies younger than this (before ever being adopted) counts toward the prewarm circuit breaker. */
-const BLANK_EARLY_DEATH_MS = 30_000;
-/** Consecutive early deaths after which prewarm disables itself for this bridge's lifetime. */
+/** Consecutive unprompted blank deaths after which prewarm disables itself for this bridge's lifetime. */
 const MAX_PREWARM_FAILURES = 3;
-/** Base delay before respawning a blank after an early death (doubles per consecutive failure). */
+/** Base delay before respawning a blank after an unprompted death (doubles per consecutive failure). */
 const PREWARM_RESPAWN_BACKOFF_MS = 10_000;
 
 export interface ClaudeProcessPoolOptions {
@@ -265,7 +263,7 @@ export class ClaudeProcessPool implements AgentRunner {
   // -- 批D blank-standby prewarm state ----------------------------------------
   /** Set by prewarm(); undefined = prewarm never requested (no blank maintenance). */
   #prewarmProto: ClaudePrewarmOptions | undefined;
-  /** Consecutive blank early-deaths — resets on a successful adoption. */
+  /** Consecutive unprompted blank deaths (any age) — resets on a successful adoption. */
   #prewarmFailures = 0;
   /** True once the circuit breaker tripped (MAX_PREWARM_FAILURES) — prewarm off until bridge restart. */
   #prewarmDisabled = false;
@@ -896,31 +894,35 @@ export class ClaudeProcessPool implements AgentRunner {
     this.#rewritePidListBestEffort();
     void this.#deleteRunnerPidFileIfMine(entry);
 
-    // 批D blank lifecycle accounting. An UNPROMPTED early death of a
-    // still-blank standby (not one we tore down ourselves) is the signature
-    // of a wire-protocol/config problem — count it toward the circuit
-    // breaker and back off before respawning, so a broken environment can't
-    // turn the standby into a spawn loop. Any other exit (adopted entry,
-    // deliberate teardown, old-age death) just frees a slot: try to
-    // replenish the standby straight away.
+    // 批D blank lifecycle accounting. ANY unprompted death of a still-blank
+    // standby (not one we tore down ourselves — those set `destroyed` first)
+    // is anomalous regardless of its age: blanks are idle-sweep-exempt, so
+    // nothing legitimate ends one except adoption, eviction, or shutdown.
+    // Every such death counts toward the circuit breaker and pays a backoff
+    // before the respawn, so a broken environment can't turn the standby
+    // into a spawn loop — no matter whether the child dies in 2 seconds
+    // (bad flag) or 2 minutes (auth/MCP init that limps along before dying;
+    // Workflow adversarial review caught that an "early deaths only" gate
+    // here left the ≥30s case as an unbounded immediate-respawn loop).
+    // An ADOPTED entry's exit just frees a slot: replenish straight away.
     if (this.#prewarmProto != null && !this.#shuttingDown && !this.#prewarmDisabled) {
-      const earlyBlankDeath =
-        entry.blank && !wasAlreadyMarkedDestroyed && Date.now() - entry.spawnedAt < BLANK_EARLY_DEATH_MS;
-      if (earlyBlankDeath) {
+      const unpromptedBlankDeath = entry.blank && !wasAlreadyMarkedDestroyed;
+      if (unpromptedBlankDeath) {
         this.#prewarmFailures += 1;
         if (this.#prewarmFailures >= MAX_PREWARM_FAILURES) {
           this.#prewarmDisabled = true;
           const stderr = Buffer.concat(entry.stderrChunks).toString("utf8").trim().slice(-2_000);
           console.warn(
-            `[claude-pool] blank standby died early ${this.#prewarmFailures} times in a row — disabling ` +
+            `[claude-pool] blank standby died unprompted ${this.#prewarmFailures} times in a row — disabling ` +
               "prewarm until the bridge restarts (warm pooling itself stays on; turns just spawn on demand)." +
               (stderr ? ` last stderr tail:\n${stderr}` : ""),
           );
         } else {
           const delay = PREWARM_RESPAWN_BACKOFF_MS * 2 ** (this.#prewarmFailures - 1);
           console.warn(
-            `[claude-pool] blank standby pid=${entry.child.pid ?? "?"} died within ${BLANK_EARLY_DEATH_MS}ms ` +
-              `of spawning (${this.#prewarmFailures}/${MAX_PREWARM_FAILURES}) — respawning in ${delay}ms.`,
+            `[claude-pool] blank standby pid=${entry.child.pid ?? "?"} died unprompted after ` +
+              `${Math.round((Date.now() - entry.spawnedAt) / 1000)}s ` +
+              `(${this.#prewarmFailures}/${MAX_PREWARM_FAILURES}) — respawning in ${delay}ms.`,
           );
           this.#prewarmRespawnTimer = setTimeout(() => {
             this.#prewarmRespawnTimer = undefined;

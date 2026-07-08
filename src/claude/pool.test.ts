@@ -982,7 +982,7 @@ describe("ClaudeProcessPool — blank standby prewarm (批D)", () => {
     }
   });
 
-  it("circuit breaker: 3 consecutive early blank deaths disable prewarm (with backoff between respawns)", async () => {
+  it("circuit breaker: 3 consecutive unprompted blank deaths disable prewarm (with backoff between respawns)", async () => {
     const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "Date"] });
     try {
@@ -991,7 +991,7 @@ describe("ClaudeProcessPool — blank standby prewarm (批D)", () => {
       await flush();
       expect(spawnedChildren).toHaveLength(1);
 
-      // Death 1 — early (well under BLANK_EARLY_DEATH_MS). Respawn after 10s backoff.
+      // Death 1 — unprompted. Respawn after 10s backoff.
       spawnedChildren[0]!.emit("exit");
       await flush();
       expect(spawnedChildren).toHaveLength(1); // not yet — backoff pending
@@ -1060,6 +1060,49 @@ describe("ClaudeProcessPool — blank standby prewarm (批D)", () => {
       await flush();
       await h2.done;
     } finally {
+      warnSpy.mockRestore();
+    }
+  });
+});
+
+describe("ClaudeProcessPool — blank standby prewarm (批D, adversarial-review fixes)", () => {
+  const PROTO = { cwd: "/ws/bot-a", model: "sonnet", effort: "high", permissionMode: "bypassPermissions" as const };
+
+  it("a blank dying LONG after spawn (≥30s) still pays backoff and counts toward the breaker — no immediate-respawn loop", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "Date"] });
+    try {
+      const pool = new ClaudeProcessPool({ botId: "bot-a" });
+      pool.prewarm(PROTO);
+      await flush();
+      expect(spawnedChildren).toHaveLength(1);
+
+      // Blank survives well past any "early death" horizon, THEN dies unprompted.
+      await vi.advanceTimersByTimeAsync(120_000);
+      spawnedChildren[0]!.emit("exit");
+      await flush();
+      // NOT an immediate respawn — the backoff gate applies at any age.
+      expect(spawnedChildren).toHaveLength(1);
+      await vi.advanceTimersByTimeAsync(10_100);
+      await flush();
+      expect(spawnedChildren).toHaveLength(2);
+
+      // Two more late deaths trip the breaker exactly like fast deaths do.
+      await vi.advanceTimersByTimeAsync(60_000);
+      spawnedChildren[1]!.emit("exit");
+      await flush();
+      await vi.advanceTimersByTimeAsync(20_100);
+      await flush();
+      expect(spawnedChildren).toHaveLength(3);
+      await vi.advanceTimersByTimeAsync(60_000);
+      spawnedChildren[2]!.emit("exit");
+      await flush();
+      await vi.advanceTimersByTimeAsync(600_000);
+      await flush();
+      expect(spawnedChildren).toHaveLength(3); // breaker tripped — no fourth spawn
+      expect(warnSpy.mock.calls.some((c) => String(c[0]).includes("disabling prewarm"))).toBe(true);
+    } finally {
+      vi.useRealTimers();
       warnSpy.mockRestore();
     }
   });

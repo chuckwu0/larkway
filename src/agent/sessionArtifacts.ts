@@ -8,6 +8,13 @@ export interface EnsureSessionArtifactsInput {
   parsed: ParsedMessage;
   isNewThread: boolean;
   larkCliProfile?: string;
+  /**
+   * 批D gated coalescing: same-session messages merged into this turn
+   * (bridge/handler.ts). Recorded in the transcript entry so the durable
+   * per-topic record stays complete — their text rode the prompt, not a turn
+   * of their own, so without this they'd vanish from transcript.md entirely.
+   */
+  queuedFollowups?: Array<{ senderOpenId: string; text: string }>;
 }
 
 async function writeIfMissing(filePath: string, content: string): Promise<void> {
@@ -88,6 +95,14 @@ function renderTranscriptEntry(input: EnsureSessionArtifactsInput): string {
     "",
     indentBlock(parsed.text),
     "",
+    ...(input.queuedFollowups && input.queuedFollowups.length > 0
+      ? [
+          "### Coalesced Follow-ups",
+          "",
+          ...input.queuedFollowups.flatMap((f) => [`- ${f.senderOpenId}:`, indentBlock(f.text)]),
+          "",
+        ]
+      : []),
     "### Feishu Doc Links",
     "",
     ...renderList(parsed.feishuDocLinks),

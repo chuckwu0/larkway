@@ -4760,3 +4760,194 @@ describe("canCoalesceFollowup (批D gated coalescing)", async () => {
     expect(canCoalesceFollowup(primary as never, image as never)).toBe(false);
   });
 });
+
+// ---------------------------------------------------------------------------
+// 批D — run() drain/absorption + shared settle (integration, adversarial-review fix)
+// ---------------------------------------------------------------------------
+
+describe("run() gated coalescing — drain, merged prompt, shared settle (批D)", () => {
+  /** Client yielding events with async gates so tests control turn interleaving. */
+  function makeMultiClient(eventsFactory: (gates: { firstRunStarted: Promise<void> }) => AsyncGenerator<Record<string, unknown>>, firstRunStarted: Promise<void>) {
+    const acked: string[] = [];
+    const unhandled: Array<{ id: string; replay?: boolean }> = [];
+    const client = {
+      events: () => eventsFactory({ firstRunStarted }),
+      addProcessingReaction: async () => {},
+      removeProcessingReaction: async () => {},
+      acknowledgeMessage: (id: string) => acked.push(id),
+      markHandled: (id: string) => acked.push(id),
+      markUnhandled: (id: string, opts?: { replay?: boolean }) => unhandled.push({ id, replay: opts?.replay }),
+    };
+    return { client, acked, unhandled };
+  }
+
+  const topicEvent = (messageId: string, rootId: string | undefined, text: string): Record<string, unknown> => ({
+    message_id: messageId,
+    chat_id: "oc_chat",
+    chat_type: "topic_group",
+    thread_id: rootId ?? messageId,
+    ...(rootId ? { root_id: rootId } : {}),
+    sender_id: "ou_sender",
+    content: JSON.stringify({ text }),
+    create_time: "1700000000000",
+  });
+
+  function gatedRunner() {
+    const prompts: string[] = [];
+    const releases: Array<(r: { exitCode: number; sessionId?: string }) => void> = [];
+    const rejects: Array<(e: Error) => void> = [];
+    let signalFirstStarted!: () => void;
+    const firstRunStarted = new Promise<void>((r) => {
+      signalFirstStarted = r;
+    });
+    runClaudeImpl = (opts: unknown) => {
+      prompts.push((opts as { prompt: string }).prompt);
+      if (prompts.length === 1) signalFirstStarted();
+      const done = new Promise<{ exitCode: number; sessionId?: string }>((resolve, reject) => {
+        releases.push(resolve);
+        rejects.push(reject);
+      });
+      return {
+        events: (async function* () {
+          yield { type: "system_init", sessionId: "sess_x", raw: {} };
+        })(),
+        done,
+        kill: () => {},
+      };
+    };
+    return { prompts, releases, rejects, firstRunStarted };
+  }
+
+  it("messages queued behind an in-flight turn merge into ONE follow-up turn; ALL ids markHandled on success", async () => {
+    const { prompts, releases, firstRunStarted } = gatedRunner();
+    const { renderer } = makeCardRenderer();
+    const { store } = makeSessionStore();
+    const { client, acked } = makeMultiClient(async function* (gates) {
+      yield topicEvent("om_c1", undefined, "先查 A");
+      await gates.firstRunStarted; // turn 1 is live — the next two must QUEUE
+      yield topicEvent("om_c2", "om_c1", "补充:也看 B");
+      yield topicEvent("om_c3", "om_c1", "顺便 bump 版本");
+    }, firstRunStarted);
+    await seedRepoCachePath();
+
+    const handler = new BridgeHandler({
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      client: client as any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      cardRenderer: renderer as any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      sessionStore: store as any,
+      conventions: makeConventions(),
+      botConfig: { id: "frontend", name: "Frontend", turn_taking_limit: 10, backend: "claude" },
+    });
+
+    const runDone = handler.run();
+    // Wait until turn 1 started AND both follow-ups are enqueued (events loop done).
+    await firstRunStarted;
+    await runDone; // for-await drained all 3 events; turns still in flight
+    releases[0]!({ exitCode: 0, sessionId: "sess_x" });
+    // Second (merged) turn starts once turn 1 fully settles.
+    for (let i = 0; i < 200 && prompts.length < 2; i++) await new Promise((r) => setTimeout(r, 10));
+    expect(prompts).toHaveLength(2);
+    // Turn 2 = om_c2 as primary + om_c3 absorbed as its single followup.
+    expect(prompts[1]).toContain("1 条追加消息");
+    expect(prompts[1]).toContain("ou_sender: 补充:也看 B");
+    expect(prompts[1]).toContain("ou_sender: 顺便 bump 版本");
+    releases[1]!({ exitCode: 0, sessionId: "sess_x" });
+    await handler.whenAllTurnsSettled();
+
+    // Exactly 2 turns for 3 messages; every message id reached markHandled.
+    expect(prompts).toHaveLength(2);
+    for (const id of ["om_c1", "om_c2", "om_c3"]) expect(acked).toContain(id);
+  });
+
+  it("a FAILED merged turn releases the primary AND every followup for replay", async () => {
+    const { prompts, releases, rejects, firstRunStarted } = gatedRunner();
+    const { renderer } = makeCardRenderer();
+    const { store } = makeSessionStore();
+    const { client, acked, unhandled } = makeMultiClient(async function* (gates) {
+      yield topicEvent("om_f1", undefined, "任务一");
+      await gates.firstRunStarted;
+      yield topicEvent("om_f2", "om_f1", "任务二");
+      yield topicEvent("om_f3", "om_f1", "任务三");
+    }, firstRunStarted);
+    await seedRepoCachePath();
+
+    const handler = new BridgeHandler({
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      client: client as any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      cardRenderer: renderer as any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      sessionStore: store as any,
+      conventions: makeConventions(),
+      botConfig: { id: "frontend", name: "Frontend", turn_taking_limit: 10, backend: "claude" },
+    });
+
+    const runDone = handler.run();
+    await firstRunStarted;
+    await runDone;
+    releases[0]!({ exitCode: 0, sessionId: "sess_x" });
+    for (let i = 0; i < 200 && prompts.length < 2; i++) await new Promise((r) => setTimeout(r, 10));
+    expect(prompts).toHaveLength(2);
+    rejects[1]!(new Error("agent crashed mid-turn"));
+    await handler.whenAllTurnsSettled();
+
+    // Turn 1 succeeded; the merged turn's primary AND followups were all
+    // released as unhandled (replayable — the agent never完成 their work).
+    expect(acked).toContain("om_f1");
+    const releasedIds = unhandled.map((u) => u.id);
+    expect(releasedIds).toContain("om_f2");
+    expect(releasedIds).toContain("om_f3");
+    for (const u of unhandled) expect(u.replay).toBe(true);
+  });
+
+  it("queued messages with DIFFERENT session keys are never merged — each gets its own turn", async () => {
+    const { prompts, releases, firstRunStarted } = gatedRunner();
+    const { renderer } = makeCardRenderer();
+    const { store } = makeSessionStore();
+    // Two quote replies on the same parent (shared QUEUE key = parent_id) but
+    // each its own session (no root_id → session key = own message_id).
+    const quoteReply = (messageId: string, text: string): Record<string, unknown> => ({
+      message_id: messageId,
+      chat_id: "oc_chat",
+      chat_type: "group",
+      thread_id: messageId,
+      parent_id: "om_parent",
+      sender_id: "ou_sender",
+      content: JSON.stringify({ text }),
+      create_time: "1700000000000",
+    });
+    const { client, acked } = makeMultiClient(async function* (gates) {
+      yield quoteReply("om_q1", "问题一");
+      await gates.firstRunStarted;
+      yield quoteReply("om_q2", "问题二");
+    }, firstRunStarted);
+    await seedRepoCachePath();
+
+    const handler = new BridgeHandler({
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      client: client as any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      cardRenderer: renderer as any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      sessionStore: store as any,
+      conventions: makeConventions(),
+      botConfig: { id: "frontend", name: "Frontend", turn_taking_limit: 10, backend: "claude" },
+    });
+
+    const runDone = handler.run();
+    await firstRunStarted;
+    await runDone;
+    releases[0]!({ exitCode: 0, sessionId: "sess_x" });
+    for (let i = 0; i < 200 && prompts.length < 2; i++) await new Promise((r) => setTimeout(r, 10));
+    expect(prompts).toHaveLength(2);
+    expect(prompts[1]).not.toContain("追加消息");
+    expect(prompts[1]).toContain("问题二");
+    expect(prompts[0]).not.toContain("问题二");
+    releases[1]!({ exitCode: 0, sessionId: "sess_x" });
+    await handler.whenAllTurnsSettled();
+    expect(acked).toContain("om_q1");
+    expect(acked).toContain("om_q2");
+  });
+});
