@@ -47,7 +47,8 @@
 | v0.3.40 | v0.3.40 | patch / 已发布 | task-handle v4 任务派单主路径:建任务→发送到群→@agent 即认领;工作话题自动开在任务卡片上;认领评论带话题深链回跳;全程评论汇报里程碑(交付/失败/等拍板推送),完成由人点;零清单配置,分享到群即权限齐备 |
 | v0.3.41 | v0.3.41 | patch / 已发布 | 修复任务派单真机三连问题:普通群引用回复的 thread_id 可能是根消息 om_ id(非话题)——omt_ 窄化后改锚正常触发(话题开在任务卡片上)、COT 不再在触发消息上开杂话题、任务评论里的话题深链不再失效 |
 | v0.3.42 | v0.3.42 | patch / 已发布 | 任务派单话题落点终修:live 推送的引用回复不带 root_id(平台坑)——改用 root_id??parent_id 探测,命中任务卡片时话题开在卡片上且 session 重键到卡片 id,首次@/话题追问/评论指挥收敛同一 session |
-| v0.3.43 | v0.3.43 | 当前 patch / 已发布 | perf 批D: warm pool default-on + blank-standby prewarm (zero cold start for new threads) + gated message coalescing (queued same-session messages merge into one turn) |
+| v0.3.43 | v0.3.43 | patch / 已发布 | perf 批D: warm pool default-on + blank-standby prewarm (zero cold start for new threads) + gated message coalescing (queued same-session messages merge into one turn) |
+| v0.3.44 | v0.3.44 | 当前 patch / 已发布 | 巡检自恢复加固(完成率目标):bridge 自动认领(认领 turn 崩溃不再造成巡检盲区,含跨 bot 双认领守卫+认领评论欠账持久化);交接检测区分 peer 失败收尾(下游崩溃 5 分钟内唤醒重派);一般停滞档 24h→1h(due 档保 24h 冷却地板) |
 
 ## 使用原则
 
@@ -102,4 +103,5 @@ v0.3.40       = task-handle v4 任务派单主路径:建任务→发送到群→
 v0.3.41       = 修复任务派单真机三连问题:普通群引用回复的 thread_id 可能是根消息 om_ id(非话题)——omt_ 窄化后改锚正常触发(话题开在任务卡片上)、COT 不再在触发消息上开杂话题、任务评论里的话题深链不再失效
 v0.3.42       = 任务派单话题落点终修:live 推送的引用回复不带 root_id(平台坑)——改用 root_id??parent_id 探测,命中任务卡片时话题开在卡片上且 session 重键到卡片 id,首次@/话题追问/评论指挥收敛同一 session
 v0.3.43       = perf 批D: warm pool default-on + blank-standby prewarm (zero cold start for new threads) + gated message coalescing (queued same-session messages merge into one turn)
+v0.3.44       = 巡检自恢复加固(完成率目标):bridge 自动认领(认领 turn 崩溃不再造成巡检盲区,含跨 bot 双认领守卫+认领评论欠账持久化);交接检测区分 peer 失败收尾(下游崩溃 5 分钟内唤醒重派);一般停滞档 24h→1h(due 档保 24h 冷却地板)
 ```

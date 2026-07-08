@@ -1,6 +1,6 @@
 {
   "name": "larkway",
-  "version": "0.3.43",
+  "version": "0.3.44",
   "description": "Thin bridge: Feishu thread to local Claude Code CLI",
   "license": "MIT",
   "author": "Chuck Wu (chuckwu0)",
