@@ -286,6 +286,12 @@ export interface RenderPromptInput {
     /** client/thread/open deep link into the work topic, when resolvable this turn. */
     topicLink?: string;
     claimed: boolean;
+    /**
+     * v4.2: the bridge auto-claim CREATED the claim this very turn — the
+     * agent still owes the user-facing claim comment (with the topic link).
+     * Absent on later turns of an already-claimed thread.
+     */
+    justClaimed?: boolean;
   };
   /**
    * A2 (perf plan): neutral fact lines for agent-workspace files whose mtime
@@ -488,6 +494,7 @@ function renderTaskRootBlock(taskRoot: {
   summary: string;
   topicLink?: string;
   claimed: boolean;
+  justClaimed?: boolean;
 }): string[] {
   const lines = [
     "<task-root>",
@@ -498,11 +505,22 @@ function renderTaskRootBlock(taskRoot: {
     `task_root_claimed: ${taskRoot.claimed ? "yes" : "no"}`,
   ];
   if (taskRoot.claimed) {
-    lines.push(
-      "本话题已认领这个任务。维护面只有任务评论:仅在交付/失败/等拍板三类里程碑节点发任务评论" +
-        "(lark-cli task comments create);真正交付的那一轮在 state.json 的 task_handle 里声明 done: true," +
-        "并发一条「已交付,看过请点完成」评论。不要修改任务描述、不要勾完成/reopen——完成永远由人在任务中心点。",
-    );
+    if (taskRoot.justClaimed) {
+      lines.push(
+        "bridge 本轮已自动认领这个任务(机械绑定,不需要你再写 state.json 认领)。你现在要做两件事:" +
+          "① 发一条**认领评论**(lark-cli task comments create):一句认领声明" +
+          `${taskRoot.topicLink ? " + 上面的 topic_link(用户点它直达本话题——任务→话题唯一回跳,别省略)" : ""};` +
+          "② 正常干活(任务标题/描述就是需求)。之后维护面只有任务评论(交付/失败/等拍板才发,过程碎碎念不发);" +
+          "真正交付的那一轮在 state.json 的 task_handle 里声明 done: true 并发「已交付,看过请点完成」评论。" +
+          "不要修改任务描述、不要勾完成/reopen——完成永远由人在任务中心点。",
+      );
+    } else {
+      lines.push(
+        "本话题已认领这个任务。维护面只有任务评论:仅在交付/失败/等拍板三类里程碑节点发任务评论" +
+          "(lark-cli task comments create);真正交付的那一轮在 state.json 的 task_handle 里声明 done: true," +
+          "并发一条「已交付,看过请点完成」评论。不要修改任务描述、不要勾完成/reopen——完成永远由人在任务中心点。",
+      );
+    }
   } else {
     lines.push(
       "本轮请顺带静默认领,分两步:① 先读一遍该任务的现有评论(lark-cli task comments list)——如果已有" +

@@ -20,15 +20,19 @@ description: 话题 ↔ 飞书任务句柄 —— 主路径:用户建任务发�
 用户的操作是:建了一条飞书任务 →「发送任务到会话」发进群 → 在这条任务卡片的话题里 @ 你。
 `<task-root>` 块里有 `task_guid`、`task_summary`、(通常还有)`topic_link` 和 `task_root_claimed`。
 
-**认领(`task_root_claimed: no` 时,本轮顺带做,静默)**:
+**认领(v4.2 起由 bridge 自动完成)**:主路径的绑定是机械确定的(话题根=任务卡片,guid 唯一),
+所以 **bridge 在你跑起来之前就已经自动认领了**——`<task-root>` 块里 `task_root_claimed: yes` +
+「bridge 本轮已自动认领」字样时,你只需要:
 1. **双 @ 竞态护栏**:先读一遍该任务的现有评论(`lark-cli task comments list`)——已有**其他 agent**
-   的认领声明 → 同话题的另一个 bot 已接手,本轮不认领、不声张,正常回答用户即可(重复认领 = 双份
-   维护 + 双份巡检骚扰,是设计红线)。
-2. 把 `task_guid` 写进 `.larkway/state.json` 的 `task_handle.guid`(与辅路径同一声明通道)。
-3. 发一条**认领评论**(`lark-cli task comments create --resource-type task --resource-id <task_guid> ...`):
+   的认领声明 → 同话题的另一个 bot 已接手,评论区不再重复发认领评论(重复评论 = 骚扰),正常配合即可。
+2. 发一条**认领评论**(`lark-cli task comments create --resource-type task --resource-id <task_guid> ...`):
    一句认领声明 + `topic_link`(用户从任务中心点它直达本话题——这是任务→话题唯一的回跳,别省略)。
    例:`已认领,工作话题:<topic_link>`。
-4. 然后正常干活(任务标题/描述就是需求;信息太薄就在话题里问,或按 §0.1 里程碑规则发"等拍板"评论)。
+3. 然后正常干活(任务标题/描述就是需求;信息太薄就在话题里问,或按 §0.1 里程碑规则发"等拍板"评论)。
+
+**兜底(`task_root_claimed: no` 时——bridge 认领失败,如该任务已被别的话题认领)**:按 prompt 里的
+指示走旧认领流程(先查评论区竞态护栏 → 把 `task_guid` 写进 state.json 的 `task_handle.guid` →
+发认领评论),或按实际情况在话题里说明冲突。
 
 **维护(全程只用任务评论——v4.1 铁律)**:
 - 只在**交付 / 失败 / 等拍板**三类里程碑节点发任务评论(每条评论都会推送给任务创建者,滥发=骚扰;

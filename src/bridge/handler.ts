@@ -960,6 +960,15 @@ export class BridgeHandler {
    * broken handoff and fire a spurious nudge. Read via getThreadReceivedAt().
    */
   private readonly threadReceivedAt = new Map<string, number>();
+  /**
+   * v4.2 (docs/task-handle.md §13 revision 5): per-thread OUTCOME of the most
+   * recent finished turn ("completed" | "failed"), recorded at finalize.
+   * StallDetector reads a PEER handler's map via getThreadLastOutcome to tell
+   * "the peer finished successfully" apart from "the peer crashed" — a failed
+   * finish must NOT resolve a handoff. In-memory like threadReceivedAt (empty
+   * after restart → detector falls back to its documented restart posture).
+   */
+  private readonly threadLastOutcome = new Map<string, "completed" | "failed">();
 
   constructor(deps: BridgeHandlerDeps) {
     this.deps = deps;
@@ -974,6 +983,11 @@ export class BridgeHandler {
    * — callers must apply their own startup quiet-period before treating that
    * as evidence of a truly broken handoff.
    */
+  /** v4.2 — see threadLastOutcome's field doc. */
+  getThreadLastOutcome(threadId: string): "completed" | "failed" | undefined {
+    return this.threadLastOutcome.get(threadId);
+  }
+
   getThreadReceivedAt(threadId: string): number | undefined {
     return this.threadReceivedAt.get(threadId);
   }
@@ -1239,7 +1253,32 @@ export class BridgeHandler {
     // already includes parent_id, so the rekeyed turn stays serialized.
     let taskRootInfo: { guid: string; summary: string; topicLink?: string } | undefined;
     let taskCardAnchorId: string | undefined;
+    // v4.2: true when the bridge auto-claim below CREATED the claim this very
+    // turn — drives the prompt's "post the claim comment now" instruction.
+    let taskRootJustClaimed = false;
     let deferredTaskRootProbe: Promise<import("../lark/messageLookupClient.js").MessageInfo | undefined> | undefined;
+    // v4.2 bridge auto-claim (docs/task-handle.md §15.3 修订): the main-path
+    // binding is mechanically CERTAIN once the probe matches the task card,
+    // so the bridge claims here — BEFORE the agent runs. Previously the claim
+    // waited for the agent's state.json declaration, so a crashed first turn
+    // left the task invisible to stall patrol forever (the completion-rate
+    // goal's biggest blind spot). Deterministic match = mechanical action —
+    // same charter as the v3 exact-match auto-bind, not a judgment call.
+    // Best-effort: a rejected claim (guid already claimed by another thread)
+    // is logged by the hook and simply leaves justClaimed false.
+    const autoClaimTaskRoot = async (guid: string): Promise<void> => {
+      if (!this.deps.taskHandleClaim || !botId) return;
+      const alreadyThis = this.deps.taskHandleClaimGuidLookup?.(threadId) === guid;
+      if (alreadyThis) return;
+      try {
+        await this.deps.taskHandleClaim({ botId, threadId, chatId: parsed.chatId, taskGuid: guid, mode: "comment" });
+        taskRootJustClaimed = this.deps.taskHandleClaimGuidLookup
+          ? this.deps.taskHandleClaimGuidLookup(threadId) === guid
+          : true;
+      } catch (err) {
+        console.warn("[bridge.handler] task-root auto-claim failed (continuing):", err);
+      }
+    };
     {
       const realTopic = realTopicThreadId(parsed.raw.thread_id);
       const rootCandidate =
@@ -1262,6 +1301,7 @@ export class BridgeHandler {
               };
               taskCardAnchorId = rootCandidate;
               threadId = rootCandidate; // rekey: session/claim live on the task card
+              await autoClaimTaskRoot(todo.taskGuid);
             }
           }
         }
@@ -2109,6 +2149,9 @@ export class BridgeHandler {
                     ? buildTopicDeepLink(parsed.chatId, probeThreadId)
                     : undefined,
               };
+              // v4.2 auto-claim, in-thread shape (see the dispatch-site
+              // closure's doc) — session key is already the topic root here.
+              await autoClaimTaskRoot(todo.taskGuid);
             }
           }
         }
@@ -2165,6 +2208,7 @@ export class BridgeHandler {
                 claimed: this.deps.taskHandleClaimGuidLookup
                   ? this.deps.taskHandleClaimGuidLookup(threadId) === taskRootInfo.guid
                   : (this.deps.taskHandleClaimedLookup?.(threadId) ?? false),
+                justClaimed: taskRootJustClaimed || undefined,
               }
             : undefined,
           mtimeFacts,
@@ -2536,6 +2580,11 @@ export class BridgeHandler {
               reason: failureReason,
             });
           }
+
+          // v4.2: record this turn's outcome for peer handoff checks (revision
+          // 5) — keyed by the (possibly rekeyed) session threadId, the same
+          // key space StallDetector queries with.
+          this.threadLastOutcome.set(threadId, success ? "completed" : "failed");
 
           // BL-38 counter: a confirmed idle-stuck turn accrues (+1); a clean
           // success resets to 0; any OTHER failure (crash / explicit `failed`)

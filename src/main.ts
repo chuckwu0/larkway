@@ -642,6 +642,10 @@ async function runV2Mode({
               // or get queued". See stallDetector.ts's module doc revision 3.
               getPeerLastActiveTs: (peerBotId, threadId) =>
                 handlersByBotId.get(peerBotId)?.getThreadLastActiveTs(threadId),
+              // v4.2 revision 5: the peer's most recent finished-turn OUTCOME —
+              // a failed finish must not resolve a handoff (see stallDetector.ts).
+              getPeerLastTurnOutcome: (peerBotId, threadId) =>
+                handlersByBotId.get(peerBotId)?.getThreadLastOutcome(threadId),
               // v3.3 due-date stall detection (docs/task-handle.md §14): free
               // read of TasklistPoller's own per-guid `due` observation — same
               // "populated after, read lazily" closure trick as

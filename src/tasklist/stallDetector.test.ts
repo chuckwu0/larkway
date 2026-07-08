@@ -1479,3 +1479,138 @@ describe("StallDetector — comment-mode nudge leaves NO description trace (v4.1
     expect(calls.some((c) => c.method === "PATCH")).toBe(true);
   });
 });
+
+// ---------------------------------------------------------------------------
+// v4.2 revision 5: a peer turn that FINISHED IN FAILURE after the mention is
+// a broken handoff right now — grace/completion evidence must not resolve it.
+// ---------------------------------------------------------------------------
+
+describe("StallDetector — peer failure re-arms the handoff tier (revision 5)", () => {
+  const HANDOFF_MS = 5 * 60_000;
+
+  function makeHandoffDetector(opts: {
+    store: TaskHandleStore;
+    client: TaskListClient;
+    enqueueNudgeTurn: (turn: { threadId: string; chatId: string; text: string }) => void;
+    lastActiveTs: number;
+    peerReceivedAt?: number;
+    peerLastActiveTs?: number;
+    peerOutcome?: "completed" | "failed";
+  }) {
+    const d = new StallDetector(
+      {
+        store: opts.store,
+        client: opts.client,
+        getLastActiveTs: () => opts.lastActiveTs,
+        enqueueNudgeTurn: opts.enqueueNudgeTurn,
+        getPeerReceivedAt: () => opts.peerReceivedAt,
+        getPeerLastActiveTs: () => opts.peerLastActiveTs,
+        getPeerLastTurnOutcome: () => opts.peerOutcome,
+      },
+      { stallThresholdMs: DAY, stallHandoffThresholdMs: HANDOFF_MS, handoffStartupQuietMs: 0 },
+    );
+    return d;
+  }
+
+  it("peer received AND finished in FAILURE within the grace window → nudges at the handoff floor (was: silent until 24h)", async () => {
+    const store = await TaskHandleStore.load(join(dir, "task-handles.json"));
+    const t0 = Date.now();
+    await store.put({
+      threadId: "t1",
+      taskGuid: "g1",
+      chatId: "oc_1",
+      claimedTs: t0,
+      mode: "comment",
+      lastTurnOutcome: "completed", // the CLAIM HOLDER's own turn succeeded
+      lastTurnMentions: ["peer-b"],
+      lastTurnMentionsAt: t0,
+    });
+    const { requester } = makeFakeRequester({ g1: { guid: "g1", summary: "任务A" } });
+    const client = new TaskListClient(requester);
+    const enqueueNudgeTurn = vi.fn();
+    const detector = makeHandoffDetector({
+      store,
+      client,
+      enqueueNudgeTurn,
+      lastActiveTs: t0, // claim holder idle since the mention
+      peerReceivedAt: t0 + 60_000, // peer received (in-memory receipt)
+      peerLastActiveTs: t0 + 20 * 60_000, // peer's turn ENDED 20min in (within 30min grace)
+      peerOutcome: "failed", // …in failure (idle-kill / crash)
+    });
+
+    vi.setSystemTime(t0 + 25 * 60_000); // 25min later: still inside receipt grace
+    await detector.pollOnceForTest();
+
+    expect(enqueueNudgeTurn).toHaveBeenCalledTimes(1);
+    expect(enqueueNudgeTurn.mock.calls[0]![0].text).toContain("协作");
+  });
+
+  it("peer finished SUCCESSFULLY → handoff resolved, no nudge (unchanged)", async () => {
+    const store = await TaskHandleStore.load(join(dir, "task-handles.json"));
+    const t0 = Date.now();
+    await store.put({
+      threadId: "t1", taskGuid: "g1", chatId: "oc_1", claimedTs: t0,
+      lastTurnOutcome: "completed", lastTurnMentions: ["peer-b"], lastTurnMentionsAt: t0,
+    });
+    const { requester } = makeFakeRequester({ g1: { guid: "g1", summary: "任务A" } });
+    const client = new TaskListClient(requester);
+    const enqueueNudgeTurn = vi.fn();
+    const detector = makeHandoffDetector({
+      store, client, enqueueNudgeTurn,
+      lastActiveTs: t0,
+      peerReceivedAt: t0 + 60_000,
+      peerLastActiveTs: t0 + 20 * 60_000,
+      peerOutcome: "completed",
+    });
+
+    vi.setSystemTime(t0 + 25 * 60_000);
+    await detector.pollOnceForTest();
+    expect(enqueueNudgeTurn).not.toHaveBeenCalled();
+  });
+
+  it("outcome unknown after restart → conservative pre-revision-5 posture (completion evidence resolves)", async () => {
+    const store = await TaskHandleStore.load(join(dir, "task-handles.json"));
+    const t0 = Date.now();
+    await store.put({
+      threadId: "t1", taskGuid: "g1", chatId: "oc_1", claimedTs: t0,
+      lastTurnOutcome: "completed", lastTurnMentions: ["peer-b"], lastTurnMentionsAt: t0,
+    });
+    const { requester } = makeFakeRequester({ g1: { guid: "g1", summary: "任务A" } });
+    const client = new TaskListClient(requester);
+    const enqueueNudgeTurn = vi.fn();
+    const detector = makeHandoffDetector({
+      store, client, enqueueNudgeTurn,
+      lastActiveTs: t0,
+      peerReceivedAt: undefined, // in-memory receipt lost (restart)
+      peerLastActiveTs: t0 + 20 * 60_000, // disk-persisted completion since mention
+      peerOutcome: undefined, // outcome map also lost
+    });
+
+    vi.setSystemTime(t0 + 25 * 60_000);
+    await detector.pollOnceForTest();
+    expect(enqueueNudgeTurn).not.toHaveBeenCalled();
+  });
+
+  it("a STALE peer failure from before this mention does not re-arm", async () => {
+    const store = await TaskHandleStore.load(join(dir, "task-handles.json"));
+    const t0 = Date.now();
+    await store.put({
+      threadId: "t1", taskGuid: "g1", chatId: "oc_1", claimedTs: t0,
+      lastTurnOutcome: "completed", lastTurnMentions: ["peer-b"], lastTurnMentionsAt: t0,
+    });
+    const { requester } = makeFakeRequester({ g1: { guid: "g1", summary: "任务A" } });
+    const client = new TaskListClient(requester);
+    const enqueueNudgeTurn = vi.fn();
+    const detector = makeHandoffDetector({
+      store, client, enqueueNudgeTurn,
+      lastActiveTs: t0 + 60_000,
+      peerReceivedAt: t0 + 60_000, // received this mention, within grace
+      peerLastActiveTs: t0 - 60_000, // last finished turn predates the mention
+      peerOutcome: "failed", // stale failure
+    });
+
+    vi.setSystemTime(t0 + 10 * 60_000); // within grace → tier 2 not broken
+    await detector.pollOnceForTest();
+    expect(enqueueNudgeTurn).not.toHaveBeenCalled();
+  });
+});
