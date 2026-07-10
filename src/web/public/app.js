@@ -405,6 +405,12 @@ const state = {
   eventFilters: {},
   /** 最近事件面板是否展开全部,按 bot id 索引。 */
   eventShowAll: {},
+  /** 当前 UI 版本(/api/context)。 */
+  runningVersion: null,
+  /** 全局 larkway 版本检查结果(/api/update_version)。 */
+  updateVersion: null,
+  /** 更新按钮是否正在执行。 */
+  updateVersionBusy: false,
   /** 当前详情表单是否有未保存改动(基础+高级 yaml 表单)。 */
   formDirty: false,
   /** 当前详情 memory 是否有未保存改动。 */
@@ -4708,6 +4714,74 @@ function renderOnboardError(msg) {
   modal.querySelector("#ob2-err-retry")?.addEventListener("click", () => openOnboardModal());
 }
 
+function renderBrandVersion() {
+  const btn = document.getElementById("brand-ver");
+  if (!btn) return;
+
+  const info = state.updateVersion;
+  const current = state.runningVersion ?? info?.currentVersion;
+  const latest = info?.latestVersion;
+  const updateAvailable = Boolean(info?.updateAvailable && latest);
+
+  btn.classList.toggle("is-update-available", updateAvailable);
+  btn.classList.toggle("is-busy", state.updateVersionBusy);
+  btn.disabled = !updateAvailable || state.updateVersionBusy;
+
+  if (state.updateVersionBusy) {
+    btn.textContent = "更新中…";
+    btn.title = "正在更新 Larkway";
+    return;
+  }
+
+  if (updateAvailable) {
+    btn.textContent = `v${latest}·可更新`;
+    btn.title = current ? `当前 v${current}，点击更新到 v${latest}` : `点击更新到 v${latest}`;
+    return;
+  }
+
+  btn.textContent = current ? `v${current}` : "";
+  btn.title = "Larkway 版本";
+}
+
+async function refreshUpdateVersion() {
+  const res = await api("GET", "/api/update_version");
+  if (!res.ok) return;
+  state.updateVersion = res.json;
+  renderBrandVersion();
+}
+
+async function doUpdateVersion() {
+  const info = state.updateVersion;
+  if (!info?.updateAvailable || state.updateVersionBusy) return;
+
+  const confirmed = await confirmDialog({
+    title: "更新 Larkway？",
+    body:
+      `将执行 npm i -g larkway@latest，并重启 bridge。\n\n` +
+      `当前全局版本：v${info.currentVersion ?? "unknown"}\n` +
+      `最新版本：v${info.latestVersion ?? "latest"}`,
+    confirmText: "确认更新",
+  });
+  if (!confirmed) return;
+
+  state.updateVersionBusy = true;
+  renderBrandVersion();
+  const res = await api("POST", "/api/update_version");
+  state.updateVersionBusy = false;
+
+  if (!res.ok) {
+    toast(`更新失败：${res.json?.error ?? res.status}`, "error");
+    renderBrandVersion();
+    return;
+  }
+
+  toast(res.json?.message ?? "已更新全局 larkway，刷新管理页后使用新版 UI。", "ok");
+  await refreshUpdateVersion();
+  await refreshRuntimeRequirements();
+  await refreshBridgeStatus();
+  await pollStatus();
+}
+
 // ---------------------------------------------------------------------------
 // 接线 + 启动
 // ---------------------------------------------------------------------------
@@ -4719,6 +4793,9 @@ function wireEvents() {
   // 添加新助手:页面内扫码开通(POST /api/onboard/start → 轮询 → 落盘)
   document.getElementById("btn-add")?.addEventListener("click", () => {
     openOnboardModal();
+  });
+  document.getElementById("brand-ver")?.addEventListener("click", () => {
+    void doUpdateVersion();
   });
 
   // 同步预览 modal 背景点击关闭
@@ -4765,8 +4842,8 @@ async function boot() {
   if (ctxRes.ok) {
     state.mode = "local";
     const ver = ctxRes.json?.version;
-    const verEl = document.getElementById("brand-ver");
-    if (verEl && ver) verEl.textContent = "v" + ver;
+    if (ver) state.runningVersion = ver;
+    renderBrandVersion();
     // 填充本机 hostname badge(浏览器侧地址,本机即 127.0.0.1)
     const hostEl = document.getElementById("ctx-host");
     const host = location.hostname || "";
@@ -4774,6 +4851,7 @@ async function boot() {
   }
 
   renderContextSwitch();
+  void refreshUpdateVersion();
 
   // 拉 backend 注册表(驱动底座选择就绪态;失败静默)
   void loadBackends();

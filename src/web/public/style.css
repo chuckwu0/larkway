@@ -231,6 +231,7 @@ body {
   margin-left: 1px;
 }
 .brand-ver {
+  appearance: none;
   font-size: 11px;
   font-weight: 500;
   font-family: ui-monospace, "Cascadia Code", "Fira Code", monospace;
@@ -242,9 +243,28 @@ body {
   background: var(--bg);
   line-height: 1.5;
   white-space: nowrap;
+  cursor: default;
 }
 .brand-ver:empty {
   display: none;
+}
+.brand-ver:disabled {
+  opacity: 1;
+}
+.brand-ver.is-update-available {
+  color: #fff;
+  background: var(--br);
+  border-color: var(--br);
+  cursor: pointer;
+  box-shadow: 0 6px 16px rgba(79, 70, 229, 0.18);
+}
+.brand-ver.is-update-available:hover:not(:disabled) {
+  background: #4338ca;
+  border-color: #4338ca;
+}
+.brand-ver.is-update-available:focus-visible {
+  outline: none;
+  box-shadow: var(--ring);
 }
 
 /* 中间绝对居中分段控件(轨道 #f6f7f9 圆角9,active 白底+阴影 圆角7) */

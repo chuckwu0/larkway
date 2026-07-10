@@ -21,6 +21,7 @@ import yaml from "js-yaml";
 
 import {
   _setEventNameResolverExecForTest,
+  _setUpdateVersionExecForTest,
   createManagementContext,
   matchRoute,
   ROUTES,
@@ -84,6 +85,8 @@ async function makeTmpDir(): Promise<string> {
 }
 
 afterEach(async () => {
+  _setEventNameResolverExecForTest();
+  _setUpdateVersionExecForTest();
   await Promise.all(tmpDirs.map((d) => rm(d, { recursive: true, force: true })));
   tmpDirs = [];
 });
@@ -253,6 +256,51 @@ describe("GET /api/context", () => {
     expect(res.status).toBe(200);
     expect((res.json as Record<string, unknown>).mode).toBe("local");
     expect((res.json as Record<string, unknown>).centralAvailable).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// /api/update_version
+// ---------------------------------------------------------------------------
+
+describe("GET /api/update_version", () => {
+  it("reports when global larkway is behind npm latest", async () => {
+    _setUpdateVersionExecForTest(async (file, args) => {
+      if (file === "larkway" && args.join(" ") === "--version") {
+        return { stdout: "0.3.30\n", stderr: "" };
+      }
+      if (file === "npm" && args.join(" ") === "view larkway version") {
+        return { stdout: "0.3.37\n", stderr: "" };
+      }
+      throw new Error(`unexpected command: ${file} ${args.join(" ")}`);
+    });
+
+    const dir = await makeLocalBotsDir();
+    const ctx = makeCtx(dir);
+    const res = await call(ctx, "GET /api/update_version");
+    expect(res.status).toBe(200);
+    expect(res.json).toMatchObject({
+      currentVersion: "0.3.30",
+      latestVersion: "0.3.37",
+      updateAvailable: true,
+    });
+  });
+});
+
+describe("POST /api/update_version", () => {
+  it("delegates to the existing larkway updater", async () => {
+    const calls: string[] = [];
+    _setUpdateVersionExecForTest(async (file, args) => {
+      calls.push(`${file} ${args.join(" ")}`);
+      return { stdout: '{"ok":true,"status":"complete"}\n', stderr: "" };
+    });
+
+    const dir = await makeLocalBotsDir();
+    const ctx = makeCtx(dir);
+    const res = await call(ctx, "POST /api/update_version");
+    expect(res.status).toBe(200);
+    expect(res.json).toMatchObject({ ok: true });
+    expect(calls).toEqual(["larkway update --latest --json"]);
   });
 });
 
