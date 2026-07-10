@@ -51,7 +51,8 @@
 | v0.3.44 | v0.3.44 | patch / 已发布 | 巡检自恢复加固(完成率目标):bridge 自动认领(认领 turn 崩溃不再造成巡检盲区,含跨 bot 双认领守卫+认领评论欠账持久化);交接检测区分 peer 失败收尾(下游崩溃 5 分钟内唤醒重派);一般停滞档 24h→1h(due 档保 24h 冷却地板) |
 | v0.3.45 | v0.3.45 | patch / 已发布 | 看板 model 建议列表更新为当前 Claude 模型 ID(claude-sonnet-5/claude-opus-4-8/claude-fable-5),修复找不到 Sonnet 5 选项的问题 |
 | v0.3.46 | v0.3.46 | patch / 已发布 | 看板模型选择改为常驻快选 chips(datalist 会按已填值过滤导致看起来选项丢失);CI 修复(doctor 的 lark-cli 探测不再让测试退出码依赖宿主机环境) |
-| v0.3.47 | v0.3.47 | 当前 patch / 已发布 | 能力体检卡+底座卡v2+版本胶囊五态(claude design 设计稿落地);/stop bridge 层硬停止;web 自更新入口 |
+| v0.3.47 | v0.3.47 | patch / 已发布 | 能力体检卡+底座卡v2+版本胶囊五态(claude design 设计稿落地);/stop bridge 层硬停止;web 自更新入口 |
+| v0.3.48 | v0.3.48 | 当前 patch / 已发布 | fix: model 覆盖菜单被卡片圆角裁剪到看不见选项(改文档流内展开) |
 
 ## 使用原则
 
@@ -110,4 +111,5 @@ v0.3.44       = 巡检自恢复加固(完成率目标):bridge 自动认领(认�
 v0.3.45       = 看板 model 建议列表更新为当前 Claude 模型 ID(claude-sonnet-5/claude-opus-4-8/claude-fable-5),修复找不到 Sonnet 5 选项的问题
 v0.3.46       = 看板模型选择改为常驻快选 chips(datalist 会按已填值过滤导致看起来选项丢失);CI 修复(doctor 的 lark-cli 探测不再让测试退出码依赖宿主机环境)
 v0.3.47       = 能力体检卡+底座卡v2+版本胶囊五态(claude design 设计稿落地);/stop bridge 层硬停止;web 自更新入口
+v0.3.48       = fix: model 覆盖菜单被卡片圆角裁剪到看不见选项(改文档流内展开)
 ```
