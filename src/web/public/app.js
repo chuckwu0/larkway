@@ -4758,9 +4758,12 @@ async function doUpdateVersion() {
     title: "更新 Larkway？",
     body:
       `将执行 npm i -g larkway@latest，并重启 bridge。\n\n` +
+      `⚠️ 重启会中断所有正在进行中的任务（不会自动重试，需重新 @）。\n` +
+      `建议确认没有 bot 正在干活时再更新。\n\n` +
       `当前全局版本：v${info.currentVersion ?? "unknown"}\n` +
       `最新版本：v${info.latestVersion ?? "latest"}`,
     confirmText: "确认更新",
+    confirmDanger: true,
   });
   if (!confirmed) return;
 
