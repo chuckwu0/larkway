@@ -9,7 +9,7 @@
  */
 
 import { describe, it, expect } from "vitest";
-import { parseMessage } from "./message.js";
+import { isStopCommand, parseMessage } from "./message.js";
 import type { LarkMessageEvent } from "./transport.js";
 
 // ---------------------------------------------------------------------------
@@ -342,5 +342,52 @@ describe("parseMessage — todo (task-share) messages", () => {
     const parsed = parseMessage(event);
     expect(parsed.text).toContain("(无标题)");
     expect(parsed.text).toContain("task_guid=guid-t2");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// BL-42 — isStopCommand
+// ---------------------------------------------------------------------------
+
+describe("isStopCommand (BL-42 /stop)", () => {
+  const textEvent = (text: string): Parameters<typeof isStopCommand>[0] => ({
+    message_id: "om_t",
+    chat_id: "oc_c",
+    chat_type: "topic_group",
+    sender_id: "ou_s",
+    content: JSON.stringify({ text }),
+    create_time: "1700000000000",
+  });
+
+  it("matches the COT ⏹ button shape: leading @mention placeholder + /stop", () => {
+    expect(isStopCommand(textEvent("@_user_1 /stop"))).toBe(true);
+  });
+
+  it("matches bare /stop, case-insensitively, with surrounding whitespace", () => {
+    expect(isStopCommand(textEvent("/stop"))).toBe(true);
+    expect(isStopCommand(textEvent("  /STOP  "))).toBe(true);
+  });
+
+  it("does NOT match a message with more text — that's a prompt, not a control command", () => {
+    expect(isStopCommand(textEvent("/stop 然后改做另一件事"))).toBe(false);
+    expect(isStopCommand(textEvent("请 /stop"))).toBe(false);
+  });
+
+  it("does NOT match unrelated text or non-command words", () => {
+    expect(isStopCommand(textEvent("stop"))).toBe(false);
+    expect(isStopCommand(textEvent("帮我跑个任务"))).toBe(false);
+  });
+
+  it("does NOT match a todo share (non-text content)", () => {
+    expect(
+      isStopCommand({
+        message_id: "om_todo",
+        chat_id: "oc_c",
+        chat_type: "group",
+        sender_id: "ou_s",
+        content: JSON.stringify({ task_id: "guid-1", summary: { content: [] } }),
+        create_time: "1700000000000",
+      }),
+    ).toBe(false);
   });
 });

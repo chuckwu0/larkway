@@ -24,7 +24,7 @@ import path from "node:path";
 import type { InboundClient } from "../lark/transport.js";
 import type { CardRenderer } from "../lark/card.js";
 import type { SessionStore } from "../claude/sessionStore.js";
-import { parseMessage, parseTodoShareContent } from "../lark/message.js";
+import { isStopCommand, parseMessage, parseTodoShareContent } from "../lark/message.js";
 import { buildTopicDeepLink, realTopicThreadId, type MessageLookupClient } from "../lark/messageLookupClient.js";
 import { renderPrompt } from "../claude/prompt.js";
 import { remapPeersToLiveRoster, type LiveRosterResolver } from "../lark/rosterResolver.js";
@@ -965,6 +965,17 @@ export class BridgeHandler {
   private readonly inFlightTurns = new Set<Promise<void>>();
 
   /**
+   * BL-42 /stop: per-queue-key kill hook for the CURRENTLY RUNNING turn.
+   * run()'s dispatch loop intercepts a bare `/stop` message and invokes the
+   * hook for its queue key instead of enqueueing the message (queueing would
+   * make it wait behind the very turn it is trying to stop). Registered by
+   * handleOne right after the agent subprocess spawns; deleted on every
+   * teardown path. Serial-per-key dispatch guarantees at most one live entry
+   * per key, and register/delete never interleave across turns.
+   */
+  private readonly activeTurnStops = new Map<string, () => void>();
+
+  /**
    * v3.2 交接断链检测 (docs/task-handle.md §13, revision 2): per-thread "most
    * recently RECEIVED" timestamp, stamped in run()'s for-await loop body —
    * i.e. the moment an event is pulled off client.events() and enqueued,
@@ -1128,6 +1139,16 @@ export class BridgeHandler {
           : (typeof event.parent_id === "string" && event.parent_id)
             ? event.parent_id
             : event.message_id;
+      // BL-42 /stop: a bare "/stop" is a channel-level control command (the
+      // Feishu COT card's ⏹ button auto-sends `@bot /stop`), NOT a prompt for
+      // the agent. Handled here, out of band: kill the in-flight turn on this
+      // key (if any), drop this key's queued messages, keep the session so a
+      // later @ resumes it. Deliberately BEFORE the threadReceivedAt stamp —
+      // a stop request is not a work request and must not refresh receipt.
+      if (isStopCommand(event)) {
+        this.handleStopCommand(key, event, pendingByKey);
+        continue;
+      }
       // Stamp "received" here — synchronously, before acquire()/handleOne()
       // — so this reflects arrival, not dispatch. See threadReceivedAt above.
       // Stamped under BOTH the queue key and the legacy session key: an
@@ -1160,7 +1181,7 @@ export class BridgeHandler {
                 `turn ${primary.message_id} on thread ${key}`,
             );
           }
-          return this.handleOne(primary, followups);
+          return this.handleOne(primary, followups, key);
         })
         .catch((err: unknown) => {
           console.error(`[bridge.handler] unhandled error on thread ${key}:`, err);
@@ -1186,6 +1207,45 @@ export class BridgeHandler {
     this.closed = true;
   }
 
+  /**
+   * BL-42 /stop (see run()'s intercept site). Every consumed message —
+   * the /stop itself AND the queued messages it drops — is acknowledged so
+   * neither live-WS dedup nor any gap-fill window (this process or
+   * post-restart) ever re-dispatches them: replaying a dropped message after
+   * a /stop would resurrect exactly the work the user just cancelled.
+   *
+   * Known benign race: between "drain took the primary" and "handleOne
+   * registered the kill hook" (subprocess starting) a /stop finds no hook and
+   * only clears the queue — the user can simply /stop again once the card
+   * shows activity.
+   */
+  private handleStopCommand(
+    key: string,
+    event: import("../lark/transport.js").LarkMessageEvent,
+    pendingByKey: Map<string, import("../lark/transport.js").LarkMessageEvent[]>,
+  ): void {
+    this.deps.client.acknowledgeMessage(event.message_id);
+    const pending = pendingByKey.get(key);
+    const droppedCount = pending?.length ?? 0;
+    if (pending) {
+      for (const dropped of pending) this.deps.client.acknowledgeMessage(dropped.message_id);
+      pendingByKey.delete(key);
+    }
+    const stop = this.activeTurnStops.get(key);
+    if (stop) {
+      console.log(
+        `[bridge.handler] /stop: killing in-flight turn on thread ${key}` +
+          (droppedCount > 0 ? ` and dropping ${droppedCount} queued message(s)` : ""),
+      );
+      stop();
+    } else {
+      console.log(
+        `[bridge.handler] /stop on thread ${key}: no in-flight turn` +
+          (droppedCount > 0 ? `; dropped ${droppedCount} queued message(s)` : " (nothing to do)"),
+      );
+    }
+  }
+
   // ---------------------------------------------------------------------------
   // Private: single-event lifecycle
   // ---------------------------------------------------------------------------
@@ -1200,6 +1260,8 @@ export class BridgeHandler {
   private async handleOne(
     event: import("../lark/transport.js").LarkMessageEvent,
     followups: import("../lark/transport.js").LarkMessageEvent[] = [],
+    /** run()'s serial-queue key — the BL-42 /stop kill-hook registry key. */
+    queueKey?: string,
   ): Promise<void> {
     // Terminal-settle guard: EVERY exit path of handleOne must settle the
     // message exactly once (markHandled on success, markUnhandled on failure).
@@ -2319,6 +2381,10 @@ export class BridgeHandler {
         // it still backstops a tool call that never returns at all.
         let lastActivityAt = Date.now();
         let interruptedByIdle = false;
+        // BL-42: set by the /stop kill hook (registered below) — a
+        // user-initiated stop, finalized as neutral 已停止 (not failure red),
+        // never counted into the BL-38 consecutive-idle-kill breaker.
+        let stoppedByUser = false;
         let toolsInFlight = 0;
         // A0: cumulative tool_use count for the whole turn — distinct from
         // toolsInFlight above (which decrements on tool_result); this one only
@@ -2346,6 +2412,19 @@ export class BridgeHandler {
             }
           }, cadenceMs);
           idleWatchdog.unref?.();
+        }
+
+        // BL-42 /stop: expose this turn's kill switch to run()'s intercept.
+        // Cleared on both watchdog-teardown paths + handleOne's outer finally.
+        if (queueKey) {
+          this.activeTurnStops.set(queueKey, () => {
+            stoppedByUser = true;
+            try {
+              handle.kill();
+            } catch {
+              /* best-effort — finalization below still renders 已停止 */
+            }
+          });
         }
 
         // GC liveness (agent_workspace only): the runner's cwd is the SHARED
@@ -2419,6 +2498,7 @@ export class BridgeHandler {
             clearInterval(idleWatchdog);
             idleWatchdog = undefined;
           }
+          if (queueKey) this.activeTurnStops.delete(queueKey);
 
           // Complete the COT bubble for this (successful/idle-cut) turn. An
           // idle-watchdog kill is a real hang → complete as error; otherwise
@@ -2431,12 +2511,16 @@ export class BridgeHandler {
           // compatible with an in-flight finalize.
           // Record the outcome for the finally's late-adoption finalize (a
           // background-adopted bubble may not exist as cotPublisher yet here).
-          cotTurnOutcome = interruptedByIdle ? "error" : "done";
+          cotTurnOutcome = interruptedByIdle || stoppedByUser ? "error" : "done";
           if (cotPublisher) {
             void cotPublisher
               .finalize(
-                interruptedByIdle ? "error" : "done",
-                interruptedByIdle ? { message: "idle timeout" } : undefined,
+                cotTurnOutcome,
+                stoppedByUser
+                  ? { message: "stopped by user" }
+                  : interruptedByIdle
+                    ? { message: "idle timeout" }
+                    : undefined,
               )
               .catch(() => {
                 /* best-effort COT completion — never affects the turn */
@@ -2588,7 +2672,10 @@ export class BridgeHandler {
           //   5. else → fail (real crash)
           const reportedStatus = reportedState?.status;
           const reportedError = reportedState?.error;
+          // stoppedByUser outranks the idle judgment: if both fired, the user
+          // explicitly cancelled — finalize as 已停止, don't feed BL-38.
           const cardKitTimeoutFailure =
+            !stoppedByUser &&
             interruptedByIdle && reportedStatus !== "ready" && reportedStatus !== "failed";
           let success: boolean;
           let failureReason: string | undefined;
@@ -2597,6 +2684,14 @@ export class BridgeHandler {
             failureReason = reportedError ?? "bot 报告 failed (无 error 字段)";
           } else if (reportedStatus === "ready") {
             success = true;
+          } else if (stoppedByUser) {
+            success = false;
+            failureReason = "已被用户 /stop 停止";
+            await recordEvent({
+              status: "running",
+              appendPath: "用户停止",
+              reason: failureReason,
+            });
           } else if (cardKitTimeoutFailure) {
             success = false;
             failureReason = `agent turn idle for ${idleTimeoutMs}ms with no activity (treated as stuck); run interrupted`;
@@ -2742,7 +2837,10 @@ export class BridgeHandler {
               : "") +
             "下一步：换个说法重试，或新开一个话题继续；若反复如此，请让维护者查看该 session 日志。";
           const cardBody =
-            stuckResetTriggered
+            stoppedByUser
+              // BL-42: user-initiated stop — neutral wording, session kept.
+              ? "⏹ 已按 /stop 停止本轮。本话题 session 保留，需要继续时再 @ 我。"
+              : stuckResetTriggered
               // BL-38: crossed the consecutive-idle-kill threshold — we just
               // dropped the poisoned session (Step 4e), so tell the user this
               // topic was reset and the next @ starts clean. Distinct from the
@@ -2772,9 +2870,11 @@ export class BridgeHandler {
             success,
             failureReason,
             titleOverride:
-              reportedState?.card_title ?? (cardKitTimeoutFailure ? "已中断" : neutralTitle),
+              reportedState?.card_title ??
+              (stoppedByUser ? "已停止" : cardKitTimeoutFailure ? "已中断" : neutralTitle),
             colorOverride:
-              reportedState?.card_color ?? (neutralTitle ? "neutral" : undefined),
+              reportedState?.card_color ??
+              (stoppedByUser || neutralTitle ? "neutral" : undefined),
             // V2 dynamic-choice buttons — agent-declared, rendered verbatim.
             // reportedState is null when state.json wasn't freshly written
             // (stale-guard), so stale leftover choices never reappear.
@@ -2990,6 +3090,7 @@ export class BridgeHandler {
             clearInterval(idleWatchdog);
             idleWatchdog = undefined;
           }
+          if (queueKey) this.activeTurnStops.delete(queueKey);
           // Stale-session fallback: if the backend rejected --resume/thread
           // resume with a ghost session, purge the record and retry once
           // without resume (fresh session).
@@ -3155,6 +3256,9 @@ export class BridgeHandler {
       if (bubbleCreate) {
         void bubbleCreate.then((handle) => handle.finalize(cotTurnOutcome).catch(() => {}));
       }
+      // BL-42: drop this turn's /stop kill hook on every exit path (no-op if
+      // the happy path already deleted it).
+      if (queueKey) this.activeTurnStops.delete(queueKey);
       // Safety net for EVERY exit path of handleOne. The success site calls
       // settle(true) and the failure catch calls settle(false); both make
       // settled=true so this is a no-op for them. But if anything threw BEFORE

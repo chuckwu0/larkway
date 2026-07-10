@@ -5067,3 +5067,159 @@ describe("handleOne — v4.2 round-2 auto-claim guards", () => {
     expect(claimCalls.length).toBe(0);
   });
 });
+
+// ---------------------------------------------------------------------------
+// BL-42 — /stop: bridge-level hard stop of the in-flight turn
+// ---------------------------------------------------------------------------
+
+describe("run() /stop — kill in-flight turn, drop queue, keep session (BL-42)", () => {
+  const topicEvent = (messageId: string, rootId: string | undefined, text: string): Record<string, unknown> => ({
+    message_id: messageId,
+    chat_id: "oc_chat",
+    chat_type: "topic_group",
+    thread_id: rootId ?? messageId,
+    ...(rootId ? { root_id: rootId } : {}),
+    sender_id: "ou_sender",
+    content: JSON.stringify({ text }),
+    create_time: "1700000000000",
+  });
+
+  function makeStopClient(eventsFactory: (gates: { firstRunStarted: Promise<void> }) => AsyncGenerator<Record<string, unknown>>, firstRunStarted: Promise<void>) {
+    const acked: string[] = [];
+    const unhandled: Array<{ id: string; replay?: boolean }> = [];
+    const client = {
+      events: () => eventsFactory({ firstRunStarted }),
+      addProcessingReaction: async () => {},
+      removeProcessingReaction: async () => {},
+      acknowledgeMessage: (id: string) => acked.push(id),
+      markHandled: (id: string) => acked.push(id),
+      markUnhandled: (id: string, opts?: { replay?: boolean }) => unhandled.push({ id, replay: opts?.replay }),
+    };
+    return { client, acked, unhandled };
+  }
+
+  /** Runner whose kill() resolves done with the SIGTERM-ish exit code 143. */
+  function stoppableRunner() {
+    const prompts: string[] = [];
+    const kills: string[] = [];
+    let signalFirstStarted!: () => void;
+    const firstRunStarted = new Promise<void>((r) => {
+      signalFirstStarted = r;
+    });
+    const releases: Array<(r: { exitCode: number; sessionId?: string }) => void> = [];
+    runClaudeImpl = (opts: unknown) => {
+      prompts.push((opts as { prompt: string }).prompt);
+      if (prompts.length === 1) signalFirstStarted();
+      let release!: (r: { exitCode: number; sessionId?: string }) => void;
+      const done = new Promise<{ exitCode: number; sessionId?: string }>((resolve) => {
+        release = resolve;
+        releases.push(resolve);
+      });
+      return {
+        events: (async function* () {
+          yield { type: "system_init", sessionId: "sess_stop", raw: {} };
+        })(),
+        done,
+        kill: () => {
+          kills.push("killed");
+          release({ exitCode: 143, sessionId: "sess_stop" });
+        },
+      };
+    };
+    return { prompts, kills, releases, firstRunStarted };
+  }
+
+  function makeHandler(client: unknown, renderer: unknown, store: unknown) {
+    return new BridgeHandler({
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      client: client as any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      cardRenderer: renderer as any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      sessionStore: store as any,
+      conventions: makeConventions(),
+      botConfig: { id: "frontend", name: "Frontend", turn_taking_limit: 10, backend: "claude" },
+    });
+  }
+
+  it("kills the in-flight turn and finalizes as neutral 已停止 (not failure red); trigger + /stop both acked, nothing replayed", async () => {
+    const { prompts, kills, firstRunStarted } = stoppableRunner();
+    const { renderer, finalizeArgs, whenFinalized } = makeCardRenderer();
+    const { store, puts } = makeSessionStore();
+    const { client, acked, unhandled } = makeStopClient(async function* (gates) {
+      yield topicEvent("om_s1", undefined, "跑一个很长的任务");
+      await gates.firstRunStarted; // turn is live — /stop must reach the kill hook
+      yield topicEvent("om_s2", "om_s1", "@_user_1 /stop");
+    }, firstRunStarted);
+    await seedRepoCachePath();
+
+    const handler = makeHandler(client, renderer, store);
+    const runDone = handler.run();
+    await runDone;
+    await whenFinalized;
+    await handler.whenAllTurnsSettled();
+
+    expect(prompts).toHaveLength(1);
+    expect(kills).toHaveLength(1);
+    expect(finalizeArgs).toHaveLength(1);
+    const fin = finalizeArgs[0]!;
+    expect(fin.success).toBe(false);
+    expect(fin.finalText).toContain("已按 /stop 停止本轮");
+    expect(fin.titleOverride).toBe("已停止");
+    expect(fin.colorOverride).toBe("neutral");
+    expect(fin.failureReason).toContain("/stop");
+    // The /stop message AND the stopped trigger are both terminal-acked —
+    // neither may ever be replayed by a gap-fill window.
+    expect(acked).toContain("om_s2");
+    expect(acked).toContain("om_s1");
+    expect(unhandled).toHaveLength(0);
+    // Session record kept (a later @ resumes the thread).
+    expect(puts.some((r) => r.sessionId === "sess_stop")).toBe(true);
+  });
+
+  it("drops messages queued behind the killed turn and acks them — a /stop also cancels the backlog", async () => {
+    const { prompts, kills, firstRunStarted } = stoppableRunner();
+    const { renderer, whenFinalized } = makeCardRenderer();
+    const { store } = makeSessionStore();
+    const { client, acked, unhandled } = makeStopClient(async function* (gates) {
+      yield topicEvent("om_q1", undefined, "跑一个很长的任务");
+      await gates.firstRunStarted;
+      yield topicEvent("om_q2", "om_q1", "补充：顺便把 B 也做了");
+      yield topicEvent("om_q3", "om_q1", "@_user_1 /stop");
+    }, firstRunStarted);
+    await seedRepoCachePath();
+
+    const handler = makeHandler(client, renderer, store);
+    await handler.run();
+    await whenFinalized;
+    await handler.whenAllTurnsSettled();
+    // Give any (wrongly) surviving drain link a chance to spawn turn 2.
+    await new Promise((r) => setTimeout(r, 50));
+
+    expect(kills).toHaveLength(1);
+    expect(prompts).toHaveLength(1); // om_q2 must NOT become a second turn
+    expect(acked).toContain("om_q2");
+    expect(acked).toContain("om_q3");
+    expect(unhandled).toHaveLength(0);
+  });
+
+  it("/stop with no in-flight turn is consumed silently — acked, no agent spawn, no card", async () => {
+    const { prompts } = stoppableRunner();
+    const { renderer, startArgs } = makeCardRenderer();
+    const { store } = makeSessionStore();
+    const firstRunStarted = Promise.resolve();
+    const { client, acked, unhandled } = makeStopClient(async function* () {
+      yield topicEvent("om_x1", undefined, "@_user_1 /stop");
+    }, firstRunStarted);
+    await seedRepoCachePath();
+
+    const handler = makeHandler(client, renderer, store);
+    await handler.run();
+    await handler.whenAllTurnsSettled();
+
+    expect(prompts).toHaveLength(0);
+    expect(startArgs).toHaveLength(0);
+    expect(acked).toEqual(["om_x1"]);
+    expect(unhandled).toHaveLength(0);
+  });
+});

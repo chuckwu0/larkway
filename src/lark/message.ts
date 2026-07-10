@@ -352,6 +352,19 @@ function extractFeishuDocLinks(text: string): string[] {
 // Main export
 // ---------------------------------------------------------------------------
 
+/**
+ * BL-42 /stop: does this inbound message carry ONLY the /stop command?
+ *
+ * The Feishu COT "任务进行中" card's ⏹ button auto-sends `@bot /stop`;
+ * extractText strips the @_user_N mention placeholder and trims, leaving
+ * exactly "/stop". Exact match (case-insensitive) on purpose: a message with
+ * MORE text ("/stop 然后改做 X") is a real prompt for the agent, not a
+ * channel-level control command — the bridge must not swallow it.
+ */
+export function isStopCommand(event: LarkMessageEvent): boolean {
+  return /^\/stop$/i.test(extractText(event));
+}
+
 export function parseMessage(event: LarkMessageEvent): ParsedMessage {
   // Parse content JSON once; keep null on failure (individual helpers handle null)
   let parsedContent: Record<string, unknown> | null = null;
