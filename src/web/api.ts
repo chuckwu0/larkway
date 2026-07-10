@@ -35,6 +35,7 @@ import {
 import { permissionItemsFromCapabilities } from "../agent/permissionPlan.js";
 import { resolveAgentWorkspacePathFromHome } from "../config/paths.js";
 import { resolveLarkwayVersion } from "../version.js";
+import { detectClaudeLogin } from "../cli/claudeAuth.js";
 import {
   readStatusFile,
   classifyStatus,
@@ -319,6 +320,203 @@ async function readLatestLarkwayVersion(): Promise<string | null> {
 }
 
 // ---------------------------------------------------------------------------
+// 能力体检(health-scan)—— 凭据探测 + 应用权限基线(能力体检设计稿范围 A)
+// 全部是确定性 CLI/文件探测,零写操作;工具组不在这里(前端直接吃
+// /api/runtime/requirements 的 per-bot 维度)。
+// ---------------------------------------------------------------------------
+
+type HealthScanExecFile = (
+  file: string,
+  args: string[],
+  opts: { timeout: number; maxBuffer: number },
+) => Promise<{ stdout: string; stderr: string }>;
+let healthScanExecFile: HealthScanExecFile = execFileAsync as HealthScanExecFile;
+
+/** 底座登录态探针(生产=detectClaudeLogin / codex auth.json 文件探测)。 */
+let healthScanBackendLoginProbe: (backend: string) => Promise<boolean | null> =
+  defaultBackendLoginProbe;
+
+export function _setHealthScanForTest(overrides?: {
+  exec?: HealthScanExecFile;
+  backendLogin?: (backend: string) => Promise<boolean | null>;
+}): void {
+  healthScanExecFile = overrides?.exec ?? (execFileAsync as HealthScanExecFile);
+  healthScanBackendLoginProbe = overrides?.backendLogin ?? defaultBackendLoginProbe;
+  healthScanCache.clear();
+}
+
+async function defaultBackendLoginProbe(backend: string): Promise<boolean | null> {
+  try {
+    if (backend === "claude") return await detectClaudeLogin();
+    if (backend === "codex") return await isCodexReady();
+    return null; // 未知底座:探测不了,如实 unknown
+  } catch {
+    return null;
+  }
+}
+
+const HEALTH_SCAN_TTL_MS = 10 * 60 * 1000;
+const HEALTH_SCAN_PROBE_TIMEOUT_MS = 10_000;
+const healthScanCache = new Map<string, { json: Record<string, unknown>; at: number }>();
+
+/**
+ * 应用权限基线清单 —— 参考对照,不是自动检测(实测 lark-cli auth scopes 只报
+ * 用户授权 scope,查不到应用在开放平台已开通的权限;体检卡如实标「无法自动
+ * 检测」,给清单 + console 深链让管理员对照)。每项注明哪个功能需要它;随
+ * bridge 功能增减在这里同步。
+ */
+const BOT_PERMISSION_BASELINE: ReadonlyArray<{ scope: string; reason: string }> = [
+  { scope: "im:message", reason: "收发消息 —— @ 触发与话题回复的根本" },
+  { scope: "im:message:send_as_bot", reason: "以应用身份发消息 —— 答案投递" },
+  { scope: "im:resource", reason: "消息图片/附件下载 —— agent 读用户发的截图和文件" },
+  { scope: "im:chat:readonly", reason: "群信息读取 —— 漏消息补抓(gap-fill)与群名解析" },
+  { scope: "im:message.reactions:write_only", reason: "表情回应 —— 「收到」即时反馈" },
+  { scope: "cardkit:card:read", reason: "卡片读取 —— 流式答案卡状态回读" },
+  { scope: "cardkit:card:write", reason: "卡片创建与更新 —— 流式答案卡本体" },
+  { scope: "task:task", reason: "任务读写 —— 话题↔任务绑定(不用任务派单可不开)" },
+  { scope: "task:comment", reason: "任务评论 —— 任务进展汇报(不用任务派单可不开)" },
+];
+
+/** 凭据组单项检查结果(事实,不含展示文案 —— 文案在前端按 id 映射)。 */
+interface HealthCredentialItem {
+  id: string;
+  label: string;
+  status: "ok" | "fail" | "unknown";
+  severity: "required" | "recommended";
+  /** 主机级(true)= 修好一处所有助手生效;false = 该 bot 自己的。 */
+  global: boolean;
+  hint?: string;
+}
+
+async function runHealthScan(
+  bot: { id: string; backend?: string; app_id: string; lark_cli_profile?: string; repos?: unknown[]; git_token_env?: string; gitlab_token_env?: string },
+  hostConfigStore: { readSecret(envName: string): Promise<string | null> },
+): Promise<Record<string, unknown>> {
+  const credentials: HealthCredentialItem[] = [];
+  const backend = bot.backend || "claude";
+
+  // ① 底座登录态(主机级,必需)
+  const login = await healthScanBackendLoginProbe(backend);
+  credentials.push({
+    id: "backend-login",
+    label: backend === "claude" ? "Claude 登录" : backend === "codex" ? "Codex 登录" : `${backend} 登录`,
+    status: login === null ? "unknown" : login ? "ok" : "fail",
+    severity: "required",
+    global: true,
+    ...(login === false ? { hint: `终端运行 \`${backend === "claude" ? "claude" : "codex login"}\` 完成登录` } : {}),
+  });
+
+  // ② lark-cli profile bot 身份(agent 级,必需)—— auth status --json 一并
+  //    验证了 keychain 可读(锁定时 bot identity 读不出 ready)。
+  const profile = bot.lark_cli_profile ?? bot.app_id;
+  try {
+    const { stdout } = await healthScanExecFile(
+      process.env.LARK_CLI_PATH || "lark-cli",
+      ["--profile", profile, "auth", "status", "--json"],
+      { timeout: HEALTH_SCAN_PROBE_TIMEOUT_MS, maxBuffer: 1024 * 1024 },
+    );
+    const payload = healthScanParseJson(stdout);
+    const botIdentity = (payload?.identities as Record<string, { available?: boolean }> | undefined)?.bot;
+    credentials.push({
+      id: "lark-profile",
+      label: "lark-cli profile",
+      status: botIdentity?.available === true ? "ok" : botIdentity ? "fail" : "unknown",
+      severity: "required",
+      global: false,
+      ...(botIdentity?.available !== true
+        ? { hint: "重启 Larkway 会自动重新配置 profile;若仍失败,检查 keychain 是否锁定" }
+        : {}),
+    });
+  } catch {
+    credentials.push({
+      id: "lark-profile",
+      label: "lark-cli profile",
+      status: "unknown",
+      severity: "required",
+      global: false,
+      hint: "lark-cli 探测失败(未安装或超时)—— 装好工具后重新体检,这项会自动补上",
+    });
+  }
+
+  // ③ Git 令牌(agent 级,建议)—— 只对配了 repo 且声明了 token env 的 bot 检查
+  const tokenEnv = bot.git_token_env ?? bot.gitlab_token_env;
+  if (Array.isArray(bot.repos) && bot.repos.length > 0 && tokenEnv) {
+    const secret = await hostConfigStore.readSecret(tokenEnv).catch(() => null);
+    credentials.push({
+      id: "git-token",
+      label: "Git 访问令牌",
+      status: secret ? "ok" : "fail",
+      severity: "recommended",
+      global: false,
+      ...(secret ? {} : { hint: `环境里没读到 ${tokenEnv} —— 配好后 clone / 推送 / 开 MR 才走这个 bot 自己的账号` }),
+    });
+  }
+
+  return {
+    credentials,
+    permissions: {
+      status: "unknown",
+      unknownReason:
+        "lark-cli 暂时查不到应用已开通哪些权限(auth scopes 只报用户授权)—— 请对照基线清单在开放平台核对",
+      baseline: BOT_PERMISSION_BASELINE,
+      consoleUrl: `https://open.feishu.cn/app/${encodeURIComponent(bot.app_id)}/auth`,
+    },
+    checkedAt: Date.now(),
+    fromCache: false,
+  };
+}
+
+/** 容错解析 CLI 输出里的 JSON 对象(输出可能带提示行/告警前缀)。 */
+function healthScanParseJson(text: string): Record<string, unknown> | null {
+  const raw = String(text || "").trim();
+  if (!raw) return null;
+  try {
+    const direct = JSON.parse(raw);
+    if (direct && typeof direct === "object" && !Array.isArray(direct)) return direct as Record<string, unknown>;
+  } catch { /* fall through */ }
+  const first = raw.indexOf("{");
+  const last = raw.lastIndexOf("}");
+  if (first >= 0 && last > first) {
+    try {
+      const parsed = JSON.parse(raw.slice(first, last + 1));
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) return parsed as Record<string, unknown>;
+    } catch { /* give up */ }
+  }
+  return null;
+}
+
+/**
+ * GET /api/bot/:id/health-scan —— 读缓存(TTL 10min);POST 同路径强制重检。
+ * 工具组数据不在响应里:前端用 /api/runtime/requirements 的 botIds 过滤。
+ */
+const getBotHealthScan: ApiHandler = async (req) => {
+  const { ctx, params } = req;
+  const id = params.id;
+  {
+    const e = badBotId(id);
+    if (e) return e;
+  }
+  if (ctx.mode !== "local") {
+    return { status: 403, json: { error: "只支持在本机助手上下文中体检。" } };
+  }
+  const force = req.method === "POST";
+  const cached = healthScanCache.get(id);
+  if (!force && cached && Date.now() - cached.at < HEALTH_SCAN_TTL_MS) {
+    return { status: 200, json: { ...cached.json, fromCache: true } };
+  }
+  let bot: Awaited<ReturnType<typeof botsStore.readBot>>;
+  try {
+    bot = await ctx.stores.botsStore.readBot(id);
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    return { status: msg.includes("not found") ? 404 : 500, json: { error: msg } };
+  }
+  const json = await runHealthScan(bot, ctx.stores.hostConfig);
+  healthScanCache.set(id, { json, at: Date.now() });
+  return { status: 200, json };
+};
+
+// ---------------------------------------------------------------------------
 // Route handlers
 // ---------------------------------------------------------------------------
 
@@ -352,37 +550,131 @@ const getUpdateVersion: ApiHandler = async () => {
 };
 
 /**
- * POST /api/update_version — run the existing updater: npm latest + bridge restart.
+ * POST /api/update_version — 启动异步更新任务(BL-46 胶囊五态):立即返回,
+ * 进度经 GET /api/update_version/status 轮询。阶段来自 `larkway update
+ * --latest --json` 的 NDJSON step 事件(下载安装 → 重启服务 → 收尾),给阶段
+ * 不给百分比。同一时间只允许一个更新任务。
  */
-const postUpdateVersion: ApiHandler = async () => {
-  try {
-    const { stdout, stderr } = await updateExecFile("larkway", ["update", "--latest", "--json"], {
-      timeout: UPDATE_RUN_TIMEOUT_MS,
-      maxBuffer: UPDATE_MAX_BUFFER,
+interface UpdateJobState {
+  status: "idle" | "running" | "failed" | "done";
+  phase?: string;
+  phaseIndex?: number;
+  phaseCount?: number;
+  error?: string;
+  /** 输出尾部(最多 60 行),失败态「复制日志」用。 */
+  log: string[];
+  startedAt?: number;
+  finishedAt?: number;
+}
+let updateJob: UpdateJobState = { status: "idle", log: [] };
+
+/** 可注入的更新任务执行器:流式回调每行 NDJSON,resolve 子进程退出码。 */
+type UpdateJobRunner = (onLine: (line: string) => void) => Promise<{ code: number }>;
+let updateJobRunner: UpdateJobRunner = defaultUpdateJobRunner;
+
+export function _setUpdateJobRunnerForTest(fn?: UpdateJobRunner): void {
+  updateJobRunner = fn ?? defaultUpdateJobRunner;
+  updateJob = { status: "idle", log: [] };
+}
+
+async function defaultUpdateJobRunner(onLine: (line: string) => void): Promise<{ code: number }> {
+  const { spawn } = await import("node:child_process");
+  return new Promise((resolve, reject) => {
+    const child = spawn("larkway", ["update", "--latest", "--json"], {
+      stdio: ["ignore", "pipe", "pipe"],
     });
-    return {
-      status: 200,
-      json: {
-        ok: true,
-        message:
-          "larkway 已更新，bridge 已重启。刷新页面即可加载新版前端；" +
-          "管理页后端进程仍是旧版，如遇接口异常请重启 larkway ui。",
-        stdout: stdout.trim(),
-        stderr: stderr.trim(),
-      },
+    let buf = "";
+    const feed = (chunk: unknown) => {
+      buf += String(chunk);
+      let idx: number;
+      while ((idx = buf.indexOf("\n")) >= 0) {
+        const line = buf.slice(0, idx).trim();
+        buf = buf.slice(idx + 1);
+        if (line) onLine(line);
+      }
     };
+    child.stdout.on("data", feed);
+    child.stderr.on("data", feed);
+    child.on("error", reject);
+    child.on("close", (code) => {
+      if (buf.trim()) onLine(buf.trim());
+      resolve({ code: code ?? 1 });
+    });
+  });
+}
+
+/** step label → 用户可读阶段(给阶段不给百分比;未识别的 step 原样透出)。 */
+function updatePhaseOf(step: string): { phase: string; phaseIndex: number } {
+  if (/npm i/i.test(step)) return { phase: "下载安装", phaseIndex: 1 };
+  if (/stop/i.test(step)) return { phase: "重启服务", phaseIndex: 2 };
+  if (/start/i.test(step)) return { phase: "收尾", phaseIndex: 3 };
+  return { phase: step, phaseIndex: updateJob.phaseIndex ?? 1 };
+}
+
+async function runUpdateJob(): Promise<void> {
+  updateJob = {
+    status: "running",
+    phase: "准备",
+    phaseIndex: 1,
+    phaseCount: 3,
+    log: [],
+    startedAt: Date.now(),
+  };
+  const pushLog = (line: string) => {
+    updateJob.log.push(line);
+    if (updateJob.log.length > 60) updateJob.log.splice(0, updateJob.log.length - 60);
+  };
+  try {
+    const { code } = await updateJobRunner((line) => {
+      pushLog(line);
+      try {
+        const ev = JSON.parse(line) as { step?: string; error?: string; ok?: boolean };
+        if (typeof ev.step === "string") {
+          const { phase, phaseIndex } = updatePhaseOf(ev.step);
+          updateJob.phase = phase;
+          updateJob.phaseIndex = phaseIndex;
+        }
+        if (ev.ok === false && typeof ev.error === "string") updateJob.error = ev.error;
+      } catch {
+        /* 非 JSON 行只进日志 */
+      }
+    });
+    if (code === 0) {
+      updateJob.status = "done";
+      updateJob.phase = "完成";
+      updateJob.phaseIndex = updateJob.phaseCount;
+    } else {
+      updateJob.status = "failed";
+      updateJob.error = updateJob.error ?? `updater 退出码 ${code}`;
+    }
   } catch (e) {
-    const err = e as NodeJS.ErrnoException & { stdout?: string; stderr?: string };
-    return {
-      status: 500,
-      json: {
-        ok: false,
-        error: err.message ?? String(e),
-        stdout: typeof err.stdout === "string" ? err.stdout.trim() : "",
-        stderr: typeof err.stderr === "string" ? err.stderr.trim() : "",
-      },
-    };
+    updateJob.status = "failed";
+    updateJob.error = e instanceof Error ? e.message : String(e);
   }
+  updateJob.finishedAt = Date.now();
+}
+
+const postUpdateVersion: ApiHandler = async () => {
+  if (updateJob.status === "running") {
+    return { status: 409, json: { ok: false, error: "更新已在进行中。" } };
+  }
+  void runUpdateJob();
+  return { status: 200, json: { ok: true, started: true } };
+};
+
+/** GET /api/update_version/status — 更新任务进度快照(胶囊轮询用)。 */
+const getUpdateVersionStatus: ApiHandler = async () => {
+  return {
+    status: 200,
+    json: {
+      status: updateJob.status,
+      phase: updateJob.phase,
+      phaseIndex: updateJob.phaseIndex,
+      phaseCount: updateJob.phaseCount,
+      error: updateJob.error,
+      log: updateJob.log,
+    },
+  };
 };
 
 /**
@@ -1451,8 +1743,11 @@ export const ROUTES: Record<string, ApiHandler> = {
   "GET /api/context": getContext,
   "GET /api/update_version": getUpdateVersion,
   "POST /api/update_version": postUpdateVersion,
+  "GET /api/update_version/status": getUpdateVersionStatus,
   "GET /api/bots": getBots,
   "GET /api/bot/:id": getBot,
+  "GET /api/bot/:id/health-scan": getBotHealthScan,
+  "POST /api/bot/:id/health-scan": getBotHealthScan,
   "GET /api/bot/:id/events": getBotEvents,
   "PUT /api/bot/:id": putBot,
   "DELETE /api/bot/:id": deleteBot,

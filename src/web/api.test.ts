@@ -21,6 +21,8 @@ import yaml from "js-yaml";
 
 import {
   _setEventNameResolverExecForTest,
+  _setHealthScanForTest,
+  _setUpdateJobRunnerForTest,
   _setUpdateVersionExecForTest,
   createManagementContext,
   matchRoute,
@@ -87,6 +89,7 @@ async function makeTmpDir(): Promise<string> {
 afterEach(async () => {
   _setEventNameResolverExecForTest();
   _setUpdateVersionExecForTest();
+  _setUpdateJobRunnerForTest();
   await Promise.all(tmpDirs.map((d) => rm(d, { recursive: true, force: true })));
   tmpDirs = [];
 });
@@ -287,20 +290,62 @@ describe("GET /api/update_version", () => {
   });
 });
 
-describe("POST /api/update_version", () => {
-  it("delegates to the existing larkway updater", async () => {
-    const calls: string[] = [];
-    _setUpdateVersionExecForTest(async (file, args) => {
-      calls.push(`${file} ${args.join(" ")}`);
-      return { stdout: '{"ok":true,"status":"complete"}\n', stderr: "" };
+describe("POST /api/update_version — async staged job (BL-46)", () => {
+  it("starts the updater in the background and reports staged progress until done", async () => {
+    _setUpdateJobRunnerForTest(async (onLine) => {
+      onLine(JSON.stringify({ step: "npm i -g larkway@latest", stream: "stdout", line: "added 1 package" }));
+      onLine(JSON.stringify({ ok: true, step: "npm i -g larkway@latest", status: "done" }));
+      onLine(JSON.stringify({ ok: true, step: "larkway stop (bridge lifecycle)", status: "done" }));
+      onLine(JSON.stringify({ ok: true, step: "larkway start (bridge lifecycle)", status: "done" }));
+      return { code: 0 };
     });
-
     const dir = await makeLocalBotsDir();
     const ctx = makeCtx(dir);
-    const res = await call(ctx, "POST /api/update_version");
-    expect(res.status).toBe(200);
-    expect(res.json).toMatchObject({ ok: true });
-    expect(calls).toEqual(["larkway update --latest --json"]);
+
+    const started = await call(ctx, "POST /api/update_version");
+    expect(started.status).toBe(200);
+    expect(started.json).toMatchObject({ ok: true, started: true });
+
+    await new Promise((r) => setImmediate(r));
+    const status = await call(ctx, "GET /api/update_version/status");
+    expect(status.json).toMatchObject({ status: "done", phaseIndex: 3, phaseCount: 3 });
+  });
+
+  it("rejects a second update while one is running (409)", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((r) => { release = r; });
+    _setUpdateJobRunnerForTest(async () => {
+      await gate;
+      return { code: 0 };
+    });
+    const dir = await makeLocalBotsDir();
+    const ctx = makeCtx(dir);
+
+    const first = await call(ctx, "POST /api/update_version");
+    expect(first.status).toBe(200);
+    const second = await call(ctx, "POST /api/update_version");
+    expect(second.status).toBe(409);
+    release();
+    await new Promise((r) => setImmediate(r));
+  });
+
+  it("captures the failure reason and output tail on a non-zero exit", async () => {
+    _setUpdateJobRunnerForTest(async (onLine) => {
+      onLine(JSON.stringify({ step: "npm i -g larkway@latest" }));
+      onLine(JSON.stringify({ ok: false, error: "npm EACCES: permission denied", step: "npm i -g larkway@latest", exitCode: 243 }));
+      return { code: 1 };
+    });
+    const dir = await makeLocalBotsDir();
+    const ctx = makeCtx(dir);
+
+    await call(ctx, "POST /api/update_version");
+    await new Promise((r) => setImmediate(r));
+    const status = await call(ctx, "GET /api/update_version/status");
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const json = status.json as any;
+    expect(json.status).toBe("failed");
+    expect(json.error).toContain("EACCES");
+    expect(json.log.length).toBeGreaterThan(0);
   });
 });
 
@@ -358,6 +403,98 @@ describe("GET /api/bot/:id", () => {
     const ctx = makeCtx(dir);
     const res = await call(ctx, "GET /api/bot/:id", { params: { id: "nonexistent" } });
     expect(res.status).toBe(404);
+  });
+});
+
+describe("GET/POST /api/bot/:id/health-scan", () => {
+  afterEach(() => {
+    _setHealthScanForTest();
+  });
+
+  it("reports backend login + lark-cli profile facts; permissions honestly unknown with baseline + console link", async () => {
+    const execCalls: Array<{ file: string; args: string[] }> = [];
+    _setHealthScanForTest({
+      exec: async (file, args) => {
+        execCalls.push({ file, args });
+        return {
+          stdout: `Querying...\n${JSON.stringify({ identities: { bot: { available: true } } })}`,
+          stderr: "",
+        };
+      },
+      backendLogin: async (backend) => {
+        expect(backend).toBe("claude"); // schema default
+        return true;
+      },
+    });
+
+    const dir = await makeLocalBotsDir();
+    const ctx = makeCtx(dir);
+    const res = await call(ctx, "GET /api/bot/:id/health-scan", { params: { id: "test-bot" } });
+
+    expect(res.status).toBe(200);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const json = res.json as any;
+    expect(execCalls).toEqual([
+      { file: "lark-cli", args: ["--profile", "cli_test123", "auth", "status", "--json"] },
+    ]);
+    expect(json.credentials).toEqual([
+      expect.objectContaining({ id: "backend-login", status: "ok", severity: "required", global: true }),
+      expect.objectContaining({ id: "lark-profile", status: "ok", severity: "required", global: false }),
+    ]);
+    expect(json.permissions.status).toBe("unknown");
+    expect(json.permissions.baseline.length).toBeGreaterThan(5);
+    expect(json.permissions.baseline[0]).toMatchObject({ scope: expect.any(String), reason: expect.any(String) });
+    expect(json.permissions.consoleUrl).toBe("https://open.feishu.cn/app/cli_test123/auth");
+    expect(json.fromCache).toBe(false);
+  });
+
+  it("serves the cached result within TTL; POST forces a re-probe", async () => {
+    let probes = 0;
+    _setHealthScanForTest({
+      exec: async () => {
+        probes++;
+        return { stdout: JSON.stringify({ identities: { bot: { available: true } } }), stderr: "" };
+      },
+      backendLogin: async () => true,
+    });
+    const dir = await makeLocalBotsDir();
+    const ctx = makeCtx(dir);
+
+    const first = await call(ctx, "GET /api/bot/:id/health-scan", { params: { id: "test-bot" } });
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    expect((first.json as any).fromCache).toBe(false);
+    expect(probes).toBe(1);
+
+    const second = await call(ctx, "GET /api/bot/:id/health-scan", { params: { id: "test-bot" } });
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    expect((second.json as any).fromCache).toBe(true);
+    expect(probes).toBe(1);
+
+    const forced = await call(ctx, "POST /api/bot/:id/health-scan", { params: { id: "test-bot" } });
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    expect((forced.json as any).fromCache).toBe(false);
+    expect(probes).toBe(2);
+  });
+
+  it("degrades honestly: login probe false → fail with hint; lark-cli probe throwing → unknown", async () => {
+    _setHealthScanForTest({
+      exec: async () => {
+        throw new Error("spawn lark-cli ENOENT");
+      },
+      backendLogin: async () => false,
+    });
+    const dir = await makeLocalBotsDir();
+    const ctx = makeCtx(dir);
+    const res = await call(ctx, "GET /api/bot/:id/health-scan", { params: { id: "test-bot" } });
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const json = res.json as any;
+    const byId = Object.fromEntries(json.credentials.map((c: { id: string }) => [c.id, c]));
+    expect(byId["backend-login"].status).toBe("fail");
+    expect(byId["backend-login"].hint).toContain("claude");
+    expect(byId["lark-profile"].status).toBe("unknown");
+    // 探测失败 ≠ 泄露原始报错细节到 UI 正文之外的字段
+    expect(JSON.stringify(json)).not.toContain("ENOENT");
   });
 });
 
