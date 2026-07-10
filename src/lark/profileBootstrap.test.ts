@@ -9,7 +9,7 @@
  */
 
 import { describe, it, expect, vi } from "vitest";
-import { ensureLarkCliProfile, deriveLarkCliProfile, type SpawnSyncFn } from "./profileBootstrap.js";
+import { ensureLarkCliProfile, ensureLarkCliProfileAsync, deriveLarkCliProfile, type SpawnSyncFn, type SpawnAsyncFn } from "./profileBootstrap.js";
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -250,5 +250,99 @@ describe("ensureLarkCliProfile — profile provisioning fails, degrades graceful
       ...fakeConsole.warn.mock.calls.flat(),
     ].join(" ");
     expect(allLogs).not.toContain(APP_SECRET);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// ensureLarkCliProfileAsync — request-path variant (no event-loop blocking)
+// ---------------------------------------------------------------------------
+
+/**
+ * Build a fake async spawn whose child immediately "closes" with the given
+ * exit code on the next microtask. Captures argv and stdin writes.
+ */
+function makeAsyncSpawn(exitCode: number | null, opts?: { stderr?: string; emitError?: Error }) {
+  const captured = { args: [] as string[], stdinWrites: [] as string[], killed: false };
+  const spawn: SpawnAsyncFn = (_cmd, args) => {
+    captured.args = args;
+    const handlers: Record<string, Array<(arg: unknown) => void>> = {};
+    queueMicrotask(() => {
+      if (opts?.stderr) for (const cb of handlers["stderr-data"] ?? []) cb(opts.stderr);
+      if (opts?.emitError) {
+        for (const cb of handlers["error"] ?? []) cb(opts.emitError);
+      } else {
+        for (const cb of handlers["close"] ?? []) cb(exitCode);
+      }
+    });
+    return {
+      stdin: {
+        write: (d: string) => void captured.stdinWrites.push(d),
+        end: () => {},
+      },
+      stderr: { on: (_e: "data", cb: (c: Buffer | string) => void) => void (handlers["stderr-data"] = [...(handlers["stderr-data"] ?? []), cb as (arg: unknown) => void]) },
+      on: (e: "close" | "error", cb: (arg: unknown) => void) => void (handlers[e] = [...(handlers[e] ?? []), cb]),
+      kill: () => (captured.killed = true),
+    };
+  };
+  return { spawn, captured };
+}
+
+describe("ensureLarkCliProfileAsync — async request-path variant", () => {
+  it("provisions via config init --name with secret over stdin, logs OK on exit 0", async () => {
+    const { spawn, captured } = makeAsyncSpawn(0);
+    const fakeConsole = { log: vi.fn(), warn: vi.fn() };
+
+    await ensureLarkCliProfileAsync(BOT_ID, PROFILE_NAME, APP_ID, APP_SECRET, spawn, fakeConsole);
+
+    expect(captured.args).toEqual([
+      "config", "init", "--app-id", APP_ID, "--app-secret-stdin", "--name", PROFILE_NAME,
+    ]);
+    expect(captured.stdinWrites).toEqual([APP_SECRET]);
+    expect(fakeConsole.warn).not.toHaveBeenCalled();
+    const allLogs = fakeConsole.log.mock.calls.flat().join(" ");
+    expect(allLogs).toContain("provisioned OK");
+    expect(allLogs).not.toContain(APP_SECRET);
+  });
+
+  it("degrades gracefully (warn, no throw) on non-zero exit, without leaking the secret", async () => {
+    const { spawn } = makeAsyncSpawn(1, { stderr: "boom" });
+    const fakeConsole = { log: vi.fn(), warn: vi.fn() };
+
+    await ensureLarkCliProfileAsync(BOT_ID, PROFILE_NAME, APP_ID, APP_SECRET, spawn, fakeConsole);
+
+    expect(fakeConsole.warn).toHaveBeenCalledOnce();
+    const warnMsg = fakeConsole.warn.mock.calls[0]![0] as string;
+    expect(warnMsg).toContain("WARNING");
+    expect(warnMsg).toContain("exit 1");
+    expect(warnMsg).toContain("boom");
+    expect(warnMsg).not.toContain(APP_SECRET);
+  });
+
+  it("degrades gracefully when the child emits 'error' (e.g. lark-cli missing)", async () => {
+    const { spawn } = makeAsyncSpawn(null, { emitError: new Error("spawn ENOENT") });
+    const fakeConsole = { log: vi.fn(), warn: vi.fn() };
+
+    await expect(
+      ensureLarkCliProfileAsync(BOT_ID, PROFILE_NAME, APP_ID, APP_SECRET, spawn, fakeConsole),
+    ).resolves.toBeUndefined();
+
+    expect(fakeConsole.warn).toHaveBeenCalledOnce();
+    const warnMsg = fakeConsole.warn.mock.calls[0]![0] as string;
+    expect(warnMsg).toContain("spawn ENOENT");
+    expect(warnMsg).not.toContain(APP_SECRET);
+  });
+
+  it("degrades gracefully when spawn itself throws synchronously", async () => {
+    const spawn: SpawnAsyncFn = () => {
+      throw new Error("spawn EACCES");
+    };
+    const fakeConsole = { log: vi.fn(), warn: vi.fn() };
+
+    await expect(
+      ensureLarkCliProfileAsync(BOT_ID, PROFILE_NAME, APP_ID, APP_SECRET, spawn, fakeConsole),
+    ).resolves.toBeUndefined();
+
+    expect(fakeConsole.warn).toHaveBeenCalledOnce();
+    expect(String(fakeConsole.warn.mock.calls[0]![0])).toContain("spawn EACCES");
   });
 });

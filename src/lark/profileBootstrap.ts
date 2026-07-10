@@ -18,7 +18,7 @@
  *  - Secure: app secret is passed via stdin, never via argv or logs.
  */
 
-import { spawnSync, type SpawnSyncOptions, type SpawnSyncReturns } from "node:child_process";
+import { spawn, spawnSync, type SpawnSyncOptions, type SpawnSyncReturns } from "node:child_process";
 
 // ---------------------------------------------------------------------------
 // Injectable spawn for testability
@@ -107,6 +107,108 @@ export function ensureLarkCliProfile(
     // Unexpected error (e.g. lark-cli not found) — non-fatal
     _console.warn(
       `[larkway] WARNING: bot "${botId}" lark-cli profile setup failed: ${String(err)}. ` +
+        `Multi-bot lark-cli calls may use the wrong app credentials. ` +
+        `Fix: lark-cli config init --app-id ${appId} --app-secret-stdin --name ${profileName}`,
+    );
+  }
+}
+
+/**
+ * Minimal async spawn shape consumed by {@link ensureLarkCliProfileAsync}.
+ * Mirrors the parts of Node's ChildProcess we actually touch, so tests can
+ * inject a plain object instead of a real subprocess.
+ */
+export type SpawnAsyncFn = (
+  command: string,
+  args: string[],
+) => {
+  stdin: { write(data: string): void; end(): void } | null;
+  stderr: { on(event: "data", cb: (chunk: Buffer | string) => void): void } | null;
+  on(event: "close" | "error", cb: (arg: unknown) => void): void;
+  kill(signal?: NodeJS.Signals): boolean;
+};
+
+/**
+ * Async variant of {@link ensureLarkCliProfile} for use inside request
+ * handlers (e.g. the web UI's permission-auth endpoint). The sync variant is
+ * fine at bridge startup — before any server accepts traffic — but its
+ * spawnSync would block the event loop for up to 10s mid-request, stalling
+ * every other in-flight HTTP request on the process. Same semantics
+ * otherwise: idempotent `config init --name`, secret via stdin, non-fatal
+ * warn-and-continue on any failure.
+ */
+export async function ensureLarkCliProfileAsync(
+  botId: string,
+  profileName: string,
+  appId: string,
+  appSecret: string,
+  _spawn: SpawnAsyncFn = spawn as unknown as SpawnAsyncFn,
+  _console: Pick<Console, "log" | "warn"> = console,
+): Promise<void> {
+  _console.log(
+    `[larkway] bot "${botId}": provisioning lark-cli profile "${profileName}" for app ${appId.slice(0, 8)}…`,
+  );
+  const result = await new Promise<{ status: number | null; stderr: string; error?: unknown }>(
+    (resolve) => {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      let settled = false;
+      const settle = (r: { status: number | null; stderr: string; error?: unknown }) => {
+        if (settled) return;
+        settled = true;
+        if (timer) clearTimeout(timer);
+        resolve(r);
+      };
+      let child: ReturnType<SpawnAsyncFn>;
+      try {
+        child = _spawn("lark-cli", [
+          "config",
+          "init",
+          "--app-id",
+          appId,
+          "--app-secret-stdin",
+          "--name",
+          profileName,
+        ]);
+      } catch (err) {
+        settle({ status: null, stderr: "", error: err });
+        return;
+      }
+      let stderr = "";
+      timer = setTimeout(() => {
+        try {
+          child.kill("SIGKILL");
+        } catch {
+          /* already dead */
+        }
+        settle({ status: null, stderr, error: new Error("timed out after 10s") });
+      }, 10_000);
+      child.stderr?.on("data", (chunk) => {
+        stderr += String(chunk);
+      });
+      child.on("error", (err) => settle({ status: null, stderr, error: err }));
+      child.on("close", (code) => settle({ status: code as number | null, stderr }));
+      try {
+        child.stdin?.write(appSecret);
+        child.stdin?.end();
+      } catch {
+        /* spawn failed before stdin opened — 'error' event will settle */
+      }
+    },
+  );
+
+  if (result.error) {
+    _console.warn(
+      `[larkway] WARNING: bot "${botId}" lark-cli profile setup failed: ${String(result.error)}. ` +
+        `Multi-bot lark-cli calls may use the wrong app credentials. ` +
+        `Fix: lark-cli config init --app-id ${appId} --app-secret-stdin --name ${profileName}`,
+    );
+  } else if (result.status === 0) {
+    _console.log(`[larkway] bot "${botId}": lark-cli profile "${profileName}" provisioned OK.`);
+  } else {
+    const stderrText = result.stderr.trim();
+    _console.warn(
+      `[larkway] WARNING: bot "${botId}" failed to provision lark-cli profile "${profileName}" ` +
+        `(exit ${result.status}${stderrText ? `: ${stderrText}` : ""}). ` +
         `Multi-bot lark-cli calls may use the wrong app credentials. ` +
         `Fix: lark-cli config init --app-id ${appId} --app-secret-stdin --name ${profileName}`,
     );

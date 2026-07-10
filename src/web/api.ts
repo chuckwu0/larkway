@@ -35,7 +35,7 @@ import {
 import { permissionItemsFromCapabilities } from "../agent/permissionPlan.js";
 import { resolveAgentWorkspacePathFromHome } from "../config/paths.js";
 import { resolveLarkwayVersion } from "../version.js";
-import { deriveLarkCliProfile, ensureLarkCliProfile } from "../lark/profileBootstrap.js";
+import { deriveLarkCliProfile, ensureLarkCliProfileAsync } from "../lark/profileBootstrap.js";
 import {
   readStatusFile,
   classifyStatus,
@@ -579,7 +579,7 @@ const postBotPermissionAuth: ApiHandler = async (req) => {
   try {
     const appSecret = await ctx.stores.hostConfig.readSecret(bot.app_secret_env).catch(() => null);
     if (appSecret) {
-      ensureLarkCliProfile(bot.id, profile, bot.app_id, appSecret);
+      await ensureLarkCliProfileAsync(bot.id, profile, bot.app_id, appSecret);
     }
 
     const { stdout } = await permissionAuthExecFile(
