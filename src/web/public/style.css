@@ -39,6 +39,11 @@
   --radius-sm: 12px;
   --shadow-sm: 0 1px 2px rgba(15, 23, 42, 0.04);
   --shadow-lg: 0 12px 40px rgba(15, 23, 42, 0.16);
+
+  /* ── 健康与引导家族(能力体检设计稿):红=必须处理 / 黄=过旧·待生效 / 绿=通过 ── */
+  --ok: #15803d;   --ok-bg: #f0fdf4;   --ok-edge: #bbf7d0;
+  --warn: #b45309; --warn-bg: #fffbeb; --warn-edge: #fde68a;
+  --bad: #b91c1c;  --bad-bg: #fef2f2;  --bad-edge: #fecaca;
   /* 交互 focus 环走 indigo */
   --ring: 0 0 0 3px var(--br-ring);
 
@@ -3828,3 +3833,412 @@ textarea.input {
   font-weight: 500;
   color: var(--faint);
 }
+
+
+/* ============================================================================
+   能力体检设计稿落地(2026-07-10)
+   范围 B:底座卡 v2 .bk2 · 范围 A:能力体检卡 .hc · 范围 C:版本胶囊态 .cap
+   状态色语义:红=必须处理 / 黄=过旧·待生效 / indigo=会执行(仅对 larkway
+   自己)/ 灰边框=引导 / 绿=通过(只作确认)。
+   ============================================================================ */
+
+@keyframes lk-spin { to { transform: rotate(360deg); } }
+
+/* ── 范围 B · 底座二选一(带就绪微行) ── */
+.bk2-choice { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 12px; }
+.bk2-opt {
+  display: flex; align-items: center; gap: 11px;
+  padding: 13px 14px; border-radius: 11px;
+  border: 1px solid var(--border); background: var(--surface);
+  cursor: pointer; font-family: inherit; text-align: left;
+  transition: border-color 0.15s ease;
+}
+.bk2-opt:hover { border-color: #cbd5e1; }
+.bk2-opt.is-active { border: 1.5px solid var(--br); background: var(--br-soft); }
+.bk2-logo {
+  flex-shrink: 0;
+  width: 32px; height: 32px; border-radius: 9px;
+  display: inline-flex; align-items: center; justify-content: center;
+  background: var(--bg); color: var(--muted);
+  border: 1px solid var(--border);
+  font-family: ui-monospace, "Cascadia Code", monospace; font-size: 11px; font-weight: 800;
+  letter-spacing: 0.02em;
+}
+.bk2-opt.is-active .bk2-logo {
+  background: #fff; color: var(--br-text);
+  border-color: var(--br-edge);
+  box-shadow: 0 1px 2px rgba(79, 70, 229, 0.12);
+}
+.bk2-opt-meta { flex: 1; min-width: 0; }
+.bk2-opt-name { display: flex; align-items: center; gap: 6px; font-size: 14px; font-weight: 700; color: var(--text); }
+.bk2-opt-sub {
+  display: flex; align-items: center; gap: 5px;
+  margin-top: 1px; font-size: 11.5px; color: var(--muted);
+}
+.bk2-opt-sub .live-dot { width: 6px; height: 6px; }
+.bk2-opt-sub code { font-family: ui-monospace, monospace; font-size: 10.5px; background: var(--bg); border: 1px solid var(--border); border-radius: 4px; padding: 0 4px; }
+.bk2-check { flex-shrink: 0; color: var(--br); width: 16px; }
+.bk2-check .icon { width: 16px; height: 16px; }
+
+/* ── 范围 B · Model/Effort 覆盖区(收起一行摘要,点开见控件) ── */
+.bk2-adv {
+  margin-top: 12px;
+  border: 1px solid var(--border); border-radius: 11px;
+  background: var(--surface);
+}
+.bk2-adv-head {
+  width: 100%; box-sizing: border-box;
+  display: flex; align-items: center; gap: 9px;
+  padding: 12px 15px;
+  border: none; background: none; font-family: inherit; text-align: left;
+  cursor: pointer;
+}
+.bk2-adv.is-open .bk2-adv-head { padding-bottom: 0; }
+.bk2-adv-label { font-size: 13px; font-weight: 700; color: var(--text); white-space: nowrap; }
+.bk2-adv-sum {
+  margin-left: auto;
+  display: inline-flex; align-items: center; gap: 7px;
+  font-size: 12.5px; color: var(--muted);
+  min-width: 0; overflow: hidden;
+}
+.bk2-adv.is-open .bk2-adv-sum { display: none; }
+.bk2-adv-sum code {
+  font-family: ui-monospace, "Cascadia Code", monospace;
+  font-size: 12px; font-weight: 600; color: var(--text);
+}
+.bk2-adv-sum i { font-style: normal; color: var(--faint); }
+.bk2-adv-chev { color: var(--faint); flex-shrink: 0; margin-left: 8px; transition: transform 0.18s ease; }
+.bk2-adv.is-open .bk2-adv-chev { transform: rotate(180deg); }
+.bk2-adv-chev .icon { width: 15px; height: 15px; }
+.bk2-adv-body { display: none; padding: 10px 15px 14px; }
+.bk2-adv.is-open .bk2-adv-body { display: block; }
+.bk2-adv-grid {
+  display: grid; grid-template-columns: 1fr auto; gap: 14px;
+  align-items: start;
+}
+.bk2-adv-grid .ac-field { margin: 0; }
+.bk2-adv-body > .ac-hint { margin: 10px 0 0; }
+.bk2-model-field { position: relative; }
+
+/* Model 选择器:单一控件 + 菜单含「自定义」逃生口 */
+.bk2-select {
+  width: 100%; box-sizing: border-box;
+  height: 40px;
+  display: flex; align-items: center; gap: 10px;
+  padding: 0 13px; border-radius: 9px;
+  border: 1px solid var(--border); background: #fff;
+  cursor: pointer; font-family: inherit; text-align: left;
+}
+.bk2-select code {
+  font-family: ui-monospace, "Cascadia Code", monospace;
+  font-size: 13.5px; font-weight: 600; color: var(--text);
+  white-space: nowrap;
+}
+.bk2-sel-desc { flex: 1; min-width: 0; font-size: 12px; color: var(--faint); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.bk2-select .icon { width: 15px; height: 15px; color: var(--faint); flex-shrink: 0; }
+.bk2-menu {
+  position: absolute; left: 0; right: 0; top: calc(100% + 6px); z-index: 30;
+  border: 1px solid var(--border); border-radius: 11px;
+  background: #fff; overflow: hidden;
+  box-shadow: 0 8px 24px rgba(15, 23, 42, 0.1);
+}
+.bk2-mi {
+  display: flex; align-items: baseline; gap: 10px;
+  padding: 10px 14px;
+  border-top: 1px solid var(--bg);
+  cursor: pointer;
+}
+.bk2-mi:first-child { border-top: none; }
+.bk2-mi:hover { background: var(--bg); }
+.bk2-mi code { font-family: ui-monospace, monospace; font-size: 12.5px; font-weight: 600; color: var(--text); white-space: nowrap; }
+.bk2-mi span { flex: 1; font-size: 12px; color: var(--muted); }
+.bk2-mi .icon { align-self: center; width: 14px; height: 14px; color: var(--br); flex-shrink: 0; }
+.bk2-mi.is-sel { background: var(--br-soft); }
+.bk2-mi.is-default code { font-weight: 500; color: var(--muted); }
+.bk2-mi-custom {
+  display: flex; align-items: center; gap: 8px;
+  padding: 10px 14px;
+  border-top: 1px solid var(--border);
+  background: var(--bg);
+  font-size: 12.5px; font-weight: 700; color: var(--br-text);
+  cursor: pointer;
+}
+.bk2-mi-custom .icon { width: 13px; height: 13px; }
+.bk2-backlink {
+  display: inline-flex; align-items: center; gap: 5px;
+  margin-top: 7px;
+  border: none; background: none; padding: 0;
+  font-size: 12px; font-weight: 600; color: var(--br-text);
+  cursor: pointer; font-family: inherit;
+}
+.bk2-backlink .icon { width: 13px; height: 13px; transform: rotate(90deg); }
+
+/* Effort 分段控件 —— 灰色轨道 + 白色浮起选中片 */
+.bk2-seg {
+  display: inline-grid; grid-auto-flow: column; grid-auto-columns: 1fr;
+  gap: 3px; padding: 3px;
+  height: 40px; box-sizing: border-box;
+  border-radius: 10px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+}
+.bk2-seg button {
+  padding: 0 14px;
+  border: none; background: none; border-radius: 7px;
+  font-size: 12.5px; font-weight: 600; color: var(--faint);
+  cursor: pointer; font-family: inherit;
+  white-space: nowrap;
+  transition: color 0.15s ease;
+}
+.bk2-seg button:hover { color: var(--muted); }
+.bk2-seg button.is-active {
+  background: #fff; color: var(--text); font-weight: 700;
+  box-shadow: 0 1px 2px rgba(15, 23, 42, 0.08), 0 0 0 1px rgba(15, 23, 42, 0.05);
+}
+
+/* 「已保存,尚未生效」条 —— 安静单行:左侧细色条语义,不用整块黄底 */
+.bk2-pending {
+  margin-top: 12px;
+  display: flex; align-items: center; gap: 12px;
+  padding: 12px 16px; border-radius: 11px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-left: 3px solid #d97706;
+}
+.bk2-pending-dot {
+  width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0;
+  background: #d97706; animation: lk-pulse 2.2s ease-in-out infinite;
+}
+.bk2-pending-text { flex: 1; min-width: 0; display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; }
+.bk2-pending-text b { font-size: 13px; font-weight: 700; color: var(--text); white-space: nowrap; }
+.bk2-pending-text span { font-size: 12px; color: var(--muted); }
+.bk2-restart {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 7px 14px; border-radius: 8px;
+  border: none; background: var(--br); color: #fff;
+  font-size: 12.5px; font-weight: 700;
+  cursor: pointer; font-family: inherit; white-space: nowrap;
+}
+.bk2-restart:hover { background: var(--br-text); }
+.bk2-restart .icon { width: 13px; height: 13px; }
+/* hero 状态行呼应 badge(BL-17 统一) */
+.hero-badge.is-pending { border-color: var(--warn-edge); background: var(--warn-bg); color: var(--warn); }
+
+/* ── 范围 A · 能力体检卡 .hc(配置卡家族成员,与 ac-layer 同壳) ── */
+.hc {
+  margin-top: 18px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  box-shadow: var(--shadow-sm);
+  overflow: hidden;
+}
+.hc-head { display: flex; align-items: flex-start; gap: 13px; padding: 18px 22px; }
+.hc-shield {
+  flex-shrink: 0;
+  width: 30px; height: 30px; border-radius: 9px;
+  display: inline-flex; align-items: center; justify-content: center;
+  color: var(--br-text); background: var(--br-soft); border: 1px solid var(--br-edge);
+}
+.hc-shield .icon { width: 17px; height: 17px; }
+.hc-meta { flex: 1; min-width: 0; }
+.hc-title-row { display: flex; align-items: center; gap: 9px; flex-wrap: wrap; }
+.hc-title { margin: 0; font-size: 16.5px; font-weight: 800; letter-spacing: -0.01em; color: var(--text); }
+.hc-headcount {
+  font-size: 11.5px; font-weight: 600; color: var(--muted);
+  padding: 1px 9px; border-radius: 999px;
+  background: var(--bg); border: 1px solid var(--border);
+}
+.hc-desc { margin: 4px 0 0; font-size: 13px; color: var(--muted); line-height: 1.5; }
+.hc-head-right { flex-shrink: 0; display: flex; flex-direction: column; align-items: flex-end; gap: 6px; }
+/* 重检 = 只读动作 → 引导型边框按钮(indigo 实心只留给真正会执行的写操作) */
+.hc-refresh {
+  display: inline-flex; align-items: center; gap: 7px;
+  padding: 7px 14px; border-radius: 9px;
+  border: 1px solid var(--br-edge); background: var(--surface);
+  color: var(--br-text);
+  font-size: 13px; font-weight: 700;
+  cursor: pointer; font-family: inherit; white-space: nowrap;
+}
+.hc-refresh:hover { background: var(--br-soft); }
+.hc-refresh.is-loading { opacity: 0.6; cursor: default; }
+.hc-refresh.is-loading .icon { animation: lk-spin 1s linear infinite; }
+.hc-refresh .icon { width: 14px; height: 14px; }
+.hc-stamp {
+  font-size: 11.5px; color: var(--faint);
+  font-family: ui-monospace, "Cascadia Code", monospace;
+  white-space: nowrap;
+}
+.hc-stamp .is-stale { color: var(--warn); }
+.hc-body { border-top: 1px solid var(--border); padding: 6px 22px 16px; }
+.hc-seg { padding: 12px 0 4px; }
+.hc-seg + .hc-seg { border-top: 1px solid var(--border); }
+.hc-seg-head {
+  width: 100%;
+  display: flex; align-items: center; gap: 10px;
+  padding: 4px 0;
+  border: none; background: none; font-family: inherit; text-align: left;
+}
+button.hc-seg-head { cursor: pointer; }
+.hc-count {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 3px 11px; border-radius: 999px;
+  font-size: 12.5px; font-weight: 800; white-space: nowrap;
+}
+.hc-count-req { color: var(--bad); background: var(--bad-bg); border: 1px solid var(--bad-edge); }
+.hc-count-rec { color: var(--muted); background: var(--bg); border: 1px solid var(--border); }
+.hc-count-ok { color: var(--ok); background: var(--ok-bg); border: 1px solid var(--ok-edge); }
+.hc-seg-sub { font-size: 12px; color: var(--faint); flex: 1; min-width: 0; }
+.hc-seg-chev { color: var(--faint); flex-shrink: 0; transition: transform 0.18s ease; }
+.hc-seg-chev .icon { width: 15px; height: 15px; }
+.hc-seg.is-open .hc-seg-chev { transform: rotate(180deg); }
+.hc-seg-rows { display: none; }
+.hc-seg.is-open .hc-seg-rows { display: block; }
+.hc-row { display: flex; align-items: flex-start; gap: 12px; padding: 13px 0 14px; }
+.hc-row + .hc-row { border-top: 1px dashed var(--border); }
+.hc-ico {
+  flex-shrink: 0; margin-top: 1px;
+  width: 22px; height: 22px; border-radius: 50%;
+  display: inline-flex; align-items: center; justify-content: center;
+}
+.hc-ico .icon { width: 14px; height: 14px; }
+.hc-ico.is-miss { color: var(--bad); background: var(--bad-bg); }
+.hc-ico.is-old  { color: var(--warn); background: var(--warn-bg); }
+.hc-ico.is-rec  { color: var(--muted); background: var(--bg); }
+.hc-ico.is-ok   { color: var(--ok); background: var(--ok-bg); }
+.hc-row-main { flex: 1; min-width: 0; }
+.hc-row-title { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.hc-name { font-size: 14px; font-weight: 700; color: var(--text); }
+.hc-ver {
+  font-size: 11px; font-weight: 600;
+  font-family: ui-monospace, monospace;
+  color: var(--warn); background: var(--warn-bg);
+  border: 1px solid var(--warn-edge);
+  border-radius: 999px; padding: 1px 8px;
+}
+.hc-tag {
+  font-size: 11px; font-weight: 600; color: var(--faint);
+  padding: 1px 8px; border-radius: 999px;
+  background: var(--bg); border: 1px solid var(--border);
+}
+/* 「全局」徽章:表达作用域,不表达严重度 —— 灰底 + 主机图标 */
+.hc-global {
+  display: inline-flex; align-items: center; gap: 4px;
+  font-size: 11px; font-weight: 700;
+  color: #475569;
+  padding: 1px 8px 1px 6px; border-radius: 999px;
+  background: #f1f5f9; border: 1px solid #cbd5e1;
+  cursor: help;
+}
+.hc-global .icon { width: 11px; height: 11px; }
+.hc-impact { margin: 4px 0 0; font-size: 12.5px; color: var(--muted); line-height: 1.55; }
+.hc-impact b { color: var(--text); font-weight: 600; }
+.hc-scopes { margin-top: 9px; display: flex; flex-direction: column; gap: 6px; }
+.hc-scope {
+  display: flex; align-items: baseline; gap: 10px;
+  padding: 6px 11px; border-radius: 8px;
+  background: var(--bg); border: 1px solid var(--border);
+}
+.hc-scope code {
+  font-family: ui-monospace, "Cascadia Code", monospace;
+  font-size: 11.5px; font-weight: 600; color: var(--text);
+  white-space: nowrap;
+}
+.hc-scope span { font-size: 12px; color: var(--muted); }
+.hc-actline { margin-top: 9px; display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.hc-act {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 6px 13px; border-radius: 8px;
+  border: 1px solid var(--border); background: var(--surface);
+  color: var(--br-text);
+  font-size: 12.5px; font-weight: 700;
+  cursor: pointer; font-family: inherit; white-space: nowrap;
+}
+.hc-act:hover { border-color: var(--br-edge); background: var(--br-soft); }
+.hc-act .icon { width: 13px; height: 13px; }
+.hc-cmd {
+  font-family: ui-monospace, "Cascadia Code", monospace;
+  font-size: 11.5px; color: var(--faint);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.hc-pubnote {
+  margin-top: 9px;
+  display: flex; align-items: flex-start; gap: 8px;
+  padding: 8px 12px; border-radius: 8px;
+  background: var(--warn-bg); border: 1px solid var(--warn-edge);
+  font-size: 12px; color: var(--warn); line-height: 1.55;
+}
+.hc-pubnote .icon { width: 13px; height: 13px; flex-shrink: 0; margin-top: 1px; }
+.hc-pubnote b { font-weight: 700; }
+.hc-unk {
+  margin: 12px 0 0;
+  display: flex; align-items: flex-start; gap: 9px;
+  padding: 10px 13px; border-radius: 10px;
+  background: var(--bg); border: 1px dashed #cbd5e1;
+  font-size: 12.5px; color: var(--muted); line-height: 1.55;
+}
+.hc-unk .icon { width: 15px; height: 15px; flex-shrink: 0; margin-top: 1px; color: var(--faint); }
+.hc-unk b { color: var(--text); font-weight: 600; }
+.hc-passed {
+  width: 100%;
+  margin-top: 12px;
+  display: flex; align-items: center; gap: 9px;
+  padding: 9px 13px;
+  background: var(--ok-bg); border: 1px solid var(--ok-edge);
+  border-radius: 10px;
+  font-family: inherit; text-align: left; cursor: pointer;
+}
+.hc-passed .icon { color: var(--ok); flex-shrink: 0; width: 14px; height: 14px; }
+.hc-passed-label { font-size: 12.5px; font-weight: 700; color: var(--ok); white-space: nowrap; }
+.hc-passed-sum { flex: 1; min-width: 0; font-size: 12px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.hc-passed .hc-seg-chev { color: var(--ok); }
+.hc-passed.is-open .hc-seg-chev { transform: rotate(180deg); }
+.hc-passed-list { display: none; padding: 2px 4px; }
+.hc-passed-list.is-open { display: block; }
+.hc-passed-list .hc-row { padding: 10px 0; }
+.hc-passed-list .hc-name { font-weight: 600; font-size: 13.5px; }
+.hc-okline { display: flex; align-items: center; gap: 11px; padding: 16px 22px; }
+.hc-okline .hc-ico { width: 26px; height: 26px; }
+.hc-ok-main { flex: 1; min-width: 0; display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; }
+.hc-ok-title { font-size: 14.5px; font-weight: 800; color: var(--ok); white-space: nowrap; }
+.hc-ok-sub { font-size: 12.5px; color: var(--muted); }
+.hc-refresh-ghost {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 6px 11px; border-radius: 8px;
+  border: 1px solid transparent; background: transparent;
+  color: var(--faint); font-size: 12px; font-weight: 600;
+  cursor: pointer; font-family: inherit; white-space: nowrap;
+}
+.hc-refresh-ghost:hover { border-color: var(--border); color: var(--muted); }
+.hc-refresh-ghost .icon { width: 13px; height: 13px; }
+.hc-refresh-ghost.is-loading .icon { animation: lk-spin 1s linear infinite; }
+
+/* ── 范围 C · 版本胶囊态 .brand-ver 扩展(BL-46 五态) ── */
+.brand-ver.is-busy {
+  color: var(--br-text); background: var(--br-soft); border-color: var(--br-edge);
+  cursor: default; opacity: 1;
+}
+.brand-ver.is-busy .cap-spin { display: inline-flex; animation: lk-spin 1s linear infinite; }
+.brand-ver.is-busy .cap-spin .icon { width: 11px; height: 11px; }
+.brand-ver.is-fail {
+  color: var(--bad); background: var(--bad-bg); border-color: var(--bad-edge);
+  cursor: pointer; opacity: 1;
+}
+.brand-ver.is-installed {
+  color: var(--warn); background: var(--warn-bg); border-color: var(--warn-edge);
+  cursor: help; opacity: 1;
+}
+/* 更新失败展开条(topbar 下方一行) */
+.cap-fail-bar {
+  display: flex; align-items: center; gap: 10px;
+  margin: 8px 14px 0;
+  padding: 9px 13px; border-radius: 10px;
+  background: var(--bad-bg); border: 1px solid var(--bad-edge);
+  font-size: 12.5px; color: var(--bad);
+}
+.cap-fail-bar code {
+  flex: 1; min-width: 0;
+  font-family: ui-monospace, monospace; font-size: 11.5px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.cap-fail-bar .hc-act { color: var(--bad); border-color: var(--bad-edge); background: var(--surface); }

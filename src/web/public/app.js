@@ -17,6 +17,13 @@
 
 const ICONS = {
   check: `<svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg>`,
+  copy: `<svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg>`,
+  clock: `<svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>`,
+  ext: `<svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M14 5h5v5M19 5l-8 8M9 5H6a1 1 0 0 0-1 1v12a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-3"/></svg>`,
+  host: `<svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="4" width="18" height="12" rx="2"/><path d="M8 20h8M12 16v4"/></svg>`,
+  up: `<svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="m8 12 4-4 4 4M12 8v8"/></svg>`,
+  q: `<svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M9.5 9a2.5 2.5 0 1 1 3.4 2.3c-.8.3-.9 1-.9 1.7M12 16.5h.01"/></svg>`,
+  chevDown: `<svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>`,
   x: `<svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M18 6 6 18M6 6l12 12"/></svg>`,
   trash: `<svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M3 6h18M8 6V4a1 1 0 0 1 1-1h6a1 1 0 0 1 1 1v2M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6M10 11v6M14 11v6"/></svg>`,
   info: `<svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 16v-4M12 8h.01"/></svg>`,
@@ -409,8 +416,8 @@ const state = {
   runningVersion: null,
   /** 全局 larkway 版本检查结果(/api/update_version)。 */
   updateVersion: null,
-  /** 更新按钮是否正在执行。 */
-  updateVersionBusy: false,
+  /** 更新任务进度快照(GET /api/update_version/status,BL-46 胶囊五态)。 */
+  updateJob: null,
   /** 当前详情表单是否有未保存改动(基础+高级 yaml 表单)。 */
   formDirty: false,
   /** 当前详情 memory 是否有未保存改动。 */
@@ -719,37 +726,30 @@ function lkBackendSelectHTML(value, containerId = "") {
     const sel = id === value;
     const isReady = _backendReady[id] !== false; // 默认就绪
     const isDefault = id === LK_BACKEND_DEFAULT;
-    const selClass = sel ? " is-sel" : "";
     return (
       `<button type="button" role="radio" aria-checked="${sel}" data-bk-id="${esc(id)}"` +
-      ` class="lk-bk-select-btn${selClass}"` +
-      (containerId ? ` data-bk-container="${esc(containerId)}"` : "") + `>` +
-      // 单选圈(选中=indigo)
-      `<span class="lk-bk-radio">${sel ? `<span class="lk-bk-radio-dot"></span>` : ""}</span>` +
-      // 字标 tile(中性)
-      lkBackendMonoHTML(id, "xl") +
-      `<div style="min-width:0;flex:1">` +
-      `<div class="lk-bk-item-name">${esc(b.name)}` +
+      (containerId ? ` data-bk-container="${esc(containerId)}"` : "") +
+      ` class="bk2-opt${sel ? " is-active" : ""}">` +
+      `<span class="bk2-logo">${esc(b.mono)}</span>` +
+      `<span class="bk2-opt-meta">` +
+      `<span class="bk2-opt-name">${esc(b.name)}` +
       (isDefault ? `<span class="lk-bk-default-badge">默认</span>` : "") +
-      `</div>` +
-      `<div class="lk-bk-item-vendor">${esc(b.vendor)}</div>` +
-      // 边界提示:未就绪(中性 slate,绝不染状态色)
-      (!isReady
-        ? `<div class="lk-bk-not-ready-hint">${ICONS.info}` +
-          `本机还没就绪 —— 先在终端 <code>${esc(id)} login</code></div>`
-        : "") +
-      `</div>` +
-      // 就绪/未就绪 badge(中性)
+      `</span>` +
+      `<span class="bk2-opt-sub">${esc(b.vendor)}` +
+      // 登录态微行:ready 探测来自 GET /api/backends(codex=login+runtime,
+      // claude 恒 true —— 细粒度登录态由能力体检卡负责,这里只做粗提示)
       (isReady
-        ? `<span class="lk-bk-ready-badge">${ICONS.check} 本机就绪</span>`
-        : `<span class="lk-bk-unready-badge">未就绪</span>`) +
+        ? `<span class="live-dot is-serving"></span>已就绪`
+        : `<span class="live-dot is-offline"></span>未就绪 · 终端 <code>${esc(id)} login</code>`) +
+      `</span></span>` +
+      `<span class="bk2-check">${sel ? ICONS.check : ""}</span>` +
       `</button>`
     );
   }).join("");
 
   return (
     `<div class="lk-bk-select">` +
-    `<div class="lk-bk-select-group" role="radiogroup" aria-label="选择底座">` +
+    `<div class="bk2-choice" role="radiogroup" aria-label="选择底座">` +
     items +
     `</div>` +
     // 「会增长的列表」的可视暗示
@@ -767,23 +767,17 @@ function lkBackendSelectHTML(value, containerId = "") {
  * @param {function(string):void} onChange  选中新 id 时调用
  */
 function wireLkBackendSelect(container, onChange) {
-  container.querySelectorAll(".lk-bk-select-btn").forEach((btn) => {
+  container.querySelectorAll(".bk2-opt").forEach((btn) => {
     btn.addEventListener("click", () => {
       const id = btn.dataset.bkId;
       if (!id) return;
-      // 更新 is-sel + aria-checked + 单选圈
-      container.querySelectorAll(".lk-bk-select-btn").forEach((b) => {
+      // 更新 is-active + aria-checked + 右侧对勾
+      container.querySelectorAll(".bk2-opt").forEach((b) => {
         const sel = b.dataset.bkId === id;
-        b.classList.toggle("is-sel", sel);
+        b.classList.toggle("is-active", sel);
         b.setAttribute("aria-checked", String(sel));
-        const dot = b.querySelector(".lk-bk-radio-dot");
-        if (sel && !dot) {
-          const radio = b.querySelector(".lk-bk-radio");
-          if (radio) radio.innerHTML = `<span class="lk-bk-radio-dot"></span>`;
-        } else if (!sel && dot) {
-          const radio = b.querySelector(".lk-bk-radio");
-          if (radio) radio.innerHTML = "";
-        }
+        const check = b.querySelector(".bk2-check");
+        if (check) check.innerHTML = sel ? ICONS.check : "";
       });
       onChange(id);
     });
@@ -804,122 +798,633 @@ function lkHexA(hex, alpha) {
 }
 
 // ---------------------------------------------------------------------------
-// Model / Effort 覆盖(perf plan 批 C 旋钮)—— 挂在底座卡片下方,因为可选的
-// model 建议项直接取决于选了哪个底座。
+// Model / Effort 覆盖(底座卡 v2,能力体检设计稿范围 B)—— 单一控件 + 菜单内
+// 自定义逃生口,替代 input+datalist+chips 三件套(原生 datalist 会按输入过滤
+// 建议,填过值后下拉「看起来是空的」,用户两次被坑;chips 只是补丁)。
+// 表单契约不变:隐藏 input#ac-model[name=model] / #ac-effort[name=effort],
+// 可视控件写值后 dispatch bubbling input,走 bkCard 现有脏检测。
 // ---------------------------------------------------------------------------
 
 /**
- * model 输入的建议项(datalist,非枚举)。按底座区分,因为两家模型名字完全不同:
- * claude 是 --model 接受的别名;codex 是 OpenAI 模型 slug(取自本机
- * ~/.codex/models_cache.json 当前可见模型,按 priority 升序的前三个:
- * gpt-5.5(默认/最强)· gpt-5.4-mini(更快更省)· gpt-5.3-codex(编程特化),
- * 不是瞎猜的名字)。input 本身允许自由输入任意值 —— 两家模型都在演进,建议项
- * 只是省得手打,不是白名单。
+ * model 建议项(菜单全量常显,不按输入过滤)。按底座区分;d 是一句定位描述,
+ * 帮人选而不是白名单 —— 菜单底部永远有「输入自定义模型名…」逃生口。
+ * codex 项取自本机 ~/.codex/models_cache.json 当前可见模型(非瞎猜)。
  * @param {string} backendId
- * @returns {Array<[string,string]>} [value, label][]
+ * @returns {Array<{v:string,d:string}>}
  */
 function modelSuggestionsForBackend(backendId) {
   if (backendId === "codex") {
     return [
-      ["gpt-5.5", "gpt-5.5 · 当前默认，最强"],
-      ["gpt-5.4-mini", "gpt-5.4-mini · 更快更省"],
-      ["gpt-5.3-codex", "gpt-5.3-codex · 编程特化"],
+      { v: "gpt-5.5", d: "日常首选 · 能力与速度均衡" },
+      { v: "gpt-5.4-mini", d: "便宜快 · 轻量任务" },
+      { v: "gpt-5.3-codex", d: "代码特化 · 重构与评审" },
     ];
   }
   return [
-    ["claude-sonnet-5", "claude-sonnet-5 · Sonnet 5，快/省"],
-    ["claude-opus-4-8", "claude-opus-4-8 · Opus 4.8"],
-    ["claude-fable-5", "claude-fable-5 · Fable 5，最强"],
-    ["sonnet", "sonnet · 别名=最新 Sonnet"],
-    ["opus", "opus · 别名=最新 Opus"],
+    { v: "claude-sonnet-5", d: "Sonnet 5 · 快/省" },
+    { v: "claude-opus-4-8", d: "Opus 4.8" },
+    { v: "claude-fable-5", d: "Fable 5 · 最强" },
+    { v: "sonnet", d: "别名 = 最新 Sonnet" },
+    { v: "opus", d: "别名 = 最新 Opus" },
   ];
 }
 
 /**
- * effort <select> 的 <option> HTML。两家底座共用同一套 value(low/medium/high/max)
- * ——claude 直接透传给 --effort;codex 经 codexEffortFromLarkway 映射成它自己的
- * low/medium/high/xhigh(即官方 Codex 客户端 Reasoning 选择器里的
- * Light/Medium/High/Extra High,已用 model/list 实测确认)。value 保持一致只是
- * 为了 larkway 配置层统一,label 按底座换成对应措辞,避免用户以为 codex 也有个
- * 叫 "max" 的档位。
- * @param {string} effortVal
+ * effort 档位:value 两家统一(low/medium/high/max,claude 直接透传 --effort;
+ * codex 经 codexEffortFromLarkway 映射),label 按底座换措辞,避免用户以为
+ * codex 也有个叫 "max" 的档位。首项 "" = 默认(不覆盖)。
  * @param {string} backendId
  */
-function effortOptionsHTML(effortVal, backendId) {
+function effortLevelsForBackend(backendId) {
   const labels = backendId === "codex"
-    ? { low: "low (Light)", medium: "medium (Medium)", high: "high (High)", max: "max (Extra High)" }
+    ? { low: "Light", medium: "Medium", high: "High", max: "Extra High" }
     : { low: "low", medium: "medium", high: "high", max: "max" };
   return [
-    ["", "默认（不覆盖）"],
-    ["low", labels.low],
-    ["medium", labels.medium],
-    ["high", labels.high],
-    ["max", labels.max],
-  ].map(([v, label]) => `<option value="${esc(v)}"${v === effortVal ? " selected" : ""}>${esc(label)}</option>`).join("");
+    { v: "", label: "默认" },
+    { v: "low", label: labels.low },
+    { v: "medium", label: labels.medium },
+    { v: "high", label: labels.high },
+    { v: "max", label: labels.max },
+  ];
+}
+
+/** model 值 → 定位描述;空值/自定义值给对应措辞。 */
+function modelDescFor(backendId, val) {
+  if (!val) return "不覆盖 —— 跟随底座全局设置";
+  const hit = modelSuggestionsForBackend(backendId).find((m) => m.v === val);
+  return hit ? hit.d : "自定义模型名";
+}
+
+/** Model 收起态单一控件(select 形态,点开自定义菜单)。 */
+function modelSelectClosedHTML(backendId, val) {
+  return (
+    `<button type="button" class="bk2-select" id="bk2-model-btn" aria-haspopup="listbox">` +
+    `<code>${esc(val || "底座默认")}</code>` +
+    `<span class="bk2-sel-desc">${esc(modelDescFor(backendId, val))}</span>` +
+    ICONS.chevDown +
+    `</button>`
+  );
+}
+
+/** Model 展开菜单:默认项 + 全量建议(带定位描述)+ 自定义逃生口。 */
+function modelMenuHTML(backendId, currentVal) {
+  const item = (v, d) =>
+    `<div class="bk2-mi${v === "" ? " is-default" : ""}${v === (currentVal || "") ? " is-sel" : ""}" role="option" data-model-pick="${esc(v)}">` +
+    `<code>${esc(v || "底座默认")}</code><span>${esc(d)}</span>` +
+    (v === (currentVal || "") ? ICONS.check : "") +
+    `</div>`;
+  return (
+    item("", "不覆盖 —— 跟随底座全局设置") +
+    modelSuggestionsForBackend(backendId).map((m) => item(m.v, m.d)).join("") +
+    `<div class="bk2-mi-custom" role="option" data-model-custom>${ICONS.edit}输入自定义模型名…</div>`
+  );
+}
+
+/** Effort 分段控件内部按钮组。 */
+function effortSegHTML(backendId, effortVal) {
+  return effortLevelsForBackend(backendId)
+    .map((l) =>
+      `<button type="button" data-effort-value="${esc(l.v)}"` +
+      (l.v === (effortVal || "") ? ` class="is-active"` : "") +
+      `>${esc(l.label)}</button>`)
+    .join("");
+}
+
+/** 覆盖区收起时的一行摘要。 */
+function bk2AdvSummaryHTML(backendId, modelVal, effortVal) {
+  if (!modelVal && !effortVal) return `<i>跟随底座默认</i>`;
+  const effortLabel = effortLevelsForBackend(backendId).find((l) => l.v === (effortVal || ""))?.label;
+  const parts = [];
+  if (modelVal) parts.push(`<code>${esc(modelVal)}</code>`);
+  if (effortVal) parts.push(`<code>${esc(effortLabel || effortVal)}</code>`);
+  return parts.join(`<i>·</i>`);
 }
 
 /**
- * Model / Effort 覆盖块的 HTML —— 嵌进「用哪个底座驱动它」卡片(lk-bk-card),
- * 紧跟在 lkBackendSelectHTML(...) 后面。只在编辑态渲染(调用方 buildDetailHTML
- * 只服务已存在的 bot);新建流程走 /api/onboard/finalize,那条路径尚不转发
- * 这两个字段,建完再来编辑页配即可。
+ * Model / Effort 覆盖块(bk2-adv)—— 嵌进底座卡(第一卡)body。只在编辑态
+ * 渲染;新建流程走 /api/onboard/finalize,那条路径不转发这两个字段。
+ * 无覆盖时默认收起成一行摘要,有覆盖时展开。
  * @param {{model?:string, effort?:string, backend?:string}} bot
  */
 function buildModelEffortHTML(bot) {
   const modelVal = bot.model ?? "";
   const effortVal = bot.effort ?? "";
   const backendId = bot.backend || LK_BACKEND_DEFAULT;
-  const modelListHTML = modelSuggestionsForBackend(backendId)
-    .map(([v, label]) => `<option value="${esc(v)}">${esc(label)}</option>`)
-    .join("");
+  const hasOverride = Boolean(modelVal || effortVal);
   return (
-    `<div class="ac-field" id="lk-bk-model-effort" style="margin-top:14px;padding-top:14px;border-top:1px solid var(--border)">` +
-    `<label class="ac-label" for="ac-model">Model / Effort 覆盖 <span class="ac-optional">可选</span></label>` +
-    `<p class="ac-hint">不覆盖 = 用账号默认；降低 effort 会牺牲判断深度。</p>` +
-    `<div style="display:flex;gap:12px;flex-wrap:wrap;align-items:center">` +
-    `<input list="ac-model-list" id="ac-model" name="model" class="ac-input" style="width:210px" value="${esc(modelVal)}" placeholder="默认（不覆盖）" autocomplete="off" />` +
-    `<datalist id="ac-model-list">${modelListHTML}</datalist>` +
-    `<span id="ac-effort-field">` +
-    `<select id="ac-effort" name="effort" class="ac-input" style="width:150px">${effortOptionsHTML(effortVal, backendId)}</select>` +
-    `</span>` +
+    `<div class="bk2-adv${hasOverride ? " is-open" : ""}" id="bk2-adv" data-backend="${esc(backendId)}">` +
+    `<button type="button" class="bk2-adv-head" id="bk2-adv-toggle" aria-expanded="${hasOverride}">` +
+    `<span class="bk2-adv-label">Model / Effort 覆盖</span>` +
+    `<span class="ac-optional">可选 · 默认跟随底座</span>` +
+    `<span class="bk2-adv-sum" id="bk2-adv-sum">${bk2AdvSummaryHTML(backendId, modelVal, effortVal)}</span>` +
+    `<span class="bk2-adv-chev">${ICONS.chevDown}</span>` +
+    `</button>` +
+    `<div class="bk2-adv-body">` +
+    `<div class="bk2-adv-grid">` +
+    `<div class="ac-field bk2-model-field" id="bk2-model-field">` +
+    modelSelectClosedHTML(backendId, modelVal) +
+    `<div class="bk2-menu" id="bk2-model-menu" hidden>${modelMenuHTML(backendId, modelVal)}</div>` +
+    `<div id="bk2-model-custom" hidden>` +
+    `<input type="text" class="ac-input ac-mono" id="bk2-model-custom-input" spellcheck="false" autocomplete="off" placeholder="模型名,如 gpt-6-preview" />` +
+    `<p class="ac-hint" style="margin-top:7px">任意模型名都行 —— 建议列表不是白名单,新模型出了直接填。</p>` +
+    `<button type="button" class="bk2-backlink" id="bk2-model-back">${ICONS.chevDown} 返回建议列表</button>` +
     `</div>` +
-    // 常驻快选 chips:datalist 会按当前输入值过滤建议(输入框已填某个模型时,
-    // 下拉只剩它自己,像"选项丢了"——2026-07-08 mini 实测用户困惑),chips 不受
-    // 输入值影响,永远列出全部建议;点一下=填入并触发 input(保存 dirty 检测)。
-    `<div id="ac-model-chips" style="margin-top:8px;display:flex;gap:6px;flex-wrap:wrap">${modelChipsHTML(backendId)}</div>` +
+    `</div>` +
+    `<div class="ac-field"><div class="bk2-seg" id="bk2-effort-seg">${effortSegHTML(backendId, effortVal)}</div></div>` +
+    `</div>` +
+    `<p class="ac-hint" id="bk2-adv-hint">${bk2AdvHintText(backendId)}</p>` +
+    `</div>` +
+    `<input type="hidden" id="ac-model" name="model" value="${esc(modelVal)}" />` +
+    `<input type="hidden" id="ac-effort" name="effort" value="${esc(effortVal)}" />` +
     `</div>`
   );
 }
 
-/** 常驻模型快选 chips 的 HTML(见 buildModelEffortHTML 里的调用注释)。 */
-function modelChipsHTML(backendId) {
-  return modelSuggestionsForBackend(backendId)
-    .map(([v, label]) =>
-      `<button type="button" class="ac-model-chip" data-model-value="${esc(v)}" title="${esc(label)}" ` +
-      `style="font-size:12px;padding:3px 10px;border:1px solid var(--border);border-radius:999px;background:var(--bg,transparent);cursor:pointer">${esc(v)}</button>`)
-    .join("");
+/** 覆盖区底部提示文案(按底座措辞)。 */
+function bk2AdvHintText(backendId) {
+  return backendId === "codex"
+    ? "建议不是白名单 —— 列表底部可输入任意模型名;切到 Claude Code 时档位显示 low / medium / high / max。"
+    : "建议不是白名单 —— 列表底部可输入任意模型名;切到 Codex 时档位显示 Light / Medium / High / Extra High。";
 }
 
 /**
- * 底座切换时实时刷新 model 建议项 + effort 选项的措辞。effort 两家底座都生效
- * (见 effortOptionsHTML 顶部注释),这里只换 label,不再隐藏控件。
+ * 底座切换时实时刷新 model 菜单/收起控件描述 + effort 分段措辞 + 提示文案。
+ * 隐藏 input 里的当前值保留(值域跨底座本就允许自由填)。
  * @param {HTMLElement} panel
  * @param {string} backendId
  */
 function refreshModelEffortForBackend(panel, backendId) {
-  const datalist = panel.querySelector("#ac-model-list");
-  if (datalist) {
-    datalist.innerHTML = modelSuggestionsForBackend(backendId)
-      .map(([v, label]) => `<option value="${esc(v)}">${esc(label)}</option>`)
-      .join("");
+  const adv = panel.querySelector("#bk2-adv");
+  if (!adv) return;
+  adv.dataset.backend = backendId;
+  const modelVal = panel.querySelector("#ac-model")?.value ?? "";
+  const effortVal = panel.querySelector("#ac-effort")?.value ?? "";
+  const menu = panel.querySelector("#bk2-model-menu");
+  if (menu) menu.innerHTML = modelMenuHTML(backendId, modelVal);
+  const btn = panel.querySelector("#bk2-model-btn");
+  if (btn) btn.outerHTML = modelSelectClosedHTML(backendId, modelVal);
+  const seg = panel.querySelector("#bk2-effort-seg");
+  if (seg) seg.innerHTML = effortSegHTML(backendId, effortVal);
+  const sum = panel.querySelector("#bk2-adv-sum");
+  if (sum) sum.innerHTML = bk2AdvSummaryHTML(backendId, modelVal, effortVal);
+  const hint = panel.querySelector("#bk2-adv-hint");
+  if (hint) hint.textContent = bk2AdvHintText(backendId);
+}
+
+/**
+ * bk2-adv 全部交互(委托到 bkCard,重渲染菜单/分段不掉线):
+ * 覆盖区折叠、model 菜单开合/选择/自定义逃生口、effort 分段。
+ * 值写进隐藏 input 后 dispatch bubbling input → bkCard 脏检测。
+ * @param {HTMLElement} panel  详情面板根
+ * @param {HTMLElement} bkCard 底座卡根(#lk-bk-card)
+ */
+function wireModelEffort(panel, bkCard) {
+  const setHidden = (idSel, val) => {
+    const input = panel.querySelector(idSel);
+    if (!input) return;
+    input.value = val;
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+  };
+  const currentBackend = () => panel.querySelector("#bk2-adv")?.dataset.backend || LK_BACKEND_DEFAULT;
+  const refreshSummary = () => {
+    const sum = panel.querySelector("#bk2-adv-sum");
+    if (sum) sum.innerHTML = bk2AdvSummaryHTML(
+      currentBackend(),
+      panel.querySelector("#ac-model")?.value ?? "",
+      panel.querySelector("#ac-effort")?.value ?? "",
+    );
+  };
+
+  bkCard.addEventListener("click", (e) => {
+    const el = e.target instanceof Element ? e.target : null;
+    if (!el) return;
+
+    // 覆盖区折叠/展开
+    const toggle = el.closest("#bk2-adv-toggle");
+    if (toggle) {
+      const adv = panel.querySelector("#bk2-adv");
+      if (adv) {
+        const open = adv.classList.toggle("is-open");
+        toggle.setAttribute("aria-expanded", String(open));
+        if (!open) panel.querySelector("#bk2-model-menu")?.setAttribute("hidden", "");
+      }
+      return;
+    }
+
+    // model 收起控件 → 菜单开合
+    if (el.closest("#bk2-model-btn")) {
+      const menu = panel.querySelector("#bk2-model-menu");
+      if (menu) menu.hidden = !menu.hidden;
+      return;
+    }
+
+    // 菜单项选择
+    const pick = el.closest("[data-model-pick]");
+    if (pick) {
+      const val = pick.getAttribute("data-model-pick") ?? "";
+      setHidden("#ac-model", val);
+      const backendId = currentBackend();
+      const btn = panel.querySelector("#bk2-model-btn");
+      if (btn) btn.outerHTML = modelSelectClosedHTML(backendId, val);
+      const menu = panel.querySelector("#bk2-model-menu");
+      if (menu) {
+        menu.innerHTML = modelMenuHTML(backendId, val);
+        menu.hidden = true;
+      }
+      refreshSummary();
+      return;
+    }
+
+    // 自定义逃生口:换成自由输入
+    if (el.closest("[data-model-custom]")) {
+      const menu = panel.querySelector("#bk2-model-menu");
+      if (menu) menu.hidden = true;
+      const btn = panel.querySelector("#bk2-model-btn");
+      const custom = panel.querySelector("#bk2-model-custom");
+      const input = panel.querySelector("#bk2-model-custom-input");
+      if (btn) btn.hidden = true;
+      if (custom) custom.hidden = false;
+      if (input instanceof HTMLInputElement) {
+        input.value = panel.querySelector("#ac-model")?.value ?? "";
+        input.focus();
+      }
+      return;
+    }
+
+    // 自定义态返回建议列表
+    if (el.closest("#bk2-model-back")) {
+      const custom = panel.querySelector("#bk2-model-custom");
+      if (custom) custom.hidden = true;
+      const backendId = currentBackend();
+      const val = panel.querySelector("#ac-model")?.value ?? "";
+      const btn = panel.querySelector("#bk2-model-btn");
+      if (btn) {
+        btn.outerHTML = modelSelectClosedHTML(backendId, val);
+        panel.querySelector("#bk2-model-btn")?.removeAttribute("hidden");
+      }
+      const menu = panel.querySelector("#bk2-model-menu");
+      if (menu) menu.innerHTML = modelMenuHTML(backendId, val);
+      refreshSummary();
+      return;
+    }
+
+    // effort 分段
+    const segBtn = el.closest("[data-effort-value]");
+    if (segBtn) {
+      const val = segBtn.getAttribute("data-effort-value") ?? "";
+      setHidden("#ac-effort", val);
+      panel.querySelectorAll("#bk2-effort-seg button").forEach((b) => {
+        b.classList.toggle("is-active", b === segBtn);
+      });
+      refreshSummary();
+      return;
+    }
+  });
+
+  // 自定义输入实时写进隐藏 input(同一条脏检测路)
+  bkCard.addEventListener("input", (e) => {
+    const el = e.target;
+    if (el instanceof HTMLInputElement && el.id === "bk2-model-custom-input") {
+      const hidden = panel.querySelector("#ac-model");
+      if (hidden && hidden.value !== el.value.trim()) {
+        hidden.value = el.value.trim();
+        hidden.dispatchEvent(new Event("input", { bubbles: true }));
+      }
+      refreshSummary();
+    }
+  });
+
+  // 点菜单外任意处收起菜单
+  document.addEventListener("click", (e) => {
+    const menu = panel.querySelector("#bk2-model-menu");
+    if (!menu || menu.hidden) return;
+    const el = e.target instanceof Element ? e.target : null;
+    if (el && !el.closest("#bk2-model-field")) menu.hidden = true;
+  });
+}
+
+// ---------------------------------------------------------------------------
+// 能力体检卡(能力体检设计稿范围 A)—— bot 详情页第五卡。
+// 三组检查:工具(/api/runtime/requirements 现成数据,botIds 过滤)· 凭据
+// (GET /api/bot/:id/health-scan)· 应用权限(无法自动检测 → 基线清单 +
+// console 深链对照)。两维正交:颜色管严重度(红=必需缺失/黄=过旧/中性=建议),
+// 「全局」徽章管作用域。面板零写操作 —— 检测、清单、深链、重检,四个动作。
+// ---------------------------------------------------------------------------
+
+/** 工具最低版本要求(有真实故障案例才进这张表,别当版本洁癖用)。 */
+const LK_TOOL_MIN_VERSIONS = {
+  "lark-cli": {
+    min: "1.0.56",
+    why: "新版修复了 keychain 凭据回落 —— 旧版会间歇读不到登录态,<b>bot 看起来像掉线</b>。",
+  },
+};
+
+/** "1.0.42" 风格版本比较:a < b 时 true。解析不了按 false(不误报过旧)。 */
+function hcVersionLt(a, b) {
+  const pa = String(a).split(".").map((n) => parseInt(n, 10));
+  const pb = String(b).split(".").map((n) => parseInt(n, 10));
+  if (pa.some(isNaN) || pb.some(isNaN)) return false;
+  for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+    const d = (pa[i] ?? 0) - (pb[i] ?? 0);
+    if (d !== 0) return d < 0;
   }
-  const chips = panel.querySelector("#ac-model-chips");
-  if (chips) chips.innerHTML = modelChipsHTML(backendId);
-  const effortSelect = panel.querySelector("#ac-effort");
-  if (effortSelect) {
-    const currentVal = effortSelect.value;
-    effortSelect.innerHTML = effortOptionsHTML(currentVal, backendId);
+  return false;
+}
+
+/** 从 `--version` 输出里抠出 x.y.z。 */
+function hcExtractVersion(text) {
+  return String(text ?? "").match(/\d+\.\d+\.\d+/)?.[0] ?? null;
+}
+
+const HC_GLOBAL_BADGE =
+  `<span class="hc-global" title="主机级 —— 修好一处,所有助手生效。真相源在右上服务指示灯。">${ICONS.host}全局</span>`;
+
+/** 检查项行(设计稿 row() 的落地版)。 */
+function hcRowHTML(o) {
+  const badges =
+    (o.ver ? `<span class="hc-ver">${esc(o.ver)}</span>` : "") +
+    `<span class="hc-tag">${esc(o.tag)}</span>` +
+    (o.global ? HC_GLOBAL_BADGE : "");
+  const scopes = o.scopes
+    ? `<div class="hc-scopes">${o.scopes
+        .map((sc) => `<div class="hc-scope"><code>${esc(sc.scope)}</code><span>${esc(sc.reason)}</span></div>`)
+        .join("")}</div>`
+    : "";
+  let act = "";
+  if (o.copy) {
+    act =
+      `<div class="hc-actline"><button type="button" class="hc-act" data-hc-copy="${esc(o.copy)}">${ICONS.copy} ${esc(o.copyLabel || "复制安装命令")}</button>` +
+      `<code class="hc-cmd">${esc(o.copy)}</code></div>`;
   }
+  if (o.link) {
+    act =
+      `<div class="hc-actline"><button type="button" class="hc-act" data-hc-link="${esc(o.linkHref || "")}">${esc(o.link)} ${ICONS.ext}</button></div>` +
+      (o.pubnote ? `<div class="hc-pubnote">${ICONS.warn}<span>${o.pubnote}</span></div>` : "");
+  }
+  return (
+    `<div class="hc-row"><span class="hc-ico ${o.ico}">${o.glyph}</span>` +
+    `<div class="hc-row-main"><div class="hc-row-title"><span class="hc-name">${esc(o.name)}</span>${badges}</div>` +
+    `<p class="hc-impact">${o.impact}</p>${scopes}${act}</div></div>`
+  );
+}
+
+/**
+ * 把工具(runtime requirements)+ 凭据(health-scan)归拢成渲染模型。
+ * @returns {{required:string[], recommended:string[], unknown:string[], passed:Array<{name:string,tag:string,note:string}>}}
+ */
+function hcComputeRows(id, bot, scan) {
+  const required = [];
+  const recommended = [];
+  const unknown = [];
+  const passed = [];
+
+  // ── 工具组(主机级;botIds 过滤出与本助手相关的) ──
+  // kind==="secret" 的项(如 Git token env)由凭据组(health-scan)负责,
+  // 这里跳过避免同一事实出现两行。
+  const reqs = (state.requirements?.requirements ?? []).filter(
+    (r) => Array.isArray(r.botIds) && r.botIds.includes(id) && r.kind !== "secret",
+  );
+  for (const r of reqs) {
+    const label = r.command || r.label || r.id;
+    if (!r.ok) {
+      const row = hcRowHTML({
+        ico: r.severity === "required" ? "is-miss" : "is-rec",
+        glyph: r.severity === "required" ? ICONS.x : ICONS.up,
+        name: `${label} ${r.kind === "secret" ? "未配置" : "未安装"}`,
+        tag: r.kind === "secret" ? "凭据" : "工具",
+        global: r.kind !== "secret",
+        impact: esc(r.reason || `本助手依赖 ${label}。`),
+        copy: r.installHint || undefined,
+      });
+      (r.severity === "required" ? required : recommended).push(row);
+      continue;
+    }
+    // 已安装:查「过旧」(有真实故障案例的最低版本表)
+    const minReq = LK_TOOL_MIN_VERSIONS[r.command];
+    const ver = hcExtractVersion(r.version);
+    if (minReq && ver && hcVersionLt(ver, minReq.min)) {
+      required.push(hcRowHTML({
+        ico: "is-old",
+        glyph: ICONS.clock,
+        name: `${label} 过旧`,
+        ver: `v${ver} → 需 ≥ ${minReq.min}`,
+        tag: "工具",
+        global: true,
+        impact: minReq.why,
+        copy: `npm install -g ${r.command}@latest`,
+        copyLabel: "复制升级命令",
+      }));
+      continue;
+    }
+    passed.push({ name: `${label} 已就绪`, tag: r.kind === "secret" ? "凭据" : "工具",
+      note: ver ? `v${ver} · 探测正常。` : "探测正常。" });
+  }
+
+  // ── 凭据组(health-scan) ──
+  const backendName = lkBackend(bot.backend || LK_BACKEND_DEFAULT).name;
+  for (const c of scan?.credentials ?? []) {
+    if (c.status === "unknown") {
+      unknown.push(
+        `<b>${esc(c.label)}</b>:${esc(c.hint || "暂时探测不到 —— 修好前置项后点重新体检,这项会自动补上。")}`,
+      );
+      continue;
+    }
+    if (c.status === "fail") {
+      const copyById = {
+        "backend-login": {
+          name: `${backendName} 未登录`,
+          impact: `主机上底座 CLI 没登录 —— <b>本助手收到任务也跑不起来</b>。${esc(c.hint || "")}`,
+        },
+        "lark-profile": {
+          name: "lark-cli profile 不可用",
+          impact: `bot 身份读不出来 —— agent <b>读不了飞书文档、拉不了话题历史、评论不了任务</b>。${esc(c.hint || "")}`,
+        },
+        "git-token": {
+          name: "Git 访问令牌未配置",
+          impact: esc(c.hint || "配好后 clone / 推送 / 开 MR 才走这个 bot 自己的账号。"),
+        },
+      };
+      const cc = copyById[c.id] || { name: c.label, impact: esc(c.hint || "") };
+      const row = hcRowHTML({
+        ico: c.severity === "required" ? "is-miss" : "is-rec",
+        glyph: c.severity === "required" ? ICONS.x : ICONS.up,
+        name: cc.name,
+        tag: "凭据",
+        global: !!c.global,
+        impact: cc.impact,
+      });
+      (c.severity === "required" ? required : recommended).push(row);
+      continue;
+    }
+    const okNoteById = {
+      "backend-login": `${backendName} 订阅登录态正常,底座随时可拉起。`,
+      "lark-profile": `绑定到本应用 ${bot.app_id ? bot.app_id.slice(0, 12) + "…" : ""},能读飞书文档、拉话题历史(keychain 可读)。`,
+      "git-token": "存于本机环境,clone / 推送可用。",
+    };
+    passed.push({
+      name: c.id === "backend-login" ? `${backendName} 已登录` : `${c.label} 已配置`,
+      tag: "凭据",
+      note: okNoteById[c.id] || "探测正常。",
+    });
+  }
+
+  return { required, recommended, unknown, passed };
+}
+
+/** 体检卡头部。 */
+function hcHeadHTML(countText, stampHtml) {
+  return (
+    `<div class="hc-head"><span class="hc-shield">${ICONS.shield}</span>` +
+    `<div class="hc-meta"><div class="hc-title-row"><h3 class="hc-title">能力体检</h3>` +
+    `<span class="hc-headcount">${countText}</span></div>` +
+    `<p class="hc-desc">这个助手现在能不能好好干活 —— 工具、凭据、应用权限一次看清。只检测、只指路,开通动作都在你手里完成。</p></div>` +
+    `<div class="hc-head-right"><button type="button" class="hc-refresh" data-hc-recheck>${ICONS.refresh}<span>重新体检</span></button>` +
+    `<span class="hc-stamp">${stampHtml}</span></div></div>`
+  );
+}
+
+/** 体检卡整卡 HTML。scan=null 表示接口失败(降级为无法检测)。 */
+function buildHealthCardHTML(id, bot, scan) {
+  const rows = hcComputeRows(id, bot, scan);
+  const requiredTotal = rows.required.length + rows.passed.length; // 粗计数:通过的都算必需侧
+  const stampTime = scan?.checkedAt ? new Date(scan.checkedAt) : new Date();
+  const hh = String(stampTime.getHours()).padStart(2, "0");
+  const mm = String(stampTime.getMinutes()).padStart(2, "0");
+  const isStale = scan?.checkedAt ? Date.now() - scan.checkedAt > 10 * 60 * 1000 : false;
+  const stamp = isStale
+    ? `<span class="is-stale">${hh}:${mm} 检测 · 结果可能过时</span>`
+    : `${hh}:${mm} 检测 · 缓存 10 分钟`;
+
+  // ✅ 全过(无必需缺失/无建议/无 unknown)→ 一行收敛(权限对照段仍在,默认折叠)
+  const allClear = rows.required.length === 0 && rows.recommended.length === 0 && rows.unknown.length === 0;
+
+  const permissions = scan?.permissions;
+  const permSeg = permissions
+    ? `<div class="hc-seg" data-hc-seg>` +
+      `<button type="button" class="hc-seg-head" data-hc-toggle><span class="hc-count hc-count-rec">应用权限 · 对照清单</span>` +
+      `<span class="hc-seg-sub">${esc(permissions.unknownReason || "无法自动检测,请人工对照")}</span>` +
+      `<span class="hc-seg-chev">${ICONS.chevDown}</span></button>` +
+      `<div class="hc-seg-rows">` +
+      hcRowHTML({
+        ico: "is-rec",
+        glyph: ICONS.q,
+        name: "基线权限清单(逐项对照)",
+        tag: "权限",
+        impact: "缺哪项、降级哪个功能,逐项如下 —— 开通在飞书开放平台完成,这里只指路。",
+        scopes: permissions.baseline ?? [],
+        link: "打开开放平台权限页",
+        linkHref: permissions.consoleUrl || "",
+        pubnote: "勾选开通后记得 <b>「创建版本 → 发布」</b> —— 权限发版后才生效。发完回来点「重新体检」。",
+      }) +
+      `</div></div>`
+    : "";
+
+  if (allClear) {
+    return (
+      `<section class="hc" id="hc-card" data-hc-root>` +
+      `<div class="hc-okline">` +
+      `<span class="hc-ico is-ok">${ICONS.check}</span>` +
+      `<div class="hc-ok-main"><span class="hc-ok-title">一切就绪</span>` +
+      `<span class="hc-ok-sub">必需 ${requiredTotal} 项全部通过 · ${hh}:${mm} 检测 —— 应用权限清单可展开对照</span></div>` +
+      `<button type="button" class="hc-refresh-ghost" data-hc-recheck>${ICONS.refresh}<span>重新体检</span></button>` +
+      `</div>` +
+      `<div class="hc-body" style="border-top:1px solid var(--border)">${permSeg}</div>` +
+      `</section>`
+    );
+  }
+
+  const reqSeg = rows.required.length
+    ? `<div class="hc-seg is-open">` +
+      `<div class="hc-seg-head"><span class="hc-count hc-count-req">${rows.required.length} 项必须处理</span>` +
+      `<span class="hc-seg-sub">缺了这些,它干不了活或功能降级</span></div>` +
+      `<div class="hc-seg-rows">${rows.required.join("")}</div></div>`
+    : `<div class="hc-seg is-open">` +
+      `<div class="hc-seg-head"><span class="hc-count hc-count-ok">必需项全部通过</span>` +
+      `<span class="hc-seg-sub">干活没问题 —— 下面是按它的配置给的加强建议</span></div></div>`;
+
+  const recSeg = rows.recommended.length
+    ? `<div class="hc-seg is-open" data-hc-seg>` +
+      `<button type="button" class="hc-seg-head" data-hc-toggle><span class="hc-count hc-count-rec">${rows.recommended.length} 项建议</span>` +
+      `<span class="hc-seg-sub">不影响当前功能 —— 按这个助手的配置给的提醒</span>` +
+      `<span class="hc-seg-chev">${ICONS.chevDown}</span></button>` +
+      `<div class="hc-seg-rows">${rows.recommended.join("")}</div></div>`
+    : "";
+
+  const unkLine = rows.unknown.length
+    ? `<div class="hc-unk">${ICONS.q}<span><b>${rows.unknown.length} 项暂时无法检测</b> —— ${rows.unknown.join(";")}</span></div>`
+    : "";
+
+  const passedBlock = rows.passed.length
+    ? `<button type="button" class="hc-passed" data-hc-toggle-passed>${ICONS.check}<span class="hc-passed-label">其余 ${rows.passed.length} 项已通过</span>` +
+      `<span class="hc-passed-sum">${esc(rows.passed.map((prow) => prow.name).join(" · "))}</span>` +
+      `<span class="hc-seg-chev">${ICONS.chevDown}</span></button>` +
+      `<div class="hc-passed-list" data-hc-passed-list>` +
+      rows.passed
+        .map((prow) => hcRowHTML({ ico: "is-ok", glyph: ICONS.check, name: prow.name, tag: prow.tag, impact: esc(prow.note) }))
+        .join("") +
+      `</div>`
+    : "";
+
+  const countText = rows.required.length
+    ? `必需 ${requiredTotal} · 待处理 ${rows.required.length}`
+    : `必需 ${requiredTotal} 全部通过${rows.recommended.length ? ` · 建议 ${rows.recommended.length}` : ""}`;
+
+  return (
+    `<section class="hc" id="hc-card" data-hc-root>` +
+    hcHeadHTML(countText, stamp) +
+    `<div class="hc-body">${reqSeg}${recSeg}${permSeg}${unkLine}${passedBlock}</div>` +
+    `</section>`
+  );
+}
+
+/** 拉数据 + 渲染 + 接线(重检/折叠/复制/深链)。 */
+async function initHealthCard(panel, id, bot, opts = {}) {
+  const slot = panel.querySelector("#hc-slot");
+  if (!slot) return;
+  const method = opts.force ? "POST" : "GET";
+  let scan = null;
+  try {
+    const res = await api(method, `/api/bot/${encodeURIComponent(id)}/health-scan`);
+    if (res.ok) scan = res.json;
+  } catch { /* 降级:凭据组缺席,工具组仍可渲染 */ }
+  slot.innerHTML = buildHealthCardHTML(id, bot, scan);
+
+  if (slot._hcWired) return; // 委托监听只接一次(重渲染不掉线)
+  slot._hcWired = true;
+  slot.addEventListener("click", async (e) => {
+    const el = e.target instanceof Element ? e.target : null;
+    if (!el) return;
+    const recheck = el.closest("[data-hc-recheck]");
+    if (recheck && !recheck.classList.contains("is-loading")) {
+      recheck.classList.add("is-loading");
+      const label = recheck.querySelector("span");
+      if (label) label.textContent = "检测中…";
+      await refreshRuntimeRequirements();
+      await initHealthCard(panel, id, bot, { force: true });
+      return;
+    }
+    const cp = el.closest("[data-hc-copy]");
+    if (cp) {
+      try { navigator.clipboard?.writeText(cp.getAttribute("data-hc-copy") ?? ""); } catch { /* 忽略 */ }
+      const old = cp.innerHTML;
+      cp.innerHTML = `${ICONS.check} 已复制`;
+      setTimeout(() => { cp.innerHTML = old; }, 1200);
+      return;
+    }
+    const lk = el.closest("[data-hc-link]");
+    if (lk) {
+      const href = lk.getAttribute("data-hc-link");
+      if (href) window.open(href, "_blank", "noopener");
+      return;
+    }
+    const tg = el.closest("[data-hc-toggle]");
+    if (tg) { tg.closest("[data-hc-seg]")?.classList.toggle("is-open"); return; }
+    const tp = el.closest("[data-hc-toggle-passed]");
+    if (tp) {
+      tp.classList.toggle("is-open");
+      tp.parentElement?.querySelector("[data-hc-passed-list]")?.classList.toggle("is-open");
+    }
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -943,6 +1448,21 @@ function refreshModelEffortForBackend(panel, backendId) {
 function isBackendMismatch(runningBackend, configuredBackend) {
   if (runningBackend === null) return false; // unknown → no badge
   return runningBackend !== configuredBackend;
+}
+
+/**
+ * 「已保存,尚未生效」待生效状态条(底座卡 v2 / BL-17 升格版)。
+ * 左侧 amber 细色条语义,不整块黄底;indigo 实心按钮 = 真会执行的重启。
+ * @param {string} runningBackend
+ * @param {string} configuredBackend
+ */
+function backendPendingBarHTML(runningBackend, configuredBackend) {
+  return (
+    `<div class="bk2-pending"><span class="bk2-pending-dot"></span>` +
+    `<div class="bk2-pending-text"><b>已保存,尚未生效</b>` +
+    `<span>运行中:${esc(lkBackend(runningBackend).name)} · 已保存:${esc(lkBackend(configuredBackend).name)} —— 重启后按新配置干活</span></div>` +
+    `<button type="button" class="bk2-restart" data-bk2-restart>${ICONS.refresh} 重启服务生效</button></div>`
+  );
 }
 
 /**
@@ -2274,6 +2794,12 @@ function buildHeroInner(id, bot, f) {
 
   // 触点②:hero kicker 行,紧跟眉批加 backend chip(mono + vendor)
   const backendKickerChip = lkBackendChipHTML(bot.backend || LK_BACKEND_DEFAULT, { mono: true, vendor: true });
+  // BL-17 呼应 badge:配置待生效(与底座卡 bk2-pending 状态条同源同灭)
+  const heroPendingBadge =
+    state.bridge?.running &&
+    isBackendMismatch(state.runningBackends?.[id] ?? null, bot.backend || LK_BACKEND_DEFAULT)
+      ? `<span class="hero-badge is-pending" title="配置已保存但服务仍按旧配置运行 —— 重启服务后生效">${ICONS.warn} 配置待生效 · 需重启</span>`
+      : "";
 
   // ── BL-18:hero 状态面板(重启中=冷静 sky 面板 / 超时=红色告警) ────────────────
   // 重启窗口内隐藏「修复/重启」类动作(别诱导重复点),下方配置区保持可读。
@@ -2296,6 +2822,7 @@ function buildHeroInner(id, bot, f) {
     `<div class="hero-eyebrow-row">` +
     `<span class="hero-eyebrow">${eyebrowLabel} ${num} 个</span>` +
     backendKickerChip +
+    heroPendingBadge +
     editBadge +
     heroDelBtn +
     `</div>` +
@@ -2553,7 +3080,7 @@ function buildAgentConfigHTML(bot, memContent, mode, prefill) {
     // ─── 层一:定义 ───
     `<section class="ac-layer">` +
     `<div class="ac-layer-head">` +
-    `<span class="ac-index">一</span>` +
+    `<span class="ac-index">二</span>` +
     `<div class="ac-layer-meta">` +
     `<h3 class="ac-layer-title">Agent 的定义</h3>` +
     `<p class="ac-layer-role">它是谁、干嘛的、怎么干活 —— 任何 bot 都要。纯对话 / 自带知识答疑的 bot，只配这一层就够。</p>` +
@@ -2598,7 +3125,7 @@ function buildAgentConfigHTML(bot, memContent, mode, prefill) {
     // ─── 层二:权限 ───
     `<section class="ac-layer ac-layer-collapsible" id="ac-perm-layer" data-open="${codeAccess ? "1" : "0"}">` +
     `<div class="ac-layer-head ac-layer-head-toggle" id="ac-perm-toggle" role="button" tabindex="0" aria-expanded="${codeAccess}">` +
-    `<span class="ac-index">二</span>` +
+    `<span class="ac-index">三</span>` +
     `<div class="ac-layer-meta">` +
     `<div class="ac-layer-title-row">` +
     `<h3 class="ac-layer-title">Agent 的权限</h3>` +
@@ -2670,7 +3197,7 @@ function buildAgentConfigHTML(bot, memContent, mode, prefill) {
     // ─── 层三:约束 ───
     `<section class="ac-layer ac-layer-collapsible" id="ac-adv-layer" data-open="0">` +
     `<div class="ac-layer-head ac-layer-head-toggle" id="ac-adv-toggle" role="button" tabindex="0" aria-expanded="false">` +
-    `<span class="ac-index">三</span>` +
+    `<span class="ac-index">四</span>` +
     `<div class="ac-layer-meta">` +
     `<div class="ac-layer-title-row">` +
     `<h3 class="ac-layer-title">行为约束</h3>` +
@@ -3349,19 +3876,24 @@ function buildDetailHTML(id, bot, memContent) {
   // 触点④(编辑表单顶部):底座选择卡
   const _configuredBk4 = bot.backend || LK_BACKEND_DEFAULT;
   const _runningBk4 = state.runningBackends[id] ?? null;
-  // BL-17:底座不一致 badge(详情区,md)— 只在 bridge 在跑时显示
-  const bkMismatchDetail =
+  // BL-17 升格:「已保存未生效」从灰字提示升为黄色待生效状态条(bk2-pending)
+  // —— 只在 bridge 在跑且运行态≠配置态时显示;hero 状态行同步出现呼应 badge。
+  const pendingBar =
     state.bridge?.running && isBackendMismatch(_runningBk4, _configuredBk4)
-      ? `<div style="margin-top:10px">${backendMismatchBadgeHTML(_runningBk4, _configuredBk4, "md")}` +
-        `<span style="margin-left:8px;font-size:12px;color:var(--muted)">右上角重启服务后生效</span></div>`
+      ? backendPendingBarHTML(_runningBk4, _configuredBk4)
       : "";
-  const backendCardHTML = `<div class="lk-bk-card" id="lk-bk-card">` +
-    `<h4 class="lk-bk-card-title">${ICONS.box} 用哪个底座驱动它</h4>` +
-    `<p class="lk-bk-card-desc">底座决定这个助手背后跑哪个 CLI agent。默认 Codex；切换后需重启服务生效。</p>` +
+  // 底座卡 = 配置卡家族第一卡(与 ac-layer 同壳,编号「一」):底座是最先要
+  // 定的事,体检卡(第五卡)末尾验能力 —— 因果顺序自然(能力体检设计稿决策①)。
+  const backendCardHTML = `<section class="ac-layer" id="lk-bk-card">` +
+    `<div class="ac-layer-head"><span class="ac-index">一</span>` +
+    `<div class="ac-layer-meta"><div class="ac-layer-title-row">` +
+    `<h3 class="ac-layer-title">用哪个底座驱动它</h3></div>` +
+    `<p class="ac-layer-role">决定它拿哪家模型思考与干活。默认 Codex；改动保存后要重启服务才生效。</p></div></div>` +
+    `<div class="ac-layer-body">` +
     lkBackendSelectHTML(_configuredBk4, `bk-edit-${id}`) +
     buildModelEffortHTML(bot) +
-    bkMismatchDetail +
-    `</div>`;
+    `<div id="bk2-pending-slot">${pendingBar}</div>` +
+    `</div></section>`;
 
   return `
 <!-- 编辑式 hero band(健康=indigo soft 渐变,异常=status soft 渐变） -->
@@ -3386,6 +3918,9 @@ function buildDetailHTML(id, bot, memContent) {
   <div class="ac-panel-wrap" id="ac-panel-wrap">
     ${acPanelHTML}
   </div>
+
+  <!-- 第五卡:能力体检(异步填充;保存 bar 是 sticky 的,不受 DOM 顺序影响) -->
+  <div id="hc-slot"><section class="hc"><div class="hc-okline"><span class="spinner"></span><span class="hc-ok-sub">正在体检 —— 工具 · 凭据 · 应用权限…</span></div></section></div>
 </div>
 `;
 }
@@ -3554,24 +4089,25 @@ function wireDetailEvents(panel, id, bot) {
       toast(`底座已切换为 ${lkBackend(newId).name}（保存后生效）`, "info");
     });
 
-    // model(input)/effort(select)挂在 lk-bk-card 里、在 #ac-panel 之外 ——
+    // model/effort 隐藏 input 挂在底座卡里、在 #ac-panel 之外 ——
     // #ac-panel 的 input 脏检测监听器(见上)碰不到它们,这里单独接一份。
     bkCard.addEventListener("input", () => {
       state.formDirty = acFormSnapshot(panel) !== panel._acBaseline;
       updateFormDirty(panel);
     });
 
-    // 模型快选 chips:点一下 = 填入 model 输入框(委托监听,chips 会随底座
-    // 切换整体重渲染);dispatch input 让上面的脏检测同一条路生效。
+    // bk2 覆盖区全部交互(菜单/分段/自定义逃生口,委托监听重渲染不掉线)
+    wireModelEffort(panel, bkCard);
+
+    // 待生效状态条的「重启服务生效」(indigo 实心 = 真会执行)
     bkCard.addEventListener("click", (e) => {
-      const chip = e.target instanceof Element ? e.target.closest(".ac-model-chip") : null;
-      if (!chip) return;
-      const input = panel.querySelector("#ac-model");
-      if (!(input instanceof HTMLInputElement)) return;
-      input.value = chip.getAttribute("data-model-value") ?? "";
-      input.dispatchEvent(new Event("input", { bubbles: true }));
+      const btn = e.target instanceof Element ? e.target.closest("[data-bk2-restart]") : null;
+      if (btn) doFixAction("restart", btn);
     });
   }
+
+  // 第五卡:能力体检(异步拉数据渲染;失败降级为工具组-only)
+  void initHealthCard(panel, id, bot);
 
   // 详情 hero 删除按钮
   const btnHeroDel = panel.querySelector("#btn-hero-del");
@@ -4714,6 +5250,14 @@ function renderOnboardError(msg) {
   modal.querySelector("#ob2-err-retry")?.addEventListener("click", () => openOnboardModal());
 }
 
+/**
+ * 版本胶囊五态(BL-46,能力体检设计稿范围 C):
+ *   最新(中性安静,不可点)→ 可更新(indigo 实心 = 会执行)→ 更新中(阶段,
+ *   图标旋转)→ 失败(可点,展开错误 + 重试 + 复制日志)→ 已装待重启(黄)。
+ * larkway 版本信息只住在这颗胶囊里,体检卡不重复(DRY)。
+ * 「已装待重启」的诚实语义:updater 已重启 bridge;仍是旧版的是本管理页的
+ * 后端进程(larkway ui),它不随更新重启 —— hover/点击都把这两个事实讲清。
+ */
 function renderBrandVersion() {
   const btn = document.getElementById("brand-ver");
   if (!btn) return;
@@ -4721,24 +5265,50 @@ function renderBrandVersion() {
   const info = state.updateVersion;
   const current = state.runningVersion ?? info?.currentVersion;
   const latest = info?.latestVersion;
-  const updateAvailable = Boolean(info?.updateAvailable && latest);
+  const job = state.updateJob;
 
-  btn.classList.toggle("is-update-available", updateAvailable);
-  btn.classList.toggle("is-busy", state.updateVersionBusy);
-  btn.disabled = !updateAvailable || state.updateVersionBusy;
+  btn.classList.remove("is-update-available", "is-busy", "is-fail", "is-installed");
+  btn.disabled = false;
 
-  if (state.updateVersionBusy) {
-    btn.textContent = "更新中…";
-    btn.title = "正在更新 Larkway";
+  // ③ 更新中:阶段不给百分比,图标旋转示活
+  if (job?.status === "running") {
+    btn.classList.add("is-busy");
+    btn.disabled = true;
+    const stage = job.phase ? `${job.phase} ${job.phaseIndex ?? 1}/${job.phaseCount ?? 3}` : "…";
+    btn.innerHTML = `<span class="cap-spin">${ICONS.refresh}</span>更新中 · ${esc(stage)}`;
+    btn.title = "正在更新 Larkway(下载安装 → 重启服务 → 收尾)";
     return;
   }
 
+  // ④ 更新失败:胶囊留在失败态可点,展开错误 + 重试 + 复制日志
+  if (job?.status === "failed") {
+    btn.classList.add("is-fail");
+    btn.innerHTML = `${ICONS.x}更新失败 · 点击处理`;
+    btn.title = job.error || "更新失败";
+    return;
+  }
+
+  // ⑤ 已装待重启:两个事实都写进态里
+  if (job?.status === "done") {
+    btn.classList.add("is-installed");
+    btn.innerHTML = `已装 v${esc(latest ?? "?")} · 管理页待重启`;
+    btn.title =
+      `bridge 已按新版重启;本管理页后端(larkway ui)运行中仍是 v${current ?? "?"}。\n` +
+      `刷新页面加载新版前端;如遇接口异常,手动重启 larkway ui。`;
+    return;
+  }
+
+  const updateAvailable = Boolean(info?.updateAvailable && latest);
+  // ② 可更新:indigo 实心 = 点了真会执行(确认后)
   if (updateAvailable) {
+    btn.classList.add("is-update-available");
     btn.textContent = `v${latest}·可更新`;
     btn.title = current ? `当前 v${current}，点击更新到 v${latest}` : `点击更新到 v${latest}`;
     return;
   }
 
+  // ① 最新:中性安静,不可点
+  btn.disabled = true;
   btn.textContent = current ? `v${current}` : "";
   btn.title = "Larkway 版本";
 }
@@ -4750,9 +5320,76 @@ async function refreshUpdateVersion() {
   renderBrandVersion();
 }
 
+/** 轮询更新任务进度直到终态;终态各自收尾。 */
+async function pollUpdateJob() {
+  for (;;) {
+    await new Promise((r) => setTimeout(r, 1500));
+    const res = await api("GET", "/api/update_version/status");
+    if (!res.ok) continue;
+    state.updateJob = res.json;
+    renderBrandVersion();
+    if (res.json?.status === "done") {
+      toast("larkway 已更新,bridge 已重启。刷新页面加载新版前端。", "ok");
+      await refreshUpdateVersion();
+      await refreshRuntimeRequirements();
+      await refreshBridgeStatus();
+      await pollStatus();
+      return;
+    }
+    if (res.json?.status === "failed") {
+      toast(`更新失败：${res.json?.error ?? "未知错误"} —— 点版本胶囊可重试/复制日志`, "error");
+      return;
+    }
+  }
+}
+
+/** 失败态点击:展开错误条(重试 + 复制日志)。 */
+function showUpdateFailBar() {
+  document.getElementById("cap-fail-bar")?.remove();
+  const job = state.updateJob;
+  const bar = document.createElement("div");
+  bar.className = "cap-fail-bar";
+  bar.id = "cap-fail-bar";
+  bar.innerHTML =
+    `${ICONS.warn}<code>${esc(job?.error ?? "更新失败")}</code>` +
+    `<button type="button" class="hc-act" id="cap-retry">${ICONS.refresh} 重试</button>` +
+    `<button type="button" class="hc-act" id="cap-copy-log">${ICONS.copy} 复制日志</button>` +
+    `<button type="button" class="hc-act" id="cap-dismiss">${ICONS.x}</button>`;
+  document.querySelector(".topbar")?.insertAdjacentElement("afterend", bar);
+  bar.querySelector("#cap-retry")?.addEventListener("click", () => {
+    bar.remove();
+    void startUpdateJob();
+  });
+  bar.querySelector("#cap-copy-log")?.addEventListener("click", () => {
+    try { navigator.clipboard?.writeText((job?.log ?? []).join("\n")); } catch { /* 忽略 */ }
+    toast("日志已复制", "ok");
+  });
+  bar.querySelector("#cap-dismiss")?.addEventListener("click", () => bar.remove());
+}
+
+/** 发起更新任务(POST)并进入轮询;409(已在更新)直接转入轮询。 */
+async function startUpdateJob() {
+  const res = await api("POST", "/api/update_version");
+  if (!res.ok && res.status !== 409) {
+    toast(`更新启动失败：${res.json?.error ?? res.status}`, "error");
+    return;
+  }
+  state.updateJob = { status: "running", phase: "准备", phaseIndex: 1, phaseCount: 3 };
+  renderBrandVersion();
+  void pollUpdateJob();
+}
+
 async function doUpdateVersion() {
+  const job = state.updateJob;
+  if (job?.status === "running") return;
+  if (job?.status === "failed") { showUpdateFailBar(); return; }
+  if (job?.status === "done") {
+    toast("已装新版 —— 刷新页面加载新版前端;如遇接口异常,手动重启 larkway ui。", "info");
+    return;
+  }
+
   const info = state.updateVersion;
-  if (!info?.updateAvailable || state.updateVersionBusy) return;
+  if (!info?.updateAvailable) return;
 
   const confirmed = await confirmDialog({
     title: "更新 Larkway？",
@@ -4766,23 +5403,7 @@ async function doUpdateVersion() {
     confirmDanger: true,
   });
   if (!confirmed) return;
-
-  state.updateVersionBusy = true;
-  renderBrandVersion();
-  const res = await api("POST", "/api/update_version");
-  state.updateVersionBusy = false;
-
-  if (!res.ok) {
-    toast(`更新失败：${res.json?.error ?? res.status}`, "error");
-    renderBrandVersion();
-    return;
-  }
-
-  toast(res.json?.message ?? "已更新全局 larkway，刷新管理页后使用新版 UI。", "ok");
-  await refreshUpdateVersion();
-  await refreshRuntimeRequirements();
-  await refreshBridgeStatus();
-  await pollStatus();
+  await startUpdateJob();
 }
 
 // ---------------------------------------------------------------------------
@@ -4855,6 +5476,15 @@ async function boot() {
 
   renderContextSwitch();
   void refreshUpdateVersion();
+  // 页面在更新中途被刷新时,接上进行中/终态的更新任务(胶囊态不丢)
+  void (async () => {
+    const res = await api("GET", "/api/update_version/status");
+    if (res.ok && res.json?.status && res.json.status !== "idle") {
+      state.updateJob = res.json;
+      renderBrandVersion();
+      if (res.json.status === "running") void pollUpdateJob();
+    }
+  })();
 
   // 拉 backend 注册表(驱动底座选择就绪态;失败静默)
   void loadBackends();
