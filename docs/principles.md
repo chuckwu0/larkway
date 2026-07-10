@@ -109,6 +109,15 @@ Larkway 传给 Agent 的核心信息应是:
 
 注意:这些都是事实和指针,不是流程要求。Agent 自己决定下一步。
 
+## Agent 身份与权限
+
+Agent 只使用 Agent 自己的身份(飞书应用/bot 身份,tenant token),**不把人的权限授予 Agent**。
+
+- 不为 agent 的 lark-cli profile 做用户 OAuth(device flow),不注入任何 user_access_token。
+- 理由:身份即审计边界。Agent 的每个动作都应归因给 agent 自己,而不是以某个真人的名义发生;拿到用户身份的 agent 等于可以冒充该用户(发消息、读邮件、动日程),风险与归因都不可控。
+- 应用身份结构性做不到的事(任务负责人必须是真人、以用户名义发送内容等)不是权限缺口,而是协作分工:agent 在飞书话题里请人来做(Feishu-native),或在产品层绕开(如任务清单的 bot-as-editor 模式)。
+- 权限治理面(管理看板)只做两件事:检测应用权限是否齐全 + 引导管理员去开放平台开通。不提供任何"把用户授权交给 agent"的入口。
+
 ## 飞书卡片契约
 
 飞书卡片也是 thin channel:
@@ -173,6 +182,7 @@ Larkway 传给 Agent 的核心信息应是:
 - 它是否避免 bridge 读上下文、下载附件、clone repo、判断 workflow?
 - 它是否把长期知识放进 workspace / `AGENTS.md` / skills,而不是 bridge 代码?
 - 它是否避免把 Dashboard / Base / 卡片变成业务真相源?
+- 它是否只使用 Agent 自己的应用身份,而没有把人的权限授予 Agent?
 - 它是否能随着 Claude Code / Codex 变强而自然受益?
 
 如果答案不清楚,先回到本文重新设计。
