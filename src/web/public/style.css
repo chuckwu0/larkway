@@ -2164,6 +2164,16 @@ textarea.input {
   cursor: not-allowed;
 }
 /* hero 区「删除」文字按钮 */
+.btn-hero-auth {
+  margin-left: auto;
+  font-size: 12.5px;
+  padding: 5px 11px;
+  border-radius: 8px;
+  gap: 5px;
+}
+.btn-hero-auth + .btn-hero-del {
+  margin-left: 0;
+}
 .btn-hero-del {
   margin-left: auto;
   font-size: 12.5px;
