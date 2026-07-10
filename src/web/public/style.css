@@ -3936,11 +3936,14 @@ textarea.input {
 }
 .bk2-sel-desc { flex: 1; min-width: 0; font-size: 12px; color: var(--faint); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .bk2-select .icon { width: 15px; height: 15px; color: var(--faint); flex-shrink: 0; }
+/* 菜单走文档流内展开(不用 absolute):外层 .ac-layer 有 overflow:hidden
+   圆角裁剪,浮层会被裁得只剩一两项「看起来没有选项」—— in-flow 展开时卡片
+   自然撑高,免疫任何祖先裁剪(2026-07-10 本机部署实测修复)。 */
 .bk2-menu {
-  position: absolute; left: 0; right: 0; top: calc(100% + 6px); z-index: 30;
+  margin-top: 6px;
   border: 1px solid var(--border); border-radius: 11px;
   background: #fff; overflow: hidden;
-  box-shadow: 0 8px 24px rgba(15, 23, 42, 0.1);
+  box-shadow: 0 4px 14px rgba(15, 23, 42, 0.08);
 }
 .bk2-mi {
   display: flex; align-items: baseline; gap: 10px;
