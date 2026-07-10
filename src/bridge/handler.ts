@@ -1697,10 +1697,24 @@ export class BridgeHandler {
         }
       };
 
-      // Existing topic → bubble BEFORE the card, anchored on the TRIGGER message
-      // — a user follow-up inside an existing topic is itself an in-topic
-      // message (pos≥0), so the bubble lands in the topic (verified in prod).
-      if (!isNewThread) await createCotBubble(messageId);
+      // Existing session → bubble BEFORE the card, anchored on the TRIGGER
+      // message — but only when anchoring there actually puts the bubble where
+      // the conversation lives:
+      //   - trigger verifiably IN-topic (omt_*): a follow-up inside an existing
+      //     topic is an in-topic message (pos≥0) → bubble lands in the topic
+      //     (verified in prod).
+      //   - no task-card anchor (plain inline conversation, no topic): the
+      //     trigger IS the conversation surface → pre-card anchoring keeps the
+      //     bubble first in the timeline, as before.
+      // The remaining case — session keyed to a task CARD but trigger OUTSIDE
+      // its work topic — must NOT early-create: the v4 任务派单 flow invites
+      // exactly that shape (user re-@s by quote-replying the card from the
+      // main chat), and anchoring on that trigger dropped the reasoning bubble
+      // at the group top level, outside the work topic where the answer card
+      // goes (real-machine screenshot 2026-07-10). Those turns fall through to
+      // the post-card site below and anchor on the in-topic answer card.
+      const triggerInTopic = realTopicThreadId(parsed.raw.thread_id) !== undefined;
+      if (!isNewThread && (triggerInTopic || !taskCardAnchorId)) await createCotBubble(messageId);
 
       // CardKit response surface: default main surface when the transport and
       // rollout gates are available. It streams bounded progress into a
@@ -2161,15 +2175,18 @@ export class BridgeHandler {
         }
       }
 
-      // New topic (first turn): NOW create the bubble, anchored on the ANSWER
-      // CARD's message. The trigger @ is the topic root (pos=-1) — anchoring on
-      // it quote-replies at the group top level (cot-write-probe §F). The card
-      // we just sent replied reply_in_thread, so it is an in-topic message
-      // (pos=0) whose thread the bubble inherits → the bubble lands INSIDE the
-      // topic (probe §F2). Fall back to the trigger message if no card id is
-      // available (both surfaces failed) — origin=首楼 lands at the top level
-      // but is still usable; never block the turn.
-      if (isNewThread) {
+      // Deferred bubble create — every turn that did NOT early-create above
+      // (new topic's first turn; task-card turn triggered from outside its
+      // work topic): NOW create the bubble, anchored on the ANSWER CARD's
+      // message. Anchoring on the trigger would quote-reply at the group top
+      // level (topic root pos=-1 / out-of-topic message, cot-write-probe §F).
+      // The card we just sent replied reply_in_thread, so it is an in-topic
+      // message (pos≥0) whose thread the bubble inherits → the bubble lands
+      // INSIDE the topic (probe §F2). Fall back to the trigger message if no
+      // card id is available (both surfaces failed) — origin=首楼 lands at the
+      // top level but is still usable; never block the turn. createCotBubble's
+      // once-per-turn guard makes this a no-op when the early site already ran.
+      {
         const anchorMessageId = cardKitProgress?.messageId ?? card?.messageId ?? messageId;
         await createCotBubble(anchorMessageId);
       }

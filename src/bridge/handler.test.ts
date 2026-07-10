@@ -3187,6 +3187,99 @@ describe("handleOne — COT bubble ordering (before the card)", () => {
     expect(createdOrigin).toBe("om_msg"); // the in-topic follow-up, not the card
   });
 
+  it("task-card re-@ from the MAIN CHAT (existing session, trigger outside the topic): anchors the bubble on the answer card, not the trigger (2026-07-10 real-machine bug)", async () => {
+    // v4 任务派单 broke the "existing session ⇒ in-topic follow-up" assumption:
+    // the session is keyed to the task CARD, and a user can re-@ by
+    // quote-replying the card from the main chat. Anchoring the bubble on that
+    // trigger dropped the reasoning bubbles at the group top level while the
+    // answer card went inside the work topic. Such turns must DEFER the bubble
+    // and anchor it on the in-topic answer card (probe §F2), like a first turn.
+    const TODO_CONTENT = JSON.stringify({
+      task_id: "g-42",
+      summary: { title: "", content: [[{ tag: "text", text: "修复登录页" }]] },
+      due_time: "0",
+    });
+    const order: string[] = [];
+    let createdOrigin: string | undefined;
+    const cotClient: OutboundCotClient = {
+      async create(target) {
+        order.push("cot_create");
+        createdOrigin = target.originMessageId;
+        return { cotId: "cot_1", messageId: "om_cot_1" };
+      },
+      async resolveThreadId() {
+        return undefined;
+      },
+      async update() {},
+      async complete() {},
+    };
+    // Live-push quote-reply on the task card: parent_id only, NO thread_id.
+    const event = {
+      message_id: "om_msg2",
+      chat_id: "oc_chat",
+      chat_type: "group",
+      parent_id: "om_card",
+      sender_id: "ou_sender",
+      content: JSON.stringify({ text: "继续" }),
+      create_time: "1700000000000",
+    };
+    // Session already keyed to the card (rekeyed on an earlier turn) → isNewThread=false.
+    const wt = await seedWorktree("om_card");
+    await seedRepoCachePath();
+    const { client: cardKitClient } = makeCardKitClient();
+    const origReply = cardKitClient.replyCardEntity.bind(cardKitClient);
+    cardKitClient.replyCardEntity = async (...args: Parameters<typeof origReply>) => {
+      order.push("card_create");
+      return origReply(...args);
+    };
+    runClaudeImpl = () => ({
+      events: (async function* () {
+        yield { type: "system_init", sessionId: "sess_bl47", raw: {} };
+        await writeFile(stateFileMod.stateFilePathOf(wt), JSON.stringify(READY_STATE, null, 2), "utf8");
+      })(),
+      done: Promise.resolve({ exitCode: 0, sessionId: "sess_bl47" }),
+      kill: () => {},
+    });
+    const { renderer } = makeCardRenderer();
+    const { store } = makeSessionStore();
+    store.get = ((threadId: string) =>
+      threadId === "om_card"
+        ? { threadId, sessionId: "prev", lastActiveTs: 0 }
+        : undefined) as unknown as typeof store.get;
+    const { client, acked, unhandled } = makeClient(event);
+    const botConfig = bubbleBotConfig();
+    botConfig.response_surface_prototype.allowed_threads = ["om_card", "om_msg2"];
+    const handler = new BridgeHandler({
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      client: client as any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      cardRenderer: renderer as any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      sessionStore: store as any,
+      conventions: makeConventions(),
+      botConfig,
+      cardKitClient,
+      cotClient,
+      messageLookup: {
+        // eslint-disable-next-line @typescript-eslint/no-unused-vars
+        get: async (_messageId: string, _opts?: { refresh?: boolean }) => ({
+          msgType: "todo",
+          content: TODO_CONTENT,
+          threadId: "omt_x1",
+        }),
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      } as any,
+    });
+    await handler.run();
+    for (let i = 0; i < 200 && acked.length === 0 && unhandled.length === 0; i++) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    expect(acked).toEqual(["om_msg2"]);
+    // The bubble must anchor on the in-topic answer card, not the main-chat trigger.
+    expect(createdOrigin).toBe("om_cardkit");
+    expect(order.indexOf("card_create")).toBeLessThan(order.indexOf("cot_create"));
+  });
+
   it("still sends the card when the COT bubble create throws (bypass rule)", async () => {
     const cotClient: OutboundCotClient = {
       async create() {
