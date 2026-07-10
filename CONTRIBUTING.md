@@ -28,6 +28,27 @@ credentials; it combines local checks and synthetic smoke fixtures. Real Feishu
 E2E smoke testing is maintainer-only and requires a separately approved test
 environment; see [docs/phase0-readiness.md](docs/phase0-readiness.md).
 
+## Merging PRs (maintainers)
+
+A PR needs two reviews before merge, and they answer different questions:
+
+1. **Code review** — is it correct and safe? Logic, error paths, security
+   (no secret leakage, no injection), test quality, and conformance to
+   [docs/principles.md](docs/principles.md) (thin bridge) and this guide.
+2. **Product review** — does the *feature* actually work, end to end?
+   - Walk the full flow step by step, including the asynchronous tail: after
+     the last click, what stores the result? Multi-step protocols (device
+     flows, polling loops, deferred callbacks) must be traced to completion —
+     "the API call succeeds" is not "the feature works".
+   - UI elements must be state-aware: done / in-progress / failed / not-yet
+     each need a presentation, not one eternal button.
+   - Operations with side effects on running work (restarts, updates, kills)
+     must say so before the user confirms.
+
+Code review alone is not enough — a PR can be clean, secure, principled, and
+still not work as a product. When product intent is unclear, ask before
+merging rather than after.
+
 ## Releasing (maintainers)
 
 Cutting a release is a single deterministic step — use the script, don't do it
