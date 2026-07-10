@@ -14,6 +14,7 @@
 #   - clean working tree, on `main`
 #   - tag v<version> does not already exist
 #   - logged in to npm (`npm whoami`) or NPM_TOKEN configured in ~/.npmrc
+#   - GitHub CLI authenticated for creating the GitHub Release
 #   - pnpm + node available
 #
 # npm auth is read from your environment (~/.npmrc / NPM_TOKEN) — never stored here.
@@ -52,6 +53,9 @@ echo "→ releasing larkway: $PREV → $VERSION"
 
 if [ "$DRY_RUN" != 1 ]; then
   npm whoami >/dev/null 2>&1 || die "not logged in to npm (run \`npm login\` or set NPM_TOKEN in ~/.npmrc)"
+  command -v gh >/dev/null 2>&1 || die "gh CLI not found — install/authenticate gh before releasing"
+  gh auth status -h github.com >/dev/null 2>&1 || die "gh CLI is not authenticated for github.com"
+  git rev-parse "v$PREV" >/dev/null 2>&1 || die "previous tag v$PREV not found — needed for generated release notes"
 else
   cleanup_dry_run() {
     git checkout -- "${RELEASE_FILES[@]}"
@@ -99,19 +103,19 @@ git tag "v$VERSION"
 echo "→ npm publish"; npm publish --access public   # prepack builds dist
 echo "→ git push"; git push origin main && git push origin "v$VERSION"
 
-# ── GitHub Release (non-fatal — the tag + npm publish are the source of truth) ─
+# ── GitHub Release ───────────────────────────────────────────────────────────
 # Without this, pushed tags never appear on the repo's Releases page (the "Latest"
-# badge goes stale). Uses the origin repo (fork-friendly; no hardcoded slug).
-if command -v gh >/dev/null 2>&1; then
-  echo "→ gh release create"
-  if gh release create "v$VERSION" --title "larkway v$VERSION" --notes "$NOTES" --latest; then
-    echo "  ✓ GitHub Release v$VERSION created"
-  else
-    echo "  ⚠ gh release create failed — tag is pushed; create the Release manually if you want it on the Releases page."
-  fi
-else
-  echo "  ⚠ gh CLI not found — skipped GitHub Release (tag pushed, npm published). Install gh to auto-create Releases."
-fi
+# badge goes stale). This is required: if it fails, the release is incomplete and
+# should be repaired before starting another release.
+echo "→ gh release create"
+gh release create "v$VERSION" \
+  --title "larkway v$VERSION" \
+  --notes "$NOTES" \
+  --generate-notes \
+  --notes-start-tag "v$PREV" \
+  --verify-tag \
+  --latest
+echo "  ✓ GitHub Release v$VERSION created"
 
 echo
 echo "✓ released larkway v$VERSION"
