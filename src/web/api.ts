@@ -441,7 +441,9 @@ const postUpdateVersion: ApiHandler = async () => {
       status: 200,
       json: {
         ok: true,
-        message: "larkway 已更新，bridge 已重启。刷新管理页后会使用新版 UI。",
+        message:
+          "larkway 已更新，bridge 已重启。刷新页面即可加载新版前端；" +
+          "管理页后端进程仍是旧版，如遇接口异常请重启 larkway ui。",
         stdout: stdout.trim(),
         stderr: stderr.trim(),
       },
