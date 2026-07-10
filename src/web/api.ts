@@ -35,7 +35,6 @@ import {
 import { permissionItemsFromCapabilities } from "../agent/permissionPlan.js";
 import { resolveAgentWorkspacePathFromHome } from "../config/paths.js";
 import { resolveLarkwayVersion } from "../version.js";
-import { deriveLarkCliProfile, ensureLarkCliProfileAsync } from "../lark/profileBootstrap.js";
 import {
   readStatusFile,
   classifyStatus,
@@ -82,17 +81,6 @@ export function _setUpdateVersionExecForTest(fn?: UpdateExecFile): void {
   updateExecFile = fn ?? (execFileAsync as UpdateExecFile);
 }
 
-type PermissionAuthExecFile = (
-  file: string,
-  args: string[],
-  opts: { timeout: number; maxBuffer: number },
-) => Promise<{ stdout: string; stderr: string }>;
-let permissionAuthExecFile: PermissionAuthExecFile = execFileAsync as PermissionAuthExecFile;
-
-export function _setPermissionAuthExecForTest(fn?: PermissionAuthExecFile): void {
-  permissionAuthExecFile = fn ?? (execFileAsync as PermissionAuthExecFile);
-}
-
 /**
  * Larkway 版本号 —— 读 package.json(单一源,和 main.ts 共用 resolveLarkwayVersion,
  * 避免版本号漂移)。模块加载时读一次;失败回退 "0.0.0"。
@@ -101,71 +89,6 @@ const LARKWAY_VERSION: string = resolveLarkwayVersion(import.meta.url, "0.0.0");
 const UPDATE_CHECK_TIMEOUT_MS = 5000;
 const UPDATE_RUN_TIMEOUT_MS = 5 * 60 * 1000;
 const UPDATE_MAX_BUFFER = 2 * 1024 * 1024;
-
-const BOT_PERMISSION_SCOPE_GROUPS = {
-  tenant: [
-    "aily:data_asset:upload_file",
-    "application:application:self_manage",
-    "application:bot.basic_info:read",
-    "application:bot.menu:write",
-    "cardkit:card:read",
-    "cardkit:card:write",
-    "contact:contact.base:readonly",
-    "docs:document.comment:create",
-    "docs:document.comment:delete",
-    "docs:document.comment:read",
-    "docs:document.comment:update",
-    "docs:document.comment:write_only",
-    "docs:document.media:download",
-    "docs:document.media:upload",
-    "docs:document:import",
-    "docs:permission.member:create",
-    "docx:document.block:convert",
-    "docx:document:readonly",
-    "docx:document:write_only",
-    "drive:drive.metadata:readonly",
-    "drive:file:upload",
-    "im:chat.members:bot_access",
-    "im:chat:create",
-    "im:chat:read",
-    "im:chat:readonly",
-    "im:chat:update",
-    "im:message",
-    "im:message.group_at_msg.include_bot:readonly",
-    "im:message.group_at_msg:readonly",
-    "im:message.group_msg",
-    "im:message.p2p_msg:readonly",
-    "im:message.pins:read",
-    "im:message.pins:write_only",
-    "im:message.reactions:read",
-    "im:message.reactions:write_only",
-    "im:message:readonly",
-    "im:message:send_as_bot",
-    "im:message:send_multi_users",
-    "im:message:send_sys_msg",
-    "im:message:update",
-    "im:resource",
-    "task:attachment:read",
-    "task:attachment:write",
-    "task:comment",
-    "task:comment:read",
-    "task:comment:write",
-    "task:custom_field:read",
-    "task:custom_field:write",
-    "task:task",
-    "task:task:read",
-    "task:task:readonly",
-    "task:task:write",
-    "task:task:writeonly",
-    "task:tasklist.privilege:read",
-    "task:tasklist:read",
-    "task:tasklist:write",
-    "wiki:node:read",
-    "wiki:node:retrieve",
-  ],
-  user: ["offline_access"],
-} as const;
-const BOT_PERMISSION_AUTH_TIMEOUT_MS = 15_000;
 
 // ---------------------------------------------------------------------------
 // ManagementContext — the local / central abstraction
@@ -550,131 +473,6 @@ const getBot: ApiHandler = async (req) => {
     return { status: 500, json: { error: msg } };
   }
 };
-
-/**
- * POST /api/bot/:id/permission-auth — generate a Feishu device-flow URL for
- * this bot's own lark-cli profile. No raw command, profile, secret, or
- * device_code is returned.
- */
-const postBotPermissionAuth: ApiHandler = async (req) => {
-  const { ctx, params } = req;
-  const id = params.id;
-  {
-    const e = badBotId(id);
-    if (e) return e;
-  }
-  if (ctx.mode !== "local") {
-    return { status: 403, json: { error: "只支持在本机助手上下文中生成授权链接。" } };
-  }
-
-  let bot: Awaited<ReturnType<typeof botsStore.readBot>>;
-  try {
-    bot = await ctx.stores.botsStore.readBot(id);
-  } catch (e) {
-    const msg = e instanceof Error ? e.message : String(e);
-    return { status: msg.includes("not found") ? 404 : 500, json: { error: msg } };
-  }
-
-  const profile = deriveLarkCliProfile(bot.lark_cli_profile, bot.app_id);
-  const scopes = [...BOT_PERMISSION_SCOPE_GROUPS.tenant, ...BOT_PERMISSION_SCOPE_GROUPS.user];
-
-  try {
-    const appSecret = await ctx.stores.hostConfig.readSecret(bot.app_secret_env).catch(() => null);
-    if (appSecret) {
-      await ensureLarkCliProfileAsync(bot.id, profile, bot.app_id, appSecret);
-    }
-
-    const { stdout } = await permissionAuthExecFile(
-      process.env.LARK_CLI_PATH || "lark-cli",
-      ["--profile", profile, "auth", "login", "--scope", scopes.join(" "), "--no-wait", "--json"],
-      { timeout: BOT_PERMISSION_AUTH_TIMEOUT_MS, maxBuffer: 1024 * 1024 },
-    );
-    const payload = parseJsonObjectFromText(stdout);
-    const authorizationUrl = extractPermissionAuthorizationUrl(payload);
-    if (!authorizationUrl) {
-      return {
-        status: 502,
-        json: { error: "飞书授权链接生成失败: lark-cli 没有返回可打开的授权链接。" },
-      };
-    }
-
-    return {
-      status: 200,
-      json: {
-        ok: true,
-        botId: bot.id,
-        authorizationUrl,
-        expiresIn: positiveNumberField(payload, ["expires_in", "expiresIn"]),
-        intervalSeconds: positiveNumberField(payload, ["interval", "intervalSeconds"]),
-        scopeGroups: BOT_PERMISSION_SCOPE_GROUPS,
-      },
-    };
-  } catch (e) {
-    const message = permissionAuthErrorMessage(e);
-    return { status: message.status, json: { error: message.error } };
-  }
-};
-
-function parseJsonObjectFromText(text: string): Record<string, unknown> {
-  const raw = String(text || "").trim();
-  if (!raw) return {};
-  const direct = tryParseJsonObject(raw);
-  if (direct) return direct;
-
-  for (const line of raw.split("\n").map((item) => item.trim()).filter(Boolean).reverse()) {
-    const parsed = tryParseJsonObject(line);
-    if (parsed) return parsed;
-  }
-
-  const first = raw.indexOf("{");
-  const last = raw.lastIndexOf("}");
-  return first >= 0 && last > first ? tryParseJsonObject(raw.slice(first, last + 1)) ?? {} : {};
-}
-
-function tryParseJsonObject(text: string): Record<string, unknown> | null {
-  try {
-    const parsed = JSON.parse(text);
-    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed as Record<string, unknown> : null;
-  } catch {
-    return null;
-  }
-}
-
-function extractPermissionAuthorizationUrl(payload: Record<string, unknown>): string {
-  for (const value of [
-    payload.verification_url,
-    payload.verificationUrl,
-    payload.verification_uri,
-    payload.verificationUri,
-    payload.auth_url,
-    payload.authUrl,
-  ]) {
-    const url = typeof value === "string" ? value.trim() : "";
-    if (/^https:\/\/accounts\.feishu\.cn\/oauth\/v1\/device\/verify\?/i.test(url)) {
-      return url;
-    }
-  }
-  return "";
-}
-
-function positiveNumberField(payload: Record<string, unknown>, keys: string[]): number | undefined {
-  for (const key of keys) {
-    const value = typeof payload[key] === "number" ? payload[key] : Number(String(payload[key] ?? "").trim());
-    if (Number.isFinite(value) && value > 0) return value;
-  }
-  return undefined;
-}
-
-function permissionAuthErrorMessage(error: unknown): { status: number; error: string } {
-  const text = error instanceof Error ? error.message : String(error || "");
-  if (/not[_ -]?configured|not configured|profile .*not found|profile .*missing|profile .*does not exist/i.test(text)) {
-    return { status: 409, error: "这个 bot 的 lark-cli profile 尚未配置，启动/重启 Larkway 后再试。" };
-  }
-  if (/ENOENT|command not found|no such file/i.test(text)) {
-    return { status: 502, error: "服务端未找到 lark-cli，无法生成飞书授权链接。" };
-  }
-  return { status: 502, error: "飞书授权链接生成失败，请稍后重试。" };
-}
 
 /**
  * GET /api/bot/:id/events — recent Feishu events observed by this local bridge.
@@ -1655,7 +1453,6 @@ export const ROUTES: Record<string, ApiHandler> = {
   "POST /api/update_version": postUpdateVersion,
   "GET /api/bots": getBots,
   "GET /api/bot/:id": getBot,
-  "POST /api/bot/:id/permission-auth": postBotPermissionAuth,
   "GET /api/bot/:id/events": getBotEvents,
   "PUT /api/bot/:id": putBot,
   "DELETE /api/bot/:id": deleteBot,

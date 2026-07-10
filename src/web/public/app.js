@@ -2271,10 +2271,6 @@ function buildHeroInner(id, bot, f) {
   const heroDelBtn = `<button class="btn btn-hero-del" id="btn-hero-del" type="button" title="删除助手">` +
     `<svg class="icon" viewBox="0 0 24 24" aria-hidden="true" style="width:14px;height:14px;flex-shrink:0"><path d="M3 6h18M8 6V4a1 1 0 0 1 1-1h6a1 1 0 0 1 1 1v2M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6M10 11v6M14 11v6"/></svg>` +
     ` 删除</button>`;
-  const heroPermissionBtn =
-    `<button class="btn btn-primary btn-hero-auth" id="btn-permission-auth" type="button" title="申请这个助手所需的飞书权限">` +
-    ICONS.shield +
-    ` 申请全部权限</button>`;
 
   // 触点②:hero kicker 行,紧跟眉批加 backend chip(mono + vendor)
   const backendKickerChip = lkBackendChipHTML(bot.backend || LK_BACKEND_DEFAULT, { mono: true, vendor: true });
@@ -2301,7 +2297,6 @@ function buildHeroInner(id, bot, f) {
     `<span class="hero-eyebrow">${eyebrowLabel} ${num} 个</span>` +
     backendKickerChip +
     editBadge +
-    heroPermissionBtn +
     heroDelBtn +
     `</div>` +
     `<h1 class="hero-title">${esc(f.name || id)}</h1>` +
@@ -3544,7 +3539,8 @@ function wireDetailEvents(panel, id, bot) {
             repoCount: repos.length,
           },
         );
-        wireHeroActions(heroBody, id);
+        // re-wire hero del btn
+        heroBody.querySelector("#btn-hero-del")?.addEventListener("click", () => doDeleteBot(id));
       }
       // 名册行 chip 也跟着换(直接操作 DOM)
       const rosterLi = document.querySelector(`li[data-bot-id="${CSS.escape(id)}"]`);
@@ -3578,7 +3574,10 @@ function wireDetailEvents(panel, id, bot) {
   }
 
   // 详情 hero 删除按钮
-  wireHeroActions(panel, id);
+  const btnHeroDel = panel.querySelector("#btn-hero-del");
+  if (btnHeroDel) {
+    btnHeroDel.addEventListener("click", () => doDeleteBot(id));
+  }
 
 }
 
@@ -3600,7 +3599,9 @@ function acRefreshHero(panel, id, bot) {
     chatCount,
     repoCount,
   });
-  wireHeroActions(body, id);
+  // re-wire del button(内容重建后需重绑)
+  const btnHeroDel = body.querySelector("#btn-hero-del");
+  if (btnHeroDel) btnHeroDel.addEventListener("click", () => doDeleteBot(id));
   // BL-18:re-wire restart panel buttons(timeout 面板 logs/restart/rescan)
   wireRestartPanelButtons(body);
 }
@@ -3660,48 +3661,6 @@ function btnLoading(btn, loadingText) {
     btn.disabled = false;
     btn.innerHTML = original;
   };
-}
-
-function wireHeroActions(root, id) {
-  root.querySelector("#btn-hero-del")?.addEventListener("click", () => doDeleteBot(id));
-  root.querySelector("#btn-permission-auth")?.addEventListener("click", (e) => {
-    startPermissionAuthorization(id, e.currentTarget);
-  });
-}
-
-function getPermissionAuthorizationUrl(payload) {
-  const url = payload?.authorizationUrl || payload?.data?.authorizationUrl || payload?.data?.session?.authorizationUrl;
-  return typeof url === "string" ? url.trim() : "";
-}
-
-async function startPermissionAuthorization(id, triggerBtn) {
-  const authWindow = window.open("", "_blank");
-  if (authWindow) authWindow.opener = null;
-  const restore = btnLoading(triggerBtn, "生成中…");
-
-  try {
-    const res = await api("POST", `/api/bot/${encodeURIComponent(id)}/permission-auth`);
-    if (!res.ok || !res.json?.ok) {
-      throw new Error(res.json?.error || `HTTP ${res.status}`);
-    }
-
-    const url = getPermissionAuthorizationUrl(res.json);
-    if (!url) {
-      throw new Error("飞书授权链接格式不正确。");
-    }
-
-    if (authWindow) {
-      authWindow.location.href = url;
-    } else {
-      window.location.href = url;
-    }
-    toast("已打开飞书授权页", "ok");
-  } catch (e) {
-    authWindow?.close();
-    toast(`生成授权链接失败：${e instanceof Error ? e.message : String(e)}`, "error");
-  } finally {
-    restore();
-  }
 }
 
 /** 保存成功:让 indigo 主按钮闪一下(lk-saveflash)。 */
