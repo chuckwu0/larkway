@@ -54,7 +54,7 @@ import {
   finalizeOnboard,
   type OnboardForm,
 } from "./onboardSession.js";
-import { runtimeRequirementsForBots } from "../runtimeRequirements.js";
+import { commandProbeEnv, runtimeRequirementsForBots } from "../runtimeRequirements.js";
 
 const execFileAsync = promisify(execFileCallback);
 const CHAT_NAME_CACHE_MS = 5 * 60 * 1000;
@@ -328,7 +328,7 @@ async function readLatestLarkwayVersion(): Promise<string | null> {
 type HealthScanExecFile = (
   file: string,
   args: string[],
-  opts: { timeout: number; maxBuffer: number },
+  opts: { timeout: number; maxBuffer: number; env?: NodeJS.ProcessEnv },
 ) => Promise<{ stdout: string; stderr: string }>;
 let healthScanExecFile: HealthScanExecFile = execFileAsync as HealthScanExecFile;
 
@@ -356,7 +356,8 @@ async function defaultBackendLoginProbe(backend: string): Promise<boolean | null
 }
 
 const HEALTH_SCAN_TTL_MS = 10 * 60 * 1000;
-const HEALTH_SCAN_PROBE_TIMEOUT_MS = 10_000;
+// 15s:mini 实测 auth status 走飞书接口偶尔 >10s,误报「探测失败」
+const HEALTH_SCAN_PROBE_TIMEOUT_MS = 15_000;
 const healthScanCache = new Map<string, { json: Record<string, unknown>; at: number }>();
 
 /**
@@ -413,7 +414,9 @@ async function runHealthScan(
     const { stdout } = await healthScanExecFile(
       process.env.LARK_CLI_PATH || "lark-cli",
       ["--profile", profile, "auth", "status", "--json"],
-      { timeout: HEALTH_SCAN_PROBE_TIMEOUT_MS, maxBuffer: 1024 * 1024 },
+      // commandProbeEnv:补齐 ~/.local/bin 等用户级安装目录(mini 实测:精简
+      // PATH 的 UI 进程探测不到工具,与登录态探测自相矛盾)
+      { timeout: HEALTH_SCAN_PROBE_TIMEOUT_MS, maxBuffer: 1024 * 1024, env: commandProbeEnv() },
     );
     const payload = healthScanParseJson(stdout);
     const botIdentity = (payload?.identities as Record<string, { available?: boolean }> | undefined)?.bot;
@@ -427,14 +430,18 @@ async function runHealthScan(
         ? { hint: "重启 Larkway 会自动重新配置 profile;若仍失败,检查 keychain 是否锁定" }
         : {}),
     });
-  } catch {
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    const timedOut = (e as { killed?: boolean }).killed === true || /timed? ?out/i.test(msg);
     credentials.push({
       id: "lark-profile",
       label: "lark-cli profile",
       status: "unknown",
       severity: "required",
       global: false,
-      hint: "lark-cli 探测失败(未安装或超时)—— 装好工具后重新体检,这项会自动补上",
+      hint: timedOut
+        ? "lark-cli 探测超时(飞书接口响应慢)—— 点「重新体检」再试一次"
+        : "lark-cli 探测失败(未安装或无法执行)—— 装好工具后重新体检,这项会自动补上",
     });
   }
 

@@ -1,5 +1,27 @@
 import { execFileSync } from "node:child_process";
+import { homedir } from "node:os";
+import { delimiter } from "node:path";
 import type { BotConfig } from "./config/botLoader.js";
+
+/**
+ * 探测用 PATH:进程 PATH + 常见的用户级安装目录。真实事故(mini,2026-06-30
+ * 起反复踩):claude CLI 自更新后迁到 `~/.local/bin`,从精简 PATH 环境(launchd
+ * / watchdog / 直接 `larkway ui`)起的进程 `which claude` 找不到 → 面板报
+ * 「未安装」,而登录态探测(凭据文件/keychain,不依赖 PATH)显示已登录,
+ * 自相矛盾。探测的问题是「这台机器装没装」,不是「这个进程的 PATH 见没见到」,
+ * 所以补齐常见目录再答。
+ */
+export function commandProbeEnv(): NodeJS.ProcessEnv {
+  const extra = [
+    `${homedir()}/.local/bin`,
+    "/opt/homebrew/bin",
+    "/usr/local/bin",
+  ];
+  const current = process.env.PATH ?? "";
+  const parts = current.split(delimiter);
+  const merged = [...parts, ...extra.filter((p) => !parts.includes(p))].join(delimiter);
+  return { ...process.env, PATH: merged };
+}
 
 export type RuntimeRequirementSeverity = "required" | "optional";
 
@@ -17,14 +39,15 @@ export interface RuntimeRequirement {
 }
 
 function checkCli(command: string): { ok: boolean; version?: string } {
+  const env = commandProbeEnv();
   try {
-    execFileSync("which", [command], { stdio: ["pipe", "pipe", "pipe"] });
+    execFileSync("which", [command], { stdio: ["pipe", "pipe", "pipe"], env });
   } catch {
     return { ok: false };
   }
 
   try {
-    const version = execFileSync(command, ["--version"], { stdio: ["pipe", "pipe", "pipe"] })
+    const version = execFileSync(command, ["--version"], { stdio: ["pipe", "pipe", "pipe"], env })
       .toString()
       .trim()
       .split("\n")[0];
