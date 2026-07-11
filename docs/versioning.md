@@ -52,7 +52,8 @@
 | v0.3.45 | v0.3.45 | patch / 已发布 | 看板 model 建议列表更新为当前 Claude 模型 ID(claude-sonnet-5/claude-opus-4-8/claude-fable-5),修复找不到 Sonnet 5 选项的问题 |
 | v0.3.46 | v0.3.46 | patch / 已发布 | 看板模型选择改为常驻快选 chips(datalist 会按已填值过滤导致看起来选项丢失);CI 修复(doctor 的 lark-cli 探测不再让测试退出码依赖宿主机环境) |
 | v0.3.47 | v0.3.47 | patch / 已发布 | 能力体检卡+底座卡v2+版本胶囊五态(claude design 设计稿落地);/stop bridge 层硬停止;web 自更新入口 |
-| v0.3.48 | v0.3.48 | 当前 patch / 已发布 | fix: model 覆盖菜单被卡片圆角裁剪到看不见选项(改文档流内展开) |
+| v0.3.48 | v0.3.48 | patch / 已发布 | fix: model 覆盖菜单被卡片圆角裁剪到看不见选项(改文档流内展开) |
+| v0.3.49 | v0.3.49 | 当前 patch / 已发布 | fix: 体检探针补齐用户级安装目录 PATH(claude 在 ~/.local/bin 被误报未安装)+ lark-cli 探测超时放宽 |
 
 ## 使用原则
 
@@ -112,4 +113,5 @@ v0.3.45       = 看板 model 建议列表更新为当前 Claude 模型 ID(claude
 v0.3.46       = 看板模型选择改为常驻快选 chips(datalist 会按已填值过滤导致看起来选项丢失);CI 修复(doctor 的 lark-cli 探测不再让测试退出码依赖宿主机环境)
 v0.3.47       = 能力体检卡+底座卡v2+版本胶囊五态(claude design 设计稿落地);/stop bridge 层硬停止;web 自更新入口
 v0.3.48       = fix: model 覆盖菜单被卡片圆角裁剪到看不见选项(改文档流内展开)
+v0.3.49       = fix: 体检探针补齐用户级安装目录 PATH(claude 在 ~/.local/bin 被误报未安装)+ lark-cli 探测超时放宽
 ```
