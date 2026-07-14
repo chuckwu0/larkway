@@ -798,6 +798,8 @@ export interface BridgeHandlerDeps {
     /** Perf plan 批C model/effort knobs — passed through to RunOptions verbatim. */
     model?: string;
     effort?: string;
+    /** 批E (E1) continuation-prompt mode — see BotConfig.promptMode. */
+    promptMode?: "full" | "delta";
     /**
      * COT (思维链) 气泡档位。"off" = 不推;"brief"/"detailed" 见 BotConfig.cot。
      * 缺省视为 "brief"。仅在非 "off" 时 main.ts 才注入 cotClient。
@@ -2307,6 +2309,7 @@ export class BridgeHandler {
           turn_taking_limit: this.deps.botConfig?.turn_taking_limit,
           botName: this.deps.botConfig?.name,
           backend: this.deps.botConfig?.backend,
+          promptMode: this.deps.botConfig?.promptMode,
           agentMemory: this.deps.agentMemory,
           larkCliProfile: this.deps.larkCliProfile,
           runtimeWarnings: this.runtimeWarnings(),
@@ -2632,7 +2635,15 @@ export class BridgeHandler {
             });
           }
 
-          if (reportedState === null) {
+          // 批E (E2): a turn that streamed answer text but wrote no fresh
+          // state.json is now the EXPECTED fast path (plain text replies skip
+          // the write entirely per the slimmed contract), not an anomaly —
+          // only record the event when there's no fresh answer either (a
+          // genuinely silent turn, the case the noOutputFallback card covers).
+          const hasFreshAnswerText =
+            trustedAnswerText.trim().length > 0 ||
+            (cardKitProgress?.answerText.trim().length ?? 0) > 0;
+          if (reportedState === null && !hasFreshAnswerText) {
             await recordEvent({
               status: "running",
               appendPath: "未更新 state.json",

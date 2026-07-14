@@ -301,6 +301,28 @@ export interface RenderPromptInput {
    * Ignored outside agent_workspace runtime (legacy has no workspace files).
    */
   mtimeFacts?: string[];
+  /**
+   * 批E (E1) continuation-prompt mode. "full" (default) keeps the historical
+   * behavior: every continuation turn re-renders all static blocks (state
+   * contract, L2 agent memory, workspace block + memory index, peers,
+   * turn-taking, edge-case rules). "delta" renders continuation turns as
+   * dynamic facts only — thread-context facts, runtime warnings, mtime facts,
+   * task blocks, the user message, and a 3-line contract anchor — because the
+   * full static blocks from the thread's FIRST turn are already in the
+   * resumed session history verbatim (claude --resume replays it; codex
+   * thread continuation keeps it in-process). Measured on a real bot config:
+   * continuation prompt 11.7k chars → ~2k chars.
+   *
+   * New threads always render the full prompt regardless of this flag, and
+   * the handler's stale-session retry loop re-renders with isNewThread=true
+   * when it falls back to a fresh session — so a session that lost its
+   * history never starts on a delta prompt.
+   *
+   * Trade-offs accepted (v1): peers list changes mid-thread are not re-sent
+   * (rare; next new thread picks them up), and the L2 persona is not
+   * re-anchored per turn (history retains it).
+   */
+  promptMode?: "full" | "delta";
 }
 
 // ---------------------------------------------------------------------------
@@ -317,9 +339,17 @@ function csv(items: string[]): string {
 // ---------------------------------------------------------------------------
 
 /**
- * Fixed block appended to every prompt. Tells the bot how to report progress
- * back to the bridge via `<worktree>/.larkway/state.json`. Matches the schema
- * enforced by src/bridge/stateFile.ts.
+ * Fixed block appended to every FULL prompt (new threads; continuation turns
+ * in `promptMode: "full"`). Tells the bot how to report back to the bridge.
+ * Matches the schema enforced by src/bridge/stateFile.ts.
+ *
+ * 批E (E2+E3): rewritten from the v1 ~4k-char version. state.json is now
+ * BY-NEED, not per-turn — the bridge's finalize truth-ordering already treats
+ * "clean exit + no fresh state.json" as success and renders the answer-channel
+ * text as the card body (handler.ts Step 4e-pre case 4 + Step 4f fallback),
+ * so a plain text reply needs zero tool calls. Business-specific guidance
+ * (e.g. social-ops content_blocks layouts) moved OUT of the bridge contract —
+ * that belongs in the bot's L2 memory (bots/<id>.memory.md).
  *
  * The bridge only needs `status` to render the generic state layer
  * (⏳/🔧/✅/❌). Everything else (rich schema, stage定义, dev_url 规则) is L3
@@ -327,65 +357,51 @@ function csv(items: string[]): string {
  */
 function renderStateContract(stateFilePath?: string): string[] {
   const stateTarget = stateFilePath
-    ? `指定路径 \`${stateFilePath}\``
+    ? `\`${stateFilePath}\``
     : "工作目录里的 `.larkway/state.json`";
   return [
     "<state-contract>",
-    "你和运营之间的界面是飞书话题里的 response surface,这是一个 thin-channel 外壳:",
-    "- 默认主回复面是一张 CardKit 流式卡片:bridge 起手只显示一行“努力回答中...”,答案通道一产出就逐 token 流入同一张卡,完成后收敛成干净总结卡。",
-    "- 运行中绝不展示思考、工具详情、进度 list、本地路径或原始 runner text_delta;这些都属于内部通道。",
-    "- 你负责把最终给运营看的正文、状态、下一步问题、是否需要 choices/结构化卡片写进 state.json。",
-    `你不直接发/编辑 bridge 管理的 post 或卡片;你只写 ${stateTarget},bridge 读它来做安全渲染。`,
+    "你的回复通过飞书话题里一张 bridge 管理的流式卡片呈现。运行中它只显示答案通道流出的正文;思考、工具过程、内部叙述一律不展示。",
     "",
-    "答案流通道:",
-    `- 只有真正要给用户看的答案正文,才包在独立行 marker 之间输出到 stdout: \`${ANSWER_BEGIN_MARKER}\` 到 \`${ANSWER_END_MARKER}\`。`,
-    "- marker 外的叙述、计划、工具说明、内部分析都会被 bridge 当作 internal_text,不会进入卡片。",
-    "- 当最终答案还没准备好时可以不输出答案 marker;卡片只保持“努力回答中...”。一旦开始输出答案 marker 内正文,bridge 会立即流式展示。",
-    "- 每轮结束前仍必须写 state.json;最终数据以 state.json 的 last_message/content_blocks/choices 等为准,答案流只是运行中可见的低延迟正文通道。",
-    "**完成本次响应前必须**根据当前实际状态更新这个文件(原子写:写 .tmp 再 mv)。",
+    "答案通道(每轮必须):真正给用户看的正文,包在独立行 marker 之间输出到 stdout:",
+    `\`${ANSWER_BEGIN_MARKER}\` 到 \`${ANSWER_END_MARKER}\`。marker 外的一切按内部过程处理,不会上卡。`,
+    "**结论一成形就先输出答案 marker 正文,再做记录/收尾类动作** —— 答案越早流出,用户越早看到。",
     "",
-    "你能写的字段:",
-    "- status: in_progress / ready / failed(bridge 唯一强依赖的字段)",
-    "- last_message: 给运营看的卡片正文。你自行组织展示内容,例如进度、结论、证据、MR 链接、dev 预览、需要用户补充的信息",
-    "- error: 失败原因(搭配 status=failed)",
-    "- card_title/card_color: 兼容字段; 默认 CardKit 不渲染顶部标题色条,legacy/fallback 卡片路径可能使用",
-    "- image_blocks: 可选图片预览块数组,最多 4 个。每项 `{img_key, alt?, title?, mode?, preview?}`; `img_key` 必须是已上传/可用于卡片的 Feishu 图片 key,`alt` 省略时 bridge 默认“图片预览”,`mode` 只允许 `crop_center`/`fit_horizontal` 并映射到 Card JSON 2.0 `scale_type`,`preview` 默认 true。bridge 不负责下载/上传/选择图片;这些由你用 lark-cli 等工具先完成。",
-    "- content_blocks: 可选有序正文块数组,最多 12 个 block、最多 4 个 image block。只支持窄 union:`{type:\"markdown\", content}` 和 `{type:\"image\", img_key, alt?, title?, mode?, preview?}`;不支持 raw card JSON。用于正文与图片交错排版,例如 markdown -> image -> markdown -> image。若 `content_blocks` 非空,bridge 以它作为主正文并忽略 `last_message` + `image_blocks` 的正文渲染,避免重复;若省略则保持旧 `last_message` + `image_blocks` 行为。",
-    "- response_surface: 可选覆盖字段,主要用于 `{post:{mentions:[{user_id,label?}]}}` late peer @。默认可不写;bridge 按 CardKit 流式卡片处理,最终收成干净总结卡。旧 `mode`/`primary` 仅兼容解析,不再选择 post-only/hybrid 主响应面。这里的 late @ 只是最终卡片里的视觉提示;需要 peer bot 消费正文的 handoff 必须由 Agent/团队工作流发送真实 Feishu post + at 标签。不要写 raw Feishu post/card JSON。",
-    "- scheduled reply / daily social ops review card 等需要“平台正文 + 匹配图片”同段相邻展示的场景,应先取得各图片 `img_key`,再写 `content_blocks` 为 `平台 markdown -> 对应 image -> 下个平台 markdown -> 对应 image`;不要用单独话题图片消息或尾部 `image_blocks` 代替验收面。",
-    "- dev_url / mr_url / 其余业务字段:自由写入,bridge 不感知其业务含义;要让运营看到,请写进 last_message",
-    "- updated_at: ISO 8601 timestamp",
+    `state.json(按需,路径 ${stateTarget}):**纯文字回答不用写** —— 只输出答案 marker、然后干净退出,bridge 自动按成功收敛卡片,正文即答案通道内容。以下情况才写(原子写:先写 .tmp 再 mv;每次都把 updated_at 刷成当前 ISO 8601 时间,旧 updated_at 会被当作 stale 忽略):`,
+    "- 失败:status=failed + error。第一个工具失败就立刻写,别连撞多个工具刷成超时。",
+    "- 等用户补充:status=in_progress + last_message 说清缺什么、怎么继续;需求有歧义先问,别猜着做不可逆动作。",
+    "- 需要用户单选:status=ready + choices(最多 5 个 `{label, value}`,可配 choice_prompt 一行问题)。label 是简短选项含义;value 是点选后**逐字回传给你**的完整自描述指令,别写 `optA` 这种代号。bridge 自动编号 A/B/C 并在正文生成图例,**正文别再手动列一遍选项**。仅限「单个离散选择、点一下就答全」;信息收集/多部分提问让用户直接打字,别用按钮。",
+    "- 图文混排:status=ready + content_blocks(有序块数组,最多 12 块、其中 image 最多 4 块;只支持 `{type:\"markdown\", content}` 和 `{type:\"image\", img_key, alt?}`,img_key 必须是你已上传、可用于卡片的 Feishu 图片 key;非空时它就是主正文)。",
+    "- 需要覆盖卡片正文:status=ready + last_message(不写时正文=答案通道内容);dev_url/mr_url 等业务字段可自由写入,但 bridge 不感知其含义,要让用户看到就写进正文。",
+    "- 需要在终态卡上 @ 人:response_surface 写 `{post:{mentions:[{user_id}]}}`;这只是视觉提示,要 peer bot 消费正文必须另发真实 post(卡片对 agent 不可读)。",
     "",
-    "**绝不自己 `lark-cli api PATCH/PUT .../im/v1/messages/...` 改 bridge 管理的 post/card** —— 那是 bridge 的活;",
-    "自己发/改主回复面会和 bridge 的 post 编辑、卡片 finalize、按钮回传、崩溃恢复冲突。你只写 state.json,网络更新交给 bridge。",
-    "写完 state.json 就**干净结束本轮**(你的进程退出 → bridge 才把 post/card 收敛成终态;",
-    "挂着不退出 = 话题永远卡在「正在处理…」)。",
-    "",
-    "卡片展示原则:",
-    "- 运行中主面是 CardKit 真流式卡片;不要依赖工具流/日志表达业务阶段,它们不会显示。",
-    "- 最终卡片以你的 `last_message` 为主;若写了 `choices`、`content_blocks` 或 `image_blocks`,bridge 会在同一张最终卡片承载这些能力。",
-    "- 不要依赖 bridge 从输出里解析业务阶段、MR、预览地址或下一步动作;需要展示的内容你自己写进 last_message。",
-    "- 不要求固定格式。根据任务选择最清楚的表达:短结论、分点、表格、链接、下一步问题都可以。",
-    "- 如果本轮涉及 repo / 代码 / 文档修改,last_message 应包含足够让运营验收的证据,例如你实际使用的 workspace/repo、关键 diff 或链接、运行过的测试/检查命令和结果。具体证据由任务决定;dogfood E2E 的严格清单只在 dogfood guide 中要求。",
-    "- 需要用户继续输入时,status 可写 in_progress,last_message 里清楚说明缺什么、为什么需要、用户怎么继续。",
-    "",
-    "**默认让运营直接在话题里 @ 你回复(自由文字)** —— 尤其当你要收集路径 / URL / 描述这类信息,",
-    "或问题有多个部分时,运营一条文字回复就能说全,比点按钮省事(按钮一次只能答一项)。",
-    "`choices` 按钮**只在「单个离散选择、点一下就答全、不需要再补任何信息」时才用**",
-    "(如「要不要让 X review?要 / 不要」「方案 A 还是 B」);**别用按钮做信息收集 / 多部分提问**。",
-    "",
-    "确实是单选时,写 `choices`(最多 5 个):",
-    "- `choices: [{label, value}]`(可选搭配 `choice_prompt` 一行问题,如「选哪个方案?」)",
-    "- `label` 写**简短**的选项含义;`value` 是运营点了之后**原样(逐字)回传给你**作为新一轮消息文本的字符串",
-    "- **按钮文字由 bridge 自动编号 A/B/C/D/E,选项含义(label)由 bridge 在正文自动生成「A. <label>」图例** ——",
-    "  所以你**不要在 `last_message` 里再手动列一遍选项**(会重复);正文只写问题背景,选项交给 bridge 渲染",
-    "- 把 `value` 写成一句自描述的完整指令(它就是你将收到的任务文本),不要写成 `optA` 这种代号",
-    "- 没有需要选的就**省略** `choices`(卡片保持干净,无按钮)",
-    "- 若同时写 `content_blocks` 和 `choices`,bridge 始终把 choices 渲染在正文内容之后;若 `status=failed`,error 仍会显示,不会被 content_blocks 覆盖。",
-    "",
-    "写 status=ready 前必须自己用代码验过(dev server 用 curl -I 看 200;文件 ls/test -f;命令看 exit code)。bridge 不再替你 probe,验证完全是你的责任。",
-    "第一个工具失败立刻写 status=failed + error,别裸奔撞多个工具刷成超时;需求有歧义先停下写 status=in_progress + last_message='等X确认',别瞎猜就开做不可逆动作。",
+    "边界与责任:",
+    "- **绝不自己 PATCH/PUT bridge 管理的卡片/post** —— 网络更新是 bridge 的活,自己改会和卡片 finalize、按钮回传、崩溃恢复冲突。",
+    "- 写 status=ready 前先自己验证过(dev server 用 curl -I;文件 ls/test -f;命令看 exit code)。bridge 不替你 probe,验证是你的责任。涉及代码/文档修改时,正文给出足够让人验收的证据(用到的 repo、关键 diff/链接、跑过的检查和结果)。",
+    "- 本轮做完就**干净退出进程** —— 挂着不退出,话题会永远停在「正在处理…」。",
     "</state-contract>",
+  ];
+}
+
+/**
+ * 批E (E1): compact per-turn anchor used INSTEAD of the full state contract
+ * on delta-mode continuation turns. The full contract from the thread's first
+ * turn is already in the resumed session history (claude --resume / codex
+ * thread continuation replay verbatim); re-sending ~4k chars every turn was
+ * pure duplication. This anchor keeps only what must never fall out of
+ * attention: the answer markers, the by-need state.json rule, and clean exit.
+ */
+function renderContractAnchor(stateFilePath?: string): string[] {
+  const stateTarget = stateFilePath
+    ? `\`${stateFilePath}\``
+    : "工作目录里的 `.larkway/state.json`";
+  return [
+    "<contract-anchor>",
+    "契约同本话题首轮注入,未变化:给用户看的答案正文包在独立行 marker " +
+      `\`${ANSWER_BEGIN_MARKER}\` / \`${ANSWER_END_MARKER}\` 之间输出;结论一成形就先流出答案。` +
+      `纯文字回答不用写 state.json;失败/等补充/choices/图文混排时才写 ${stateTarget}` +
+      "(原子写 + 刷新 updated_at)。做完干净退出进程。",
+    "</contract-anchor>",
   ];
 }
 
@@ -597,7 +613,6 @@ function renderWorkspaceBlock(
 async function renderAgentWorkspaceBlock(
   conventions: PromptConventions,
   extraRepos: RepoRef[],
-  isNewThread: boolean,
   mtimeFacts: string[],
 ): Promise<string[]> {
   const summaryFilePath = conventions.workspaceSessionPath
@@ -621,18 +636,15 @@ async function renderAgentWorkspaceBlock(
     "- 群里 @ 你时,bridge 会拉起/关联一个话题;是否读取群历史、话题历史、附件、文档,由你根据任务自行决定。",
     "- 不要假设 bridge 已经 clone/fetch/worktree/pnpm install;需要代码时,你在 workspace 里自己 clone/branch/install/test。",
     "- summary.md 是你维护本话题摘要、决策和下一步 notes 的地方;bridge 只创建占位,不替你总结。",
-    // A2(仪式降频): "起手先读 memory/index.md…" only on the FIRST turn of a
-    // topic. Continuation turns already got this once, and memory_index's
-    // content is now injected verbatim below on every turn anyway (A7) —
-    // repeating the command-style reminder every turn is exactly the
-    // "instruction ceremony" this batch is cutting. mtimeFacts (below) is the
-    // neutral-fact substitute for "something changed, go re-read it".
-    ...(isNewThread
-      ? [
-          "- 起手先读 memory/index.md 拉起跨 session 长期记忆(preferences / reusable-knowledge / workflows / decisions / assets),再读 workspace 内的 AGENTS.md、CLAUDE.md(如存在)、permissions-request.md、permissions-granted.md。",
-        ]
-      : []),
-    "- 本 session 里跨 session 可复用的内容,先记到 topic_session_path/memory-candidates.md;owner 确认后,由你写进 memory/<category>.md。",
+    // 批E (E4): the old first-turn ceremony line ("起手先读 memory/index.md…
+    // 再读 AGENTS.md/CLAUDE.md/permissions*") is gone entirely. It was double
+    // waste: memory/index.md's content is injected verbatim below (A7), so
+    // reading it again was a pure no-op tool call; and the AGENTS.md/
+    // CLAUDE.md/permissions*.md instruction already appears in skillIntroNew
+    // at the top of every new-thread prompt — the same instruction twice in
+    // one prompt. mtimeFacts (below) remains the neutral-fact substitute for
+    // "something changed, go re-read it".
+    "- 本 session 里跨 session 可复用的内容,先记到 topic_session_path/memory-candidates.md;owner 确认后,由你写进 memory/<category>.md(category: preferences / reusable-knowledge / workflows / decisions / assets)。",
     "- 热路径(每轮)只允许 ADD / NOOP:把候选 append 到 memory-candidates.md,或往 category 文件追加新条目;不在热路径做 UPDATE/DELETE/改写已有条目。",
     "- 改写、删除、解决冲突 → 推迟到 owner 显式说「整理记忆」时的离线步骤做。失效/被推翻的条目移 memory/archive/(注一句原因),不物理删。",
     "- 离线整理/改写已有记忆前,先用 rg 在 sessions/*/transcript.md 核到来源行;commit/笔记引用该行;核不到来源的结论降级为 candidate,不写进正文。(单 agent 自己做,别 spawn 别的 agent。)",
@@ -798,10 +810,54 @@ export async function renderPrompt(input: RenderPromptInput): Promise<string> {
       : [];
   const taskRootBlock = taskRoot ? renderTaskRootBlock(taskRoot) : [];
   const runtimeWarningsBlock = renderRuntimeWarningsBlock(runtimeWarnings);
+
+  // 批E (E1): delta continuation prompt — dynamic facts only. Everything
+  // static (contract, L2 memory, workspace block, peers, rules) is already in
+  // the resumed session history from the thread's first (full) turn. Placed
+  // BEFORE the workspace-block computation so delta turns also skip its
+  // filesystem reads (memory index + category line counts).
+  if (!isNewThread && (input.promptMode ?? "full") === "delta") {
+    return [
+      ...(runtimeWarningsBlock.length > 0 ? [...runtimeWarningsBlock, ""] : []),
+      "<thread-context>",
+      `thread_id:        ${parsed.threadId}`,
+      `message_id:       ${parsed.messageId}`,
+      `chat_id:          ${parsed.chatId}`,
+      `sender:           ${parsed.senderOpenId}`,
+      `is_new_thread:    false`,
+      `trigger_type:     ${trigger.triggerType}`,
+      `mention_type:     ${trigger.mentionType}`,
+      `scene_type:       ${scene.sceneType}`,
+      `chat_type:        ${scene.chatType}`,
+      `feishu_thread_id: ${trigger.feishuThreadId ?? "none"}`,
+      `feishu_root_id:   ${trigger.feishuRootId ?? "none"}`,
+      `raw_pointer:      ${trigger.rawMessagePointer}`,
+      `attachments:      ${csv(attachmentKeys)}`,
+      `feishu_doc_links: ${csv(parsed.feishuDocLinks)}`,
+      `images:           ${csv(imageKeys)}`,
+      `scene_hint:       ${scene.hint}`,
+      "</thread-context>",
+      "",
+      ...renderContractAnchor(conventions.stateFilePath),
+      ...(mtimeFacts.length > 0
+        ? [
+            "",
+            "<workspace-file-changes>",
+            ...mtimeFacts.map((fact) => `- ${fact}`),
+            "</workspace-file-changes>",
+          ]
+        : []),
+      ...(taskHandleBlock.length > 0 ? ["", ...taskHandleBlock] : []),
+      ...(taskRootBlock.length > 0 ? ["", ...taskRootBlock] : []),
+      "",
+      ...userMessageLines,
+    ].join("\n");
+  }
+
   // Workspace warm-up block — rendered for all bots that have at least one repo.
   const extraRepos = extraRepoPaths ?? conventions.extraRepoPaths ?? [];
   const workspaceBlock = isAgentWorkspace
-    ? await renderAgentWorkspaceBlock(conventions, extraRepos, isNewThread, mtimeFacts)
+    ? await renderAgentWorkspaceBlock(conventions, extraRepos, mtimeFacts)
     : hasRepo
       ? renderWorkspaceBlock(
         conventions.defaultProjectSlug ?? "repo",

@@ -85,30 +85,38 @@ describe("renderPrompt — V2 mode (botName set)", () => {
     expect(prompt).not.toContain("internal_test");
     expect(prompt).not.toContain("local_demo_ready");
     // The V2 prompt frames remaining business fields as bridge-opaque.
-    expect(prompt).toContain("不感知其业务含义");
+    expect(prompt).toContain("不感知其含义");
   });
 
-  it("still contains state-contract block (minimal V2 schema)", async () => {
+  it("still contains state-contract block (批E slimmed schema)", async () => {
     const prompt = await renderPrompt(makeInput({ botName: "Frontend" }));
     expect(prompt).toContain("<state-contract>");
-    expect(prompt).toContain("status: in_progress / ready / failed");
+    // All three statuses stay documented, now as by-need cases.
+    expect(prompt).toContain("status=failed");
+    expect(prompt).toContain("status=in_progress");
+    expect(prompt).toContain("status=ready");
     expect(prompt).toContain("content_blocks");
     expect(prompt).toContain("response_surface");
-    expect(prompt).toContain("默认主回复面是一张 CardKit 流式卡片");
+    expect(prompt).toContain("bridge 管理的流式卡片");
     expect(prompt).toContain("LARKWAY_ANSWER_BEGIN");
     expect(prompt).toContain("LARKWAY_ANSWER_END");
-    expect(prompt).toContain("旧 `mode`/`primary` 仅兼容解析");
-    expect(prompt).toContain("late @ 只是最终卡片里的视觉提示");
-    expect(prompt).toContain("handoff 必须由 Agent/团队工作流发送真实 Feishu post + at 标签");
-    expect(prompt).toContain("不要写 raw Feishu post/card JSON");
-    expect(prompt).toContain("markdown -> image -> markdown -> image");
-    expect(prompt).toContain("若 `content_blocks` 非空");
-    expect(prompt).toContain("scheduled reply / daily social ops review card");
-    expect(prompt).toContain("不要用单独话题图片消息或尾部 `image_blocks` 代替验收面");
-    expect(prompt).toContain("choices 渲染在正文内容之后");
-    expect(prompt).toContain("last_message 应包含足够让运营验收的证据");
-    expect(prompt).toContain("具体证据由任务决定");
-    expect(prompt).toContain("dogfood E2E 的严格清单只在 dogfood guide 中要求");
+    // 批E (E2): plain text replies must NOT be told to write state.json.
+    expect(prompt).toContain("纯文字回答不用写");
+    // 批E (E3): answer-first ordering — stream the answer before bookkeeping.
+    expect(prompt).toContain("先输出答案 marker");
+    // Atomic write + fresh updated_at (the handler stale-guard depends on it).
+    expect(prompt).toContain("先写 .tmp 再 mv");
+    expect(prompt).toContain("updated_at");
+    // Late-@ stays a visual hint; peer data flows via a real post.
+    expect(prompt).toContain("这只是视觉提示");
+    expect(prompt).toContain("必须另发真实 post");
+    // content_blocks essentials survive the slimming.
+    expect(prompt).toContain("最多 12 块");
+    expect(prompt).toContain("img_key");
+    // Delivery evidence duty survives the slimming.
+    expect(prompt).toContain("足够让人验收的证据");
+    // 批E (E3): business leakage removed from the generic bridge contract.
+    expect(prompt).not.toContain("scheduled reply / daily social ops review card");
     expect(prompt).not.toContain("git remote -v / git status、已读取的 AGENTS.md 和 docs/README");
     expect(prompt).toContain("</state-contract>");
   });
@@ -220,8 +228,8 @@ describe("renderPrompt — V2 mode (botName set)", () => {
     // This rule used to live ONLY in skills/larkway-protocol; it MUST be in the
     // prompt now or the agent loses it. Lock it here.
     const prompt = await renderPrompt(makeInput({ botName: "Frontend" }));
-    expect(prompt).toContain("写 status=ready 前必须自己用代码验过");
-    expect(prompt).toContain("验证完全是你的责任");
+    expect(prompt).toContain("写 status=ready 前先自己验证过");
+    expect(prompt).toContain("验证是你的责任");
   });
 
   it("does not render stage lines in thread-context", async () => {
@@ -289,7 +297,9 @@ describe("renderPrompt — V2 mode (botName set)", () => {
       makeInput({ botName: "Frontend", isNewThread: false }),
     );
     expect(prompt).not.toContain("stage: developing");
-    expect(prompt).toContain("status: in_progress / ready / failed");
+    // Full-mode continuation still carries the whole contract.
+    expect(prompt).toContain("status=failed");
+    expect(prompt).toContain("<state-contract>");
   });
 
   it("documents the dynamic choices contract (write choices → buttons → click sends value verbatim)", async () => {
@@ -298,10 +308,9 @@ describe("renderPrompt — V2 mode (botName set)", () => {
     // click round-trips the chosen `value` verbatim as a new turn.
     expect(prompt).toContain("choices");
     expect(prompt).toContain("choice_prompt");
-    expect(prompt).toContain("逐字"); // value is round-tripped verbatim
-    // It tells the agent to make value self-describing and to omit when nothing
-    // to choose (clean card preserved).
-    expect(prompt).toContain("省略");
+    expect(prompt).toContain("逐字回传给你"); // value is round-tripped verbatim
+    // Self-describing value, never an opaque code.
+    expect(prompt).toContain("别写 `optA` 这种代号");
   });
 
   it("base contract: card shell is bridge-rendered — agent must NEVER PATCH the card itself", async () => {
@@ -310,40 +319,40 @@ describe("renderPrompt — V2 mode (botName set)", () => {
     // the turn → runner.done never fired → card stranded. The base contract now
     // forbids self-PATCH and mandates a clean exit. Lock it for ALL bots.
     const prompt = await renderPrompt(makeInput({ botName: "Frontend" }));
-    expect(prompt).toContain("thin-channel 外壳");
-    expect(prompt).toContain("你负责把最终给运营看的正文");
+    expect(prompt).toContain("bridge 管理的流式卡片");
     expect(prompt).toContain("绝不自己");
     expect(prompt).toContain("PATCH/PUT");
-    expect(prompt).toContain("bridge 管理的 post/card");
-    expect(prompt).toContain("干净结束本轮");
+    expect(prompt).toContain("bridge 管理的卡片/post");
+    expect(prompt).toContain("干净退出进程");
     // The old self-PATCH instruction must be gone.
     expect(prompt).not.toContain("PATCH 到卡片");
   });
 
   it("base contract: buttons are auto-numbered A/B/C by the bridge (agent writes short labels, no hand-listing)", async () => {
     const prompt = await renderPrompt(makeInput({ botName: "Frontend" }));
-    expect(prompt).toContain("A/B/C/D/E"); // bridge auto-numbers
+    expect(prompt).toContain("自动编号 A/B/C"); // bridge auto-numbers
     expect(prompt).toContain("图例"); // bridge generates the legend from labels
-    expect(prompt).toContain("card_color"); // decorative override documented
+    expect(prompt).toContain("正文别再手动列一遍选项"); // no hand-listing
   });
 
   it("base contract: agent owns final card content, bridge does not infer business status", async () => {
     const prompt = await renderPrompt(makeInput({ botName: "Frontend" }));
-    expect(prompt).toContain("最终卡片以你的 `last_message` 为主");
-    expect(prompt).toContain("bridge 会在同一张最终卡片承载这些能力");
-    expect(prompt).toContain("不要依赖 bridge 从输出里解析业务阶段");
-    expect(prompt).toContain("不要求固定格式");
+    // 批E (E2): default body = answer channel; last_message is the override.
+    expect(prompt).toContain("不写时正文=答案通道内容");
+    expect(prompt).toContain("last_message");
+    // Business fields stay bridge-opaque — surfacing them is the agent's job.
+    expect(prompt).toContain("bridge 不感知其含义");
+    expect(prompt).toContain("要让用户看到就写进正文");
   });
 
-  it("base contract: default is operator @-reply in text; buttons only for a single discrete choice", async () => {
+  it("base contract: buttons only for a single discrete choice; info-gathering stays free text", async () => {
     // 2026-05-30 UX decision: choice buttons were over-used for multi-part
     // info-gathering (package + page path + style). A tap answers one slot only
-    // and each click spawns a fresh worktree (no session resume) → heavier than
-    // a text reply. So the contract now defaults to @-reply and reserves buttons
-    // for a single discrete choice that fully answers in one tap.
+    // → heavier than a text reply. The contract reserves buttons for a single
+    // discrete choice that fully answers in one tap.
     const prompt = await renderPrompt(makeInput({ botName: "Frontend" }));
-    expect(prompt).toContain("默认让运营直接在话题里 @ 你回复");
-    expect(prompt).toContain("别用按钮做信息收集 / 多部分提问");
+    expect(prompt).toContain("单个离散选择、点一下就答全");
+    expect(prompt).toContain("信息收集/多部分提问让用户直接打字,别用按钮");
   });
 
   it("base peer-contract: @ peer must use a post message + at tag, never plain text", async () => {
@@ -574,8 +583,11 @@ describe("renderPrompt — workspace warm-up block", () => {
     expect(prompt).toContain(
       "memory_index:        /tmp/larkway/agents/larkway-devops/workspace/memory/index.md",
     );
-    expect(prompt).toContain("起手先读 memory/index.md 拉起跨 session 长期记忆");
-    expect(prompt).toContain("assets"); // D5: assets is in the startup read list
+    // 批E (E4): the redundant first-turn ceremony line is gone — index.md's
+    // content is injected verbatim (A7) and the AGENTS.md/permissions read
+    // instruction already lives in skillIntroNew at the top of the prompt.
+    expect(prompt).not.toContain("起手先读 memory/index.md");
+    expect(prompt).toContain("assets"); // D5: category vocabulary still taught
     expect(prompt).toContain("owner 确认后,由你写进 memory/<category>.md");
     // D2: hot-path is ADD/NOOP only; rewrites/deletes deferred to offline 整理记忆
     expect(prompt).toContain("热路径(每轮)只允许 ADD / NOOP");
@@ -1141,5 +1153,110 @@ describe("renderPrompt — <task-root> justClaimed (v4.2 bridge auto-claim)", ()
     );
     expect(prompt).toContain("本话题已认领这个任务");
     expect(prompt).not.toContain("已自动认领");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 批E (E1) — delta continuation prompt mode
+// ---------------------------------------------------------------------------
+
+describe("renderPrompt — promptMode: delta (批E E1)", () => {
+  const deltaContinuation = (overrides: Partial<RenderPromptInput> = {}) =>
+    makeInput({
+      isNewThread: false,
+      promptMode: "delta",
+      agentMemory: "我是测试 persona,负责 XX。",
+      peers,
+      turn_taking_limit: 8,
+      ...overrides,
+    });
+
+  it("continuation renders dynamic facts + contract anchor only — no static blocks", async () => {
+    const prompt = await renderPrompt(deltaContinuation());
+    // Dynamic facts survive.
+    expect(prompt).toContain("<thread-context>");
+    expect(prompt).toContain("thread_id:        om_thread001");
+    expect(prompt).toContain("message_id:       om_msg001");
+    expect(prompt).toContain("is_new_thread:    false");
+    expect(prompt).toContain("<user-message>");
+    expect(prompt).toContain("ou_sender001: 帮我做个按钮");
+    // The anchor keeps the never-forget essentials.
+    expect(prompt).toContain("<contract-anchor>");
+    expect(prompt).toContain("LARKWAY_ANSWER_BEGIN");
+    expect(prompt).toContain("LARKWAY_ANSWER_END");
+    expect(prompt).toContain("纯文字回答不用写 state.json");
+    expect(prompt).toContain("干净退出进程");
+    // Static blocks — already in the resumed session history — are gone.
+    expect(prompt).not.toContain("<state-contract>");
+    expect(prompt).not.toContain("<agent-memory>");
+    expect(prompt).not.toContain("<peer-bots>");
+    expect(prompt).not.toContain("<turn-taking>");
+    expect(prompt).not.toContain("<agent-workspace>");
+    expect(prompt).not.toContain("<memory-index-content>");
+    expect(prompt).not.toContain("可用工具(命令行)");
+    expect(prompt).not.toContain("约定路径:");
+  });
+
+  it("NEW thread ignores delta mode and renders the full prompt", async () => {
+    const prompt = await renderPrompt(deltaContinuation({ isNewThread: true }));
+    expect(prompt).toContain("<state-contract>");
+    expect(prompt).toContain("<agent-memory>");
+    expect(prompt).toContain("<peer-bots>");
+    expect(prompt).not.toContain("<contract-anchor>");
+  });
+
+  it("default promptMode keeps continuation prompts byte-identical to full mode", async () => {
+    const full = await renderPrompt(
+      makeInput({ isNewThread: false, agentMemory: "我是测试 persona,负责 XX。", peers }),
+    );
+    const explicitFull = await renderPrompt(
+      makeInput({
+        isNewThread: false,
+        promptMode: "full",
+        agentMemory: "我是测试 persona,负责 XX。",
+        peers,
+      }),
+    );
+    expect(explicitFull).toBe(full);
+    expect(full).toContain("<state-contract>");
+  });
+
+  it("delta continuation keeps dynamic per-turn blocks: runtime warnings, mtime facts, task blocks, followups", async () => {
+    const prompt = await renderPrompt(
+      deltaContinuation({
+        runtimeWarnings: [{ label: "Feishu CLI", command: "lark-cli", reason: "not found" }],
+        mtimeFacts: ["permissions-granted.md 自上轮后有更新 (mtime advanced)"],
+        taskRoot: { guid: "task_g1", summary: "修按钮", claimed: true },
+        queuedFollowups: [{ senderOpenId: "ou_sender001", text: "补充:优先移动端" }],
+      }),
+    );
+    expect(prompt).toContain("<runtime-warnings>");
+    expect(prompt).toContain("<workspace-file-changes>");
+    expect(prompt).toContain("permissions-granted.md 自上轮后有更新");
+    expect(prompt).toContain("<task-root>");
+    expect(prompt).toContain("task_g1");
+    expect(prompt).toContain("补充:优先移动端");
+    expect(prompt).toContain("已合并进本轮");
+  });
+
+  it("delta anchor pins the exact state.json path when provided", async () => {
+    const prompt = await renderPrompt(
+      deltaContinuation({
+        conventions: {
+          ...makeConventions(),
+          stateFilePath: "/tmp/ws/sessions/om_thread001/.larkway/state.json",
+        },
+      }),
+    );
+    expect(prompt).toContain("/tmp/ws/sessions/om_thread001/.larkway/state.json");
+  });
+
+  it("delta continuation is an order of magnitude smaller than full continuation", async () => {
+    const memory = "我是测试 persona。".repeat(50);
+    const fullPrompt = await renderPrompt(
+      makeInput({ isNewThread: false, agentMemory: memory, peers, turn_taking_limit: 8 }),
+    );
+    const deltaPrompt = await renderPrompt(deltaContinuation({ agentMemory: memory }));
+    expect(deltaPrompt.length).toBeLessThan(fullPrompt.length / 3);
   });
 });

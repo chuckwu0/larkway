@@ -66,6 +66,17 @@ ou_xxxxxxxxxxxx: 帮我看一下刚刚这个报错,如果需要改 Larkway 代�
 
 > 说明:prompt 无外层 `<larkway-context>` 包装。实际块顺序:agent-memory(可选) → thread-context → state-contract → agent-workspace(可选,agent workspace 模式) → user-message。块名以 `src/claude/prompt.ts` 渲染为准。
 
+### 批E (E1):`promptMode: "delta"` 续轮增量 prompt
+
+bot yaml 配 `promptMode: "delta"` 时,**续轮**(isNewThread=false)不再重发上面全部静态块。
+理由:claude `--resume` / codex thread 续接会逐字重放历史,话题首轮注入的契约、L2 memory、
+workspace 块、peers 块本来就还在上下文里;每轮重发 ≈ 1 万字符纯重复(实测 11.7k → ~2k)。
+delta 续轮只含:`<thread-context>` 动态事实 → `<contract-anchor>`(3 行:答案 marker、
+state.json 按需规则、干净退出)→ `<workspace-file-changes>`(如有)→ task 块(如有)→
+`<user-message>`。新话题永远渲染全量;bridge 的 stale-session 重试回退到全新 session 时
+以 isNewThread=true 重渲染,不会让丢失历史的 session 落在 delta prompt 上。
+缺省 = "full",与旧行为逐字节一致。已知取舍:话题中途 peers 变化不重发(下个新话题生效)。
+
 ---
 
 ## 字段语义
@@ -146,7 +157,12 @@ legacy 卡片只作为 CardKit 不可用/失败时的可见 fallback:
 | 失败兜底 | CardKit 不可用或更新失败时创建 legacy 可见卡片 fallback;若 legacy 卡片也失败,再发 create-only post,避免不可见回复 | 不自行发第二条消息绕过 bridge |
 | 底部动作 | 把 `choices` 渲染成 final 区按钮,点击后把 value 原样回传 | 只在单个离散选择时声明 `choices` |
 
-Agent 通过工作区里的 `.larkway/state.json` 或 v0.3 session state artifact 表达卡片意图:
+Agent 通过工作区里的 `.larkway/state.json` 或 v0.3 session state artifact 表达卡片意图。
+**批E (E2) 起 state.json 是按需写,不是每轮必写**:纯文字回答只需把正文输出在答案 marker
+(`LARKWAY_ANSWER_BEGIN` / `LARKWAY_ANSWER_END`)之间然后干净退出,bridge 按
+「干净退出 + 无 fresh state.json」自动收敛为成功卡(标题「💬 已回复」,正文=答案通道内容,
+handler.ts 真值排序 case 4 + Step 4f 兜底)。以下字段只在失败 / 等用户补充 / choices /
+图文混排 / 覆盖正文时才写(原子写 + 刷新 `updated_at`,旧值会被 stale-guard 忽略):
 
 - `status`: `in_progress / ready / failed`,bridge 唯一强依赖字段。
 - `last_message`: 最终或当前要给运营看的正文。Agent 自己决定结构,不需要固定格式。

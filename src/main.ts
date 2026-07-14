@@ -820,6 +820,7 @@ async function runV2Mode({
         taskHandle: effectiveTaskHandleTasklistGuid ? { tasklistGuid: effectiveTaskHandleTasklistGuid } : undefined,
         model: bot.model,
         effort: bot.effort,
+        promptMode: bot.promptMode,
         cot: bot.cot,
         cotSurface: bot.cotSurface,
       },

@@ -382,6 +382,18 @@ export const BotConfigSchema = z.object({
   effort: z.string().min(1).optional(),
 
   /**
+   * 批E (E1) — continuation-prompt mode. "delta" renders continuation turns
+   * as dynamic facts + a 3-line contract anchor instead of re-sending every
+   * static block (state contract, L2 memory, workspace block, peers) that is
+   * already in the resumed session history from the thread's first turn.
+   * Measured on a real bot config: continuation prompt ~11.7k → ~2k chars.
+   * Omitted = "full" (byte-identical prompts to before this field existed).
+   * `.optional()` (not `.default()`) deliberately — same strict-schema
+   * backward-compat reasoning as `warmProcess` below.
+   */
+  promptMode: z.enum(["full", "delta"]).optional(),
+
+  /**
    * docs/larkway-perf-plan.md §4 — persistent warm process instead of a
    * one-shot cold start per turn. Takes effect for `backend: "codex"` (a
    * single bot-level `codex app-server` process — src/codex/pool.ts
