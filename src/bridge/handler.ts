@@ -49,6 +49,7 @@ import {
   computeMtimeFacts,
   readMtimeBaseline,
   writeMtimeBaseline,
+  type MtimeBaseline,
 } from "../agent/mtimeFacts.js";
 import {
   ensureStateFile,
@@ -540,6 +541,22 @@ const CORE_DENY_RULES = [
 interface WriteWorktreeSettingsOpts {
   /** Project-stack-specific extras merged with CORE_ALLOW_RULES (deduped). */
   allowExtra?: string[];
+  /**
+   * 批H H5: agent_workspace writes allow-rules ONLY. Relocating the file to
+   * runCwd made it live for the first time — silently activating
+   * CORE_DENY_RULES (git push --force / npm publish blocks) for every
+   * deployed bot would be an unannounced behavior change riding a
+   * dead-write cleanup (deny rules bind even under bypassPermissions).
+   * Activating deny for agent_workspace is a separate product decision
+   * (backlog). Legacy keeps deny — there the file was always live.
+   */
+  includeDeny?: boolean;
+  /**
+   * 批H H5: refuse to overwrite a file we didn't author (no _larkway_managed
+   * marker) — the workspace root is long-lived and owner-editable, unlike
+   * the throwaway per-session dirs this used to target.
+   */
+  respectForeignFile?: boolean;
 }
 
 async function writeWorktreeSettings(
@@ -552,20 +569,39 @@ async function writeWorktreeSettings(
   //   with a modified tracked file that `git add -A` would inadvertently commit.
   // - settings.local.json is conventionally git-ignored (via ~/.config/git/ignore
   //   pattern `**/.claude/settings.local.json`), so it stays out of commits.
+  //
+  // 批H H5: content-compare idempotence — the agent_workspace call site now
+  // targets the WORKSPACE ROOT (a long-lived dir hit on every turn of every
+  // session), so an unconditional write would be a per-turn no-op write and
+  // a misleading fresh mtime. Skip when the payload is byte-identical;
+  // rewrite only when the rules actually changed (e.g. allowExtra config).
   const dir = path.join(worktreePath, ".claude");
   await fs.mkdir(dir, { recursive: true });
   const allow = Array.from(new Set([...CORE_ALLOW_RULES, ...(opts.allowExtra ?? [])]));
   const settings = {
+    _larkway_managed: true,
     permissions: {
       allow,
-      deny: CORE_DENY_RULES,
+      ...(opts.includeDeny === false ? {} : { deny: CORE_DENY_RULES }),
     },
   };
-  await fs.writeFile(
-    path.join(dir, "settings.local.json"),
-    JSON.stringify(settings, null, 2),
-    "utf8"
-  );
+  const filePath = path.join(dir, "settings.local.json");
+  const payload = JSON.stringify(settings, null, 2);
+  try {
+    const existing = await fs.readFile(filePath, "utf8");
+    if (existing === payload) return;
+    if (opts.respectForeignFile) {
+      try {
+        const parsed = JSON.parse(existing) as { _larkway_managed?: unknown };
+        if (parsed._larkway_managed !== true) return; // human-authored — hands off
+      } catch {
+        return; // unparseable = definitely not ours — hands off
+      }
+    }
+  } catch {
+    /* missing/unreadable — write below */
+  }
+  await fs.writeFile(filePath, payload, "utf8");
 }
 
 /**
@@ -889,6 +925,13 @@ export interface BridgeHandlerDeps {
    * When absent (V1 or no memory_file), no memory block is rendered.
    */
   agentMemory?: string;
+  /**
+   * 批G G4: absolute path of the bot's L2 memory file. When set, handleOne
+   * re-reads it fresh each turn ("下一次全量渲染即新鲜") so editing L2 no
+   * longer needs a bridge restart; `agentMemory` above stays the boot-time
+   * fallback for read failures.
+   */
+  agentMemoryPath?: string;
   /**
    * V2: resolved GitLab PAT for this bot (read from process.env by main.ts).
    * Injected as GITLAB_TOKEN into the claude subprocess. When absent (V1),
@@ -1409,6 +1452,16 @@ export class BridgeHandler {
     });
     const stickySession = isSyntheticSessionKey(threadId);
     const botId = this.deps.botConfig?.id;
+    // 批G G4: L2 live-read — a few-KB local file per turn buys "edit L2, no
+    // restart". Boot-cached deps.agentMemory remains the fallback.
+    let agentMemory = this.deps.agentMemory;
+    if (this.deps.agentMemoryPath) {
+      try {
+        agentMemory = await fs.readFile(this.deps.agentMemoryPath, "utf8");
+      } catch {
+        /* keep boot-cached fallback */
+      }
+    }
     const eventLogId = messageId;
     const eventStartedAt = Date.now();
 
@@ -2059,7 +2112,7 @@ export class BridgeHandler {
             description: this.deps.botConfig?.description ?? "Local agent served through Larkway.",
             gitlab_token_env: this.deps.botConfig?.git_token_env ?? this.deps.botConfig?.gitlab_token_env,
           },
-          agentMemory: this.deps.agentMemory,
+          agentMemory,
           repos: [
             ...(conventions.defaultProjectSlug
               ? [
@@ -2252,9 +2305,23 @@ export class BridgeHandler {
 
       // Step 4a-iii: write .claude/settings.local.json with Bash allow rules (idempotent)
       //   Failure here is non-fatal: Claude can still run, just may prompt for perms.
+      //
+      // 批H H5 (adversarial-audit fix): the settings file must live where the
+      // agent process actually starts — Claude Code resolves project settings
+      // from its CWD. agent_workspace runs with cwd = the WORKSPACE ROOT
+      // (runCwd above), so the old per-session-dir write was a dead write:
+      // rewritten every turn, read by nobody, and it falsely suggested the
+      // allow/deny list was in effect. Legacy runtime keeps the worktree
+      // target — there cwd IS the worktree, and under permissions.mode
+      // acceptEdits this file is the live permission source.
       try {
-        await writeWorktreeSettings(worktreePath, {
+        await writeWorktreeSettings(isAgentWorkspace ? runCwd : worktreePath, {
           allowExtra: this.deps.permissionsAllowExtra,
+          // agent_workspace: allow-only + never clobber an owner-authored
+          // file (see WriteWorktreeSettingsOpts docs). Legacy: unchanged
+          // full behavior — there the file was always live.
+          includeDeny: !isAgentWorkspace,
+          respectForeignFile: isAgentWorkspace,
         });
       } catch (err) {
         console.warn("[bridge.handler] writeWorktreeSettings failed (continuing):", err);
@@ -2338,16 +2405,22 @@ export class BridgeHandler {
       // in the (GC'd) session history — it self-heals from the next real
       // change onward, so this is a one-turn blind window, not a permanent one.
       let mtimeFacts: string[] = [];
+      // 批G G8: the re-arm baseline — persisted only after a SUCCESSFUL
+      // finalize (a failed turn must not consume an informational signal).
+      let mtimeAdvance: { baselinePath: string; baseline: MtimeBaseline } | undefined;
       if (isAgentWorkspace) {
         const mtimeBaselinePath = path.join(worktreePath, ".larkway", "mtime-baseline.json");
         try {
           const previousBaseline = await readMtimeBaseline(mtimeBaselinePath);
-          const { facts, baseline } = await computeMtimeFacts(
+          const { facts, baseline, advancedBaseline } = await computeMtimeFacts(
             conventions.agentWorkspacePath!,
             previousBaseline,
           );
           mtimeFacts = facts;
           await writeMtimeBaseline(mtimeBaselinePath, baseline);
+          if (advancedBaseline) {
+            mtimeAdvance = { baselinePath: mtimeBaselinePath, baseline: advancedBaseline };
+          }
         } catch (err) {
           console.warn("[bridge.handler] mtime fact computation failed (continuing):", err);
         }
@@ -2494,7 +2567,7 @@ export class BridgeHandler {
           botName: this.deps.botConfig?.name,
           backend: this.deps.botConfig?.backend,
           promptMode: this.deps.botConfig?.promptMode,
-          agentMemory: this.deps.agentMemory,
+          agentMemory,
           larkCliProfile: this.deps.larkCliProfile,
           runtimeWarnings: this.runtimeWarnings(),
           taskHandleTasklistGuid: this.deps.botConfig?.taskHandle?.tasklistGuid,
@@ -2936,6 +3009,14 @@ export class BridgeHandler {
           // 5) — keyed by the (possibly rekeyed) session threadId, the same
           // key space StallDetector queries with.
           this.threadLastOutcome.set(threadId, success ? "completed" : "failed");
+
+          // 批G G8: a clean turn carried the re-arm mtime facts to completion
+          // — advance the baseline so the SAME change stops repeating next
+          // turn (a further change still re-triggers; sticky permissions-*
+          // entries were never advanced). Failed turns skip this on purpose.
+          if (success && mtimeAdvance) {
+            await writeMtimeBaseline(mtimeAdvance.baselinePath, mtimeAdvance.baseline);
+          }
 
           // BL-38 counter: a confirmed idle-stuck turn accrues (+1); a clean
           // success resets to 0; any OTHER failure (crash / explicit `failed`)

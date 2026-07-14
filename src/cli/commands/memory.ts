@@ -21,6 +21,39 @@ import { mkdir, writeFile, rm } from "node:fs/promises";
 import path from "node:path";
 import process from "node:process";
 import type { CliContext } from "../types.js";
+import { projectRoleNotes } from "../../agent/workspaceStore.js";
+import { resolveAgentWorkspacePath } from "../../config/paths.js";
+
+/**
+ * 批G G4 (fix B2): every L2 write must also project into the workspace
+ * AGENTS.md `## Role Notes` section — the CLI previously wrote only
+ * bots/<id>.memory.md, leaving the runtime-auto-loaded AGENTS.md stale (the
+ * documented "保存时同步投影" contract existed only on the Web path). Uses the
+ * surgical section replacement, so agent-authored AGENTS.md content survives.
+ * Best-effort: a projection failure warns but never fails the save itself.
+ */
+async function projectMemoryToWorkspace(ctx: CliContext, id: string): Promise<void> {
+  try {
+    // Adversarial-review fix: only agent_workspace bots have a workspace
+    // AGENTS.md to project into — a legacy bot would otherwise get a
+    // misleading "尚未初始化,下次会生成" warning on every save (the promised
+    // ensure never happens for legacy).
+    const bot = await ctx.botsStore.readBot(id);
+    if (bot.runtime !== "agent_workspace") return;
+    const content = await ctx.botsStore.readMemory(id);
+    const result = await projectRoleNotes(resolveAgentWorkspacePath(id), content);
+    if (result === "skipped") {
+      ctx.ui.warning(
+        `workspace AGENTS.md 不存在(agent workspace 尚未初始化)——memory 已保存,投影跳过;` +
+          `下次 bot 启动/保存配置时会随 ensureAgentWorkspace 生成。`,
+      );
+    }
+  } catch (e) {
+    ctx.ui.warning(
+      `memory 已保存,但投影到 workspace AGENTS.md 失败(不影响保存): ${e instanceof Error ? e.message : String(e)}`,
+    );
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -148,6 +181,7 @@ async function subSet(ctx: CliContext, id: string, file: string): Promise<number
   }
 
   await ctx.botsStore.writeMemory(id, content);
+  await projectMemoryToWorkspace(ctx, id);
 
   if (ctx.flags.json) {
     ctx.ui.emitJson({ ok: true, id, written: content.length });
@@ -213,6 +247,7 @@ async function subEdit(ctx: CliContext, id: string): Promise<number> {
   }
 
   await ctx.botsStore.writeMemory(id, edited);
+  await projectMemoryToWorkspace(ctx, id);
   if (ctx.flags.json) {
     ctx.ui.emitJson({ ok: true, id, written: edited.length });
   } else {

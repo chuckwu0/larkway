@@ -86,7 +86,10 @@ function renderAgentsMd(input: EnsureAgentWorkspaceInput): string {
     "",
     "## Workspace Contract",
     "",
-    "- 开场不可跳过:回应 owner 前,先 Read `memory/index.md`,并按相关性 Read 相关 category 文件,再开始干活(防止新 session 失忆)。",
+    // 批G G4: the old "开场不可跳过:先 Read memory/index.md" ritual line is
+    // gone — memory/index.md's content is injected verbatim into every full
+    // prompt (批E A7/E4), so the instructed re-read was a guaranteed no-op
+    // tool call, and this template was the last place still issuing it.
     "- Larkway is a thin Feishu bridge. It passes scene/context pointers; you decide what to inspect and what work to do.",
     "- Each Feishu topic is one task session under `sessions/<thread_id>/`.",
     "- Keep durable notes, repo clones, session summaries, and permission decisions inside this workspace.",
@@ -95,7 +98,15 @@ function renderAgentsMd(input: EnsureAgentWorkspaceInput): string {
     "",
     "## Role Notes",
     "",
+    // 批G G4: sentinel-delimited so projectRoleNotes can replace the body
+    // even when the L2 memory itself contains "## " headings (blocker found
+    // in adversarial review: a heading-based boundary scan accumulated stale
+    // copies on every save).
+    ROLE_NOTES_START,
+    "",
     input.agentMemory?.trim() || "No extra role notes have been configured yet.",
+    "",
+    ROLE_NOTES_END,
     "",
     "## Repos",
     "",
@@ -240,6 +251,82 @@ function extractCreationTaskDescription(text: string | undefined): string | unde
   }
   const value = collected.join("\n").trim();
   return value || undefined;
+}
+
+/**
+ * 批G G4: surgically project the bot's L2 memory into AGENTS.md's
+ * `## Role Notes` section — replacing ONLY that section's body, never the
+ * rest of the file (the previous full-template re-render wiped out anything
+ * the agent had legitimately promoted into AGENTS.md per its own docs). This
+ * is THE single projection path every L2 write route (CLI `larkway memory
+ * set/edit`, Web PUT /api/memory/:id, onboarding) must converge on.
+ *
+ * Also performs a one-shot legacy migration in passing: drops the retired
+ * "开场不可跳过:…先 Read `memory/index.md`…" ritual line if the file still
+ * carries it (批E E4 removed its prompt twin; the template no longer emits it).
+ *
+ * Returns "projected" when AGENTS.md was updated, "skipped" when the file
+ * doesn't exist (workspace never ensured — caller decides whether to run the
+ * full ensureAgentWorkspace instead). Never throws on content issues; IO
+ * errors propagate to the caller.
+ */
+export const ROLE_NOTES_START = "<!-- larkway:role-notes:start (bridge-projected from bots/<id>.memory.md — edit THAT file, not this section) -->";
+export const ROLE_NOTES_END = "<!-- larkway:role-notes:end -->";
+
+export async function projectRoleNotes(
+  workspacePath: string,
+  agentMemory: string | undefined,
+): Promise<"projected" | "skipped"> {
+  const agentsPath = path.join(workspacePath, "AGENTS.md");
+  let current: string;
+  try {
+    current = await fs.readFile(agentsPath, "utf8");
+  } catch {
+    return "skipped";
+  }
+
+  const lines = current.split(/\r?\n/).filter(
+    (line) => !line.includes("开场不可跳过") || !line.includes("memory/index.md"),
+  );
+  // The body must never be able to smuggle in an END sentinel — the section
+  // boundary is a hard invariant, not a convention.
+  const body = (agentMemory?.trim() || "No extra role notes have been configured yet.")
+    .split(/\r?\n/)
+    .filter((line) => !line.includes("larkway:role-notes:"))
+    .join("\n");
+  const section = [ROLE_NOTES_START, "", body, "", ROLE_NOTES_END];
+
+  // Preferred path: sentinel-delimited replacement — immune to "## " headings
+  // inside the projected body (adversarial-review blocker: a heading-boundary
+  // scan turned every save into one more stale, contradictory copy).
+  const startIdx = lines.findIndex((line) => line.trim().startsWith("<!-- larkway:role-notes:start"));
+  const endIdx = lines.findIndex((line) => line.trim() === ROLE_NOTES_END);
+  let next: string[];
+  if (startIdx !== -1 && endIdx > startIdx) {
+    next = [...lines.slice(0, startIdx), ...section, ...lines.slice(endIdx + 1)];
+  } else {
+    // Legacy file without sentinels: replace from the Role Notes heading up
+    // to the next heading THE TEMPLATE ITSELF emits ("## Repos") — never an
+    // arbitrary "## " line, which may belong to the previously projected L2
+    // body — installing sentinels for every future save. EOF fallback covers
+    // files whose Repos section was removed by hand.
+    const heading = "## Role Notes";
+    const start = lines.findIndex((line) => line.trim() === heading);
+    if (start === -1) {
+      next = [...lines, "", heading, "", ...section, ""];
+    } else {
+      let end = lines.length;
+      for (let i = start + 1; i < lines.length; i++) {
+        if (lines[i]!.trim() === "## Repos") {
+          end = i;
+          break;
+        }
+      }
+      next = [...lines.slice(0, start + 1), "", ...section, "", ...lines.slice(end)];
+    }
+  }
+  await fs.writeFile(agentsPath, next.join("\n"), "utf8");
+  return "projected";
 }
 
 function extractMarkdownSectionText(text: string | undefined, heading: string): string | undefined {
@@ -456,10 +543,25 @@ export async function ensureAgentWorkspace(
   }
   const writeFacts = input.refreshFacts ? writeAlways : writeIfMissing;
 
-  await writeFacts(
-    path.join(input.workspacePath, "AGENTS.md"),
-    renderAgentsMd(input),
-  );
+  // 批G G4 (adversarial-review fix): refreshFacts must NEVER full-rewrite an
+  // EXISTING AGENTS.md — that wiped every section the agent had legitimately
+  // promoted into it (the exact bug projectRoleNotes exists to fix, which
+  // the Web putBot path was still triggering). Existing file → surgical Role
+  // Notes projection only; the template render is reserved for first
+  // creation. Trade-off accepted: the informational Repos section can go
+  // stale after a config change (live repo pointers ride every prompt).
+  const agentsPath = path.join(input.workspacePath, "AGENTS.md");
+  let agentsMdExists = true;
+  try {
+    await fs.stat(agentsPath);
+  } catch {
+    agentsMdExists = false;
+  }
+  if (agentsMdExists && input.refreshFacts) {
+    await projectRoleNotes(input.workspacePath, input.agentMemory);
+  } else {
+    await writeIfMissing(agentsPath, renderAgentsMd(input));
+  }
   await ensureRelativeSymlink(path.join(input.workspacePath, "CLAUDE.md"), "AGENTS.md");
   await writeFacts(
     path.join(input.workspacePath, "permissions-request.md"),

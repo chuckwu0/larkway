@@ -115,6 +115,15 @@ export interface SessionRecord {
    * threshold from now on).
    */
   turnCount?: number;
+  /**
+   * 批G G3: ms epoch when Housekeeping GC harvested this session's dir
+   * (summary/transcript extract moved to workspace memory/harvest/) and
+   * reclaimed it. The 批H fresh-start seed builder reads harvest/<key>.md
+   * when this is set. Cleared naturally by the next live turn's write-back
+   * (the handler builds records without this field), which is correct — a
+   * revived session has fresh artifacts again.
+   */
+  harvestedAt?: number;
 }
 
 /** The shape actually persisted to disk — botId required. */
@@ -129,6 +138,7 @@ interface StoredRecord {
   chatId?: string;
   consecutiveStuckCount?: number;
   turnCount?: number;
+  harvestedAt?: number;
 }
 
 interface StoreFile {
@@ -390,8 +400,26 @@ export class SessionStore {
       ...(record.consecutiveStuckCount ? { consecutiveStuckCount: record.consecutiveStuckCount } : {}),
       // 批F (F2): same only-when-positive persistence as the BL-38 counter.
       ...(record.turnCount ? { turnCount: record.turnCount } : {}),
+      // 批G G3: persisted when set; a put() without it clears the stamp.
+      ...(record.harvestedAt ? { harvestedAt: record.harvestedAt } : {}),
     };
     this.#map.set(key, stored);
+    await this.#flush();
+  }
+
+  /**
+   * 批G G3: stamp a record as harvested (dir reclaimed, extract lives in
+   * workspace memory/harvest/). No-op when the record doesn't exist.
+   */
+  async markHarvested(
+    threadId: string,
+    botId: string | undefined,
+    harvestedAt: number,
+  ): Promise<void> {
+    const key = SessionStore.#makeKey(threadId, botId ?? LEGACY_BOT_ID);
+    const existing = this.#map.get(key);
+    if (!existing) return;
+    this.#map.set(key, { ...existing, harvestedAt });
     await this.#flush();
   }
 
@@ -518,6 +546,7 @@ function isStoredRecord(value: unknown): value is StoredRecord {
     (v["senderOpenId"] === undefined || typeof v["senderOpenId"] === "string") &&
     (v["rootText"] === undefined || typeof v["rootText"] === "string") &&
     (v["chatId"] === undefined || typeof v["chatId"] === "string") &&
-    (v["turnCount"] === undefined || typeof v["turnCount"] === "number")
+    (v["turnCount"] === undefined || typeof v["turnCount"] === "number") &&
+    (v["harvestedAt"] === undefined || typeof v["harvestedAt"] === "number")
   );
 }

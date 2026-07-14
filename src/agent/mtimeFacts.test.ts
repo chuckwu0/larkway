@@ -158,3 +158,86 @@ describe("mtimeFacts — A2 mtime-change fact computation", () => {
     expect(await readFile(file, "utf8")).toBe("irrelevant content");
   });
 });
+
+// ---------------------------------------------------------------------------
+// 批G G8 — layered baseline (sticky vs re-arm)
+// ---------------------------------------------------------------------------
+
+import { mkdtemp as mkdtempG8, mkdir as mkdirG8, writeFile as writeFileG8, utimes as utimesG8 } from "node:fs/promises";
+import { tmpdir as tmpdirG8 } from "node:os";
+import pathG8 from "node:path";
+
+describe("computeMtimeFacts layering (批G G8)", () => {
+  async function makeWorkspace(): Promise<string> {
+    const ws = await mkdtempG8(pathG8.join(tmpdirG8(), "larkway-mtime-"));
+    await mkdirG8(pathG8.join(ws, "memory"), { recursive: true });
+    return ws;
+  }
+  const touch = async (p: string, ms: number) => {
+    const d = new Date(ms);
+    await utimesG8(p, d, d);
+  };
+
+  it("memory/index.md is now watched; its change yields an advancedBaseline (re-arm class)", async () => {
+    const ws = await makeWorkspace();
+    const idx = pathG8.join(ws, "memory", "index.md");
+    await writeFileG8(idx, "v1", "utf8");
+    await touch(idx, 1_000_000);
+    const seed = await computeMtimeFacts(ws, {});
+    expect(seed.facts).toHaveLength(0);
+    // File changes → fact + advanced baseline prepared.
+    await writeFileG8(idx, "v2", "utf8");
+    await touch(idx, 2_000_000);
+    const changed = await computeMtimeFacts(ws, seed.baseline);
+    expect(changed.facts.some((f) => f.includes("memory/index.md"))).toBe(true);
+    expect(changed.advancedBaseline).toBeDefined();
+    // After the handler persists advancedBaseline (successful finalize), the
+    // SAME change stops repeating…
+    const after = await computeMtimeFacts(ws, changed.advancedBaseline!);
+    expect(after.facts).toHaveLength(0);
+    // …but a FURTHER change re-triggers.
+    await writeFileG8(idx, "v3", "utf8");
+    await touch(idx, 3_000_000);
+    const again = await computeMtimeFacts(ws, changed.advancedBaseline!);
+    expect(again.facts.some((f) => f.includes("memory/index.md"))).toBe(true);
+  });
+
+  it("permissions files are STICKY: never advanced, repeat every turn (revocation safety net)", async () => {
+    const ws = await makeWorkspace();
+    const perm = pathG8.join(ws, "permissions-granted.md");
+    await writeFileG8(perm, "granted v1", "utf8");
+    await touch(perm, 1_000_000);
+    const seed = await computeMtimeFacts(ws, {});
+    await writeFileG8(perm, "REVOKED", "utf8");
+    await touch(perm, 2_000_000);
+    const changed = await computeMtimeFacts(ws, seed.baseline);
+    expect(changed.facts.some((f) => f.includes("permissions-granted.md"))).toBe(true);
+    // No advanced baseline for a sticky-only change…
+    expect(changed.advancedBaseline).toBeUndefined();
+    // …and the fact keeps repeating against the immutable baseline.
+    const again = await computeMtimeFacts(ws, changed.baseline);
+    expect(again.facts.some((f) => f.includes("permissions-granted.md"))).toBe(true);
+  });
+
+  it("mixed change: sticky entry stays un-advanced inside the advanced baseline", async () => {
+    const ws = await makeWorkspace();
+    const perm = pathG8.join(ws, "permissions-granted.md");
+    const idx = pathG8.join(ws, "memory", "index.md");
+    await writeFileG8(perm, "v1", "utf8");
+    await writeFileG8(idx, "v1", "utf8");
+    await touch(perm, 1_000_000);
+    await touch(idx, 1_000_000);
+    const seed = await computeMtimeFacts(ws, {});
+    await writeFileG8(perm, "v2", "utf8");
+    await writeFileG8(idx, "v2", "utf8");
+    await touch(perm, 2_000_000);
+    await touch(idx, 2_000_000);
+    const changed = await computeMtimeFacts(ws, seed.baseline);
+    expect(changed.facts).toHaveLength(2);
+    // Persisting the advanced baseline silences the memory fact but NOT the
+    // permissions fact.
+    const after = await computeMtimeFacts(ws, changed.advancedBaseline!);
+    expect(after.facts.some((f) => f.includes("permissions-granted.md"))).toBe(true);
+    expect(after.facts.some((f) => f.includes("memory/index.md"))).toBe(false);
+  });
+});

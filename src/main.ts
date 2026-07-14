@@ -1,4 +1,4 @@
-import { mkdirSync } from "node:fs";
+import { mkdirSync, writeFileSync, renameSync } from "node:fs";
 import path from "node:path";
 import { resolveLarkwayVersion } from "./version.js";
 import { Client as LarkSdkClient } from "@larksuiteoapi/node-sdk";
@@ -13,7 +13,7 @@ import { upsertRuntimeEvent } from "./bridge/eventLog.js";
 import { appendPerfSample } from "./bridge/perfLog.js";
 import type { HandlerConventions } from "./bridge/handler.js";
 import { Housekeeping } from "./housekeeping/gc.js";
-import { loadBots, effectiveWarmProcess, effectivePrewarmProcess } from "./config/botLoader.js";
+import { loadBotsDetailed, effectiveWarmProcess, effectivePrewarmProcess } from "./config/botLoader.js";
 import type { BotConfig } from "./config/botLoader.js";
 import {
   larkwayHome,
@@ -859,6 +859,7 @@ async function runV2Mode({
       messageLookup: client.outboundMessageLookupClient(),
       gitlabToken: effectiveGitlabToken,
       agentMemory: bot.agent_memory,
+      agentMemoryPath: bot.agent_memory_path,
       larkCliProfile,
       // PRB-6/§11.3: resolve peer @ targets to same-app-scope open_ids from the
       // live chat roster (per-chat cached), only when this bot actually has peers.
@@ -1222,10 +1223,42 @@ async function main(): Promise<void> {
     ? path.resolve(process.env["LARKWAY_BOTS_DIR"])
     : path.join(larkwayHome(), "bots");
   let bots;
+  let skippedBots: Awaited<ReturnType<typeof loadBotsDetailed>>["skipped"] = [];
+  let strippedPeers: Awaited<ReturnType<typeof loadBotsDetailed>>["strippedPeers"] = [];
   try {
-    bots = await loadBots(botsDir);
+    const detailed = await loadBotsDetailed(botsDir);
+    bots = detailed.bots;
+    skippedBots = detailed.skipped;
+    strippedPeers = detailed.strippedPeers;
   } catch (err) {
     console.error(`[larkway] Failed to load bots: ${(err as Error).message}`);
+    process.exit(1);
+  }
+
+  // 批I I1: persist the load diagnostics so the Web dashboard can surface a
+  // red "被跳过的 bot" row — one bad yaml must be VISIBLE, not a line lost in
+  // the boot log. Atomic write; an empty diagnostics file is still written so
+  // a fixed config clears the dashboard signal on the next boot.
+  try {
+    const diagPath = path.join(larkwayHome(), "bot-load-diagnostics.json");
+    const tmp = `${diagPath}.tmp`;
+    writeFileSync(tmp, JSON.stringify({ at: new Date().toISOString(), skipped: skippedBots, strippedPeers }, null, 2));
+    renameSync(tmp, diagPath);
+  } catch (err) {
+    console.warn("[larkway] failed to persist bot-load diagnostics (continuing):", err);
+  }
+
+  if (bots.length === 0 && skippedBots.length > 0) {
+    // 批I I1 (adversarial-review fix): every configured bot failed to load.
+    // This is a CONFIG ERROR, not "nothing configured" — exit non-zero so the
+    // supervisor keeps retrying and recovery is automatic once the yaml is
+    // fixed, and make the skip reasons THE final message (the old flow
+    // printed a misleading "no bots/*.yaml found" and exit(0)'d, leaving the
+    // bridge silently down until a human noticed).
+    console.error(
+      `[larkway] ⛔ ${skippedBots.length} 个 bot 配置全部加载失败,没有可服务的 bot:\n` +
+        skippedBots.map((s) => `  - ${s.file}: ${s.reason.split("\n")[0]}`).join("\n"),
+    );
     process.exit(1);
   }
 
@@ -1238,6 +1271,13 @@ async function main(): Promise<void> {
       `[larkway] no bots/*.yaml found in ${botsDir} — no bots configured, nothing to serve — exiting cleanly.`,
     );
     process.exit(0);
+  }
+
+  if (skippedBots.length > 0) {
+    console.error(
+      `[larkway] ⚠️⚠️ ${skippedBots.length} 个 bot 配置被跳过(其余 ${bots.length} 个正常服务):\n` +
+        skippedBots.map((s) => `  - ${s.file}: ${s.reason.split("\n")[0]}`).join("\n"),
+    );
   }
 
   // ── External CLIs probe (backend-aware startup diagnostics) ────────────────

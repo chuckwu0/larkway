@@ -106,8 +106,10 @@ describe("ensureAgentWorkspace", () => {
 
     const agentsMd = await fs.readFile(path.join(workspacePath, "AGENTS.md"), "utf8");
     // D4: unskippable startup-load contract is baked into the AGENTS.md template.
-    expect(agentsMd).toContain("开场不可跳过");
-    expect(agentsMd).toContain("Read `memory/index.md`");
+    // 批G G4: the "开场不可跳过:先 Read memory/index.md" ritual line is retired
+    // (index.md content is injected verbatim into every full prompt).
+    expect(agentsMd).not.toContain("开场不可跳过");
+    expect(agentsMd).not.toContain("Read `memory/index.md`");
     expect(agentsMd).toContain("Develop and operate Larkway from Feishu.");
     expect(agentsMd).toContain("You are the Larkway DevOps agent.");
     expect(agentsMd).toContain("https://gitlab.example.com/chuckwu0/larkway.git");
@@ -246,11 +248,15 @@ describe("ensureAgentWorkspace", () => {
     });
 
     const agentsMd = await fs.readFile(path.join(workspacePath, "AGENTS.md"), "utf8");
-    expect(agentsMd).toContain("New description");
-    expect(agentsMd).toContain("New task");
+    // 批G G4 (adversarial-review fix): refreshFacts on an EXISTING AGENTS.md
+    // no longer full-rewrites the file (that wiped agent-promoted sections)
+    // — it surgically re-projects Role Notes only. Header/task/repos keep
+    // their creation-time values (accepted trade-off; live repo pointers
+    // ride every prompt). permissions-request.md refresh is unchanged.
     expect(agentsMd).toContain("new AGENTS role notes");
-    expect(agentsMd).toContain("chuckwu0/larkway");
-    expect(agentsMd).not.toContain("Old task");
+    expect(agentsMd).not.toContain("old memory");
+    expect(agentsMd).toContain("Old description");
+    expect(agentsMd).toContain("Old task");
 
     const request = await fs.readFile(path.join(workspacePath, "permissions-request.md"), "utf8");
     expect(request).toContain("New task");
@@ -338,5 +344,70 @@ describe("ensureAgentWorkspace", () => {
     expect(granted).toContain("Git repo pointer: chuckwu0/larkway (main)");
     expect(granted).toContain("env=LARKWAY_DEVOPS_GITLAB_TOKEN");
     expect(granted).toContain("Reset reason: repo changed");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 批G G4 — projectRoleNotes (surgical L2 projection)
+// ---------------------------------------------------------------------------
+
+import { projectRoleNotes } from "./workspaceStore.js";
+import { mkdtemp as mkdtempG4, writeFile as writeFileG4, readFile as readFileG4 } from "node:fs/promises";
+import { tmpdir as tmpdirG4 } from "node:os";
+import pathG4 from "node:path";
+
+describe("projectRoleNotes (批G G4 surgical projection)", () => {
+  const AGENTS = [
+    "# Elon",
+    "",
+    "CEO bot",
+    "",
+    "## Workspace Contract",
+    "",
+    "- 开场不可跳过:回应 owner 前,先 Read `memory/index.md`,并按相关性 Read 相关 category 文件,再开始干活(防止新 session 失忆)。",
+    "- thin bridge rules here",
+    "",
+    "## Role Notes",
+    "",
+    "旧的职能描述",
+    "",
+    "## Repos",
+    "",
+    "- git/mm/workspace",
+    "",
+    "## Agent 自己提升的稳定规则",
+    "",
+    "- 真 at 回报:必须发真实 post",
+    "",
+  ].join("\n");
+
+  it("replaces ONLY the Role Notes body; agent-authored sections survive; legacy ritual line is migrated out", async () => {
+    const dir = await mkdtempG4(pathG4.join(tmpdirG4(), "larkway-proj-"));
+    await writeFileG4(pathG4.join(dir, "AGENTS.md"), AGENTS, "utf8");
+    const result = await projectRoleNotes(dir, "新的职能:CEO/总协调,不亲自写码。");
+    expect(result).toBe("projected");
+    const out = await readFileG4(pathG4.join(dir, "AGENTS.md"), "utf8");
+    expect(out).toContain("新的职能:CEO/总协调");
+    expect(out).not.toContain("旧的职能描述");
+    // The section the agent promoted itself MUST survive (the old full
+    // re-render wiped it — the exact bug this function fixes).
+    expect(out).toContain("真 at 回报:必须发真实 post");
+    expect(out).toContain("thin bridge rules here");
+    // Legacy ritual line migrated out in passing (批E E4).
+    expect(out).not.toContain("开场不可跳过");
+  });
+
+  it("missing AGENTS.md → skipped (caller falls back to full ensure)", async () => {
+    const dir = await mkdtempG4(pathG4.join(tmpdirG4(), "larkway-proj-"));
+    expect(await projectRoleNotes(dir, "内容")).toBe("skipped");
+  });
+
+  it("no Role Notes section (ancient workspace) → appends one", async () => {
+    const dir = await mkdtempG4(pathG4.join(tmpdirG4(), "larkway-proj-"));
+    await writeFileG4(pathG4.join(dir, "AGENTS.md"), "# Old\n\nno sections\n", "utf8");
+    await projectRoleNotes(dir, "补上的职能");
+    const out = await readFileG4(pathG4.join(dir, "AGENTS.md"), "utf8");
+    expect(out).toContain("## Role Notes");
+    expect(out).toContain("补上的职能");
   });
 });

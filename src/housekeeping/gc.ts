@@ -18,11 +18,13 @@ import { readFile, readdir, rm, stat } from "node:fs/promises";
 import { join as pathJoin } from "node:path";
 import {
   resolveAgentSessionPath,
+  resolveAgentWorkspacePath,
   resolveAgentWorkspaceSessionsDir,
   resolveWorktreePath as pathsResolveWorktreePath,
   resolveWorktreesDir,
 } from "../config/paths.js";
 import type { SessionStore } from "../claude/sessionStore.js";
+import { harvestSessionArtifacts } from "./harvest.js";
 import { isSyntheticSessionKey } from "../lark/message.js";
 
 // ---------------------------------------------------------------------------
@@ -123,6 +125,10 @@ export class Housekeeping {
       const idleMs = now - record.lastActiveTs;
       const tid = record.threadId;
 
+      // 批G G3: already harvested+reclaimed — nothing left to do until a
+      // live turn revives the dir (whose write-back clears the stamp).
+      if (record.harvestedAt) continue;
+
       // 批F (F1/F2): sticky p2p sessions are exempt from idle cleanup. The
       // session dir is the durable home of an ongoing 1:1 relationship —
       // summary.md / transcript.md there are exactly the seed corpus the
@@ -142,7 +148,17 @@ export class Housekeeping {
         // Fire real cleanup (async — don't block scan loop). Passes botId
         // from the session record so V2 worktrees at ~/.larkway/<botId>/...
         // are resolved correctly (V1 records have botId="v1-default" → V1 path).
-        void this.#cleanupThread(tid, record.botId, dryRun);
+        // 批G G3: after a real reclaim, stamp the record with harvestedAt —
+        // the fresh-start seed builder (批H H1) uses it to know the corpus
+        // moved to memory/harvest/. Record fields (incl. sessionId) survive;
+        // a later live turn's write-back naturally clears the stamp.
+        void this.#cleanupThread(tid, record.botId, dryRun).then((outcome) => {
+          if (outcome === "reclaimed" && !dryRun) {
+            void this.#sessionStore
+              .markHarvested(tid, record.botId, Date.now())
+              .catch((err) => console.warn("[gc] markHarvested failed (continuing):", err));
+          }
+        });
         // Remove from notify-dedup set: if lastActiveTs ever updates,
         // the notify threshold fires again.
         this.#notified.delete(tid);
@@ -215,11 +231,11 @@ export class Housekeeping {
    * - legacy:          git worktree remove --force <botId>/worktrees/<tid>.
    * Both kill any lingering runner PIDs first (idle >24h → normally dead).
    */
-  #cleanupThread(
+  async #cleanupThread(
     threadId: string,
     botId: string | undefined,
     dryRun: boolean,
-  ): Promise<void> {
+  ): Promise<AgentSessionCleanupOutcome | void> {
     if (this.#runtime === "agent_workspace") {
       return cleanupAgentSession(threadId, botId ?? this.#botId, dryRun);
     }
@@ -563,23 +579,39 @@ export async function removeSessionDir(
  *   3. rm -rf the session dir
  * In dry-run mode all actions are logged but never executed.
  */
+export type AgentSessionCleanupOutcome =
+  | "reclaimed"
+  | "already-clean"
+  | "skipped-live"
+  | "skipped-harvest-failed"
+  | "skipped-invalid";
+
 export async function cleanupAgentSession(
   threadId: string,
   agentId: string | undefined,
   dryRun: boolean,
-): Promise<void> {
+): Promise<AgentSessionCleanupOutcome> {
   if (!agentId) {
     console.error(
       `[gc] cleanupAgentSession: missing agentId for thread=${threadId}`,
     );
-    return;
+    return "skipped-invalid";
   }
   let sessionPath: string;
   try {
     sessionPath = resolveAgentSessionPath(agentId, threadId);
   } catch (err) {
     console.error(`[gc] invalid session threadId=${threadId}:`, err);
-    return;
+    return "skipped-invalid";
+  }
+  // Adversarial-review fix: a record whose dir is already gone (previously
+  // reclaimed; record deliberately retained) must be a no-op — NOT a fresh
+  // "reclaimed" that re-stamps harvestedAt every scan and rewrites
+  // sessions.json in a 30-minute loop forever.
+  try {
+    await stat(sessionPath);
+  } catch {
+    return "already-clean";
   }
   console.log(
     `[gc] cleanup session thread=${threadId} path=${sessionPath} dryRun=${dryRun}`,
@@ -605,9 +637,46 @@ export async function cleanupAgentSession(
     console.warn(
       `[gc] skip live session thread=${threadId} path=${sessionPath}: runner pid(s) [${alivePids.join(", ")}] still alive — not reclaiming in-flight work`,
     );
-    return;
+    return "skipped-live";
+  }
+
+  // 批G G3: harvest the durable extract (summary + transcript tail) into
+  // workspace/memory/harvest/ BEFORE removal. Placed here — inside
+  // cleanupAgentSession, after the live-pid gate, before the rm — so BOTH
+  // reclaim paths (record-driven cleanup and the orphan sweep) are covered,
+  // including the SessionStore-corruption disaster case where every dir
+  // turns orphan at once. A harvest failure SKIPS the removal: deleting
+  // unharvested raw material is the exact loss this exists to prevent; the
+  // next scan retries both steps.
+  try {
+    await harvestSessionArtifacts({
+      sessionPath,
+      workspacePath: resolveAgentWorkspacePath(agentId),
+      threadId,
+      dryRun,
+    });
+  } catch (err) {
+    console.error(
+      `[gc] harvest failed for thread=${threadId} — NOT reclaiming this scan (will retry):`,
+      err,
+    );
+    return "skipped-harvest-failed";
   }
 
   // No live process → the session is genuinely idle/abandoned; reclaim it.
   await removeSessionDir(sessionPath, dryRun);
+  // Contested-review fix: only report "reclaimed" (→ harvestedAt stamp) when
+  // the dir is REALLY gone — removeSessionDir swallows rm failures and can
+  // refuse non-reclaimable paths, and a false stamp would make the scan skip
+  // this record forever while the dir still exists.
+  if (!dryRun) {
+    try {
+      await stat(sessionPath);
+      console.warn(`[gc] session dir still present after rm attempt: ${sessionPath}`);
+      return "skipped-invalid";
+    } catch {
+      /* gone — the expected case */
+    }
+  }
+  return "reclaimed";
 }

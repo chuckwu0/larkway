@@ -30,10 +30,12 @@ import {
 import {
   defaultPermissionCapabilitiesForBot,
   ensureAgentWorkspace,
+  projectRoleNotes,
   resetAgentWorkspacePermissions,
 } from "../agent/workspaceStore.js";
 import { permissionItemsFromCapabilities } from "../agent/permissionPlan.js";
 import { resolveAgentWorkspacePathFromHome } from "../config/paths.js";
+import { computeBotMemoryLiveness } from "./memoryLiveness.js";
 import { resolveLarkwayVersion } from "../version.js";
 import { detectClaudeLogin } from "../cli/claudeAuth.js";
 import {
@@ -526,6 +528,28 @@ const getBotHealthScan: ApiHandler = async (req) => {
 // ---------------------------------------------------------------------------
 // Route handlers
 // ---------------------------------------------------------------------------
+
+/**
+ * GET /api/memory-liveness — 批G P0 记忆活性指标(原则 6):每 bot 的
+ * summary 占位率 / 最近记忆写入 / 收割件数 / 孤儿记录数。纯文件统计,
+ * 本机模式限定;curl 一下就能看出记忆管道有没有再次死掉。
+ */
+const getMemoryLiveness: ApiHandler = async (req) => {
+  const { ctx } = req;
+  if (ctx.mode !== "local") {
+    return { status: 403, json: { error: "只支持在本机助手上下文中查看。" } };
+  }
+  let botIds: string[] = [];
+  try {
+    botIds = await ctx.stores.botsStore.listBots();
+  } catch {
+    botIds = [];
+  }
+  const bots = await Promise.all(
+    botIds.map((botId) => computeBotMemoryLiveness(ctx.larkwayDir, botId)),
+  );
+  return { status: 200, json: { bots, computedAt: new Date().toISOString() } };
+};
 
 /**
  * GET /api/context — current { mode, centralAvailable }
@@ -1156,6 +1180,42 @@ const deleteBot: ApiHandler = async (req) => {
     return { status: 500, json: { error: msg } };
   }
 
+  // 批I I1 (adversarial-audit fix): reference-integrity checks BEFORE any
+  // deletion. All other bots are loaded once here for both checks; a bot
+  // whose own yaml fails to read simply drops out of the checks (best-effort
+  // degradation to the old unchecked behavior for that one bot).
+  let otherBots: Array<Awaited<ReturnType<typeof botsStore.readBot>>> = [];
+  try {
+    const otherIds = (await ctx.stores.botsStore.listBots()).filter((b) => b !== id);
+    otherBots = (
+      await Promise.all(
+        otherIds.map((otherId) => ctx.stores.botsStore.readBot(otherId).catch(() => null)),
+      )
+    ).filter((b): b is NonNullable<typeof b> => b !== null);
+  } catch {
+    otherBots = [];
+  }
+
+  // (1) peers referencing this bot: deleting used to leave dangling peers
+  // entries that made loadBots throw on the next restart — the whole bridge
+  // (every bot) failed to start. loadBots now degrades that to a strip+warn,
+  // but the Web flow should not manufacture the dangling state at all:
+  // block with an actionable message instead.
+  const referencedBy = otherBots
+    .filter((b) => (b.peers ?? []).includes(id))
+    .map((b) => b.id);
+  if (referencedBy.length > 0) {
+    return {
+      status: 409,
+      json: {
+        error:
+          `bot "${id}" 仍被以下 bot 的 peers 引用: ${referencedBy.join(", ")}。` +
+          `请先在这些 bot 的配置里移除该 peer,再删除。`,
+        referencedBy,
+      },
+    };
+  }
+
   // Delete the bot files.
   try {
     await ctx.stores.botsStore.deleteBot(id);
@@ -1165,15 +1225,30 @@ const deleteBot: ApiHandler = async (req) => {
   }
 
   // Best-effort: remove .env secrets referenced by this bot.
-  // Include both git_token_env (new) and gitlab_token_env (legacy alias) to clean up either.
+  // Include both git_token_env (new) and gitlab_token_env (legacy alias).
+  // 批I I1 (adversarial-audit fix): env-var NAMES can be shared across bots
+  // (a real deployment borrows another bot's git token env) — only remove a
+  // secret no surviving bot still references.
+  const survivorEnvNames = new Set(
+    otherBots.flatMap((b) =>
+      [b.app_secret_env, b.git_token_env, b.gitlab_token_env].filter(
+        (n): n is string => typeof n === "string" && n.length > 0,
+      ),
+    ),
+  );
   const envNames = [config.app_secret_env, config.git_token_env, config.gitlab_token_env].filter(
-    (n): n is string => typeof n === "string" && n.length > 0,
+    (n): n is string => typeof n === "string" && n.length > 0 && !survivorEnvNames.has(n),
   );
   await Promise.all(
     envNames.map((envName) => ctx.stores.hostConfig.removeSecret(envName).catch(() => undefined)),
   );
 
-  return { status: 200, json: { ok: true, id } };
+  // 批I I1 / 批H H4: report the orphaned workspace instead of silently
+  // leaving it (the historical source of dead-workspace buildup). Deleting
+  // agent data is NOT done implicitly here — the response carries the path
+  // so the UI/runbook can surface "workspace 留在磁盘上,确认后手动删".
+  const workspacePath = resolveAgentWorkspacePathFromHome(ctx.larkwayDir, id);
+  return { status: 200, json: { ok: true, id, orphanedWorkspacePath: workspacePath } };
 };
 
 /**
@@ -1227,7 +1302,19 @@ const putMemory: ApiHandler = async (req) => {
     await ctx.stores.botsStore.writeMemory(id, body.content);
     const bot = await ctx.stores.botsStore.readBot(id);
     if (bot.runtime === "agent_workspace") {
-      await ensureWorkspaceForPutBot(ctx, bot, body.content);
+      // 批G G4: a memory save projects ONLY the Role Notes section
+      // (surgical). The previous full ensureWorkspaceForPutBot with
+      // refreshFacts re-rendered the whole AGENTS.md template, wiping any
+      // content the agent had legitimately promoted into it. If the
+      // workspace was never ensured (no AGENTS.md yet), fall back to the
+      // full ensure — there is nothing agent-authored to protect there.
+      const projected = await projectRoleNotes(
+        resolveAgentWorkspacePathFromHome(ctx.larkwayDir, id),
+        body.content,
+      );
+      if (projected === "skipped") {
+        await ensureWorkspaceForPutBot(ctx, bot, body.content);
+      }
     }
     return { status: 200, json: { ok: true, id } };
   } catch (e) {
@@ -1424,9 +1511,29 @@ const getStatus: ApiHandler = async (req) => {
       centralRepo: null,
       logExists,
       logSizeKb,
+      // 批I I1: bridge-boot load diagnostics — skipped bots MUST be visible
+      // on the dashboard, not just a line in the boot log ("防炸变静默少一个").
+      botLoadDiagnostics: await readBotLoadDiagnostics(ctx.larkwayDir),
     },
   };
 };
+
+/** 批I I1: read the bridge-boot diagnostics persisted by main.ts (best-effort). */
+async function readBotLoadDiagnostics(
+  larkwayDir: string,
+): Promise<{ at: string; skipped: unknown[]; strippedPeers: unknown[] } | null> {
+  try {
+    const raw = await readFile(path.join(larkwayDir, "bot-load-diagnostics.json"), "utf8");
+    const parsed = JSON.parse(raw) as { at?: string; skipped?: unknown[]; strippedPeers?: unknown[] };
+    return {
+      at: parsed.at ?? "",
+      skipped: Array.isArray(parsed.skipped) ? parsed.skipped : [],
+      strippedPeers: Array.isArray(parsed.strippedPeers) ? parsed.strippedPeers : [],
+    };
+  } catch {
+    return null;
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Onboarding (页面内扫码开通新助手) — V2.2
@@ -1748,6 +1855,7 @@ const getBackends: ApiHandler = async (_req) => {
  */
 export const ROUTES: Record<string, ApiHandler> = {
   "GET /api/context": getContext,
+  "GET /api/memory-liveness": getMemoryLiveness,
   "GET /api/update_version": getUpdateVersion,
   "POST /api/update_version": postUpdateVersion,
   "GET /api/update_version/status": getUpdateVersionStatus,

@@ -6,7 +6,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { mkdtemp, writeFile, mkdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { loadBots } from "./botLoader.js";
+import { loadBots, loadBotsDetailed } from "./botLoader.js";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -199,7 +199,7 @@ repos:
     });
   });
 
-  it("throws on missing required field (name)", async () => {
+  it("skips (not throws) on missing required field (name) — 批I I1 failure isolation", async () => {
     await createBotsDir();
     await writeYaml(
       "bad.yaml",
@@ -214,11 +214,15 @@ chats:
 `,
     );
 
-    await expect(loadBots(botsDir())).rejects.toThrow(/Schema validation failed/);
-    await expect(loadBots(botsDir())).rejects.toThrow(/bad\.yaml/);
+    // 批I I1: a bad yaml SKIPS that bot instead of failing the fleet.
+    const { bots, skipped } = await loadBotsDetailed(botsDir());
+    expect(bots).toHaveLength(0);
+    expect(skipped).toHaveLength(1);
+    expect(skipped[0]!.file).toBe("bad.yaml");
+    expect(skipped[0]!.reason).toMatch(/schema validation failed/);
   });
 
-  it("throws on non-kebab-case id", async () => {
+  it("skips (not throws) on non-kebab-case id — 批I I1 failure isolation", async () => {
     await createBotsDir();
     await writeYaml(
       "bad.yaml",
@@ -234,10 +238,12 @@ chats:
 `,
     );
 
-    await expect(loadBots(botsDir())).rejects.toThrow(/Schema validation failed/);
+    const { bots, skipped } = await loadBotsDetailed(botsDir());
+    expect(bots).toHaveLength(0);
+    expect(skipped[0]!.reason).toMatch(/schema validation failed/);
   });
 
-  it("throws when peers reference an unknown bot id", async () => {
+  it("strips (not throws) a peers entry referencing an unknown bot id — 批I I1", async () => {
     await createBotsDir();
     await writeYaml(
       "bot-a.yaml",
@@ -255,11 +261,15 @@ peers:
 `,
     );
 
-    await expect(loadBots(botsDir())).rejects.toThrow(/unknown peer/);
-    await expect(loadBots(botsDir())).rejects.toThrow(/nonexistent-bot/);
+    // The dangling-peer state is exactly what the Web deleteBot flow used
+    // to leave behind — it must degrade to strip+warn, never fleet-fatal.
+    const { bots, strippedPeers } = await loadBotsDetailed(botsDir());
+    expect(bots).toHaveLength(1);
+    expect(bots[0]!.peers).toEqual([]);
+    expect(strippedPeers).toEqual([{ botId: "bot-a", peerId: "nonexistent-bot" }]);
   });
 
-  it("throws on duplicate bot id across files", async () => {
+  it("keeps the first and skips later duplicates of a bot id — 批I I1", async () => {
     await createBotsDir();
     await writeYaml(
       "bot-first.yaml",
@@ -288,18 +298,23 @@ chats:
 `,
     );
 
-    await expect(loadBots(botsDir())).rejects.toThrow(/Duplicate bot id/);
-    await expect(loadBots(botsDir())).rejects.toThrow(/same-bot/);
+    const { bots, skipped } = await loadBotsDetailed(botsDir());
+    expect(bots).toHaveLength(1);
+    expect(bots[0]!.description).toBe("First version");
+    expect(skipped).toHaveLength(1);
+    expect(skipped[0]!.reason).toMatch(/duplicate bot id "same-bot"/);
   });
 
-  it("throws on malformed yaml", async () => {
+  it("skips (not throws) malformed yaml — 批I I1", async () => {
     await createBotsDir();
     await writeYaml("bad.yaml", "key: [unclosed bracket\n");
 
-    await expect(loadBots(botsDir())).rejects.toThrow(/YAML parse error/);
+    const { bots, skipped } = await loadBotsDetailed(botsDir());
+    expect(bots).toHaveLength(0);
+    expect(skipped[0]!.reason).toMatch(/YAML parse error/);
   });
 
-  it("throws on unknown fields in yaml (strict schema rejects typos)", async () => {
+  it("skips (not throws) unknown fields in yaml (strict schema still rejects typos) — 批I I1", async () => {
     await createBotsDir();
     await writeYaml(
       "bad.yaml",
@@ -316,8 +331,12 @@ typoed_field: should-fail
 `,
     );
 
-    await expect(loadBots(botsDir())).rejects.toThrow(/Schema validation failed/);
-    await expect(loadBots(botsDir())).rejects.toThrow(/typoed_field/);
+    {
+      const { bots, skipped } = await loadBotsDetailed(botsDir());
+      expect(bots).toHaveLength(0);
+      expect(skipped[0]!.reason).toMatch(/schema validation failed/);
+      expect(skipped[0]!.reason).toMatch(/typoed_field/);
+    }
   });
 
   it("allows bot to have itself in peers list (self-reference is not prevented at loader level)", async () => {
@@ -479,7 +498,12 @@ repos:
 `,
     );
 
-    await expect(loadBots(botsDir())).rejects.toThrow(/Schema validation failed/);
+    {
+      const { bots, skipped } = await loadBotsDetailed(botsDir());
+      expect(bots).toHaveLength(0);
+      expect(skipped[0]!.reason).toMatch(/schema validation failed/);
+      expect(skipped[0]!.reason).toMatch(/clone URL/);
+    }
   });
 
   // ---------------------------------------------------------------------------
@@ -1124,7 +1148,9 @@ taskHandle:
   stallThresholdMs: -1
 `,
     );
-    await expect(loadBots(botsDir())).rejects.toThrow();
+    const { bots, skipped } = await loadBotsDetailed(botsDir());
+    expect(bots).toHaveLength(0);
+    expect(skipped[0]!.reason).toMatch(/schema validation failed/);
   });
 });
 

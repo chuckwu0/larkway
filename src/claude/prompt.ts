@@ -34,6 +34,12 @@ const MEMORY_FILE_LINE_LIMIT = 200;
  * code-level size contract, so an unbounded file could blow up prompt size. */
 const MEMORY_INDEX_MAX_CHARS = 4000;
 
+/** 批G G4: same cap for the L2 <agent-memory> block. L2 was the ONE injected
+ * file with no size contract — and the one 批E explicitly invites operators
+ * to move business guidance into, so an unbounded L2 could quietly undo the
+ * whole prompt-slimming batch. Soft cap: clipped with a pointer note. */
+const AGENT_MEMORY_MAX_CHARS = 4000;
+
 /**
  * Read a file's line count asynchronously (A5 perf: off the sync fs path).
  * Returns 0 if the file is missing or unreadable — never throws. Used only to
@@ -952,8 +958,16 @@ export async function renderPrompt(input: RenderPromptInput): Promise<string> {
       : [];
 
   // L2 Agent Memory (职能) — injected as a role preamble when provided.
-  const agentMemoryBlock = agentMemory && agentMemory.trim().length > 0
-    ? ["<agent-memory>", agentMemory.trim(), "</agent-memory>", ""]
+  // 批G G4: code-point-safe soft cap (same treatment as memory/index.md) —
+  // the over-limit tail stays readable in the file, just not injected.
+  const trimmedAgentMemory = agentMemory?.trim() ?? "";
+  const agentMemoryChars = Array.from(trimmedAgentMemory);
+  const cappedAgentMemory =
+    agentMemoryChars.length <= AGENT_MEMORY_MAX_CHARS
+      ? trimmedAgentMemory
+      : `${agentMemoryChars.slice(0, AGENT_MEMORY_MAX_CHARS).join("")}\n\n…(L2 memory 超过 ${AGENT_MEMORY_MAX_CHARS} 字符注入上限,已截断——请 owner 蒸馏精简 bots/<id>.memory.md)`;
+  const agentMemoryBlock = cappedAgentMemory.length > 0
+    ? ["<agent-memory>", cappedAgentMemory, "</agent-memory>", ""]
     : [];
 
   // Skill-discovery intro: bridge stays thin and only points at repo-local

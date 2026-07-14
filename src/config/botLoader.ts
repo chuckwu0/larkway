@@ -486,6 +486,8 @@ export const BotConfigSchema = z.object({
 export type BotConfig = z.infer<typeof BotConfigSchema> & {
   /** Resolved content of `memory_file`, if present. Injected into the prompt. */
   agent_memory?: string;
+  /** 批G G4: absolute path of `memory_file` for per-turn live re-reads. */
+  agent_memory_path?: string;
 };
 
 /**
@@ -515,21 +517,47 @@ export function effectivePrewarmProcess(
 // ---------------------------------------------------------------------------
 
 /**
+ * A bot that failed to load — surfaced instead of thrown (批I I1).
+ */
+export interface SkippedBot {
+  /** yaml filename (not full path). */
+  file: string;
+  /** bot id when parse got far enough to know it. */
+  botId?: string;
+  reason: string;
+}
+
+export interface LoadBotsResult {
+  bots: BotConfig[];
+  /** Bots whose yaml failed to load — the fleet keeps running without them. */
+  skipped: SkippedBot[];
+  /** peers entries dropped because they referenced an unknown bot id. */
+  strippedPeers: Array<{ botId: string; peerId: string }>;
+}
+
+/**
  * Load all bot configurations from `botsDir/*.yaml`.
  *
- * @param botsDir  Absolute path to the `bots/` directory.
- * @returns        Array of validated BotConfig objects.
- *                 Empty array if botsDir does not exist (V1 compat path).
- * @throws         On any parse/validation error or cross-reference inconsistency.
+ * 批I I1 (adversarial-audit fix): failure isolation. Previously ANY single
+ * bad yaml — schema error, unreadable memory_file, or a peers entry pointing
+ * at a deleted bot (the exact state the Web deleteBot flow used to leave
+ * behind) — threw out of this function and main.ts exit(1)'d the whole
+ * bridge: one config mistake took every bot offline. Now a bad file SKIPS
+ * that one bot (loud console.error + returned in `skipped` for 体检), and an
+ * unknown peer is STRIPPED from the referencing bot with a warning instead
+ * of failing the fleet. Duplicate ids keep the first file and skip later ones.
+ *
+ * @returns bots + skipped diagnostics. Empty bots if botsDir does not exist
+ *          (V1 compat path). Only an unreadable botsDir itself still throws.
  */
-export async function loadBots(botsDir: string): Promise<BotConfig[]> {
+export async function loadBotsDetailed(botsDir: string): Promise<LoadBotsResult> {
   // V1 compat: no bots/ directory → single-bot mode
   let entries: string[];
   try {
     entries = await readdir(botsDir);
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code === "ENOENT") {
-      return [];
+      return { bots: [], skipped: [], strippedPeers: [] };
     }
     throw new Error(`[botLoader] Failed to read bots directory ${botsDir}: ${String(err)}`);
   }
@@ -537,25 +565,36 @@ export async function loadBots(botsDir: string): Promise<BotConfig[]> {
   const yamlFiles = entries.filter((f) => f.endsWith(".yaml") || f.endsWith(".yml"));
 
   if (yamlFiles.length === 0) {
-    return [];
+    return { bots: [], skipped: [], strippedPeers: [] };
   }
 
-  // Parse each file
+  // Parse each file — 批I I1: per-file failures skip THAT bot only.
   const bots: BotConfig[] = [];
+  const skipped: SkippedBot[] = [];
+  const strippedPeers: Array<{ botId: string; peerId: string }> = [];
+  const skip = (file: string, reason: string, botId?: string): void => {
+    skipped.push({ file, botId, reason });
+    console.error(
+      `[botLoader] ⛔ SKIPPING bot config ${file}${botId ? ` (id "${botId}")` : ""} — ${reason}\n` +
+        `[botLoader]    其余 bot 正常加载;修复该文件后重启生效。`,
+    );
+  };
   for (const filename of yamlFiles.sort()) {
     const filePath = path.join(botsDir, filename);
     let raw: string;
     try {
       raw = await readFile(filePath, "utf-8");
     } catch (err) {
-      throw new Error(`[botLoader] Failed to read ${filePath}: ${String(err)}`);
+      skip(filename, `failed to read: ${String(err)}`);
+      continue;
     }
 
     let parsed: unknown;
     try {
       parsed = yaml.load(raw);
     } catch (err) {
-      throw new Error(`[botLoader] YAML parse error in ${filePath}: ${String(err)}`);
+      skip(filename, `YAML parse error: ${String(err)}`);
+      continue;
     }
 
     const result = BotConfigSchema.safeParse(parsed);
@@ -563,7 +602,8 @@ export async function loadBots(botsDir: string): Promise<BotConfig[]> {
       const issues = result.error.issues
         .map((issue) => `  ${issue.path.join(".")}: ${issue.message}`)
         .join("\n");
-      throw new Error(`[botLoader] Schema validation failed for ${filePath}:\n${issues}`);
+      skip(filename, `schema validation failed:\n${issues}`);
+      continue;
     }
 
     const bot: BotConfig = result.data;
@@ -615,40 +655,61 @@ export async function loadBots(botsDir: string): Promise<BotConfig[]> {
     // L2 Agent Memory: load memory_file content (relative to botsDir) so the
     // bridge can inject it as the agent's role preamble. Missing file is fatal
     // — a memory_file pointing nowhere is a config error worth failing loud.
+    // 批G G4: the resolved absolute path is ALSO recorded so the handler can
+    // re-read the file per turn ("下一次全量渲染即新鲜") — editing L2 no
+    // longer requires a bridge restart; this boot-time content remains the
+    // fallback when a live read fails mid-flight.
     if (bot.memory_file) {
       const memoryPath = path.join(botsDir, bot.memory_file);
       try {
         bot.agent_memory = await readFile(memoryPath, "utf-8");
+        bot.agent_memory_path = memoryPath;
       } catch (err) {
-        throw new Error(
-          `[botLoader] Bot "${bot.id}" memory_file not readable: ${memoryPath}: ${String(err)}`,
-        );
+        skip(filename, `memory_file not readable: ${memoryPath}: ${String(err)}`, bot.id);
+        continue;
       }
     }
 
     bots.push(bot);
   }
 
-  // Post-load validation: duplicate id check
+  // Post-load validation: duplicate id → keep the first, skip later ones.
   const idSet = new Set<string>();
+  const deduped: BotConfig[] = [];
   for (const bot of bots) {
     if (idSet.has(bot.id)) {
-      throw new Error(`[botLoader] Duplicate bot id "${bot.id}" found in ${botsDir}`);
+      skip("(duplicate)", `duplicate bot id "${bot.id}" — 保留先加载的一份`, bot.id);
+      continue;
     }
     idSet.add(bot.id);
+    deduped.push(bot);
   }
 
-  // Post-load validation: peers must reference known bot ids
-  for (const bot of bots) {
-    for (const peerId of bot.peers) {
-      if (!idSet.has(peerId)) {
-        throw new Error(
-          `[botLoader] Bot "${bot.id}" references unknown peer "${peerId}". ` +
-            `Known bot ids: ${[...idSet].join(", ")}`,
+  // Post-load validation: peers referencing unknown ids are STRIPPED, not
+  // fatal — the Web deleteBot flow used to leave exactly this dangling state
+  // behind and the resulting throw took the whole bridge down on restart.
+  for (const bot of deduped) {
+    const unknown = bot.peers.filter((peerId) => !idSet.has(peerId));
+    if (unknown.length > 0) {
+      bot.peers = bot.peers.filter((peerId) => idSet.has(peerId));
+      for (const peerId of unknown) {
+        strippedPeers.push({ botId: bot.id, peerId });
+        console.warn(
+          `[botLoader] ⚠️ Bot "${bot.id}" references unknown peer "${peerId}" — 已从 peers 中剔除` +
+            `(known ids: ${[...idSet].join(", ")})。若该 peer 是被删除的 bot,请顺手清理 yaml。`,
         );
       }
     }
   }
 
-  return bots;
+  return { bots: deduped, skipped, strippedPeers };
+}
+
+/**
+ * Back-compat wrapper — returns bots only. Skips/strips are already logged
+ * loudly inside loadBotsDetailed; callers needing them for 体检/status use
+ * the detailed variant.
+ */
+export async function loadBots(botsDir: string): Promise<BotConfig[]> {
+  return (await loadBotsDetailed(botsDir)).bots;
 }
