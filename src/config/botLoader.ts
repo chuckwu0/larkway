@@ -394,6 +394,39 @@ export const BotConfigSchema = z.object({
   promptMode: z.enum(["full", "delta"]).optional(),
 
   /**
+   * 批F (F1) — p2p sticky sessions. When true, every PURE top-level message
+   * in a p2p (单聊) chat (no root_id, no parent_id) keys to ONE chat-level
+   * session (`p2p-<chat_id>`) instead of a fresh session per message — a 1:1
+   * conversation becomes continuous, like chatting with a person. Explicit
+   * thread-panel replies keep their own topic session; quote replies keep
+   * today's behavior (incl. v4 task-card rekey). Known v1 trade-off: a
+   * task-handle claim made FROM a sticky session cannot receive stall-nudge
+   * cards (the synthetic wake-up needs a real message id to anchor on —
+   * main.ts skips those with a log line); lifecycle writeback (comments/
+   * complete) is unaffected. Omitted = false (per-message sessions, the
+   * historical behavior).
+   */
+  p2pStickySession: z.boolean().optional(),
+
+  /**
+   * 批F (F2) — session reseed threshold, in completed turns. Past this many
+   * turns on one backend session, the next turn starts a FRESH backend
+   * session seeded with summary.md + the transcript tail (session record and
+   * directory continue in place) — bounding the "resume 无压缩,话题越滚越慢"
+   * growth. 0 disables. Omitted = 60 (handler DEFAULT_SESSION_RESEED_TURNS).
+   */
+  sessionReseedTurns: z.number().int().nonnegative().optional(),
+
+  /**
+   * 批F (F1/F2) — idle gap (ms) after which a STICKY p2p session reseeds on
+   * its next message (fresh backend session + seed; same mechanism as
+   * sessionReseedTurns). Only sticky sessions have an idle trigger — topic
+   * sessions resuming days later with full context is a feature. 0 disables.
+   * Omitted = 12h (handler DEFAULT_P2P_STICKY_IDLE_MS).
+   */
+  p2pStickyIdleMs: z.number().int().nonnegative().optional(),
+
+  /**
    * docs/larkway-perf-plan.md §4 — persistent warm process instead of a
    * one-shot cold start per turn. Takes effect for `backend: "codex"` (a
    * single bot-level `codex app-server` process — src/codex/pool.ts

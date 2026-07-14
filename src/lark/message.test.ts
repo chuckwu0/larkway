@@ -391,3 +391,70 @@ describe("isStopCommand (BL-42 /stop)", () => {
     ).toBe(false);
   });
 });
+
+// ---------------------------------------------------------------------------
+// 批F (F1) — deriveSessionKey / isSyntheticSessionKey
+// ---------------------------------------------------------------------------
+
+import { deriveSessionKey, isSyntheticSessionKey } from "./message.js";
+
+describe("deriveSessionKey (批F F1 sticky p2p sessions)", () => {
+  const base = {
+    message_id: "om_msg1",
+    chat_id: "oc_chat1",
+    chat_type: "p2p",
+  };
+
+  it("root_id always wins — thread replies stay on their topic's session", () => {
+    expect(
+      deriveSessionKey({ ...base, root_id: "om_root" }, { p2pStickySession: true }),
+    ).toBe("om_root");
+  });
+
+  it("pure top-level p2p message + sticky flag → chat-level key", () => {
+    expect(deriveSessionKey(base, { p2pStickySession: true })).toBe("p2p-oc_chat1");
+  });
+
+  it("sticky key derivation is a pure function — replays agree byte-for-byte", () => {
+    const a = deriveSessionKey(base, { p2pStickySession: true });
+    const b = deriveSessionKey({ ...base }, { p2pStickySession: true });
+    expect(a).toBe(b);
+  });
+
+  it("flag off (default) → per-message key, the historical behavior", () => {
+    expect(deriveSessionKey(base)).toBe("om_msg1");
+    expect(deriveSessionKey(base, {})).toBe("om_msg1");
+    expect(deriveSessionKey(base, { p2pStickySession: false })).toBe("om_msg1");
+  });
+
+  it("quote reply (parent_id, no root_id) is NOT sticky — keeps per-message key so the v4 task-card rekey keyspace is untouched", () => {
+    expect(
+      deriveSessionKey({ ...base, parent_id: "om_quoted" }, { p2pStickySession: true }),
+    ).toBe("om_msg1");
+  });
+
+  it("group chat is never sticky", () => {
+    expect(
+      deriveSessionKey({ ...base, chat_type: "group" }, { p2pStickySession: true }),
+    ).toBe("om_msg1");
+  });
+
+  it("missing/empty chat_id degrades to per-message key", () => {
+    expect(
+      deriveSessionKey({ message_id: "om_m", chat_id: "", chat_type: "p2p" }, { p2pStickySession: true }),
+    ).toBe("om_m");
+  });
+
+  it("sticky key stays within the GC-safe charset [A-Za-z0-9_-]", () => {
+    const key = deriveSessionKey(base, { p2pStickySession: true });
+    expect(key).toMatch(/^[A-Za-z0-9_-]+$/);
+  });
+});
+
+describe("isSyntheticSessionKey", () => {
+  it("recognizes sticky keys and nothing else", () => {
+    expect(isSyntheticSessionKey("p2p-oc_chat1")).toBe(true);
+    expect(isSyntheticSessionKey("om_msg1")).toBe(false);
+    expect(isSyntheticSessionKey("omt_topic1")).toBe(false);
+  });
+});

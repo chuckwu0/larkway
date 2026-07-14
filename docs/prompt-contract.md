@@ -77,6 +77,30 @@ state.json 按需规则、干净退出)→ `<workspace-file-changes>`(如有)→
 以 isNewThread=true 重渲染,不会让丢失历史的 session 落在 delta prompt 上。
 缺省 = "full",与旧行为逐字节一致。已知取舍:话题中途 peers 变化不重发(下个新话题生效)。
 
+### 批F (F1):`p2pStickySession` 单聊粘连 session
+
+bot yaml 配 `p2pStickySession: true` 时,p2p(单聊)里**无 root_id 且无 parent_id 的纯顶层消息**
+统一映射到 chat 级 session key `p2p-<chat_id>`(src/lark/message.ts `deriveSessionKey`,纯函数)——
+1:1 对话变成一个连续 session,不再每条消息冷启失忆。话题面板内的回复(root_id)仍走各自话题
+session;引用回复(parent_id)保持原行为(含 v4 任务卡 rekey)。prompt 侧:注入 `session_key:`
+事实行 + `p2p_direct_message` 场景;p2p/synthetic-key 场景下上下文命令切换为
+**chat-messages-list 为主**(p2p 没有真话题,threads-messages-list 必失败;卡片按钮合成事件
+会把 sticky key 带进 parsed.threadId,不能当消息 id interpolate)。配套硬化:sticky 会话的
+⏹ /stop 以 sticky key 为第二候选查杀在跑轮;housekeeping GC 豁免 sticky session 目录
+(它是 1:1 关系的长期家,数量以单聊数为界);gap-fill 重建用活消息学到的 chat_type,保证
+重放与实时推导同一 session key。已知 v1 取舍:sticky session 里认领的任务收不到巡检唤醒卡
+(合成事件缺真实锚点消息 id,main.ts 守卫跳过并留日志);任务生命周期评论/writeback 不受影响。
+
+### 批F (F2):`<session-reseed>` 重播种块
+
+session 完成轮数超过 `sessionReseedTurns`(默认 60,0 关)或 sticky session 空闲超过
+`p2pStickyIdleMs`(默认 12h,仅 sticky 有空闲触发)时,下一轮**弃用旧后端 session**:
+不 resume、渲染全量 prompt,并注入 `<session-reseed>` 块 = 重播种原因 + summary.md 摘录
+(≤2000 字符,占位符跳过)+ transcript.md 尾部(≤3000 字符,含 bridge 落盘的用户消息与答案摘录)
++ 完整转录路径指针。session 记录与目录原地续用(createdTs/rootText/chatId/任务认领全保留,
+仅换 sessionId、turnCount 重置);ClaudeProcessPool 先退役该 thread 的热进程,防止旧上下文
+从警备进程里泄漏回来。这是「resume 无压缩,话题越滚越慢」的 bridge 层解法。
+
 ---
 
 ## 字段语义

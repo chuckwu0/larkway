@@ -162,7 +162,7 @@ describe("renderPrompt — V2 mode (botName set)", () => {
     expect(prompt).toContain("feishu_thread_id: omt_topic");
     expect(prompt).toContain("feishu_root_id:   om_thread001");
     expect(prompt).toContain("同一个 task/session 的续接");
-    expect(prompt).toContain("拉完整话题历史(续接/弱指令时优先)");
+    expect(prompt).toContain("拉完整话题历史(当前消息为空/只有 @/弱指令时优先)");
     expect(prompt).toContain(
       "lark-cli im +threads-messages-list --thread omt_topic --as bot --sort asc --page-size 50 --no-reactions",
     );
@@ -1258,5 +1258,113 @@ describe("renderPrompt — promptMode: delta (批E E1)", () => {
     );
     const deltaPrompt = await renderPrompt(deltaContinuation({ agentMemory: memory }));
     expect(deltaPrompt.length).toBeLessThan(fullPrompt.length / 3);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 批F — sticky session facts (F1) + session reseed block (F2)
+// ---------------------------------------------------------------------------
+
+describe("renderPrompt — 批F sticky session + session reseed", () => {
+  it("stickySessionKey renders a session_key fact line; p2p gets chat-history-first commands with no synthetic ids", async () => {
+    const prompt = await renderPrompt(
+      makeInput({
+        botName: "Elon",
+        stickySessionKey: "p2p-oc_chat001",
+        parsed: makeParsed({ raw: { chat_type: "p2p" } as unknown as LarkMessageEvent }),
+      }),
+    );
+    expect(prompt).toContain("session_key:      p2p-oc_chat001");
+    // p2p has no topics/首楼 — chat history is the primary context command,
+    // and no command template may interpolate the synthetic key.
+    expect(prompt).toContain("拉本对话最近历史");
+    expect(prompt).toContain("+chat-messages-list --chat-id oc_chat001");
+    expect(prompt).not.toContain("拉话题首楼");
+    expect(prompt).not.toContain("/open-apis/im/v1/messages/p2p-oc_chat001");
+    expect(prompt).not.toContain("--thread p2p-oc_chat001");
+    expect(prompt).toContain("不要把 `thread_id` 当作可拉取的消息 id");
+  });
+
+  it("a card-action synthetic event carrying the sticky key as threadId still renders no dead commands", async () => {
+    // channelClient.synthesizeCardActionEvent sets root_id = cardThreads value,
+    // which for a sticky session's card is the synthetic key — parseMessage
+    // then yields threadId = "p2p-…". The chatHistoryFirst gate must catch it.
+    const prompt = await renderPrompt(
+      makeInput({
+        botName: "Elon",
+        isNewThread: false,
+        parsed: makeParsed({
+          threadId: "p2p-oc_chat001",
+          raw: { chat_type: "p2p", root_id: "p2p-oc_chat001" } as unknown as LarkMessageEvent,
+        }),
+      }),
+    );
+    expect(prompt).not.toContain("--thread p2p-oc_chat001");
+    expect(prompt).not.toContain("/open-apis/im/v1/messages/p2p-oc_chat001");
+    expect(prompt).toContain("+chat-messages-list --chat-id oc_chat001");
+  });
+
+  it("p2p scene facts: sticky claims continuity, non-sticky does not", async () => {
+    const p2pParsed = makeParsed({ raw: { chat_type: "p2p" } as unknown as LarkMessageEvent });
+    const sticky = await renderPrompt(
+      makeInput({ botName: "Elon", stickySessionKey: "p2p-oc_chat001", parsed: p2pParsed }),
+    );
+    expect(sticky).toContain("scene_type:       p2p_direct_message");
+    expect(sticky).toContain("会续接这个 session");
+    const nonSticky = await renderPrompt(makeInput({ botName: "Elon", parsed: p2pParsed }));
+    expect(nonSticky).toContain("scene_type:       p2p_direct_message");
+    expect(nonSticky).not.toContain("会续接这个 session");
+  });
+
+  it("delta continuation carries the session_key line too", async () => {
+    const prompt = await renderPrompt(
+      makeInput({
+        isNewThread: false,
+        promptMode: "delta",
+        stickySessionKey: "p2p-oc_chat001",
+        parsed: makeParsed({ raw: { chat_type: "p2p" } as unknown as LarkMessageEvent }),
+      }),
+    );
+    expect(prompt).toContain("session_key:      p2p-oc_chat001");
+    expect(prompt).toContain("<contract-anchor>");
+  });
+
+  it("sessionReseed renders the seed block with summary + transcript + pointer", async () => {
+    const prompt = await renderPrompt(
+      makeInput({
+        botName: "Elon",
+        sessionReseed: {
+          reason: "history-limit",
+          summaryExcerpt: "在推进官网逻辑梳理,已完成数据核验。",
+          transcriptTail: "ou_x: 下一步先出报告\n  好的,报告今天给。",
+          transcriptPath: "/tmp/ws/sessions/om_t/transcript.md",
+        },
+      }),
+    );
+    expect(prompt).toContain("<session-reseed>");
+    expect(prompt).toContain("已超阈值");
+    expect(prompt).toContain("不在你的上下文里");
+    expect(prompt).toContain("在推进官网逻辑梳理");
+    expect(prompt).toContain("下一步先出报告");
+    expect(prompt).toContain("/tmp/ws/sessions/om_t/transcript.md");
+    expect(prompt).toContain("把 summary.md 补到能独立看懂的程度");
+    expect(prompt).toContain("</session-reseed>");
+  });
+
+  it("sessionReseed idle-gap reason renders the idle wording; missing seed parts drop out", async () => {
+    const prompt = await renderPrompt(
+      makeInput({
+        botName: "Elon",
+        sessionReseed: { reason: "idle-gap", transcriptPath: "/tmp/t.md" },
+      }),
+    );
+    expect(prompt).toContain("空闲阈值");
+    expect(prompt).not.toContain("### 话题摘要");
+    expect(prompt).not.toContain("### 最近转录");
+  });
+
+  it("no sessionReseed input → no block (byte-stability for ordinary turns)", async () => {
+    const prompt = await renderPrompt(makeInput({ botName: "Elon" }));
+    expect(prompt).not.toContain("<session-reseed>");
   });
 });

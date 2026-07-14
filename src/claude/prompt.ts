@@ -13,6 +13,7 @@
 
 import fs from "node:fs/promises";
 import type { ParsedMessage } from "../lark/message.js";
+import { isSyntheticSessionKey } from "../lark/message.js";
 import { deriveTriggerFacts } from "../agent/triggerFacts.js";
 import { ANSWER_BEGIN_MARKER, ANSWER_END_MARKER } from "../agent/answerChannel.js";
 import type { TaskCandidate } from "../tasklist/types.js";
@@ -323,6 +324,29 @@ export interface RenderPromptInput {
    * re-anchored per turn (history retains it).
    */
   promptMode?: "full" | "delta";
+  /**
+   * 批F (F1): the handler rekeyed this turn onto a sticky p2p session key
+   * (`p2p-<chat_id>`) that differs from parsed.threadId. parsed.threadId
+   * deliberately KEEPS the real Feishu message id — every lark-cli command
+   * template in the prompt stays valid — while this field surfaces the actual
+   * session identity as a thread-context fact line so the agent understands
+   * why consecutive messages share one session/workspace dir.
+   */
+  stickySessionKey?: string;
+  /**
+   * 批F (F2): this turn runs on a freshly reseeded backend session — the
+   * thread's record and directory continue, but the model has NO in-context
+   * history. Rendered as a <session-reseed> block (reason + summary excerpt +
+   * transcript tail + full-transcript pointer) inside the FULL prompt. The
+   * handler always renders reseed turns as full prompts (isNewThread=true
+   * semantics), so the delta branch never has to consider this field.
+   */
+  sessionReseed?: {
+    reason: "history-limit" | "idle-gap";
+    summaryExcerpt?: string;
+    transcriptTail?: string;
+    transcriptPath: string;
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -713,7 +737,42 @@ async function renderAgentWorkspaceBlock(
   return lines;
 }
 
-function sceneFacts(parsed: ParsedMessage, isNewThread: boolean): {
+/**
+ * 批F (F2): the fresh-session seed block. Rendered ONLY on reseed turns
+ * (handler forces full-prompt rendering for those), right after the workspace
+ * block, so the agent knows (a) it has no in-context history, (b) what the
+ * conversation was about, and (c) where the full record lives.
+ */
+function renderSessionReseedBlock(reseed: NonNullable<RenderPromptInput["sessionReseed"]>): string[] {
+  const reasonText =
+    reseed.reason === "history-limit"
+      ? "本话题累计轮数已超阈值,继续拖全量历史不如带种子重开"
+      : "距上次活动已超过空闲阈值,大概率是新话题";
+  const lines = [
+    "<session-reseed>",
+    `本话题的后端 session 已重播种(${reasonText})。此前轮次的对话**不在你的上下文里**;以下种子帮助你延续:`,
+  ];
+  if (reseed.summaryExcerpt) {
+    lines.push("", "### 话题摘要(summary.md,你此前维护的)", "", reseed.summaryExcerpt);
+  }
+  if (reseed.transcriptTail) {
+    lines.push("", "### 最近转录(transcript.md 尾部,含用户消息与你的答复摘录)", "", reseed.transcriptTail);
+  }
+  lines.push(
+    "",
+    `完整转录可自行 Read: ${reseed.transcriptPath}`,
+    "种子若不足以回答当前消息,优先用 lark-cli 拉取聊天/话题历史补齐,不要凭空猜此前的结论。",
+    "本轮结束前顺手把 summary.md 补到能独立看懂的程度——它是下次重播种的种子质量上限。",
+    "</session-reseed>",
+  );
+  return lines;
+}
+
+function sceneFacts(
+  parsed: ParsedMessage,
+  isNewThread: boolean,
+  stickySession: boolean,
+): {
   sceneType: string;
   chatType: string;
   hint: string;
@@ -721,6 +780,21 @@ function sceneFacts(parsed: ParsedMessage, isNewThread: boolean): {
   const raw = parsed.raw as { root_id?: unknown; chat_type?: unknown };
   const hasRoot = typeof raw.root_id === "string" && raw.root_id.length > 0;
   const chatType = typeof raw.chat_type === "string" ? raw.chat_type : "unknown";
+  // 批F (F1): p2p (单聊) gets its own scene — the group wording ("在群里 @
+  // 你") was actively wrong there. Continuity is only claimed when the bot
+  // actually runs sticky sessions; without the flag every top-level p2p
+  // message is its own session (the historical behavior).
+  if (chatType === "p2p") {
+    return {
+      sceneType: "p2p_direct_message",
+      chatType,
+      hint: isNewThread
+        ? stickySession
+          ? "用户在单聊里给你发消息。这是一个新 session 的开始;同一单聊的后续顶层消息会续接这个 session。"
+          : "用户在单聊里给你发消息。"
+        : "用户在单聊里继续对话;这是同一个 session 的续接。",
+    };
+  }
   if (!hasRoot && isNewThread) {
     return {
       sceneType: "group_mention_opens_topic",
@@ -786,8 +860,13 @@ export async function renderPrompt(input: RenderPromptInput): Promise<string> {
     .map((a) => a.fileKey);
 
   const portRange = `${conventions.portRangeStart}-${conventions.portRangeEnd}`;
-  const scene = sceneFacts(parsed, isNewThread);
+  const scene = sceneFacts(parsed, isNewThread, input.stickySessionKey != null);
   const trigger = deriveTriggerFacts(parsed, isNewThread, larkCliProfile);
+  // 批F (F1): surfaced in <thread-context> when the session key diverges from
+  // the trigger message id (sticky p2p sessions).
+  const sessionKeyLine = input.stickySessionKey
+    ? [`session_key:      ${input.stickySessionKey} (单聊粘连 session,同一单聊的顶层消息共享)`]
+    : [];
   const isAgentWorkspace = conventions.runtime === "agent_workspace";
   // Legacy: repoCachePath means bridge-prepared cache/worktree.
   // Agent workspace: defaultProjectSlug/url are only pointers.
@@ -810,6 +889,10 @@ export async function renderPrompt(input: RenderPromptInput): Promise<string> {
       : [];
   const taskRootBlock = taskRoot ? renderTaskRootBlock(taskRoot) : [];
   const runtimeWarningsBlock = renderRuntimeWarningsBlock(runtimeWarnings);
+  // 批F (F2): fresh-session seed — only ever non-empty on reseed turns.
+  const sessionReseedBlock = input.sessionReseed
+    ? renderSessionReseedBlock(input.sessionReseed)
+    : [];
 
   // 批E (E1): delta continuation prompt — dynamic facts only. Everything
   // static (contract, L2 memory, workspace block, peers, rules) is already in
@@ -821,6 +904,7 @@ export async function renderPrompt(input: RenderPromptInput): Promise<string> {
       ...(runtimeWarningsBlock.length > 0 ? [...runtimeWarningsBlock, ""] : []),
       "<thread-context>",
       `thread_id:        ${parsed.threadId}`,
+      ...sessionKeyLine,
       `message_id:       ${parsed.messageId}`,
       `chat_id:          ${parsed.chatId}`,
       `sender:           ${parsed.senderOpenId}`,
@@ -929,6 +1013,34 @@ export async function renderPrompt(input: RenderPromptInput): Promise<string> {
   const threadHistoryId = trigger.feishuThreadId ?? parsed.threadId;
   const topicHistoryCommand = `lark-cli im +threads-messages-list --thread ${threadHistoryId}${profileFlag} --as bot --sort asc --page-size 50 --no-reactions`;
   const chatHistoryFallbackCommand = `lark-cli im +chat-messages-list --chat-id ${parsed.chatId}${profileFlag} --as bot --sort desc --page-size 20 --no-reactions`;
+  // 批F (F1) adversarial-review fix: two cases where the topic-first command
+  // set hands the agent commands that can only fail —
+  //   (a) p2p chats have no real topics: threads-messages-list against a bare
+  //       om_ id returns "thread ID not found" every time;
+  //   (b) a card-button click on a sticky session's card synthesizes
+  //       root_id = the sticky key, so parsed.threadId itself is synthetic
+  //       ("p2p-…") and interpolating it as a message id guarantees a 400.
+  // Both get chat history as the PRIMARY context command instead. The topic
+  // command survives only when a real omt_ topic id is present.
+  const chatHistoryFirst =
+    scene.chatType === "p2p" || isSyntheticSessionKey(parsed.threadId);
+  const historyCommandLines = chatHistoryFirst
+    ? [
+        `- 拉本对话最近历史(当前消息为空/只有 @/弱指令时优先):`,
+        `    ${chatHistoryFallbackCommand}`,
+        ...(trigger.feishuThreadId
+          ? [
+              `- 拉话题面板内历史(本消息在话题面板里,feishu_thread_id 可用):`,
+              `    ${topicHistoryCommand}`,
+            ]
+          : []),
+      ]
+    : [
+        `- 拉完整话题历史(当前消息为空/只有 @/弱指令时优先):`,
+        `    ${topicHistoryCommand}`,
+        `- 话题历史找不到时,拉最近群消息兜底:`,
+        `    ${chatHistoryFallbackCommand}`,
+      ];
   const weakTopicRule =
     "**话题/回复上下文规则**:飞书 topic 或对某条消息的 reply 都是本 session 的协作上下文。若当前消息为空、只有 @、retry、继续、看上面、你知道吗、或没有新的明确操作对象,**先拉完整上下文历史**,找到最近一条有实质内容的用户消息和已有 bot 回复,再判断下一步;不要只因为当前触发消息为空或只有 @ 就回复“没有新指令”。";
   const topicHistoryFallbackRule =
@@ -947,6 +1059,7 @@ export async function renderPrompt(input: RenderPromptInput): Promise<string> {
       ...(runtimeWarningsBlock.length > 0 ? [...runtimeWarningsBlock, ""] : []),
       "<thread-context>",
       `thread_id:        ${parsed.threadId}`,
+      ...sessionKeyLine,
       `message_id:       ${parsed.messageId}`,
       `chat_id:          ${parsed.chatId}`,
       `sender:           ${parsed.senderOpenId}`,
@@ -985,12 +1098,13 @@ export async function renderPrompt(input: RenderPromptInput): Promise<string> {
       `- 可用端口范围:  ${portRange}`,
       "",
       "可用工具(命令行):",
-      `- 拉话题首楼(包含运营最初需求文本 + 附件 file_key + 飞书文档链接):`,
-      `    lark-cli api GET /open-apis/im/v1/messages/${parsed.threadId}${profileFlag} --as bot`,
-      `- 拉完整话题历史(当前消息为空/只有 @/弱指令时优先):`,
-      `    ${topicHistoryCommand}`,
-      `- 话题历史找不到时,拉最近群消息兜底:`,
-      `    ${chatHistoryFallbackCommand}`,
+      ...(chatHistoryFirst
+        ? []
+        : [
+            `- 拉话题首楼(包含运营最初需求文本 + 附件 file_key + 飞书文档链接):`,
+            `    lark-cli api GET /open-apis/im/v1/messages/${parsed.threadId}${profileFlag} --as bot`,
+          ]),
+      ...historyCommandLines,
       "- 拉飞书云文档为 markdown:",
       `    lark-cli docs +get <doc-url>${profileFlag}`,
       "- 取本条消息的附件/内联图(post 内联图不在上面 attachments/images 里)、拉话题历史:",
@@ -998,7 +1112,9 @@ export async function renderPrompt(input: RenderPromptInput): Promise<string> {
       "- glab / gh / git API",
       "- pnpm / npm",
       "",
-      "**重要**:`thread_id` 就是话题首楼的 message_id。如果当前消息 attachments/feishu_doc_links 为空,说明运营把素材放在首楼,**先拉首楼看运营原始需求**,再决定下一步。",
+      chatHistoryFirst
+        ? "**重要**:这是单聊/粘连 session 场景,上下文历史用上面的 chat-messages-list 拉取;不要把 `thread_id` 当作可拉取的消息 id 使用。"
+        : "**重要**:`thread_id` 就是话题首楼的 message_id。如果当前消息 attachments/feishu_doc_links 为空,说明运营把素材放在首楼,**先拉首楼看运营原始需求**,再决定下一步。",
       weakTopicRule,
       topicHistoryFallbackRule,
       topicHistoryFailureRule,
@@ -1007,6 +1123,7 @@ export async function renderPrompt(input: RenderPromptInput): Promise<string> {
       "",
       ...stateContract,
       ...(workspaceBlock.length > 0 ? ["", ...workspaceBlock] : []),
+      ...(sessionReseedBlock.length > 0 ? ["", ...sessionReseedBlock] : []),
       ...(peersBlock.length > 0 ? ["", ...peersBlock] : []),
       ...(turnTakingBlock.length > 0 ? ["", ...turnTakingBlock] : []),
       ...(taskHandleBlock.length > 0 ? ["", ...taskHandleBlock] : []),
@@ -1023,6 +1140,7 @@ export async function renderPrompt(input: RenderPromptInput): Promise<string> {
     ...(runtimeWarningsBlock.length > 0 ? [...runtimeWarningsBlock, ""] : []),
     "<thread-context>",
     `thread_id:        ${parsed.threadId}`,
+    ...sessionKeyLine,
     `message_id:       ${parsed.messageId}`,
     `chat_id:          ${parsed.chatId}`,
     `sender:           ${parsed.senderOpenId}`,
@@ -1053,10 +1171,7 @@ export async function renderPrompt(input: RenderPromptInput): Promise<string> {
     "可用工具(命令行):",
     `- 拉当前触发消息:`,
     `    ${trigger.rawMessagePointer}`,
-    `- 拉完整话题历史(续接/弱指令时优先):`,
-    `    ${topicHistoryCommand}`,
-    `- 话题历史找不到时,拉最近群消息兜底:`,
-    `    ${chatHistoryFallbackCommand}`,
+    ...historyCommandLines,
     "",
     weakTopicRule,
     topicHistoryFallbackRule,
@@ -1066,6 +1181,7 @@ export async function renderPrompt(input: RenderPromptInput): Promise<string> {
     "",
     ...stateContract,
     ...(workspaceBlock.length > 0 ? ["", ...workspaceBlock] : []),
+    ...(sessionReseedBlock.length > 0 ? ["", ...sessionReseedBlock] : []),
     ...(peersBlock.length > 0 ? ["", ...peersBlock] : []),
     ...(turnTakingBlock.length > 0 ? ["", ...turnTakingBlock] : []),
     ...(taskHandleBlock.length > 0 ? ["", ...taskHandleBlock] : []),

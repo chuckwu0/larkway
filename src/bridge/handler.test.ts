@@ -5316,3 +5316,46 @@ describe("run() /stop — kill in-flight turn, drop queue, keep session (BL-42)"
     expect(unhandled).toHaveLength(0);
   });
 });
+
+// ---------------------------------------------------------------------------
+// 批F (F1) — canCoalesceFollowup under sticky p2p session keys
+// ---------------------------------------------------------------------------
+
+describe("canCoalesceFollowup (批F sticky p2p keys)", async () => {
+  const { canCoalesceFollowup } = await import("./handler.js");
+  const textContent = (t: string) => JSON.stringify({ text: t });
+  const mkP2p = (over: Record<string, unknown> = {}) => ({
+    message_id: "om_p1",
+    chat_id: "oc_dm1",
+    chat_type: "p2p",
+    sender_id: "ou_alice",
+    content: textContent("first ask"),
+    create_time: "1700000000000",
+    ...over,
+  });
+
+  it("two top-level p2p messages coalesce when sticky is ON (one conversation, one session)", () => {
+    const primary = mkP2p();
+    const followup = mkP2p({ message_id: "om_p2", content: textContent("补充:优先移动端") });
+    expect(
+      canCoalesceFollowup(primary as never, followup as never, { p2pStickySession: true }),
+    ).toBe(true);
+  });
+
+  it("the same two messages do NOT coalesce when sticky is OFF (historical per-message sessions)", () => {
+    const primary = mkP2p();
+    const followup = mkP2p({ message_id: "om_p2", content: textContent("补充:优先移动端") });
+    expect(canCoalesceFollowup(primary as never, followup as never)).toBe(false);
+    expect(
+      canCoalesceFollowup(primary as never, followup as never, { p2pStickySession: false }),
+    ).toBe(false);
+  });
+
+  it("sticky never crosses chats", () => {
+    const primary = mkP2p();
+    const followup = mkP2p({ message_id: "om_p2", chat_id: "oc_dm2" });
+    expect(
+      canCoalesceFollowup(primary as never, followup as never, { p2pStickySession: true }),
+    ).toBe(false);
+  });
+});

@@ -386,7 +386,18 @@ export function synthesizeCardActionEvent(
  * The RAW `message.content` (text/post JSON string) + `mentions` are preserved
  * verbatim so lark/message.ts parses attachments / post text / @ exactly as before.
  */
-export function channelMsgToLarkEvent(msg: ChannelNormalizedMessage): LarkMessageEvent | null {
+export function channelMsgToLarkEvent(
+  msg: ChannelNormalizedMessage,
+  /**
+   * 批F (F1) adversarial-review fix: fallback chat_type when neither the raw
+   * event nor the SDK-normalized shape carries one (the im/v1/messages LIST
+   * item — the gap-fill source — has no chat_type field). deriveSessionKey's
+   * sticky branch keys off chat_type === "p2p", and its contract requires a
+   * live delivery and its gap-fill replay to derive the SAME session key —
+   * so the replayer passes the chat type it learned from live traffic here.
+   */
+  fallbackChatType?: string,
+): LarkMessageEvent | null {
   const raw = msg.raw as
     | { event?: { message?: Record<string, unknown>; sender?: { sender_id?: { open_id?: string } } } }
     | undefined;
@@ -439,7 +450,7 @@ export function channelMsgToLarkEvent(msg: ChannelNormalizedMessage): LarkMessag
   return {
     message_id,
     chat_id,
-    chat_type: (m?.["chat_type"] as string) ?? msg.chatType ?? "group",
+    chat_type: (m?.["chat_type"] as string) ?? msg.chatType ?? fallbackChatType ?? "group",
     thread_id,
     root_id,
     parent_id,
@@ -529,6 +540,13 @@ export class ChannelClient {
    * search space.
    */
   private readonly recentlySeenChatIds = new Set<string>();
+  /**
+   * 批F (F1): chat_id → chat_type learned from live deliveries. Gap-fill's
+   * source (im/v1/messages list items) carries no chat_type, but the sticky
+   * session key derivation needs it — see channelMsgToLarkEvent's
+   * fallbackChatType param. In-memory only (bounded by chats served).
+   */
+  private readonly chatTypesById = new Map<string, string>();
   /**
    * PER-CHAT unresolved gapFill windows: chatId → the OLDEST windowStart (ms) for
    * which that chat's lark-cli history pull still failed after all retries. On a
@@ -785,6 +803,15 @@ export class ChannelClient {
         return;
       }
       this.noteSeenChat(ev.chat_id);
+      // 批F (F1): learn the chat's type from live traffic so gap-fill
+      // reconstruction (whose source list items carry no chat_type) derives
+      // the same session key a live delivery would — in-memory only; after a
+      // cold restart the pre-live-traffic fallback stays "group" (safe
+      // degradation: the replayed p2p turn runs per-message, exactly the
+      // pre-sticky behavior).
+      if (typeof ev.chat_type === "string" && ev.chat_type.length > 0) {
+        this.chatTypesById.set(ev.chat_id, ev.chat_type);
+      }
       // Guard against double-delivery without permanently marking seen: if this
       // message is already handled (seen) or in-flight, skip. Otherwise mark it
       // in-flight so gap-fill won't also deliver it while the turn runs. It is
@@ -1120,14 +1147,19 @@ export class ChannelClient {
           // lark-cli +chat-messages-list returns items in the same shape as
           // im.message.receive_v1 → channelMsgToLarkEvent can parse them via
           // its raw fallback path.
-          const ev = channelMsgToLarkEvent({
-            raw: {
-              event: {
-                message: m,
-                sender: { sender_id: { open_id: m["sender"] as string | undefined } },
+          const ev = channelMsgToLarkEvent(
+            {
+              raw: {
+                event: {
+                  message: m,
+                  sender: { sender_id: { open_id: m["sender"] as string | undefined } },
+                },
               },
             },
-          });
+            // 批F (F1): list items carry no chat_type — use the type learned
+            // from this chat's live traffic so sticky-key derivation agrees.
+            this.chatTypesById.get((m["chat_id"] as string | undefined) ?? ""),
+          );
           if (!ev) {
             // Fall back to direct field mapping from the list item shape.
             const fallbackEv: LarkMessageEvent | null = (() => {
@@ -1139,7 +1171,11 @@ export class ChannelClient {
               return {
                 message_id: mid,
                 chat_id: cid,
-                chat_type: (m["chat_type"] as string | undefined) ?? "group",
+                // 批F (F1): same live-learned fallback as the primary path.
+                chat_type:
+                  (m["chat_type"] as string | undefined) ??
+                  this.chatTypesById.get(cid) ??
+                  "group",
                 thread_id:
                   (m["thread_id"] as string | undefined) ??
                   (isThreadReply ? recoveredThread ?? undefined : undefined) ??

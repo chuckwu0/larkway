@@ -372,6 +372,21 @@ export class ClaudeProcessPool implements AgentRunner {
       }
     }
 
+    // 批F (F2 session reseed): a forced-fresh turn must NOT continue this
+    // thread's live warm process — that child's in-memory conversation IS the
+    // old session, and the pool key deliberately excludes sessionId, so the
+    // same-key lookup below would silently hand the old context back. Retire
+    // the thread's entry first; the fresh no-resume turn then goes through
+    // normal placement and may adopt the blank standby. The bridge's serial
+    // queue guarantees no in-flight turn exists for this thread here.
+    if (opts.forceFreshSession) {
+      for (const existing of this.#entries.values()) {
+        if (existing.threadId === threadId && !existing.blank) {
+          this.#destroyEntry(existing, "session reseed — forced fresh session for this thread (批F F2)");
+        }
+      }
+    }
+
     let entry = this.#entries.get(key);
     if (entry == null && opts.resumeSessionId == null) {
       // 批D blank adoption: a NEW session (nothing to --resume) whose spawn

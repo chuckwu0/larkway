@@ -37,6 +37,30 @@ function renderSummaryPlaceholder(): string {
   ].join("\n");
 }
 
+/**
+ * 批F (F2): strip the bridge-written placeholder lines from summary.md,
+ * returning only agent-authored content (trimmed; "" when the file is still
+ * the untouched placeholder). Adversarial-review fix: the seed builder
+ * originally skipped the WHOLE summary when the file merely CONTAINED the
+ * placeholder sentence — but nothing instructs the agent to delete the
+ * placeholder, so an agent that appends its real summary below it would have
+ * its seed silently dropped on every reseed. Line-wise removal keeps the
+ * agent's content regardless of where it sits relative to the placeholder.
+ */
+export function stripSummaryPlaceholder(summary: string): string {
+  const placeholderLines = new Set(
+    renderSummaryPlaceholder()
+      .split("\n")
+      .map((line) => line.trim())
+      .filter((line) => line.length > 0),
+  );
+  return summary
+    .split(/\r?\n/)
+    .filter((line) => !placeholderLines.has(line.trim()))
+    .join("\n")
+    .trim();
+}
+
 function renderMemoryCandidatesPlaceholder(): string {
   return [
     "# Memory Candidates",
@@ -128,4 +152,38 @@ export async function ensureSessionArtifacts(
     `${renderTranscriptEntry(input)}\n`,
     "utf8",
   );
+}
+
+/** Answer excerpt cap for the per-turn transcript record (code points). */
+const TRANSCRIPT_ANSWER_MAX_CHARS = 1500;
+
+/**
+ * 批F (F2): append the turn's final user-facing answer to transcript.md.
+ *
+ * Until now transcript.md recorded ONLY the user side (trigger facts + text);
+ * the agent's answers lived solely in the Feishu card and the latest
+ * state.json `last_message` — so a session-reseed seed built from the
+ * transcript would replay questions with no answers. Called by the handler at
+ * finalize, best-effort (a failed append never affects the turn outcome).
+ */
+export async function appendTranscriptAnswer(
+  sessionPath: string,
+  answer: string,
+  outcome: "completed" | "failed",
+): Promise<void> {
+  const trimmed = answer.trim();
+  if (trimmed.length === 0) return;
+  const chars = Array.from(trimmed);
+  const excerpt =
+    chars.length <= TRANSCRIPT_ANSWER_MAX_CHARS
+      ? trimmed
+      : `${chars.slice(0, TRANSCRIPT_ANSWER_MAX_CHARS).join("")}\n…(已截断)`;
+  const entry = [
+    `### Agent Answer (${outcome})`,
+    "",
+    indentBlock(excerpt),
+    "",
+    "",
+  ].join("\n");
+  await fs.appendFile(path.join(sessionPath, "transcript.md"), entry, "utf8");
 }

@@ -1107,3 +1107,67 @@ describe("ClaudeProcessPool — blank standby prewarm (批D, adversarial-review 
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// 批F (F2) — forceFreshSession retires the thread's warm process
+// ---------------------------------------------------------------------------
+
+describe("ClaudeProcessPool — forceFreshSession (批F F2 session reseed)", () => {
+  it("retires the SAME-key warm process and spawns fresh — the old in-memory session must not leak into the reseeded turn", async () => {
+    const pool = new ClaudeProcessPool({ botId: "bot-a" });
+
+    const handleA = pool.run({ prompt: "first", cwd: "/wt/thread-1", threadId: "thread-1" });
+    await flush();
+    const childA = spawnedChildren[0]!;
+    childA.stdout.write(systemInit("old-session") + "\n");
+    childA.stdout.write(resultLine("success") + "\n");
+    await flush();
+    await handleA.done;
+    expect(childA.killed).toBe(false);
+
+    // Reseed turn: identical key (same cwd/model/effort), forceFreshSession set,
+    // no resumeSessionId — without the flag this would silently reuse childA.
+    const handleB = pool.run({
+      prompt: "reseeded",
+      cwd: "/wt/thread-1",
+      threadId: "thread-1",
+      forceFreshSession: true,
+    });
+    await flush();
+
+    expect(childA.killed).toBe(true);
+    expect(spawnedChildren).toHaveLength(2);
+    const childB = spawnedChildren[1]!;
+    expect(handleB.pid).toBe(childB.pid);
+    // The fresh spawn must NOT carry --resume.
+    expect(spawnArgs[1]!.join(" ")).not.toContain("--resume");
+
+    childB.stdout.write(systemInit("new-session") + "\n");
+    childB.stdout.write(resultLine("success") + "\n");
+    await flush();
+    const resultB = await handleB.done;
+    expect(resultB.pooled).toBe(true);
+  });
+
+  it("without the flag, the same-key turn keeps reusing the warm process (baseline unchanged)", async () => {
+    const pool = new ClaudeProcessPool({ botId: "bot-a" });
+    const handleA = pool.run({ prompt: "first", cwd: "/wt/t2", threadId: "t2" });
+    await flush();
+    const childA = spawnedChildren[0]!;
+    childA.stdout.write(systemInit("s") + "\n");
+    childA.stdout.write(resultLine("success") + "\n");
+    await flush();
+    await handleA.done;
+
+    const handleB = pool.run({ prompt: "second", cwd: "/wt/t2", threadId: "t2" });
+    await flush();
+    expect(spawnedChildren).toHaveLength(1);
+    childA.stdout.write(resultLine("success") + "\n");
+    await flush();
+    const r = await handleB.done;
+    // Reuse is proven by the single spawned child; resumeMode telemetry is
+    // only stamped on resumeSessionId turns (bridge continuation), not here.
+    expect(r.pooled).toBe(true);
+    expect(spawnedChildren).toHaveLength(1);
+  });
+});

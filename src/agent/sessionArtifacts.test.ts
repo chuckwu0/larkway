@@ -122,3 +122,35 @@ describe("ensureSessionArtifacts", () => {
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// 批F (F2) — stripSummaryPlaceholder
+// ---------------------------------------------------------------------------
+
+import { stripSummaryPlaceholder } from "./sessionArtifacts.js";
+
+describe("stripSummaryPlaceholder (批F F2 reseed seed)", () => {
+  const placeholder = [
+    "# Session Summary",
+    "",
+    "Bridge creates this placeholder only.",
+    "The Agent owns any task summary, decisions, and next-step notes for this Feishu topic.",
+    "",
+  ].join("\n");
+
+  it("untouched placeholder → empty (no seed signal)", () => {
+    expect(stripSummaryPlaceholder(placeholder)).toBe("");
+  });
+
+  it("agent APPENDED below the placeholder → agent content survives (the review-caught bug)", () => {
+    const appended = `${placeholder}\n## 进展\n- 官网逻辑已核验,报告已交付`;
+    const out = stripSummaryPlaceholder(appended);
+    expect(out).toContain("官网逻辑已核验");
+    expect(out).not.toContain("Bridge creates this placeholder");
+  });
+
+  it("agent REPLACED the file entirely → returned verbatim (trimmed)", () => {
+    const replaced = "## 任务\n查转化影响\n## 结论\n下降 2%,已定位到改版";
+    expect(stripSummaryPlaceholder(replaced)).toBe(replaced);
+  });
+});

@@ -385,6 +385,8 @@ export function parseMessage(event: LarkMessageEvent): ParsedMessage {
     // This makes session continuity match what the user expects: "this whole
     // back-and-forth is one task". Field name stays threadId for compatibility,
     // but its semantic is now "session key", not strictly Feishu thread_id.
+    // 批F (F1): p2p sticky rekeying happens LATER, in the handler, via
+    // deriveSessionKey below — parseMessage stays config-free.
     threadId: (typeof event.root_id === "string" && event.root_id)
                 ? event.root_id
                 : event.message_id,
@@ -403,6 +405,59 @@ export function parseMessage(event: LarkMessageEvent): ParsedMessage {
     feishuDocLinks,
     raw: event,
   };
+}
+
+/**
+ * 批F (F1) — session-key derivation options.
+ */
+export interface SessionKeyOptions {
+  /**
+   * P2P sticky sessions: in a p2p (single) chat, every PURE top-level message
+   * (no root_id, no parent_id) maps to one chat-level session key
+   * `p2p-<chat_id>` instead of its own message_id — so a 1:1 conversation is
+   * ONE continuous agent session rather than a new cold session per message.
+   * Explicit thread replies (root_id) keep their topic's session; quote
+   * replies (parent_id) keep today's per-message/v4-task-rekey behavior.
+   */
+  p2pStickySession?: boolean;
+}
+
+/**
+ * Derive the larkway session key for a raw message event.
+ *
+ * MUST remain a PURE function of the event itself — no clocks, no store
+ * lookups. Live deliveries, gap-fill replays, and card-button synthetic
+ * events all re-derive this key independently and must always agree, and the
+ * serial-queue key in handler.run() must serialize everything that can land
+ * on one session. Time-based session rotation is therefore NOT part of the
+ * key — it is a session-reseed decision (批F F2) made against the stable key.
+ *
+ * The `p2p-` prefix stays within [A-Za-z0-9_-]: resolveAgentSessionPath and
+ * the housekeeping GC hard-require that charset for session dir names.
+ */
+export function deriveSessionKey(
+  event: Pick<LarkMessageEvent, "message_id" | "root_id" | "parent_id" | "chat_id" | "chat_type">,
+  opts?: SessionKeyOptions,
+): string {
+  const rootId = typeof event.root_id === "string" && event.root_id ? event.root_id : undefined;
+  if (rootId) return rootId;
+  const parentId =
+    typeof event.parent_id === "string" && event.parent_id ? event.parent_id : undefined;
+  if (
+    opts?.p2pStickySession === true &&
+    parentId === undefined &&
+    event.chat_type === "p2p" &&
+    typeof event.chat_id === "string" &&
+    event.chat_id.length > 0
+  ) {
+    return `p2p-${event.chat_id}`;
+  }
+  return event.message_id;
+}
+
+/** Whether a session key is a synthetic sticky key (not a real Feishu message id). */
+export function isSyntheticSessionKey(key: string): boolean {
+  return key.startsWith("p2p-");
 }
 
 function senderOpenIdOf(senderId: LarkMessageEvent["sender_id"]): string {

@@ -54,6 +54,18 @@ export interface RunOptions {
   prompt: string;
   resumeSessionId?: string;
   /**
+   * 批F (F2 session reseed): this turn must start a genuinely FRESH backend
+   * session for its thread. Meaningful only to ClaudeProcessPool, whose
+   * warm-process cache key deliberately excludes the session id — without
+   * this flag a live warm entry would silently continue the OLD session even
+   * though the bridge passed no resumeSessionId. The pool retires the
+   * thread's live entry first (the fresh turn may then adopt the blank
+   * standby). Cold runners and CodexProcessPool need no signal: for them,
+   * `resumeSessionId: undefined` alone already means a brand-new session.
+   * Callers setting this must also omit resumeSessionId.
+   */
+  forceFreshSession?: boolean;
+  /**
    * Permission posture for the agent subprocess. The words are CLAUDE
    * semantics; each runner translates for its backend — note codex maps
    * everything except "ask" to danger-full-access (there is no codex

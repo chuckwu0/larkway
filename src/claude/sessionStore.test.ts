@@ -433,3 +433,44 @@ describe("BL-38 consecutiveStuckCount", () => {
     expect(store.get("om_old", "bot-a")?.consecutiveStuckCount).toBeUndefined();
   });
 });
+
+// ---------------------------------------------------------------------------
+// 批F (F2) — turnCount persistence
+// ---------------------------------------------------------------------------
+
+describe("SessionStore turnCount (批F F2 reseed accounting)", () => {
+  it("persists a positive turnCount and round-trips it through disk", async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), "larkway-store-"));
+    const file = path.join(dir, "sessions.json");
+    const store = await SessionStore.load(file);
+    await store.put({
+      threadId: "p2p-oc_x",
+      sessionId: "sess-1",
+      botId: "elon",
+      createdTs: 1,
+      lastActiveTs: 2,
+      turnCount: 7,
+    });
+    const reloaded = await SessionStore.load(file);
+    expect(reloaded.get("p2p-oc_x", "elon")?.turnCount).toBe(7);
+  });
+
+  it("turnCount: 0/undefined is not persisted (same only-when-positive rule as the BL-38 counter)", async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), "larkway-store-"));
+    const file = path.join(dir, "sessions.json");
+    const store = await SessionStore.load(file);
+    await store.put({
+      threadId: "om_t",
+      sessionId: "sess-1",
+      botId: "elon",
+      createdTs: 1,
+      lastActiveTs: 2,
+      turnCount: 0,
+    });
+    const raw = JSON.parse(await readFile(file, "utf8")) as {
+      records: Record<string, Record<string, unknown>>;
+    };
+    const rec = Object.values(raw.records)[0]!;
+    expect("turnCount" in rec).toBe(false);
+  });
+});

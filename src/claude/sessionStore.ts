@@ -103,6 +103,18 @@ export interface SessionRecord {
    * non-stuck thread = 0 (backward compatible; only persisted when > 0).
    */
   consecutiveStuckCount?: number;
+  /**
+   * 批F (F2 session reseed): count of COMPLETED turns on this session since
+   * it was created or last reseeded. Incremented by the handler's write-back
+   * on every turn that reported a sessionId; reset to 1 by a reseed turn (the
+   * reseed turn itself ran on the fresh session). When it reaches the bot's
+   * `sessionReseedTurns` threshold, the next turn starts a fresh backend
+   * session seeded from summary.md + the transcript tail instead of resuming
+   * the ever-growing history. Absent on records written before this field
+   * existed = 0 (those long-lived sessions reseed once they accrue the
+   * threshold from now on).
+   */
+  turnCount?: number;
 }
 
 /** The shape actually persisted to disk — botId required. */
@@ -116,6 +128,7 @@ interface StoredRecord {
   rootText?: string;
   chatId?: string;
   consecutiveStuckCount?: number;
+  turnCount?: number;
 }
 
 interface StoreFile {
@@ -375,6 +388,8 @@ export class SessionStore {
       // BL-38: only persist when > 0 — a 0/undefined counter is a clean thread,
       // so passing consecutiveStuckCount: 0 naturally clears the field on reset.
       ...(record.consecutiveStuckCount ? { consecutiveStuckCount: record.consecutiveStuckCount } : {}),
+      // 批F (F2): same only-when-positive persistence as the BL-38 counter.
+      ...(record.turnCount ? { turnCount: record.turnCount } : {}),
     };
     this.#map.set(key, stored);
     await this.#flush();
@@ -502,6 +517,7 @@ function isStoredRecord(value: unknown): value is StoredRecord {
     typeof v["lastActiveTs"] === "number" &&
     (v["senderOpenId"] === undefined || typeof v["senderOpenId"] === "string") &&
     (v["rootText"] === undefined || typeof v["rootText"] === "string") &&
-    (v["chatId"] === undefined || typeof v["chatId"] === "string")
+    (v["chatId"] === undefined || typeof v["chatId"] === "string") &&
+    (v["turnCount"] === undefined || typeof v["turnCount"] === "number")
   );
 }

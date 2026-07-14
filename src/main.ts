@@ -33,6 +33,7 @@ import { ClaudeProcessPool, reapOrphanedWarmClaudeProcesses } from "./claude/poo
 import { CodexRunner } from "./codex/runner.js";
 import { CodexProcessPool, reapOrphanedWarmProcess } from "./codex/pool.js";
 import { ensureLarkCliProfile, deriveLarkCliProfile } from "./lark/profileBootstrap.js";
+import { isSyntheticSessionKey } from "./lark/message.js";
 import { createCachedRosterResolver } from "./lark/rosterResolver.js";
 import { checkWorkspacePermissionGrant } from "./agent/permissionGate.js";
 import { runtimeRequirementsForBots } from "./runtimeRequirements.js";
@@ -579,6 +580,19 @@ async function runV2Mode({
           store: taskHandleStore,
           client: taskListClient,
           enqueueSyntheticTurn: (turn) => {
+            // 批F (F1) known v1 trade-off: a claim recorded from a sticky p2p
+            // session has a synthetic threadId (`p2p-<chat>`) — there is no
+            // real message id to anchor the wake-up reply on (anchoring on a
+            // fake id 400s; that exact bug shipped once, see below). Skip the
+            // synthetic turn; lifecycle writeback still works via task
+            // comments, only the in-chat wake-up card is lost.
+            if (isSyntheticSessionKey(turn.threadId)) {
+              console.info(
+                `[larkway] bot "${bot.id}": skipping comment-relay wake-up for sticky-session claim ` +
+                  `thread=${turn.threadId} (no real message id to anchor a reply on)`,
+              );
+              return;
+            }
             client.enqueueSyntheticEvent({
               message_id: `synthetic-task-comment-${turn.threadId}-${Date.now()}`,
               // Real-deployment bug fix: message_id above is a fake string
@@ -676,6 +690,15 @@ async function runV2Mode({
               // but this closure is only invoked at poll time.
               getOwnThreadReceivedAt: (threadId) => handlersByBotId.get(bot.id)?.getThreadReceivedAt(threadId),
               enqueueNudgeTurn: (turn) => {
+                // 批F (F1): same sticky-session guard as CommentPoller's
+                // enqueueSyntheticTurn above — no real message id to anchor on.
+                if (isSyntheticSessionKey(turn.threadId)) {
+                  console.info(
+                    `[larkway] bot "${bot.id}": skipping stall nudge for sticky-session claim ` +
+                      `thread=${turn.threadId} (no real message id to anchor a reply on)`,
+                  );
+                  return;
+                }
                 client.enqueueSyntheticEvent({
                   message_id: `synthetic-task-stall-${turn.threadId}-${Date.now()}`,
                   // Real-deployment bug fix (mini): message_id above is a fake
@@ -821,6 +844,9 @@ async function runV2Mode({
         model: bot.model,
         effort: bot.effort,
         promptMode: bot.promptMode,
+        p2pStickySession: bot.p2pStickySession,
+        sessionReseedTurns: bot.sessionReseedTurns,
+        p2pStickyIdleMs: bot.p2pStickyIdleMs,
         cot: bot.cot,
         cotSurface: bot.cotSurface,
       },

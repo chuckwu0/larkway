@@ -24,7 +24,14 @@ import path from "node:path";
 import type { InboundClient } from "../lark/transport.js";
 import type { CardRenderer } from "../lark/card.js";
 import type { SessionStore } from "../claude/sessionStore.js";
-import { isStopCommand, parseMessage, parseTodoShareContent } from "../lark/message.js";
+import {
+  deriveSessionKey,
+  isStopCommand,
+  isSyntheticSessionKey,
+  parseMessage,
+  parseTodoShareContent,
+  type SessionKeyOptions,
+} from "../lark/message.js";
 import { buildTopicDeepLink, realTopicThreadId, type MessageLookupClient } from "../lark/messageLookupClient.js";
 import { renderPrompt } from "../claude/prompt.js";
 import { remapPeersToLiveRoster, type LiveRosterResolver } from "../lark/rosterResolver.js";
@@ -32,7 +39,11 @@ import type { PeerBot, RepoRef } from "../claude/prompt.js";
 import { createRunner } from "../agent/runner.js";
 import type { PerfMarkerName } from "../agent/runner.js";
 import type { BotConfig } from "../config/botLoader.js";
-import { ensureSessionArtifacts } from "../agent/sessionArtifacts.js";
+import {
+  appendTranscriptAnswer,
+  ensureSessionArtifacts,
+  stripSummaryPlaceholder,
+} from "../agent/sessionArtifacts.js";
 import { ensureAgentWorkspace } from "../agent/workspaceStore.js";
 import {
   computeMtimeFacts,
@@ -122,11 +133,46 @@ const COT_BUBBLE_CREATE_BUDGET_MS = 3_000;
  * unparseable override falls back to the default.
  */
 const DEFAULT_STUCK_SESSION_RESET_AFTER = 3;
+
+/**
+ * 批F (F2) session-reseed defaults. Turn-count trigger applies to ALL
+ * sessions (`sessionReseedTurns`, 0 disables): past this many completed
+ * turns, the next turn starts a fresh backend session seeded from summary.md
+ * + the transcript tail instead of resuming the ever-growing history — the
+ * "resume 无压缩,话题越滚越慢" fix at the bridge layer. The idle-gap trigger
+ * applies ONLY to sticky p2p sessions (`p2pStickyIdleMs`): a 1:1 chat quiet
+ * past this gap very likely starts a new topic, so reseed rather than drag a
+ * huge stale context in. Both are per-bot yaml knobs; these are the
+ * effective defaults when the yaml omits them.
+ */
+const DEFAULT_SESSION_RESEED_TURNS = 60;
+const DEFAULT_P2P_STICKY_IDLE_MS = 12 * 60 * 60 * 1000;
+
+/** Caps for the <session-reseed> seed material (chars, code-point sliced). */
+const RESEED_SUMMARY_MAX_CHARS = 2000;
+const RESEED_TRANSCRIPT_TAIL_MAX_CHARS = 3000;
+
 function resolveStuckSessionResetAfter(): number {
   const raw = process.env.LARKWAY_STUCK_SESSION_RESET_AFTER;
   if (raw === undefined) return DEFAULT_STUCK_SESSION_RESET_AFTER;
   const n = Number.parseInt(raw, 10);
   return Number.isFinite(n) && n > 0 ? n : DEFAULT_STUCK_SESSION_RESET_AFTER;
+}
+
+/**
+ * Code-point-safe head/tail clips for the reseed seed (批F F2). Plain
+ * string.slice counts UTF-16 units and can split a surrogate pair; iterate by
+ * code point instead (same rationale as prompt.ts's memory-index truncation).
+ */
+function clipCodePointsHead(text: string, max: number): string {
+  const chars = Array.from(text);
+  if (chars.length <= max) return text;
+  return `${chars.slice(0, max).join("")}\n…(已截断)`;
+}
+function clipCodePointsTail(text: string, max: number): string {
+  const chars = Array.from(text);
+  if (chars.length <= max) return text;
+  return `…(前文已截断)\n${chars.slice(chars.length - max).join("")}`;
 }
 
 function summarizeMentionPolicyRules(rules: string[]): string {
@@ -269,12 +315,16 @@ async function isWorktreeGitHealthy(worktreePath: string): Promise<boolean> {
 export function canCoalesceFollowup(
   primary: import("../lark/transport.js").LarkMessageEvent,
   candidate: import("../lark/transport.js").LarkMessageEvent,
+  keyOpts?: SessionKeyOptions,
 ): boolean {
   if (primary.larkway_trigger_type != null || candidate.larkway_trigger_type != null) return false;
   if (primary.reply_anchor_message_id != null || candidate.reply_anchor_message_id != null) return false;
-  const sessionKeyOf = (e: import("../lark/transport.js").LarkMessageEvent): string =>
-    typeof e.root_id === "string" && e.root_id ? e.root_id : e.message_id;
-  if (sessionKeyOf(primary) !== sessionKeyOf(candidate)) return false;
+  // 批F (F1): session-key derivation is shared with message.ts/run() —
+  // coalescing must merge exactly the messages that would land on one
+  // session, no more, no less. Note deriveSessionKey never returns parent_id,
+  // matching the OLD inline rule here (a quote reply keyed by its own
+  // message_id never coalesced, and still doesn't).
+  if (deriveSessionKey(primary, keyOpts) !== deriveSessionKey(candidate, keyOpts)) return false;
   try {
     const parsed = parseMessage(candidate);
     if (parsed.attachments.length > 0) return false;
@@ -800,6 +850,12 @@ export interface BridgeHandlerDeps {
     effort?: string;
     /** 批E (E1) continuation-prompt mode — see BotConfig.promptMode. */
     promptMode?: "full" | "delta";
+    /** 批F (F1) p2p sticky sessions — see BotConfig.p2pStickySession. */
+    p2pStickySession?: boolean;
+    /** 批F (F2) reseed after N turns (0 disables) — see BotConfig.sessionReseedTurns. */
+    sessionReseedTurns?: number;
+    /** 批F (F1/F2) sticky-session idle gap (ms) that triggers a reseed — see BotConfig.p2pStickyIdleMs. */
+    p2pStickyIdleMs?: number;
     /**
      * COT (思维链) 气泡档位。"off" = 不推;"brief"/"detailed" 见 BotConfig.cot。
      * 缺省视为 "brief"。仅在非 "off" 时 main.ts 才注入 cotClient。
@@ -1125,22 +1181,30 @@ export class BridgeHandler {
       if (signal?.aborted) break;
 
       // Queue key must SERIALIZE every event that can end up on the same
-      // session. Base rule: session key = `root_id ?? message_id`
-      // (message.ts). v4 任务派单 addition: a quote reply on a task-share
-      // card gets REKEYED inside handleOne to the card's id (root_id ??
-      // parent_id) — so parent_id joins the queue key here to keep that
-      // rekeyed turn and the card-topic follow-ups on one serial chain. For
-      // an ORDINARY quote reply this makes the queue key a superset of the
-      // session key (several distinct sessions serialized under the quoted
-      // chain's root) — the safe direction: less parallelism, never the
-      // concurrent-same-session hazard the original invariant guarded
-      // against (fresh session instead of --resume, interleaved state.json).
+      // session. Base rule: session key = deriveSessionKey (message.ts —
+      // `root_id ?? [p2p sticky] ?? message_id`). v4 任务派单 addition: a
+      // quote reply on a task-share card gets REKEYED inside handleOne to the
+      // card's id (root_id ?? parent_id) — so parent_id joins the queue key
+      // here to keep that rekeyed turn and the card-topic follow-ups on one
+      // serial chain. For an ORDINARY quote reply this makes the queue key a
+      // superset of the session key (several distinct sessions serialized
+      // under the quoted chain's root) — the safe direction: less
+      // parallelism, never the concurrent-same-session hazard the original
+      // invariant guarded against (fresh session instead of --resume,
+      // interleaved state.json). 批F (F1): the sticky p2p key only ever
+      // applies when BOTH root_id and parent_id are absent (deriveSessionKey
+      // excludes parent_id-bearing events), so queue key ⊇ session key holds:
+      // every event of one sticky session shares the `p2p-<chat>` queue key.
+      const keyOpts: SessionKeyOptions = {
+        p2pStickySession: this.deps.botConfig?.p2pStickySession === true,
+      };
+      const sessionKey = deriveSessionKey(event, keyOpts);
       const key =
         (typeof event.root_id === "string" && event.root_id)
           ? event.root_id
           : (typeof event.parent_id === "string" && event.parent_id)
             ? event.parent_id
-            : event.message_id;
+            : sessionKey;
       // BL-42 /stop: a bare "/stop" is a channel-level control command (the
       // Feishu COT card's ⏹ button auto-sends `@bot /stop`), NOT a prompt for
       // the agent. Handled here, out of band: kill the in-flight turn on this
@@ -1153,13 +1217,13 @@ export class BridgeHandler {
       }
       // Stamp "received" here — synchronously, before acquire()/handleOne()
       // — so this reflects arrival, not dispatch. See threadReceivedAt above.
-      // Stamped under BOTH the queue key and the legacy session key: an
-      // ordinary quote reply's session stays keyed by its own message_id,
-      // and its receipt lookup must still hit.
+      // Stamped under BOTH the queue key and the session key: an ordinary
+      // quote reply's session stays keyed by its own message_id, and its
+      // receipt lookup must still hit. (批F: sessionKey may be the sticky
+      // `p2p-<chat>` key — handleOne's turnReceivedAt lookup uses the same
+      // derivation, so it keeps hitting.)
       this.threadReceivedAt.set(key, Date.now());
-      const legacySessionKey =
-        (typeof event.root_id === "string" && event.root_id) ? event.root_id : event.message_id;
-      if (legacySessionKey !== key) this.threadReceivedAt.set(legacySessionKey, Date.now());
+      if (sessionKey !== key) this.threadReceivedAt.set(sessionKey, Date.now());
       let pendingList = pendingByKey.get(key);
       if (pendingList == null) {
         pendingList = [];
@@ -1174,7 +1238,7 @@ export class BridgeHandler {
           const primary = pending?.shift();
           if (primary == null) return; // absorbed into an earlier drain's merged turn
           const followups: import("../lark/transport.js").LarkMessageEvent[] = [];
-          while (pending != null && pending.length > 0 && canCoalesceFollowup(primary, pending[0]!)) {
+          while (pending != null && pending.length > 0 && canCoalesceFollowup(primary, pending[0]!, keyOpts)) {
             followups.push(pending.shift()!);
           }
           if (followups.length > 0) {
@@ -1227,22 +1291,43 @@ export class BridgeHandler {
     pendingByKey: Map<string, import("../lark/transport.js").LarkMessageEvent[]>,
   ): void {
     this.deps.client.acknowledgeMessage(event.message_id);
-    const pending = pendingByKey.get(key);
-    const droppedCount = pending?.length ?? 0;
-    if (pending) {
-      for (const dropped of pending) this.deps.client.acknowledgeMessage(dropped.message_id);
-      pendingByKey.delete(key);
+    // 批F (F1) adversarial-review fix: a sticky p2p turn registers its kill
+    // hook under the sticky key `p2p-<chat_id>`, but the ⏹ /stop the COT
+    // card auto-sends arrives INSIDE the turn's topic (root_id = the user's
+    // own top-level message id) — so the raw queue key alone misses it.
+    // Try the sticky key as a second candidate whenever this bot runs sticky
+    // p2p sessions and the /stop came from a p2p chat. (A bare top-level
+    // "/stop" in the chat already keys to the sticky key via the primary.)
+    const candidates = [key];
+    if (
+      this.deps.botConfig?.p2pStickySession === true &&
+      event.chat_type === "p2p" &&
+      typeof event.chat_id === "string" &&
+      event.chat_id.length > 0
+    ) {
+      const stickyKey = `p2p-${event.chat_id}`;
+      if (stickyKey !== key) candidates.push(stickyKey);
     }
-    const stop = this.activeTurnStops.get(key);
+    let droppedCount = 0;
+    for (const candidate of candidates) {
+      const pending = pendingByKey.get(candidate);
+      if (pending) {
+        droppedCount += pending.length;
+        for (const dropped of pending) this.deps.client.acknowledgeMessage(dropped.message_id);
+        pendingByKey.delete(candidate);
+      }
+    }
+    const hitKey = candidates.find((candidate) => this.activeTurnStops.has(candidate));
+    const stop = hitKey ? this.activeTurnStops.get(hitKey) : undefined;
     if (stop) {
       console.log(
-        `[bridge.handler] /stop: killing in-flight turn on thread ${key}` +
+        `[bridge.handler] /stop: killing in-flight turn on thread ${hitKey}` +
           (droppedCount > 0 ? ` and dropping ${droppedCount} queued message(s)` : ""),
       );
       stop();
     } else {
       console.log(
-        `[bridge.handler] /stop on thread ${key}: no in-flight turn` +
+        `[bridge.handler] /stop on thread ${candidates.join("/")}: no in-flight turn` +
           (droppedCount > 0 ? `; dropped ${droppedCount} queued message(s)` : " (nothing to do)"),
       );
     }
@@ -1313,7 +1398,16 @@ export class BridgeHandler {
     // Step 1: parse
     const parsed = parseMessage(event);
     const { messageId, senderOpenId } = parsed;
-    let threadId = parsed.threadId;
+    // 批F (F1): the session key may diverge from parsed.threadId — a pure
+    // top-level p2p message on a sticky-enabled bot keys to `p2p-<chat_id>`
+    // so the whole 1:1 conversation is ONE continuous session. Must use the
+    // SAME derivation as run()'s queue key / canCoalesceFollowup, or two
+    // messages of one session could run concurrently. parsed.threadId keeps
+    // the raw Feishu semantics for anything that needs a real message id.
+    let threadId = deriveSessionKey(event, {
+      p2pStickySession: this.deps.botConfig?.p2pStickySession === true,
+    });
+    const stickySession = isSyntheticSessionKey(threadId);
     const botId = this.deps.botConfig?.id;
     const eventLogId = messageId;
     const eventStartedAt = Date.now();
@@ -1500,6 +1594,43 @@ export class BridgeHandler {
     const existing = this.deps.sessionStore.get(threadId, botId);
     const isNewThread = existing === undefined;
 
+    // 批F (F2): session-reseed decision. A reseed keeps the session RECORD
+    // (createdTs/rootText/chatId survive via the existing-record write-back
+    // branch) and the session DIRECTORY (summary.md/transcript.md continue in
+    // place), but starts a FRESH backend session this turn: no resume, full
+    // prompt, plus a <session-reseed> seed block (summary + transcript tail).
+    // Two triggers:
+    //   - history-limit: the session has accumulated `sessionReseedTurns`
+    //     turns — resume replay / in-context history has grown past the point
+    //     where dragging all of it beats a seeded fresh start.
+    //   - idle-gap (sticky p2p sessions only): the 1:1 conversation went
+    //     quiet for p2pStickyIdleMs — a fresh topic is very likely; seed with
+    //     the summary instead of resuming a huge stale context. Topic (group)
+    //     sessions deliberately have NO idle trigger: resuming a days-old
+    //     topic with full context is a feature, not a bug.
+    const reseedTurnsLimit =
+      this.deps.botConfig?.sessionReseedTurns ?? DEFAULT_SESSION_RESEED_TURNS;
+    const stickyIdleMs = this.deps.botConfig?.p2pStickyIdleMs ?? DEFAULT_P2P_STICKY_IDLE_MS;
+    let reseedReason: "history-limit" | "idle-gap" | undefined;
+    // Adversarial-review fix: reseed is agent_workspace-only. The seed corpus
+    // (summary.md/transcript.md via ensureSessionArtifacts + the answer
+    // append) only exists there — a legacy-runtime reseed would silently drop
+    // all context at turn 60 with a structurally empty seed and a dead
+    // transcript pointer.
+    const reseedEligible = this.deps.conventions.runtime === "agent_workspace";
+    if (reseedEligible && existing?.sessionId) {
+      if (reseedTurnsLimit > 0 && (existing.turnCount ?? 0) >= reseedTurnsLimit) {
+        reseedReason = "history-limit";
+      } else if (
+        stickySession &&
+        stickyIdleMs > 0 &&
+        Date.now() - existing.lastActiveTs > stickyIdleMs
+      ) {
+        reseedReason = "idle-gap";
+      }
+    }
+    const forceFreshSession = reseedReason !== undefined;
+
     // Step 3: create "thinking" card — get handle.
     // Top-level @bot (no root_id): pass --reply-in-thread to open a Feishu topic
     // anchored on the user's message. Thread-replies pass false.
@@ -1578,6 +1709,51 @@ export class BridgeHandler {
       const runCwd = isAgentWorkspace
         ? conventions.agentWorkspacePath!
         : worktreePath;
+
+      // 批F (F2): build the <session-reseed> seed material. Best-effort file
+      // reads — a missing summary/transcript just drops out of the seed; the
+      // reseed itself (fresh backend session) happens regardless. The session
+      // DIR is reused in place, so summary.md / transcript.md keep
+      // accumulating across reseeds.
+      let sessionReseed:
+        | {
+            reason: "history-limit" | "idle-gap";
+            summaryExcerpt?: string;
+            transcriptTail?: string;
+            transcriptPath: string;
+          }
+        | undefined;
+      if (forceFreshSession && reseedReason) {
+        const transcriptPath = path.join(worktreePath, "transcript.md");
+        let summaryExcerpt: string | undefined;
+        let transcriptTail: string | undefined;
+        try {
+          const summary = await fs.readFile(path.join(worktreePath, "summary.md"), "utf8");
+          // Strip the bridge placeholder lines; keep whatever the agent
+          // actually wrote (whether it replaced the placeholder or appended
+          // below it — adversarial-review fix, see stripSummaryPlaceholder).
+          const agentSummary = stripSummaryPlaceholder(summary);
+          if (agentSummary.length > 0) {
+            summaryExcerpt = clipCodePointsHead(agentSummary, RESEED_SUMMARY_MAX_CHARS);
+          }
+        } catch {
+          /* no summary.md — seed from transcript only */
+        }
+        try {
+          const transcript = (await fs.readFile(transcriptPath, "utf8")).trim();
+          if (transcript.length > 0) {
+            transcriptTail = clipCodePointsTail(transcript, RESEED_TRANSCRIPT_TAIL_MAX_CHARS);
+          }
+        } catch {
+          /* no transcript.md */
+        }
+        sessionReseed = { reason: reseedReason, summaryExcerpt, transcriptTail, transcriptPath };
+        await recordEvent({
+          status: "running",
+          appendPath: "session 重播种",
+          reason: `原因=${reseedReason};本轮弃用旧后端 session,注入 summary/transcript 种子后全新开始(session 目录与任务记录不变)。`,
+        });
+      }
 
       // A1 (perf plan §3): create the CardKit placeholder card before the
       // prewarm work — but ONLY for agent_workspace runtime. This is
@@ -2285,7 +2461,15 @@ export class BridgeHandler {
 
         const prompt = await renderPrompt({
           parsed,
-          isNewThread: currentIsNewThread,
+          // 批F (F2): a reseed turn renders the FULL new-thread prompt — the
+          // fresh backend session has no history, so contract/memory/workspace
+          // blocks must all re-arrive — plus the <session-reseed> seed block.
+          isNewThread: currentIsNewThread || forceFreshSession,
+          sessionReseed,
+          // 批F (F1): surfaces the sticky session identity as a fact line.
+          // parsed.threadId deliberately keeps the real message id, so every
+          // lark-cli command template in the prompt stays valid.
+          stickySessionKey: stickySession ? threadId : undefined,
           queuedFollowups,
           conventions: {
             worktreePath,
@@ -2367,7 +2551,15 @@ export class BridgeHandler {
 
         const handle = createRunner(runnerKey).run({
           prompt,
-          resumeSessionId: currentExisting?.sessionId,
+          // 批F (F2): reseed = no resume. The record itself is kept (write-back
+          // uses the existing-record branch to persist the NEW sessionId while
+          // preserving createdTs/rootText/chatId — unlike BL-38's full delete).
+          resumeSessionId: forceFreshSession ? undefined : currentExisting?.sessionId,
+          // 批F (F2): tells ClaudeProcessPool to retire this thread's live warm
+          // process first — the pool key excludes sessionId, so without this a
+          // warm entry would silently continue the OLD session. Cold runners
+          // and the codex pool (no per-thread process cache) ignore it.
+          forceFreshSession,
           permissionMode,
           timeoutMs,
           cwd: runCwd,
@@ -2804,6 +2996,8 @@ export class BridgeHandler {
               // BL-38: a brand-new thread that idle-killed on its very first turn
               // starts the counter at 1 (0 when clean; only persisted when > 0).
               consecutiveStuckCount: nextStuckCount,
+              // 批F (F2): turn accounting for the history-limit reseed trigger.
+              turnCount: 1,
               ...(isTopLevel ? { rootText: parsed.text.slice(0, 200), chatId: parsed.chatId } : {}),
             });
           } else if (sessionId !== undefined && currentExisting !== undefined) {
@@ -2821,14 +3015,24 @@ export class BridgeHandler {
               chatId: currentExisting.chatId,
               // BL-38: +1 on an idle-stuck turn, 0 (cleared) on any clean turn.
               consecutiveStuckCount: nextStuckCount,
+              // 批F (F2): a reseed turn restarts the count at 1 (this turn ran
+              // on the fresh session); ordinary turns accrue.
+              turnCount: forceFreshSession ? 1 : (currentExisting.turnCount ?? 0) + 1,
             });
           } else if (currentExisting !== undefined && sessionId === undefined) {
             // Anomaly: no system_init seen; touch to update lastActiveTs at minimum.
             // BL-38: still update the counter — the spread carries the OLD value,
             // so set it explicitly AFTER the spread (0 clears it, +1 accrues it).
+            // 批F (F2) adversarial-review fix: on a RESEED turn that died
+            // before system_init, keep the OLD lastActiveTs — refreshing it
+            // would silently disarm the idle-gap trigger while the record
+            // still points at the giant stale session the reseed just tried
+            // to leave (turnCount is likewise preserved by the spread, so the
+            // history-limit trigger also re-fires). Next turn retries the
+            // reseed instead of resuming the stale session.
             await this.deps.sessionStore.put({
               ...currentExisting,
-              lastActiveTs: now,
+              lastActiveTs: forceFreshSession ? currentExisting.lastActiveTs : now,
               consecutiveStuckCount: nextStuckCount,
             });
           }
@@ -2881,6 +3085,27 @@ export class BridgeHandler {
                 ? "⚠️ 本轮被中断（长时间无活性，判定卡死），未完成。请重试。"
                 : reportedState?.last_message ??
                   (fallbackAnswer ? fallbackAnswer : noOutputFallback);
+
+          // 批F (F2): persist this turn's user-facing answer into the session
+          // transcript so a future reseed seed carries BOTH sides of the
+          // conversation (transcript.md previously recorded only user text).
+          // Awaited (it's a fast local append) so the next serialized turn's
+          // transcript entry / seed read never races this one; failure is
+          // still swallowed — a missed answer line never affects the turn.
+          // Agent_workspace only (legacy has no transcript.md); /stop turns
+          // record nothing (no answer was produced).
+          if (isAgentWorkspace && !stoppedByUser) {
+            await appendTranscriptAnswer(
+              worktreePath,
+              cardBody,
+              success ? "completed" : "failed",
+            ).catch((err) =>
+              console.warn(
+                "[bridge.handler] transcript answer append failed (continuing):",
+                err,
+              ),
+            );
+          }
 
           // When the agent didn't report status this turn (reportedState null,
           // per stale-guard) but exited cleanly, don't let the card default to

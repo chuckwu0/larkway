@@ -23,6 +23,7 @@ import {
   resolveWorktreesDir,
 } from "../config/paths.js";
 import type { SessionStore } from "../claude/sessionStore.js";
+import { isSyntheticSessionKey } from "../lark/message.js";
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -121,6 +122,17 @@ export class Housekeeping {
     for (const record of records) {
       const idleMs = now - record.lastActiveTs;
       const tid = record.threadId;
+
+      // 批F (F1/F2): sticky p2p sessions are exempt from idle cleanup. The
+      // session dir is the durable home of an ongoing 1:1 relationship —
+      // summary.md / transcript.md there are exactly the seed corpus the
+      // idle-gap reseed (a LONGER-than-cleanup horizon is its flagship
+      // scenario: quiet weekend, back on Monday) needs. Cardinality is
+      // bounded by the number of p2p chats the bot serves, not by message
+      // volume, so exemption cannot grow unbounded the way per-topic
+      // sessions did. The orphan sweep below still reclaims a sticky DIR if
+      // its record is ever deleted.
+      if (isSyntheticSessionKey(tid)) continue;
 
       if (idleMs >= this.#idleCleanupMs) {
         const idleHours = Math.floor(idleMs / (60 * 60 * 1000));
