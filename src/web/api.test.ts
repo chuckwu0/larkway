@@ -1754,3 +1754,72 @@ describe("GET /api/backends — backend registry", () => {
     expect(matched).not.toBeNull();
   });
 });
+
+describe("backend model facts (看板 Model/Effort 动态事实)", () => {
+  it("parseCodexConfigDefaults: 只取第一个 [section] 之前的顶层键", async () => {
+    const { parseCodexConfigDefaults } = await import("./api.js");
+    const raw = [
+      'model_provider = "OpenAI"',
+      'model = "gpt-5.6-custom"',
+      'model_reasoning_effort = "medium"',
+      "",
+      "[model_providers.OpenAI]",
+      'model = "should-not-leak"',
+    ].join("\n");
+    expect(parseCodexConfigDefaults(raw)).toEqual({ model: "gpt-5.6-custom", effort: "medium" });
+  });
+
+  it("parseCodexConfigDefaults: model_provider 不会误配 model;缺键返回空对象", async () => {
+    const { parseCodexConfigDefaults } = await import("./api.js");
+    expect(parseCodexConfigDefaults('model_provider = "OpenAI"\n')).toEqual({});
+    expect(parseCodexConfigDefaults("")).toEqual({});
+  });
+
+  it("parseCodexModelsCache: 提取 slug+截短描述,坏 JSON/坏形状回空,封顶 8 项", async () => {
+    const { parseCodexModelsCache } = await import("./api.js");
+    const cache = JSON.stringify({
+      models: [
+        { slug: "gpt-5.5", description: "Frontier model for complex coding, research, and real-world work." },
+        { slug: "gpt-5.4-mini" },
+        { notSlug: true },
+        ...Array.from({ length: 10 }, (_, i) => ({ slug: `m${i}`, description: "x" })),
+      ],
+    });
+    const out = parseCodexModelsCache(cache);
+    expect(out[0]!.v).toBe("gpt-5.5");
+    expect(out[0]!.d.length).toBeLessThanOrEqual(60);
+    expect(out[1]).toEqual({ v: "gpt-5.4-mini", d: "" });
+    expect(out.length).toBe(8);
+    expect(parseCodexModelsCache("not json")).toEqual([]);
+    expect(parseCodexModelsCache("{}")).toEqual([]);
+  });
+
+  it("GET /api/backends: HOME 下有 codex config/cache 时带 globalDefault+visibleModels", async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), "larkway-backends-facts-"));
+    const oldHome = process.env.HOME;
+    process.env.HOME = dir;
+    try {
+      await mkdir(path.join(dir, ".codex"), { recursive: true });
+      await writeFile(
+        path.join(dir, ".codex", "config.toml"),
+        'model = "gpt-9-test"\nmodel_reasoning_effort = "low"\n',
+        "utf8",
+      );
+      await writeFile(
+        path.join(dir, ".codex", "models_cache.json"),
+        JSON.stringify({ models: [{ slug: "gpt-9-test", description: "test model" }] }),
+        "utf8",
+      );
+      const res = await call(makeCtx(dir), "GET /api/backends");
+      expect(res.status).toBe(200);
+      const backends = (res.json as { backends: Array<Record<string, unknown>> }).backends;
+      const codex = backends.find((b) => b.id === "codex") as Record<string, unknown>;
+      expect(codex.globalDefault).toEqual({ model: "gpt-9-test", effort: "low" });
+      expect(codex.visibleModels).toEqual([{ v: "gpt-9-test", d: "test model" }]);
+    } finally {
+      if (oldHome === undefined) delete process.env.HOME;
+      else process.env.HOME = oldHome;
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+});

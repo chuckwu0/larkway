@@ -701,13 +701,28 @@ function lkBackendChipHTML(backendId, opts = {}) {
  */
 let _backendReady = {};
 
-/** 拉一次 /api/backends 并更新 _backendReady,供 select 渲染前调用。 */
+/**
+ * 各底座的模型事实(同样来自 GET /api/backends):
+ *   globalDefault  — 底座全局配置的实际生效值 {model, effort},「底座默认」
+ *                    项用它把盲盒渲染成「当前 = <model> / <effort>」;
+ *   visibleModels  — 本机可见模型 [{v,d}](codex 来自 ~/.codex/models_cache.json),
+ *                    建议列表优先用它,硬编码列表只作兜底。
+ * @type {Record<string, {globalDefault?:{model?:string,effort?:string}, visibleModels?:Array<{v:string,d:string}>}>}
+ */
+let _backendModelFacts = {};
+
+/** 拉一次 /api/backends 并更新 _backendReady/_backendModelFacts,供 select 渲染前调用。 */
 async function loadBackends() {
   try {
     const res = await api("GET", "/api/backends");
     if (res.ok && Array.isArray(res.json?.backends)) {
       for (const b of res.json.backends) {
-        if (typeof b.id === "string") _backendReady[b.id] = !!b.ready;
+        if (typeof b.id !== "string") continue;
+        _backendReady[b.id] = !!b.ready;
+        _backendModelFacts[b.id] = {
+          globalDefault: b.globalDefault && typeof b.globalDefault === "object" ? b.globalDefault : undefined,
+          visibleModels: Array.isArray(b.visibleModels) ? b.visibleModels : undefined,
+        };
       }
     }
   } catch { /* 失败静默;ready 默认 true */ }
@@ -814,11 +829,20 @@ function lkHexA(hex, alpha) {
  */
 function modelSuggestionsForBackend(backendId) {
   if (backendId === "codex") {
-    return [
-      { v: "gpt-5.5", d: "日常首选 · 能力与速度均衡" },
-      { v: "gpt-5.4-mini", d: "便宜快 · 轻量任务" },
-      { v: "gpt-5.3-codex", d: "代码特化 · 重构与评审" },
-    ];
+    // 中文定位描述覆盖已知官方模型;本机 cache 里其余模型用它自带的英文描述。
+    const curated = {
+      "gpt-5.5": "日常首选 · 能力与速度均衡",
+      "gpt-5.4-mini": "便宜快 · 轻量任务",
+      "gpt-5.3-codex": "代码特化 · 重构与评审",
+    };
+    // 优先用本机真实可见模型(~/.codex/models_cache.json,经 /api/backends);
+    // 拿不到(cache 缺失/接口失败)才落回硬编码。内部代理的私有模型名不进
+    // 硬编码 —— 它要么出现在这台机器的 cache 里,要么走自定义输入逃生口。
+    const live = _backendModelFacts.codex?.visibleModels;
+    if (Array.isArray(live) && live.length > 0) {
+      return live.map((m) => ({ v: m.v, d: curated[m.v] ?? m.d ?? "" }));
+    }
+    return Object.entries(curated).map(([v, d]) => ({ v, d }));
   }
   return [
     { v: "claude-sonnet-5", d: "Sonnet 5 · 快/省" },
@@ -850,7 +874,17 @@ function effortLevelsForBackend(backendId) {
 
 /** model 值 → 定位描述;空值/自定义值给对应措辞。 */
 function modelDescFor(backendId, val) {
-  if (!val) return "不覆盖 —— 跟随底座全局设置";
+  if (!val) {
+    // 「底座默认」不做盲盒:能读到底座全局配置的实际生效值就直接亮出来
+    // (2026-07-15 教训:服务器全局默认改了模型,看板却只显示"跟随全局
+    // 设置",跟建议列表首项一叠加,读起来像配置被改回去了)。
+    const gd = _backendModelFacts[backendId]?.globalDefault;
+    if (gd && (gd.model || gd.effort)) {
+      const parts = [gd.model, gd.effort].filter(Boolean).join(" / ");
+      return `不覆盖 —— 当前底座全局 = ${parts}`;
+    }
+    return "不覆盖 —— 跟随底座全局设置";
+  }
   const hit = modelSuggestionsForBackend(backendId).find((m) => m.v === val);
   return hit ? hit.d : "自定义模型名";
 }
@@ -874,7 +908,7 @@ function modelMenuHTML(backendId, currentVal) {
     (v === (currentVal || "") ? ICONS.check : "") +
     `</div>`;
   return (
-    item("", "不覆盖 —— 跟随底座全局设置") +
+    item("", modelDescFor(backendId, "")) +
     modelSuggestionsForBackend(backendId).map((m) => item(m.v, m.d)).join("") +
     `<div class="bk2-mi-custom" role="option" data-model-custom>${ICONS.edit}输入自定义模型名…</div>`
   );

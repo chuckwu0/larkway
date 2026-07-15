@@ -1843,6 +1843,94 @@ async function isCodexReady(): Promise<boolean> {
 }
 
 /**
+ * 看板「Model / Effort 覆盖」的两块动态事实(2026-07-15,起因:owner 在服务器
+ * 把 codex 全局默认改成了内部路由模型名,看板的「底座默认」是盲盒 + 建议
+ * 列表又硬编码官方模型,读起来像"配置被改回去了"):
+ *
+ *   globalDefault — 底座全局配置的实际生效值(codex: ~/.codex/config.toml 的
+ *     model/model_reasoning_effort;claude: ~/.claude/settings.json 的 model)。
+ *     UI 的「底座默认」项用它把"不覆盖"渲染成"不覆盖 = 当前 <model>/<effort>"。
+ *   visibleModels — codex 本机可见模型(~/.codex/models_cache.json,codex CLI
+ *     自己维护的缓存),UI 建议列表优先用它,硬编码列表只作缓存缺失时的兜底。
+ *     内部代理/私有路由模型名不会出现在任何硬编码里 —— 要么出现在本机 cache
+ *     (说明这台机器真的可见),要么走「输入自定义模型名」逃生口。
+ *
+ * 解析都是纯函数(exported for tests);IO 包装永不 throw,缺文件 = 字段缺失。
+ */
+export function parseCodexConfigDefaults(raw: string): { model?: string; effort?: string } {
+  // TOML 顶层键必须出现在第一个 [section] 之前 —— 只解析文件头部,防止
+  // [model_providers.*] 等段里的同名键串进来。
+  const topLevel = raw.split(/^\[/m)[0] ?? "";
+  const model = /^\s*model\s*=\s*"([^"]+)"/m.exec(topLevel)?.[1];
+  const effort = /^\s*model_reasoning_effort\s*=\s*"([^"]+)"/m.exec(topLevel)?.[1];
+  return {
+    ...(model ? { model } : {}),
+    ...(effort ? { effort } : {}),
+  };
+}
+
+export function parseCodexModelsCache(raw: string): Array<{ v: string; d: string }> {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return [];
+  }
+  const models = (parsed as { models?: unknown })?.models;
+  if (!Array.isArray(models)) return [];
+  const out: Array<{ v: string; d: string }> = [];
+  for (const m of models) {
+    const slug = (m as { slug?: unknown })?.slug;
+    if (typeof slug !== "string" || slug === "") continue;
+    const desc = (m as { description?: unknown })?.description;
+    const d = typeof desc === "string" ? Array.from(desc).slice(0, 60).join("") : "";
+    out.push({ v: slug, d });
+    if (out.length >= 8) break;
+  }
+  return out;
+}
+
+async function readBackendModelFacts(): Promise<{
+  codex: { globalDefault?: { model?: string; effort?: string }; visibleModels?: Array<{ v: string; d: string }> };
+  claude: { globalDefault?: { model?: string; effort?: string } };
+}> {
+  const home = process.env.HOME ?? "";
+  let codexDefault: { model?: string; effort?: string } | undefined;
+  try {
+    codexDefault = parseCodexConfigDefaults(
+      await readFile(path.join(home, ".codex", "config.toml"), "utf8"),
+    );
+    if (!codexDefault.model && !codexDefault.effort) codexDefault = undefined;
+  } catch {
+    /* no codex config */
+  }
+  let codexVisible: Array<{ v: string; d: string }> | undefined;
+  try {
+    const list = parseCodexModelsCache(
+      await readFile(path.join(home, ".codex", "models_cache.json"), "utf8"),
+    );
+    if (list.length > 0) codexVisible = list;
+  } catch {
+    /* no models cache */
+  }
+  let claudeDefault: { model?: string } | undefined;
+  try {
+    const settings = JSON.parse(
+      await readFile(path.join(home, ".claude", "settings.json"), "utf8"),
+    ) as { model?: unknown };
+    if (typeof settings.model === "string" && settings.model !== "") {
+      claudeDefault = { model: settings.model };
+    }
+  } catch {
+    /* no claude settings */
+  }
+  return {
+    codex: { globalDefault: codexDefault, visibleModels: codexVisible },
+    claude: { globalDefault: claudeDefault },
+  };
+}
+
+/**
  * GET /api/backends — returns the list of supported backends with their display
  * metadata and live ready status. Extensible: add more entries to BACKEND_META /
  * BACKEND_ORDER and a detection fn when new backends are added.
@@ -1853,9 +1941,18 @@ const getBackends: ApiHandler = async (_req) => {
     claude: true,   // claude is always assumed ready (checked separately by doctor)
     codex: codexReady,
   };
+  const modelFacts = await readBackendModelFacts();
   const backends = BACKEND_ORDER.map((id) => ({
     ...(BACKEND_META[id] ?? { id, name: id, short: id, vendor: "第三方底座", mono: id.slice(0, 2).toUpperCase() }),
     ready: ready[id] ?? false,
+    ...(id === "codex"
+      ? {
+          globalDefault: modelFacts.codex.globalDefault,
+          visibleModels: modelFacts.codex.visibleModels,
+        }
+      : id === "claude"
+        ? { globalDefault: modelFacts.claude.globalDefault }
+        : {}),
   }));
   return { status: 200, json: { backends } };
 };
