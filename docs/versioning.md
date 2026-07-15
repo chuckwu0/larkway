@@ -53,7 +53,8 @@
 | v0.3.46 | v0.3.46 | patch / 已发布 | 看板模型选择改为常驻快选 chips(datalist 会按已填值过滤导致看起来选项丢失);CI 修复(doctor 的 lark-cli 探测不再让测试退出码依赖宿主机环境) |
 | v0.3.47 | v0.3.47 | patch / 已发布 | 能力体检卡+底座卡v2+版本胶囊五态(claude design 设计稿落地);/stop bridge 层硬停止;web 自更新入口 |
 | v0.3.48 | v0.3.48 | patch / 已发布 | fix: model 覆盖菜单被卡片圆角裁剪到看不见选项(改文档流内展开) |
-| v0.3.49 | v0.3.49 | 当前 patch / 已发布 | fix: 体检探针补齐用户级安装目录 PATH(claude 在 ~/.local/bin 被误报未安装)+ lark-cli 探测超时放宽 |
+| v0.3.49 | v0.3.49 | patch / 已发布 | fix: 体检探针补齐用户级安装目录 PATH(claude 在 ~/.local/bin 被误报未安装)+ lark-cli 探测超时放宽 |
+| v0.3.50 | v0.3.50 | 当前 patch / 已发布 | 批E/F 性能(prompt 去重+delta 续轮+P2P 粘连+session 重播种) + 批G/H/I 记忆体系 P0/P1(组织知识库 git 仓+GC 收割+统一带种换血+预警窗合规计数+记忆变更机械可见+owner 事实+保养流程) |
 
 ## 使用原则
 
@@ -114,4 +115,5 @@ v0.3.46       = 看板模型选择改为常驻快选 chips(datalist 会按已填
 v0.3.47       = 能力体检卡+底座卡v2+版本胶囊五态(claude design 设计稿落地);/stop bridge 层硬停止;web 自更新入口
 v0.3.48       = fix: model 覆盖菜单被卡片圆角裁剪到看不见选项(改文档流内展开)
 v0.3.49       = fix: 体检探针补齐用户级安装目录 PATH(claude 在 ~/.local/bin 被误报未安装)+ lark-cli 探测超时放宽
+v0.3.50       = 批E/F 性能(prompt 去重+delta 续轮+P2P 粘连+session 重播种) + 批G/H/I 记忆体系 P0/P1(组织知识库 git 仓+GC 收割+统一带种换血+预警窗合规计数+记忆变更机械可见+owner 事实+保养流程)
 ```
