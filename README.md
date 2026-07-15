@@ -227,6 +227,7 @@ platform-fact writeups: [docs/task-handle.md](docs/task-handle.md).
 | Agent workspace runtime (v0.3) | [docs/agent-workspace.md](docs/agent-workspace.md) |
 | Version history and semver mapping | [docs/versioning.md](docs/versioning.md) |
 | Bridge ↔ Agent prompt contract | [docs/prompt-contract.md](docs/prompt-contract.md) |
+| Org knowledge base (memory/harvest/maintenance) | [docs/knowledge-base.md](docs/knowledge-base.md) |
 | Topic ↔ Feishu task handle (design + config) | [docs/task-handle.md](docs/task-handle.md) |
 | Bot config + memory templates | [bots-examples/](bots-examples/) |
 

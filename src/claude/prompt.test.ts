@@ -3,9 +3,6 @@
  */
 
 import { describe, it, expect } from "vitest";
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
-import path from "node:path";
 import { renderPrompt, type RenderPromptInput, type PeerBot, type RepoRef } from "./prompt.js";
 import type { ParsedMessage } from "../lark/message.js";
 import type { LarkMessageEvent } from "../lark/transport.js";
@@ -577,26 +574,24 @@ describe("renderPrompt — workspace warm-up block", () => {
       "summary_file_path:  /tmp/larkway/agents/larkway-devops/workspace/sessions/om_thread001/summary.md",
     );
     expect(prompt).toContain("state_file_path:");
+    // 批G P1 (R1/R2): memory_dir is identity/preferences only now; the
+    // memory_index pointer and the five-category write-discipline lines are
+    // retired with the per-agent category files.
     expect(prompt).toContain(
-      "memory_dir:          /tmp/larkway/agents/larkway-devops/workspace/memory",
+      "memory_dir:          /tmp/larkway/agents/larkway-devops/workspace/memory(仅本 agent 身份/偏好)",
     );
-    expect(prompt).toContain(
-      "memory_index:        /tmp/larkway/agents/larkway-devops/workspace/memory/index.md",
-    );
-    // 批E (E4): the redundant first-turn ceremony line is gone — index.md's
-    // content is injected verbatim (A7) and the AGENTS.md/permissions read
-    // instruction already lives in skillIntroNew at the top of the prompt.
+    expect(prompt).not.toContain("memory_index:");
+    expect(prompt).not.toContain("<memory-index-content>");
+    // No knowledgeDir input on this render → no org-knowledge lines either.
+    expect(prompt).not.toContain("org_knowledge_dir:");
+    expect(prompt).not.toContain("<org-knowledge-map>");
+    // 批E (E4): the redundant first-turn ceremony line stays gone.
     expect(prompt).not.toContain("起手先读 memory/index.md");
-    expect(prompt).toContain("assets"); // D5: category vocabulary still taught
-    expect(prompt).toContain("owner 确认后,由你写进 memory/<category>.md");
-    // D2: hot-path is ADD/NOOP only; rewrites/deletes deferred to offline 整理记忆
-    expect(prompt).toContain("热路径(每轮)只允许 ADD / NOOP");
-    expect(prompt).toContain("整理记忆");
-    expect(prompt).toContain("memory/archive/");
-    // D3: offline reorg must ground rewrites against transcript.md via rg
-    expect(prompt).toContain("rg 在 sessions/*/transcript.md 核到来源行");
-    // D2 no longer frames memory as 增删一体 in the hot path
-    expect(prompt).not.toContain("写 memory 是「增删一体」");
+    // 批G P1 (R2): the candidates five-step ritual + write-time classification
+    // died with their storage.
+    expect(prompt).not.toContain("memory-candidates.md");
+    expect(prompt).not.toContain("热路径(每轮)只允许 ADD / NOOP");
+    expect(prompt).not.toContain("owner 确认后,由你写进 memory/<category>.md");
     expect(prompt).toContain("summary.md 是你维护本话题摘要、决策和下一步 notes 的地方");
     expect(prompt).toContain("Repo pointers(只是指针");
     expect(prompt).toContain("gitlab_token_env_name: LARKWAY_DEVOPS_GITLAB_TOKEN");
@@ -677,219 +672,147 @@ describe("renderPrompt — workspace warm-up block", () => {
     expect(prompt).toContain("不要默认要求 sudo");
   });
 
-  it("D9: injects an over-size hint when a memory category file exceeds the line limit", async () => {
-    const workspaceDir = mkdtempSync(path.join(tmpdir(), "larkway-mem-"));
-    try {
-      const memoryDir = path.join(workspaceDir, "memory");
-      mkdirSync(memoryDir, { recursive: true });
-      // 201 lines > 200 limit → should trigger the hint.
-      const bigFile = path.join(memoryDir, "preferences.md");
-      writeFileSync(bigFile, "x\n".repeat(201), "utf8");
-      // Exactly 200 lines = at the limit, NOT over → must NOT trigger. Pins the
-      // off-by-one: a 200-line file with a trailing newline must count as 200.
-      writeFileSync(path.join(memoryDir, "reusable-knowledge.md"), "x\n".repeat(200), "utf8");
-      // A small file must NOT trigger the hint.
-      writeFileSync(path.join(memoryDir, "decisions.md"), "x\n".repeat(3), "utf8");
+});
 
-      const prompt = await renderPrompt(
-        makeInput({
-          conventions: {
-            ...makeConventions(),
-            runtime: "agent_workspace",
-            agentWorkspacePath: workspaceDir,
-            workspaceSessionPath: path.join(workspaceDir, "sessions", "om_thread001"),
-            workspaceReposPath: path.join(workspaceDir, "repos"),
-            stateFilePath: path.join(
-              workspaceDir,
-              "sessions",
-              "om_thread001",
-              ".larkway",
-              "state.json",
-            ),
-          },
-        }),
-      );
+// ---------------------------------------------------------------------------
+// 批G P1 (R2) — org knowledge pointers + <org-knowledge-map> injection
+// (the retired A7 memory/index.md verbatim injection's replacement)
+// ---------------------------------------------------------------------------
 
-      expect(prompt).toContain("⚠️ preferences.md 已 201 行,超限");
-      expect(prompt).not.toContain("⚠️ reusable-knowledge.md");
-      expect(prompt).not.toContain("⚠️ decisions.md");
-    } finally {
-      rmSync(workspaceDir, { recursive: true, force: true });
-    }
+describe("renderPrompt — org knowledge map (批G P1 R2)", () => {
+  const KNOWLEDGE_MAP = "- inbox 待处理速记: 3 行";
+  const awConventions = () => ({
+    ...makeConventions(),
+    runtime: "agent_workspace" as const,
+    agentWorkspacePath: "/tmp/ws",
+    workspaceSessionPath: "/tmp/ws/sessions/om_thread001",
+    workspaceReposPath: "/tmp/ws/repos",
+    stateFilePath: "/tmp/ws/sessions/om_thread001/.larkway/state.json",
   });
 
-  it("D9: statMemoryLines is non-throwing — no hint when memory dir is absent", async () => {
-    const workspaceDir = mkdtempSync(path.join(tmpdir(), "larkway-nomem-"));
-    try {
-      // No memory/ dir created → reads return 0, no hint, no throw.
-      const prompt = await renderPrompt(
-        makeInput({
-          conventions: {
-            ...makeConventions(),
-            runtime: "agent_workspace",
-            agentWorkspacePath: workspaceDir,
-            workspaceSessionPath: path.join(workspaceDir, "sessions", "om_thread001"),
-            workspaceReposPath: path.join(workspaceDir, "repos"),
-            stateFilePath: path.join(
-              workspaceDir,
-              "sessions",
-              "om_thread001",
-              ".larkway",
-              "state.json",
-            ),
-          },
-        }),
-      );
-      expect(prompt).not.toContain("超限");
-    } finally {
-      rmSync(workspaceDir, { recursive: true, force: true });
-    }
+  it("NEW thread: renders org_knowledge_dir pointer, inbox speed-note contract, priority rule and the map verbatim", async () => {
+    const prompt = await renderPrompt(
+      makeInput({
+        isNewThread: true,
+        conventions: awConventions(),
+        knowledgeDir: "/tmp/k",
+        knowledgeMap: KNOWLEDGE_MAP,
+      }),
+    );
+    expect(prompt).toContain("org_knowledge_dir:   /tmp/k");
+    expect(prompt).toContain("<org-knowledge-map>");
+    expect(prompt).toContain(KNOWLEDGE_MAP); // map text verbatim
+    expect(prompt).toContain("</org-knowledge-map>");
+    // Conversation turns carry exactly ONE memory duty: the inbox append.
+    expect(prompt).toContain("/tmp/k/inbox/inbox.md");
+    // Conflict-resolution priority order rides the same block.
+    expect(prompt).toContain("取信优先级");
+    // The retired A7 injection must never come back.
+    expect(prompt).not.toContain("<memory-index-content>");
+    expect(prompt).not.toContain("memory_index:");
   });
 
-  it("A7: injects memory/index.md content verbatim on a NEW-thread prompt", async () => {
-    const workspaceDir = mkdtempSync(path.join(tmpdir(), "larkway-a7-"));
-    try {
-      const memoryDir = path.join(workspaceDir, "memory");
-      mkdirSync(memoryDir, { recursive: true });
-      writeFileSync(path.join(memoryDir, "index.md"), "# Memory Index\n\nsome distinctive content ABC123", "utf8");
-
-      const prompt = await renderPrompt(
-        makeInput({
-          isNewThread: true,
-          conventions: {
-            ...makeConventions(),
-            runtime: "agent_workspace",
-            agentWorkspacePath: workspaceDir,
-            workspaceSessionPath: path.join(workspaceDir, "sessions", "om_thread001"),
-            workspaceReposPath: path.join(workspaceDir, "repos"),
-            stateFilePath: path.join(workspaceDir, "sessions", "om_thread001", ".larkway", "state.json"),
-          },
-        }),
-      );
-
-      expect(prompt).toContain("<memory-index-content>");
-      expect(prompt).toContain("some distinctive content ABC123");
-      expect(prompt).toContain("</memory-index-content>");
-    } finally {
-      rmSync(workspaceDir, { recursive: true, force: true });
-    }
+  it("continuation FULL prompt renders the same knowledge block", async () => {
+    const prompt = await renderPrompt(
+      makeInput({
+        isNewThread: false,
+        conventions: awConventions(),
+        knowledgeDir: "/tmp/k",
+        knowledgeMap: KNOWLEDGE_MAP,
+      }),
+    );
+    expect(prompt).toContain("<org-knowledge-map>");
+    expect(prompt).toContain(KNOWLEDGE_MAP);
+    expect(prompt).toContain("/tmp/k/inbox/inbox.md");
+    expect(prompt).toContain("取信优先级");
   });
 
-  it("A7: injects memory/index.md content verbatim on a CONTINUATION prompt too (both branches)", async () => {
-    const workspaceDir = mkdtempSync(path.join(tmpdir(), "larkway-a7-cont-"));
-    try {
-      const memoryDir = path.join(workspaceDir, "memory");
-      mkdirSync(memoryDir, { recursive: true });
-      writeFileSync(path.join(memoryDir, "index.md"), "# Memory Index\n\ncontinuation-branch-marker-XYZ", "utf8");
-
-      const prompt = await renderPrompt(
-        makeInput({
-          isNewThread: false,
-          conventions: {
-            ...makeConventions(),
-            runtime: "agent_workspace",
-            agentWorkspacePath: workspaceDir,
-            workspaceSessionPath: path.join(workspaceDir, "sessions", "om_thread001"),
-            workspaceReposPath: path.join(workspaceDir, "repos"),
-            stateFilePath: path.join(workspaceDir, "sessions", "om_thread001", ".larkway", "state.json"),
-          },
-        }),
-      );
-
-      expect(prompt).toContain("<memory-index-content>");
-      expect(prompt).toContain("continuation-branch-marker-XYZ");
-    } finally {
-      rmSync(workspaceDir, { recursive: true, force: true });
-    }
+  it("delta prompt renders NONE of it (the static block lives in the resumed session history)", async () => {
+    const prompt = await renderPrompt(
+      makeInput({
+        isNewThread: false,
+        promptMode: "delta",
+        conventions: awConventions(),
+        knowledgeDir: "/tmp/k",
+        knowledgeMap: KNOWLEDGE_MAP,
+      }),
+    );
+    expect(prompt).toContain("<contract-anchor>"); // it IS the delta shape
+    expect(prompt).not.toContain("<org-knowledge-map>");
+    expect(prompt).not.toContain("org_knowledge_dir:");
+    expect(prompt).not.toContain("inbox/inbox.md");
+    expect(prompt).not.toContain("取信优先级");
   });
 
-  it("A7: read failure (missing index.md) is non-fatal — no block rendered, no throw", async () => {
-    const workspaceDir = mkdtempSync(path.join(tmpdir(), "larkway-a7-missing-"));
-    try {
-      // No memory/ dir at all — readMemoryIndexContent must swallow the ENOENT.
-      const prompt = await renderPrompt(
-        makeInput({
-          conventions: {
-            ...makeConventions(),
-            runtime: "agent_workspace",
-            agentWorkspacePath: workspaceDir,
-            workspaceSessionPath: path.join(workspaceDir, "sessions", "om_thread001"),
-            workspaceReposPath: path.join(workspaceDir, "repos"),
-            stateFilePath: path.join(workspaceDir, "sessions", "om_thread001", ".larkway", "state.json"),
-          },
-        }),
-      );
-      expect(prompt).not.toContain("<memory-index-content>");
-    } finally {
-      rmSync(workspaceDir, { recursive: true, force: true });
-    }
+  it("blank/absent knowledgeMap → dir pointer lines render, but no <org-knowledge-map> block", async () => {
+    const blank = await renderPrompt(
+      makeInput({ conventions: awConventions(), knowledgeDir: "/tmp/k", knowledgeMap: "   " }),
+    );
+    expect(blank).toContain("org_knowledge_dir:   /tmp/k");
+    expect(blank).not.toContain("<org-knowledge-map>");
+    const absent = await renderPrompt(
+      makeInput({ conventions: awConventions(), knowledgeDir: "/tmp/k" }),
+    );
+    expect(absent).toContain("org_knowledge_dir:   /tmp/k");
+    expect(absent).not.toContain("<org-knowledge-map>");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 批G G7 (P1) — sender_is_owner fact line (all three prompt shapes)
+// ---------------------------------------------------------------------------
+
+describe("renderPrompt — sender_is_owner fact line (批G G7)", () => {
+  it("defaults to unknown when senderIsOwner is not provided (new thread)", async () => {
+    const prompt = await renderPrompt(makeInput({}));
+    expect(prompt).toContain("sender_is_owner:  unknown");
   });
 
-  it("A7: truncates content over the size cap and appends a truncation note", async () => {
-    const workspaceDir = mkdtempSync(path.join(tmpdir(), "larkway-a7-trunc-"));
-    try {
-      const memoryDir = path.join(workspaceDir, "memory");
-      mkdirSync(memoryDir, { recursive: true });
-      // Comfortably over the 4000-char cap.
-      writeFileSync(path.join(memoryDir, "index.md"), "z".repeat(5000), "utf8");
-
-      const prompt = await renderPrompt(
-        makeInput({
-          conventions: {
-            ...makeConventions(),
-            runtime: "agent_workspace",
-            agentWorkspacePath: workspaceDir,
-            workspaceSessionPath: path.join(workspaceDir, "sessions", "om_thread001"),
-            workspaceReposPath: path.join(workspaceDir, "repos"),
-            stateFilePath: path.join(workspaceDir, "sessions", "om_thread001", ".larkway", "state.json"),
-          },
-        }),
-      );
-
-      expect(prompt).toContain("<memory-index-content>");
-      expect(prompt).toContain("已截断，完整内容见 memory_index 路径原文件");
-      expect(prompt).not.toContain("z".repeat(5000)); // full content must not appear verbatim
-    } finally {
-      rmSync(workspaceDir, { recursive: true, force: true });
-    }
+  it("passes yes/no through on continuation FULL prompts", async () => {
+    const yes = await renderPrompt(makeInput({ isNewThread: false, senderIsOwner: "yes" }));
+    expect(yes).toContain("sender_is_owner:  yes");
+    const no = await renderPrompt(makeInput({ isNewThread: false, senderIsOwner: "no" }));
+    expect(no).toContain("sender_is_owner:  no");
+    expect(no).not.toContain("sender_is_owner:  unknown");
   });
 
-  it("A7 minor fix: truncation is code-point safe — never splits a surrogate pair (e.g. an emoji) in half", async () => {
-    const workspaceDir = mkdtempSync(path.join(tmpdir(), "larkway-a7-surrogate-"));
-    try {
-      const memoryDir = path.join(workspaceDir, "memory");
-      mkdirSync(memoryDir, { recursive: true });
-      // 3999 ASCII chars + one 2-code-unit emoji landing exactly on the
-      // truncation boundary (code point #4000) + trailing filler past the
-      // cap. A naive `string.slice(0, 4000)` (UTF-16 code units) would cut
-      // this emoji in half, leaving a lone unpaired surrogate in the prompt.
-      const content = "x".repeat(3999) + "😀" + "y".repeat(50);
-      writeFileSync(path.join(memoryDir, "index.md"), content, "utf8");
+  it("delta prompt carries the fact line too", async () => {
+    const prompt = await renderPrompt(
+      makeInput({ isNewThread: false, promptMode: "delta", senderIsOwner: "no" }),
+    );
+    expect(prompt).toContain("<contract-anchor>");
+    expect(prompt).toContain("sender_is_owner:  no");
+  });
+});
 
-      const prompt = await renderPrompt(
-        makeInput({
-          conventions: {
-            ...makeConventions(),
-            runtime: "agent_workspace",
-            agentWorkspacePath: workspaceDir,
-            workspaceSessionPath: path.join(workspaceDir, "sessions", "om_thread001"),
-            workspaceReposPath: path.join(workspaceDir, "repos"),
-            stateFilePath: path.join(workspaceDir, "sessions", "om_thread001", ".larkway", "state.json"),
-          },
-        }),
-      );
+// ---------------------------------------------------------------------------
+// 批G G1 (P1) — pre-reseed warning window (⚠️ 交接预警)
+// ---------------------------------------------------------------------------
 
-      expect(prompt).toContain("<memory-index-content>");
-      // The emoji must appear intact (either whole or wholly excluded) —
-      // never as a lone unpaired surrogate (which would render as U+FFFD or
-      // similar mojibake once split).
-      expect(prompt).toContain("😀");
-      // eslint-disable-next-line no-control-regex
-      expect(prompt).not.toMatch(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])/); // no unpaired high surrogate
-      expect(prompt).not.toMatch(/(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/); // no unpaired low surrogate
-    } finally {
-      rmSync(workspaceDir, { recursive: true, force: true });
-    }
+describe("renderPrompt — reseedWarning (批G G1 pre-reseed window)", () => {
+  it("renders the ⚠️ 交接预警 line on a delta continuation", async () => {
+    const prompt = await renderPrompt(
+      makeInput({ isNewThread: false, promptMode: "delta", reseedWarning: true }),
+    );
+    expect(prompt).toContain("⚠️ 交接预警");
+    expect(prompt).toContain("summary.md");
+  });
+
+  it("renders it on a FULL continuation too", async () => {
+    const prompt = await renderPrompt(makeInput({ isNewThread: false, reseedWarning: true }));
+    expect(prompt).toContain("⚠️ 交接预警");
+  });
+
+  it("does NOT render on a new thread even when the flag is set (nothing to hand over yet)", async () => {
+    const prompt = await renderPrompt(makeInput({ isNewThread: true, reseedWarning: true }));
+    expect(prompt).not.toContain("⚠️ 交接预警");
+  });
+
+  it("absent flag → no warning line on any shape", async () => {
+    expect(await renderPrompt(makeInput({ isNewThread: false }))).not.toContain("⚠️ 交接预警");
+    expect(
+      await renderPrompt(makeInput({ isNewThread: false, promptMode: "delta" })),
+    ).not.toContain("⚠️ 交接预警");
   });
 });
 
@@ -1361,6 +1284,32 @@ describe("renderPrompt — 批F sticky session + session reseed", () => {
     expect(prompt).toContain("空闲阈值");
     expect(prompt).not.toContain("### 话题摘要");
     expect(prompt).not.toContain("### 最近转录");
+  });
+
+  // 批H (H1): the two former ad-hoc 换血 paths now ride the same unified
+  // fresh-start enum, each with its own wording.
+  it("sessionReseed poison-reset reason renders the stuck-session wording (判定卡死)", async () => {
+    const prompt = await renderPrompt(
+      makeInput({
+        botName: "Elon",
+        sessionReseed: { reason: "poison-reset", transcriptPath: "/tmp/t.md" },
+      }),
+    );
+    expect(prompt).toContain("<session-reseed>");
+    expect(prompt).toContain("判定卡死");
+    expect(prompt).toContain("已强制换血");
+  });
+
+  it("sessionReseed ghost-purge reason renders the resume-failure wording (无法 resume)", async () => {
+    const prompt = await renderPrompt(
+      makeInput({
+        botName: "Elon",
+        sessionReseed: { reason: "ghost-purge", transcriptPath: "/tmp/t.md" },
+      }),
+    );
+    expect(prompt).toContain("<session-reseed>");
+    expect(prompt).toContain("无法 resume");
+    expect(prompt).toContain("已换到全新 session");
   });
 
   it("no sessionReseed input → no block (byte-stability for ordinary turns)", async () => {

@@ -61,48 +61,48 @@ describe("ensureAgentWorkspace", () => {
     await expect(
       fs.stat(path.join(workspacePath, "memory")),
     ).resolves.toBeTruthy();
+    // 批G P1 (R1/R2): the six-category scaffold is retired for NEW workspaces.
+    // Per-agent memory keeps ONLY identity/preferences; shared knowledge lives
+    // in the host-level knowledge repo (src/knowledge/store.ts).
     await expect(
-      fs.stat(path.join(workspacePath, "memory", "index.md")),
+      fs.stat(path.join(workspacePath, "memory", "README.md")),
     ).resolves.toBeTruthy();
-    for (const file of [
-      "preferences.md",
+    await expect(
+      fs.stat(path.join(workspacePath, "memory", "preferences.md")),
+    ).resolves.toBeTruthy();
+    for (const retired of [
+      "index.md",
       "reusable-knowledge.md",
       "workflows.md",
       "decisions.md",
       "assets.md",
     ]) {
       await expect(
-        fs.stat(path.join(workspacePath, "memory", file)),
-      ).resolves.toBeTruthy();
+        fs.stat(path.join(workspacePath, "memory", retired)),
+      ).rejects.toThrow();
     }
-    // D5/D8: assets/ and archive/ container dirs are scaffolded too.
+    // assets/ and archive/ container dirs are still scaffolded.
     await expect(
       fs.stat(path.join(workspacePath, "memory", "assets")),
     ).resolves.toBeTruthy();
     await expect(
       fs.stat(path.join(workspacePath, "memory", "archive")),
     ).resolves.toBeTruthy();
-    const memoryIndex = await fs.readFile(
-      path.join(workspacePath, "memory", "index.md"),
+    const memoryReadme = await fs.readFile(
+      path.join(workspacePath, "memory", "README.md"),
       "utf8",
     );
-    expect(memoryIndex).toContain("跨 session 长期记忆");
-    expect(memoryIndex).toContain("preferences.md");
-    expect(memoryIndex).toContain("assets.md");
-    // D6: hot-path is ADD-only; rewrites/deletes are deferred offline.
-    expect(memoryIndex).toContain("热路径(每轮)只做加法");
-    expect(memoryIndex).toContain("整理记忆");
-    expect(memoryIndex).toContain("archive/");
-    expect(memoryIndex).toContain("source 优先");
-    // D1: category skeletons carry the write-discipline hint, not "按需 append。"
+    expect(memoryReadme).toContain("仅身份与偏好");
+    // Cross-agent knowledge is pointed at the org knowledge inbox, not here.
+    expect(memoryReadme).toContain("knowledge/inbox/inbox.md");
+    expect(memoryReadme).toContain("preferences.md");
     const prefSkeleton = await fs.readFile(
       path.join(workspacePath, "memory", "preferences.md"),
       "utf8",
     );
-    expect(prefSkeleton).not.toContain("按需 append");
-    // skeleton must agree with the hot-path ADD/NOOP rule (no in-place 改写/去重)
-    expect(prefSkeleton).toContain("有相同/相关条目就 NOOP 不重复写");
-    expect(prefSkeleton).not.toContain("改写并把旧条目移 archive");
+    expect(prefSkeleton).toContain("Owner Preferences");
+    expect(prefSkeleton).toContain("有相同/相关条目就不重复写");
+    expect(prefSkeleton).toContain("组织级知识请走知识库 inbox");
 
     const agentsMd = await fs.readFile(path.join(workspacePath, "AGENTS.md"), "utf8");
     // D4: unskippable startup-load contract is baked into the AGENTS.md template.
@@ -110,6 +110,11 @@ describe("ensureAgentWorkspace", () => {
     // (index.md content is injected verbatim into every full prompt).
     expect(agentsMd).not.toContain("开场不可跳过");
     expect(agentsMd).not.toContain("Read `memory/index.md`");
+    // 批G G7 (P1): the DEFAULT non-owner knowledge policy ships as a template
+    // line in the Workspace Contract (owner-editable — the bridge only injects
+    // the sender_is_owner fact; what to do with it is policy).
+    expect(agentsMd).toContain("`sender_is_owner`");
+    expect(agentsMd).toContain("非 owner 提供的新知识只写进本 session 的 summary.md");
     expect(agentsMd).toContain("Develop and operate Larkway from Feishu.");
     expect(agentsMd).toContain("You are the Larkway DevOps agent.");
     expect(agentsMd).toContain("https://gitlab.example.com/chuckwu0/larkway.git");

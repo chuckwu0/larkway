@@ -11,77 +11,25 @@
  * See docs/prompt-contract.md and examples/prompt.template.md for the spec.
  */
 
-import fs from "node:fs/promises";
 import type { ParsedMessage } from "../lark/message.js";
 import { isSyntheticSessionKey } from "../lark/message.js";
 import { deriveTriggerFacts } from "../agent/triggerFacts.js";
 import { ANSWER_BEGIN_MARKER, ANSWER_END_MARKER } from "../agent/answerChannel.js";
 import type { TaskCandidate } from "../tasklist/types.js";
 
-/** Memory category files watched for the over-size hint (D9). */
-export const MEMORY_CATEGORY_FILE_NAMES = [
-  "preferences.md",
-  "reusable-knowledge.md",
-  "workflows.md",
-  "decisions.md",
-  "assets.md",
-] as const;
-
-/** Line count above which a memory file should be distilled at next 整理记忆. */
-const MEMORY_FILE_LINE_LIMIT = 200;
-
-/** Max chars of memory/index.md injected verbatim (A7) — index.md has no
- * code-level size contract, so an unbounded file could blow up prompt size. */
-const MEMORY_INDEX_MAX_CHARS = 4000;
-
-/** 批G G4: same cap for the L2 <agent-memory> block. L2 was the ONE injected
+/** 批G G4: char cap for the L2 <agent-memory> block. L2 was the ONE injected
  * file with no size contract — and the one 批E explicitly invites operators
  * to move business guidance into, so an unbounded L2 could quietly undo the
  * whole prompt-slimming batch. Soft cap: clipped with a pointer note. */
 const AGENT_MEMORY_MAX_CHARS = 4000;
 
-/**
- * Read a file's line count asynchronously (A5 perf: off the sync fs path).
- * Returns 0 if the file is missing or unreadable — never throws. Used only to
- * inject an advisory hint into the memory prompt block; it must not break
- * prompt rendering.
- */
-async function statMemoryLines(filePath: string): Promise<number> {
-  try {
-    const text = await fs.readFile(filePath, "utf8");
-    if (text.length === 0) return 0;
-    // True line count (wc -l semantics): count newlines, +1 only when the file
-    // does not end in a newline. `split("\n").length` over-counts by 1 on the
-    // common trailing-newline case, which would false-trigger the over-limit
-    // hint and report a wrong "已 N 行" to the agent.
-    return (text.match(/\n/g)?.length ?? 0) + (text.endsWith("\n") ? 0 : 1);
-  } catch {
-    return 0;
-  }
-}
-
-/**
- * Read memory/index.md content verbatim for L3 injection (A7) — saves the
- * agent a tool round-trip reading the same file on almost every turn.
- * Truncated (with a note) above MEMORY_INDEX_MAX_CHARS; never parsed/expanded
- * (thin-bridge: verbatim only). Returns undefined when missing/unreadable —
- * a read failure must never break prompt rendering.
- */
-async function readMemoryIndexContent(indexPath: string): Promise<string | undefined> {
-  try {
-    const text = await fs.readFile(indexPath, "utf8");
-    // Code-point-safe truncation (minor fix): `string.slice()` counts UTF-16
-    // code units, so a plain `.slice(0, N)` can land in the middle of a
-    // surrogate pair (any character outside the BMP, e.g. most emoji) and
-    // emit a lone unpaired surrogate — Array.from() iterates by code point,
-    // so slicing the resulting array never splits one.
-    const chars = Array.from(text);
-    if (chars.length <= MEMORY_INDEX_MAX_CHARS) return text;
-    return `${chars.slice(0, MEMORY_INDEX_MAX_CHARS).join("")}\n\n…(已截断，完整内容见 memory_index 路径原文件)`;
-  } catch {
-    return undefined;
-  }
-}
+// 批G P1 (R2): memory/index.md verbatim injection (A7) is retired — the
+// audited index was 8/9 pure boilerplate, so ~4k chars/turn bought nothing.
+// Its slot is taken by the org knowledge MAP (a mechanically generated
+// manifest the handler passes in via `knowledgeMap`), which lists what exists
+// and where; knowledge BODY is pulled on demand by the agent (rg/Read), never
+// injected (R5 injection discipline). The five-category oversize hints died
+// with the write-time classification they policed.
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -340,19 +288,50 @@ export interface RenderPromptInput {
    */
   stickySessionKey?: string;
   /**
-   * 批F (F2): this turn runs on a freshly reseeded backend session — the
-   * thread's record and directory continue, but the model has NO in-context
-   * history. Rendered as a <session-reseed> block (reason + summary excerpt +
-   * transcript tail + full-transcript pointer) inside the FULL prompt. The
-   * handler always renders reseed turns as full prompts (isNewThread=true
-   * semantics), so the delta branch never has to consider this field.
+   * 批F (F2) / 批H (H1): this turn runs on a freshly (re)seeded backend
+   * session — the thread's record and directory continue, but the model has
+   * NO in-context history. Rendered as a <session-reseed> block (reason +
+   * summary excerpt + transcript tail + full-transcript pointer) inside the
+   * FULL prompt. The handler always renders fresh-start turns as full prompts
+   * (isNewThread=true semantics), so the delta branch never has to consider
+   * this field. H1 widened the reason set to the unified fresh-start enum.
    */
   sessionReseed?: {
-    reason: "history-limit" | "idle-gap";
+    reason: "history-limit" | "idle-gap" | "poison-reset" | "ghost-purge";
     summaryExcerpt?: string;
     transcriptTail?: string;
     transcriptPath: string;
   };
+  /**
+   * 批G G1 (P1): pre-reseed warning window. True on the ≤5 turns leading up
+   * to a fresh start (turn-count window / approx-volume ratio — handler's
+   * call), rendered as ONE line telling the agent to bring summary.md up to
+   * handover grade NOW. Deliberately does not promise an exact turn count
+   * (the H2 volume trigger can fire first). This is the fix for the audited
+   * "summary 督促时机错位" — the only nudge used to appear ON the reseed
+   * turn itself, after the old context was already gone.
+   */
+  reseedWarning?: boolean;
+  /**
+   * 批G G7 (P1): per-turn owner fact — `yes` / `no` (owner configured, sender
+   * differs — includes every synthetic sentinel sender) / `unknown` (bot has
+   * no owner_open_id configured). A FACT line only: the bridge never gates
+   * any behavior on it; policy lives in the AGENTS.md/L2 scaffold text.
+   */
+  senderIsOwner?: "yes" | "no" | "unknown";
+  /**
+   * 批G P1 (R1): org knowledge repo root (`<LARKWAY_HOME>/knowledge`), for
+   * the workspace block's pointer + inbox speed-note contract lines. Absent →
+   * no knowledge lines (e.g. isolated tests).
+   */
+  knowledgeDir?: string;
+  /**
+   * 批G P1 (R2): the mechanically generated knowledge MAP (topics manifest +
+   * inbox count — knowledge/store.ts's knowledgeMapSummary), replacing the
+   * retired memory/index.md verbatim injection. Handler-computed so this
+   * module stays fs-free.
+   */
+  knowledgeMap?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -640,18 +619,18 @@ function renderWorkspaceBlock(
   return lines;
 }
 
-async function renderAgentWorkspaceBlock(
+function renderAgentWorkspaceBlock(
   conventions: PromptConventions,
   extraRepos: RepoRef[],
   mtimeFacts: string[],
-): Promise<string[]> {
+  knowledge?: { dir?: string; map?: string; botName?: string; threadId?: string },
+): string[] {
   const summaryFilePath = conventions.workspaceSessionPath
     ? `${conventions.workspaceSessionPath}/summary.md`
     : undefined;
   const memoryDir = conventions.agentWorkspacePath
     ? `${conventions.agentWorkspacePath}/memory`
     : undefined;
-  const memoryIndex = memoryDir ? `${memoryDir}/index.md` : undefined;
   const lines = [
     "<agent-workspace>",
     "Larkway 是 thin bridge:它只把飞书触发场景和本地路径指针交给你,不替你编排任务。",
@@ -660,36 +639,28 @@ async function renderAgentWorkspaceBlock(
     `- summary_file_path:  ${summaryFilePath ?? "(topic_session_path)/summary.md"}`,
     `- state_file_path:     ${conventions.stateFilePath}`,
     `- workspace_repos_dir: ${conventions.workspaceReposPath}`,
-    `- memory_dir:          ${memoryDir ?? "(agent_workspace_path)/memory"}`,
-    `- memory_index:        ${memoryIndex ?? "(memory_dir)/index.md"}`,
+    `- memory_dir:          ${memoryDir ?? "(agent_workspace_path)/memory"}(仅本 agent 身份/偏好)`,
+    ...(knowledge?.dir ? [`- org_knowledge_dir:   ${knowledge.dir}(组织知识库,全体 agent 共享,git 版本化)`] : []),
     "- 一个飞书话题 = 一个 task/session。话题内续接时,继续使用同一个 topic_session_path。",
     "- 群里 @ 你时,bridge 会拉起/关联一个话题;是否读取群历史、话题历史、附件、文档,由你根据任务自行决定。",
     "- 不要假设 bridge 已经 clone/fetch/worktree/pnpm install;需要代码时,你在 workspace 里自己 clone/branch/install/test。",
-    "- summary.md 是你维护本话题摘要、决策和下一步 notes 的地方;bridge 只创建占位,不替你总结。",
-    // 批E (E4): the old first-turn ceremony line ("起手先读 memory/index.md…
-    // 再读 AGENTS.md/CLAUDE.md/permissions*") is gone entirely. It was double
-    // waste: memory/index.md's content is injected verbatim below (A7), so
-    // reading it again was a pure no-op tool call; and the AGENTS.md/
-    // CLAUDE.md/permissions*.md instruction already appears in skillIntroNew
-    // at the top of every new-thread prompt — the same instruction twice in
-    // one prompt. mtimeFacts (below) remains the neutral-fact substitute for
-    // "something changed, go re-read it".
-    "- 本 session 里跨 session 可复用的内容,先记到 topic_session_path/memory-candidates.md;owner 确认后,由你写进 memory/<category>.md(category: preferences / reusable-knowledge / workflows / decisions / assets)。",
-    "- 热路径(每轮)只允许 ADD / NOOP:把候选 append 到 memory-candidates.md,或往 category 文件追加新条目;不在热路径做 UPDATE/DELETE/改写已有条目。",
-    "- 改写、删除、解决冲突 → 推迟到 owner 显式说「整理记忆」时的离线步骤做。失效/被推翻的条目移 memory/archive/(注一句原因),不物理删。",
-    "- 离线整理/改写已有记忆前,先用 rg 在 sessions/*/transcript.md 核到来源行;commit/笔记引用该行;核不到来源的结论降级为 candidate,不写进正文。(单 agent 自己做,别 spawn 别的 agent。)",
-    "- 只有跨 session 还会再用到的才进 memory/(单次任务留在 summary,随 session 过期);新增、以及会改变行为或边界的改写/删除都要 owner 确认。",
+    "- summary.md 是你维护本话题摘要、决策和下一步 notes 的地方;bridge 只创建占位,不替你总结。它也是本话题换血时的种子来源——保持「新会话仅凭它就能续接」的水位。",
+    // 批E (E4): the old first-turn ceremony line is gone (see git history).
+    // 批G P1 (R2): the candidates five-step ritual + write-time-classification
+    // rules that used to live here are gone WITH their storage (the audited
+    // dead pipeline: 6/6 candidates files were untouched placeholders).
+    // Conversation turns now carry exactly ONE zero-cost memory duty — the
+    // inbox speed-note append; distillation/classification/dedup belong to
+    // the maintenance turn (a separate, mechanically-triggered session).
+    ...(knowledge?.dir
+      ? [
+          `- 对话轮不整理记忆。值得跨 session 留的事实,append 一行速记进 ${knowledge.dir}/inbox/inbox.md,格式:\`[rec:YYYY-MM-DD] [${knowledge.botName ?? "你的bot名"}] [session ${knowledge.threadId ?? "<threadId>"}] 一句话\`。蒸馏、分类、去重由保养轮统一做,不占你当前任务。`,
+          `- 需要历史知识时:先看下方知识地图,再按需 rg/Read ${knowledge.dir}/topics/ 正文;不要整目录通读。`,
+          "- 取信优先级:你的 L2 职能(<agent-memory>) > 知识库 topics/ > session summary。冲突按序取信,并在答复里指出矛盾,不要静默合并。",
+          "- 注入到 prompt 里的地图/种子是只读快照 —— 不要把它们原样回写进任何持久文件(防自激励循环)。",
+        ]
+      : []),
   ];
-  if (memoryDir) {
-    for (const fileName of MEMORY_CATEGORY_FILE_NAMES) {
-      const count = await statMemoryLines(`${memoryDir}/${fileName}`);
-      if (count > MEMORY_FILE_LINE_LIMIT) {
-        lines.push(
-          `- ⚠️ ${fileName} 已 ${count} 行,超限——下次「整理记忆」时先蒸馏压缩。`,
-        );
-      }
-    }
-  }
   if (conventions.defaultProjectSlug) {
     lines.push("");
     lines.push("Repo pointers(只是指针,不是已准备好的 clone):");
@@ -712,20 +683,16 @@ async function renderAgentWorkspaceBlock(
   if (conventions.gitlabTokenEnvName) {
     lines.push(`- gitlab_token_env_name: ${conventions.gitlabTokenEnvName}`);
   }
-  // A7: inject memory/index.md content verbatim (both new-thread and
-  // continuation turns — same treatment as L2 <agent-memory>), so the agent
-  // doesn't spend a tool round-trip reading the same short index file nearly
-  // every turn. Verbatim only, never parsed/expanded (thin-bridge). Absent /
-  // unreadable → block omitted, non-fatal.
-  if (memoryIndex) {
-    const indexContent = await readMemoryIndexContent(memoryIndex);
-    if (indexContent && indexContent.trim().length > 0) {
-      lines.push("");
-      lines.push("<memory-index-content>");
-      lines.push("以下是 memory_index 文件当前内容(逐字注入,未解析;完整历史仍可自行 Read 原文件):");
-      lines.push(indexContent.trim());
-      lines.push("</memory-index-content>");
-    }
+  // 批G P1 (R2): the knowledge MAP replaces the retired memory/index.md
+  // verbatim injection — a mechanically generated manifest ("what exists,
+  // where, how much"), hard-capped in knowledge/store.ts. Knowledge BODY is
+  // never injected; the agent pulls it on demand (R5).
+  if (knowledge?.map && knowledge.map.trim().length > 0) {
+    lines.push("");
+    lines.push("<org-knowledge-map>");
+    lines.push("组织知识库地图(机械生成的清单,非正文;正文按需 rg/Read):");
+    lines.push(knowledge.map.trim());
+    lines.push("</org-knowledge-map>");
   }
   // A2: neutral mtime-change facts for the ceremony line dropped above on
   // continuation turns (bridge-computed, not a business judgment — see
@@ -750,10 +717,15 @@ async function renderAgentWorkspaceBlock(
  * conversation was about, and (c) where the full record lives.
  */
 function renderSessionReseedBlock(reseed: NonNullable<RenderPromptInput["sessionReseed"]>): string[] {
+  // 批H H1: one wording per unified fresh-start reason.
   const reasonText =
     reseed.reason === "history-limit"
-      ? "本话题累计轮数已超阈值,继续拖全量历史不如带种子重开"
-      : "距上次活动已超过空闲阈值,大概率是新话题";
+      ? "本话题累计轮数/体量已超阈值,继续拖全量历史不如带种子重开"
+      : reseed.reason === "idle-gap"
+        ? "距上次活动已超过空闲阈值,大概率是新话题"
+        : reseed.reason === "poison-reset"
+          ? "此前的后端 session 连续多轮无活性(判定卡死),已强制换血"
+          : "旧后端 session 已失效(无法 resume),已换到全新 session";
   const lines = [
     "<session-reseed>",
     `本话题的后端 session 已重播种(${reasonText})。此前轮次的对话**不在你的上下文里**;以下种子帮助你延续:`,
@@ -899,6 +871,17 @@ export async function renderPrompt(input: RenderPromptInput): Promise<string> {
   const sessionReseedBlock = input.sessionReseed
     ? renderSessionReseedBlock(input.sessionReseed)
     : [];
+  // 批G G7 (P1): owner fact line — rendered adjacent to `sender:` in every
+  // prompt shape. Pure fact; policy text lives in the AGENTS.md scaffold.
+  const senderIsOwnerLine = `sender_is_owner:  ${input.senderIsOwner ?? "unknown"}`;
+  // 批G G1 (P1): bounded pre-reseed warning (delta + continuation only — a
+  // new thread has nothing to hand over yet). Wording deliberately promises
+  // no exact turn count: the H2 volume trigger can fire first.
+  const reseedWarningLines = input.reseedWarning
+    ? [
+        "⚠️ 交接预警:本 session 快到换血点,下次将带种子重开。趁上下文还在,现在就把 summary.md 补到「新会话仅凭它+转录尾部即可续接」的程度。",
+      ]
+    : [];
 
   // 批E (E1): delta continuation prompt — dynamic facts only. Everything
   // static (contract, L2 memory, workspace block, peers, rules) is already in
@@ -914,6 +897,7 @@ export async function renderPrompt(input: RenderPromptInput): Promise<string> {
       `message_id:       ${parsed.messageId}`,
       `chat_id:          ${parsed.chatId}`,
       `sender:           ${parsed.senderOpenId}`,
+      senderIsOwnerLine,
       `is_new_thread:    false`,
       `trigger_type:     ${trigger.triggerType}`,
       `mention_type:     ${trigger.mentionType}`,
@@ -929,6 +913,7 @@ export async function renderPrompt(input: RenderPromptInput): Promise<string> {
       "</thread-context>",
       "",
       ...renderContractAnchor(conventions.stateFilePath),
+      ...(reseedWarningLines.length > 0 ? ["", ...reseedWarningLines] : []),
       ...(mtimeFacts.length > 0
         ? [
             "",
@@ -947,7 +932,12 @@ export async function renderPrompt(input: RenderPromptInput): Promise<string> {
   // Workspace warm-up block — rendered for all bots that have at least one repo.
   const extraRepos = extraRepoPaths ?? conventions.extraRepoPaths ?? [];
   const workspaceBlock = isAgentWorkspace
-    ? await renderAgentWorkspaceBlock(conventions, extraRepos, mtimeFacts)
+    ? renderAgentWorkspaceBlock(conventions, extraRepos, mtimeFacts, {
+        dir: input.knowledgeDir,
+        map: input.knowledgeMap,
+        botName: input.botName,
+        threadId: parsed.threadId,
+      })
     : hasRepo
       ? renderWorkspaceBlock(
         conventions.defaultProjectSlug ?? "repo",
@@ -958,8 +948,8 @@ export async function renderPrompt(input: RenderPromptInput): Promise<string> {
       : [];
 
   // L2 Agent Memory (职能) — injected as a role preamble when provided.
-  // 批G G4: code-point-safe soft cap (same treatment as memory/index.md) —
-  // the over-limit tail stays readable in the file, just not injected.
+  // 批G G4: code-point-safe soft cap — the over-limit tail stays readable in
+  // the file, just not injected.
   const trimmedAgentMemory = agentMemory?.trim() ?? "";
   const agentMemoryChars = Array.from(trimmedAgentMemory);
   const cappedAgentMemory =
@@ -1077,6 +1067,7 @@ export async function renderPrompt(input: RenderPromptInput): Promise<string> {
       `message_id:       ${parsed.messageId}`,
       `chat_id:          ${parsed.chatId}`,
       `sender:           ${parsed.senderOpenId}`,
+      senderIsOwnerLine,
       `is_new_thread:    true`,
       `trigger_type:     ${trigger.triggerType}`,
       `mention_type:     ${trigger.mentionType}`,
@@ -1158,6 +1149,7 @@ export async function renderPrompt(input: RenderPromptInput): Promise<string> {
     `message_id:       ${parsed.messageId}`,
     `chat_id:          ${parsed.chatId}`,
     `sender:           ${parsed.senderOpenId}`,
+    senderIsOwnerLine,
     `is_new_thread:    false`,
     `trigger_type:     ${trigger.triggerType}`,
     `mention_type:     ${trigger.mentionType}`,
@@ -1196,10 +1188,11 @@ export async function renderPrompt(input: RenderPromptInput): Promise<string> {
     ...stateContract,
     ...(workspaceBlock.length > 0 ? ["", ...workspaceBlock] : []),
     ...(sessionReseedBlock.length > 0 ? ["", ...sessionReseedBlock] : []),
+    ...(reseedWarningLines.length > 0 ? ["", ...reseedWarningLines] : []),
     ...(peersBlock.length > 0 ? ["", ...peersBlock] : []),
     ...(turnTakingBlock.length > 0 ? ["", ...turnTakingBlock] : []),
     ...(taskHandleBlock.length > 0 ? ["", ...taskHandleBlock] : []),
-      ...(taskRootBlock.length > 0 ? ["", ...taskRootBlock] : []),
+    ...(taskRootBlock.length > 0 ? ["", ...taskRootBlock] : []),
     "",
     ...userMessageLines,
   ].join("\n");

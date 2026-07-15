@@ -61,16 +61,6 @@ export function stripSummaryPlaceholder(summary: string): string {
     .trim();
 }
 
-function renderMemoryCandidatesPlaceholder(): string {
-  return [
-    "# Memory Candidates",
-    "",
-    "本 session 里值得提升为跨 session 长期记忆的候选,记在这。",
-    "owner 确认后,由你(Agent)写进 ../../memory/<category>.md。",
-    "",
-  ].join("\n");
-}
-
 function indentBlock(value: string): string {
   const trimmed = value.trim();
   if (!trimmed) return "  (empty)";
@@ -143,10 +133,11 @@ export async function ensureSessionArtifacts(
 ): Promise<void> {
   await fs.mkdir(input.sessionPath, { recursive: true });
   await writeIfMissing(path.join(input.sessionPath, "summary.md"), renderSummaryPlaceholder());
-  await writeIfMissing(
-    path.join(input.sessionPath, "memory-candidates.md"),
-    renderMemoryCandidatesPlaceholder(),
-  );
+  // 批G G1: memory-candidates.md is gone. It was the audited dead pipeline —
+  // 6/6 files byte-identical to the placeholder, zero candidates ever written.
+  // The speed-note primitive is now one appended line to the org knowledge
+  // repo's inbox (see prompt.ts's workspace block); distillation belongs to
+  // the maintenance turn, not to conversation turns.
   await fs.appendFile(
     path.join(input.sessionPath, "transcript.md"),
     `${renderTranscriptEntry(input)}\n`,
@@ -166,6 +157,141 @@ const TRANSCRIPT_ANSWER_MAX_CHARS = 1500;
  * transcript would replay questions with no answers. Called by the handler at
  * finalize, best-effort (a failed append never affects the turn outcome).
  */
+// ---------------------------------------------------------------------------
+// 批H H1: shared fresh-start seed builder
+// ---------------------------------------------------------------------------
+
+/** Seed excerpt caps (code points) — same values 批F used inline in handler.ts. */
+export const SEED_SUMMARY_MAX_CHARS = 2000;
+export const SEED_TRANSCRIPT_TAIL_MAX_CHARS = 3000;
+
+function clipHead(text: string, max: number): string {
+  const chars = Array.from(text);
+  if (chars.length <= max) return text;
+  return `${chars.slice(0, max).join("")}\n…(后文已截断)`;
+}
+
+function clipTail(text: string, max: number): string {
+  const chars = Array.from(text);
+  if (chars.length <= max) return text;
+  return `…(前文已截断)\n${chars.slice(chars.length - max).join("")}`;
+}
+
+export interface FreshStartSeed {
+  summaryExcerpt?: string;
+  transcriptTail?: string;
+  /** Pointer the agent can Read for the full record (dir file or harvest file). */
+  transcriptPath: string;
+}
+
+/**
+ * Build the seed material for a fresh backend session — the ONE builder all
+ * three former 换血 paths share (批F reseed at turn start, BL-38 poison-reset
+ * marker, ghost-purge retry). Re-entrant: pure reads, no state, safe to call
+ * inside the handler's retry loop.
+ *
+ * Source order (原则 2 made real): when `harvestPath` is provided the HARVEST
+ * wins outright. The caller gates it on `record.harvestedAt`, and that flag
+ * is cleared by the first completed post-revival turn's write-back — so
+ * harvestedAt-set ⇒ no turn has completed since the GC reclaim ⇒ the session
+ * dir holds AT MOST this turn's fresh scaffold (placeholder summary + the
+ * current trigger's transcript entry, which the agent already has as the
+ * user message). Preferring the dir there would silently trade the rich
+ * harvest for an echo of the current message (found in self-review: the
+ * ghost-purge retry builds its seed AFTER ensureSessionArtifacts recreated
+ * the dir). Without harvestPath: read the live dir.
+ * Never throws; a seed with neither part is still returned (the fresh start
+ * itself must proceed) — callers can inspect the fields for logging.
+ */
+export async function buildFreshStartSeed(opts: {
+  sessionPath: string;
+  /** Harvest file (resolveHarvestPath(...)) — pass ONLY when record.harvestedAt is set. */
+  harvestPath?: string;
+}): Promise<FreshStartSeed> {
+  const transcriptPath = path.join(opts.sessionPath, "transcript.md");
+
+  if (opts.harvestPath) {
+    // The section headings are written by src/housekeeping/harvest.ts (our
+    // own mechanical format, stable). Unreadable harvest → fall through to
+    // the dir (defensive; shouldn't happen while harvestedAt is set).
+    try {
+      const harvest = await fs.readFile(opts.harvestPath, "utf8");
+      const summaryPart = extractHarvestSection(harvest, "## Summary (agent-authored)");
+      const tailPart = extractHarvestSection(harvest, "## Transcript tail");
+      return {
+        summaryExcerpt: summaryPart ? clipHead(summaryPart, SEED_SUMMARY_MAX_CHARS) : undefined,
+        transcriptTail: tailPart
+          ? clipTail(tailPart, SEED_TRANSCRIPT_TAIL_MAX_CHARS)
+          : clipTail(harvest.trim(), SEED_TRANSCRIPT_TAIL_MAX_CHARS) || undefined,
+        transcriptPath: opts.harvestPath,
+      };
+    } catch {
+      /* fall through to the dir reads below */
+    }
+  }
+
+  let summaryExcerpt: string | undefined;
+  let transcriptTail: string | undefined;
+  try {
+    const agentSummary = stripSummaryPlaceholder(
+      await fs.readFile(path.join(opts.sessionPath, "summary.md"), "utf8"),
+    );
+    if (agentSummary.length > 0) {
+      summaryExcerpt = clipHead(agentSummary, SEED_SUMMARY_MAX_CHARS);
+    }
+  } catch {
+    /* no summary.md */
+  }
+  try {
+    const transcript = (await fs.readFile(transcriptPath, "utf8")).trim();
+    if (transcript.length > 0) {
+      transcriptTail = clipTail(transcript, SEED_TRANSCRIPT_TAIL_MAX_CHARS);
+    }
+  } catch {
+    /* no transcript.md */
+  }
+  return { summaryExcerpt, transcriptTail, transcriptPath };
+}
+
+/**
+ * Mechanical section extractor for harvest files: everything under the LAST
+ * occurrence of `heading` (append-merged harvests repeat sections; the last
+ * block is the newest) up to the next STRUCTURAL boundary.
+ *
+ * Boundary = only the harvest module's OWN structural lines (its two section
+ * headings + the per-generation `# Session harvest:` title) — NEVER a generic
+ * `## ` or `---` match. Agent summaries routinely contain their own `## `
+ * headings (adversarial-test find: a `## 进展` first line made the extracted
+ * summary silently empty — the same heading-boundary bug class as the
+ * projectRoleNotes blocker). Since we anchor on the LAST heading occurrence,
+ * nothing after it belongs to a later generation, so content-level `---` hr
+ * lines are safe to keep too.
+ */
+const HARVEST_STRUCTURAL_LINES = new Set([
+  "## Summary (agent-authored)",
+  "## Transcript tail",
+]);
+
+function extractHarvestSection(harvest: string, heading: string): string | undefined {
+  const lines = harvest.split(/\r?\n/);
+  let start = -1;
+  for (let i = 0; i < lines.length; i++) {
+    if (lines[i]!.trim() === heading) start = i + 1;
+  }
+  if (start === -1) return undefined;
+  const collected: string[] = [];
+  for (let i = start; i < lines.length; i++) {
+    const line = lines[i]!;
+    const trimmed = line.trim();
+    if (HARVEST_STRUCTURAL_LINES.has(trimmed) || trimmed.startsWith("# Session harvest:")) {
+      break;
+    }
+    collected.push(line);
+  }
+  const text = collected.join("\n").trim();
+  return text.length > 0 ? text : undefined;
+}
+
 export async function appendTranscriptAnswer(
   sessionPath: string,
   answer: string,

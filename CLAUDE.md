@@ -23,6 +23,7 @@ src/
   bridge/       Message handler, card renderer, session state files
   lark/         Feishu WS channel client, card/message parsing utilities
   config/       Bot YAML loader, path helpers, zod config schema
+  knowledge/    Host-level org knowledge repo (git; harvest/inbox/topics — docs/knowledge-base.md)
   housekeeping/ Idle-session GC, orphaned worktree cleanup
   web/          Local management UI (REST + static assets)
   cli/          `larkway` CLI subcommands (init, bot, doctor, …)

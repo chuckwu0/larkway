@@ -41,9 +41,24 @@ import type { PerfMarkerName } from "../agent/runner.js";
 import type { BotConfig } from "../config/botLoader.js";
 import {
   appendTranscriptAnswer,
+  buildFreshStartSeed,
   ensureSessionArtifacts,
-  stripSummaryPlaceholder,
 } from "../agent/sessionArtifacts.js";
+import type { FreshStartReason } from "../claude/sessionStore.js";
+import { resolveKnowledgeDir } from "../config/paths.js";
+import {
+  commitKnowledgeIfDirty,
+  ensureKnowledgeRepo,
+  knowledgeMapSummary,
+  resolveHarvestPath,
+} from "../knowledge/store.js";
+import {
+  diffMemoryMtimes,
+  renderMemoryVisibilityTail,
+  snapshotMemoryMtimes,
+  type MemoryMtimeSnapshot,
+} from "./memoryVisibility.js";
+import type { MemoryMetricEvent } from "./memoryMetrics.js";
 import { ensureAgentWorkspace } from "../agent/workspaceStore.js";
 import {
   computeMtimeFacts,
@@ -149,31 +164,29 @@ const DEFAULT_STUCK_SESSION_RESET_AFTER = 3;
 const DEFAULT_SESSION_RESEED_TURNS = 60;
 const DEFAULT_P2P_STICKY_IDLE_MS = 12 * 60 * 60 * 1000;
 
-/** Caps for the <session-reseed> seed material (chars, code-point sliced). */
-const RESEED_SUMMARY_MAX_CHARS = 2000;
-const RESEED_TRANSCRIPT_TAIL_MAX_CHARS = 3000;
+/**
+ * 批H (H2) volume-trigger default: reseed once the session's approxChars
+ * (assistant answer text + JSON.stringify of visible tool_result raws — an
+ * explicit LOWER-BOUND estimate) crosses this. Complements the turn counter:
+ * a few turns with huge tool outputs can bloat a session long before turn 60.
+ * Per-bot `sessionReseedChars` overrides; 0 disables.
+ */
+const DEFAULT_SESSION_RESEED_CHARS = 300_000;
+
+/**
+ * 批G G1 (P1) pre-reseed warning window: the last N turns before the
+ * turn-count trigger (and, for the volume trigger, past this ratio of the
+ * char threshold) carry a one-line "补 summary.md 到可交接程度" warning.
+ * Bounded by construction — at most N turns per session generation.
+ */
+const RESEED_WARNING_WINDOW_TURNS = 5;
+const RESEED_WARNING_CHARS_RATIO = 0.85;
 
 function resolveStuckSessionResetAfter(): number {
   const raw = process.env.LARKWAY_STUCK_SESSION_RESET_AFTER;
   if (raw === undefined) return DEFAULT_STUCK_SESSION_RESET_AFTER;
   const n = Number.parseInt(raw, 10);
   return Number.isFinite(n) && n > 0 ? n : DEFAULT_STUCK_SESSION_RESET_AFTER;
-}
-
-/**
- * Code-point-safe head/tail clips for the reseed seed (批F F2). Plain
- * string.slice counts UTF-16 units and can split a surrogate pair; iterate by
- * code point instead (same rationale as prompt.ts's memory-index truncation).
- */
-function clipCodePointsHead(text: string, max: number): string {
-  const chars = Array.from(text);
-  if (chars.length <= max) return text;
-  return `${chars.slice(0, max).join("")}\n…(已截断)`;
-}
-function clipCodePointsTail(text: string, max: number): string {
-  const chars = Array.from(text);
-  if (chars.length <= max) return text;
-  return `…(前文已截断)\n${chars.slice(chars.length - max).join("")}`;
 }
 
 function summarizeMentionPolicyRules(rules: string[]): string {
@@ -890,8 +903,12 @@ export interface BridgeHandlerDeps {
     p2pStickySession?: boolean;
     /** 批F (F2) reseed after N turns (0 disables) — see BotConfig.sessionReseedTurns. */
     sessionReseedTurns?: number;
+    /** 批H (H2) reseed past N approx chars (0 disables) — see BotConfig.sessionReseedChars. */
+    sessionReseedChars?: number;
     /** 批F (F1/F2) sticky-session idle gap (ms) that triggers a reseed — see BotConfig.p2pStickyIdleMs. */
     p2pStickyIdleMs?: number;
+    /** 批G (G7) owner's open_id in THIS bot's app scope — see BotConfig.owner_open_id. */
+    owner_open_id?: string;
     /**
      * COT (思维链) 气泡档位。"off" = 不推;"brief"/"detailed" 见 BotConfig.cot。
      * 缺省视为 "brief"。仅在非 "off" 时 main.ts 才注入 cotClient。
@@ -938,6 +955,14 @@ export interface BridgeHandlerDeps {
    * the subprocess inherits the global GITLAB_TOKEN from process.env.
    */
   gitlabToken?: string;
+  /**
+   * 批G P1 (原则 6): mechanical memory-pipeline metric sink. main.ts wires
+   * this to memoryMetrics.appendMemoryMetric (fire-and-forget JSONL);
+   * absent (tests / embedders) → no metrics, zero behavior change. The
+   * handler only ever CALLS it with facts — aggregation lives in
+   * memoryMetrics.summarizeMemoryMetrics, surfaced via /api/memory-liveness.
+   */
+  recordMemoryMetric?: (event: MemoryMetricEvent) => void;
 
   /**
    * V2: lark-cli named profile for this bot.
@@ -1452,6 +1477,9 @@ export class BridgeHandler {
     });
     const stickySession = isSyntheticSessionKey(threadId);
     const botId = this.deps.botConfig?.id;
+    // V1 (no bot yaml) has no id — metrics/harvest paths use the same
+    // sentinel bucket sessionStore.put() defaults to.
+    const metricBotId = botId ?? "v1-default";
     // 批G G4: L2 live-read — a few-KB local file per turn buys "edit L2, no
     // restart". Boot-cached deps.agentMemory remains the fallback.
     let agentMemory = this.deps.agentMemory;
@@ -1663,16 +1691,29 @@ export class BridgeHandler {
     //     topic with full context is a feature, not a bug.
     const reseedTurnsLimit =
       this.deps.botConfig?.sessionReseedTurns ?? DEFAULT_SESSION_RESEED_TURNS;
+    const reseedCharsLimit =
+      this.deps.botConfig?.sessionReseedChars ?? DEFAULT_SESSION_RESEED_CHARS;
     const stickyIdleMs = this.deps.botConfig?.p2pStickyIdleMs ?? DEFAULT_P2P_STICKY_IDLE_MS;
-    let reseedReason: "history-limit" | "idle-gap" | undefined;
+    let reseedReason: FreshStartReason | undefined;
     // Adversarial-review fix: reseed is agent_workspace-only. The seed corpus
     // (summary.md/transcript.md via ensureSessionArtifacts + the answer
     // append) only exists there — a legacy-runtime reseed would silently drop
     // all context at turn 60 with a structurally empty seed and a dead
     // transcript pointer.
     const reseedEligible = this.deps.conventions.runtime === "agent_workspace";
-    if (reseedEligible && existing?.sessionId) {
+    if (existing?.needsFreshStart) {
+      // 批H H1: a prior turn condemned this thread's backend session
+      // (poison-reset / ghost-purge marker; sessionId already cleared). This
+      // fires on BOTH runtimes — the fresh start is mandatory either way;
+      // only the SEED is agent_workspace-gated (legacy has no corpus, its
+      // explicit degradation is a seedless fresh start = the old behavior).
+      reseedReason = existing.needsFreshStart.reason;
+    } else if (reseedEligible && existing?.sessionId) {
       if (reseedTurnsLimit > 0 && (existing.turnCount ?? 0) >= reseedTurnsLimit) {
+        reseedReason = "history-limit";
+      } else if (reseedCharsLimit > 0 && (existing.approxChars ?? 0) >= reseedCharsLimit) {
+        // 批H H2: volume trigger — same seeded fresh start, same reason label
+        // (the event log below records which signal tripped).
         reseedReason = "history-limit";
       } else if (
         stickySession &&
@@ -1682,7 +1723,30 @@ export class BridgeHandler {
         reseedReason = "idle-gap";
       }
     }
-    const forceFreshSession = reseedReason !== undefined;
+    // `let`: the ghost-purge retry (Step 4c catch) flips this mid-loop for
+    // its seeded second attempt (批H H1).
+    let forceFreshSession = reseedReason !== undefined;
+
+    // 批G G1 (P1): bounded pre-reseed warning window — the audited failure
+    // was "summary 督促时机错位" (the only nudge arrived ON the reseed turn,
+    // after the old context was gone). Mechanical trigger, prompt renders one
+    // line; compliance is measured at the NEXT reseed (metric event below).
+    const reseedWarning =
+      !forceFreshSession &&
+      reseedEligible &&
+      !!existing?.sessionId &&
+      ((reseedTurnsLimit > 0 &&
+        (existing.turnCount ?? 0) >= reseedTurnsLimit - RESEED_WARNING_WINDOW_TURNS) ||
+        (reseedCharsLimit > 0 &&
+          (existing.approxChars ?? 0) >= reseedCharsLimit * RESEED_WARNING_CHARS_RATIO));
+    if (reseedWarning) {
+      this.deps.recordMemoryMetric?.({
+        type: "reseed-warning",
+        at: Date.now(),
+        botId: metricBotId,
+        threadId,
+      });
+    }
 
     // Step 3: create "thinking" card — get handle.
     // Top-level @bot (no root_id): pass --reply-in-thread to open a Feishu topic
@@ -1763,48 +1827,61 @@ export class BridgeHandler {
         ? conventions.agentWorkspacePath!
         : worktreePath;
 
-      // 批F (F2): build the <session-reseed> seed material. Best-effort file
-      // reads — a missing summary/transcript just drops out of the seed; the
-      // reseed itself (fresh backend session) happens regardless. The session
-      // DIR is reused in place, so summary.md / transcript.md keep
-      // accumulating across reseeds.
+      // 批F (F2) / 批H (H1): build the <session-reseed> seed material via the
+      // SHARED fresh-start seed builder (agent/sessionArtifacts.ts) — the one
+      // builder all three 换血 paths use. Best-effort reads; the fresh start
+      // itself happens regardless. Source order: live session dir first, the
+      // knowledge repo's harvest file when the dir was GC-reclaimed
+      // (record.harvestedAt is the mechanical flag — 原则 2's "结构性空种子"
+      // fix). Legacy runtime: explicit degradation — no seed corpus exists,
+      // the fresh start proceeds seedless (old behavior, unchanged).
       let sessionReseed:
         | {
-            reason: "history-limit" | "idle-gap";
+            reason: FreshStartReason;
             summaryExcerpt?: string;
             transcriptTail?: string;
             transcriptPath: string;
           }
         | undefined;
-      if (forceFreshSession && reseedReason) {
-        const transcriptPath = path.join(worktreePath, "transcript.md");
-        let summaryExcerpt: string | undefined;
-        let transcriptTail: string | undefined;
-        try {
-          const summary = await fs.readFile(path.join(worktreePath, "summary.md"), "utf8");
-          // Strip the bridge placeholder lines; keep whatever the agent
-          // actually wrote (whether it replaced the placeholder or appended
-          // below it — adversarial-review fix, see stripSummaryPlaceholder).
-          const agentSummary = stripSummaryPlaceholder(summary);
-          if (agentSummary.length > 0) {
-            summaryExcerpt = clipCodePointsHead(agentSummary, RESEED_SUMMARY_MAX_CHARS);
+      if (forceFreshSession && reseedReason && isAgentWorkspace) {
+        let harvestFallbackPath: string | undefined;
+        if (existing?.harvestedAt) {
+          try {
+            harvestFallbackPath = resolveHarvestPath(resolveKnowledgeDir(), metricBotId, threadId);
+          } catch {
+            /* unsafe path segment — no fallback */
           }
-        } catch {
-          /* no summary.md — seed from transcript only */
         }
-        try {
-          const transcript = (await fs.readFile(transcriptPath, "utf8")).trim();
-          if (transcript.length > 0) {
-            transcriptTail = clipCodePointsTail(transcript, RESEED_TRANSCRIPT_TAIL_MAX_CHARS);
-          }
-        } catch {
-          /* no transcript.md */
-        }
-        sessionReseed = { reason: reseedReason, summaryExcerpt, transcriptTail, transcriptPath };
+        const seed = await buildFreshStartSeed({
+          sessionPath: worktreePath,
+          harvestPath: harvestFallbackPath,
+        });
+        sessionReseed = { reason: reseedReason, ...seed };
+        // 批G G1 (P1) compliance metric: was there a REAL agent-authored
+        // summary at handover time? This is the number the pre-reseed
+        // warning window is judged by (原则 6).
+        this.deps.recordMemoryMetric?.({
+          type: "reseed",
+          at: Date.now(),
+          botId: metricBotId,
+          threadId,
+          reason: reseedReason,
+          summaryWasPlaceholder: seed.summaryExcerpt === undefined,
+        });
         await recordEvent({
           status: "running",
-          appendPath: "session 重播种",
-          reason: `原因=${reseedReason};本轮弃用旧后端 session,注入 summary/transcript 种子后全新开始(session 目录与任务记录不变)。`,
+          appendPath: "session 换血",
+          reason:
+            `原因=${reseedReason}(turns=${existing?.turnCount ?? 0}, approxChars=${existing?.approxChars ?? 0});` +
+            `本轮弃用旧后端 session,注入种子后全新开始(session 目录与任务记录不变;` +
+            `种子来源=${seed.transcriptPath})。`,
+        });
+      } else if (forceFreshSession && reseedReason) {
+        // Legacy runtime fresh start (marker-driven): seedless by design.
+        await recordEvent({
+          status: "running",
+          appendPath: "session 换血(legacy,无种子)",
+          reason: `原因=${reseedReason};legacy runtime 无 session 语料,直接全新开始。`,
         });
       }
 
@@ -2426,6 +2503,34 @@ export class BridgeHandler {
         }
       }
 
+      // 批G P1 (R1/G6): org knowledge repo — ensure (per-process cached, ~free
+      // after the first turn), snapshot-commit any pre-existing dirt so this
+      // turn's diffstat only ever shows THIS turn's changes, and render the
+      // knowledge MAP for the prompt. Host-level and runtime-independent (a
+      // legacy bot can append inbox notes too). Every step best-effort — the
+      // knowledge layer must never block the conversation path.
+      let knowledgeDir: string | undefined;
+      let knowledgeGitReady = false;
+      try {
+        const ensured = await ensureKnowledgeRepo(resolveKnowledgeDir());
+        knowledgeDir = ensured.knowledgeDir;
+        knowledgeGitReady = ensured.gitReady;
+        if (knowledgeGitReady) {
+          await commitKnowledgeIfDirty(
+            knowledgeDir,
+            `snapshot: before turn ${metricBotId}/${threadId}`,
+          );
+        }
+      } catch (err) {
+        console.warn("[bridge.handler] knowledge repo unavailable (continuing):", err);
+      }
+      // 批G G6: turn-boundary mtime snapshot of the per-agent memory files —
+      // the mechanical "本轮修改了…" card-tail evidence (原则 4).
+      let memoryMtimeSnapshot: MemoryMtimeSnapshot | undefined;
+      if (isAgentWorkspace && conventions.agentWorkspacePath) {
+        memoryMtimeSnapshot = await snapshotMemoryMtimes(conventions.agentWorkspacePath);
+      }
+
       // Deferred bubble create — every turn that did NOT early-create above
       // (new topic's first turn; task-card turn triggered from outside its
       // work topic): NOW create the bubble, anchored on the ANSWER CARD's
@@ -2532,6 +2637,24 @@ export class BridgeHandler {
           }
         }
 
+        // 批G P1 (R2): the knowledge map only renders inside the workspace
+        // block of FULL prompts — delta turns (批E's slim path) must not pay
+        // its readdir/read cost every turn for a string the renderer drops.
+        // Computed in-loop because the ghost-purge retry flips a delta turn
+        // into a full fresh-start prompt.
+        const rendersFullPrompt =
+          currentIsNewThread ||
+          forceFreshSession ||
+          (this.deps.botConfig?.promptMode ?? "full") !== "delta";
+        let knowledgeMap: string | undefined;
+        if (knowledgeDir && rendersFullPrompt) {
+          try {
+            knowledgeMap = await knowledgeMapSummary(knowledgeDir);
+          } catch {
+            /* map is optional — never blocks the turn */
+          }
+        }
+
         const prompt = await renderPrompt({
           parsed,
           // 批F (F2): a reseed turn renders the FULL new-thread prompt — the
@@ -2567,6 +2690,25 @@ export class BridgeHandler {
           botName: this.deps.botConfig?.name,
           backend: this.deps.botConfig?.backend,
           promptMode: this.deps.botConfig?.promptMode,
+          // 批G G1 (P1): pre-reseed handover warning (one line, bounded
+          // window). `&& !forceFreshSession`: the ghost-purge retry flips
+          // forceFreshSession mid-loop — without the guard, a warned record
+          // whose resume then ghost-fails would render BOTH the warning
+          // ("下次将带种子重开") AND the <session-reseed> block in one prompt
+          // (adversarial-test find).
+          reseedWarning: reseedWarning && !forceFreshSession,
+          // 批G G7 (P1): owner FACT — `unknown` when the bot has no
+          // owner_open_id configured; `no` for any non-matching sender,
+          // which by construction includes every synthetic sentinel sender
+          // (patrol/nudge turns never carry the owner's open_id).
+          senderIsOwner: this.deps.botConfig?.owner_open_id
+            ? parsed.senderOpenId === this.deps.botConfig.owner_open_id
+              ? "yes"
+              : "no"
+            : "unknown",
+          // 批G P1 (R1/R2): knowledge repo pointers + mechanical map.
+          knowledgeDir,
+          knowledgeMap,
           agentMemory,
           larkCliProfile: this.deps.larkCliProfile,
           runtimeWarnings: this.runtimeWarnings(),
@@ -2626,8 +2768,13 @@ export class BridgeHandler {
           prompt,
           // 批F (F2): reseed = no resume. The record itself is kept (write-back
           // uses the existing-record branch to persist the NEW sessionId while
-          // preserving createdTs/rootText/chatId — unlike BL-38's full delete).
-          resumeSessionId: forceFreshSession ? undefined : currentExisting?.sessionId,
+          // preserving createdTs/rootText/chatId — unlike BL-38's old full
+          // delete). `|| undefined`: a fresh-start-marked record carries
+          // sessionId "" (批H H1) — an empty string must never reach the
+          // runner as a resume target.
+          resumeSessionId: forceFreshSession
+            ? undefined
+            : currentExisting?.sessionId || undefined,
           // 批F (F2): tells ClaudeProcessPool to retire this thread's live warm
           // process first — the pool key excludes sessionId, so without this a
           // warm entry would silently continue the OLD session. Cold runners
@@ -2743,6 +2890,10 @@ export class BridgeHandler {
         // Step 4d: stream events
         let sessionId: string | undefined;
         let trustedAnswerText = "";
+        // 批H H2: this turn's volume contribution. tool_result raws accrue
+        // here; the answer channel's length is added once at write-back (the
+        // delta/snapshot mix would double-count if summed per event).
+        let turnToolResultChars = 0;
 
         try {
           for await (const ev of handle.events) {
@@ -2759,6 +2910,14 @@ export class BridgeHandler {
               toolUseTotalCount += 1;
             } else if (ev.type === "tool_result") {
               toolsInFlight = Math.max(0, toolsInFlight - 1);
+              // 批H H2: lower-bound volume estimate (documented口径:
+              // JSON.stringify of the raw event). Guarded — a cyclic/huge raw
+              // must never break the stream loop.
+              try {
+                turnToolResultChars += JSON.stringify(ev.raw)?.length ?? 0;
+              } catch {
+                /* unstringifiable raw — skip its contribution */
+              }
             }
             if (cardKitProgress) cardKitProgress.handle(ev);
             else if (card) card.handle(ev);
@@ -3036,17 +3195,25 @@ export class BridgeHandler {
           const now = Date.now();
 
           if (stuckResetTriggered) {
-            // BL-38: this thread has ended by the idle watchdog on
+            // BL-38 × 批H H1: this thread has ended by the idle watchdog on
             // `stuckResetAfter` consecutive turns — the session is behaviorally
-            // poisoned (resume keeps producing the same silent hang). Drop the
-            // record entirely (same delete semantics as the stale/ghost purge)
-            // so the next @ on this thread starts a brand-new session. The
-            // failure card below (Step 4f) tells the user it was reset.
-            await this.deps.sessionStore.delete(threadId, botId);
+            // poisoned (resume keeps producing the same silent hang). MARK the
+            // record for a fresh start (sessionId cleared, stuck counter
+            // zeroed) instead of the old full delete: createdTs/rootText/
+            // chatId survive, so task-handle auto-bind keeps working and the
+            // next @ starts a SEEDED fresh session (agent_workspace) instead
+            // of meeting a total stranger. The failure card below (Step 4f)
+            // tells the user it was reset.
+            await this.deps.sessionStore.markNeedsFreshStart(
+              threadId,
+              botId,
+              "poison-reset",
+              now,
+            );
             console.info(
               `[bridge.handler] BL-38 stuck-session reset: thread=${threadId} bot=${botId} ` +
-                `consecutiveStuckCount=${nextStuckCount} (>= ${stuckResetAfter}) — dropped session ` +
-                `record; next @ starts fresh`,
+                `consecutiveStuckCount=${nextStuckCount} (>= ${stuckResetAfter}) — fresh-start ` +
+                `marker set (record kept); next @ starts a seeded fresh session`,
             );
           } else if (sessionId !== undefined && currentExisting === undefined) {
             // New thread — create record. rootText/chatId (v3 task-handle
@@ -3079,6 +3246,8 @@ export class BridgeHandler {
               consecutiveStuckCount: nextStuckCount,
               // 批F (F2): turn accounting for the history-limit reseed trigger.
               turnCount: 1,
+              // 批H (H2): volume accounting starts with this turn's own contribution.
+              approxChars: turnToolResultChars + trustedAnswerText.length,
               ...(isTopLevel ? { rootText: parsed.text.slice(0, 200), chatId: parsed.chatId } : {}),
             });
           } else if (sessionId !== undefined && currentExisting !== undefined) {
@@ -3099,6 +3268,15 @@ export class BridgeHandler {
               // 批F (F2): a reseed turn restarts the count at 1 (this turn ran
               // on the fresh session); ordinary turns accrue.
               turnCount: forceFreshSession ? 1 : (currentExisting.turnCount ?? 0) + 1,
+              // 批H (H2): same fresh-start reset semantics as turnCount. This
+              // branch also drops any needsFreshStart marker (the fields
+              // are rebuilt explicitly) — the marked thread just completed
+              // its fresh start, so the marker's job is done.
+              approxChars: forceFreshSession
+                ? turnToolResultChars + trustedAnswerText.length
+                : (currentExisting.approxChars ?? 0) +
+                  turnToolResultChars +
+                  trustedAnswerText.length,
             });
           } else if (currentExisting !== undefined && sessionId === undefined) {
             // Anomaly: no system_init seen; touch to update lastActiveTs at minimum.
@@ -3188,6 +3366,56 @@ export class BridgeHandler {
             );
           }
 
+          // 批G G6 (P1): mechanical memory-visibility card tail (原则 4 —
+          // "记忆可见即可纠,且可见性必须机械"). Two mechanical sources:
+          //   1. per-agent memory files whose mtime advanced this turn
+          //      (snapshot taken before spawn);
+          //   2. the org knowledge repo's end-of-turn porterage commit —
+          //      dirty → commit → its diffstat IS the evidence (plus free
+          //      history/blame/revert).
+          // state.json's optional memory_updates renders only as annotation
+          // UNDER a mechanical line — an unaccompanied claim shows nothing.
+          // Computed AFTER appendTranscriptAnswer so transcript/seed text
+          // stays clean of card chrome; appended to finalText so all three
+          // final surfaces (cardkit / legacy card / post fallback) carry it
+          // via the shared baseCardPayload. Best-effort throughout.
+          let memoryVisibilityLines: string[] = [];
+          try {
+            const changedWorkspaceFiles =
+              memoryMtimeSnapshot && conventions.agentWorkspacePath
+                ? await diffMemoryMtimes(conventions.agentWorkspacePath, memoryMtimeSnapshot)
+                : [];
+            let knowledgeDiffstat: string | undefined;
+            if (knowledgeDir && knowledgeGitReady) {
+              const committed = await commitKnowledgeIfDirty(
+                knowledgeDir,
+                `turn: ${metricBotId}/${threadId}`,
+              );
+              if (committed.committed) knowledgeDiffstat = committed.diffstat;
+            }
+            memoryVisibilityLines = renderMemoryVisibilityTail({
+              changedWorkspaceFiles,
+              knowledgeDiffstat,
+              agentDeclared: reportedState?.memory_updates,
+            });
+            if (memoryVisibilityLines.length > 0) {
+              this.deps.recordMemoryMetric?.({
+                type: "memory-visibility",
+                at: Date.now(),
+                botId: metricBotId,
+                threadId,
+                filesChanged: changedWorkspaceFiles.length,
+                knowledgeCommitted: knowledgeDiffstat !== undefined,
+              });
+            }
+          } catch (err) {
+            console.warn("[bridge.handler] memory visibility tail failed (continuing):", err);
+          }
+          const cardBodyWithTail =
+            memoryVisibilityLines.length > 0
+              ? `${cardBody}\n\n${memoryVisibilityLines.join("\n")}`
+              : cardBody;
+
           // When the agent didn't report status this turn (reportedState null,
           // per stale-guard) but exited cleanly, don't let the card default to
           // "✅ 完成" — the agent just produced text without a status, claiming
@@ -3200,7 +3428,7 @@ export class BridgeHandler {
               : undefined;
 
           const baseCardPayload = {
-            finalText: cardBody,
+            finalText: cardBodyWithTail,
             success,
             failureReason,
             titleOverride:
@@ -3447,12 +3675,58 @@ export class BridgeHandler {
             (errMsg.includes("thread/resume failed") &&
               errMsg.includes("no rollout found"));
           if (attempt === 1 && currentExisting != null && isStaleSessionErr) {
+            // 批H H1: ghost purge joins the unified fresh-start pipeline.
+            // Mark (never delete) the record — createdTs/rootText/chatId
+            // survive — and, on agent_workspace, retry WITH a seed built by
+            // the shared builder (re-entrant by design: pure reads). The old
+            // behavior (delete + context-free new thread) remains only as the
+            // legacy-runtime degradation, minus the delete.
             console.warn(
               `[bridge.handler] stale session ${currentExisting.sessionId} for thread ${threadId}` +
-                ` — removing and retrying without --resume`
+                ` — fresh-start marker (ghost-purge), retrying without resume`,
             );
-            await this.deps.sessionStore.delete(threadId, botId);
-            currentExisting = undefined; // next iteration: fresh session, isNewThread=true
+            await this.deps.sessionStore
+              .markNeedsFreshStart(threadId, botId, "ghost-purge", Date.now())
+              .catch((err) =>
+                console.warn("[bridge.handler] ghost-purge marker write failed (continuing):", err),
+              );
+            const ghostMarker = { reason: "ghost-purge" as const, at: Date.now() };
+            // Keep the record in-memory (write-back preserves identity fields;
+            // the anomaly branch would carry the marker if the retry dies
+            // before system_init, so the NEXT turn retries the fresh start).
+            currentExisting = { ...currentExisting, sessionId: "", needsFreshStart: ghostMarker };
+            forceFreshSession = true;
+            reseedReason = "ghost-purge";
+            if (isAgentWorkspace) {
+              let harvestFallbackPath: string | undefined;
+              if (currentExisting.harvestedAt) {
+                try {
+                  harvestFallbackPath = resolveHarvestPath(resolveKnowledgeDir(), metricBotId, threadId);
+                } catch {
+                  /* unsafe path segment — no fallback */
+                }
+              }
+              const seed = await buildFreshStartSeed({
+                sessionPath: worktreePath,
+                harvestPath: harvestFallbackPath,
+              });
+              sessionReseed = { reason: "ghost-purge", ...seed };
+              this.deps.recordMemoryMetric?.({
+                type: "reseed",
+                at: Date.now(),
+                botId: metricBotId,
+                threadId,
+                reason: "ghost-purge",
+                summaryWasPlaceholder: seed.summaryExcerpt === undefined,
+              });
+            }
+            await recordEvent({
+              status: "running",
+              appendPath: "session 换血(ghost-purge)",
+              reason:
+                `旧后端 session resume 失败(${errMsg.slice(0, 120)});` +
+                `记录保留、带种子重试全新 session。`,
+            });
             continue;
           }
           // Not a stale-session error, or already on retry — propagate to outer catch

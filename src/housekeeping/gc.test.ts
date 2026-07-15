@@ -568,3 +568,97 @@ describe("isPidAlive", () => {
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// cleanupAgentSession — agent_workspace reclaim now transits the org knowledge
+// repo (批G G3 / P1 R1): ensureKnowledgeRepo + harvest → <home>/knowledge/
+// raw/sessions/<agentId>/ + commitKnowledgeIfDirty. LARKWAY_HOME is pointed at
+// a tmp dir (gc.ts resolves knowledgeDir via resolveKnowledgeDir() at call
+// time), and every git call goes through the injected knowledge exec fake —
+// the module-level spawn mock only covers pgrep/kill, and NO real git may
+// ever spawn from a unit test.
+// ---------------------------------------------------------------------------
+
+describe("cleanupAgentSession — harvest lands in the knowledge repo", () => {
+  const { mkdtemp, mkdir, writeFile, readFile, rm, stat } = require("node:fs/promises");
+  const { tmpdir } = require("node:os");
+  const nodePath = require("node:path");
+
+  let home: string;
+  let prevHome: string | undefined;
+
+  beforeEach(async () => {
+    prevHome = process.env["LARKWAY_HOME"];
+    home = await mkdtemp(nodePath.join(tmpdir(), "larkway-gc-agentsession-"));
+    process.env["LARKWAY_HOME"] = home;
+    const { setKnowledgeExecFileForTest, resetKnowledgeEnsureCacheForTest } = await import(
+      "../knowledge/store.js"
+    );
+    setKnowledgeExecFileForTest(async () => ({ stdout: "", stderr: "" }));
+    resetKnowledgeEnsureCacheForTest();
+    resetSpawn([{ exitCode: 1, stdout: "" }]); // pgrep: no live pids
+  });
+
+  afterEach(async () => {
+    const { setKnowledgeExecFileForTest, resetKnowledgeEnsureCacheForTest } = await import(
+      "../knowledge/store.js"
+    );
+    setKnowledgeExecFileForTest(undefined);
+    resetKnowledgeEnsureCacheForTest();
+    if (prevHome === undefined) delete process.env["LARKWAY_HOME"];
+    else process.env["LARKWAY_HOME"] = prevHome;
+    await rm(home, { recursive: true, force: true });
+  });
+
+  it("reclaims an idle session dir and harvests into <home>/knowledge/raw/sessions/<agentId>/", async () => {
+    const sessionPath = nodePath.join(
+      home, "agents", "turing", "workspace", "sessions", "om_gc1",
+    );
+    await mkdir(sessionPath, { recursive: true });
+    await writeFile(
+      nodePath.join(sessionPath, "transcript.md"),
+      "## turn 1\n结论:GC 收割进知识库验证",
+      "utf8",
+    );
+
+    const { cleanupAgentSession } = await import("./gc.js");
+    const outcome = await cleanupAgentSession("om_gc1", "turing", false);
+    expect(outcome).toBe("reclaimed");
+
+    // The session dir is gone…
+    await expect(stat(sessionPath)).rejects.toThrow();
+    // …and the durable extract landed in the ORG KNOWLEDGE repo — NOT the
+    // retired per-agent workspace/memory/harvest location.
+    const harvestPath = nodePath.join(
+      home, "knowledge", "raw", "sessions", "turing", "om_gc1.md",
+    );
+    const harvested = await readFile(harvestPath, "utf8");
+    expect(harvested).toContain("结论:GC 收割进知识库验证");
+    await expect(
+      stat(nodePath.join(home, "agents", "turing", "workspace", "memory", "harvest")),
+    ).rejects.toThrow();
+    // The knowledge repo itself was scaffolded on the way through.
+    await expect(stat(nodePath.join(home, "knowledge", "README.md"))).resolves.toBeTruthy();
+  });
+
+  it("dir already gone → already-clean no-op (record retained without a re-stamp loop)", async () => {
+    const { cleanupAgentSession } = await import("./gc.js");
+    expect(await cleanupAgentSession("om_never_existed", "turing", false)).toBe("already-clean");
+  });
+
+  it("dry-run: walks the pipeline but neither removes the dir nor writes a harvest file", async () => {
+    const sessionPath = nodePath.join(
+      home, "agents", "turing", "workspace", "sessions", "om_gc2",
+    );
+    await mkdir(sessionPath, { recursive: true });
+    await writeFile(nodePath.join(sessionPath, "transcript.md"), "内容", "utf8");
+
+    const { cleanupAgentSession } = await import("./gc.js");
+    const outcome = await cleanupAgentSession("om_gc2", "turing", true);
+    expect(outcome).toBe("reclaimed");
+    await expect(stat(sessionPath)).resolves.toBeTruthy();
+    await expect(
+      stat(nodePath.join(home, "knowledge", "raw", "sessions", "turing", "om_gc2.md")),
+    ).rejects.toThrow();
+  });
+});

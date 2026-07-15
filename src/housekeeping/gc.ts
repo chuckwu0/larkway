@@ -18,13 +18,14 @@ import { readFile, readdir, rm, stat } from "node:fs/promises";
 import { join as pathJoin } from "node:path";
 import {
   resolveAgentSessionPath,
-  resolveAgentWorkspacePath,
   resolveAgentWorkspaceSessionsDir,
+  resolveKnowledgeDir,
   resolveWorktreePath as pathsResolveWorktreePath,
   resolveWorktreesDir,
 } from "../config/paths.js";
 import type { SessionStore } from "../claude/sessionStore.js";
 import { harvestSessionArtifacts } from "./harvest.js";
+import { commitKnowledgeIfDirty, ensureKnowledgeRepo } from "../knowledge/store.js";
 import { isSyntheticSessionKey } from "../lark/message.js";
 
 // ---------------------------------------------------------------------------
@@ -640,18 +641,30 @@ export async function cleanupAgentSession(
     return "skipped-live";
   }
 
-  // 批G G3: harvest the durable extract (summary + transcript tail) into
-  // workspace/memory/harvest/ BEFORE removal. Placed here — inside
-  // cleanupAgentSession, after the live-pid gate, before the rm — so BOTH
-  // reclaim paths (record-driven cleanup and the orphan sweep) are covered,
-  // including the SessionStore-corruption disaster case where every dir
-  // turns orphan at once. A harvest failure SKIPS the removal: deleting
-  // unharvested raw material is the exact loss this exists to prevent; the
-  // next scan retries both steps.
+  // 批G G3: harvest the durable extract (summary + transcript tail) into the
+  // org knowledge repo (<knowledge>/raw/sessions/<agent>/, P1 R1) BEFORE
+  // removal. Placed here — inside cleanupAgentSession, after the live-pid
+  // gate, before the rm — so BOTH reclaim paths (record-driven cleanup and
+  // the orphan sweep) are covered, including the SessionStore-corruption
+  // disaster case where every dir turns orphan at once. A harvest failure
+  // SKIPS the removal: deleting unharvested raw material is the exact loss
+  // this exists to prevent; the next scan retries both steps.
+  const knowledgeDir = resolveKnowledgeDir();
+  let knowledgeGitReady = false;
   try {
-    await harvestSessionArtifacts({
+    knowledgeGitReady = (await ensureKnowledgeRepo(knowledgeDir)).gitReady;
+  } catch (err) {
+    // Knowledge dir unusable (disk/permissions) — the harvest write below
+    // will fail for the same reason and skip the removal, which is the
+    // conservative outcome we want.
+    console.warn(`[gc] knowledge repo unavailable:`, err);
+  }
+  let harvestOutcome: "harvested" | "nothing-to-harvest";
+  try {
+    harvestOutcome = await harvestSessionArtifacts({
       sessionPath,
-      workspacePath: resolveAgentWorkspacePath(agentId),
+      knowledgeDir,
+      agentId,
       threadId,
       dryRun,
     });
@@ -661,6 +674,13 @@ export async function cleanupAgentSession(
       err,
     );
     return "skipped-harvest-failed";
+  }
+  // Mechanical porterage commit (原则 4: git history is the visibility/undo
+  // layer). Committed BEFORE the rm so the raw material is versioned even if
+  // the removal below fails. Never throws; a contention miss just leaves the
+  // file uncommitted until the next boundary commit sweeps it in.
+  if (!dryRun && knowledgeGitReady && harvestOutcome === "harvested") {
+    await commitKnowledgeIfDirty(knowledgeDir, `harvest: ${agentId}/${threadId}`);
   }
 
   // No live process → the session is genuinely idle/abandoned; reclaim it.

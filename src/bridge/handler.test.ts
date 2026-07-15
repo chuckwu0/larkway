@@ -7,9 +7,14 @@
  * and NOT demoted — finalize follows status=ready → success.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { mkdtemp, rm, mkdir, writeFile, readFile, stat } from "node:fs/promises";
+import { mkdtemp, rm, mkdir, writeFile, readFile, stat, utimes } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import {
+  resetKnowledgeEnsureCacheForTest,
+  setKnowledgeExecFileForTest,
+} from "../knowledge/store.js";
+import type { MemoryMetricEvent } from "./memoryMetrics.js";
 import { readPostFile, writePostFile } from "./postFile.js";
 import { reconcileOrphanedCards } from "./reconcile.js";
 import { buildPostContent } from "../lark/postContent.js";
@@ -106,9 +111,19 @@ beforeEach(async () => {
 });
 
 let root: string;
+let priorLarkwayHome: string | undefined;
 
 beforeEach(async () => {
   root = await mkdtemp(join(tmpdir(), "larkway-handler-"));
+  // 批G P1: handleOne now ensures/commits the org knowledge repo inside every
+  // turn (ensureKnowledgeRepo / commitKnowledgeIfDirty). Stub the injectable
+  // git exec so no real subprocess ever spawns (repo rule), and point
+  // LARKWAY_HOME at this test's tmp root so knowledge/metrics paths never
+  // touch the real ~/.larkway.
+  priorLarkwayHome = process.env.LARKWAY_HOME;
+  process.env.LARKWAY_HOME = join(root, "larkway-home");
+  setKnowledgeExecFileForTest(async () => ({ stdout: "", stderr: "" }));
+  resetKnowledgeEnsureCacheForTest();
 });
 
 afterEach(async () => {
@@ -117,6 +132,10 @@ afterEach(async () => {
   spawnCalls = [];
   spawnShouldFail = null;
   spawnDelayMs = null;
+  setKnowledgeExecFileForTest(undefined);
+  resetKnowledgeEnsureCacheForTest();
+  if (priorLarkwayHome === undefined) delete process.env.LARKWAY_HOME;
+  else process.env.LARKWAY_HOME = priorLarkwayHome;
   await rm(root, { recursive: true, force: true });
 });
 
@@ -222,9 +241,23 @@ function makePersistentSessionStore() {
     createdTs: number;
     lastActiveTs: number;
     senderOpenId: string;
+    rootText?: string;
+    chatId?: string;
+    consecutiveStuckCount?: number;
+    turnCount?: number;
+    harvestedAt?: number;
+    approxChars?: number;
+    needsFreshStart?: { reason: string; at: number };
   };
   const records = new Map<string, Rec>();
   const puts: Rec[] = [];
+  const deleteCalls: string[] = [];
+  const markNeedsFreshStartCalls: Array<{
+    threadId: string;
+    botId?: string;
+    reason: string;
+    at: number;
+  }> = [];
   const keyOf = (threadId: string, botId?: string) => `${botId ?? ""}:${threadId}`;
   const store = {
     get: (threadId: string, botId?: string) => records.get(keyOf(threadId, botId)),
@@ -233,14 +266,34 @@ function makePersistentSessionStore() {
       records.set(keyOf(rec.threadId, rec.botId), rec);
     },
     delete: async (threadId: string, botId?: string) => {
+      deleteCalls.push(keyOf(threadId, botId));
       records.delete(keyOf(threadId, botId));
     },
     touch: async (threadId: string, botId?: string) => {
       const rec = records.get(keyOf(threadId, botId));
       if (rec) rec.lastActiveTs = Date.now();
     },
+    // 批H H1: mirrors SessionStore.markNeedsFreshStart — clears sessionId,
+    // drops the BL-38 stuck counter, sets the marker, keeps every identity
+    // field (createdTs/rootText/chatId/turnCount/approxChars/harvestedAt).
+    markNeedsFreshStart: async (
+      threadId: string,
+      botId: string | undefined,
+      reason: string,
+      at: number,
+    ) => {
+      markNeedsFreshStartCalls.push({ threadId, botId, reason, at });
+      const existing = records.get(keyOf(threadId, botId));
+      if (!existing) return;
+      const { consecutiveStuckCount: _dropped, ...rest } = existing;
+      records.set(keyOf(threadId, botId), {
+        ...rest,
+        sessionId: "",
+        needsFreshStart: { reason, at },
+      });
+    },
   };
-  return { store, puts, records };
+  return { store, puts, records, deleteCalls, markNeedsFreshStartCalls };
 }
 
 /**
@@ -4368,9 +4421,12 @@ describe("BL-38: poison-session self-heal", () => {
       createdTs: 1,
       lastActiveTs: 2,
       senderOpenId: "ou_seed",
+      // 批H H1: identity fields the poison-reset marker must PRESERVE (the
+      // old delete destroyed them — task-handle auto-bind's regression).
+      rootText: "修复登录页",
+      chatId: "oc_chat",
       ...(consecutiveStuckCount !== undefined ? { consecutiveStuckCount } : {}),
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    } as any);
+    });
     return { store, records };
   }
 
@@ -4523,7 +4579,7 @@ describe("BL-38: poison-session self-heal", () => {
     expect(stuckCountOf(records)).toBe(2); // conservative: neither +1 nor reset
   });
 
-  it("(d) reaching the threshold drops the session record + shows the reset card + logs an info line", async () => {
+  it("(d) reaching the threshold MARKS the record for a fresh start (kept, not deleted) + shows the reset card + logs an info line", async () => {
     const infoSpy = vi.spyOn(console, "info").mockImplementation(() => {});
     const { store, records } = seedStore(2); // this turn makes it 3 == default threshold
     await seedWorktree(threadId);
@@ -4532,7 +4588,17 @@ describe("BL-38: poison-session self-heal", () => {
 
     const { cardKitCalls } = await runTurn(store);
 
-    expect(records.has(key)).toBe(false); // poisoned session dropped
+    // 批H H1: the poison reset no longer deletes — the record survives with a
+    // fresh-start marker (sessionId cleared, stuck counter zeroed) so the
+    // identity fields keep task-handle auto-bind alive.
+    expect(records.has(key)).toBe(true);
+    const rec = records.get(key)!;
+    expect(rec.sessionId).toBe("");
+    expect(rec.needsFreshStart?.reason).toBe("poison-reset");
+    expect(stuckCountOf(records)).toBeUndefined(); // counter cleared by the marker
+    expect(rec.createdTs).toBe(1);
+    expect(rec.rootText).toBe("修复登录页");
+    expect(rec.chatId).toBe("oc_chat");
     const text = finalCardText(cardKitCalls);
     expect(text).toContain("已重置本话题上下文");
     expect(text).toContain("全新开始");
@@ -4551,7 +4617,10 @@ describe("BL-38: poison-session self-heal", () => {
 
       const { cardKitCalls } = await runTurn(store);
 
-      expect(records.has(key)).toBe(false); // dropped at the lower threshold
+      // Marked (kept) at the lower threshold — same H1 semantics as (d).
+      expect(records.has(key)).toBe(true);
+      expect(records.get(key)?.sessionId).toBe("");
+      expect(records.get(key)?.needsFreshStart?.reason).toBe("poison-reset");
       expect(finalCardText(cardKitCalls)).toContain("已重置本话题上下文");
     } finally {
       delete process.env.LARKWAY_STUCK_SESSION_RESET_AFTER;
@@ -5357,5 +5426,506 @@ describe("canCoalesceFollowup (批F sticky p2p keys)", async () => {
     expect(
       canCoalesceFollowup(primary as never, followup as never, { p2pStickySession: true }),
     ).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 批H H1/H2 + 批G G1/G6/G7 — unified fresh-start pipeline (marker /
+// ghost-purge / volume trigger), pre-reseed warning window, mechanical memory
+// visibility, and the per-turn owner fact.
+//
+// Shared agent_workspace harness: persistent session store + metric
+// collector; runner behavior comes from runClaudeImpl (file convention).
+// ---------------------------------------------------------------------------
+
+type CapturedRunOpts = {
+  prompt?: string;
+  resumeSessionId?: string;
+  forceFreshSession?: boolean;
+};
+
+/** The persistent fake's record shape (put()'s parameter type). */
+type WsRec = Parameters<ReturnType<typeof makePersistentSessionStore>["store"]["put"]>[0];
+
+function workspacePaths() {
+  const workspacePath = join(root, "agents", "wsbot", "workspace");
+  return {
+    workspacePath,
+    sessionsDir: join(workspacePath, "sessions"),
+    reposDir: join(workspacePath, "repos"),
+  };
+}
+
+/** Seed a pre-existing record for makeEvent()'s thread on the workspace bot. */
+function seedWsRecord(
+  s: ReturnType<typeof makePersistentSessionStore>,
+  over: Partial<WsRec> = {},
+): void {
+  s.records.set("wsbot:om_msg", {
+    threadId: "om_msg",
+    sessionId: "sess_prev",
+    botId: "wsbot",
+    createdTs: 111,
+    lastActiveTs: 222,
+    senderOpenId: "ou_seed",
+    rootText: "修登录页",
+    chatId: "oc_chat",
+    ...over,
+  });
+}
+
+function makeWorkspaceHandler(opts: {
+  store: unknown;
+  botConfigExtra?: Partial<NonNullable<import("./handler.js").BridgeHandlerDeps["botConfig"]>>;
+  cardKit?: boolean;
+}) {
+  const { workspacePath, sessionsDir, reposDir } = workspacePaths();
+  const metrics: MemoryMetricEvent[] = [];
+  const card = makeCardRenderer();
+  const cardKit = opts.cardKit ? makeCardKitClient() : undefined;
+  const { client, acked } = makeClient(makeEvent());
+  const handler = new BridgeHandler({
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    client: client as any,
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    cardRenderer: card.renderer as any,
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    sessionStore: opts.store as any,
+    conventions: {
+      runtime: "agent_workspace",
+      worktreesDir: join(root, "legacy-worktrees"),
+      agentWorkspacePath: workspacePath,
+      workspaceSessionsDir: sessionsDir,
+      workspaceReposPath: reposDir,
+      devHostname: "10.0.0.1",
+      portRangeStart: 3000,
+      portRangeEnd: 3999,
+    },
+    botConfig: {
+      id: "wsbot",
+      name: "WS Bot",
+      turn_taking_limit: 10,
+      backend: "codex",
+      runtime: "agent_workspace",
+      ...(opts.cardKit
+        ? {
+            response_surface_prototype: {
+              enabled: true,
+              allowed_chats: [],
+              allowed_threads: ["om_msg"],
+              kill_switch: false,
+              post_outbound_enabled: false,
+              cardkit_streaming_enabled: true,
+              allow_agent_mentions: true,
+              denied_mention_open_ids: [],
+              allowed_mention_open_ids: [],
+            },
+          }
+        : {}),
+      ...opts.botConfigExtra,
+    },
+    ...(cardKit ? { cardKitClient: cardKit.client } : {}),
+    recordMemoryMetric: (e) => metrics.push(e),
+  });
+  return {
+    handler,
+    card,
+    metrics,
+    acked,
+    cardKitCalls: cardKit?.calls,
+    workspacePath,
+    sessionsDir,
+  };
+}
+
+/** Runner stub: capture RunOptions, emit system_init, exit 0. */
+function captureWorkspaceRunner(sessionId: string): CapturedRunOpts[] {
+  const captured: CapturedRunOpts[] = [];
+  runClaudeImpl = (o: unknown) => {
+    captured.push(o as CapturedRunOpts);
+    return {
+      events: (async function* () {
+        yield { type: "system_init", sessionId, raw: {} };
+      })(),
+      done: Promise.resolve({ exitCode: 0, sessionId }),
+      kill: () => {},
+    };
+  };
+  return captured;
+}
+
+/** Runner stub: first attempt rejects as a ghost session, retry succeeds. */
+function ghostThenFreshRunner(freshSessionId: string): CapturedRunOpts[] {
+  const captured: CapturedRunOpts[] = [];
+  runClaudeImpl = (o: unknown) => {
+    captured.push(o as CapturedRunOpts);
+    if (captured.length === 1) {
+      const done = Promise.reject(new Error("No conversation found: sess_ghost"));
+      done.catch(() => {}); // pre-attach so the rejection can never surface as unhandled
+      return { events: (async function* () {})(), done, kill: () => {} };
+    }
+    return {
+      events: (async function* () {
+        yield { type: "system_init", sessionId: freshSessionId, raw: {} };
+      })(),
+      done: Promise.resolve({ exitCode: 0, sessionId: freshSessionId }),
+      kill: () => {},
+    };
+  };
+  return captured;
+}
+
+describe("批H H1 — marker-driven fresh start", () => {
+  it("a needsFreshStart(poison-reset) record runs fresh (no resume) with the seeded <session-reseed> block, then clears the marker (turnCount=1)", async () => {
+    const sessionStore = makePersistentSessionStore();
+    seedWsRecord(sessionStore, {
+      sessionId: "", // markNeedsFreshStart cleared it on the condemning turn
+      needsFreshStart: { reason: "poison-reset", at: 333 },
+    });
+    // Pre-seed the session dir (agent_workspace corpus) so the fresh start
+    // carries a REAL seed, not just the reason line.
+    const { sessionsDir } = workspacePaths();
+    const sessionPath = join(sessionsDir, "om_msg");
+    await mkdir(sessionPath, { recursive: true });
+    await writeFile(join(sessionPath, "summary.md"), "已确认登录页 bug 在 auth.ts\n", "utf8");
+    await writeFile(join(sessionPath, "transcript.md"), "## turn-1\n\n  查登录页\n", "utf8");
+    const captured = captureWorkspaceRunner("sess_fresh");
+
+    const h = makeWorkspaceHandler({ store: sessionStore.store });
+    await h.handler.run();
+    await h.handler.whenAllTurnsSettled();
+
+    expect(captured).toHaveLength(1);
+    expect(captured[0]?.resumeSessionId).toBeUndefined(); // sessionId "" never reaches the runner
+    expect(captured[0]?.forceFreshSession).toBe(true);
+    expect(captured[0]?.prompt).toContain("<session-reseed>");
+    expect(captured[0]?.prompt).toContain("判定卡死"); // poison-reset wording
+    expect(captured[0]?.prompt).toContain("已确认登录页 bug 在 auth.ts"); // summary excerpt
+    expect(captured[0]?.prompt).toContain("查登录页"); // transcript tail
+
+    const rec = sessionStore.records.get("wsbot:om_msg");
+    expect(rec?.sessionId).toBe("sess_fresh");
+    expect(rec?.needsFreshStart).toBeUndefined(); // marker consumed by the write-back
+    expect(rec?.turnCount).toBe(1);
+    expect(rec?.createdTs).toBe(111);
+    expect(rec?.rootText).toBe("修登录页");
+    expect(rec?.chatId).toBe("oc_chat");
+    expect(
+      h.metrics.some((m) => m.type === "reseed" && m.reason === "poison-reset"),
+    ).toBe(true);
+  });
+});
+
+describe("批H H1 — ghost-session purge (resume rejected)", () => {
+  it("agent_workspace: marks ghost-purge (record KEPT), retries once fresh with the seed, then persists the NEW sessionId with identity preserved", async () => {
+    const sessionStore = makePersistentSessionStore();
+    seedWsRecord(sessionStore, { sessionId: "sess_ghost" });
+    const captured = ghostThenFreshRunner("sess_new");
+
+    const h = makeWorkspaceHandler({ store: sessionStore.store });
+    await h.handler.run();
+    await h.handler.whenAllTurnsSettled();
+
+    expect(captured).toHaveLength(2);
+    expect(captured[0]?.resumeSessionId).toBe("sess_ghost");
+    expect(captured[1]?.resumeSessionId).toBeUndefined();
+    expect(captured[1]?.forceFreshSession).toBe(true);
+    expect(captured[1]?.prompt).toContain("<session-reseed>");
+    expect(captured[1]?.prompt).toContain("旧后端 session 已失效"); // ghost-purge wording
+    expect(sessionStore.markNeedsFreshStartCalls).toEqual([
+      expect.objectContaining({ threadId: "om_msg", botId: "wsbot", reason: "ghost-purge" }),
+    ]);
+    expect(sessionStore.deleteCalls).toHaveLength(0); // never deleted
+
+    const rec = sessionStore.records.get("wsbot:om_msg");
+    expect(rec?.sessionId).toBe("sess_new");
+    expect(rec?.needsFreshStart).toBeUndefined();
+    expect(rec?.createdTs).toBe(111);
+    expect(rec?.rootText).toBe("修登录页");
+    expect(rec?.chatId).toBe("oc_chat");
+    expect(
+      h.metrics.some((m) => m.type === "reseed" && m.reason === "ghost-purge"),
+    ).toBe(true);
+  });
+
+  it("legacy runtime: record kept + marker set + fresh retry, but seedless (no <session-reseed> block)", async () => {
+    const sessionStore = makePersistentSessionStore();
+    sessionStore.records.set("frontend:om_msg", {
+      threadId: "om_msg",
+      sessionId: "sess_ghost",
+      botId: "frontend",
+      createdTs: 111,
+      lastActiveTs: 222,
+      senderOpenId: "ou_seed",
+      rootText: "修登录页",
+      chatId: "oc_chat",
+    });
+    await seedWorktree("om_msg");
+    await seedRepoCachePath();
+    const captured = ghostThenFreshRunner("sess_new");
+
+    const { renderer, whenFinalized } = makeCardRenderer();
+    const { client } = makeClient(makeEvent());
+    const handler = new BridgeHandler({
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      client: client as any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      cardRenderer: renderer as any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      sessionStore: sessionStore.store as any,
+      conventions: makeConventions(),
+      botConfig: { id: "frontend", name: "Frontend", turn_taking_limit: 10, backend: "claude" },
+    });
+    await handler.run();
+    await whenFinalized;
+    await handler.whenAllTurnsSettled();
+
+    expect(captured).toHaveLength(2);
+    expect(captured[1]?.resumeSessionId).toBeUndefined();
+    expect(captured[1]?.forceFreshSession).toBe(true);
+    expect(captured[1]?.prompt).not.toContain("<session-reseed>"); // legacy has no seed corpus
+    expect(sessionStore.markNeedsFreshStartCalls.map((c) => c.reason)).toEqual(["ghost-purge"]);
+    expect(sessionStore.deleteCalls).toHaveLength(0);
+    const rec = sessionStore.records.get("frontend:om_msg");
+    expect(rec?.sessionId).toBe("sess_new");
+    expect(rec?.createdTs).toBe(111);
+    expect(rec?.rootText).toBe("修登录页");
+  });
+});
+
+describe("批H H2 — approxChars volume accounting", () => {
+  it("volume trigger: approxChars ≥ sessionReseedChars → seeded fresh start; approxChars resets to THIS turn's own contribution", async () => {
+    const sessionStore = makePersistentSessionStore();
+    seedWsRecord(sessionStore, { turnCount: 3, approxChars: 150 });
+    const raw = { tool: "Bash", output: "hello from the tool" };
+    const answer = "换血后的答复";
+    const captured: CapturedRunOpts[] = [];
+    runClaudeImpl = (o: unknown) => {
+      captured.push(o as CapturedRunOpts);
+      return {
+        events: (async function* () {
+          yield { type: "system_init", sessionId: "sess_fresh", raw: {} };
+          yield { type: "tool_use", raw: {} };
+          yield { type: "tool_result", raw };
+          yield { type: "answer_snapshot", text: answer, raw: {} };
+        })(),
+        done: Promise.resolve({ exitCode: 0, sessionId: "sess_fresh" }),
+        kill: () => {},
+      };
+    };
+
+    const h = makeWorkspaceHandler({
+      store: sessionStore.store,
+      botConfigExtra: { sessionReseedChars: 100 },
+    });
+    await h.handler.run();
+    await h.handler.whenAllTurnsSettled();
+
+    expect(captured[0]?.resumeSessionId).toBeUndefined();
+    expect(captured[0]?.forceFreshSession).toBe(true);
+    expect(captured[0]?.prompt).toContain("<session-reseed>");
+    expect(captured[0]?.prompt).toContain("累计轮数/体量已超阈值"); // history-limit wording
+    const rec = sessionStore.records.get("wsbot:om_msg");
+    const ownContribution = JSON.stringify(raw).length + answer.length;
+    expect(rec?.approxChars).toBe(ownContribution); // reset — NOT 150 + contribution
+    expect(rec?.turnCount).toBe(1);
+  });
+
+  it("accumulation: an ordinary turn adds tool_result raw JSON length + FINAL answer text (snapshot replaces deltas)", async () => {
+    const sessionStore = makePersistentSessionStore();
+    seedWsRecord(sessionStore, { turnCount: 3, approxChars: 30 });
+    const raw = { tool: "Read", output: "file contents here" };
+    const answer = "最终答复正文";
+    const captured: CapturedRunOpts[] = [];
+    runClaudeImpl = (o: unknown) => {
+      captured.push(o as CapturedRunOpts);
+      return {
+        events: (async function* () {
+          yield { type: "system_init", sessionId: "sess_prev", raw: {} };
+          yield { type: "tool_use", raw: {} };
+          yield { type: "tool_result", raw };
+          yield { type: "answer_delta", text: "草稿草稿草稿", raw: {} };
+          yield { type: "answer_snapshot", text: answer, raw: {} }; // replaces the delta
+        })(),
+        done: Promise.resolve({ exitCode: 0, sessionId: "sess_prev" }),
+        kill: () => {},
+      };
+    };
+
+    const h = makeWorkspaceHandler({ store: sessionStore.store });
+    await h.handler.run();
+    await h.handler.whenAllTurnsSettled();
+
+    expect(captured[0]?.resumeSessionId).toBe("sess_prev"); // ordinary resume, no reseed
+    expect(captured[0]?.prompt).not.toContain("<session-reseed>");
+    const rec = sessionStore.records.get("wsbot:om_msg");
+    expect(rec?.approxChars).toBe(30 + JSON.stringify(raw).length + answer.length);
+    expect(rec?.turnCount).toBe(4);
+  });
+});
+
+describe("批G G1 — pre-reseed warning window", () => {
+  it("turnCount inside the window (threshold-5) → 交接预警 line + reseed-warning metric; still resumes", async () => {
+    const sessionStore = makePersistentSessionStore();
+    seedWsRecord(sessionStore, { turnCount: 5 });
+    const captured = captureWorkspaceRunner("sess_prev");
+
+    const h = makeWorkspaceHandler({
+      store: sessionStore.store,
+      botConfigExtra: { sessionReseedTurns: 10 },
+    });
+    await h.handler.run();
+    await h.handler.whenAllTurnsSettled();
+
+    expect(captured[0]?.resumeSessionId).toBe("sess_prev"); // a warning is NOT a reseed
+    expect(captured[0]?.prompt).toContain("交接预警");
+    expect(captured[0]?.prompt).not.toContain("<session-reseed>");
+    expect(h.metrics.filter((m) => m.type === "reseed-warning")).toHaveLength(1);
+  });
+
+  it("turnCount below the window → no warning line, no metric", async () => {
+    const sessionStore = makePersistentSessionStore();
+    seedWsRecord(sessionStore, { turnCount: 4 });
+    const captured = captureWorkspaceRunner("sess_prev");
+
+    const h = makeWorkspaceHandler({
+      store: sessionStore.store,
+      botConfigExtra: { sessionReseedTurns: 10 },
+    });
+    await h.handler.run();
+    await h.handler.whenAllTurnsSettled();
+
+    expect(captured[0]?.prompt).not.toContain("交接预警");
+    expect(h.metrics.filter((m) => m.type === "reseed-warning")).toHaveLength(0);
+  });
+
+  it("turnCount at the threshold → reseed fires INSTEAD of the warning (reseed metric with summaryWasPlaceholder)", async () => {
+    const sessionStore = makePersistentSessionStore();
+    seedWsRecord(sessionStore, { turnCount: 10 });
+    const captured = captureWorkspaceRunner("sess_fresh");
+
+    const h = makeWorkspaceHandler({
+      store: sessionStore.store,
+      botConfigExtra: { sessionReseedTurns: 10 },
+    });
+    await h.handler.run();
+    await h.handler.whenAllTurnsSettled();
+
+    expect(captured[0]?.resumeSessionId).toBeUndefined();
+    expect(captured[0]?.forceFreshSession).toBe(true);
+    expect(captured[0]?.prompt).toContain("<session-reseed>");
+    expect(captured[0]?.prompt).not.toContain("交接预警");
+    expect(h.metrics.filter((m) => m.type === "reseed-warning")).toHaveLength(0);
+    // No agent-authored summary.md existed → placeholder handover, metered.
+    expect(h.metrics).toContainEqual(
+      expect.objectContaining({
+        type: "reseed",
+        reason: "history-limit",
+        summaryWasPlaceholder: true,
+      }),
+    );
+  });
+});
+
+describe("批G G6 — mechanical memory-visibility card tail", () => {
+  it("a memory file touched mid-turn lands as 📝 in the FINAL card (with a memory-visibility metric) but NOT in transcript.md's answer append", async () => {
+    const { workspacePath } = workspacePaths();
+    const answer = "记住了,以后先给结论";
+    runClaudeImpl = () => ({
+      events: (async function* () {
+        yield { type: "system_init", sessionId: "sess_mem", raw: {} };
+        // Simulate the agent editing a watched memory file mid-turn (between
+        // the pre-spawn mtime snapshot and finalize). utimes +2s beats mtime
+        // granularity vs the snapshot taken milliseconds earlier.
+        const pref = join(workspacePath, "memory", "preferences.md");
+        await mkdir(join(workspacePath, "memory"), { recursive: true });
+        await writeFile(pref, "- 用户偏好:先给结论\n", "utf8");
+        const future = new Date(Date.now() + 2000);
+        await utimes(pref, future, future);
+        yield { type: "answer_snapshot", text: answer, raw: {} };
+      })(),
+      done: Promise.resolve({ exitCode: 0, sessionId: "sess_mem" }),
+      kill: () => {},
+    });
+
+    const sessionStore = makePersistentSessionStore();
+    const h = makeWorkspaceHandler({ store: sessionStore.store, cardKit: true });
+    await h.handler.run();
+    await h.handler.whenAllTurnsSettled();
+
+    // finalize() streams the FULL final markdown (answer + mechanical tail)
+    // as the LAST final_md write; the first one was the mid-turn snapshot.
+    const finalStreams = (h.cardKitCalls ?? []).filter(
+      (c) => c.kind === "stream" && c.elementId === "final_md",
+    );
+    const finalText = finalStreams[finalStreams.length - 1]?.content ?? "";
+    expect(finalText).toContain(answer);
+    expect(finalText).toContain("📝 本轮修改了 memory/preferences.md");
+    expect(h.metrics).toContainEqual(
+      expect.objectContaining({
+        type: "memory-visibility",
+        filesChanged: 1,
+        knowledgeCommitted: false,
+      }),
+    );
+    // The 📝 tail is card chrome only — added AFTER the transcript answer
+    // append, so the durable seed corpus stays clean of it.
+    const transcriptMd = await readFile(join(h.sessionsDir, "om_msg", "transcript.md"), "utf8");
+    expect(transcriptMd).toContain(answer);
+    expect(transcriptMd).not.toContain("📝 本轮修改了");
+  });
+});
+
+describe("批G G7 — sender_is_owner fact line", () => {
+  async function promptForOwner(ownerOpenId?: string): Promise<string> {
+    let prompt = "";
+    runClaudeImpl = (o: unknown) => {
+      prompt = (o as { prompt?: string }).prompt ?? "";
+      return {
+        events: (async function* () {
+          yield { type: "system_init", sessionId: "sess_owner", raw: {} };
+        })(),
+        done: Promise.resolve({ exitCode: 0, sessionId: "sess_owner" }),
+        kill: () => {},
+      };
+    };
+    const { renderer, whenFinalized } = makeCardRenderer();
+    const { store } = makeSessionStore();
+    const { client } = makeClient(makeEvent());
+    await seedRepoCachePath();
+    const handler = new BridgeHandler({
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      client: client as any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      cardRenderer: renderer as any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      sessionStore: store as any,
+      conventions: makeConventions(),
+      botConfig: {
+        id: "frontend",
+        name: "Frontend",
+        turn_taking_limit: 10,
+        backend: "claude",
+        ...(ownerOpenId !== undefined ? { owner_open_id: ownerOpenId } : {}),
+      },
+    });
+    await handler.run();
+    await whenFinalized;
+    await handler.whenAllTurnsSettled();
+    return prompt;
+  }
+
+  it("owner_open_id matches the sender → sender_is_owner: yes", async () => {
+    expect(await promptForOwner("ou_sender")).toContain("sender_is_owner:  yes");
+  });
+
+  it("owner_open_id configured but a DIFFERENT sender → sender_is_owner: no", async () => {
+    const prompt = await promptForOwner("ou_boss");
+    expect(prompt).toContain("sender_is_owner:  no");
+    expect(prompt).not.toContain("sender_is_owner:  yes");
+  });
+
+  it("owner_open_id unset → sender_is_owner: unknown", async () => {
+    expect(await promptForOwner(undefined)).toContain("sender_is_owner:  unknown");
   });
 });

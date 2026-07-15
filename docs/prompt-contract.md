@@ -281,6 +281,16 @@ handler.ts 真值排序 case 4 + Step 4f 兜底)。以下字段只在失败 / �
 
 ---
 
+## 批G/H P1 增量(2026-07:知识库 + 统一换血 + 机械可见)
+
+对模板的全部改动(细节见 docs/knowledge-base.md):
+
+- **`<agent-workspace>` 块**:删除 memory-candidates 五步仪式与写时分类规则(审计确认的死管道);新增知识库指针(`org_knowledge_dir`)、inbox 速记契约(对话轮唯一记忆义务 = append 一行)、取信优先级一行(owner L2 > topics/ > session summary)、注入不回写纪律一行。`<memory-index-content>`(index.md 逐字注入)退役,换 **`<org-knowledge-map>`**(机械生成的清单,硬帽 ~2.5k 字符,正文永不注入)。
+- **`sender_is_owner: yes|no|unknown`** 事实行(G7),三种 prompt 形态的 `sender:` 行下都有。纯事实——政策在 AGENTS.md 脚手架文本里。
+- **交接预警一行**(G1):重播种阈值(轮数或体积)临近的 ≤5 轮,delta/续轮 prompt 带一行「把 summary.md 补到可交接程度」。措辞不承诺确切轮数。
+- **`<session-reseed>` reason 扩为 4 值**(H1):history-limit / idle-gap / poison-reset / ghost-purge——三条换血路径(批F 重播种、连续卡死重置、ghost session 重试)统一带种子。
+- **state.json 可选 `memory_updates: string[]`**(G6):agent 对本轮记忆变更的自述注释;只在 bridge 机械检测到变更时渲染在机械行之下,单独出现不渲染。
+
 ## 演进策略
 
 prompt 模板是稳定契约,**不要轻易加字段**。每次想加字段,先问:

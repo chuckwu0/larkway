@@ -117,14 +117,48 @@ export interface SessionRecord {
   turnCount?: number;
   /**
    * 批G G3: ms epoch when Housekeeping GC harvested this session's dir
-   * (summary/transcript extract moved to workspace memory/harvest/) and
-   * reclaimed it. The 批H fresh-start seed builder reads harvest/<key>.md
-   * when this is set. Cleared naturally by the next live turn's write-back
-   * (the handler builds records without this field), which is correct — a
-   * revived session has fresh artifacts again.
+   * (summary/transcript extract moved to the org knowledge repo's
+   * raw/sessions/<agent>/) and reclaimed it. The 批H fresh-start seed builder
+   * reads the harvest file when this is set. Cleared naturally by the next
+   * live turn's write-back (the handler builds records without this field),
+   * which is correct — a revived session has fresh artifacts again.
    */
   harvestedAt?: number;
+  /**
+   * 批H H2: cumulative volume estimate for this backend session — assistant
+   * answer-channel text + JSON.stringify length of visible tool_result raw
+   * events, summed per turn by the handler's event loop. EXPLICITLY a
+   * lower-bound estimate (thinking/attachments/replayed history are not
+   * counted); used only as a reseed trigger alongside turnCount, never as an
+   * exact token measure. Reset (to the triggering turn's own volume) by a
+   * fresh-start turn. Absent = 0.
+   */
+  approxChars?: number;
+  /**
+   * 批H H1: record-level fresh-start marker. Set (with sessionId cleared)
+   * instead of DELETING the record — deletion was BL-38's old semantics and
+   * destroyed rootText/chatId/createdTs, downgrading task-handle auto-bind
+   * and turning the next @ into a context-free stranger. The next turn on
+   * this thread starts a fresh backend session; on agent_workspace it also
+   * carries a seed built from the session dir (or its harvest file, via
+   * harvestedAt). Cleared by the write-back of any turn that reports a fresh
+   * sessionId.
+   */
+  needsFreshStart?: { reason: FreshStartReason; at: number };
 }
+
+/**
+ * 批H H1: the unified fresh-start reason enum — one vocabulary across all
+ * three former "换血" paths plus the H2 volume trigger.
+ */
+export type FreshStartReason = "history-limit" | "idle-gap" | "poison-reset" | "ghost-purge";
+
+const FRESH_START_REASONS: readonly string[] = [
+  "history-limit",
+  "idle-gap",
+  "poison-reset",
+  "ghost-purge",
+];
 
 /** The shape actually persisted to disk — botId required. */
 interface StoredRecord {
@@ -139,6 +173,8 @@ interface StoredRecord {
   consecutiveStuckCount?: number;
   turnCount?: number;
   harvestedAt?: number;
+  approxChars?: number;
+  needsFreshStart?: { reason: FreshStartReason; at: number };
 }
 
 interface StoreFile {
@@ -402,6 +438,11 @@ export class SessionStore {
       ...(record.turnCount ? { turnCount: record.turnCount } : {}),
       // 批G G3: persisted when set; a put() without it clears the stamp.
       ...(record.harvestedAt ? { harvestedAt: record.harvestedAt } : {}),
+      // 批H H2: only-when-positive, same rationale as turnCount.
+      ...(record.approxChars ? { approxChars: record.approxChars } : {}),
+      // 批H H1: persisted when set; a put() without it clears the marker —
+      // which is exactly what the fresh-start turn's write-back does.
+      ...(record.needsFreshStart ? { needsFreshStart: record.needsFreshStart } : {}),
     };
     this.#map.set(key, stored);
     await this.#flush();
@@ -420,6 +461,28 @@ export class SessionStore {
     const existing = this.#map.get(key);
     if (!existing) return;
     this.#map.set(key, { ...existing, harvestedAt });
+    await this.#flush();
+  }
+
+  /**
+   * 批H H1: mark a record for a seeded fresh start instead of deleting it.
+   * Clears sessionId (so no path can ever resume the condemned backend
+   * session) and zeroes the BL-38 stuck counter (matching the old delete's
+   * "start the streak over" semantics), while every identity field —
+   * createdTs / rootText / chatId / turnCount / approxChars / harvestedAt —
+   * survives. No-op when the record doesn't exist.
+   */
+  async markNeedsFreshStart(
+    threadId: string,
+    botId: string | undefined,
+    reason: FreshStartReason,
+    at: number,
+  ): Promise<void> {
+    const key = SessionStore.#makeKey(threadId, botId ?? LEGACY_BOT_ID);
+    const existing = this.#map.get(key);
+    if (!existing) return;
+    const { consecutiveStuckCount: _dropped, ...rest } = existing;
+    this.#map.set(key, { ...rest, sessionId: "", needsFreshStart: { reason, at } });
     await this.#flush();
   }
 
@@ -547,6 +610,18 @@ function isStoredRecord(value: unknown): value is StoredRecord {
     (v["rootText"] === undefined || typeof v["rootText"] === "string") &&
     (v["chatId"] === undefined || typeof v["chatId"] === "string") &&
     (v["turnCount"] === undefined || typeof v["turnCount"] === "number") &&
-    (v["harvestedAt"] === undefined || typeof v["harvestedAt"] === "number")
+    (v["harvestedAt"] === undefined || typeof v["harvestedAt"] === "number") &&
+    (v["approxChars"] === undefined || typeof v["approxChars"] === "number") &&
+    (v["needsFreshStart"] === undefined || isFreshStartMarker(v["needsFreshStart"]))
+  );
+}
+
+function isFreshStartMarker(value: unknown): value is { reason: FreshStartReason; at: number } {
+  if (typeof value !== "object" || value === null) return false;
+  const v = value as Record<string, unknown>;
+  return (
+    typeof v["reason"] === "string" &&
+    FRESH_START_REASONS.includes(v["reason"]) &&
+    typeof v["at"] === "number"
   );
 }

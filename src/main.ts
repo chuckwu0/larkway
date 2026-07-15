@@ -11,6 +11,8 @@ import { SessionStore } from "./claude/sessionStore.js";
 import { BridgeHandler } from "./bridge/handler.js";
 import { upsertRuntimeEvent } from "./bridge/eventLog.js";
 import { appendPerfSample } from "./bridge/perfLog.js";
+import { appendMemoryMetric } from "./bridge/memoryMetrics.js";
+import { ensureKnowledgeRepo } from "./knowledge/store.js";
 import type { HandlerConventions } from "./bridge/handler.js";
 import { Housekeeping } from "./housekeeping/gc.js";
 import { loadBotsDetailed, effectiveWarmProcess, effectivePrewarmProcess } from "./config/botLoader.js";
@@ -846,7 +848,9 @@ async function runV2Mode({
         promptMode: bot.promptMode,
         p2pStickySession: bot.p2pStickySession,
         sessionReseedTurns: bot.sessionReseedTurns,
+        sessionReseedChars: bot.sessionReseedChars,
         p2pStickyIdleMs: bot.p2pStickyIdleMs,
+        owner_open_id: bot.owner_open_id,
         cot: bot.cot,
         cotSurface: bot.cotSurface,
       },
@@ -870,6 +874,12 @@ async function runV2Mode({
       runtimeRequirements: runtimeRequirementsForBots([bot]),
       recordRuntimeEvent: async (patch) => {
         await upsertRuntimeEvent(larkwayHome(), bot.id, patch);
+      },
+      // 批G P1 (原则 6): memory-pipeline compliance counters → JSONL at
+      // <home>/memory-metrics.jsonl, aggregated by /api/memory-liveness.
+      // Fire-and-forget (appendMemoryMetric never throws).
+      recordMemoryMetric: (event) => {
+        void appendMemoryMetric(event);
       },
       // A0 (perf plan): raw per-turn perf samples for the batch-B sizing
       // decision (§6 step 2). Diagnostic-only JSONL, not a dashboard feature.
@@ -1283,6 +1293,19 @@ async function main(): Promise<void> {
   // ── External CLIs probe (backend-aware startup diagnostics) ────────────────
   printExternalCliProbe(bots);
   console.log("");
+
+  // 批G P1 (R1): org knowledge repo — ensure once at boot so the first turn
+  // pays nothing and the boot log states plainly whether git versioning is
+  // live. Failure is non-fatal (handleOne retries lazily and degrades).
+  try {
+    const knowledge = await ensureKnowledgeRepo();
+    console.log(
+      `[larkway] 组织知识库: ${knowledge.knowledgeDir}` +
+        (knowledge.gitReady ? "(git 版本化已就绪)" : "(⚠️ git 不可用,降级为纯目录模式)"),
+    );
+  } catch (err) {
+    console.warn("[larkway] 组织知识库初始化失败(不阻塞启动,turn 内会重试):", err);
+  }
 
   // ── SDK-only multi-bot mode ─────────────────────────────────────────────────
   console.log(`[larkway] ${bots.length} bot(s) from ${botsDir}.\n`);

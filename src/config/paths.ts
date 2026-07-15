@@ -164,6 +164,19 @@ export function resolveCandidateAlertsPath(tasklistGuid: string): string {
   return join(larkwayHome(), `candidate-alerts-${tasklistGuid}.json`);
 }
 
+/**
+ * Resolve the host-level organization knowledge repo (批G P1 R1).
+ *
+ * Deliberately home-level, NOT per-bot (mirrors resolveTaskTeamRegistryPath's
+ * reasoning): one LARKWAY_HOME = one owner's fleet, and the audited reality is
+ * that durable memories are ORGANIZATION facts — per-agent silos produced 6
+ * drifting copies of the same rule. Agents keep only identity/preferences
+ * locally; shared knowledge lives here (git repo, see knowledge/store.ts).
+ */
+export function resolveKnowledgeDir(): string {
+  return join(larkwayHome(), "knowledge");
+}
+
 function assertSafePathSegment(label: string, value: string): void {
   if (!/^[A-Za-z0-9_-]+$/.test(value)) {
     throw new Error(`${label} must be a safe path segment`);

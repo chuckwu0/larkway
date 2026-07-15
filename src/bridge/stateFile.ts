@@ -193,6 +193,15 @@ export const StateFileSchema = z.object({
    */
   choice_prompt: z.string().optional(),
   /**
+   * 批G G6 (P1): OPTIONAL human-readable notes about memory changes this turn
+   * (e.g. "把部署纪律速记进了知识库 inbox"). Pure annotation — the card's
+   * memory-visibility lines come from the bridge's MECHANICAL mtime/git
+   * detection and render with or without this field; these notes are only
+   * appended under the mechanical lines when a mechanical change was actually
+   * detected (an unaccompanied claim renders nothing). Never a defense layer.
+   */
+  memory_updates: z.array(z.string().max(200)).max(5).optional(),
+  /**
    * Prototype response-surface declaration. Soft-failed by schema design: a bad
    * prototype field becomes undefined and must not discard status/last_message.
    * Runtime behavior is gated by bot config; when disabled, this field is

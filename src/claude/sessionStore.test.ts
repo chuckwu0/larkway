@@ -474,3 +474,159 @@ describe("SessionStore turnCount (批F F2 reseed accounting)", () => {
     expect("turnCount" in rec).toBe(false);
   });
 });
+
+// ---------------------------------------------------------------------------
+// 批H (H2) — approxChars persistence (session volume estimate)
+// ---------------------------------------------------------------------------
+
+describe("SessionStore approxChars (批H H2 volume estimate)", () => {
+  it("persists a positive approxChars and round-trips it through disk", async () => {
+    const store = await SessionStore.load(sessionsPath);
+    await store.put({
+      threadId: "om_vol",
+      sessionId: "sess-1",
+      botId: "elon",
+      createdTs: 1,
+      lastActiveTs: 2,
+      approxChars: 123_456,
+    });
+    expect(store.get("om_vol", "elon")?.approxChars).toBe(123_456);
+    const reloaded = await SessionStore.load(sessionsPath);
+    expect(reloaded.get("om_vol", "elon")?.approxChars).toBe(123_456);
+  });
+
+  it("approxChars: 0/undefined is not persisted (only-when-positive, like turnCount)", async () => {
+    const store = await SessionStore.load(sessionsPath);
+    await store.put({
+      threadId: "om_vol0",
+      sessionId: "sess-1",
+      botId: "elon",
+      createdTs: 1,
+      lastActiveTs: 2,
+      approxChars: 0,
+    });
+    expect(store.get("om_vol0", "elon")?.approxChars).toBeUndefined();
+    const raw = JSON.parse(await readFile(sessionsPath, "utf8")) as {
+      records: Record<string, Record<string, unknown>>;
+    };
+    expect("approxChars" in Object.values(raw.records)[0]!).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 批H (H1) — needsFreshStart marker + markNeedsFreshStart
+// ---------------------------------------------------------------------------
+
+describe("SessionStore needsFreshStart (批H H1)", () => {
+  it("persists the marker when set and a later put() without it clears it (fresh-start write-back)", async () => {
+    const store = await SessionStore.load(sessionsPath);
+    const base = {
+      threadId: "om_fs",
+      botId: "elon",
+      createdTs: 1,
+      lastActiveTs: 2,
+    };
+    await store.put({ ...base, sessionId: "", needsFreshStart: { reason: "idle-gap", at: 42 } });
+    expect(store.get("om_fs", "elon")?.needsFreshStart).toEqual({ reason: "idle-gap", at: 42 });
+    // Round-trips through disk.
+    const reloaded = await SessionStore.load(sessionsPath);
+    expect(reloaded.get("om_fs", "elon")?.needsFreshStart).toEqual({ reason: "idle-gap", at: 42 });
+
+    // The fresh-start turn's write-back puts WITHOUT the marker → cleared,
+    // in memory and on disk.
+    await store.put({ ...base, sessionId: "sess-new" });
+    expect(store.get("om_fs", "elon")?.needsFreshStart).toBeUndefined();
+    const raw = JSON.parse(await readFile(sessionsPath, "utf8")) as {
+      records: Record<string, Record<string, unknown>>;
+    };
+    expect("needsFreshStart" in raw.records["om_fs::elon"]!).toBe(false);
+  });
+
+  it("markNeedsFreshStart clears sessionId + stuck counter, preserves every identity field, sets the marker", async () => {
+    const store = await SessionStore.load(sessionsPath);
+    await store.put({
+      threadId: "om_h1",
+      sessionId: "sess-condemned",
+      botId: "elon",
+      createdTs: 111,
+      lastActiveTs: 222,
+      senderOpenId: "ou_owner",
+      rootText: "根消息文本",
+      chatId: "oc_1",
+      consecutiveStuckCount: 2,
+      turnCount: 9,
+      approxChars: 12_345,
+      harvestedAt: 333,
+    });
+
+    await store.markNeedsFreshStart("om_h1", "elon", "history-limit", 999);
+
+    const rec = store.get("om_h1", "elon");
+    expect(rec).toBeDefined();
+    // Condemned backend session can never be resumed again.
+    expect(rec?.sessionId).toBe("");
+    // BL-38 streak starts over (matches the old delete's semantics).
+    expect(rec?.consecutiveStuckCount).toBeUndefined();
+    expect(rec?.needsFreshStart).toEqual({ reason: "history-limit", at: 999 });
+    // Identity fields all survive — the old delete destroyed these.
+    expect(rec?.createdTs).toBe(111);
+    expect(rec?.rootText).toBe("根消息文本");
+    expect(rec?.chatId).toBe("oc_1");
+    expect(rec?.turnCount).toBe(9);
+    expect(rec?.approxChars).toBe(12_345);
+    expect(rec?.harvestedAt).toBe(333);
+
+    // And it all survives a reload from disk.
+    const reloaded = await SessionStore.load(sessionsPath);
+    const back = reloaded.get("om_h1", "elon");
+    expect(back?.sessionId).toBe("");
+    expect(back?.needsFreshStart).toEqual({ reason: "history-limit", at: 999 });
+    expect(back?.rootText).toBe("根消息文本");
+    expect(back?.consecutiveStuckCount).toBeUndefined();
+  });
+
+  it("markNeedsFreshStart is a no-op when the record is absent", async () => {
+    const store = await SessionStore.load(sessionsPath);
+    await expect(
+      store.markNeedsFreshStart("om_ghost", "elon", "poison-reset", 1),
+    ).resolves.toBeUndefined();
+    expect(store.get("om_ghost", "elon")).toBeUndefined();
+    expect(store.list()).toHaveLength(0);
+  });
+
+  it("load keeps records with a valid needsFreshStart and drops an invalid reason string", async () => {
+    await writeV2Fixture({
+      "om_ok::bot-a": {
+        threadId: "om_ok",
+        sessionId: "",
+        botId: "bot-a",
+        createdTs: 1,
+        lastActiveTs: 2,
+        needsFreshStart: { reason: "ghost-purge", at: 5 },
+      },
+      "om_bad::bot-a": {
+        threadId: "om_bad",
+        sessionId: "",
+        botId: "bot-a",
+        createdTs: 1,
+        lastActiveTs: 2,
+        needsFreshStart: { reason: "not-a-real-reason", at: 5 },
+      },
+      "om_bad2::bot-a": {
+        threadId: "om_bad2",
+        sessionId: "",
+        botId: "bot-a",
+        createdTs: 1,
+        lastActiveTs: 2,
+        needsFreshStart: { reason: "idle-gap" }, // missing `at`
+      },
+    });
+
+    const store = await SessionStore.load(sessionsPath);
+    expect(store.get("om_ok", "bot-a")?.needsFreshStart).toEqual({ reason: "ghost-purge", at: 5 });
+    // One bad record must not take down the store — only that record is dropped.
+    expect(store.get("om_bad", "bot-a")).toBeUndefined();
+    expect(store.get("om_bad2", "bot-a")).toBeUndefined();
+    expect(store.list()).toHaveLength(1);
+  });
+});

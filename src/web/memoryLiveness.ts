@@ -21,7 +21,7 @@ export interface BotMemoryLiveness {
   summaryPlaceholders: number;
   /** newest mtime (ms epoch) across memory/*.md content files; null = never written. */
   lastMemoryWriteMs: number | null;
-  /** harvested session extracts under memory/harvest/sessions/ (批G G3). */
+  /** harvested session extracts under <knowledge>/raw/sessions/<botId>/ (批G G3, P1 R1). */
   harvestFiles: number;
   /** sessions.json records whose session dir no longer exists AND aren't harvest-stamped. */
   orphanRecords: number;
@@ -88,12 +88,13 @@ export async function computeBotMemoryLiveness(
     }
   }
 
-  // Harvest inventory.
+  // Harvest inventory — P1 R1: raw material lives in the org knowledge repo,
+  // namespaced per agent (<home>/knowledge/raw/sessions/<botId>/).
   let harvestFiles = 0;
   try {
-    harvestFiles = (await fs.readdir(path.join(memoryDir, "harvest", "sessions"))).filter(
-      (n) => n.endsWith(".md"),
-    ).length;
+    harvestFiles = (
+      await fs.readdir(path.join(larkwayDir, "knowledge", "raw", "sessions", botId))
+    ).filter((n) => n.endsWith(".md")).length;
   } catch {
     /* none yet */
   }

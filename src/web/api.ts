@@ -36,6 +36,10 @@ import {
 import { permissionItemsFromCapabilities } from "../agent/permissionPlan.js";
 import { resolveAgentWorkspacePathFromHome } from "../config/paths.js";
 import { computeBotMemoryLiveness } from "./memoryLiveness.js";
+import {
+  resolveMemoryMetricsPath,
+  summarizeMemoryMetrics,
+} from "../bridge/memoryMetrics.js";
 import { resolveLarkwayVersion } from "../version.js";
 import { detectClaudeLogin } from "../cli/claudeAuth.js";
 import {
@@ -533,6 +537,8 @@ const getBotHealthScan: ApiHandler = async (req) => {
  * GET /api/memory-liveness — 批G P0 记忆活性指标(原则 6):每 bot 的
  * summary 占位率 / 最近记忆写入 / 收割件数 / 孤儿记录数。纯文件统计,
  * 本机模式限定;curl 一下就能看出记忆管道有没有再次死掉。
+ * 批G P1: 加 compliance(最近 7 天机械合规计数 — 预警触发数 / 重播种带真
+ * summary 率 / 机械可见行出现数,来自 memory-metrics.jsonl)。
  */
 const getMemoryLiveness: ApiHandler = async (req) => {
   const { ctx } = req;
@@ -548,7 +554,13 @@ const getMemoryLiveness: ApiHandler = async (req) => {
   const bots = await Promise.all(
     botIds.map((botId) => computeBotMemoryLiveness(ctx.larkwayDir, botId)),
   );
-  return { status: 200, json: { bots, computedAt: new Date().toISOString() } };
+  const compliance = await summarizeMemoryMetrics(
+    resolveMemoryMetricsPath(ctx.larkwayDir),
+  );
+  return {
+    status: 200,
+    json: { bots, compliance, computedAt: new Date().toISOString() },
+  };
 };
 
 /**

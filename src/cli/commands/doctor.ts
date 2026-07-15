@@ -325,6 +325,20 @@ async function checkBotYaml(ctx: CliContext): Promise<CheckResult[]> {
           status: "ok",
         });
       }
+      // 批G G7 (P1): owner 事实未配置 → 每轮注入 sender_is_owner: unknown,
+      // 非 owner 政策(脚手架文本)无法生效。open_id 是 app 作用域的,必须
+      // per-bot 配,不能从别的 bot 抄。status 保持 "ok"(带提示):doctor 是
+      // CI 闸门(warn → exit 1),可选配置缺失不该让存量部署全体翻闸。
+      if (bot.app_id && bot.app_secret_env && !bot.owner_open_id) {
+        results.push({
+          id: `bot-owner-${id}`,
+          label: `bot "${id}" owner 身份`,
+          status: "ok",
+          message:
+            `未配置 owner_open_id(可选)——sender_is_owner 将注入 unknown。` +
+            `取法:用该 bot 的 profile 查 owner 发来消息的 sender open_id(app 作用域,勿从别的 bot 抄)。`,
+        });
+      }
     } catch (e) {
       results.push({
         id: `bot-yaml-${id}`,

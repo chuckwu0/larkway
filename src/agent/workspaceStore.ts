@@ -87,14 +87,17 @@ function renderAgentsMd(input: EnsureAgentWorkspaceInput): string {
     "## Workspace Contract",
     "",
     // 批G G4: the old "开场不可跳过:先 Read memory/index.md" ritual line is
-    // gone — memory/index.md's content is injected verbatim into every full
-    // prompt (批E A7/E4), so the instructed re-read was a guaranteed no-op
-    // tool call, and this template was the last place still issuing it.
+    // gone (批E A7/E4 made it a guaranteed no-op; 批G P1 then retired the
+    // index injection itself in favor of the org knowledge map).
     "- Larkway is a thin Feishu bridge. It passes scene/context pointers; you decide what to inspect and what work to do.",
     "- Each Feishu topic is one task session under `sessions/<thread_id>/`.",
     "- Keep durable notes, repo clones, session summaries, and permission decisions inside this workspace.",
     "- Write the per-session state file path provided by the prompt before ending a turn so the Feishu card can finalize.",
     "- Read `permissions-request.md` and `permissions-granted.md` before write/deploy/external-message work.",
+    // 批G G7 (P1): the DEFAULT non-owner knowledge policy. Deliberately a
+    // template line (owner-editable), NOT bridge code — the bridge only
+    // injects the `sender_is_owner` fact; what to do with it is policy.
+    "- 长期知识纪律:每轮 prompt 带有 `sender_is_owner` 事实。owner 的指示可进组织知识库 inbox;非 owner 提供的新知识只写进本 session 的 summary.md 并标注 `[未经 owner 确认]`,由保养轮决定是否晋升 —— 不直接写 AGENTS.md、L2 或知识库。",
     "",
     "## Role Notes",
     "",
@@ -574,60 +577,33 @@ export async function ensureAgentWorkspace(
   await ensureMemoryScaffold(input.workspacePath);
 }
 
-const MEMORY_CATEGORY_FILES: Array<{ name: string; title: string; purpose: string }> = [
-  {
-    name: "preferences.md",
-    title: "Owner Preferences",
-    purpose: "owner 或团队长期偏好(汇报格式、默认语言、验证偏好等)。",
-  },
-  {
-    name: "reusable-knowledge.md",
-    title: "Reusable Knowledge",
-    purpose: "多个 session 后沉淀出的可复用经验、常见坑、方案判断。",
-  },
-  {
-    name: "workflows.md",
-    title: "Workflows",
-    purpose: "这个 Agent 自己的长期工作方式(项目 repo 的工程规范仍写进项目 repo)。",
-  },
-  {
-    name: "decisions.md",
-    title: "Decisions",
-    purpose: "长期决策记录,例如为什么某权限必须人工确认。",
-  },
-  {
-    name: "assets.md",
-    title: "Assets",
-    purpose: "长期图片/截图/附件的索引,只记引用和用途,不内联大文件(实体放 assets/)。",
-  },
-];
+// 批G P1 (R1/R2): the six-category per-agent scaffold is retired for NEW
+// workspaces. The audit showed the categories were a dead pipeline (45 files,
+// 5 with content — all six drifting copies of ORGANIZATION facts), so shared
+// knowledge now lives in the host-level knowledge repo (src/knowledge/store.ts)
+// and per-agent memory keeps only identity/preferences. Existing workspaces
+// are untouched here (their stock is a one-time owner cleanup, G0); every
+// path below is writeIfMissing / mkdir-recursive, so re-running on an old
+// workspace changes nothing.
 
-function renderMemoryIndex(): string {
+function renderMemoryReadme(): string {
   return [
-    "# Memory Index",
+    "# 本 agent 的私有记忆(仅身份与偏好)",
     "",
-    "这是跨 session 长期记忆。新 session 起手先读这里,把过往积累拉起来。",
-    "Larkway 只初始化空容器;提炼、分类、写入正文都由你(Agent)在 owner 确认后完成。",
-    "",
-    "## 分类文件",
-    "",
-    ...MEMORY_CATEGORY_FILES.map((f) => `- \`${f.name}\` — ${f.purpose}`),
-    "",
-    "## 维护规则",
-    "",
-    "- 热路径(每轮)只做加法:把候选写进 session 的 `memory-candidates.md`,或往 category 文件追加新条目;不在热路径改写/删除已有条目。",
-    "- 改写、删除、解决冲突 → 推迟到 owner 显式说「整理记忆」时离线做。UPDATE/DELETE 的旧条目移 `archive/`(注一句原因+对应 commit),不手写 superseded 戳,不物理删;archive/ 的长期清理交给 git history。",
-    "- 裁决以 source 优先:user 亲口说的 >> agent 推断;冲突时保留旧的 user 条目,把新推断降级为 candidate。同 source 内 recency 以 git 历史为准,不手写日期戳。",
-    "- 只有跨 session 还会用到的才进这里(单次任务留在 session summary)。本文件保持简短(≤~50 行),不放 changelog/统计。",
+    "- 跨 agent 复用的知识**不放这里** —— 组织知识库(`<LARKWAY_HOME>/knowledge/`,git 版本化)才是长期记忆的家;",
+    "  对话轮往 `knowledge/inbox/inbox.md` 追加一行速记即可,蒸馏/分类由保养轮统一做。",
+    "- `preferences.md` — owner 对**这个 agent** 的长期偏好(汇报格式、默认语言、验证偏好等)。",
+    "- `assets/` — 本 agent 长期图片/附件实体;`archive/` — 失效条目的留档。",
     "",
   ].join("\n");
 }
 
-function renderMemoryCategorySkeleton(title: string): string {
+function renderPreferencesSkeleton(): string {
   return [
-    `# ${title}`,
+    "# Owner Preferences",
     "",
-    "写前先读本文件;有相同/相关条目就 NOOP 不重复写(改写、删除、移 archive 留到 owner 说「整理记忆」时的离线步骤);信号不跨 session 复用就不写。",
+    "owner 对这个 agent 的长期偏好(汇报格式、默认语言、验证偏好等)。",
+    "写前先读本文件;有相同/相关条目就不重复写;组织级知识请走知识库 inbox,不写这里。",
     "",
   ].join("\n");
 }
@@ -637,11 +613,6 @@ async function ensureMemoryScaffold(workspacePath: string): Promise<void> {
   await fs.mkdir(memoryDir, { recursive: true });
   await fs.mkdir(path.join(memoryDir, "assets"), { recursive: true });
   await fs.mkdir(path.join(memoryDir, "archive"), { recursive: true });
-  await writeIfMissing(path.join(memoryDir, "index.md"), renderMemoryIndex());
-  for (const file of MEMORY_CATEGORY_FILES) {
-    await writeIfMissing(
-      path.join(memoryDir, file.name),
-      renderMemoryCategorySkeleton(file.title),
-    );
-  }
+  await writeIfMissing(path.join(memoryDir, "README.md"), renderMemoryReadme());
+  await writeIfMissing(path.join(memoryDir, "preferences.md"), renderPreferencesSkeleton());
 }

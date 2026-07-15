@@ -427,6 +427,30 @@ export const BotConfigSchema = z.object({
   p2pStickyIdleMs: z.number().int().nonnegative().optional(),
 
   /**
+   * 批H (H2) — session reseed threshold by VOLUME (approx chars): assistant
+   * answer text + JSON.stringify length of visible tool_result events,
+   * accumulated per turn (an explicit LOWER-BOUND estimate — thinking /
+   * replayed history aren't counted). Fires the same seeded fresh start as
+   * sessionReseedTurns; whichever trips first wins. A turn-count alone misses
+   * the "few turns, huge tool outputs" session shape. 0 disables. Omitted =
+   * 300k (handler DEFAULT_SESSION_RESEED_CHARS).
+   */
+  sessionReseedChars: z.number().int().nonnegative().optional(),
+
+  /**
+   * 批G (G7) — the OWNER's Feishu open_id AS SEEN BY THIS BOT'S APP.
+   * Deliberately per-bot, never host-level: open_id is app-scoped (proven on
+   * this fleet — the same human resolves to DIFFERENT ou_ ids under each
+   * bot's app), so one shared value would misidentify the owner for every
+   * bot but one. The bridge does exactly two things with it: store it, and
+   * inject a `sender_is_owner: yes/no` fact line per turn (prompt.ts).
+   * What non-owners may do is POLICY — it lives in the AGENTS.md/L2
+   * scaffold text, owner-editable, never in bridge code. Omitted =
+   * `sender_is_owner: unknown` (and a doctor red flag once wired).
+   */
+  owner_open_id: z.string().min(1).optional(),
+
+  /**
    * docs/larkway-perf-plan.md §4 — persistent warm process instead of a
    * one-shot cold start per turn. Takes effect for `backend: "codex"` (a
    * single bot-level `codex app-server` process — src/codex/pool.ts
