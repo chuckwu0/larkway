@@ -89,7 +89,7 @@ describe("renderMemoryVisibilityTail", () => {
     const lines = renderMemoryVisibilityTail({
       changedWorkspaceFiles: ["AGENTS.md", "memory/preferences.md"],
     });
-    expect(lines).toEqual(["📝 本轮修改了 AGENTS.md、memory/preferences.md"]);
+    expect(lines).toEqual(["📝 本轮期间变更了 AGENTS.md、memory/preferences.md"]);
   });
 
   it("clips a long knowledge diffstat to the max lines, keeping git's summary line", () => {
@@ -132,7 +132,7 @@ describe("renderMemoryVisibilityTail", () => {
       changedWorkspaceFiles: ["memory/preferences.md"],
       agentDeclared: ["更新了偏好", "note-2", "note-3", "note-4"],
     });
-    expect(withMechanical[0]).toContain("📝 本轮修改了");
+    expect(withMechanical[0]).toContain("📝 本轮期间变更了");
     const notes = withMechanical.filter((l) => l.includes("agent 自述"));
     expect(notes).toHaveLength(3); // capped at 3
     expect(notes[0]).toContain("更新了偏好");

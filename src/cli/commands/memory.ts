@@ -8,10 +8,10 @@
  * Memory files are the L2 "职能定义" that shape each bot's behavior.
  * This command edits bots/<id>.memory.md only; never touches the bot yaml.
  *
- * 注意区分两个同名概念,别混淆:
- *   - bots/<id>.memory.md   = L2 职能/身份,投影进 workspace AGENTS.md,本命令编辑的就是它。
- *   - workspace memory/      = 跨 session 长期记忆容器(preferences / decisions / ...),
- *                             由 Agent 在 runtime 维护,本命令不碰。
+ * 注意区分几个同名概念,别混淆:
+ *   - bots/<id>.memory.md    = L2 职能/身份,投影进 workspace AGENTS.md,本命令编辑的就是它。
+ *   - workspace memory/       = 该 agent 的私有身份/偏好(P1 起仅 README+preferences),本命令不碰。
+ *   - <home>/knowledge/       = 组织知识库(跨 agent 长期记忆,git 版本化),本命令不碰。
  */
 
 import { readFile } from "node:fs/promises";

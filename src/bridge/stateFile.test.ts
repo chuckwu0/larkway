@@ -773,3 +773,102 @@ describe("StateFileSchema — task_handle", () => {
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// 批G G6 — memory_updates soft-fail (adversarial-review blocker-class fix)
+//
+// memory_updates is the LEAST load-bearing field in the file (a pure card-tail
+// annotation), so a malformed value must degrade to undefined ON THE FULL
+// SCHEMA — it used to fail the whole parse into the salvage path, which
+// silently drops choices / content_blocks / task_handle for the turn.
+// ---------------------------------------------------------------------------
+
+describe("StateFileSchema — memory_updates soft-fail (批G G6)", () => {
+  const VALID_REST = {
+    status: "ready",
+    updated_at: "2026-07-15T12:00:00.000Z",
+    choices: [{ label: "A", value: "执行方案 A" }],
+    task_handle: { guid: "task-guid-1", done: true },
+  };
+
+  it("parses valid memory_updates verbatim (≤5 items, ≤200 chars each)", () => {
+    const r = StateFileSchema.safeParse({
+      ...VALID_REST,
+      memory_updates: ["把部署纪律速记进了知识库 inbox"],
+    });
+    expect(r.success).toBe(true);
+    if (r.success) {
+      expect(r.data.memory_updates).toEqual(["把部署纪律速记进了知识库 inbox"]);
+    }
+  });
+
+  it("an over-long item (250 chars) → memory_updates undefined; choices AND task_handle survive the FULL parse", () => {
+    const r = StateFileSchema.safeParse({
+      ...VALID_REST,
+      memory_updates: ["x".repeat(250)],
+    });
+    // FULL-schema success — NOT the salvage path (salvage drops choices/task_handle).
+    expect(r.success).toBe(true);
+    if (r.success) {
+      expect(r.data.memory_updates).toBeUndefined();
+      expect(r.data.choices?.[0]?.value).toBe("执行方案 A");
+      expect(r.data.task_handle).toEqual({ guid: "task-guid-1", done: true });
+    }
+  });
+
+  it("6 items (over the max-5 cap) → memory_updates undefined; rest intact", () => {
+    const r = StateFileSchema.safeParse({
+      ...VALID_REST,
+      memory_updates: ["a", "b", "c", "d", "e", "f"],
+    });
+    expect(r.success).toBe(true);
+    if (r.success) {
+      expect(r.data.memory_updates).toBeUndefined();
+      expect(r.data.choices).toHaveLength(1);
+      expect(r.data.task_handle?.guid).toBe("task-guid-1");
+    }
+  });
+
+  it("a plain string instead of an array → memory_updates undefined; rest intact", () => {
+    const r = StateFileSchema.safeParse({
+      ...VALID_REST,
+      memory_updates: "我更新了记忆",
+    });
+    expect(r.success).toBe(true);
+    if (r.success) {
+      expect(r.data.memory_updates).toBeUndefined();
+      expect(r.data.choices?.[0]?.label).toBe("A");
+      expect(r.data.task_handle?.done).toBe(true);
+    }
+  });
+
+  it("end-to-end via readStateFileDetailed: malformed memory_updates never reaches the salvage path (no degradation diagnostic, choices/task_handle preserved)", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "larkway-state-"));
+    try {
+      await mkdir(join(dir, ".larkway"), { recursive: true });
+      await writeFile(
+        stateFilePathOf(dir),
+        JSON.stringify({
+          status: "ready",
+          last_message: "带按钮的回复",
+          choices: [{ label: "B", value: "执行方案 B" }],
+          task_handle: { guid: "task-guid-2" },
+          memory_updates: ["y".repeat(250), 42], // doubly malformed
+          updated_at: "2026-07-15T12:00:00.000Z",
+        }),
+        "utf8",
+      );
+
+      const result = await readStateFileDetailed(dir);
+      expect(result.state?.status).toBe("ready");
+      expect(result.state?.memory_updates).toBeUndefined();
+      // Structured fields the salvage path would have dropped are intact.
+      expect(result.state?.choices?.[0]?.value).toBe("执行方案 B");
+      expect(result.state?.task_handle?.guid).toBe("task-guid-2");
+      // And no "部分字段无效已忽略" salvage diagnostic was emitted.
+      expect(result.diagnostics).toEqual([]);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+});

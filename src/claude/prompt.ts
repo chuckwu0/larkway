@@ -936,7 +936,11 @@ export async function renderPrompt(input: RenderPromptInput): Promise<string> {
         dir: input.knowledgeDir,
         map: input.knowledgeMap,
         botName: input.botName,
-        threadId: parsed.threadId,
+        // The inbox line's [session …] tag must be the SESSION key so the
+        // maintenance turn can join it against raw/sessions/<key>.md — for
+        // sticky p2p, parsed.threadId is a per-message id (adversarial-review
+        // fix: provenance joins were structurally broken for sticky sessions).
+        threadId: input.stickySessionKey ?? parsed.threadId,
       })
     : hasRepo
       ? renderWorkspaceBlock(

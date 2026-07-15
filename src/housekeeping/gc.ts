@@ -151,10 +151,18 @@ export class Housekeeping {
         // are resolved correctly (V1 records have botId="v1-default" → V1 path).
         // 批G G3: after a real reclaim, stamp the record with harvestedAt —
         // the fresh-start seed builder (批H H1) uses it to know the corpus
-        // moved to memory/harvest/. Record fields (incl. sessionId) survive;
-        // a later live turn's write-back naturally clears the stamp.
+        // moved to the knowledge repo's raw/sessions/. Record fields (incl.
+        // sessionId) survive; a later live turn's successful write-back
+        // naturally clears the stamp.
+        // "already-clean" stamps too (adversarial-review fix): a crash between
+        // rm and markHarvested left the record dir-less and unstamped — every
+        // scan re-warned + re-ran cleanup forever, and the seed builder never
+        // learned the harvest file existed. Dir gone = reclaim already
+        // happened; stamping is the missing bookkeeping, and a record that
+        // never harvested degrades exactly as before (harvest read fails →
+        // dir fallback → seedless).
         void this.#cleanupThread(tid, record.botId, dryRun).then((outcome) => {
-          if (outcome === "reclaimed" && !dryRun) {
+          if ((outcome === "reclaimed" || outcome === "already-clean") && !dryRun) {
             void this.#sessionStore
               .markHarvested(tid, record.botId, Date.now())
               .catch((err) => console.warn("[gc] markHarvested failed (continuing):", err));

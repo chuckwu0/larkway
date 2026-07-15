@@ -2,8 +2,11 @@
  * src/bridge/memoryVisibility.ts — 批G G6: 记忆变更机械可见(原则 4).
  *
  * 「agent 说没说不重要,文件变没变 bridge 直接看得见。」turn 前快照 workspace
- * 内记忆类文件的 mtime,finalize 时 diff — 变了的文件名机械渲染进终态卡尾,
- * 被注入攻击改了记忆也骗不掉(申报字段只是可选注释,不是防线)。
+ * 内记忆类文件的 mtime,finalize 时 diff — 变了的文件名机械渲染进终态卡尾;
+ * 申报字段只是可选注释,不是防线。防护面(诚实声明):常规写入路径必现;
+ * 蓄意 backdate(touch -t / cp -p)可绕过 mtime 判断——若需对抗该级别,
+ * 升级为内容哈希(watch 集很小,代价可控),预留为后续加固项。同 bot 并发
+ * turn 共享一个 workspace,卡尾措辞因此说「本轮期间」而非「本轮所改」。
  *
  * 与 agent/mtimeFacts.ts 的分工:mtimeFacts 面向 PROMPT(告诉 agent「有东西
  * 变了去重读」,带 G8 分层降噪);本模块面向 OWNER 的卡片(报告「这一轮改了
@@ -86,7 +89,9 @@ export function renderMemoryVisibilityTail(input: {
 }): string[] {
   const lines: string[] = [];
   if (input.changedWorkspaceFiles.length > 0) {
-    lines.push(`📝 本轮修改了 ${input.changedWorkspaceFiles.join("、")}`);
+    // 「本轮期间」not「本轮修改」— 同 bot 并发 turn 共享 workspace,mtime
+    // diff 只能证明变更发生在本轮时间窗内,不能证明是本轮所为。
+    lines.push(`📝 本轮期间变更了 ${input.changedWorkspaceFiles.join("、")}`);
   }
   if (input.knowledgeDiffstat && input.knowledgeDiffstat.trim() !== "") {
     const statLines = input.knowledgeDiffstat.trim().split("\n");

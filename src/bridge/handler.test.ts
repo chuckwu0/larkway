@@ -5478,6 +5478,8 @@ function makeWorkspaceHandler(opts: {
   store: unknown;
   botConfigExtra?: Partial<NonNullable<import("./handler.js").BridgeHandlerDeps["botConfig"]>>;
   cardKit?: boolean;
+  /** Arm a tiny idle watchdog threshold (ms) for idle-kill scenarios. */
+  idleTimeoutMs?: number;
 }) {
   const { workspacePath, sessionsDir, reposDir } = workspacePaths();
   const metrics: MemoryMetricEvent[] = [];
@@ -5525,6 +5527,9 @@ function makeWorkspaceHandler(opts: {
       ...opts.botConfigExtra,
     },
     ...(cardKit ? { cardKitClient: cardKit.client } : {}),
+    ...(opts.idleTimeoutMs !== undefined
+      ? { responseSurfaceIdleTimeoutMs: opts.idleTimeoutMs }
+      : {}),
     recordMemoryMetric: (e) => metrics.push(e),
   });
   return {
@@ -5570,6 +5575,61 @@ function ghostThenFreshRunner(freshSessionId: string): CapturedRunOpts[] {
       })(),
       done: Promise.resolve({ exitCode: 0, sessionId: freshSessionId }),
       kill: () => {},
+    };
+  };
+  return captured;
+}
+
+/** Runner stub: emits system_init then stalls until the idle watchdog kills it. */
+function idleHangRunner(sessionId: string): CapturedRunOpts[] {
+  const captured: CapturedRunOpts[] = [];
+  let killed = false;
+  runClaudeImpl = (o: unknown) => {
+    captured.push(o as CapturedRunOpts);
+    let resolveDone: (r: { exitCode: number; sessionId?: string }) => void = () => {};
+    const done = new Promise<{ exitCode: number; sessionId?: string }>((res) => {
+      resolveDone = res;
+    });
+    return {
+      events: (async function* () {
+        yield { type: "system_init", sessionId, raw: {} };
+        while (!killed) await new Promise((r) => setTimeout(r, 5));
+      })(),
+      done,
+      kill: () => {
+        killed = true;
+        resolveDone({ exitCode: 143, sessionId });
+      },
+    };
+  };
+  return captured;
+}
+
+/** Runner stub: attempt 1 rejects as a ghost session; the retry idle-hangs. */
+function ghostThenIdleRunner(retrySessionId: string): CapturedRunOpts[] {
+  const captured: CapturedRunOpts[] = [];
+  let killed = false;
+  runClaudeImpl = (o: unknown) => {
+    captured.push(o as CapturedRunOpts);
+    if (captured.length === 1) {
+      const done = Promise.reject(new Error("No conversation found: sess_ghost"));
+      done.catch(() => {});
+      return { events: (async function* () {})(), done, kill: () => {} };
+    }
+    let resolveDone: (r: { exitCode: number; sessionId?: string }) => void = () => {};
+    const done = new Promise<{ exitCode: number; sessionId?: string }>((res) => {
+      resolveDone = res;
+    });
+    return {
+      events: (async function* () {
+        yield { type: "system_init", sessionId: retrySessionId, raw: {} };
+        while (!killed) await new Promise((r) => setTimeout(r, 5));
+      })(),
+      done,
+      kill: () => {
+        killed = true;
+        resolveDone({ exitCode: 143, sessionId: retrySessionId });
+      },
     };
   };
   return captured;
@@ -5691,6 +5751,46 @@ describe("批H H1 — ghost-session purge (resume rejected)", () => {
     expect(rec?.createdTs).toBe(111);
     expect(rec?.rootText).toBe("修登录页");
   });
+
+  it("ghost purge zeroes the stuck streak: a single idle-hang on the seeded retry does NOT poison-reset (adversarial fix)", async () => {
+    const sessionStore = makePersistentSessionStore();
+    // Two prior idle-kills on the OLD session — one more would have tripped
+    // BL-38's default threshold if the streak wrongly survived the purge.
+    seedWsRecord(sessionStore, { sessionId: "sess_ghost", consecutiveStuckCount: 2 });
+    const captured = ghostThenIdleRunner("sess_retry");
+
+    const h = makeWorkspaceHandler({ store: sessionStore.store, idleTimeoutMs: 30 });
+    await h.handler.run();
+    await h.handler.whenAllTurnsSettled();
+
+    expect(captured).toHaveLength(2);
+    // Only the ghost-purge marker was ever written — never a poison-reset.
+    expect(sessionStore.markNeedsFreshStartCalls.map((c) => c.reason)).toEqual(["ghost-purge"]);
+    const rec = sessionStore.records.get("wsbot:om_msg");
+    expect(rec?.needsFreshStart).toBeUndefined();
+    expect(rec?.consecutiveStuckCount).toBe(1); // fresh streak: zeroed by the purge + this one hang
+    expect(rec?.sessionId).toBe("sess_retry");
+  });
+
+  it("ghost-purge retry inside the G1 warning window: retry prompt carries <session-reseed> but NOT the stale 交接预警 line (adversarial fix)", async () => {
+    const sessionStore = makePersistentSessionStore();
+    seedWsRecord(sessionStore, { sessionId: "sess_ghost", turnCount: 8 }); // threshold-2 → window armed
+    const captured = ghostThenFreshRunner("sess_new");
+
+    const h = makeWorkspaceHandler({
+      store: sessionStore.store,
+      botConfigExtra: { sessionReseedTurns: 10 },
+    });
+    await h.handler.run();
+    await h.handler.whenAllTurnsSettled();
+
+    expect(captured).toHaveLength(2);
+    expect(captured[0]?.prompt).toContain("交接预警"); // window genuinely armed on attempt 1
+    expect(captured[1]?.prompt).toContain("<session-reseed>");
+    // The warning promises "下次将带种子重开" — contradictory next to the
+    // reseed block this very prompt already carries; it must be dropped.
+    expect(captured[1]?.prompt).not.toContain("交接预警");
+  });
 });
 
 describe("批H H2 — approxChars volume accounting", () => {
@@ -5761,6 +5861,73 @@ describe("批H H2 — approxChars volume accounting", () => {
     const rec = sessionStore.records.get("wsbot:om_msg");
     expect(rec?.approxChars).toBe(30 + JSON.stringify(raw).length + answer.length);
     expect(rec?.turnCount).toBe(4);
+  });
+
+  it("claude parallel-batch shape: tool_result events sharing ONE raw object count it ONCE (+ distinct raw once + answer) — adversarial fix", async () => {
+    const sessionStore = makePersistentSessionStore();
+    seedWsRecord(sessionStore, { turnCount: 3, approxChars: 30 });
+    // The claude runner yields one tool_result event PER BLOCK of a parallel
+    // batch, each carrying the SAME raw message object reference.
+    const sharedRaw = { batch: "same message object", results: ["a", "b", "c"] };
+    const distinctRaw = { tool: "Bash", output: "different message" };
+    const answer = "并行批次答复";
+    runClaudeImpl = () => ({
+      events: (async function* () {
+        yield { type: "system_init", sessionId: "sess_prev", raw: {} };
+        yield { type: "tool_use", raw: {} };
+        yield { type: "tool_use", raw: {} };
+        yield { type: "tool_use", raw: {} };
+        yield { type: "tool_use", raw: {} };
+        yield { type: "tool_result", raw: sharedRaw };
+        yield { type: "tool_result", raw: sharedRaw };
+        yield { type: "tool_result", raw: sharedRaw };
+        yield { type: "tool_result", raw: distinctRaw };
+        yield { type: "answer_snapshot", text: answer, raw: {} };
+      })(),
+      done: Promise.resolve({ exitCode: 0, sessionId: "sess_prev" }),
+      kill: () => {},
+    });
+
+    const h = makeWorkspaceHandler({ store: sessionStore.store });
+    await h.handler.run();
+    await h.handler.whenAllTurnsSettled();
+
+    const rec = sessionStore.records.get("wsbot:om_msg");
+    expect(rec?.approxChars).toBe(
+      30 + JSON.stringify(sharedRaw).length + JSON.stringify(distinctRaw).length + answer.length,
+    );
+  });
+});
+
+describe("批G G3 × 批H — harvestedAt across revival outcomes (adversarial fix)", () => {
+  it("a FAILED revival (single idle-kill, below the stuck threshold) keeps harvestedAt so the next fresh start still seeds from the harvest", async () => {
+    const sessionStore = makePersistentSessionStore();
+    seedWsRecord(sessionStore, { harvestedAt: 777, turnCount: 1 });
+    idleHangRunner("sess_idle");
+
+    const h = makeWorkspaceHandler({ store: sessionStore.store, idleTimeoutMs: 30 });
+    await h.handler.run();
+    await h.handler.whenAllTurnsSettled();
+
+    const rec = sessionStore.records.get("wsbot:om_msg");
+    expect(rec?.sessionId).toBe("sess_idle");
+    expect(rec?.harvestedAt).toBe(777); // a failed turn must NOT consume the harvest stamp
+    expect(rec?.consecutiveStuckCount).toBe(1); // single idle-kill — no poison-reset
+    expect(rec?.needsFreshStart).toBeUndefined();
+  });
+
+  it("a SUCCESSFUL turn clears harvestedAt (the revived dir has fresh artifacts again)", async () => {
+    const sessionStore = makePersistentSessionStore();
+    seedWsRecord(sessionStore, { harvestedAt: 777, turnCount: 1 });
+    captureWorkspaceRunner("sess_prev");
+
+    const h = makeWorkspaceHandler({ store: sessionStore.store });
+    await h.handler.run();
+    await h.handler.whenAllTurnsSettled();
+
+    const rec = sessionStore.records.get("wsbot:om_msg");
+    expect(rec?.harvestedAt).toBeUndefined();
+    expect(rec?.turnCount).toBe(2); // ordinary successful continuation
   });
 });
 
@@ -5860,7 +6027,7 @@ describe("批G G6 — mechanical memory-visibility card tail", () => {
     );
     const finalText = finalStreams[finalStreams.length - 1]?.content ?? "";
     expect(finalText).toContain(answer);
-    expect(finalText).toContain("📝 本轮修改了 memory/preferences.md");
+    expect(finalText).toContain("📝 本轮期间变更了 memory/preferences.md");
     expect(h.metrics).toContainEqual(
       expect.objectContaining({
         type: "memory-visibility",
@@ -5872,7 +6039,56 @@ describe("批G G6 — mechanical memory-visibility card tail", () => {
     // append, so the durable seed corpus stays clean of it.
     const transcriptMd = await readFile(join(h.sessionsDir, "om_msg", "transcript.md"), "utf8");
     expect(transcriptMd).toContain(answer);
-    expect(transcriptMd).not.toContain("📝 本轮修改了");
+    expect(transcriptMd).not.toContain("📝 本轮期间变更了");
+  });
+});
+
+describe("批G G6 — visibility tail survives content_blocks (adversarial fix)", () => {
+  it("a content_blocks turn that touches a memory file gets an EXTRA trailing markdown block with the 📝 tail; finalText keeps the tail too", async () => {
+    const { workspacePath, sessionsDir } = workspacePaths();
+    const sessionPath = join(sessionsDir, "om_msg");
+    const finalState = {
+      status: "ready",
+      content_blocks: [{ type: "markdown", content: "主正文块" }],
+      updated_at: "2099-01-01T00:00:00.000Z",
+    };
+    runClaudeImpl = () => ({
+      events: (async function* () {
+        yield { type: "system_init", sessionId: "sess_blocks", raw: {} };
+        // Touch a watched memory file mid-turn (same shape as the base G6 test).
+        const pref = join(workspacePath, "memory", "preferences.md");
+        await mkdir(join(workspacePath, "memory"), { recursive: true });
+        await writeFile(pref, "- 新偏好\n", "utf8");
+        const future = new Date(Date.now() + 2000);
+        await utimes(pref, future, future);
+        // Declare content_blocks — both final renderers ignore finalText for
+        // the body then, which used to silently swallow the tail.
+        await writeFile(
+          stateFileMod.stateFilePathOf(sessionPath),
+          JSON.stringify(finalState, null, 2),
+          "utf8",
+        );
+        yield { type: "answer_snapshot", text: "图文答复", raw: {} };
+      })(),
+      done: Promise.resolve({ exitCode: 0, sessionId: "sess_blocks" }),
+      kill: () => {},
+    });
+
+    const sessionStore = makePersistentSessionStore();
+    const h = makeWorkspaceHandler({ store: sessionStore.store });
+    await h.handler.run();
+    await h.handler.whenAllTurnsSettled();
+
+    const fin = h.card.finalizeArgs[0];
+    expect(fin).toBeDefined();
+    const blocks = fin?.contentBlocks ?? [];
+    expect(blocks).toHaveLength(2);
+    expect(blocks[0]).toEqual({ type: "markdown", content: "主正文块" });
+    const tailBlock = blocks[1] as { type: string; content?: string };
+    expect(tailBlock.type).toBe("markdown");
+    expect(tailBlock.content).toContain("📝 本轮期间变更了 memory/preferences.md");
+    // finalText carries the same tail (unchanged behavior).
+    expect(fin?.finalText).toContain("📝 本轮期间变更了 memory/preferences.md");
   });
 });
 
@@ -5927,5 +6143,106 @@ describe("批G G7 — sender_is_owner fact line", () => {
 
   it("owner_open_id unset → sender_is_owner: unknown", async () => {
     expect(await promptForOwner(undefined)).toContain("sender_is_owner:  unknown");
+  });
+});
+
+describe("批G G7 — sender_is_owner under 批D coalescing (adversarial fix)", () => {
+  const topicEvent = (
+    messageId: string,
+    rootId: string | undefined,
+    text: string,
+    sender: string,
+  ): Record<string, unknown> => ({
+    message_id: messageId,
+    chat_id: "oc_chat",
+    chat_type: "topic_group",
+    thread_id: rootId ?? messageId,
+    ...(rootId ? { root_id: rootId } : {}),
+    sender_id: sender,
+    content: JSON.stringify({ text }),
+    create_time: "1700000000000",
+  });
+
+  /**
+   * Drive the 批D coalescing path: turn 1 (om_o1) is gated in-flight while
+   * om_o2 + om_o3 queue behind it and merge into ONE second turn — returns
+   * that merged turn's prompt. Primary sender of the merged turn = om_o2's
+   * (the owner); om_o3's sender is the variable under test.
+   */
+  async function mergedTurnPrompt(followupSender: string): Promise<string> {
+    const prompts: string[] = [];
+    const releases: Array<(r: { exitCode: number; sessionId?: string }) => void> = [];
+    let signalFirstStarted!: () => void;
+    const firstRunStarted = new Promise<void>((r) => {
+      signalFirstStarted = r;
+    });
+    runClaudeImpl = (o: unknown) => {
+      prompts.push((o as { prompt: string }).prompt);
+      if (prompts.length === 1) signalFirstStarted();
+      const done = new Promise<{ exitCode: number; sessionId?: string }>((resolve) => {
+        releases.push(resolve);
+      });
+      return {
+        events: (async function* () {
+          yield { type: "system_init", sessionId: "sess_own", raw: {} };
+        })(),
+        done,
+        kill: () => {},
+      };
+    };
+    const { renderer } = makeCardRenderer();
+    const { store } = makeSessionStore();
+    const client = {
+      events: async function* () {
+        yield topicEvent("om_o1", undefined, "先跑任务", "ou_owner");
+        await firstRunStarted; // turn 1 is live — the next two must QUEUE and merge
+        yield topicEvent("om_o2", "om_o1", "补充一", "ou_owner");
+        yield topicEvent("om_o3", "om_o1", "补充二", followupSender);
+      },
+      addProcessingReaction: async () => {},
+      removeProcessingReaction: async () => {},
+      acknowledgeMessage: () => {},
+      markHandled: () => {},
+      markUnhandled: () => {},
+    };
+    await seedRepoCachePath();
+    const handler = new BridgeHandler({
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      client: client as any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      cardRenderer: renderer as any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      sessionStore: store as any,
+      conventions: makeConventions(),
+      botConfig: {
+        id: "frontend",
+        name: "Frontend",
+        turn_taking_limit: 10,
+        backend: "claude",
+        owner_open_id: "ou_owner",
+      },
+    });
+    const runDone = handler.run();
+    await firstRunStarted;
+    await runDone; // for-await drained all 3 events; turns still in flight
+    releases[0]!({ exitCode: 0, sessionId: "sess_own" });
+    for (let i = 0; i < 200 && prompts.length < 2; i++) await new Promise((r) => setTimeout(r, 10));
+    expect(prompts).toHaveLength(2);
+    releases[1]!({ exitCode: 0, sessionId: "sess_own" });
+    await handler.whenAllTurnsSettled();
+    return prompts[1]!;
+  }
+
+  it("a bystander's followup folded into an owner-triggered turn → sender_is_owner: no (conservative)", async () => {
+    const prompt = await mergedTurnPrompt("ou_bystander");
+    expect(prompt).toContain("1 条追加消息"); // the merge really happened
+    expect(prompt).toContain("sender_is_owner:  no");
+    expect(prompt).not.toContain("sender_is_owner:  yes");
+  });
+
+  it("an all-owner merged turn → sender_is_owner: yes", async () => {
+    const prompt = await mergedTurnPrompt("ou_owner");
+    expect(prompt).toContain("1 条追加消息");
+    expect(prompt).toContain("sender_is_owner:  yes");
   });
 });

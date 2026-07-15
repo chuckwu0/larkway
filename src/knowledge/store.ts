@@ -150,6 +150,19 @@ export interface EnsureKnowledgeRepoResult {
   gitReady: boolean;
 }
 
+/** 播种文件 tmp+rename(评审 fix:半写崩溃不能留下被 access 判「已存在」的残缺契约文件)。 */
+async function seedIfMissing(filePath: string, content: string): Promise<void> {
+  try {
+    await fs.access(filePath);
+    return;
+  } catch {
+    /* missing — seed below */
+  }
+  const tmp = `${filePath}.${process.pid}.tmp`;
+  await fs.writeFile(tmp, content, "utf8");
+  await fs.rename(tmp, filePath);
+}
+
 /** 每进程只 ensure 一次(boot/首次触达后 turn 热路径零成本)。 */
 const ensureCache = new Map<string, Promise<EnsureKnowledgeRepoResult>>();
 
@@ -186,24 +199,12 @@ async function ensureKnowledgeRepoUncached(knowledgeDir: string): Promise<Ensure
   await fs.mkdir(path.join(knowledgeDir, "topics"), { recursive: true });
   await fs.mkdir(path.join(knowledgeDir, "inbox"), { recursive: true });
 
-  const readmePath = path.join(knowledgeDir, "README.md");
-  try {
-    await fs.access(readmePath);
-  } catch {
-    await fs.writeFile(readmePath, KNOWLEDGE_README_SEED, "utf8");
-  }
-  const maintenancePath = path.join(knowledgeDir, "MAINTENANCE.md");
-  try {
-    await fs.access(maintenancePath);
-  } catch {
-    await fs.writeFile(maintenancePath, KNOWLEDGE_MAINTENANCE_SEED, "utf8");
-  }
-  const inboxPath = resolveInboxPath(knowledgeDir);
-  try {
-    await fs.access(inboxPath);
-  } catch {
-    await fs.writeFile(inboxPath, "", "utf8");
-  }
+  await seedIfMissing(path.join(knowledgeDir, "README.md"), KNOWLEDGE_README_SEED);
+  await seedIfMissing(path.join(knowledgeDir, "MAINTENANCE.md"), KNOWLEDGE_MAINTENANCE_SEED);
+  // *.tmp are the harvest/rotation scratch files — a boundary commit's
+  // `add -A` must never capture a half-written one into history.
+  await seedIfMissing(path.join(knowledgeDir, ".gitignore"), "*.tmp\n");
+  await seedIfMissing(resolveInboxPath(knowledgeDir), "");
 
   let gitReady = false;
   try {
@@ -266,14 +267,45 @@ export async function commitKnowledgeIfDirty(
   }
 }
 
+/** index.lock 超过这个年龄视为陈锁(持有者早已死亡),可安全清除重试。 */
+const STALE_INDEX_LOCK_MS = 10 * 60 * 1000;
+
+/**
+ * 评审 fix(git wedge):SIGKILL/断电杀死一次 commit 会留下 .git/index.lock,
+ * 之后每个边界 commit 永久失败(除非人肉清理)。机械恢复:失败信息含
+ * index.lock 且锁文件 mtime 已超过陈锁阈值 → 删锁重试一次。年龄闸防误删
+ * 并发活跃持有者的锁(活 commit 秒级完成,10 分钟绰绰有余)。
+ */
+async function clearStaleIndexLock(knowledgeDir: string): Promise<boolean> {
+  const lockPath = path.join(knowledgeDir, ".git", "index.lock");
+  try {
+    const st = await fs.stat(lockPath);
+    if (Date.now() - st.mtimeMs < STALE_INDEX_LOCK_MS) return false;
+    await fs.rm(lockPath, { force: true });
+    console.warn(`[knowledge] cleared stale git index.lock (age > ${STALE_INDEX_LOCK_MS}ms)`);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 async function commitKnowledgeIfDirtyUnlocked(
   knowledgeDir: string,
   message: string,
 ): Promise<KnowledgeCommitResult> {
   const status = await git(knowledgeDir, ["status", "--porcelain"]);
   if (status.stdout.trim() === "") return { committed: false };
-  await git(knowledgeDir, ["add", "-A"]);
-  await git(knowledgeDir, ["commit", "-q", "-m", message]);
+  try {
+    await git(knowledgeDir, ["add", "-A"]);
+    await git(knowledgeDir, ["commit", "-q", "-m", message]);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (!msg.includes("index.lock") || !(await clearStaleIndexLock(knowledgeDir))) {
+      throw err;
+    }
+    await git(knowledgeDir, ["add", "-A"]);
+    await git(knowledgeDir, ["commit", "-q", "-m", message]);
+  }
   let diffstat: string | undefined;
   try {
     const shown = await git(knowledgeDir, ["show", "--stat", "--format=", "HEAD"]);
@@ -293,6 +325,18 @@ function clipCodePoints(text: string, max: number): string {
   return `${chars.slice(0, max).join("")}\n…(地图已截断,目录里直接看)`;
 }
 
+/** 头部读:最多读 maxBytes,不整读(map 用来取首行标题)。 */
+async function readHead(filePath: string, maxBytes: number): Promise<string> {
+  const handle = await fs.open(filePath, "r");
+  try {
+    const buffer = Buffer.alloc(maxBytes);
+    const { bytesRead } = await handle.read(buffer, 0, maxBytes, 0);
+    return buffer.subarray(0, bytesRead).toString("utf8");
+  } finally {
+    await handle.close();
+  }
+}
+
 /**
  * 机械生成的知识地图摘要(R2:替代 index.md 正文注入)。列 topics 文件名+首标题、
  * inbox 待处理行数、raw 原料量——只给"有什么、在哪",正文按需 rg/读取。
@@ -303,14 +347,23 @@ export async function knowledgeMapSummary(
 ): Promise<string> {
   const lines: string[] = [`- 根目录: ${knowledgeDir}(git 版本化;正文按需读取,不随 prompt 注入)`];
 
-  let inboxCount = 0;
+  // 评审 fix(热路径成本):map 在每个全量 prompt 前计算,禁止无界读。
+  // inbox 超过体积闸就不逐行数(它本该被保养轮排干 — 超闸本身就是信号)。
   try {
-    const inbox = await fs.readFile(resolveInboxPath(knowledgeDir), "utf8");
-    inboxCount = inbox.split("\n").filter((l) => l.trim() !== "").length;
+    const inboxPath = resolveInboxPath(knowledgeDir);
+    const st = await fs.stat(inboxPath);
+    if (st.size > 512 * 1024) {
+      lines.push(
+        `- inbox 待处理速记: 过大(${Math.round(st.size / 1024)}KB)——保养轮长期未跑,尽快触发「执行记忆保养」`,
+      );
+    } else {
+      const inbox = await fs.readFile(inboxPath, "utf8");
+      const inboxCount = inbox.split("\n").filter((l) => l.trim() !== "").length;
+      lines.push(`- inbox 待处理速记: ${inboxCount} 行`);
+    }
   } catch {
-    /* inbox 尚未创建 */
+    lines.push(`- inbox 待处理速记: 0 行`);
   }
-  lines.push(`- inbox 待处理速记: ${inboxCount} 行`);
 
   const topicLines: string[] = [];
   try {
@@ -324,8 +377,14 @@ export async function knowledgeMapSummary(
         const st = await fs.stat(filePath);
         if (!st.isFile()) continue;
         size = st.size;
-        const content = await fs.readFile(filePath, "utf8");
-        head = content.split("\n").find((l) => l.trim() !== "")?.trim().slice(0, 80) ?? "";
+        // 评审 fix:只为取首行标题,头部读 2KB,不整读文件(一个 50MB 的
+        // topic 文件/符号链接不能拖慢每个全量 prompt)。
+        head =
+          (await readHead(filePath, 2048))
+            .split("\n")
+            .find((l) => l.trim() !== "")
+            ?.trim()
+            .slice(0, 80) ?? "";
       } catch {
         continue;
       }

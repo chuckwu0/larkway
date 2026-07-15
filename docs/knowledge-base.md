@@ -35,9 +35,10 @@
 
 ## 机械可见(G6)
 
-- turn 前 bridge 快照 workspace 内 `AGENTS.md + memory/*.md` 的 mtime;turn 后 diff,变了的文件名渲染进终态卡尾(`📝 本轮修改了 …`)。
+- turn 前 bridge 快照 workspace 内 `AGENTS.md + memory/*.md` 的 mtime;turn 后 diff,变了的文件名渲染进终态卡尾(`📝 本轮期间变更了 …`)。agent 声明 `content_blocks` 时,卡尾以追加 markdown 块的形式随卡(不会因自定义卡体而消失)。
 - 知识库变更走更强的主路:turn 结束 dirty 即 commit,**commit diffstat 直接进卡尾**(`📚 组织知识库变更(已自动 commit)`)——历史/blame/一键 revert 免费;坏蒸馏的终极解药是 `git revert`。
-- state.json 可选 `memory_updates: string[]` 仅作机械行下的注释;单独出现不渲染(申报不是防线)。
+- state.json 可选 `memory_updates: string[]` 仅作机械行下的注释;单独出现不渲染(申报不是防线);格式不合法时该字段静默降级为缺失,不影响其余 state 字段。
+- **已知边界(诚实声明)**:①同 bot 并发 turn 共享 workspace 和知识库——mtime 行只证明「变更发生在本轮时间窗内」;并发时某 turn 的 commit 可能并入相邻 turn 的知识库变更,或使自己的 diffstat 延后一轮出现(inbox 行内自带 `[agent]` 标签,归属信息不丢;建议在安静时段触发保养轮)。②崩溃收场的 turn 不渲染卡尾,其知识库变更由下一轮 commit 收编(git 历史完整)。③mtime 判断防常规路径,不防蓄意 backdate(升级项:内容哈希)。
 
 ## 保养轮(G2-P1:纯 SKILL + 外部真实消息触发)
 
@@ -49,7 +50,7 @@
 
 bridge 落机械计数到 `<LARKWAY_HOME>/memory-metrics.jsonl`(2MB 自轮转),`GET /api/memory-liveness` 聚合最近 7 天:
 
-- `reseedWarnings` — 交接预警注入次数(G1 预警窗:重播种阈值前 ≤5 轮,每轮一行提示补 summary);
+- `reseedWarnings` — 交接预警注入**轮数**(G1 预警窗:轮数触发前 ≤5 轮;体积触发达到阈值 85% 起,每轮一行直到换血——体积增长慢时窗口可长于 5 轮,该计数按轮累计,不是话题数);
 - `reseeds` / `reseedsWithRealSummary` / `reseedComplianceRate` — 换血时 summary 是不是还是占位符(预警窗是否被理会的**唯一裁判**);
 - `memoryVisibilityTurns` / `knowledgeCommits` — 机械可见行与知识库 commit 出现数。
 
@@ -65,7 +66,12 @@ sessionReseedChars: 300000   # 批H H2:体积换血阈值,approxChars 下界估�
 p2pStickyIdleMs: 43200000    # 批F:粘连单聊空闲换血阈值
 ```
 
-`owner_open_id` 只驱动一行事实注入(`sender_is_owner: yes/no/unknown`);非 owner 能做什么是**政策**,写在 AGENTS.md 脚手架里(owner 可改),bridge 永不按身份分支代码。
+`owner_open_id` 只驱动一行事实注入(`sender_is_owner: yes/no/unknown`);非 owner 能做什么是**政策**,写在 AGENTS.md 脚手架里(owner 可改),bridge 永不按身份分支代码。批D 合并进同一 turn 的跟发消息若含其他发送者,整轮降级为 `no`(保守;逐条发送者 id 仍在 `<user-message>` 内可见)。
+
+## 升级与回滚注意(既有部署)
+
+- **存量 workspace**:AGENTS.md 只在首次创建时用模板渲染(之后仅 Role Notes 段被投影)。升级后请手动把两行新契约补进各存量 AGENTS.md 的 Workspace Contract(非 owner 政策行 + 知识库指针行,文本见新建 workspace 的模板),或删除 AGENTS.md 让下次启动重建(会丢手写内容,慎用)。存量 `memory/index.md` 与六分类文件不再被注入/引用,由 owner 一次性清理(G0)。
+- **回滚风险**:①新 yaml 键(`owner_open_id`/`sessionReseedChars`)在旧二进制(≤0.3.49,strict schema 且无坏 yaml 隔离)上会让 **loadBots 整体抛错、全桥拒载**——先升二进制再加键;回滚前先摘键。②本版本的换血标记会把 sessionStore 记录写成 `sessionId: ""`,旧二进制不带空串防御,可能对空 id 发起 resume——回滚前删掉 sessions.json 里带 `needsFreshStart` 的记录(或整文件重建)。
 
 ## 换血(fresh start)统一管道(H1)
 

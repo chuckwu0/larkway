@@ -177,7 +177,10 @@ const DEFAULT_SESSION_RESEED_CHARS = 300_000;
  * 批G G1 (P1) pre-reseed warning window: the last N turns before the
  * turn-count trigger (and, for the volume trigger, past this ratio of the
  * char threshold) carry a one-line "补 summary.md 到可交接程度" warning.
- * Bounded by construction — at most N turns per session generation.
+ * The TURN window is bounded by construction (≤ N turns per generation);
+ * the VOLUME window is a ratio band [85%, 100%) — with slow per-turn growth
+ * it can span more turns (harmless: same single line, and reseedWarnings is
+ * documented as a per-turn count).
  */
 const RESEED_WARNING_WINDOW_TURNS = 5;
 const RESEED_WARNING_CHARS_RATIO = 0.85;
@@ -2504,23 +2507,26 @@ export class BridgeHandler {
       }
 
       // 批G P1 (R1/G6): org knowledge repo — ensure (per-process cached, ~free
-      // after the first turn), snapshot-commit any pre-existing dirt so this
-      // turn's diffstat only ever shows THIS turn's changes, and render the
-      // knowledge MAP for the prompt. Host-level and runtime-independent (a
-      // legacy bot can append inbox notes too). Every step best-effort — the
-      // knowledge layer must never block the conversation path.
+      // after the first turn). Host-level and runtime-independent (a legacy
+      // bot can append inbox notes too). Best-effort — the knowledge layer
+      // must never block the conversation path.
+      //
+      // Deliberately NO turn-start snapshot commit (adversarial-review fix):
+      // with up to MAX_CONCURRENT threads per bot sharing one repo, a start
+      // commit's `add -A` swept SIBLING turns' in-progress writes — their own
+      // end-of-turn commit then found a clean tree and their card showed no
+      // knowledge line at all (worst on maintenance turns, whose diffstat IS
+      // the deliverable). One commit point (turn end) halves the sweep
+      // windows; the cost is that a turn's diffstat may also carry leftovers
+      // from a crashed earlier turn — over-attribution beats invisibility,
+      // and inbox lines carry their own [agent] tags. Documented in
+      // docs/knowledge-base.md.
       let knowledgeDir: string | undefined;
       let knowledgeGitReady = false;
       try {
         const ensured = await ensureKnowledgeRepo(resolveKnowledgeDir());
         knowledgeDir = ensured.knowledgeDir;
         knowledgeGitReady = ensured.gitReady;
-        if (knowledgeGitReady) {
-          await commitKnowledgeIfDirty(
-            knowledgeDir,
-            `snapshot: before turn ${metricBotId}/${threadId}`,
-          );
-        }
       } catch (err) {
         console.warn("[bridge.handler] knowledge repo unavailable (continuing):", err);
       }
@@ -2701,8 +2707,16 @@ export class BridgeHandler {
           // owner_open_id configured; `no` for any non-matching sender,
           // which by construction includes every synthetic sentinel sender
           // (patrol/nudge turns never carry the owner's open_id).
+          // Adversarial-review fix (major): the fact describes the WHOLE
+          // turn, and 批D coalescing can fold другого sender's followup into
+          // an owner-triggered turn — a bystander's "记进知识库:<假事实>"
+          // would ride under `yes`. Mixed senders ⇒ `no` (conservative; the
+          // per-followup `ou_` prefixes stay visible for the agent to weigh).
           senderIsOwner: this.deps.botConfig?.owner_open_id
-            ? parsed.senderOpenId === this.deps.botConfig.owner_open_id
+            ? parsed.senderOpenId === this.deps.botConfig.owner_open_id &&
+              (queuedFollowups ?? []).every(
+                (f) => f.senderOpenId === this.deps.botConfig?.owner_open_id,
+              )
               ? "yes"
               : "no"
             : "unknown",
@@ -2893,7 +2907,16 @@ export class BridgeHandler {
         // 批H H2: this turn's volume contribution. tool_result raws accrue
         // here; the answer channel's length is added once at write-back (the
         // delta/snapshot mix would double-count if summed per event).
+        // Adversarial-review fix (major): the claude runner yields one
+        // tool_result event PER BLOCK of a parallel batch, each carrying the
+        // SAME raw message object (all sibling results included) — counting
+        // per event inflated N-result batches N×, flipping the documented
+        // lower-bound into an overcount on exactly the tool-heavy sessions
+        // H2 targets. Object identity dedupes the batch (and cuts the
+        // stringify cost to once per batch); the codex parsers emit per-item
+        // raws, unaffected.
         let turnToolResultChars = 0;
+        let lastCountedToolResultRaw: unknown;
 
         try {
           for await (const ev of handle.events) {
@@ -2911,12 +2934,16 @@ export class BridgeHandler {
             } else if (ev.type === "tool_result") {
               toolsInFlight = Math.max(0, toolsInFlight - 1);
               // 批H H2: lower-bound volume estimate (documented口径:
-              // JSON.stringify of the raw event). Guarded — a cyclic/huge raw
-              // must never break the stream loop.
-              try {
-                turnToolResultChars += JSON.stringify(ev.raw)?.length ?? 0;
-              } catch {
-                /* unstringifiable raw — skip its contribution */
+              // JSON.stringify of the raw event, deduped by raw identity —
+              // see lastCountedToolResultRaw's doc). Guarded — a cyclic/huge
+              // raw must never break the stream loop.
+              if (ev.raw !== lastCountedToolResultRaw) {
+                lastCountedToolResultRaw = ev.raw;
+                try {
+                  turnToolResultChars += JSON.stringify(ev.raw)?.length ?? 0;
+                } catch {
+                  /* unstringifiable raw — skip its contribution */
+                }
               }
             }
             if (cardKitProgress) cardKitProgress.handle(ev);
@@ -3277,6 +3304,15 @@ export class BridgeHandler {
                 : (currentExisting.approxChars ?? 0) +
                   turnToolResultChars +
                   trustedAnswerText.length,
+              // 批G G3 × 批H (adversarial-review fix): only a SUCCESSFUL turn
+              // counts as "revived with fresh artifacts". A failed revival
+              // (e.g. resume succeeded then idle-hung) has contributed only
+              // scaffold echoes to the dir — clearing the stamp here would
+              // permanently downgrade the next fresh start's seed from the
+              // rich harvest to those echoes.
+              ...(currentExisting.harvestedAt && !success
+                ? { harvestedAt: currentExisting.harvestedAt }
+                : {}),
             });
           } else if (currentExisting !== undefined && sessionId === undefined) {
             // Anomaly: no system_init seen; touch to update lastActiveTs at minimum.
@@ -3415,6 +3451,24 @@ export class BridgeHandler {
             memoryVisibilityLines.length > 0
               ? `${cardBody}\n\n${memoryVisibilityLines.join("\n")}`
               : cardBody;
+          // Adversarial-review fix (major): when the agent declares
+          // content_blocks, BOTH final renderers ignore finalText for the
+          // body — the visibility tail would silently vanish on exactly the
+          // turns an injected agent could exploit. Carry it as an extra
+          // markdown block instead (skipped only at the schema's 12-block
+          // cap — rare, and the metric below reflects computed-not-shown by
+          // design, documented in knowledge-base.md).
+          const declaredContentBlocks = reportedState?.content_blocks;
+          const contentBlocksWithTail =
+            declaredContentBlocks &&
+            declaredContentBlocks.length > 0 &&
+            memoryVisibilityLines.length > 0 &&
+            declaredContentBlocks.length < 12
+              ? [
+                  ...declaredContentBlocks,
+                  { type: "markdown" as const, content: memoryVisibilityLines.join("\n") },
+                ]
+              : declaredContentBlocks;
 
           // When the agent didn't report status this turn (reportedState null,
           // per stale-guard) but exited cleanly, don't let the card default to
@@ -3443,7 +3497,7 @@ export class BridgeHandler {
             choices: reportedState?.choices,
             choicePrompt: reportedState?.choice_prompt,
             imageBlocks: reportedState?.image_blocks,
-            contentBlocks: reportedState?.content_blocks,
+            contentBlocks: contentBlocksWithTail,
           };
 
           if (cardKitProgress) {
@@ -3624,19 +3678,25 @@ export class BridgeHandler {
           // `task_handle.done` declaration (dogfood fix V1) — the bridge makes
           // no judgment of its own about whether a successful turn means the
           // task is actually delivered; see src/tasklist/writeback.ts.
+          // Adversarial-review fix: the task writeback + peer-mention matcher
+          // consume the PRE-TAIL body (`cardBody`), not finalText — otherwise
+          // the G6 visibility tail (diffstat lines) leaks into Feishu task
+          // descriptions via writeback's note-fallback, and a diffstat path /
+          // agent note containing a peer's display name would raise a
+          // spurious handoff-mention signal.
           await invokeTaskHandleLifecycle(
             success
               ? {
                   status: "completed",
-                  finalText: baseCardPayload.finalText,
+                  finalText: cardBody,
                   agentDeclaredDone: reportedState?.task_handle?.done === true,
                   note: reportedState?.task_handle?.note,
-                  mentionedPeerBotIds: this.#matchMentionedPeers(baseCardPayload.finalText),
+                  mentionedPeerBotIds: this.#matchMentionedPeers(cardBody),
                   turnReceivedAt,
                 }
               : {
                   status: "failed",
-                  failureReason: failureReason ?? baseCardPayload.finalText,
+                  failureReason: failureReason ?? cardBody,
                   note: reportedState?.task_handle?.note,
                 },
           );
@@ -3694,7 +3754,16 @@ export class BridgeHandler {
             // Keep the record in-memory (write-back preserves identity fields;
             // the anomaly branch would carry the marker if the retry dies
             // before system_init, so the NEXT turn retries the fresh start).
-            currentExisting = { ...currentExisting, sessionId: "", needsFreshStart: ghostMarker };
+            // consecutiveStuckCount is dropped to mirror markNeedsFreshStart's
+            // on-disk zeroing (adversarial-review fix: the retry's finalize
+            // reads prevStuckCount from THIS object — carrying the old streak
+            // could poison-reset a brand-new session on its very first hang).
+            currentExisting = {
+              ...currentExisting,
+              sessionId: "",
+              needsFreshStart: ghostMarker,
+              consecutiveStuckCount: undefined,
+            };
             forceFreshSession = true;
             reseedReason = "ghost-purge";
             if (isAgentWorkspace) {

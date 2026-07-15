@@ -119,9 +119,10 @@ export interface SessionRecord {
    * 批G G3: ms epoch when Housekeeping GC harvested this session's dir
    * (summary/transcript extract moved to the org knowledge repo's
    * raw/sessions/<agent>/) and reclaimed it. The 批H fresh-start seed builder
-   * reads the harvest file when this is set. Cleared naturally by the next
-   * live turn's write-back (the handler builds records without this field),
-   * which is correct — a revived session has fresh artifacts again.
+   * reads the harvest file when this is set. Cleared by the next SUCCESSFUL
+   * live turn's write-back (a revived session then has fresh artifacts);
+   * failed post-revival turns preserve it (their dir holds only scaffold
+   * echoes — the harvest stays the better seed).
    */
   harvestedAt?: number;
   /**
@@ -450,7 +451,7 @@ export class SessionStore {
 
   /**
    * 批G G3: stamp a record as harvested (dir reclaimed, extract lives in
-   * workspace memory/harvest/). No-op when the record doesn't exist.
+   * the org knowledge repo's raw/sessions/). No-op when the record doesn't exist.
    */
   async markHarvested(
     threadId: string,

@@ -199,8 +199,19 @@ export const StateFileSchema = z.object({
    * detection and render with or without this field; these notes are only
    * appended under the mechanical lines when a mechanical change was actually
    * detected (an unaccompanied claim renders nothing). Never a defense layer.
+   *
+   * `.catch(undefined)` (adversarial-review blocker-class fix): this file's
+   * soft-fail doctrine — a malformed OPTIONAL field must degrade to absent,
+   * never fail the FULL schema into the salvage path (which would silently
+   * drop choices / content_blocks / task_handle for the turn). The exact
+   * incident class already documented three times above (mr_url / stage /
+   * card_color), and this is the least-load-bearing field in the file.
    */
-  memory_updates: z.array(z.string().max(200)).max(5).optional(),
+  memory_updates: z
+    .array(z.string().max(200))
+    .max(5)
+    .optional()
+    .catch(undefined),
   /**
    * Prototype response-surface declaration. Soft-failed by schema design: a bad
    * prototype field becomes undefined and must not discard status/last_message.

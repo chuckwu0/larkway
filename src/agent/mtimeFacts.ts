@@ -48,9 +48,11 @@ import path from "node:path";
  * Files watched relative to the agent workspace root. Mirrors the set named
  * explicitly in perf plan §3 A2 护栏③ plus the memory category files already
  * covered by the (now continuation-turn-silent) ceremony line.
- * 批G G8: memory/index.md joined the watch list — its content is injected
- * verbatim only on FULL prompts (A7), so delta-mode long sessions were
- * previously blind to index edits until the next reseed.
+ * 批G G8: memory/index.md joined the watch list. 批G P1 note: the index
+ * verbatim injection (A7) is retired and NEW workspaces no longer scaffold
+ * index.md or the category files — the watch entries stay for the LEGACY
+ * stock (existing workspaces keep those files until the owner's G0 cleanup);
+ * missing files simply produce no facts.
  */
 export const MTIME_WATCH_FILE_NAMES = [
   "AGENTS.md",

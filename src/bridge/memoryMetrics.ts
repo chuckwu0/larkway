@@ -69,6 +69,9 @@ export async function appendMemoryMetric(
       // Unique tmp per rotation: appends are fire-and-forget, so two
       // rotations can theoretically overlap within one process — a shared
       // pid-only name would have them clobber each other's tmp.
+      // Known bounded loss (accepted for a best-effort diagnostics sink): an
+      // append landing between this read and the rename below is dropped by
+      // the rename; only possible near the 2MB boundary, costs a few lines.
       const tmp = `${filePath}.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2, 8)}.tmp`;
       await fs.writeFile(tmp, `${keep.join("\n")}\n`, "utf8");
       await fs.rename(tmp, filePath);

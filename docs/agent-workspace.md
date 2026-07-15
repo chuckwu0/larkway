@@ -18,19 +18,28 @@ Workspace 不是 Larkway 自建的厚任务系统。它的目录结构只解决�
 
 ## 2. 目标目录结构
 
+> ⚠️ **批G/H P1(2026-07)重构了记忆所有权**:跨 agent 复用的长期记忆从本文的
+> per-agent `memory/` 六分类迁至 host 级组织知识库(`~/.larkway/knowledge/`,
+> git 版本化),`memory-candidates.md` 与 `memory/index.md` 注入已废除。本文的
+> memory 相关段落保留作历史设计参考(存量 workspace 仍有这些文件,直至 G0 清理);
+> **现行权威见 [docs/knowledge-base.md](knowledge-base.md)**。目录结构中打 †
+> 的条目已退役(新 workspace 不再创建)。
+
 ```text
 ~/.larkway/agents/<agent-id>/workspace/
   AGENTS.md
   CLAUDE.md -> AGENTS.md
 
   memory/
-    index.md
-    preferences.md
-    reusable-knowledge.md
-    workflows.md
-    decisions.md
-    assets.md
+    README.md                ← P1 起:指向组织知识库的说明
+    preferences.md           ← 本 agent 私有偏好(唯一保留的分类)
+    index.md †
+    reusable-knowledge.md †
+    workflows.md †
+    decisions.md †
+    assets.md †
     assets/
+    archive/
 
   permissions/
     request.md
@@ -41,7 +50,7 @@ Workspace 不是 Larkway 自建的厚任务系统。它的目录结构只解决�
     <larkway-session-key>/
       transcript.md
       summary.md
-      memory-candidates.md
+      memory-candidates.md †
       attachments/
       .larkway/
         state.json
@@ -52,6 +61,8 @@ Workspace 不是 Larkway 自建的厚任务系统。它的目录结构只解决�
   drafts/
     identity/
     permissions/
+
+~/.larkway/knowledge/        ← P1 起:组织知识库(全 agent 共享,git;见 knowledge-base.md)
 ```
 
 配置源说明:

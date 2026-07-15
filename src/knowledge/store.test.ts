@@ -7,7 +7,7 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdtemp, mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, rm, stat, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import {
@@ -33,12 +33,20 @@ let execCalls: ExecCall[] = [];
 let statusStdout = "";
 /** When set, the fake throws for any call whose args satisfy the predicate. */
 let throwOn: ((args: string[]) => boolean) | undefined;
+/** When >0, the next `commit` calls reject with an index.lock error (decrementing). */
+let commitIndexLockFailures = 0;
 
 const FAKE_DIFFSTAT = " raw/sessions/elon/om_1.md | 3 +++\n 1 file changed, 3 insertions(+)\n";
 
 const fakeExec: KnowledgeExecFile = async (cmd, args) => {
   execCalls.push({ cmd, args });
   if (throwOn?.(args)) throw new Error("fake git failure");
+  if (args.includes("commit") && commitIndexLockFailures > 0) {
+    commitIndexLockFailures--;
+    throw new Error(
+      "fatal: Unable to create '/x/.git/index.lock': File exists.\n\nAnother git process seems to be running in this repository",
+    );
+  }
   if (args.includes("status") && args.includes("--porcelain")) {
     return { stdout: statusStdout, stderr: "" };
   }
@@ -54,6 +62,7 @@ beforeEach(async () => {
   execCalls = [];
   statusStdout = "";
   throwOn = undefined;
+  commitIndexLockFailures = 0;
   setKnowledgeExecFileForTest(fakeExec);
   resetKnowledgeEnsureCacheForTest();
   dir = await mkdtemp(path.join(tmpdir(), "larkway-knowledge-"));
@@ -85,6 +94,8 @@ describe("ensureKnowledgeRepo", () => {
     // MAINTENANCE.md (保养轮 SKILL, 批G G2-P1) is seeded alongside the README.
     const maintenance = await readFile(path.join(dir, "MAINTENANCE.md"), "utf8");
     expect(maintenance).toContain("记忆保养轮");
+    // .gitignore keeps *.tmp scratch files (harvest/rotation) out of `add -A`.
+    expect(await readFile(path.join(dir, ".gitignore"), "utf8")).toContain("*.tmp");
     // Inbox seeded empty (the speed-note append target).
     expect(await readFile(resolveInboxPath(dir), "utf8")).toBe("");
 
@@ -164,6 +175,61 @@ describe("commitKnowledgeIfDirty", () => {
 });
 
 // ---------------------------------------------------------------------------
+// commitKnowledgeIfDirty — stale index.lock self-heal (评审 fix: a SIGKILL'd
+// commit leaves .git/index.lock behind and every later boundary commit would
+// fail forever without mechanical recovery)
+// ---------------------------------------------------------------------------
+
+describe("commitKnowledgeIfDirty — stale index.lock recovery", () => {
+  async function plantIndexLock(ageMs: number): Promise<string> {
+    const lockPath = path.join(dir, ".git", "index.lock");
+    await mkdir(path.join(dir, ".git"), { recursive: true });
+    await writeFile(lockPath, "", "utf8");
+    const t = new Date(Date.now() - ageMs);
+    await utimes(lockPath, t, t);
+    return lockPath;
+  }
+
+  it("a STALE lock (mtime >10min old) is cleared and the commit retried once → committed:true, lock gone", async () => {
+    statusStdout = " M topics/a.md\n";
+    commitIndexLockFailures = 1; // first commit rejects with the index.lock error
+    const lockPath = await plantIndexLock(11 * 60 * 1000);
+
+    const result = await commitKnowledgeIfDirty(dir, "harvest: retry-after-stale-lock");
+    expect(result.committed).toBe(true);
+    expect(result.diffstat).toContain("1 file changed");
+    // The stale lock file was removed on the way through.
+    await expect(stat(lockPath)).rejects.toThrow();
+    // Failed once, retried once.
+    const commits = execCalls.filter((c) => c.args.includes("commit"));
+    expect(commits).toHaveLength(2);
+  });
+
+  it("a FRESH lock (recent mtime = live holder) is NOT touched — no retry, committed:false", async () => {
+    statusStdout = " M topics/a.md\n";
+    commitIndexLockFailures = 1;
+    const lockPath = await plantIndexLock(1_000); // 1s old — some live git holds it
+
+    const result = await commitKnowledgeIfDirty(dir, "harvest: fresh-lock");
+    expect(result).toEqual({ committed: false });
+    // The live holder's lock file is left alone…
+    await expect(stat(lockPath)).resolves.toBeTruthy();
+    // …and no blind retry was attempted.
+    const commits = execCalls.filter((c) => c.args.includes("commit"));
+    expect(commits).toHaveLength(1);
+  });
+
+  it("a non-lock failure is not confused with the lock path (no lock file involved → committed:false)", async () => {
+    statusStdout = " M topics/a.md\n";
+    throwOn = (args) => args.includes("commit"); // generic failure, message has no index.lock
+    const result = await commitKnowledgeIfDirty(dir, "harvest: generic-failure");
+    expect(result).toEqual({ committed: false });
+    const commits = execCalls.filter((c) => c.args.includes("commit"));
+    expect(commits).toHaveLength(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // knowledgeMapSummary (pure fs — no git involved)
 // ---------------------------------------------------------------------------
 
@@ -193,6 +259,29 @@ describe("knowledgeMapSummary", () => {
     expect(map).toContain("inbox 待处理速记: 0 行");
     expect(map).toContain("主题文件: (空");
     expect(map).not.toContain("raw/sessions 收割原料");
+  });
+
+  it("inbox over the 512KB size guard → 「过大」+ 保养轮 nudge instead of a line count (评审 fix: no unbounded read on the hot path)", async () => {
+    await mkdir(path.join(dir, "inbox"), { recursive: true });
+    await writeFile(resolveInboxPath(dir), "a".repeat(513 * 1024), "utf8");
+
+    const map = await knowledgeMapSummary(dir);
+    expect(map).toContain("过大");
+    expect(map).toContain("执行记忆保养");
+    expect(map).not.toMatch(/待处理速记: \d+ 行/);
+  });
+
+  it("a huge topic file (3MB) still yields its first-line heading via the 2KB head-read", async () => {
+    await mkdir(path.join(dir, "topics"), { recursive: true });
+    await writeFile(
+      path.join(dir, "topics", "huge.md"),
+      `# 巨型主题标题\n${"x".repeat(3 * 1024 * 1024)}`,
+      "utf8",
+    );
+
+    const map = await knowledgeMapSummary(dir);
+    expect(map).toContain("topics/huge.md");
+    expect(map).toContain("— # 巨型主题标题");
   });
 
   it("huge topics list → output hard-capped near KNOWLEDGE_MAP_MAX_CHARS with a truncation note", async () => {
