@@ -2904,6 +2904,15 @@ export class BridgeHandler {
         // Step 4d: stream events
         let sessionId: string | undefined;
         let trustedAnswerText = "";
+        // Untrusted-channel rescue buffer: the LAST non-blank internal_text of
+        // the run (typically the final assistant text block). Never streamed to
+        // any surface here — only consulted at finalize, as a body-of-last-
+        // resort when the agent exited 0 but produced neither marker-channel
+        // text nor a fresh state.json (a real failure mode: the model writes
+        // its whole answer OUTSIDE the LARKWAY_ANSWER markers and the user
+        // would otherwise get the "没有产出正文" error card). Kept verbatim,
+        // no parsing/interpretation (iron rule 1).
+        let lastInternalText = "";
         // 批H H2: this turn's volume contribution. tool_result raws accrue
         // here; the answer channel's length is added once at write-back (the
         // delta/snapshot mix would double-count if summed per event).
@@ -2958,6 +2967,8 @@ export class BridgeHandler {
               trustedAnswerText += ev.text;
             } else if (ev.type === "answer_snapshot") {
               trustedAnswerText = ev.text;
+            } else if (ev.type === "internal_text" && ev.text.trim().length > 0) {
+              lastInternalText = ev.text;
             }
           }
 
@@ -3089,8 +3100,9 @@ export class BridgeHandler {
           // 批E (E2): a turn that streamed answer text but wrote no fresh
           // state.json is now the EXPECTED fast path (plain text replies skip
           // the write entirely per the slimmed contract), not an anomaly —
-          // only record the event when there's no fresh answer either (a
-          // genuinely silent turn, the case the noOutputFallback card covers).
+          // only record the event when there's no fresh answer either (no
+          // marker-channel text at all; the card then shows either the
+          // untrusted-text rescue below or the noOutputFallback error).
           const hasFreshAnswerText =
             trustedAnswerText.trim().length > 0 ||
             (cardKitProgress?.answerText.trim().length ?? 0) > 0;
@@ -3348,9 +3360,41 @@ export class BridgeHandler {
           // trusted answer-channel text instead of repeating the previous reply.
           // If there's also no fresh answer (e.g. run was interrupted before any output),
           // show an honest prompt to retry rather than a blank/stale card.
+          // Untrusted-channel rescue: the agent exited cleanly but put its
+          // whole answer OUTSIDE the LARKWAY_ANSWER markers (internal_text)
+          // and wrote no fresh state.json either. Rather than showing the
+          // "没有产出正文" error card while the real answer exists, surface the
+          // LAST internal_text verbatim as the body. Deliberately narrow:
+          //   - only when BOTH trusted channels are empty (marker channel
+          //     semantics unchanged — trusted text always wins);
+          //   - only on exitCode 0 with no fresh report (reportedState null),
+          //     which is exactly the case where `neutralTitle` below already
+          //     renders "💬 已回复" instead of "✅ 完成" — the card honestly
+          //     says "replied", never claims trusted completion;
+          //   - never on /stop / idle-kill / poison-reset turns (those
+          //     branches bypass fallbackAnswer entirely, but the gates keep
+          //     this expression self-evidently safe).
+          const untrustedAnswerFallback =
+            !stoppedByUser &&
+            !cardKitTimeoutFailure &&
+            result.exitCode === 0 &&
+            reportedState === null &&
+            !trustedAnswerText.trim() &&
+            !cardKitProgress?.answerText.trim()
+              ? lastInternalText.trim()
+              : "";
+          if (untrustedAnswerFallback) {
+            await recordEvent({
+              status: "running",
+              appendPath: "正文回退",
+              reason:
+                "本轮无 marker 通道正文与 state.json，已回退展示 agent 最后一段非可信文本。",
+            });
+          }
           const fallbackAnswer =
             trustedAnswerText.trim() ||
             cardKitProgress?.answerText.trim() ||
+            untrustedAnswerFallback ||
             "";
           // When there's genuinely no fresh state AND no answer text, tell the
           // operator WHERE it broke + a concrete next step, instead of the old

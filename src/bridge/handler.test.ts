@@ -6246,3 +6246,95 @@ describe("批G G7 — sender_is_owner under 批D coalescing (adversarial fix)", 
     expect(prompt).toContain("sender_is_owner:  yes");
   });
 });
+
+// ---------------------------------------------------------------------------
+// Untrusted-text rescue — answer written OUTSIDE the LARKWAY_ANSWER markers
+// (internal_text), clean exit, no fresh state.json. The bridge must surface
+// the last internal_text as the card body under the neutral "💬 已回复" title
+// instead of the "没有产出正文" error card. Marker-channel semantics unchanged:
+// trusted text always wins; non-zero exits never rescue.
+// ---------------------------------------------------------------------------
+
+describe("handleOne — untrusted-text rescue (answer outside markers)", () => {
+  async function runTurn(
+    events: Array<Record<string, unknown>>,
+    exitCode = 0,
+  ): Promise<{ finalizeArgs: FinalizeArgs[] }> {
+    runClaudeImpl = () => ({
+      events: (async function* () {
+        for (const ev of events) yield ev;
+      })(),
+      done: Promise.resolve({ exitCode, sessionId: "sess_rescue" }),
+      kill: () => {},
+    });
+    const { renderer, finalizeArgs, whenFinalized } = makeCardRenderer();
+    const { store } = makeSessionStore();
+    const { client, acked } = makeClient(makeEvent());
+    await seedRepoCachePath();
+    const handler = new BridgeHandler({
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      client: client as any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      cardRenderer: renderer as any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      sessionStore: store as any,
+      conventions: makeConventions(),
+      botConfig: { id: "frontend", name: "Frontend", turn_taking_limit: 10, backend: "claude" },
+    });
+    await handler.run();
+    await whenFinalized;
+    for (let i = 0; i < 100 && acked.length === 0; i++) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    return { finalizeArgs };
+  }
+
+  it("exit 0 + only internal_text → last non-blank internal_text becomes the body under 💬 已回复 (neutral), not the error card", async () => {
+    const { finalizeArgs } = await runTurn([
+      { type: "system_init", sessionId: "sess_rescue", raw: {} },
+      { type: "internal_text", text: "我先看看这个文件。", raw: {} },
+      { type: "tool_use", toolName: "Read", toolInput: {}, raw: {} },
+      { type: "tool_result", raw: {} },
+      { type: "internal_text", text: "这里是写在 marker 外的完整答案。", raw: {} },
+      // A trailing blank internal_text must NOT clobber the kept answer.
+      { type: "internal_text", text: "   \n", raw: {} },
+    ]);
+    expect(finalizeArgs).toHaveLength(1);
+    expect(finalizeArgs[0]?.success).toBe(true);
+    expect(finalizeArgs[0]?.finalText).toBe("这里是写在 marker 外的完整答案。");
+    expect(finalizeArgs[0]?.titleOverride).toBe("💬 已回复");
+    expect(finalizeArgs[0]?.colorOverride).toBe("neutral");
+  });
+
+  it("trusted answer channel always wins over internal_text (marker semantics unchanged)", async () => {
+    const { finalizeArgs } = await runTurn([
+      { type: "system_init", sessionId: "sess_rescue", raw: {} },
+      { type: "internal_text", text: "marker 外的杂音", raw: {} },
+      { type: "answer_snapshot", text: "可信通道正文", raw: {} },
+    ]);
+    expect(finalizeArgs).toHaveLength(1);
+    expect(finalizeArgs[0]?.finalText).toBe("可信通道正文");
+  });
+
+  it("a genuinely silent turn (exit 0, no text at all) still shows the no-output error card", async () => {
+    const { finalizeArgs } = await runTurn([
+      { type: "system_init", sessionId: "sess_rescue", raw: {} },
+    ]);
+    expect(finalizeArgs).toHaveLength(1);
+    expect(finalizeArgs[0]?.finalText).toContain("本轮 agent 没有产出正文");
+  });
+
+  it("non-zero exit does NOT rescue internal_text — crash card keeps the honest error body", async () => {
+    const { finalizeArgs } = await runTurn(
+      [
+        { type: "system_init", sessionId: "sess_rescue", raw: {} },
+        { type: "internal_text", text: "崩溃前的半截输出", raw: {} },
+      ],
+      1,
+    );
+    expect(finalizeArgs).toHaveLength(1);
+    expect(finalizeArgs[0]?.success).toBe(false);
+    expect(finalizeArgs[0]?.finalText).toContain("本轮 agent 没有产出正文");
+    expect(finalizeArgs[0]?.finalText).toContain("exit code 1");
+  });
+});
