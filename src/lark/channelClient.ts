@@ -882,6 +882,41 @@ export class ChannelClient {
   }
 
   /**
+   * Local-dispatch fast path (peer handoff): push an event that carries a REAL
+   * Feishu message_id — one the bridge itself just sent on a sibling bot's
+   * behalf — through the SAME dedup bookkeeping as a live WS delivery. The
+   * point of going through here instead of {@link enqueueSyntheticEvent}: the
+   * real message WILL also arrive over this bot's own WS (it @-mentions this
+   * bot), and marking it in-flight now is what makes that later copy a no-op.
+   * Ordering is symmetric — if the WS copy somehow wins the race, THIS call
+   * becomes the no-op. Either way exactly one turn runs.
+   *
+   * Failure keeps the existing self-heal semantics: markUnhandled removes the
+   * id from in-flight, so gap-fill can re-dispatch the real message later.
+   *
+   * @returns true when the event was dispatched, false when it was deduped
+   *          (already seen/in-flight) or the client is closed.
+   */
+  ingestLocalEvent(ev: LarkMessageEvent, sourceTag: string): boolean {
+    if (this.closed) return false;
+    const log = (s: string) => console.log(`[channel.client] ${s}`);
+    this.noteSeenChat(ev.chat_id);
+    if (typeof ev.chat_type === "string" && ev.chat_type.length > 0) {
+      this.chatTypesById.set(ev.chat_id, ev.chat_type);
+    }
+    if (this.seenMessageIds.has(ev.message_id) || this.inFlightMessageIds.has(ev.message_id)) {
+      log(`local-dispatch deduped (${sourceTag}): message_id=${ev.message_id}`);
+      return false;
+    }
+    this.inFlightMessageIds.add(ev.message_id);
+    this.noteInFlightMeta(ev);
+    this.noteDispatchAttempt(ev.message_id);
+    log(`dispatching (local-handoff from ${sourceTag}): message_id=${ev.message_id} thread=${ev.thread_id ?? "?"}`);
+    this.queue.push(ev);
+    return true;
+  }
+
+  /**
    * Push an already-built synthetic LarkMessageEvent onto the inbound queue,
    * so handler.ts processes it as an ordinary turn. Same mechanism as
    * {@link handleCardAction}'s cardAction → queue.push, generalized for other

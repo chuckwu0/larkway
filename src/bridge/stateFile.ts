@@ -220,6 +220,31 @@ export const StateFileSchema = z.object({
    */
   response_surface: ResponseSurfaceStateSchema.optional(),
   /**
+   * Peer handoff declarations (local-dispatch fast path). Each entry asks the
+   * bridge to (a) send ONE real Feishu post into this thread with a true at
+   * tag for the named peer bot — the durable, human-visible mirror — and
+   * (b) dispatch the same message to that peer's inbound queue locally when
+   * the peer lives in this bridge process, so the handoff no longer depends
+   * on the peer's WS delivery. `to` is the peer's display name or bot id as
+   * listed in <peer-bots>; unknown targets are skipped with a diagnostic
+   * (never fail the turn). Bridge-opaque beyond that: `text` is sent
+   * VERBATIM — the bridge does not interpret it (thin channel).
+   *
+   * `.catch(undefined)`: soft-fail doctrine — a malformed optional field
+   * degrades to absent, never drags down `status` (same class as
+   * memory_updates above).
+   */
+  handoffs: z
+    .array(
+      z.object({
+        to: z.string().trim().min(1).max(64),
+        text: z.string().trim().min(1).max(10_000),
+      }),
+    )
+    .max(3)
+    .optional()
+    .catch(undefined),
+  /**
    * 话题 ↔ 飞书任务句柄认领声明(docs/task-handle.md §5.1/§5.2)。agent 在 turn
    * 内检索到候选任务、消解歧义后,把 guid 写进这里;bridge finalize 时读取并
    * 持久化进 TaskHandleStore(thread → task_guid)。**只有 guid 这一个字段**是

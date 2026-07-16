@@ -872,3 +872,50 @@ describe("StateFileSchema — memory_updates soft-fail (批G G6)", () => {
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// Peer handoffs (local dispatch + Feishu mirror) — schema surface
+// ---------------------------------------------------------------------------
+
+describe("StateFileSchema — handoffs (peer handoff declarations)", () => {
+  const VALID_REST = {
+    status: "ready",
+    updated_at: "2026-07-16T12:00:00.000Z",
+  };
+
+  it("parses valid handoffs verbatim", () => {
+    const r = StateFileSchema.safeParse({
+      ...VALID_REST,
+      handoffs: [{ to: "ReviewBot", text: "请 review 这个 MR：<链接>，重点看鉴权路径" }],
+    });
+    expect(r.success).toBe(true);
+    if (r.success) {
+      expect(r.data.handoffs).toEqual([
+        { to: "ReviewBot", text: "请 review 这个 MR：<链接>，重点看鉴权路径" },
+      ]);
+    }
+  });
+
+  it("soft-fails malformed handoffs to undefined WITHOUT dropping status (thin-channel doctrine)", () => {
+    const r = StateFileSchema.safeParse({
+      ...VALID_REST,
+      choices: [{ label: "A", value: "执行方案 A" }],
+      handoffs: [{ to: "", text: "" }, "not-an-object"],
+    });
+    expect(r.success).toBe(true);
+    if (r.success) {
+      expect(r.data.handoffs).toBeUndefined();
+      expect(r.data.status).toBe("ready");
+      expect(r.data.choices?.[0]?.value).toBe("执行方案 A");
+    }
+  });
+
+  it("soft-fails more than 3 handoffs to undefined (cap, not reject)", () => {
+    const r = StateFileSchema.safeParse({
+      ...VALID_REST,
+      handoffs: [1, 2, 3, 4].map((i) => ({ to: `bot${i}`, text: `task ${i}` })),
+    });
+    expect(r.success).toBe(true);
+    if (r.success) expect(r.data.handoffs).toBeUndefined();
+  });
+});

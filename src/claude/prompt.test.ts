@@ -104,9 +104,12 @@ describe("renderPrompt — V2 mode (botName set)", () => {
     // Atomic write + fresh updated_at (the handler stale-guard depends on it).
     expect(prompt).toContain("先写 .tmp 再 mv");
     expect(prompt).toContain("updated_at");
-    // Late-@ stays a visual hint; peer data flows via a real post.
+    // Late-@ stays a visual hint; peer data flows via handoffs or a real post.
     expect(prompt).toContain("这只是视觉提示");
-    expect(prompt).toContain("必须另发真实 post");
+    expect(prompt).toContain("必须走 handoffs 或另发真实 post");
+    // Peer-handoff fast path is documented as a by-need state.json case.
+    expect(prompt).toContain("handoffs");
+    expect(prompt).toContain("本地直递");
     // content_blocks essentials survive the slimming.
     expect(prompt).toContain("最多 12 块");
     expect(prompt).toContain("img_key");

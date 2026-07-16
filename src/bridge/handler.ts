@@ -72,6 +72,7 @@ import {
   readStateFileDetailed,
   stateFilePathOf,
 } from "./stateFile.js";
+import { processHandoffs, type LocalHandoffRegistry } from "./localHandoff.js";
 import { writeCardFile, deleteCardFile } from "./cardFile.js";
 import {
   writeCardKitFile,
@@ -864,6 +865,13 @@ export interface BridgeHandlerDeps {
    * rendering). Absent → mention detection is a no-op (no peers configured).
    */
   taskHandleMentionRoster?: Array<{ name: string; botId: string }>;
+  /**
+   * Peer-handoff fast path (local dispatch + Feishu mirror): the process-wide
+   * registry of same-bridge bots' inbound queues. Absent → `handoffs` in
+   * state.json still produce the mirror post (when postClient is available)
+   * but nothing is dispatched locally. See src/bridge/localHandoff.ts.
+   */
+  localHandoffRegistry?: LocalHandoffRegistry;
   /**
    * V2: sourced from BotConfig — passed to renderPrompt + createRunner().run.
    * When absent (V1), renderPrompt and the runner fall back to V1 behavior.
@@ -3699,6 +3707,39 @@ export class BridgeHandler {
               // Card was finalized successfully — drop its card.json so boot
               // reconcile doesn't re-finalize an already-finalized card.
               await deleteCardFile(worktreePath);
+            }
+          }
+
+          // Peer-handoff fast path (local dispatch + Feishu mirror) — after the
+          // card settled, before terminal bookkeeping. Best-effort by design:
+          // a handoff problem must never fail an otherwise-successful turn
+          // (each entry degrades to a recorded diagnostic; WS delivery remains
+          // the fallback whenever local dispatch doesn't apply).
+          const declaredHandoffs = reportedState?.handoffs;
+          if (declaredHandoffs && declaredHandoffs.length > 0) {
+            try {
+              const outcomes = await processHandoffs({
+                handoffs: declaredHandoffs,
+                peers: effectivePeers ?? [],
+                roster: this.deps.taskHandleMentionRoster ?? [],
+                selfBotId: this.deps.botConfig?.id ?? "v1-default",
+                postClient: this.deps.postClient,
+                registry: this.deps.localHandoffRegistry,
+                replyAnchorId,
+                chatId: parsed.chatId,
+                threadId,
+                triggerMessageId: messageId,
+                localDispatchEnabled: process.env["LARKWAY_LOCAL_HANDOFF"] !== "off",
+              });
+              for (const o of outcomes) {
+                await recordEvent({
+                  status: "running",
+                  appendPath: "peer handoff",
+                  reason: `→ ${o.to}: ${o.detail}`,
+                });
+              }
+            } catch (err) {
+              console.warn("[bridge.handler] processHandoffs failed (turn unaffected):", err);
             }
           }
 

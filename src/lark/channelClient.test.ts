@@ -2411,3 +2411,125 @@ describe("ChannelClient — atomic seen-state writes (0.3.28)", () => {
     vi.resetModules();
   });
 });
+
+// ---------------------------------------------------------------------------
+// ingestLocalEvent — peer-handoff local dispatch dedup (vs the later WS copy)
+// ---------------------------------------------------------------------------
+
+describe("ChannelClient ingestLocalEvent — local dispatch + WS-copy dedup", () => {
+  function makeFakeChannel(handlers: Record<string, ((arg: unknown) => void) | undefined>) {
+    return {
+      botIdentity: { openId: "ou_bot", name: "ReviewBot" },
+      on(event: string, handler: (arg: unknown) => void) {
+        handlers[event] = handler;
+      },
+      async connect() {},
+      async disconnect() {},
+      async updateCard() {},
+      rawClient: { im: { v1: { message: { async reply() { return { data: {} }; } } } } },
+    };
+  }
+
+  const localEvent = {
+    message_id: "om_mirror_1",
+    chat_id: "oc_1",
+    chat_type: "group",
+    thread_id: "om_root",
+    root_id: "om_root",
+    sender_id: "dev-bot",
+    content: JSON.stringify({ text: "@_user_1 请 review" }),
+    create_time: String(1_784_000_000_000),
+  };
+
+  it("dispatches the local copy once; a second local ingest of the same id is deduped", async () => {
+    const handlers: Record<string, ((arg: unknown) => void) | undefined> = {};
+    vi.resetModules();
+    vi.doMock("@larksuiteoapi/node-sdk", () => ({ createLarkChannel: () => makeFakeChannel(handlers) }));
+    const { ChannelClient } = await import("./channelClient.js");
+    const client = new ChannelClient({
+      allowedChatIds: new Set(["oc_1"]),
+      botOpenId: "ou_bot",
+      appId: "cli_x",
+      appSecret: "secret",
+      connectGraceMs: 0,
+      channelStaleMs: 0,
+    });
+
+    const iterator = client.events()[Symbol.asyncIterator]();
+    const firstEvent = iterator.next();
+    await new Promise((r) => setTimeout(r, 0));
+
+    expect(client.ingestLocalEvent({ ...localEvent }, "dev-bot")).toBe(true);
+    expect(client.ingestLocalEvent({ ...localEvent }, "dev-bot")).toBe(false); // dedup
+
+    const { value, done } = await firstEvent;
+    expect(done).toBe(false);
+    expect(value!.message_id).toBe("om_mirror_1");
+
+    // No second event pending: a follow-up next() must still be waiting.
+    let secondArrived = false;
+    void iterator.next().then(() => { secondArrived = true; });
+    await new Promise((r) => setTimeout(r, 10));
+    expect(secondArrived).toBe(false);
+
+    await client.close();
+    vi.doUnmock("@larksuiteoapi/node-sdk");
+    vi.resetModules();
+  });
+
+  it("the WS copy of a locally-dispatched message is deduped (and vice versa)", async () => {
+    const handlers: Record<string, ((arg: unknown) => void) | undefined> = {};
+    vi.resetModules();
+    vi.doMock("@larksuiteoapi/node-sdk", () => ({ createLarkChannel: () => makeFakeChannel(handlers) }));
+    const { ChannelClient } = await import("./channelClient.js");
+    const client = new ChannelClient({
+      allowedChatIds: new Set(["oc_1"]),
+      botOpenId: "ou_bot",
+      appId: "cli_x",
+      appSecret: "secret",
+      connectGraceMs: 0,
+      channelStaleMs: 0,
+    });
+
+    const iterator = client.events()[Symbol.asyncIterator]();
+    const firstEvent = iterator.next();
+    await new Promise((r) => setTimeout(r, 0));
+
+    // Local dispatch wins the race…
+    expect(client.ingestLocalEvent({ ...localEvent }, "dev-bot")).toBe(true);
+
+    // …then the same message arrives over the live WS (raw SDK shape).
+    handlers["message"]!({
+      messageId: "om_mirror_1",
+      chatId: "oc_1",
+      chatType: "group",
+      raw: {
+        event: {
+          message: {
+            message_id: "om_mirror_1",
+            chat_id: "oc_1",
+            chat_type: "group",
+            thread_id: "om_root",
+            root_id: "om_root",
+            message_type: "text",
+            content: JSON.stringify({ text: "@_user_1 请 review" }),
+            create_time: "1784000000000",
+          },
+          sender: { sender_id: { open_id: "ou_dev_bot" } },
+        },
+      },
+    });
+
+    const { value } = await firstEvent;
+    expect(value!.message_id).toBe("om_mirror_1");
+
+    let secondArrived = false;
+    void iterator.next().then(() => { secondArrived = true; });
+    await new Promise((r) => setTimeout(r, 10));
+    expect(secondArrived).toBe(false); // WS copy was deduped
+
+    await client.close();
+    vi.doUnmock("@larksuiteoapi/node-sdk");
+    vi.resetModules();
+  });
+});

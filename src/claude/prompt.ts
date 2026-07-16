@@ -382,7 +382,8 @@ function renderStateContract(stateFilePath?: string): string[] {
     "- 需要用户单选:status=ready + choices(最多 5 个 `{label, value}`,可配 choice_prompt 一行问题)。label 是简短选项含义;value 是点选后**逐字回传给你**的完整自描述指令,别写 `optA` 这种代号。bridge 自动编号 A/B/C 并在正文生成图例,**正文别再手动列一遍选项**。仅限「单个离散选择、点一下就答全」;信息收集/多部分提问让用户直接打字,别用按钮。",
     "- 图文混排:status=ready + content_blocks(有序块数组,最多 12 块、其中 image 最多 4 块;只支持 `{type:\"markdown\", content}` 和 `{type:\"image\", img_key, alt?}`,img_key 必须是你已上传、可用于卡片的 Feishu 图片 key;非空时它就是主正文)。",
     "- 需要覆盖卡片正文:status=ready + last_message(不写时正文=答案通道内容);dev_url/mr_url 等业务字段可自由写入,但 bridge 不感知其含义,要让用户看到就写进正文。",
-    "- 需要在终态卡上 @ 人:response_surface 写 `{post:{mentions:[{user_id}]}}`;这只是视觉提示,要 peer bot 消费正文必须另发真实 post(卡片对 agent 不可读)。",
+    "- 需要在终态卡上 @ 人:response_surface 写 `{post:{mentions:[{user_id}]}}`;这只是视觉提示,要 peer bot 消费正文必须走 handoffs 或另发真实 post(卡片对 agent 不可读)。",
+    "- 交接给 peer bot:handoffs(最多 3 条 `{to, text}`,to 写 peer-bots 名册里的名字)。bridge 替你发一条带真实 at 标签的 post 留痕,同桥进程内的 peer 还会被**本地直递**立即唤醒——比自己用 lark-cli 发 post 更快更可靠。text 必须自包含:对方只看得到这条文本,背景、要做什么、期望产出都写清楚。",
     "",
     "边界与责任:",
     "- **绝不自己 PATCH/PUT bridge 管理的卡片/post** —— 网络更新是 bridge 的活,自己改会和卡片 finalize、按钮回传、崩溃恢复冲突。",
@@ -408,7 +409,7 @@ function renderContractAnchor(stateFilePath?: string): string[] {
     "<contract-anchor>",
     "契约同本话题首轮注入,未变化:给用户看的答案正文包在独立行 marker " +
       `\`${ANSWER_BEGIN_MARKER}\` / \`${ANSWER_END_MARKER}\` 之间输出;结论一成形就先流出答案。` +
-      `纯文字回答不用写 state.json;失败/等补充/choices/图文混排时才写 ${stateTarget}` +
+      `纯文字回答不用写 state.json;失败/等补充/choices/图文混排/handoffs 交接时才写 ${stateTarget}` +
       "(原子写 + 刷新 updated_at)。做完干净退出进程。",
     "</contract-anchor>",
   ];
@@ -434,7 +435,9 @@ function renderPeersBlock(peers: PeerBot[]): string[] {
     "- 只在你确认自己能力范围之外才 @ peer",
     "- @ peer 时在消息里说清楚「你需要它做什么」",
     "- 不要把同一任务同时转发给多个 peer",
-    "- @ peer 必须用 **post 消息** + at 标签 `{\"tag\":\"at\",\"user_id\":\"ou_xxx\"}`(用上面的 open_id),",
+    "- 交接首选 state.json 的 `handoffs` 字段(见 state-contract):bridge 代发带真实 at 标签的 post,",
+    "  同桥 peer 还会被本地直递立即唤醒。仅当轮次**中途**需要即时 ack/多轮往来时,才自己用 lark-cli 发",
+    "  **post 消息** + at 标签 `{\"tag\":\"at\",\"user_id\":\"ou_xxx\"}`(用上面的 open_id),",
     "  **严禁用纯 text 的 @xxx**(纯文本 @ 不会真正触达对方 bot)",
     "- **对方需要行动的实质内容,必须写进这条 post 消息本体,不要指望对方去读你的卡片总结**——" +
       "实测过 peer 用工具读取你之前发的卡片消息时,只拿到「请升级客户端查看」之类的降级占位,读不到卡片里的真实结论。" +

@@ -9,6 +9,7 @@ import { CardRenderer } from "./lark/card.js";
 import { silentSdkLogger, compactErrorText } from "./lark/sdkLogger.js";
 import { SessionStore } from "./claude/sessionStore.js";
 import { BridgeHandler } from "./bridge/handler.js";
+import { LocalHandoffRegistry } from "./bridge/localHandoff.js";
 import { upsertRuntimeEvent } from "./bridge/eventLog.js";
 import { appendPerfSample } from "./bridge/perfLog.js";
 import { appendMemoryMetric } from "./bridge/memoryMetrics.js";
@@ -281,6 +282,12 @@ async function runV2Mode({
   }
   const tasklistGuidGroups = new Map<string, TasklistGuidGroup>();
 
+  // Peer-handoff fast path (src/bridge/localHandoff.ts): one process-wide
+  // registry of every hosted bot's inbound queue. Filled progressively inside
+  // the loop below; handlers hold the shared reference and look targets up
+  // lazily at dispatch time, so registration order across bots is irrelevant.
+  const localHandoffRegistry = new LocalHandoffRegistry();
+
   for (const bot of healthyBots) {
     const appSecret = process.env[bot.app_secret_env]!;
 
@@ -365,6 +372,11 @@ async function runV2Mode({
       larkwayDir: larkwayHome(),
     });
     console.log(`[larkway] bot "${bot.id}" inbound transport = Channel SDK (WS in-process)`);
+    // Peer-handoff fast path: make this bot locally dispatchable by siblings.
+    localHandoffRegistry.register(
+      { botId: bot.id, name: bot.name, botOpenId: bot.bot_open_id },
+      client,
+    );
 
     // CardRenderer — V2 mode prefixes card titles with [<botName>] so messages
     // from different bots in the same thread are visually distinguishable.
@@ -830,6 +842,7 @@ async function runV2Mode({
       permissionMode: configJson.permissions.mode,
       peers: resolvedPeers,
       taskHandleMentionRoster,
+      localHandoffRegistry,
       botConfig: {
         id: bot.id,
         name: bot.name,
