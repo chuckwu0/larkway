@@ -32,6 +32,9 @@ function makePostClient(overrides?: { fail?: boolean }) {
     updatePost: vi.fn(async (_messageId: string, _content: string) => ({
       messageId: "om_mirror_1",
     })),
+    createPost: vi.fn(async (_chatId: string, _content: string, _opts: { idempotencyKey: string }) => ({
+      messageId: "om_mirror_1",
+    })),
   };
 }
 

@@ -15,6 +15,18 @@ export interface OutboundPostClient {
   ): Promise<{ messageId: string }>;
 
   /**
+   * Send a NEW top-level msg_type=post message into a chat (starts its own
+   * topic/thread). Used by the scheduler's wake mirror, where no prior
+   * message exists to reply to. Same content/idempotency contract as
+   * createPostReply.
+   */
+  createPost(
+    chatId: string,
+    content: string,
+    opts: { idempotencyKey: string },
+  ): Promise<{ messageId: string }>;
+
+  /**
    * Edit an existing msg_type=post message in place.
    *
    * `content` must already be the stringified Feishu post JSON. The caller must

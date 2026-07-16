@@ -315,6 +315,9 @@ function makeFakePostClient(opts?: { rejectCreate?: boolean }) {
     async updatePost(messageId) {
       return { messageId };
     },
+    async createPost() {
+      return { messageId: "om_post_toplevel" };
+    },
   };
   return { client, calls };
 }

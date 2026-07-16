@@ -35,6 +35,7 @@ import { run as updateRun } from "./commands/update.js";
 import { run as uiRun } from "./commands/ui.js";
 import { run as dogfoodRun } from "./commands/dogfood.js";
 import { run as tasklistInitRun } from "./commands/tasklistInit.js";
+import { run as wakeRun } from "./commands/wake.js";
 
 // ---------------------------------------------------------------------------
 // Command table
@@ -58,6 +59,7 @@ const COMMANDS: Record<string, CommandRun> = {
   dogfood: dogfoodRun,
   ui: uiRun,
   "tasklist-init": tasklistInitRun,
+  wake: wakeRun,
 };
 
 const USAGE = `larkway — Feishu ↔ local CLI agent bridge host manager
@@ -77,6 +79,7 @@ const USAGE = `larkway — Feishu ↔ local CLI agent bridge host manager
   dogfood preflight|guide [id] v0.3 Phase 1 dogfood 前置验收 / 下一步指引
   ui                     启动轻量 Web UI 管理面(127.0.0.1 + token)
   tasklist-init          为话题↔任务句柄 feature provisioning 共享清单(docs/task-handle.md)
+  wake <id> --at --prompt 给 bot 挂一次性闹钟(周期闹钟写 bot yaml schedules:;docs/schedule.md)
 
 全局 flags:
   --json                 机器可读输出(与其他 flag 正交)

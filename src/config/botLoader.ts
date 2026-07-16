@@ -227,6 +227,39 @@ export const BotConfigSchema = z.object({
   turn_taking_limit: z.number().int().min(1).default(10),
 
   /**
+   * Dumb-alarm-clock schedules (docs/schedule.md). Each entry fires
+   * UNCONDITIONALLY at its cron instants (host-local time): the bridge posts
+   * one mirror note into the target chat (new topic = durable human-visible
+   * record) and locally dispatches a turn for THIS bot carrying `prompt`
+   * verbatim. The bridge never interprets the prompt and never reads business
+   * state to decide whether to fire — "is there anything to do" is the woken
+   * agent's first question (thin-channel iron rule 1).
+   */
+  schedules: z
+    .array(
+      z.object({
+        /** 5-field cron (minute hour dom month dow), vixie semantics. */
+        cron: z.string().min(1),
+        /** Wake prompt, delivered verbatim as the turn's message text. */
+        prompt: z.string().min(1),
+        /** Short label for the mirror note header + logs. */
+        note: z.string().min(1).optional(),
+        /** Target chat; falls back to schedule_chat_id. */
+        chat_id: z.string().min(1).optional(),
+        enabled: z.boolean().default(true),
+        /** Cron fires older than this many minutes are skipped, not fired late. @default 10 */
+        misfire_grace_minutes: z.number().int().min(0).optional(),
+      }),
+    )
+    .default([]),
+
+  /**
+   * Default target chat for schedules/one-shot wakes that don't name a
+   * chat_id. Also what `larkway wake` falls back to.
+   */
+  schedule_chat_id: z.string().min(1).optional(),
+
+  /**
    * Feishu bot avatar URL (from bot/v3/info `avatar_url`). Persisted here so the
    * Web 管理面 can show an avatar even before the bridge has written status.json
    * (pre-bridge / central roster). The bridge's live status.json avatar takes

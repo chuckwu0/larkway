@@ -54,9 +54,13 @@ import { TasklistPoller, type RootTextEntry } from "./tasklist/tasklistPoller.js
 import { CandidateAlertStore } from "./tasklist/candidateAlertStore.js";
 import { StallDetector } from "./tasklist/stallDetector.js";
 import { readTeamTasklistGuid } from "./tasklist/teamRegistry.js";
+import { BotScheduler } from "./schedule/scheduler.js";
+import { buildPostContent } from "./lark/postContent.js";
 
 /** Bridge-internal synthetic sender marker for stall-nudge turns — no real Feishu user triggered it (mirrors LEGACY_BOT_ID's sentinel-string convention). */
 const STALL_NUDGE_SENDER_ID = "larkway-stall-detector";
+/** Same convention for scheduler-fired wake turns (docs/schedule.md). */
+const SCHEDULE_SENDER_ID = "larkway-scheduler";
 
 /** How often the bridge rewrites each bot's status.json liveness heartbeat. */
 const STATUS_WRITE_INTERVAL_MS = 30_000;
@@ -211,6 +215,8 @@ async function runV2Mode({
     taskCommentPoller: CommentPoller | undefined;
     /** Task-handle v3.1 stall detector (docs/task-handle.md §12) — undefined when the bot doesn't enable the feature or has stallDetectionDisabled set. */
     stallDetector: StallDetector | undefined;
+    /** Dumb-alarm-clock scheduler (docs/schedule.md) — always constructed; a bot with no cron entries and an empty wakes/ dir ticks as a no-op. */
+    scheduler: BotScheduler;
     /** Liveness heartbeat interval (status.json). Armed after wiring; unref()-ed. */
     statusTimer: ReturnType<typeof setInterval> | null;
     /**
@@ -918,9 +924,67 @@ async function runV2Mode({
       runtime: bot.runtime,
     });
 
+    // Dumb-alarm-clock scheduler (docs/schedule.md): cron entries from the
+    // bot yaml + one-shot wake files dropped by `larkway wake`. Fire = mirror
+    // + local dispatch: ONE real top-level Feishu post into the target chat
+    // (the durable human-visible record AND the new topic anchor), then a
+    // synthesized turn pushed onto THIS bot's own inbound queue — waking on a
+    // timer never depends on Feishu inbound delivery (and needs no second bot
+    // identity to dodge the self-@ guard: the trigger is local, not a mention).
+    // Kill switch: LARKWAY_SCHEDULE=off (mirrors LARKWAY_LOCAL_HANDOFF).
+    const scheduler = new BotScheduler({
+      botId: bot.id,
+      botDir,
+      schedules: bot.schedules,
+      defaultChatId: bot.schedule_chat_id,
+      log: (line) => console.log(`[schedule] ${line}`),
+      fire: async ({ prompt, note, chatId, source, id, occurrence }) => {
+        // (a) MIRROR first — if this fails, the wake did not happen (same
+        // invariant as localHandoff.ts). Idempotency key is stable per
+        // occurrence so a retried one-shot whose first post actually landed
+        // doesn't double-post.
+        let mirrorId: string;
+        try {
+          const header = `⏰ ${note ?? "定时唤醒"} · ${source === "cron" ? "周期" : "一次性"}闹钟`;
+          const sent = await client.outboundPostClient().createPost(
+            chatId,
+            buildPostContent({ text: `${header}\n${prompt}` }),
+            { idempotencyKey: `schedule:${bot.id}:${id}:${occurrence}` },
+          );
+          mirrorId = sent.messageId;
+        } catch (err) {
+          console.warn(`[schedule] bot "${bot.id}": mirror post failed (${note ?? id}):`, err);
+          return false;
+        }
+        // (b) LOCAL DISPATCH: real message_id (mirror) = its own topic root,
+        // so cards/replies anchor naturally and the WS copy of the (self-
+        // authored, mention-less) mirror dedupes via in-flight bookkeeping.
+        // root_id/thread_id deliberately absent: a top-level message IS its
+        // own root — session key resolves to message_id (transport.ts doc).
+        return client.ingestLocalEvent(
+          {
+            message_id: mirrorId,
+            chat_id: chatId,
+            chat_type: "group",
+            larkway_trigger_type: "schedule",
+            sender_id: SCHEDULE_SENDER_ID,
+            content: JSON.stringify({ text: prompt }),
+            create_time: String(Date.now()),
+          },
+          "schedule",
+        );
+      },
+    });
+    if (!dryRun && process.env["LARKWAY_SCHEDULE"] !== "off") {
+      scheduler.start();
+      if (scheduler.cronCount > 0) {
+        console.log(`[larkway] bot "${bot.id}": scheduler armed (${scheduler.cronCount} cron entr${scheduler.cronCount === 1 ? "y" : "ies"} + wakes/ queue)`);
+      }
+    }
+
     const inst: BotInstance = {
       bot, client, sessionStore, cardRenderer, handler, housekeeping,
-      taskCommentPoller, stallDetector, codexPool, claudePool,
+      taskCommentPoller, stallDetector, scheduler, codexPool, claudePool,
       statusTimer: null, avatar: undefined,
     };
     instances.push(inst);
@@ -1069,7 +1133,7 @@ async function runV2Mode({
   async function shutdown(signal: string): Promise<void> {
     console.log(`\n[larkway] Received ${signal}, shutting down V2 bots…`);
     await Promise.all(
-      instances.map(async ({ bot, statusTimer, housekeeping, taskCommentPoller, stallDetector, handler, sessionStore, client, avatar, codexPool, claudePool }) => {
+      instances.map(async ({ bot, statusTimer, housekeeping, taskCommentPoller, stallDetector, scheduler, handler, sessionStore, client, avatar, codexPool, claudePool }) => {
         if (statusTimer) clearInterval(statusTimer);
         // Await drain (M1): stop() only cancels the NEXT scheduled cycle —
         // without awaiting, a cycle already in flight would keep running
@@ -1077,6 +1141,7 @@ async function runV2Mode({
         // has logged "complete" and the process is exiting.
         await taskCommentPoller?.stop();
         await stallDetector?.stop();
+        await scheduler.stop();
         // Mark this bot as no-longer-serving on the way out (ws:false). The Web
         // 管理面 will then show 🟡 degraded briefly, then 🔴 offline once the
         // file goes stale. Best-effort — never block shutdown on it. Preserve the
@@ -1117,10 +1182,11 @@ async function runV2Mode({
   if (dryRun) {
     console.log("[dry-run] V2 mode — all bots wired OK, exiting.");
     await Promise.all(
-      instances.map(async ({ housekeeping, taskCommentPoller, stallDetector, sessionStore, client, codexPool, claudePool }) => {
+      instances.map(async ({ housekeeping, taskCommentPoller, stallDetector, scheduler, sessionStore, client, codexPool, claudePool }) => {
         housekeeping.stop();
         await taskCommentPoller?.stop();
         await stallDetector?.stop();
+        await scheduler.stop();
         // No-op: dry-run never calls .run(), so no process was ever spawned.
         await codexPool?.shutdown();
         await claudePool?.shutdown();

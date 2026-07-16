@@ -24,6 +24,10 @@ describe("ChannelPostClient", () => {
                 calls.push(payload);
                 return { data: { message_id: payload.path.message_id } };
               },
+              async create(payload) {
+                calls.push(payload);
+                return { data: { message_id: "om_post_toplevel" } };
+              },
             },
           },
         },
@@ -69,6 +73,10 @@ describe("ChannelPostClient", () => {
                 calls.push(payload);
                 return { data: { message_id: payload.path.message_id } };
               },
+              async create(payload) {
+                calls.push(payload);
+                return { data: { message_id: "om_post_toplevel" } };
+              },
             },
           },
         },
@@ -111,6 +119,11 @@ describe("ChannelPostClient", () => {
                 if (calls.length < 3) throw errorWithStatus(503);
                 return { data: { message_id: payload.path.message_id } };
               },
+              async create(payload) {
+                calls.push(payload);
+                if (calls.length < 3) throw errorWithStatus(503);
+                return { data: { message_id: "om_post_toplevel" } };
+              },
             },
           },
         },
@@ -151,6 +164,10 @@ describe("ChannelPostClient", () => {
                 throw errorWithStatus(400);
               },
               async update() {
+                calls += 1;
+                throw errorWithStatus(400);
+              },
+              async create() {
                 calls += 1;
                 throw errorWithStatus(400);
               },

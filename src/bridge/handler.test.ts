@@ -365,6 +365,10 @@ function makePostClient(opts: { fail?: boolean; failCreate?: boolean; failUpdate
       if (opts.fail || opts.failUpdate) throw new Error("fake post failed");
       return { messageId };
     },
+    async createPost() {
+      if (opts.fail || opts.failCreate) throw new Error("fake post failed");
+      return { messageId: "om_post_toplevel" };
+    },
   };
   return { client, calls };
 }

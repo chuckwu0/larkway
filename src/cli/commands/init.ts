@@ -631,6 +631,7 @@ async function runCreateBot(
     peers: [],
     repos: basics.repos,
     turn_taking_limit: basics.turnLimit ?? 10,
+    schedules: [],
     read_only: false,
     response_surface_prototype: DEFAULT_RESPONSE_SURFACE_PROTOTYPE,
     runtime: "agent_workspace",

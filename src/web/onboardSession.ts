@@ -456,6 +456,7 @@ export async function createBotFromCreds(
     peers: [],
     repos,
     turn_taking_limit: form.turn_taking_limit ?? 10,
+    schedules: [],
     ...(git_token_env ? { git_token_env } : {}),
     memory_file: memoryFile,
     read_only: false,

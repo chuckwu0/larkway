@@ -43,6 +43,7 @@ const sampleBot = (id = "test-bot"): BotConfig =>
     peers: [],
     repos: [{ slug: "group/repo", branch: "master" }],
     turn_taking_limit: 10,
+    schedules: [],
     read_only: false,
     response_surface_prototype: DEFAULT_RESPONSE_SURFACE_PROTOTYPE,
     runtime: "legacy",

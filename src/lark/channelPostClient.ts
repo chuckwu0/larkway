@@ -11,6 +11,10 @@ interface RawUpdateResult {
   data?: { message_id?: string };
 }
 
+interface RawCreateResult {
+  data?: { message_id?: string };
+}
+
 export interface OutboundPostLarkChannel {
   rawClient: {
     im: {
@@ -32,6 +36,15 @@ export interface OutboundPostLarkChannel {
               msg_type: "post";
             };
           }): Promise<RawUpdateResult>;
+          create(payload: {
+            params: { receive_id_type: "chat_id" };
+            data: {
+              receive_id: string;
+              content: string;
+              msg_type: "post";
+              uuid?: string;
+            };
+          }): Promise<RawCreateResult>;
         };
       };
     };
@@ -87,6 +100,33 @@ export class ChannelPostClient implements OutboundPostClient {
         "[channel.post] im.v1.message.reply returned no message_id " +
           `(replyTo=${replyToMessageId})`,
       );
+    }
+    return { messageId };
+  }
+
+  async createPost(
+    chatId: string,
+    content: string,
+    opts: { idempotencyKey: string },
+  ): Promise<{ messageId: string }> {
+    const res = await withPostRetry(
+      "createPost",
+      () =>
+        this.channel().rawClient.im.v1.message.create({
+          params: { receive_id_type: "chat_id" },
+          data: {
+            receive_id: chatId,
+            content,
+            msg_type: "post",
+            uuid: opts.idempotencyKey,
+          },
+        }),
+      { maxAttempts: this.maxAttempts, baseDelayMs: this.baseDelayMs },
+    );
+
+    const messageId = res.data?.message_id;
+    if (!messageId) {
+      throw new Error(`[channel.post] im.v1.message.create returned no message_id (chat=${chatId})`);
     }
     return { messageId };
   }
