@@ -55,7 +55,8 @@
 | v0.3.48 | v0.3.48 | patch / 已发布 | fix: model 覆盖菜单被卡片圆角裁剪到看不见选项(改文档流内展开) |
 | v0.3.49 | v0.3.49 | patch / 已发布 | fix: 体检探针补齐用户级安装目录 PATH(claude 在 ~/.local/bin 被误报未安装)+ lark-cli 探测超时放宽 |
 | v0.3.50 | v0.3.50 | patch / 已发布 | 批E/F 性能(prompt 去重+delta 续轮+P2P 粘连+session 重播种) + 批G/H/I 记忆体系 P0/P1(组织知识库 git 仓+GC 收割+统一带种换血+预警窗合规计数+记忆变更机械可见+owner 事实+保养流程) |
-| v0.3.51 | v0.3.51 | 当前 patch / 已发布 | 看板 Model/Effort 覆盖显示底座全局实际生效值;codex 模型建议列表按本机可见模型动态生成 |
+| v0.3.51 | v0.3.51 | patch / 已发布 | 看板 Model/Effort 覆盖显示底座全局实际生效值;codex 模型建议列表按本机可见模型动态生成 |
+| v0.3.52 | v0.3.52 | 当前 patch / 已发布 | fix(bridge): marker 外正文兜底 — agent exit 0 但答案写在 LARKWAY_ANSWER 标记外且未写 state.json 时,以最后一段 internal_text 作为卡片正文(💬 已回复 中性标注,不伪装完成),不再渲染「没有产出正文」错误卡 |
 
 ## 使用原则
 
@@ -118,4 +119,5 @@ v0.3.48       = fix: model 覆盖菜单被卡片圆角裁剪到看不见选项(�
 v0.3.49       = fix: 体检探针补齐用户级安装目录 PATH(claude 在 ~/.local/bin 被误报未安装)+ lark-cli 探测超时放宽
 v0.3.50       = 批E/F 性能(prompt 去重+delta 续轮+P2P 粘连+session 重播种) + 批G/H/I 记忆体系 P0/P1(组织知识库 git 仓+GC 收割+统一带种换血+预警窗合规计数+记忆变更机械可见+owner 事实+保养流程)
 v0.3.51       = 看板 Model/Effort 覆盖显示底座全局实际生效值;codex 模型建议列表按本机可见模型动态生成
+v0.3.52       = fix(bridge): marker 外正文兜底 — agent exit 0 但答案写在 LARKWAY_ANSWER 标记外且未写 state.json 时,以最后一段 internal_text 作为卡片正文(💬 已回复 中性标注,不伪装完成),不再渲染「没有产出正文」错误卡
 ```
