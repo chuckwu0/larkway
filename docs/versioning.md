@@ -58,7 +58,8 @@
 | v0.3.51 | v0.3.51 | patch / 已发布 | 看板 Model/Effort 覆盖显示底座全局实际生效值;codex 模型建议列表按本机可见模型动态生成 |
 | v0.3.52 | v0.3.52 | patch / 已发布 | fix(bridge): marker 外正文兜底 — agent exit 0 但答案写在 LARKWAY_ANSWER 标记外且未写 state.json 时,以最后一段 internal_text 作为卡片正文(💬 已回复 中性标注,不伪装完成),不再渲染「没有产出正文」错误卡 |
 | v0.3.53 | v0.3.53 | patch / 已发布 | peer-handoff fast path: state.json handoffs → bridge-sent mirror post + same-process local dispatch (WS copy deduped); LARKWAY_LOCAL_HANDOFF=off kill switch |
-| v0.3.54 | v0.3.54 | 当前 patch / 已发布 | 原生 schedule 哑闹钟: bot yaml schedules(5段cron,宿主本地时区)+ larkway wake 一次性闹钟(目录队列); 到点镜像 post + 本地直递唤醒,不经飞书入站、无需借第二 bot 身份; 错过策略 cron 超宽限跳过/一次性恢复补发; kill switch LARKWAY_SCHEDULE=off |
+| v0.3.54 | v0.3.54 | patch / 已发布 | 原生 schedule 哑闹钟: bot yaml schedules(5段cron,宿主本地时区)+ larkway wake 一次性闹钟(目录队列); 到点镜像 post + 本地直递唤醒,不经飞书入站、无需借第二 bot 身份; 错过策略 cron 超宽限跳过/一次性恢复补发; kill switch LARKWAY_SCHEDULE=off |
+| v0.3.55 | v0.3.55 | 当前 patch / 已发布 | fix: 定时唤醒/handoff 镜像 post 的幂等 uuid 超飞书 50 字符上限被 99992402 拒收(首晨两次唤醒失败),统一 sha256 短哈希 |
 
 ## 使用原则
 
@@ -124,4 +125,5 @@ v0.3.51       = 看板 Model/Effort 覆盖显示底座全局实际生效值;code
 v0.3.52       = fix(bridge): marker 外正文兜底 — agent exit 0 但答案写在 LARKWAY_ANSWER 标记外且未写 state.json 时,以最后一段 internal_text 作为卡片正文(💬 已回复 中性标注,不伪装完成),不再渲染「没有产出正文」错误卡
 v0.3.53       = peer-handoff fast path: state.json handoffs → bridge-sent mirror post + same-process local dispatch (WS copy deduped); LARKWAY_LOCAL_HANDOFF=off kill switch
 v0.3.54       = 原生 schedule 哑闹钟: bot yaml schedules(5段cron,宿主本地时区)+ larkway wake 一次性闹钟(目录队列); 到点镜像 post + 本地直递唤醒,不经飞书入站、无需借第二 bot 身份; 错过策略 cron 超宽限跳过/一次性恢复补发; kill switch LARKWAY_SCHEDULE=off
+v0.3.55       = fix: 定时唤醒/handoff 镜像 post 的幂等 uuid 超飞书 50 字符上限被 99992402 拒收(首晨两次唤醒失败),统一 sha256 短哈希
 ```
