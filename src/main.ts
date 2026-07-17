@@ -56,6 +56,7 @@ import { StallDetector } from "./tasklist/stallDetector.js";
 import { readTeamTasklistGuid } from "./tasklist/teamRegistry.js";
 import { BotScheduler } from "./schedule/scheduler.js";
 import { buildPostContent } from "./lark/postContent.js";
+import { safeIdempotencyKey } from "./lark/outboundPostClient.js";
 
 /** Bridge-internal synthetic sender marker for stall-nudge turns — no real Feishu user triggered it (mirrors LEGACY_BOT_ID's sentinel-string convention). */
 const STALL_NUDGE_SENDER_ID = "larkway-stall-detector";
@@ -949,7 +950,10 @@ async function runV2Mode({
           const sent = await client.outboundPostClient().createPost(
             chatId,
             buildPostContent({ text: `${header}\n${prompt}` }),
-            { idempotencyKey: `schedule:${bot.id}:${id}:${occurrence}` },
+            // Hashed: Feishu's uuid field rejects long/odd-charset keys with
+            // 99992402 (see safeIdempotencyKey) — raw cron keys contain
+            // spaces/asterisks and overflow the cap.
+            { idempotencyKey: safeIdempotencyKey(`schedule:${bot.id}:${id}:${occurrence}`) },
           );
           mirrorId = sent.messageId;
         } catch (err) {

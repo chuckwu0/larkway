@@ -26,7 +26,7 @@
 
 import type { PeerBot } from "../claude/prompt.js";
 import type { LarkMessageEvent } from "../lark/transport.js";
-import type { OutboundPostClient } from "../lark/outboundPostClient.js";
+import { safeIdempotencyKey, type OutboundPostClient } from "../lark/outboundPostClient.js";
 import { buildPostContent } from "../lark/postContent.js";
 
 // ---------------------------------------------------------------------------
@@ -162,7 +162,12 @@ export async function processHandoffs(ctx: ProcessHandoffsContext): Promise<Hand
       });
       const sent = await ctx.postClient.createPostReply(ctx.replyAnchorId, content, {
         replyInThread: true,
-        idempotencyKey: `handoff:${ctx.triggerMessageId}:${i}:${rosterEntry?.botId ?? wanted}`,
+        // Hashed: raw `handoff:<om_ id>:<i>:<botId>` sits at ~50 chars — right
+        // on Feishu's uuid validation cap (99992402). Same-input stability
+        // keeps retry dedup working.
+        idempotencyKey: safeIdempotencyKey(
+          `handoff:${ctx.triggerMessageId}:${i}:${rosterEntry?.botId ?? wanted}`,
+        ),
       });
       mirrorMessageId = sent.messageId;
     } catch (err) {

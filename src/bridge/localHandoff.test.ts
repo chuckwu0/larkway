@@ -86,7 +86,8 @@ describe("processHandoffs — mirror + local dispatch", () => {
     const [anchor, content, opts] = postClient.createPostReply.mock.calls[0]!;
     expect(anchor).toBe("om_anchor");
     expect(opts.replyInThread).toBe(true);
-    expect(opts.idempotencyKey).toContain("om_trigger");
+    // Hashed key (Feishu uuid cap): stable, short, safe charset.
+    expect(opts.idempotencyKey).toMatch(/^lw-[0-9a-f]{40}$/);
     // The at tag targets the SENDER-scope open_id (the only scope the mirror
     // post's app identity can address).
     expect(content).toContain("ou_review_in_sender_scope");

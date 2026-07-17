@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto";
+
 export interface OutboundPostClient {
   /**
    * Reply to a Feishu message with msg_type=post content.
@@ -34,6 +36,18 @@ export interface OutboundPostClient {
    * edits by non-senders and caps each message at 20 edits.
    */
   updatePost(messageId: string, content: string): Promise<{ messageId: string }>;
+}
+
+/**
+ * Feishu message-create/reply `uuid` (idempotency) fields reject long keys
+ * (~50 char cap) and unusual characters with 99992402 "field validation
+ * failed" — BEFORE creating the message (real incident: the scheduler's
+ * first morning fire 2026-07-17, key was a 53-char colon/space/asterisk
+ * concat). Every bridge-derived idempotency key must go through this: same
+ * input → same key (retry dedup preserved), always 43 chars of [a-z0-9-].
+ */
+export function safeIdempotencyKey(raw: string): string {
+  return "lw-" + createHash("sha256").update(raw).digest("hex").slice(0, 40);
 }
 
 function numericStatus(err: unknown): number | undefined {
