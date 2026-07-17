@@ -92,6 +92,17 @@ export interface SessionRecord {
    */
   chatId?: string;
   /**
+   * Companion to {@link chatId}, captured at the same time (same "New thread"
+   * branch): the Feishu chat_type ("p2p" | "group") of the chat this thread
+   * lives in. Consumed by ChannelClient.seedTrackedChats (2026-07-17 p2p
+   * message-loss fix): gap-fill's p2p dispatch path must know a chat is p2p
+   * BEFORE any live traffic after a restart — p2p chats are invisible to
+   * bot-side chat-list discovery, and p2p messages carry no mentions to match
+   * on. Absent on records written before this field existed (those chats fall
+   * back to the runtime channel-seen-chats cache / live re-learning).
+   */
+  chatType?: string;
+  /**
    * BL-38 (poison-session self-heal): count of CONSECUTIVE turns on this thread
    * that ended by the idle watchdog (a confirmed hang). Incremented on each
    * such turn, reset to 0 by any clean-completing turn. When it reaches the
@@ -171,6 +182,7 @@ interface StoredRecord {
   senderOpenId?: string;
   rootText?: string;
   chatId?: string;
+  chatType?: string;
   consecutiveStuckCount?: number;
   turnCount?: number;
   harvestedAt?: number;
@@ -432,6 +444,7 @@ export class SessionStore {
       ...(record.senderOpenId !== undefined ? { senderOpenId: record.senderOpenId } : {}),
       ...(record.rootText !== undefined ? { rootText: record.rootText } : {}),
       ...(record.chatId !== undefined ? { chatId: record.chatId } : {}),
+      ...(record.chatType !== undefined ? { chatType: record.chatType } : {}),
       // BL-38: only persist when > 0 — a 0/undefined counter is a clean thread,
       // so passing consecutiveStuckCount: 0 naturally clears the field on reset.
       ...(record.consecutiveStuckCount ? { consecutiveStuckCount: record.consecutiveStuckCount } : {}),
@@ -610,6 +623,7 @@ function isStoredRecord(value: unknown): value is StoredRecord {
     (v["senderOpenId"] === undefined || typeof v["senderOpenId"] === "string") &&
     (v["rootText"] === undefined || typeof v["rootText"] === "string") &&
     (v["chatId"] === undefined || typeof v["chatId"] === "string") &&
+    (v["chatType"] === undefined || typeof v["chatType"] === "string") &&
     (v["turnCount"] === undefined || typeof v["turnCount"] === "number") &&
     (v["harvestedAt"] === undefined || typeof v["harvestedAt"] === "number") &&
     (v["approxChars"] === undefined || typeof v["approxChars"] === "number") &&

@@ -1005,7 +1005,11 @@ describe("ChannelClient — gap-fill after reconnect (BL-15)", () => {
       }
       await new Promise((r) => setTimeout(r, 20));
     }
-    expect(JSON.parse(cached)).toContain("oc_persist");
+    // Persisted shape: { chats, chatTypes } — types ride along so p2p chats
+    // stay p2p-dispatchable across restarts (2026-07-17 message-loss fix).
+    const parsedCache = JSON.parse(cached) as { chats: string[]; chatTypes: Record<string, string> };
+    expect(parsedCache.chats).toContain("oc_persist");
+    expect(parsedCache.chatTypes["oc_persist"]).toBe("group");
 
     await client.close();
     vi.doUnmock("@larksuiteoapi/node-sdk");
@@ -1248,6 +1252,244 @@ describe("ChannelClient — gap-fill after reconnect (BL-15)", () => {
 
     await client.close();
     vi.doUnmock("@larksuiteoapi/node-sdk");
+    vi.doUnmock("node:child_process");
+    vi.resetModules();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 2026-07-17 p2p message-loss fix:
+//   (a) a p2p chat seeded from durable session history (sessions.json) is
+//       gap-filled after a restart, and its messages dispatch WITHOUT a
+//       mentions match (p2p messages carry no mentions at all — the old gate
+//       silently dropped every one of them, so a p2p @ lost during a WS
+//       outage was unrecoverable);
+//   (b) the bot's OWN p2p replies in the pulled window are not re-dispatched;
+//   (c) a chat whose pull fails with 230002 (bot removed from the chat) fails
+//       fast (no in-cycle retries), never queues a replay window (the quota
+//       amplifier), and is untracked after 3 consecutive cycles.
+// ---------------------------------------------------------------------------
+
+describe("ChannelClient — p2p gap-fill across restart + 230002 untracking", () => {
+  function makeFakeChannelWithHandlers() {
+    const handlers: Record<string, ((arg: unknown) => void) | undefined> = {};
+    const ch = {
+      botIdentity: { openId: "ou_bot", name: "test-bot" },
+      on(event: string, handler: (arg: unknown) => void) {
+        handlers[event] = handler;
+      },
+      async connect() {},
+      async disconnect() {},
+    };
+    return { ch, handlers };
+  }
+
+  it("recovers p2p messages after a restart: seeded p2p chat gap-fills without mentions, bot's own replies skipped", async () => {
+    const humanMessageId = "om_p2p_gap_human";
+    const botOwnMessageId = "om_p2p_gap_botown";
+
+    vi.resetModules();
+    vi.doMock("node:child_process", () => ({
+      execFile: (
+        _cmd: string,
+        _args: string[],
+        cb: (err: null, result: { stdout: string; stderr: string }) => void,
+      ) => {
+        // Realistic +chat-messages-list items: NO chat_type field, NO mentions
+        // (p2p messages never carry them) — the human message and the bot's
+        // own earlier reply both appear in the pulled window.
+        const items = [
+          {
+            message_id: humanMessageId,
+            chat_id: "oc_p2ptest",
+            content: JSON.stringify({ text: "断线期间发的私聊消息" }),
+            sender: { id: "ou_user", sender_type: "user" },
+            create_time: String(Date.now()),
+          },
+          {
+            message_id: botOwnMessageId,
+            chat_id: "oc_p2ptest",
+            content: JSON.stringify({ text: "bot 自己之前的回复" }),
+            sender: { id: "ou_bot", sender_type: "app" },
+            create_time: String(Date.now()),
+          },
+        ];
+        cb(null, { stdout: JSON.stringify({ ok: true, data: { messages: items } }), stderr: "" });
+      },
+    }));
+    const chObj = makeFakeChannelWithHandlers();
+    vi.doMock("@larksuiteoapi/node-sdk", () => ({
+      createLarkChannel: () => chObj.ch,
+    }));
+
+    const { ChannelClient } = await import("./channelClient.js");
+    // Fresh process = post-restart: no live traffic has taught this client
+    // anything. The ONLY knowledge of the p2p chat comes from the seed
+    // (main.ts feeds it from sessions.json's chatId/chatType).
+    const client = new ChannelClient({
+      allowedChatIds: new Set(),
+      botOpenId: "ou_bot",
+      appId: "cli_x",
+      appSecret: "secret",
+      connectGraceMs: 0,
+      channelStaleMs: 0,
+      openChatDiscoveryMs: 0,
+    });
+    client.seedTrackedChats([{ chatId: "oc_p2ptest", chatType: "p2p" }]);
+
+    const dispatched: Array<{ messageId: string; chatType?: string }> = [];
+    void (async () => {
+      for await (const ev of client.events()) {
+        dispatched.push({ messageId: ev.message_id, chatType: ev.chat_type });
+      }
+    })();
+    for (let i = 0; i < 100 && !chObj.handlers["reconnected"]; i++) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
+
+    chObj.handlers["reconnecting"]!(undefined);
+    chObj.handlers["reconnected"]!(undefined);
+
+    for (let i = 0; i < 100 && !dispatched.some((d) => d.messageId === humanMessageId); i++) {
+      await new Promise((r) => setTimeout(r, 20));
+    }
+
+    // The human p2p message is recovered — reconstructed as chat_type "p2p"
+    // (from the seeded type) so session-key derivation matches a live delivery.
+    expect(dispatched).toContainEqual({ messageId: humanMessageId, chatType: "p2p" });
+    // The bot's own reply is NOT re-dispatched.
+    expect(dispatched.map((d) => d.messageId)).not.toContain(botOwnMessageId);
+
+    await client.close();
+    vi.doUnmock("@larksuiteoapi/node-sdk");
+    vi.doUnmock("node:child_process");
+    vi.resetModules();
+  });
+
+  it("a chat still keeps the mentions gate when its type is unknown", async () => {
+    let execCalls = 0;
+    vi.resetModules();
+    vi.doMock("node:child_process", () => ({
+      execFile: (
+        _cmd: string,
+        _args: string[],
+        cb: (err: null, result: { stdout: string; stderr: string }) => void,
+      ) => {
+        execCalls++;
+        const items = [
+          {
+            message_id: "om_unknown_type",
+            chat_id: "oc_unknowntype",
+            content: JSON.stringify({ text: "没有@bot 的普通消息" }),
+            sender: { id: "ou_user", sender_type: "user" },
+            create_time: String(Date.now()),
+          },
+        ];
+        cb(null, { stdout: JSON.stringify({ ok: true, data: { messages: items } }), stderr: "" });
+      },
+    }));
+    const chObj = makeFakeChannelWithHandlers();
+    vi.doMock("@larksuiteoapi/node-sdk", () => ({
+      createLarkChannel: () => chObj.ch,
+    }));
+
+    const { ChannelClient } = await import("./channelClient.js");
+    const client = new ChannelClient({
+      allowedChatIds: new Set(),
+      botOpenId: "ou_bot",
+      appId: "cli_x",
+      appSecret: "secret",
+      connectGraceMs: 0,
+      channelStaleMs: 0,
+      openChatDiscoveryMs: 0,
+    });
+    // Seeded WITHOUT a chatType (e.g. an old session record) → the safe
+    // pre-existing behavior (mentions gate) applies.
+    client.seedTrackedChats([{ chatId: "oc_unknowntype" }]);
+
+    const dispatched: string[] = [];
+    void (async () => {
+      for await (const ev of client.events()) dispatched.push(ev.message_id);
+    })();
+    for (let i = 0; i < 100 && !chObj.handlers["reconnected"]; i++) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    chObj.handlers["reconnecting"]!(undefined);
+    chObj.handlers["reconnected"]!(undefined);
+    // Wait until gap-fill has actually pulled the chat (execFile called), so a
+    // zero-dispatch assertion can't pass vacuously if gap-fill never ran.
+    for (let i = 0; i < 100 && execCalls === 0; i++) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    await new Promise((r) => setTimeout(r, 100));
+
+    expect(execCalls).toBeGreaterThan(0);
+    expect(dispatched).toHaveLength(0);
+
+    await client.close();
+    vi.doUnmock("@larksuiteoapi/node-sdk");
+    vi.doUnmock("node:child_process");
+    vi.resetModules();
+  });
+
+  it("230002 fails fast (no retries), queues no replay window, and untracks the chat after 3 cycles", async () => {
+    let execCalls = 0;
+
+    vi.resetModules();
+    vi.doMock("node:child_process", () => ({
+      execFile: (
+        _cmd: string,
+        _args: string[],
+        cb: (err: Error | null, result?: { stdout: string; stderr: string }) => void,
+      ) => {
+        execCalls++;
+        cb(
+          Object.assign(
+            new Error(
+              "Command failed: lark-cli im +chat-messages-list — " +
+                "code: 230002, msg: Bot/User can NOT be out of the chat",
+            ),
+            { stderr: "code: 230002, msg: Bot/User can NOT be out of the chat" },
+          ),
+        );
+      },
+    }));
+
+    const { ChannelClient } = await import("./channelClient.js");
+    const client = new ChannelClient({
+      allowedChatIds: new Set(),
+      botOpenId: "ou_bot",
+      appId: "cli_x",
+      appSecret: "secret",
+      connectGraceMs: 0,
+      channelStaleMs: 0,
+      openChatDiscoveryMs: 0,
+    });
+    // If fail-fast regressed, the in-cycle retry backoff would be observable here.
+    const backoffs: number[] = [];
+    client.setGapFillSleepForTest(async (ms) => {
+      backoffs.push(ms);
+    });
+    client.seedTrackedChats([{ chatId: "oc_gonetest" }]);
+
+    // Cycles 1-2: strikes accumulate; the chat stays tracked, and — the
+    // amplifier fix — NO unresolved window is ever queued for replay.
+    await client.gapFillForTest(Date.now() - 1000, new Set(["oc_gonetest"]));
+    await client.gapFillForTest(Date.now() - 1000, new Set(["oc_gonetest"]));
+    expect(client.trackedChatIdsForTest().has("oc_gonetest")).toBe(true);
+    expect(client.unresolvedGapWindowsForTest().size).toBe(0);
+
+    // Cycle 3: third consecutive 230002 → untracked.
+    await client.gapFillForTest(Date.now() - 1000, new Set(["oc_gonetest"]));
+    expect(client.trackedChatIdsForTest().has("oc_gonetest")).toBe(false);
+    expect(client.unresolvedGapWindowsForTest().size).toBe(0);
+
+    // Fail-fast: exactly ONE lark-cli attempt per cycle (the old behavior
+    // burned 3 retries per cycle against the same deterministic error).
+    expect(execCalls).toBe(3);
+    expect(backoffs).toHaveLength(0);
+
+    await client.close();
     vi.doUnmock("node:child_process");
     vi.resetModules();
   });

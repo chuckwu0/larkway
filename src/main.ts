@@ -378,6 +378,18 @@ async function runV2Mode({
       larkCliProfile,
       larkwayDir: larkwayHome(),
     });
+    // Gap-fill tracked-chat seeding (2026-07-17 p2p message-loss fix): the
+    // runtime channel-seen-chats cache is best-effort; sessions.json is the
+    // durable record of every chat this bot has served. Seeding from it keeps
+    // a p2p chat — invisible to bot chat-list discovery — gap-fillable across
+    // restarts even when the runtime cache is missing or stale.
+    client.seedTrackedChats(
+      sessionStore.list().flatMap((r) =>
+        r.chatId
+          ? [{ chatId: r.chatId, ...(r.chatType ? { chatType: r.chatType } : {}) }]
+          : [],
+      ),
+    );
     console.log(`[larkway] bot "${bot.id}" inbound transport = Channel SDK (WS in-process)`);
     // Peer-handoff fast path: make this bot locally dispatchable by siblings.
     localHandoffRegistry.register(

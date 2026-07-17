@@ -123,6 +123,36 @@ const UNRESOLVED_WINDOW_MAX_CHATS = 50;
  * otherwise an old window could never be covered and would only ever age out.
  */
 const UNRESOLVED_WINDOW_MAX_AGE_MS = 30 * 60 * 1000; // 30 min
+/**
+ * Untrack a chat after this many CONSECUTIVE gap-fill cycles whose history pull
+ * failed with Feishu 230002 ("Bot/User can NOT be out of the chat" — the bot is
+ * no longer a member). Such a failure is deterministic: retrying within a cycle
+ * and replaying the window across cycles both burn quota (and feed 429 rate
+ * limiting) without ever succeeding. A small threshold (not 1) tolerates a
+ * mislabeled transient; re-tracking is automatic — any live message from the
+ * chat (bot re-invited) re-learns it via noteSeenChat.
+ */
+const CHAT_ACCESS_GONE_UNTRACK_AFTER = 3;
+
+/**
+ * Whether a lark-cli history-pull error is Feishu 230002 — the bot has been
+ * removed from the chat. Deterministic (not transient): the pull can never
+ * succeed until the bot is re-invited, so callers fail fast instead of
+ * retrying/replaying. Matched against the error message and the child
+ * process's captured stderr/stdout (lark-cli surfaces the code in either,
+ * depending on version).
+ */
+function isChatAccessGoneError(e: unknown): boolean {
+  const parts: string[] = [];
+  if (e instanceof Error) parts.push(e.message);
+  if (e && typeof e === "object") {
+    for (const key of ["stderr", "stdout"] as const) {
+      const v = (e as Record<string, unknown>)[key];
+      if (typeof v === "string") parts.push(v);
+    }
+  }
+  return parts.some((s) => s.includes("230002"));
+}
 
 // ---------------------------------------------------------------------------
 // Minimal structural types for the SDK surface we use.
@@ -286,6 +316,25 @@ export function resolveRecoveredThreadId(m: Record<string, unknown>): string | n
     if (match) return match[1] ?? null;
   }
   return null;
+}
+
+/**
+ * Whether a +chat-messages-list item was sent by the bot itself. Used by the
+ * p2p gap-fill dispatch path, which (unlike the group path) has no mentions
+ * gate to implicitly exclude the bot's own replies from a recovered window.
+ * Handles both sender shapes lark-cli has returned over time: a bare open_id
+ * string, and the object form `{ id, id_type, sender_type }` (bot-sent
+ * messages carry sender_type "app").
+ */
+export function isBotSentMessage(m: Record<string, unknown>, botOpenId: string): boolean {
+  const sender = m["sender"];
+  if (typeof sender === "string") return sender === botOpenId;
+  if (sender && typeof sender === "object") {
+    const s = sender as Record<string, unknown>;
+    if (s["sender_type"] === "app") return true;
+    if (typeof s["id"] === "string" && s["id"] === botOpenId) return true;
+  }
+  return false;
 }
 
 /** A card-button click delivered by the SDK (raw `card.action.trigger`). */
@@ -563,6 +612,16 @@ export class ChannelClient {
    */
   private readonly unresolvedGapWindowByChat = new Map<string, number>();
   /**
+   * chatId → count of CONSECUTIVE gap-fill cycles whose pull failed with
+   * 230002 (bot removed from the chat). At {@link CHAT_ACCESS_GONE_UNTRACK_AFTER}
+   * the chat is dropped from gap-fill tracking entirely (see
+   * {@link noteChatAccessGone}) — the fix for the 2026-07-17 amplifier where a
+   * stale chat's unresolved window was replayed (3 retries each) every cycle,
+   * forever, burning quota against a deterministic error. Reset by any
+   * successful pull of the chat or any live sighting (noteSeenChat).
+   */
+  private readonly chatAccessGoneCountByChat = new Map<string, number>();
+  /**
    * Backoff sleep used by the per-chat history-pull retry. Indirected through a
    * field purely so tests can observe/await the backoff deterministically; in
    * production it is the real timer-based {@link sleep}.
@@ -653,6 +712,48 @@ export class ChannelClient {
   /** TEST-ONLY read of the per-chat unresolved-window replay map (chatId → windowStart). */
   unresolvedGapWindowsForTest(): ReadonlyMap<string, number> {
     return new Map(this.unresolvedGapWindowByChat);
+  }
+
+  /** TEST-ONLY read of the tracked (gap-fillable) chat id set. */
+  trackedChatIdsForTest(): ReadonlySet<string> {
+    return new Set(this.recentlySeenChatIds);
+  }
+
+  /**
+   * Seed gap-fill's tracked-chat set from durable session history
+   * (sessions.json), BEFORE connect. Fix for the 2026-07-17 p2p message-loss
+   * incident: p2p chats are invisible to bot-side chat-list discovery (the API
+   * returns groups only), so once the in-memory tracking state was gone —
+   * restart plus a missing/stale runtime cache — a p2p chat could never
+   * re-enter the gap-fill list and its messages dropped during a WS outage
+   * were lost forever. sessions.json persists the chatId (and, going forward,
+   * chatType) of every thread the bot has served, so seeding from it makes a
+   * p2p chat permanently gap-fillable once it has ever been seen.
+   *
+   * Deliberately does NOT persist to the runtime channel-seen-chats cache:
+   * this runs before {@link loadRecentlySeenChatIds} merges the cache in, and
+   * persisting the (possibly smaller) seed set here would overwrite cached
+   * chats learned in previous runs. The union is persisted by the next
+   * ordinary noteSeenChat.
+   */
+  seedTrackedChats(entries: ReadonlyArray<{ chatId: string; chatType?: string }>): void {
+    let added = 0;
+    for (const { chatId, chatType } of entries) {
+      if (!chatId.startsWith("oc_")) continue;
+      const before = this.recentlySeenChatIds.size;
+      this.recentlySeenChatIds.add(chatId);
+      if (this.recentlySeenChatIds.size > before) added++;
+      // Session history is authoritative enough for a cold start; a live
+      // delivery (noteSeenChat) still overwrites with the freshest type.
+      if (chatType && !this.chatTypesById.has(chatId)) {
+        this.chatTypesById.set(chatId, chatType);
+      }
+    }
+    if (added > 0) {
+      console.log(
+        `[channel.client] seeded ${added} chat(s) from session history for gap-fill`,
+      );
+    }
   }
 
   /**
@@ -802,16 +903,15 @@ export class ChannelClient {
         log(`dropped (unmappable raw): ${JSON.stringify(msg.messageId ?? "?")}`);
         return;
       }
-      this.noteSeenChat(ev.chat_id);
-      // 批F (F1): learn the chat's type from live traffic so gap-fill
+      // 批F (F1): the chat's type is learned from live traffic so gap-fill
       // reconstruction (whose source list items carry no chat_type) derives
-      // the same session key a live delivery would — in-memory only; after a
-      // cold restart the pre-live-traffic fallback stays "group" (safe
-      // degradation: the replayed p2p turn runs per-message, exactly the
-      // pre-sticky behavior).
-      if (typeof ev.chat_type === "string" && ev.chat_type.length > 0) {
-        this.chatTypesById.set(ev.chat_id, ev.chat_type);
-      }
+      // the same session key a live delivery would. Persisted alongside the
+      // learned-chats cache (2026-07-17 p2p fix): gap-fill's p2p dispatch path
+      // needs to KNOW a chat is p2p across restarts, before any live traffic.
+      this.noteSeenChat(
+        ev.chat_id,
+        typeof ev.chat_type === "string" && ev.chat_type.length > 0 ? ev.chat_type : undefined,
+      );
       // Guard against double-delivery without permanently marking seen: if this
       // message is already handled (seen) or in-flight, skip. Otherwise mark it
       // in-flight so gap-fill won't also deliver it while the turn runs. It is
@@ -900,10 +1000,10 @@ export class ChannelClient {
   ingestLocalEvent(ev: LarkMessageEvent, sourceTag: string): boolean {
     if (this.closed) return false;
     const log = (s: string) => console.log(`[channel.client] ${s}`);
-    this.noteSeenChat(ev.chat_id);
-    if (typeof ev.chat_type === "string" && ev.chat_type.length > 0) {
-      this.chatTypesById.set(ev.chat_id, ev.chat_type);
-    }
+    this.noteSeenChat(
+      ev.chat_id,
+      typeof ev.chat_type === "string" && ev.chat_type.length > 0 ? ev.chat_type : undefined,
+    );
     if (this.seenMessageIds.has(ev.message_id) || this.inFlightMessageIds.has(ev.message_id)) {
       log(`local-dispatch deduped (${sourceTag}): message_id=${ev.message_id}`);
       return false;
@@ -1153,15 +1253,28 @@ export class ChannelClient {
           // handler.markUnhandled, so it becomes re-dispatchable here.
           if (this.seenMessageIds.has(messageId) || this.inFlightMessageIds.has(messageId)) continue;
 
-          // Only dispatch messages that @ this bot.
-          const mentions = m["mentions"] as Array<{ id?: string | { open_id?: string } }> | undefined;
-          const mentionsBot = Array.isArray(mentions) && mentions.some(
-            (mn) => {
-              if (typeof mn?.id === "string") return mn.id === botOpenId;
-              return mn?.id?.open_id === botOpenId;
-            },
-          );
-          if (!mentionsBot) continue;
+          // Dispatch gate. Groups: only messages that @ this bot. p2p chats
+          // (2026-07-17 message-loss fix): p2p messages carry NO mentions at
+          // all, so the mentions gate silently dropped every p2p message from
+          // a recovered window — a p2p @ lost during a WS outage was
+          // unrecoverable. For a chat KNOWN to be p2p (live-learned, or
+          // persisted/seeded across restarts) we instead dispatch every human
+          // message and skip only the bot's own replies (also present in the
+          // pulled history). An unknown-type chat keeps the mentions gate —
+          // same safe behavior as before.
+          const isP2pChat = this.chatTypesById.get(chatId) === "p2p";
+          if (isP2pChat) {
+            if (isBotSentMessage(m, botOpenId)) continue;
+          } else {
+            const mentions = m["mentions"] as Array<{ id?: string | { open_id?: string } }> | undefined;
+            const mentionsBot = Array.isArray(mentions) && mentions.some(
+              (mn) => {
+                if (typeof mn?.id === "string") return mn.id === botOpenId;
+                return mn?.id?.open_id === botOpenId;
+              },
+            );
+            if (!mentionsBot) continue;
+          }
 
           // Resolve the REAL originating thread for a recovered thread-reply.
           // +chat-messages-list items don't always carry root_id directly; the
@@ -1251,7 +1364,15 @@ export class ChannelClient {
         // windowStart NEWER than the tracked window, the old window wasn't really
         // covered — keep it queued for a later, wider replay.
         this.resolveUnresolvedGapWindow(chatId, windowStart);
+        this.chatAccessGoneCountByChat.delete(chatId);
       } catch (e) {
+        if (isChatAccessGoneError(e)) {
+          // Deterministic access failure (bot removed from the chat): queuing
+          // an unresolved window would replay it forever against the same
+          // error — strike the chat toward untracking instead.
+          this.noteChatAccessGone(chatId, log);
+          continue;
+        }
         // All retries for this chat exhausted → record THIS chat's window so a
         // later gapFill that pulls it widens the look-back (BLOCKER 1: per-chat —
         // another chat's success can't clear this).
@@ -1292,6 +1413,9 @@ export class ChannelClient {
         return await execFile(larkCli, args);
       } catch (e) {
         lastErr = e;
+        // 230002 is deterministic (bot removed from the chat) — in-cycle
+        // retries can never succeed; fail fast and let the caller strike it.
+        if (isChatAccessGoneError(e)) throw e;
         if (attempt < GAP_FILL_MAX_ATTEMPTS) {
           const backoffMs = GAP_FILL_BACKOFF_BASE_MS * 2 ** (attempt - 1);
           log(
@@ -1350,6 +1474,37 @@ export class ChannelClient {
     const tracked = this.unresolvedGapWindowByChat.get(chatId);
     if (tracked === undefined) return;
     if (coveredFrom <= tracked) this.unresolvedGapWindowByChat.delete(chatId);
+  }
+
+  /**
+   * A gap-fill cycle hit 230002 for this chat (bot removed from it). Drop any
+   * queued unresolved window IMMEDIATELY — replaying it burns quota against a
+   * deterministic error (the 2026-07-17 amplifier) — and count a strike; at
+   * {@link CHAT_ACCESS_GONE_UNTRACK_AFTER} consecutive strikes, untrack the
+   * chat entirely so no future cycle pulls it. Self-healing: if the bot is
+   * re-invited, the next live message (or discovery listing) re-tracks the
+   * chat via {@link noteSeenChat}, which also resets the strikes.
+   */
+  private noteChatAccessGone(chatId: string, log: (s: string) => void): void {
+    this.unresolvedGapWindowByChat.delete(chatId);
+    const strikes = (this.chatAccessGoneCountByChat.get(chatId) ?? 0) + 1;
+    if (strikes < CHAT_ACCESS_GONE_UNTRACK_AFTER) {
+      this.chatAccessGoneCountByChat.set(chatId, strikes);
+      log(
+        `gap-fill: chat ${chatId} inaccessible (230002 — bot not in chat), ` +
+          `strike ${strikes}/${CHAT_ACCESS_GONE_UNTRACK_AFTER}`,
+      );
+      return;
+    }
+    this.chatAccessGoneCountByChat.delete(chatId);
+    const wasTracked = this.recentlySeenChatIds.delete(chatId);
+    this.chatTypesById.delete(chatId);
+    if (wasTracked) void this.persistRecentlySeenChatIds();
+    log(
+      `gap-fill: chat ${chatId} untracked after ${CHAT_ACCESS_GONE_UNTRACK_AFTER} ` +
+        `consecutive inaccessible cycles (bot removed from chat?) — ` +
+        `re-tracks automatically on the next live message`,
+    );
   }
 
   /**
@@ -1569,12 +1724,27 @@ export class ChannelClient {
     try {
       const raw = await readFile(file, "utf8");
       const parsed = JSON.parse(raw) as unknown;
-      if (!Array.isArray(parsed)) return;
+      // Two on-disk shapes: ≤v0.3.55 persisted a bare array of chat ids; the
+      // current shape is { chats: string[], chatTypes: { [chatId]: type } } —
+      // the types are what let gap-fill's p2p dispatch path (no mentions to
+      // match on) survive a restart that precedes any live p2p traffic.
+      const ids = Array.isArray(parsed) ? parsed : arrayField(parsed, "chats") ?? [];
       let count = 0;
-      for (const chatId of parsed) {
+      for (const chatId of ids) {
         if (typeof chatId !== "string" || !chatId.startsWith("oc_")) continue;
         this.recentlySeenChatIds.add(chatId);
         count++;
+      }
+      const types =
+        !Array.isArray(parsed) && parsed && typeof parsed === "object"
+          ? (parsed as Record<string, unknown>)["chatTypes"]
+          : undefined;
+      if (types && typeof types === "object") {
+        for (const [chatId, t] of Object.entries(types as Record<string, unknown>)) {
+          if (typeof t !== "string" || t.length === 0) continue;
+          if (!this.recentlySeenChatIds.has(chatId)) continue;
+          this.chatTypesById.set(chatId, t);
+        }
       }
       if (count > 0) log(`loaded ${count} learned chat(s) for gap-fill`);
     } catch (err) {
@@ -1583,11 +1753,17 @@ export class ChannelClient {
     }
   }
 
-  private noteSeenChat(chatId: string): void {
+  private noteSeenChat(chatId: string, chatType?: string): void {
+    const typeChanged =
+      chatType !== undefined && this.chatTypesById.get(chatId) !== chatType;
+    if (typeChanged) this.chatTypesById.set(chatId, chatType);
     if (!chatId.startsWith("oc_")) return;
+    // Any sighting of the chat (live delivery, discovery list) proves it is
+    // reachable again — reset the 230002 untrack strikes.
+    this.chatAccessGoneCountByChat.delete(chatId);
     const before = this.recentlySeenChatIds.size;
     this.recentlySeenChatIds.add(chatId);
-    if (this.recentlySeenChatIds.size === before) return;
+    if (this.recentlySeenChatIds.size === before && !typeChanged) return;
     void this.persistRecentlySeenChatIds();
   }
 
@@ -1660,8 +1836,15 @@ export class ChannelClient {
     const file = this.learnedChatsPath();
     if (!file) return;
     const chats = [...this.recentlySeenChatIds].sort().slice(-LEARNED_CHATS_LIMIT);
+    // Chat types ride along (bounded by the same chat cap) so a restart still
+    // knows which tracked chats are p2p — see loadRecentlySeenChatIds.
+    const chatTypes: Record<string, string> = {};
+    for (const chatId of chats) {
+      const t = this.chatTypesById.get(chatId);
+      if (t) chatTypes[chatId] = t;
+    }
     // Best effort only: losing the cache can at worst reduce reconnect recovery.
-    await this.atomicWriteJson(file, chats);
+    await this.atomicWriteJson(file, { chats, chatTypes });
   }
 
   async addProcessingReaction(messageId: string): Promise<void> {

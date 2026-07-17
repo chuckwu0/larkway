@@ -3295,7 +3295,19 @@ export class BridgeHandler {
               turnCount: 1,
               // 批H (H2): volume accounting starts with this turn's own contribution.
               approxChars: turnToolResultChars + trustedAnswerText.length,
-              ...(isTopLevel ? { rootText: parsed.text.slice(0, 200), chatId: parsed.chatId } : {}),
+              ...(isTopLevel
+                ? {
+                    rootText: parsed.text.slice(0, 200),
+                    chatId: parsed.chatId,
+                    // 2026-07-17 p2p message-loss fix: persist the chat's type
+                    // alongside chatId so ChannelClient.seedTrackedChats can
+                    // mark a p2p chat gap-fillable across restarts (p2p is
+                    // invisible to bot chat-list discovery).
+                    ...(typeof parsed.raw.chat_type === "string" && parsed.raw.chat_type
+                      ? { chatType: parsed.raw.chat_type }
+                      : {}),
+                  }
+                : {}),
             });
           } else if (sessionId !== undefined && currentExisting !== undefined) {
             // Existing thread — update, preserving createdTs AND rootText/
@@ -3310,6 +3322,7 @@ export class BridgeHandler {
               senderOpenId,
               rootText: currentExisting.rootText,
               chatId: currentExisting.chatId,
+              chatType: currentExisting.chatType,
               // BL-38: +1 on an idle-stuck turn, 0 (cleared) on any clean turn.
               consecutiveStuckCount: nextStuckCount,
               // 批F (F2): a reseed turn restarts the count at 1 (this turn ran
