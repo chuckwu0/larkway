@@ -12,7 +12,8 @@
 #
 # Preconditions:
 #   - clean working tree, on `main`
-#   - tag v<version> does not already exist
+#   - main up to date with origin/main (fetched + checked here — rebase first if behind)
+#   - tag v<version> does not already exist (locally, on origin, or as an npm version)
 #   - logged in to npm (`npm whoami`) or NPM_TOKEN configured in ~/.npmrc
 #   - GitHub CLI authenticated for creating the GitHub Release
 #   - pnpm + node available
@@ -47,6 +48,27 @@ RELEASE_FILES=(package.json README.md README.zh.md docs/versioning.md)
 [ "$(git branch --show-current)" = "main" ] || die "not on main (on $(git branch --show-current))"
 git rev-parse "v$VERSION" >/dev/null 2>&1   && die "tag v$VERSION already exists"
 [ "$PREV" != "$VERSION" ]                   || die "version unchanged ($PREV)"
+
+# ── concurrent-release guard ─────────────────────────────────────────────────
+# 2026-07-18 incident: two agent sessions cut releases in parallel; the second
+# only found out at `npm publish` ("cannot publish over 0.3.56"), leaving a
+# half-done bump in its working tree and a local main diverged from origin.
+# Catch both failure modes BEFORE touching any file:
+#   1. local main behind origin/main → rebase first (being AHEAD is normal —
+#      the release commit itself is pushed by this script at the end).
+#   2. target version already on npm / tag on origin → someone raced ahead;
+#      rebase and pick the next number.
+if git fetch -q --tags origin main 2>/dev/null; then
+  BEHIND="$(git rev-list --count HEAD..origin/main)"
+  [ "$BEHIND" = 0 ] || die "main is $BEHIND commit(s) behind origin/main — run \`git pull --rebase origin main\`, re-run typecheck+test, then release"
+  git rev-parse "v$VERSION" >/dev/null 2>&1 && die "tag v$VERSION already exists on origin (fetched just now) — another release raced ahead; pick the next version"
+else
+  [ "$DRY_RUN" = 1 ] || die "git fetch origin failed — cannot verify main is up to date with origin (check network/remote)"
+  echo "  (dry-run: git fetch failed — skipping up-to-date check)"
+fi
+if npm view "larkway@$VERSION" version >/dev/null 2>&1; then
+  die "larkway@$VERSION is already published on npm — another release raced ahead; rebase onto origin/main and pick the next version"
+fi
 
 echo "→ releasing larkway: $PREV → $VERSION"
 [ "$DRY_RUN" = 1 ] && echo "  (dry-run: no commit / tag / publish / push)"
