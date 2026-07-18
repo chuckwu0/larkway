@@ -16,7 +16,7 @@ import { appendMemoryMetric } from "./bridge/memoryMetrics.js";
 import { ensureKnowledgeRepo } from "./knowledge/store.js";
 import type { HandlerConventions } from "./bridge/handler.js";
 import { Housekeeping } from "./housekeeping/gc.js";
-import { loadBotsDetailed, effectiveWarmProcess, effectivePrewarmProcess } from "./config/botLoader.js";
+import { loadBotsDetailed, effectiveWarmProcess, effectivePrewarmProcess, createScheduleConfigReloader } from "./config/botLoader.js";
 import type { BotConfig } from "./config/botLoader.js";
 import {
   larkwayHome,
@@ -950,6 +950,15 @@ async function runV2Mode({
       botDir,
       schedules: bot.schedules,
       defaultChatId: bot.schedule_chat_id,
+      // Hot-reload: edits to the bot yaml's schedules:/schedule_chat_id go
+      // live within one tick (≤30s) — no bridge restart. Every other yaml
+      // field still needs a restart (loaded once at boot).
+      reloadConfig: createScheduleConfigReloader(
+        process.env["LARKWAY_BOTS_DIR"]
+          ? path.resolve(process.env["LARKWAY_BOTS_DIR"])
+          : path.join(larkwayHome(), "bots"),
+        bot.id,
+      ),
       log: (line) => console.log(`[schedule] ${line}`),
       fire: async ({ prompt, note, chatId, source, id, occurrence }) => {
         // (a) MIRROR first — if this fails, the wake did not happen (same

@@ -38,6 +38,12 @@ schedules:
 
 cron 为标准 5 段(分 时 日 月 周),支持 `*` `,` `-` `*/n`,vixie 语义(日/周同时受限时取并集;0 和 7 都是周日),按**宿主机本地时区**求值。
 
+**热加载(v0.3.56+),改 yaml 不用重启**:scheduler 每个 tick 对 bot yaml 做 mtime 检测,`schedules:` / `schedule_chat_id` 的改动 ≤30 秒生效(日志见 `[schedule] ... hot-reloaded`)。语义:
+
+- 没改的条目(序号+表达式不变)**保留触发状态**,不重排不倒灌;改过/新增的条目从当前时间向前排下一次。
+- yaml 改坏了(编辑到一半 / YAML 语法错 / 字段非法)→ **保持现行配置继续跑**,下个 tick 重试,永远不会因为一次坏编辑把已武装的闹钟清空。
+- 只有这两个字段热加载;yaml 里其他字段(peers / model / repos …)仍需重启生效。
+
 ## 一次性闹钟(`larkway wake`)
 
 ```bash

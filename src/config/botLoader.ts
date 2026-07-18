@@ -13,7 +13,7 @@
  *   - `peers` references are validated against the loaded bot set after parsing.
  */
 
-import { readdir, readFile } from "node:fs/promises";
+import { readdir, readFile, stat } from "node:fs/promises";
 import path from "node:path";
 import { z } from "zod";
 import yaml from "js-yaml";
@@ -769,4 +769,93 @@ export async function loadBotsDetailed(botsDir: string): Promise<LoadBotsResult>
  */
 export async function loadBots(botsDir: string): Promise<BotConfig[]> {
   return (await loadBotsDetailed(botsDir)).bots;
+}
+
+// ---------------------------------------------------------------------------
+// Schedule hot-reload (docs/schedule.md)
+// ---------------------------------------------------------------------------
+
+/** The slice of a bot yaml the scheduler hot-reloads. Everything else in the
+ *  yaml (peers/model/repos/...) still requires a bridge restart. */
+export interface BotScheduleSlice {
+  schedules: BotConfig["schedules"];
+  schedule_chat_id?: string;
+}
+
+// BotConfigSchema is `.strict()`; pick() inherits that and would reject every
+// OTHER key in the yaml (id/name/...). strip() relaxes it back to "validate
+// these two fields, ignore the rest" — exactly the hot-reload contract.
+const ScheduleSliceSchema = BotConfigSchema.pick({
+  schedules: true,
+  schedule_chat_id: true,
+}).strip();
+
+/**
+ * Returns a closure the BotScheduler polls each tick to hot-reload the bot's
+ * `schedules:` / `schedule_chat_id` without a bridge restart ("edit yaml →
+ * live within one tick"). Contract: resolve to the fresh slice when the yaml
+ * CHANGED since the last successful read, null otherwise — null also covers
+ * every failure mode (file mid-edit / temporarily missing during an editor's
+ * atomic save / YAML broken / slice invalid), so a bad edit never nukes the
+ * currently-armed schedules; the next tick simply retries.
+ *
+ * File resolution: bot yaml filenames are not guaranteed to equal the bot id
+ * (the id lives INSIDE the file), so the first call scans botsDir for the
+ * yaml whose `id` matches, then caches that path and stat-guards it by mtime.
+ */
+export function createScheduleConfigReloader(
+  botsDir: string,
+  botId: string,
+): () => Promise<BotScheduleSlice | null> {
+  let filePath: string | undefined;
+  let lastMtimeMs: number | undefined;
+
+  return async () => {
+    try {
+      if (filePath === undefined) {
+        const entries = (await readdir(botsDir)).filter(
+          (f) => f.endsWith(".yaml") || f.endsWith(".yml"),
+        );
+        for (const f of entries.sort()) {
+          const p = path.join(botsDir, f);
+          try {
+            const parsed = yaml.load(await readFile(p, "utf-8")) as
+              | Record<string, unknown>
+              | null
+              | undefined;
+            if (parsed && parsed["id"] === botId) {
+              filePath = p;
+              break;
+            }
+          } catch {
+            /* unparseable candidate — keep scanning */
+          }
+        }
+        if (filePath === undefined) return null;
+      }
+
+      const st = await stat(filePath);
+      if (lastMtimeMs !== undefined && st.mtimeMs === lastMtimeMs) return null;
+
+      const parsed = yaml.load(await readFile(filePath, "utf-8"));
+      const result = ScheduleSliceSchema.safeParse(parsed);
+      if (!result.success) return null; // mid-edit/broken → keep current, retry next tick
+
+      lastMtimeMs = st.mtimeMs;
+      return {
+        schedules: result.data.schedules,
+        schedule_chat_id: result.data.schedule_chat_id,
+      };
+    } catch {
+      // stat/read raced an atomic save or the file is gone — keep current;
+      // if it was renamed, drop the cached path so the next tick rescans.
+      try {
+        if (filePath !== undefined) await stat(filePath);
+      } catch {
+        filePath = undefined;
+        lastMtimeMs = undefined;
+      }
+      return null;
+    }
+  };
 }

@@ -273,3 +273,93 @@ describe("BotScheduler one-shot wakes", () => {
     expect(await readdir(wakesDir)).toEqual([]);
   });
 });
+
+describe("BotScheduler config hot-reload", () => {
+  it("applies a changed schedules slice on the next tick without recreation", async () => {
+    let slice: { schedules: { cron: string; prompt: string; chat_id?: string }[]; schedule_chat_id?: string } | null = null;
+    const fired: FireRequest[] = [];
+    const scheduler = new BotScheduler({
+      botId: "test-bot",
+      botDir,
+      schedules: [],
+      now: () => new Date(2026, 6, 17, 9, 0, 30),
+      log: () => undefined,
+      reloadConfig: async () => slice,
+      fire: async (req) => {
+        fired.push(req);
+        return true;
+      },
+    });
+
+    expect(scheduler.cronCount).toBe(0);
+    await scheduler.tickOnce(); // reload returns null → still empty
+    expect(scheduler.cronCount).toBe(0);
+
+    // Yaml edited: new entry appears live on the next tick, seeds forward.
+    slice = {
+      schedules: [{ cron: "0 9 * * *", prompt: "added live" }],
+      schedule_chat_id: "oc_hot",
+    };
+    await scheduler.tickOnce();
+    expect(scheduler.cronCount).toBe(1);
+    expect(fired).toHaveLength(0); // seeded forward (09:00 already past 09:00:30) — no backfire
+
+    // Simulate the seeded entry coming due: rewrite state to a due instant.
+    const key = cronEntryKey(0, { cron: "0 9 * * *", prompt: "added live" });
+    await writeFile(
+      path.join(botDir, "schedule-state.json"),
+      JSON.stringify({
+        version: 1,
+        cron: { [key]: { next_fire_at: new Date(2026, 6, 18, 9, 0, 0).toISOString() } },
+      }),
+      "utf8",
+    );
+    slice = null; // unchanged from here on
+    const scheduler2 = new BotScheduler({
+      botId: "test-bot",
+      botDir,
+      schedules: [{ cron: "0 9 * * *", prompt: "added live" }],
+      defaultChatId: "oc_hot",
+      now: () => new Date(2026, 6, 18, 9, 0, 30),
+      log: () => undefined,
+      fire: async (req) => {
+        fired.push(req);
+        return true;
+      },
+    });
+    await scheduler2.tickOnce();
+    expect(fired).toHaveLength(1);
+    expect(fired[0]).toMatchObject({ prompt: "added live", chatId: "oc_hot" });
+  });
+
+  it("hot-reload updates the default chat used by later fires", async () => {
+    const fired: FireRequest[] = [];
+    let slice: { schedules: []; schedule_chat_id?: string } | null = {
+      schedules: [],
+      schedule_chat_id: "oc_new_default",
+    };
+    const scheduler = new BotScheduler({
+      botId: "test-bot",
+      botDir,
+      schedules: [],
+      defaultChatId: "oc_old_default",
+      now: () => new Date("2026-07-17T00:01:00Z"),
+      log: () => undefined,
+      reloadConfig: async () => slice,
+      fire: async (req) => {
+        fired.push(req);
+        return true;
+      },
+    });
+    const wakesDir = path.join(botDir, "wakes");
+    await mkdir(wakesDir, { recursive: true });
+    await writeFile(
+      path.join(wakesDir, "wake-1.json"),
+      JSON.stringify({ at: "2026-07-17T00:00:00Z", prompt: "p" }),
+      "utf8",
+    );
+    await scheduler.tickOnce();
+    expect(fired).toHaveLength(1);
+    expect(fired[0]!.chatId).toBe("oc_new_default");
+  });
+});

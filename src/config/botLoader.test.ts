@@ -1181,3 +1181,99 @@ describe("effectiveWarmProcess / effectivePrewarmProcess (批D default-on)", () 
     expect(effectivePrewarmProcess({ backend: "gemini", warmProcess: undefined, prewarmProcess: undefined })).toBe(false);
   });
 });
+
+describe("createScheduleConfigReloader (schedule hot-reload)", () => {
+  const MINIMAL = `
+id: my-bot
+name: My Bot
+description: reloader test bot
+app_id: cli_abc123
+app_secret_env: MY_BOT_SECRET
+bot_open_id: ou_abc123
+chats: []
+`;
+
+  async function bumpMtime(filename: string, when: Date): Promise<void> {
+    const { utimes } = await import("node:fs/promises");
+    await utimes(path.join(botsDir(), filename), when, when);
+  }
+
+  it("finds the bot yaml by inner id (filename ≠ id) and returns the slice on first call", async () => {
+    const { createScheduleConfigReloader } = await import("./botLoader.js");
+    await createBotsDir();
+    await writeYaml(
+      "some-other-filename.yaml",
+      MINIMAL + `
+schedule_chat_id: oc_default
+schedules:
+  - cron: "30 8 * * 1-5"
+    prompt: morning
+`,
+    );
+    const reload = createScheduleConfigReloader(botsDir(), "my-bot");
+    const slice = await reload();
+    expect(slice).not.toBeNull();
+    expect(slice!.schedule_chat_id).toBe("oc_default");
+    expect(slice!.schedules).toHaveLength(1);
+    expect(slice!.schedules[0]).toMatchObject({ cron: "30 8 * * 1-5", prompt: "morning" });
+  });
+
+  it("returns null when the file is unchanged, and the fresh slice after an edit", async () => {
+    const { createScheduleConfigReloader } = await import("./botLoader.js");
+    await createBotsDir();
+    await writeYaml("my-bot.yaml", MINIMAL + "schedules: []\n");
+    await bumpMtime("my-bot.yaml", new Date(Date.now() - 60_000));
+    const reload = createScheduleConfigReloader(botsDir(), "my-bot");
+    expect(await reload()).not.toBeNull(); // first read
+    expect(await reload()).toBeNull(); // unchanged mtime → null
+
+    await writeYaml(
+      "my-bot.yaml",
+      MINIMAL + `
+schedules:
+  - cron: "0 9 * * *"
+    prompt: added live
+    chat_id: oc_x
+`,
+    );
+    await bumpMtime("my-bot.yaml", new Date());
+    const slice = await reload();
+    expect(slice).not.toBeNull();
+    expect(slice!.schedules[0]).toMatchObject({ cron: "0 9 * * *", prompt: "added live" });
+  });
+
+  it("returns null (keeps current) while the yaml is broken, then recovers", async () => {
+    const { createScheduleConfigReloader } = await import("./botLoader.js");
+    await createBotsDir();
+    await writeYaml("my-bot.yaml", MINIMAL + "schedules: []\n");
+    await bumpMtime("my-bot.yaml", new Date(Date.now() - 120_000));
+    const reload = createScheduleConfigReloader(botsDir(), "my-bot");
+    expect(await reload()).not.toBeNull();
+
+    await writeYaml("my-bot.yaml", "id: my-bot\nschedules: [ {broken");
+    await bumpMtime("my-bot.yaml", new Date(Date.now() - 60_000));
+    expect(await reload()).toBeNull(); // broken → keep current
+
+    await writeYaml(
+      "my-bot.yaml",
+      MINIMAL + `
+schedules:
+  - cron: "0 9 * * *"
+    prompt: fixed
+    chat_id: oc_x
+`,
+    );
+    await bumpMtime("my-bot.yaml", new Date());
+    const slice = await reload();
+    expect(slice).not.toBeNull();
+    expect(slice!.schedules[0]!.prompt).toBe("fixed");
+  });
+
+  it("returns null when no yaml matches the bot id", async () => {
+    const { createScheduleConfigReloader } = await import("./botLoader.js");
+    await createBotsDir();
+    await writeYaml("other.yaml", MINIMAL.replace("id: my-bot", "id: other-bot"));
+    const reload = createScheduleConfigReloader(botsDir(), "my-bot");
+    expect(await reload()).toBeNull();
+  });
+});

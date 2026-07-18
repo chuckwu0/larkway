@@ -106,6 +106,18 @@ export interface BotSchedulerDeps {
   defaultChatId?: string;
   /** Mirror + local dispatch. Resolves true when the wake turn was dispatched. */
   fire: (req: FireRequest) => Promise<boolean>;
+  /**
+   * Hot-reload poll (docs/schedule.md): called at the top of every tick.
+   * Resolve to a fresh config slice when the bot yaml's schedules changed,
+   * null when unchanged or unreadable (null NEVER clears armed schedules).
+   * Editing yaml `schedules:` therefore goes live within one tick — no
+   * bridge restart. Unchanged entries (same index + cron expr) keep their
+   * persisted next_fire_at; edited/added entries seed forward from now.
+   */
+  reloadConfig?: () => Promise<{
+    schedules: BotScheduleConfig[];
+    schedule_chat_id?: string;
+  } | null>;
   log?: (line: string) => void;
   /** Test seam. */
   now?: () => Date;
@@ -146,6 +158,14 @@ export function decideCronDue(
 
 export type OneShotDecision = { kind: "not_due" } | { kind: "fire" } | { kind: "expired" };
 
+/** Stable identity of an applied schedule config, for silent-when-unchanged reloads. */
+export function fingerprintConfig(
+  schedules: BotScheduleConfig[],
+  defaultChatId: string | undefined,
+): string {
+  return JSON.stringify([schedules, defaultChatId ?? null]);
+}
+
 export function decideOneShotDue(wake: OneShotWake, now: Date): OneShotDecision {
   const at = Date.parse(wake.at);
   if (Number.isNaN(at)) return { kind: "expired" }; // unparseable → drop, never loop
@@ -166,7 +186,10 @@ export class BotScheduler {
   readonly #tickMs: number;
   readonly #statePath: string;
   readonly #wakesDir: string;
-  readonly #cron: Array<{ key: string; entry: BotScheduleConfig; spec: CronSpec }> = [];
+  #cron: Array<{ key: string; entry: BotScheduleConfig; spec: CronSpec }> = [];
+  #defaultChatId: string | undefined;
+  /** Fingerprint of the applied config — reload no-ops (and stays silent) when unchanged. */
+  #configFingerprint: string;
   #timer: ReturnType<typeof setInterval> | undefined;
   #running = false;
   /** Awaitable current cycle — same M1 shutdown-drain shape as CommentPoller. */
@@ -177,14 +200,23 @@ export class BotScheduler {
     this.#tickMs = opts?.tickMs ?? DEFAULT_TICK_MS;
     this.#statePath = path.join(deps.botDir, "schedule-state.json");
     this.#wakesDir = path.join(deps.botDir, "wakes");
-    for (const [i, entry] of deps.schedules.entries()) {
+    this.#defaultChatId = deps.defaultChatId;
+    this.#configFingerprint = fingerprintConfig(deps.schedules, deps.defaultChatId);
+    this.#applyCronConfig(deps.schedules);
+  }
+
+  /** (Re)build the parsed cron entry list from a config slice. */
+  #applyCronConfig(schedules: BotScheduleConfig[]): void {
+    const next: Array<{ key: string; entry: BotScheduleConfig; spec: CronSpec }> = [];
+    for (const [i, entry] of schedules.entries()) {
       if (entry.enabled === false) continue;
       try {
-        this.#cron.push({ key: cronEntryKey(i, entry), entry, spec: parseCron(entry.cron) });
+        next.push({ key: cronEntryKey(i, entry), entry, spec: parseCron(entry.cron) });
       } catch (err) {
         this.#log(`schedule entry ${i} skipped (bad cron "${entry.cron}"): ${String(err)}`);
       }
     }
+    this.#cron = next;
   }
 
   #log(line: string): void {
@@ -264,6 +296,11 @@ export class BotScheduler {
   async #tick(): Promise<void> {
     if (!this.#running) return;
     try {
+      await this.#maybeReloadConfig();
+    } catch (err) {
+      this.#log(`config reload failed (keeping current schedules): ${String(err)}`);
+    }
+    try {
       await this.#tickCron();
     } catch (err) {
       this.#log(`cron tick failed (next tick retries): ${String(err)}`);
@@ -273,6 +310,21 @@ export class BotScheduler {
     } catch (err) {
       this.#log(`one-shot tick failed (next tick retries): ${String(err)}`);
     }
+  }
+
+  /** Hot-reload: apply a changed yaml schedules slice mid-flight (docs/schedule.md). */
+  async #maybeReloadConfig(): Promise<void> {
+    if (!this.#deps.reloadConfig) return;
+    const next = await this.#deps.reloadConfig();
+    if (!next) return; // unchanged or unreadable — keep current
+    const fingerprint = fingerprintConfig(next.schedules, next.schedule_chat_id);
+    if (fingerprint === this.#configFingerprint) return;
+    this.#configFingerprint = fingerprint;
+    this.#defaultChatId = next.schedule_chat_id;
+    this.#applyCronConfig(next.schedules);
+    this.#log(
+      `schedules hot-reloaded from yaml: ${this.#cron.length} active cron entr${this.#cron.length === 1 ? "y" : "ies"} (no restart needed)`,
+    );
   }
 
   async #tickCron(): Promise<void> {
@@ -307,7 +359,7 @@ export class BotScheduler {
             `(> grace ${grace}min) — skipped, next at ${advance?.toISOString() ?? "never"}`,
         );
       } else {
-        const chatId = entry.chat_id ?? this.#deps.defaultChatId;
+        const chatId = entry.chat_id ?? this.#defaultChatId;
         if (!chatId) {
           this.#log(`cron "${entry.cron}" due but no chat_id/schedule_chat_id — skipped`);
         } else {
@@ -379,7 +431,7 @@ export class BotScheduler {
         continue;
       }
 
-      const chatId = wake.chat_id ?? this.#deps.defaultChatId;
+      const chatId = wake.chat_id ?? this.#defaultChatId;
       if (!chatId) {
         this.#log(`wake ${file} due but no chat_id/schedule_chat_id — dropped`);
         await unlink(full).catch(() => undefined);
