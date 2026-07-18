@@ -61,7 +61,8 @@
 | v0.3.54 | v0.3.54 | patch / 已发布 | 原生 schedule 哑闹钟: bot yaml schedules(5段cron,宿主本地时区)+ larkway wake 一次性闹钟(目录队列); 到点镜像 post + 本地直递唤醒,不经飞书入站、无需借第二 bot 身份; 错过策略 cron 超宽限跳过/一次性恢复补发; kill switch LARKWAY_SCHEDULE=off |
 | v0.3.55 | v0.3.55 | patch / 已发布 | fix: 定时唤醒/handoff 镜像 post 的幂等 uuid 超飞书 50 字符上限被 99992402 拒收(首晨两次唤醒失败),统一 sha256 短哈希 |
 | v0.3.56 | v0.3.56 | patch / 已发布 | gap-fill: recover p2p messages lost during WS outages (seed tracked chats from session history, p2p dispatch without mentions gate); stop 230002 dead-chat replay loop (fail fast + untrack after 3 cycles) |
-| v0.3.57 | v0.3.57 | 当前 patch / 已发布 | schedule 热加载:改 bot yaml 的 schedules/schedule_chat_id 无需重启,≤30s 生效;坏编辑不清空已武装闹钟 |
+| v0.3.57 | v0.3.57 | patch / 已发布 | schedule 热加载:改 bot yaml 的 schedules/schedule_chat_id 无需重启,≤30s 生效;坏编辑不清空已武装闹钟 |
+| v0.3.58 | v0.3.58 | 当前 patch / 已发布 | task_handle v5: declarative create/due/blocked — five-signal delegation contract; bridge creates task cards with topic backlink + follower, reschedules with reason, posts blocked comments; out-of-box prompt contract |
 
 ## 使用原则
 
@@ -130,4 +131,5 @@ v0.3.54       = 原生 schedule 哑闹钟: bot yaml schedules(5段cron,宿主本
 v0.3.55       = fix: 定时唤醒/handoff 镜像 post 的幂等 uuid 超飞书 50 字符上限被 99992402 拒收(首晨两次唤醒失败),统一 sha256 短哈希
 v0.3.56       = gap-fill: recover p2p messages lost during WS outages (seed tracked chats from session history, p2p dispatch without mentions gate); stop 230002 dead-chat replay loop (fail fast + untrack after 3 cycles)
 v0.3.57       = schedule 热加载:改 bot yaml 的 schedules/schedule_chat_id 无需重启,≤30s 生效;坏编辑不清空已武装闹钟
+v0.3.58       = task_handle v5: declarative create/due/blocked — five-signal delegation contract; bridge creates task cards with topic backlink + follower, reschedules with reason, posts blocked comments; out-of-box prompt contract
 ```
