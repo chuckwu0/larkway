@@ -264,8 +264,29 @@ export const StateFileSchema = z.object({
    * 不要粘贴完整回复;bridge 侧仍有 sanitizeSummary 的机械截断兜底(见
    * src/tasklist/writeback.ts),但那只防"过长",不防"文不对题"。
    */
+  /**
+   * v5 (BL-48, 五信号委托契约): `guid` becomes optional because `create` is the
+   * new way a task comes into existence — agent 自判「这个活值得追踪」时声明
+   * create,bridge 机械建卡(话题回链 + 发起人进关注列表)并自动认领。其余
+   * 新字段同样是声明式信号:`due`(+`due_reason`)= 改期/设期,`blocked` =
+   * 阻塞需要人(bridge 落任务评论,关注人收到推送)。全部按需、互不依赖;
+   * bridge 不判断该不该建卡/该不该改期 —— 判断永远在 agent 侧(薄通道)。
+   */
   task_handle: z
-    .object({ guid: z.string().min(1), done: z.boolean().optional(), note: z.string().optional() })
+    .object({
+      guid: z.string().min(1).optional(),
+      create: z
+        .object({
+          summary: z.string().trim().min(1).max(500),
+          due: z.string().trim().min(1).optional(),
+        })
+        .optional(),
+      due: z.string().trim().min(1).optional(),
+      due_reason: z.string().optional(),
+      blocked: z.string().optional(),
+      done: z.boolean().optional(),
+      note: z.string().optional(),
+    })
     .optional(),
   /**
    * Freshness signal for the handler's stale-guard (it compares this against a

@@ -736,21 +736,27 @@ describe("StateFileSchema — task_handle", () => {
     }
   });
 
-  it("rejects task_handle missing guid at the raw schema level", () => {
+  it("v5: task_handle without guid PARSES (guid optional since create/note/blocked are standalone signals)", () => {
+    // v4 hard-required guid; v5 (BL-48) made it optional — a guid-less
+    // task_handle is a valid declaration (e.g. note-only), and claim simply
+    // doesn't happen (handler claims only on guid/createdGuid).
     const r = StateFileSchema.safeParse({
       status: "ready",
       last_message: "回复正文",
       updated_at: "2026-07-04T12:00:00.000Z",
-      task_handle: { note: "缺 guid" },
+      task_handle: { note: "只有 note" },
     });
-    expect(r.success).toBe(false);
+    expect(r.success).toBe(true);
+    if (r.success) {
+      expect(r.data.task_handle?.guid).toBeUndefined();
+      expect(r.data.task_handle?.note).toBe("只有 note");
+    }
   });
 
   it("a bad task_handle shape still salvages status/last_message via readStateFileDetailed (thin-channel leniency)", async () => {
-    // Same posture as the mr_url/content_blocks salvage tests above:
-    // task_handle.guid is the one hard-required sub-field, but a bad
-    // task_handle shape must not take the bridge's actual hard need
-    // (status/last_message) down with it.
+    // Same posture as the mr_url/content_blocks salvage tests above: a
+    // genuinely malformed task_handle (wrong types) must not take the
+    // bridge's actual hard need (status/last_message) down with it.
     const dir = await mkdtemp(join(tmpdir(), "larkway-state-"));
     try {
       await mkdir(join(dir, ".larkway"), { recursive: true });
@@ -759,7 +765,7 @@ describe("StateFileSchema — task_handle", () => {
         JSON.stringify({
           status: "ready",
           last_message: "task_handle 字段坏了也要活下来",
-          task_handle: { note: "缺 guid" },
+          task_handle: { guid: 42, create: "not-an-object" },
         }),
         "utf8",
       );
@@ -917,5 +923,34 @@ describe("StateFileSchema — handoffs (peer handoff declarations)", () => {
     });
     expect(r.success).toBe(true);
     if (r.success) expect(r.data.handoffs).toBeUndefined();
+  });
+});
+
+describe("StateFileSchema — task_handle v5 declarative signals (BL-48)", () => {
+  it("parses create/due/blocked and keeps guid optional", () => {
+    const r = StateFileSchema.safeParse({
+      status: "ready",
+      updated_at: "2026-07-18T12:00:00.000Z",
+      task_handle: {
+        create: { summary: "CRDO 前瞻", due: "2026-07-22T18:00:00+08:00" },
+        blocked: "配额用尽",
+      },
+    });
+    expect(r.success).toBe(true);
+    if (r.success) {
+      expect(r.data.task_handle?.create?.summary).toBe("CRDO 前瞻");
+      expect(r.data.task_handle?.guid).toBeUndefined();
+      expect(r.data.task_handle?.blocked).toBe("配额用尽");
+    }
+  });
+
+  it("v4 claim shape still parses unchanged", () => {
+    const r = StateFileSchema.safeParse({
+      status: "ready",
+      updated_at: "2026-07-18T12:00:00.000Z",
+      task_handle: { guid: "g-1", done: true, note: "已交付" },
+    });
+    expect(r.success).toBe(true);
+    if (r.success) expect(r.data.task_handle?.guid).toBe("g-1");
   });
 });

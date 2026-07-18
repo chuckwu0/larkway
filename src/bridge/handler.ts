@@ -92,7 +92,13 @@ import type { OutboundCotClient } from "../lark/channelCotClient.js";
 import type { RuntimeEventPatch } from "./eventLog.js";
 import type { PerfSample } from "./perfLog.js";
 import type { RuntimeRequirement } from "../runtimeRequirements.js";
-import type { TaskCandidate, TaskHandleClaimPatch, TaskHandleLifecyclePatch } from "../tasklist/types.js";
+import type {
+  TaskCandidate,
+  TaskHandleClaimPatch,
+  TaskHandleDeclarationPatch,
+  TaskHandleDeclarationResult,
+  TaskHandleLifecyclePatch,
+} from "../tasklist/types.js";
 import {
   evaluateResponseSurfaceMentionPolicy,
   isResponseSurfaceCardKitAvailable,
@@ -1027,6 +1033,16 @@ export interface BridgeHandlerDeps {
    * of its own (that's the agent's job via the SKILL).
    */
   taskHandleClaim?: (patch: TaskHandleClaimPatch) => Promise<void>;
+  /**
+   * task_handle v5 (BL-48) declarative-signal hook — fired before the claim
+   * when the agent declared `create` / `due` / `blocked` this turn. Execution
+   * (create card + backlink + follower, reschedule + reason comment, blocked
+   * comment) lives in src/tasklist/declare.ts; judgment lives agent-side.
+   * Best-effort: caught and logged, never propagated.
+   */
+  taskHandleDeclare?: (
+    patch: TaskHandleDeclarationPatch,
+  ) => Promise<TaskHandleDeclarationResult | void>;
   /**
    * Task-handle claimed-state fact lookup (dogfood fix V2). Synchronous
    * because it's a plain in-memory TaskHandleStore.get() check — no I/O.
@@ -3125,10 +3141,64 @@ export class BridgeHandler {
             });
           }
 
+          // task_handle v5 (BL-48) — declarative signals BEFORE the claim, so a
+          // bridge-created task's guid flows into the claim below. Best-effort:
+          // any failure degrades that signal, never the turn.
+          const declaredTaskHandle = reportedState?.task_handle;
+          let bridgeCreatedTaskGuid: string | undefined;
+          if (
+            declaredTaskHandle &&
+            (declaredTaskHandle.create || declaredTaskHandle.due || declaredTaskHandle.blocked) &&
+            this.deps.taskHandleDeclare &&
+            botId
+          ) {
+            try {
+              // Topic backlink (硬性要求): ONLY a real omt_* id makes a live
+              // deep link. Resolve from the event first, then one refresh
+              // lookup; unresolvable → chat-link fallback (explicit, never
+              // silent). Lookup cost is only paid on turns that declare create.
+              let topicLink: string | undefined;
+              if (declaredTaskHandle.create) {
+                const direct = realTopicThreadId(parsed.raw.thread_id);
+                if (direct) {
+                  topicLink = buildTopicDeepLink(parsed.chatId, direct);
+                } else if (this.deps.messageLookup) {
+                  const refreshed = await this.deps.messageLookup
+                    .get(replyAnchorId, { refresh: true })
+                    .catch(() => undefined);
+                  const refreshedThreadId = realTopicThreadId(refreshed?.threadId);
+                  if (refreshedThreadId) {
+                    topicLink = buildTopicDeepLink(parsed.chatId, refreshedThreadId);
+                  }
+                }
+              }
+              const result = await this.deps.taskHandleDeclare({
+                botId,
+                threadId,
+                chatId: parsed.chatId,
+                senderOpenId: parsed.senderOpenId || undefined,
+                create: declaredTaskHandle.create,
+                declaredGuid: declaredTaskHandle.guid,
+                due: declaredTaskHandle.due,
+                dueReason: declaredTaskHandle.due_reason,
+                blocked: declaredTaskHandle.blocked,
+                topicLink,
+                chatLink: `https://applink.feishu.cn/client/chat/open?openChatId=${parsed.chatId}`,
+              });
+              bridgeCreatedTaskGuid = result?.createdGuid;
+              for (const line of result?.outcomes ?? []) {
+                await recordEvent({ status: "running", appendPath: "任务信号", reason: line });
+              }
+            } catch (err) {
+              console.warn("[bridge.handler] taskHandleDeclare hook failed (continuing):", err);
+            }
+          }
+
           // Task-handle claim declaration (docs/task-handle.md §5.2): the agent
           // wrote `task_handle.guid` this turn — this is the ONLY path that
-          // records a new thread↔task claim. Best-effort, never blocks finalize.
-          const claimedTaskGuid = reportedState?.task_handle?.guid;
+          // records a new thread↔task claim. v5: a bridge-created task (create
+          // declaration above) claims its fresh guid the same way.
+          const claimedTaskGuid = bridgeCreatedTaskGuid ?? reportedState?.task_handle?.guid;
           if (claimedTaskGuid && this.deps.taskHandleClaim && botId) {
             try {
               await this.deps.taskHandleClaim({

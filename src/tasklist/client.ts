@@ -519,6 +519,79 @@ export class TaskListClient {
       wrapErr(label, err);
     }
   }
+
+  /**
+   * task_handle v5 (BL-48, 声明式建卡): create a task under this bot's app
+   * identity. `due.timestamp` is ms-epoch string per task v2; `members` lets
+   * the create carry the originator as follower in one call; `tasklists`
+   * attaches the task to the bot's configured list when present. Response
+   * shape mirrors createTasklist's envelope (`data.task.guid`).
+   */
+  async createTask(input: {
+    summary: string;
+    description?: string;
+    due?: { timestamp: string; is_all_day?: boolean };
+    members?: TaskMember[];
+    tasklists?: Array<{ tasklist_guid: string }>;
+  }): Promise<{ guid: string }> {
+    const label = `createTask(${input.summary.slice(0, 30)})`;
+    let resp: { data?: { task?: Record<string, unknown> } };
+    try {
+      resp = await this.#request(
+        {
+          method: "POST",
+          url: `${TASK_V2_BASE}/tasks`,
+          params: { user_id_type: "open_id" },
+          data: {
+            summary: input.summary,
+            ...(input.description ? { description: input.description } : {}),
+            ...(input.due ? { due: input.due } : {}),
+            ...(input.members && input.members.length > 0 ? { members: input.members } : {}),
+            ...(input.tasklists && input.tasklists.length > 0 ? { tasklists: input.tasklists } : {}),
+          },
+        },
+        label,
+      );
+    } catch (err) {
+      wrapErr(label, err);
+    }
+    const guid = resp.data?.task?.["guid"];
+    if (typeof guid !== "string" || guid.length === 0) {
+      throw new TaskApiError(`[tasklist.client] ${label} returned no guid`, {});
+    }
+    return { guid };
+  }
+
+  /**
+   * task_handle v5: add members (e.g. a late follower) to an existing TASK
+   * (`POST /tasks/:guid/add_members` — task-level counterpart of
+   * addTasklistMembers). Best-effort semantics at the caller, same as every
+   * other write here.
+   */
+  async addTaskMembers(taskGuid: string, members: TaskMember[]): Promise<void> {
+    const label = `addTaskMembers(${taskGuid})`;
+    try {
+      await this.#request(
+        {
+          method: "POST",
+          url: `${TASK_V2_BASE}/tasks/${encodeURIComponent(taskGuid)}/add_members`,
+          params: { user_id_type: "open_id" },
+          data: { members },
+        },
+        label,
+      );
+    } catch (err) {
+      wrapErr(label, err);
+    }
+  }
+
+  /**
+   * task_handle v5: reschedule (or set) the task due. ms-epoch string per
+   * task v2 `due.timestamp`; same patch semantics as complete()/reopen().
+   */
+  async patchDue(taskGuid: string, due: { timestamp: string; is_all_day?: boolean }): Promise<void> {
+    await this.#patchTask(taskGuid, { due }, ["due"]);
+  }
 }
 
 /** Narrow pre-wrap check so getTask can return `null` instead of throwing on a 404-shaped error. */

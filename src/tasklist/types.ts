@@ -71,6 +71,52 @@ export interface TaskHandleLifecyclePatch {
 }
 
 /**
+ * task_handle v5 (BL-48): the agent's declarative task signals for THIS turn,
+ * extracted verbatim from `.larkway/state.json` by the handler. The tasklist
+ * module executes them mechanically (create card / reschedule / blocked
+ * comment); every judgment ("should this be a task?", "is the new due
+ * reasonable?") already happened agent-side. Best-effort by contract — the
+ * hook never throws back into the bridge.
+ */
+export interface TaskHandleDeclarationPatch {
+  botId: string;
+  threadId: string;
+  chatId: string;
+  /** open_id of the human who triggered this turn — becomes the created task's follower. */
+  senderOpenId?: string;
+  /** Declarative create (信号1 接了): summary + optional due (ISO 8601 / YYYY-MM-DD / ms-epoch string). */
+  create?: { summary: string; due?: string };
+  /**
+   * The guid the agent declared in the SAME state.json (claim happens after
+   * declarations in the handler) — lets a first-claim turn carry `due`/`blocked`
+   * before the store has the record.
+   */
+  declaredGuid?: string;
+  /** 信号3 ETA: set/reschedule due on the already-claimed task. */
+  due?: string;
+  /** One-line reason accompanying a reschedule — bridge posts it as a task comment. */
+  dueReason?: string;
+  /** 信号5 阻塞: reason text — bridge posts a comment (followers get push-notified). */
+  blocked?: string;
+  /**
+   * Topic deep link for the task description backlink (硬性要求, BL-48).
+   * Only ever built from a REAL `omt_*` topic id — an `om_*`-derived link is
+   * dead on click. Absent → the description falls back to `chatLink` with an
+   * explicit note, never silently omitted.
+   */
+  topicLink?: string;
+  /** Chat-level fallback link when no real topic id could be resolved. */
+  chatLink?: string;
+}
+
+export interface TaskHandleDeclarationResult {
+  /** Set when `create` was executed — the new task's guid (caller records the claim). */
+  createdGuid?: string;
+  /** Human-readable one-liners for the runtime event log (per executed signal). */
+  outcomes: string[];
+}
+
+/**
  * Bridge → tasklist module: the agent declared a claim via
  * `.larkway/state.json`'s `task_handle.guid` field. This is the ONLY write
  * path into TaskHandleStore — the bridge never guesses or infers a claim.

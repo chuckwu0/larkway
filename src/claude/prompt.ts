@@ -384,6 +384,13 @@ function renderStateContract(stateFilePath?: string): string[] {
     "- 需要覆盖卡片正文:status=ready + last_message(不写时正文=答案通道内容);dev_url/mr_url 等业务字段可自由写入,但 bridge 不感知其含义,要让用户看到就写进正文。",
     "- 需要在终态卡上 @ 人:response_surface 写 `{post:{mentions:[{user_id}]}}`;这只是视觉提示,要 peer bot 消费正文必须走 handoffs 或另发真实 post(卡片对 agent 不可读)。",
     "- 交接给 peer bot:handoffs(最多 3 条 `{to, text}`,to 写 peer-bots 名册里的名字)。bridge 替你发一条带真实 at 标签的 post 留痕,同桥进程内的 peer 还会被**本地直递**立即唤醒——比自己用 lark-cli 发 post 更快更可靠。text 必须自包含:对方只看得到这条文本,背景、要做什么、期望产出都写清楚。",
+    "- **任务卡(五信号委托契约,值得追踪的活必用)**:判断标准——三个月后复盘会找它、或执行跨越本轮对话(要跑很久/等外部/分阶段)→ 写 task_handle。一问一答聊完就完的**不建卡**。",
+    "  - 接了:`task_handle: {create: {summary, due?}}`——bridge 自动建卡、把话题回链写进任务描述、把发起人加进关注列表,并绑定本话题。已有任务则用 `{guid}` 认领。",
+    "  - 进展:`{note: \"一句话里程碑\"}` 只在实质进展时写(阶段结论/关键转折),bridge 落到任务侧;不要每轮都写。",
+    "  - 改期:`{due: \"<ISO 或 YYYY-MM-DD>\", due_reason: \"一句原因\"}`——延期必须带原因,bridge 会改卡上截止并评论说明。",
+    "  - 完成:`{done: true, note: ...}` 交付轮才写;失败让任务保持 open。",
+    "  - 阻塞:`{blocked: \"卡在哪、需要人做什么\"}`——bridge 落任务评论,关注人会收到通知;同时在正文用 choices 把决定收敛成选项。",
+    "  - 交付双指针:结论报告先用 lark-cli 导成**飞书文档**,回复和任务评论里 doc 链接在前、本地绝对路径在后(本地文件是取证真相,doc 是给人看的形态)。",
     "",
     "边界与责任:",
     "- **绝不自己 PATCH/PUT bridge 管理的卡片/post** —— 网络更新是 bridge 的活,自己改会和卡片 finalize、按钮回传、崩溃恢复冲突。",
@@ -409,7 +416,7 @@ function renderContractAnchor(stateFilePath?: string): string[] {
     "<contract-anchor>",
     "契约同本话题首轮注入,未变化:给用户看的答案正文包在独立行 marker " +
       `\`${ANSWER_BEGIN_MARKER}\` / \`${ANSWER_END_MARKER}\` 之间输出;结论一成形就先流出答案。` +
-      `纯文字回答不用写 state.json;失败/等补充/choices/图文混排/handoffs 交接时才写 ${stateTarget}` +
+      `纯文字回答不用写 state.json;失败/等补充/choices/图文混排/handoffs 交接/task_handle 任务信号(建卡/里程碑/改期/阻塞/交付)时才写 ${stateTarget}` +
       "(原子写 + 刷新 updated_at)。做完干净退出进程。",
     "</contract-anchor>",
   ];

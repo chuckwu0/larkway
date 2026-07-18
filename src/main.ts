@@ -49,6 +49,7 @@ import { resolveTaskHandlesPath, resolveTaskTeamRegistryPath, resolveCandidateAl
 import { TaskHandleStore } from "./tasklist/store.js";
 import { TaskListClient, type LarkTaskRequester } from "./tasklist/client.js";
 import { applyTaskHandleWriteback, applyAutoBindConfirmation } from "./tasklist/writeback.js";
+import { applyTaskHandleDeclarations } from "./tasklist/declare.js";
 import { CommentPoller } from "./tasklist/commentPoller.js";
 import { TasklistPoller, type RootTextEntry } from "./tasklist/tasklistPoller.js";
 import { CandidateAlertStore } from "./tasklist/candidateAlertStore.js";
@@ -505,6 +506,11 @@ async function runV2Mode({
     let effectiveTaskHandleTasklistGuid: string | undefined;
     let taskHandleLifecycle: ((patch: import("./tasklist/types.js").TaskHandleLifecyclePatch) => Promise<void>) | undefined;
     let taskHandleClaim: ((patch: import("./tasklist/types.js").TaskHandleClaimPatch) => Promise<void>) | undefined;
+    let taskHandleDeclare:
+      | ((
+          patch: import("./tasklist/types.js").TaskHandleDeclarationPatch,
+        ) => Promise<import("./tasklist/types.js").TaskHandleDeclarationResult>)
+      | undefined;
     let taskHandleClaimedLookup: ((threadId: string) => boolean) | undefined;
     let taskHandleClaimGuidLookup: ((threadId: string) => string | undefined) | undefined;
     let taskGuidClaimedByOtherBot: ((guid: string) => boolean) | undefined;
@@ -570,6 +576,15 @@ async function runV2Mode({
         const taskHandleStore = await TaskHandleStore.load(resolveTaskHandlesPath(bot.id));
         allTaskHandleStores.push({ botId: bot.id, store: taskHandleStore });
         taskHandleLifecycle = (patch) => applyTaskHandleWriteback(patch, { store: taskHandleStore, client: taskListClient });
+        // task_handle v5 (BL-48): declarative create/due/blocked — the agent
+        // declares in state.json, this executes mechanically.
+        taskHandleDeclare = (patch) =>
+          applyTaskHandleDeclarations(patch, {
+            store: taskHandleStore,
+            client: taskListClient,
+            tasklistGuid: effectiveTaskHandleTasklistGuid,
+            botName: bot.name,
+          });
         // TaskHandleStore.claim() is idempotent on an unchanged guid (see its
         // doc comment) — this is what makes it safe for handler.ts to call
         // every turn the agent re-declares task_handle.guid, not just once.
@@ -920,6 +935,7 @@ async function runV2Mode({
       },
       taskHandleLifecycle,
       taskHandleClaim,
+      taskHandleDeclare,
       taskHandleClaimedLookup,
       taskHandleClaimGuidLookup,
       taskGuidClaimedByOtherBot,
