@@ -1128,7 +1128,7 @@ export async function renderPrompt(input: RenderPromptInput): Promise<string> {
       `    lark-cli docs +get <doc-url>${profileFlag}`,
       "- 取本条消息的附件/内联图(post 内联图不在上面 attachments/images 里)、拉话题历史:",
       attachmentHelpLine,
-      "- glab / gh / git API",
+      "- gh / glab / git API",
       "- pnpm / npm",
       "",
       chatHistoryFirst

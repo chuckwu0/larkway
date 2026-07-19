@@ -47,7 +47,7 @@ scene_hint:       这是话题内 @;话题里可能已有上下文,可按需读�
 - 拉最近群消息兜底: lark-cli im +messages-list oc_xxx --profile cli_xxx --as bot
 - 拉飞书云文档: lark-cli docs +get <doc-url> --profile cli_xxx
 - 取附件/内联图: lark-cli im +messages-download-resource <file_key> --profile cli_xxx --as bot
-- glab / git / gitlab API
+- gh / glab / git / forge API
 - pnpm / npm
 </thread-context>
 
