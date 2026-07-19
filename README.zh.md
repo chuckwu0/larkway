@@ -152,10 +152,11 @@ scope 是否健康）。完整设计、配置项、平台事实排查记录见�
 
 ## 前置要求
 
+- **macOS / Linux / Windows** —— 原生 Windows 支持处于 beta(服务注册走任务计划程序;全量测试已在 Windows CI 上运行);偏好 Linux 环境也可继续用 [WSL](https://learn.microsoft.com/windows/wsl/install)
 - **Node.js 20+ LTS**
 - **Claude Code 或 Codex 订阅**，本地 CLI 已安装并登录
 - **`lark-cli`** —— 飞书长连接客户端和消息工具
-- **`glab` + `git`** —— 需要开 MR 的 bot 必须；只读 bot 可省
+- **`git` + `gh`** —— 需要开 PR 的 bot 必须(GitHub 为默认;GitLab 仓库用 `glab`);只读 bot 可省
 - **一台常开的机器** —— bridge 必须持续运行才能接收飞书事件；经常休眠的笔记本会漏消息，小服务器或台式机更合适
 
 ---
