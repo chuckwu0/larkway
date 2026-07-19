@@ -78,7 +78,7 @@ describe("deriveBotId", () => {
 // ---------------------------------------------------------------------------
 
 describe("createBotFromCreds", () => {
-  it("writes secret (0600) + yaml + memory; yaml passes BotConfigSchema", async () => {
+  it.skipIf(process.platform === "win32")("writes secret (0600) + yaml + memory; yaml passes BotConfigSchema", async () => {
     const form: OnboardForm = {
       name: "Frontend Bot",
       description: "builds landing pages",

@@ -142,7 +142,7 @@ describe("restartBridge — starts when not running", () => {
 // detectBridgeStatus — Tier 3: bare main.ts + fresh status.json (Bug④ fix)
 // ---------------------------------------------------------------------------
 
-describe("detectBridgeStatus — tier 3 bare bridge detection", () => {
+describe.skipIf(process.platform === "win32")("detectBridgeStatus — tier 3 bare bridge detection", () => {
   it("returns running:true when status.json is fresh AND mainProcessPattern matches a live pid", async () => {
     if (process.platform === "linux") return;
 

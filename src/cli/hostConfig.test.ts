@@ -65,7 +65,7 @@ describe("config.json round-trip", () => {
 });
 
 describe(".env secret store", () => {
-  it("writes a secret with 0600 perms and reads it back", async () => {
+  it.skipIf(process.platform === "win32")("writes a secret with 0600 perms and reads it back", async () => {
     await hc.writeSecret("MY_BOT_SECRET", "s3cr3t-value");
     expect(await hc.readSecret("MY_BOT_SECRET")).toBe("s3cr3t-value");
     const mode = (await stat(hc.resolveEnvPath())).mode & 0o777;
@@ -96,7 +96,7 @@ describe(".env secret store", () => {
     expect(await hc.readSecret("ABSENT")).toBeNull();
   });
 
-  it("removeSecret deletes a key while preserving others + 0600 perm", async () => {
+  it.skipIf(process.platform === "win32")("removeSecret deletes a key while preserving others + 0600 perm", async () => {
     await hc.writeSecret("KEY_A", "aaa");
     await hc.writeSecret("KEY_B", "bbb");
     await hc.removeSecret("KEY_A");

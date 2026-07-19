@@ -45,7 +45,7 @@ const defaultExec: ExecFn = async (cmd, args) => {
   return { stdout, stderr };
 };
 
-export type ServiceKind = "launchd" | "systemd-user" | "systemd-system";
+export type ServiceKind = "launchd" | "systemd-user" | "systemd-system" | "schtasks";
 
 export interface ServiceAdapter {
   kind: ServiceKind;
@@ -344,6 +344,101 @@ export function makeSystemdSystemAdapter(exec: ExecFn = defaultExec): ServiceAda
 }
 
 // ---------------------------------------------------------------------------
+// schtasks adapter (Windows Task Scheduler)
+// ---------------------------------------------------------------------------
+
+export function windowsTaskName(larkwayDir: string): string {
+  return `LarkwayBridge${homeSuffix(larkwayDir).replace(".", "-")}`;
+}
+
+/**
+ * The .cmd launcher the scheduled task invokes. schtasks /TR is a bare command
+ * line, so log redirection and env baking need a batch wrapper (same pattern
+ * as launchd/systemd: minimal service env would otherwise hide lark-cli /
+ * claude from the bridge). CRLF + @echo off keep cmd.exe happy and the log
+ * free of echoed commands; >> appends so history survives restarts.
+ */
+export function buildWindowsLauncherCmd(inputs: ServiceDefInputs): string {
+  const dq = (s: string): string => s.replace(/"/g, '""');
+  return [
+    "@echo off",
+    `set "LARKWAY_HOME=${dq(inputs.larkwayDir)}"`,
+    `set "PATH=${dq(inputs.envPath)}"`,
+    `"${dq(inputs.nodePath)}" "${dq(inputs.distMain)}" >> "${dq(inputs.logPath)}" 2>&1`,
+    "",
+  ].join("\r\n");
+}
+
+export interface SchtasksAdapterOpts {
+  exec?: ExecFn;
+  /** Override for tests. Default: the larkway home dir. */
+  launcherDir?: string;
+}
+
+/**
+ * Task Scheduler gives ONLOGON autostart; unlike launchd/systemd it has no
+ * CLI-settable crash-restart, so on Windows crash recovery relies on the
+ * bridge's in-process crash guard + WS reconnect (schtasks XML would allow
+ * RestartOnFailure, but that's a follow-up).
+ */
+export function makeSchtasksAdapter(
+  inputs: ServiceDefInputs,
+  opts: SchtasksAdapterOpts = {},
+): ServiceAdapter {
+  const exec = opts.exec ?? defaultExec;
+  const taskName = windowsTaskName(inputs.larkwayDir);
+  const launcherPath = path.join(opts.launcherDir ?? inputs.larkwayDir, "bridge-launcher.cmd");
+
+  return {
+    kind: "schtasks",
+    name: taskName,
+    async install(): Promise<void> {
+      await mkdir(path.dirname(launcherPath), { recursive: true });
+      await mkdir(path.dirname(inputs.logPath), { recursive: true });
+      await writeFile(launcherPath, buildWindowsLauncherCmd(inputs), "utf-8");
+      // /F overwrites (and re-enables a previously disabled task);
+      // /RL LIMITED runs as the current user without elevation.
+      await exec("schtasks", [
+        "/Create", "/F", "/SC", "ONLOGON", "/RL", "LIMITED",
+        "/TN", taskName,
+        "/TR", `"${launcherPath}"`,
+      ]);
+    },
+    async start(): Promise<void> {
+      await exec("schtasks", ["/Run", "/TN", taskName]);
+    },
+    async stop(): Promise<void> {
+      try {
+        await exec("schtasks", ["/End", "/TN", taskName]);
+      } catch {
+        /* not running */
+      }
+      try {
+        await exec("schtasks", ["/Change", "/TN", taskName, "/Disable"]);
+      } catch {
+        /* not registered */
+      }
+    },
+    async isRunning(): Promise<boolean> {
+      try {
+        const { stdout } = await exec("schtasks", ["/Query", "/TN", taskName, "/FO", "CSV", "/NH"]);
+        return /running/i.test(stdout);
+      } catch {
+        return false;
+      }
+    },
+    async isInstalled(): Promise<boolean> {
+      try {
+        await exec("schtasks", ["/Query", "/TN", taskName]);
+        return true;
+      } catch {
+        return false;
+      }
+    },
+  };
+}
+
+// ---------------------------------------------------------------------------
 // Resolution
 // ---------------------------------------------------------------------------
 
@@ -402,6 +497,9 @@ export async function resolveServiceAdapter(
     }
   }
 
-  // win32 → schtasks adapter arrives with native Windows support (BL-49 2b).
+  if (platform === "win32") {
+    return makeSchtasksAdapter(inputs, { exec, launcherDir: opts.unitDir });
+  }
+
   return null;
 }

@@ -139,7 +139,7 @@ export interface BridgeStatus {
   running: boolean;
   pid: number | null;
   platform: BridgePlatform;
-  mode: "systemd" | "local" | "unknown" | "launchd" | "systemd-user" | "systemd-system";
+  mode: "systemd" | "local" | "unknown" | "launchd" | "systemd-user" | "systemd-system" | "schtasks";
 }
 
 // ---------------------------------------------------------------------------

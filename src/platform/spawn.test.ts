@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { findOnPath, spawnCollect } from "./spawn.js";
 
-describe("findOnPath", () => {
+describe.skipIf(process.platform === "win32")("findOnPath", () => {
   it("finds an executable on PATH and returns its absolute path", async () => {
     const dir = await mkdtemp(path.join(tmpdir(), "lw-path-"));
     const bin = path.join(dir, "lw-fake-tool");

@@ -17,6 +17,8 @@ import {
   makeLaunchdAdapter,
   makeSystemdUserAdapter,
   makeSystemdSystemAdapter,
+  makeSchtasksAdapter,
+  buildWindowsLauncherCmd,
   resolveServiceAdapter,
   type ServiceDefInputs,
   type ExecFn,
@@ -210,6 +212,52 @@ describe("makeSystemdUserAdapter", () => {
   });
 });
 
+describe("schtasks adapter (Windows)", () => {
+  it("launcher .cmd bakes env, appends logs, and uses CRLF", () => {
+    const cmd = buildWindowsLauncherCmd(INPUTS);
+    expect(cmd).toContain('set "LARKWAY_HOME=/home/u/.larkway"');
+    expect(cmd).toContain('set "PATH=/usr/bin:/bin"');
+    expect(cmd).toContain('>> "/home/u/.larkway/logs/bridge.log" 2>&1');
+    expect(cmd).toContain("\r\n");
+    expect(cmd.startsWith("@echo off")).toBe(true);
+  });
+
+  it("install writes the launcher and registers an ONLOGON task without elevation", async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), "lw-schtasks-"));
+    const { exec, calls } = makeFakeExec();
+    const a = makeSchtasksAdapter({ ...INPUTS, logPath: path.join(dir, "l", "b.log") }, { exec, launcherDir: dir });
+    await a.install();
+    await access(path.join(dir, "bridge-launcher.cmd"));
+    const create = calls[0]!;
+    expect(create[0]).toBe("schtasks");
+    expect(create).toContain("/Create");
+    expect(create).toContain("ONLOGON");
+    expect(create).toContain("LIMITED");
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  it("stop ends the running instance AND disables autostart", async () => {
+    const { exec, calls } = makeFakeExec();
+    const a = makeSchtasksAdapter(INPUTS, { exec, launcherDir: "/tmp" });
+    await a.stop();
+    expect(calls.map((c) => c[1])).toEqual(["/End", "/Change"]);
+    expect(calls[1]).toContain("/Disable");
+  });
+
+  it("isRunning parses /Query CSV status", async () => {
+    const running = makeSchtasksAdapter(INPUTS, {
+      exec: makeFakeExec(() => ({ stdout: '"LarkwayBridge","19/07/2026","Running"' })).exec,
+      launcherDir: "/tmp",
+    });
+    expect(await running.isRunning()).toBe(true);
+    const stopped = makeSchtasksAdapter(INPUTS, {
+      exec: makeFakeExec(() => ({ stdout: '"LarkwayBridge","19/07/2026","Ready"' })).exec,
+      launcherDir: "/tmp",
+    });
+    expect(await stopped.isRunning()).toBe(false);
+  });
+});
+
 describe("resolveServiceAdapter", () => {
   const base = {
     larkwayDir: "/home/u/.larkway",
@@ -253,9 +301,14 @@ describe("resolveServiceAdapter", () => {
     expect(r).toBeNull();
   });
 
-  it("win32 → null until the schtasks adapter lands", async () => {
-    const r = await resolveServiceAdapter({ ...base, distMain: "/x/dist/main.js", platform: "win32" });
-    expect(r).toBeNull();
+  it("win32 → schtasks", async () => {
+    const r = await resolveServiceAdapter({
+      ...base,
+      distMain: "/x/dist/main.js",
+      platform: "win32",
+      exec: makeFakeExec().exec,
+    });
+    expect(r?.kind).toBe("schtasks");
   });
 });
 

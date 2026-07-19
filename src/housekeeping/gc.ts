@@ -14,6 +14,7 @@
  */
 
 import { spawn } from "node:child_process";
+import { pidsMatching } from "../platform/processes.js";
 import { readFile, readdir, rm, stat } from "node:fs/promises";
 import { join as pathJoin } from "node:path";
 import {
@@ -376,15 +377,20 @@ export async function findPidsByWorktree(
   // --- Primary: pid file written by runner.ts ---
   const primaryPid = await readPidFile(worktreePath);
 
-  // --- Secondary: pgrep -f fallback ---
+  // --- Secondary: pgrep -f fallback (win32: PowerShell CIM sweep) ---
   // pgrep exits 1 with empty stdout when no match, which is fine.
-  const { stdout } = await spawnCollect("pgrep", ["-f", worktreePath]);
-  const pgrepPids = stdout
-    .split("\n")
-    .map((s) => s.trim())
-    .filter(Boolean)
-    .map(Number)
-    .filter((n) => !isNaN(n) && n > 0);
+  let pgrepPids: number[];
+  if (process.platform === "win32") {
+    pgrepPids = await pidsMatching(worktreePath);
+  } else {
+    const { stdout } = await spawnCollect("pgrep", ["-f", worktreePath]);
+    pgrepPids = stdout
+      .split("\n")
+      .map((s) => s.trim())
+      .filter(Boolean)
+      .map(Number)
+      .filter((n) => !isNaN(n) && n > 0);
+  }
 
   // --- Merge + deduplicate ---
   const all = primaryPid !== null ? [primaryPid, ...pgrepPids] : pgrepPids;
@@ -434,6 +440,27 @@ export async function killPid(
   }
 
   console.log(`[gc] SIGTERM pid=${pid} path=${worktreePath}`);
+  if (process.platform === "win32") {
+    // No /bin/kill on Windows — signal through process.kill (SIGTERM there is
+    // an unconditional terminate; the SIGKILL escalation is then a no-op).
+    try {
+      process.kill(pid, "SIGTERM");
+    } catch {
+      /* already gone */
+    }
+    await new Promise<void>((r) => setTimeout(r, KILL_GRACE_MS));
+    if (isPidAlive(pid)) {
+      console.log(`[gc] SIGKILL pid=${pid} (survived SIGTERM grace period)`);
+      try {
+        process.kill(pid, "SIGKILL");
+      } catch {
+        /* already gone */
+      }
+    } else {
+      console.log(`[gc] pid=${pid} exited cleanly after SIGTERM`);
+    }
+    return;
+  }
   // Use `kill` subprocess so we don't have to deal with permission oddities
   // and to keep the interface testable via mock.
   // NEVER use pkill -9 -f <pattern> — too broad. Kill specific known PIDs only.
