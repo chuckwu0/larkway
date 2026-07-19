@@ -64,7 +64,8 @@
 | v0.3.57 | v0.3.57 | patch / 已发布 | schedule 热加载:改 bot yaml 的 schedules/schedule_chat_id 无需重启,≤30s 生效;坏编辑不清空已武装闹钟 |
 | v0.3.58 | v0.3.58 | patch / 已发布 | task_handle v5: declarative create/due/blocked — five-signal delegation contract; bridge creates task cards with topic backlink + follower, reschedules with reason, posts blocked comments; out-of-box prompt contract |
 | v0.3.59 | v0.3.59 | patch / 已发布 | Windows install stopgap: Node bin shim with WSL guidance (was bash, broke npm on Windows); GitHub-first parity: Bash(gh *) core allow rule + doctor gh check |
-| v0.3.60 | v0.3.60 | 当前 patch / 已发布 | OS-service daemon mode: larkway start now registers launchd (macOS) / systemd (Linux) with boot autostart + OS-level crash restart, replacing the bash supervisor; stop disables autostart; tasklistInit flake fix |
+| v0.3.60 | v0.3.60 | patch / 已发布 | OS-service daemon mode: larkway start now registers launchd (macOS) / systemd (Linux) with boot autostart + OS-level crash restart, replacing the bash supervisor; stop disables autostart; tasklistInit flake fix |
+| v0.3.61 | v0.3.61 | 当前 patch / 已发布 | Windows-native groundwork behind LARKWAY_EXPERIMENTAL_WINDOWS=1: cross-spawn layer for .cmd shims, schtasks service adapter, PowerShell process discovery, pure-Node log tail; POSIX behaviour unchanged |
 
 ## 使用原则
 
@@ -136,4 +137,5 @@ v0.3.57       = schedule 热加载:改 bot yaml 的 schedules/schedule_chat_id �
 v0.3.58       = task_handle v5: declarative create/due/blocked — five-signal delegation contract; bridge creates task cards with topic backlink + follower, reschedules with reason, posts blocked comments; out-of-box prompt contract
 v0.3.59       = Windows install stopgap: Node bin shim with WSL guidance (was bash, broke npm on Windows); GitHub-first parity: Bash(gh *) core allow rule + doctor gh check
 v0.3.60       = OS-service daemon mode: larkway start now registers launchd (macOS) / systemd (Linux) with boot autostart + OS-level crash restart, replacing the bash supervisor; stop disables autostart; tasklistInit flake fix
+v0.3.61       = Windows-native groundwork behind LARKWAY_EXPERIMENTAL_WINDOWS=1: cross-spawn layer for .cmd shims, schtasks service adapter, PowerShell process discovery, pure-Node log tail; POSIX behaviour unchanged
 ```
