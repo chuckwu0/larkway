@@ -17,7 +17,7 @@
   },
   "type": "module",
   "bin": {
-    "larkway": "bin/larkway"
+    "larkway": "bin/larkway.mjs"
   },
   "scripts": {
     "start": "tsx src/main.ts",
@@ -54,7 +54,7 @@
   },
   "files": [
     "dist/",
-    "bin/larkway",
+    "bin/larkway.mjs",
     "README.md"
   ]
 }

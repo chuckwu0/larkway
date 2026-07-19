@@ -194,6 +194,7 @@ platform-fact writeups: [docs/task-handle.md](docs/task-handle.md).
 
 ## Requirements
 
+- **macOS or Linux** — native Windows is not supported yet (the runtime depends on POSIX tooling such as `bash` and `pgrep`); on Windows, install and run everything (Node.js, larkway, Claude Code / Codex, `lark-cli`) inside [WSL](https://learn.microsoft.com/windows/wsl/install)
 - **Node.js 20+ LTS**
 - **A Claude Code or Codex subscription** with local CLI installed and logged in
 - **`lark-cli`** — Feishu long-connection client and message utilities: `npm i -g @larksuite/cli`, then `lark-cli auth login` (the agent uses it to read thread history and attachments; `larkway doctor` checks it's present)
