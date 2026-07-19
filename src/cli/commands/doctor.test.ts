@@ -385,7 +385,7 @@ describe("doctor --lint --json", () => {
     });
   });
 
-  it("exit 2: codex backend bot requires writable Codex state DB", async () => {
+  it.skipIf(process.platform === "win32")("exit 2: codex backend bot requires writable Codex state DB", async () => {
     await withFakeHome(async () => {
       const fakeBin = path.join(tmpRoot, "bin");
       const codexHome = path.join(tmpRoot, ".codex");

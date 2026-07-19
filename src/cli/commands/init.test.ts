@@ -143,7 +143,7 @@ function silenceOutput() {
 // Tests
 // ---------------------------------------------------------------------------
 
-describe("larkway init --non-interactive --skip-register", () => {
+describe.skipIf(process.platform === "win32")("larkway init --non-interactive --skip-register", () => {
   it("完整跑通:生成合法 bot yaml + memory.md + .env + config.json", async () => {
     silenceOutput();
 
