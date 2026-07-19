@@ -146,6 +146,7 @@ interface FinalizeArgs {
   mentionOpenId?: string;
   titleOverride?: string;
   colorOverride?: string;
+  choices?: Array<{ label: string; value: string }>;
   imageBlocks?: Array<{
     img_key: string;
     alt: string;
@@ -6263,10 +6264,21 @@ describe("handleOne — untrusted-text rescue (answer outside markers)", () => {
   async function runTurn(
     events: Array<Record<string, unknown>>,
     exitCode = 0,
+    // Fresh state.json the "agent" writes during the stream (updated_at must
+    // advance past seedWorktree's bootstrap snapshot to count as fresh).
+    freshState?: Record<string, unknown>,
   ): Promise<{ finalizeArgs: FinalizeArgs[] }> {
+    const wt = freshState ? await seedWorktree("om_msg") : undefined;
     runClaudeImpl = () => ({
       events: (async function* () {
         for (const ev of events) yield ev;
+        if (wt && freshState) {
+          await writeFile(
+            stateFileMod.stateFilePathOf(wt),
+            JSON.stringify(freshState, null, 2),
+            "utf8",
+          );
+        }
       })(),
       done: Promise.resolve({ exitCode, sessionId: "sess_rescue" }),
       kill: () => {},
@@ -6340,5 +6352,51 @@ describe("handleOne — untrusted-text rescue (answer outside markers)", () => {
     expect(finalizeArgs[0]?.success).toBe(false);
     expect(finalizeArgs[0]?.finalText).toContain("本轮 agent 没有产出正文");
     expect(finalizeArgs[0]?.finalText).toContain("exit code 1");
+  });
+
+  // 2026-07-19 排障: the agent wrote a FRESH state.json (status + choices, no
+  // last_message) with its whole answer in internal_text — the old
+  // `reportedState === null` gate blocked the rescue and the card showed the
+  // "没有产出正文" error despite the answer existing. The gate is now
+  // `last_message == null`: a fresh report without a body still rescues.
+  it("fresh state.json WITHOUT last_message (status/choices only) still rescues internal_text, keeping declared choices", async () => {
+    const { finalizeArgs } = await runTurn(
+      [
+        { type: "system_init", sessionId: "sess_rescue", raw: {} },
+        { type: "internal_text", text: "完整答案写在 marker 外，state.json 只报了状态。", raw: {} },
+      ],
+      0,
+      {
+        status: "ready",
+        choices: [{ label: "继续", value: "继续处理" }],
+        updated_at: "2026-07-19T10:00:00.000Z",
+      },
+    );
+    expect(finalizeArgs).toHaveLength(1);
+    expect(finalizeArgs[0]?.success).toBe(true);
+    expect(finalizeArgs[0]?.finalText).toBe("完整答案写在 marker 外，state.json 只报了状态。");
+    expect(finalizeArgs[0]?.finalText).not.toContain("没有产出正文");
+    // The fresh report's declared signals still flow through untouched.
+    expect(finalizeArgs[0]?.choices).toEqual([{ label: "继续", value: "继续处理" }]);
+    // A fresh report exists, so the agent's own status drives the title —
+    // no neutral "💬 已回复" override.
+    expect(finalizeArgs[0]?.titleOverride).toBeUndefined();
+  });
+
+  it("fresh state.json WITH last_message still wins over internal_text (rescue stays a fallback)", async () => {
+    const { finalizeArgs } = await runTurn(
+      [
+        { type: "system_init", sessionId: "sess_rescue", raw: {} },
+        { type: "internal_text", text: "marker 外的过程独白", raw: {} },
+      ],
+      0,
+      {
+        status: "ready",
+        last_message: "state.json 里的正式正文",
+        updated_at: "2026-07-19T10:00:00.000Z",
+      },
+    );
+    expect(finalizeArgs).toHaveLength(1);
+    expect(finalizeArgs[0]?.finalText).toBe("state.json 里的正式正文");
   });
 });

@@ -3456,15 +3456,22 @@ export class BridgeHandler {
           // show an honest prompt to retry rather than a blank/stale card.
           // Untrusted-channel rescue: the agent exited cleanly but put its
           // whole answer OUTSIDE the LARKWAY_ANSWER markers (internal_text)
-          // and wrote no fresh state.json either. Rather than showing the
-          // "没有产出正文" error card while the real answer exists, surface the
-          // LAST internal_text verbatim as the body. Deliberately narrow:
+          // and gave the card no body through state.json either — either no
+          // fresh state.json at all, or a fresh one that carries status/
+          // choices/task_handle but no `last_message` (2026-07-19 排障:that
+          // second shape hit the old `reportedState === null` gate and
+          // rendered the "没有产出正文" error card while the full answer sat
+          // in the agent's last internal_text). Rather than showing the error
+          // card while the real answer exists, surface the LAST internal_text
+          // verbatim as the body. Deliberately narrow:
           //   - only when BOTH trusted channels are empty (marker channel
           //     semantics unchanged — trusted text always wins);
-          //   - only on exitCode 0 with no fresh report (reportedState null),
-          //     which is exactly the case where `neutralTitle` below already
-          //     renders "💬 已回复" instead of "✅ 完成" — the card honestly
-          //     says "replied", never claims trusted completion;
+          //   - only on exitCode 0 with no body from state.json
+          //     (`last_message` missing — which includes reportedState null).
+          //     With no fresh report at all, `neutralTitle` below renders
+          //     "💬 已回复" instead of "✅ 完成"; with a fresh report the
+          //     agent's own declared status still drives title/color — only
+          //     the body is rescued;
           //   - never on /stop / idle-kill / poison-reset turns (those
           //     branches bypass fallbackAnswer entirely, but the gates keep
           //     this expression self-evidently safe).
@@ -3472,7 +3479,7 @@ export class BridgeHandler {
             !stoppedByUser &&
             !cardKitTimeoutFailure &&
             result.exitCode === 0 &&
-            reportedState === null &&
+            reportedState?.last_message == null &&
             !trustedAnswerText.trim() &&
             !cardKitProgress?.answerText.trim()
               ? lastInternalText.trim()
@@ -3482,7 +3489,9 @@ export class BridgeHandler {
               status: "running",
               appendPath: "正文回退",
               reason:
-                "本轮无 marker 通道正文与 state.json，已回退展示 agent 最后一段非可信文本。",
+                reportedState === null
+                  ? "本轮无 marker 通道正文与 state.json，已回退展示 agent 最后一段非可信文本。"
+                  : "本轮无 marker 通道正文，state.json 也未提供 last_message，已回退展示 agent 最后一段非可信文本。",
             });
           }
           const fallbackAnswer =
