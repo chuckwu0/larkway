@@ -50,6 +50,23 @@ let mockGetTasklistThrows: boolean;
 let mockAddMembersThrows404: boolean;
 let mockAddMembersThrowsScope: boolean;
 let mockAddMembersThrowsDeleted: boolean;
+/**
+ * When true, the fake platform silently DROPS every user-type member from
+ * create/add_members (apps land fine) — simulating the "member silently
+ * dropped" failure mode the membership safety net guards against.
+ *
+ * This is a flag on the ONE shared SDK mock rather than a per-test
+ * `vi.doMock` override, deliberately: re-registering `vi.doMock` for a module
+ * the suite-level beforeEach ALREADY queued is flaky. @vitest/mocker's
+ * queueMock (vitest 4.1.7) resolves each registration through an async RPC
+ * and writes the registry in the `.then()` — so the WINNING factory is
+ * whichever RPC completes LAST, not whichever was registered last. Under a
+ * cold transform cache or a loaded full-suite run, the beforeEach factory can
+ * complete after the per-test one and silently win, making the per-test
+ * override a no-op (observed: full `pnpm test` flaked exactly this way while
+ * single-file runs stayed green). One doMock per module per test, always.
+ */
+let mockPlatformDropsUserMembers: boolean;
 
 // v3.4 --adopt mode: controllable results for the mocked userTasklistOps.js functions.
 let mockedListUserTasklists: UserOpResult<UserTasklistSummary[]>;
@@ -103,6 +120,7 @@ beforeEach(async () => {
   mockAddMembersThrows404 = false;
   mockAddMembersThrowsScope = false;
   mockAddMembersThrowsDeleted = false;
+  mockPlatformDropsUserMembers = false;
   mockedAutoResolvedOwner = undefined; // default: auto-detect finds nothing, same as no lark-cli user login
   // v3.4 --adopt mode defaults — individual tests override to exercise each branch.
   mockedListUserTasklists = { ok: true, data: [] };
@@ -116,7 +134,7 @@ beforeEach(async () => {
         capturedRequests.push(config);
         if (config.url.endsWith("/tasklists") && config.method === "POST") {
           const data = config.data as { members?: FakeMember[] };
-          currentMembers = [...(data.members ?? [])];
+          currentMembers = (data.members ?? []).filter((m) => !mockPlatformDropsUserMembers || m.type !== "user");
           return { data: { tasklist: { guid: "tl-created-1", members: currentMembers } } };
         }
         if (config.url.includes("/members") && config.method === "POST") {
@@ -142,6 +160,7 @@ beforeEach(async () => {
           }
           const data = config.data as { members?: FakeMember[] };
           for (const m of data.members ?? []) {
+            if (mockPlatformDropsUserMembers && m.type === "user") continue;
             if (!currentMembers.some((existing) => existing.id === m.id)) currentMembers.push(m);
           }
           return { data: {} };
@@ -447,25 +466,11 @@ describe("tasklist-init --team", () => {
   describe("membership safety net", () => {
     it("warns (but still exits 0) when the owner does not appear in the post-create membership readback", async () => {
       await makeBot("bot-a", "cli_a", "BOT_A_SECRET");
-      // Simulate the platform silently dropping the owner member: the fake
-      // create/GET responses below never include the owner, only the bot app.
-      // vi.doMock must be registered BEFORE the dynamic import below — once a
-      // module is evaluated its already-resolved imports can't be swapped out
-      // by a later doMock call (no re-import happens inside run()).
-      vi.doMock("@larksuiteoapi/node-sdk", () => ({
-        Client: class {
-          async request(config: { method: string; url: string; data?: unknown }) {
-            capturedRequests.push(config);
-            if (config.url.endsWith("/tasklists") && config.method === "POST") {
-              return { data: { tasklist: { guid: "tl-created-1", members: [{ id: "cli_a", type: "app", role: "editor" }] } } };
-            }
-            if (/\/tasklists\/[^/]+$/.test(config.url) && config.method === "GET") {
-              return { data: { tasklist: { guid: "tl-created-1", members: [{ id: "cli_a", type: "app", role: "editor" }] } } };
-            }
-            return { data: {} };
-          }
-        },
-      }));
+      // Simulate the platform silently dropping the owner member: create/GET
+      // only ever report the bot app, never the owner. Flag on the shared SDK
+      // mock — NOT a second vi.doMock — see mockPlatformDropsUserMembers's doc
+      // comment for the doMock re-registration race this avoids.
+      mockPlatformDropsUserMembers = true;
       const { run } = await import("./tasklistInit.js");
 
       const code = await run(makeCtx(), ["--team", "bot-a", "--owner", "ou_owner"]);
@@ -475,20 +480,7 @@ describe("tasklist-init --team", () => {
 
     it("reports ownerConfirmedMember:false in JSON mode when the owner is missing from the readback", async () => {
       await makeBot("bot-a", "cli_a", "BOT_A_SECRET");
-      vi.doMock("@larksuiteoapi/node-sdk", () => ({
-        Client: class {
-          async request(config: { method: string; url: string; data?: unknown }) {
-            capturedRequests.push(config);
-            if (config.url.endsWith("/tasklists") && config.method === "POST") {
-              return { data: { tasklist: { guid: "tl-created-1", members: [] } } };
-            }
-            if (/\/tasklists\/[^/]+$/.test(config.url) && config.method === "GET") {
-              return { data: { tasklist: { guid: "tl-created-1", members: [] } } };
-            }
-            return { data: {} };
-          }
-        },
-      }));
+      mockPlatformDropsUserMembers = true;
       const { run } = await import("./tasklistInit.js");
       const code = await run(makeCtx({ json: true }), ["--team", "bot-a", "--owner", "ou_owner"]);
       expect(code).toBe(0);
