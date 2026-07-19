@@ -61,7 +61,7 @@ Feishu thread
 
 **What Larkway does NOT do** — the agent decides everything else:
 
-- No GitLab/GitHub API calls (the agent runs `glab`/`gh` itself)
+- No GitHub/GitLab API calls (the agent runs `gh`/`glab` itself)
 - No worktree creation (the agent runs `git worktree add`)
 - No dev server management (the agent starts it)
 - No orchestration logic — the agent reads your `AGENTS.md` / `CLAUDE.md` / skills and plans its own steps
@@ -198,7 +198,7 @@ platform-fact writeups: [docs/task-handle.md](docs/task-handle.md).
 - **Node.js 20+ LTS**
 - **A Claude Code or Codex subscription** with local CLI installed and logged in
 - **`lark-cli`** — Feishu long-connection client and message utilities: `npm i -g @larksuite/cli`, then `lark-cli auth login` (the agent uses it to read thread history and attachments; `larkway doctor` checks it's present)
-- **`glab` + `git`** — for bots that open MRs (optional for read-only bots)
+- **`git` + `gh`** — for bots that open PRs (GitHub is the default forge; use `glab` instead for GitLab repos; both optional for read-only bots)
 - **An always-on host machine** — the bridge must stay running to receive Feishu events; a laptop that sleeps will miss messages; a small server or desktop works well
 
 ---

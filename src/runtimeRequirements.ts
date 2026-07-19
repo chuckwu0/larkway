@@ -65,6 +65,12 @@ function botUsesGitLab(bot: BotConfig): boolean {
   return bot.repos.some((repo) => repoLooksGitLab(repo.url ?? repo.slug));
 }
 
+// GitHub is the default forge: any repo that doesn't look like GitLab counts,
+// including bare owner/repo slugs with no host.
+function botUsesGitHub(bot: BotConfig): boolean {
+  return bot.repos.some((repo) => !repoLooksGitLab(repo.url ?? repo.slug));
+}
+
 function addCliRequirement(
   requirements: Map<string, RuntimeRequirement>,
   input: {
@@ -170,6 +176,17 @@ export function runtimeRequirementsForBots(bots: BotConfig[]): RuntimeRequiremen
           botIds: [bot.id],
         });
       }
+    }
+
+    if (botUsesGitHub(bot)) {
+      addCliRequirement(requirements, {
+        command: "gh",
+        label: "GitHub CLI",
+        severity: "optional",
+        botIds: [bot.id],
+        reason: "Only needed when an agent uses GitHub-specific actions such as PRs, issues, or releases.",
+        installHint: "Install gh only for bots that need GitHub-specific workflow commands.",
+      });
     }
 
     if (botUsesGitLab(bot)) {

@@ -505,7 +505,7 @@ async function ensureRepoCloneImpl(
 
 /**
  * Bridge core Bash allow-list — capabilities the bridge itself depends on
- * regardless of project (Lark IO, git ops, glab MR ops, port detection,
+ * regardless of project (Lark IO, git ops, gh/glab PR/MR ops, port detection,
  * HTTP probe, basic POSIX scripting). Project-stack-specific tools
  * (pnpm, gradle, cargo, NEXT_PUBLIC_PORT=...) come from
  * `~/.larkway/config.json permissions.allowExtra` — see WriteWorktreeSettingsOpts.
@@ -513,6 +513,7 @@ async function ensureRepoCloneImpl(
 const CORE_ALLOW_RULES = [
   "Bash(lark-cli *)",
   "Bash(git *)",
+  "Bash(gh *)",
   "Bash(glab *)",
   "Bash(lsof *)",
   "Bash(curl *)",
