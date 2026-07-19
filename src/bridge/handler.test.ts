@@ -3393,8 +3393,10 @@ describe("handleOne — COT bubble ordering (before the card)", () => {
     const { acked } = await runTurn({ cotClient, cotBubbleCreateBudgetMs: 20, existingTopic: true });
     expect(acked).toEqual(["om_msg"]);
     // The turn is long done; wait for the late create + finally finalize.
+    // 5s ceiling: parallel-worker CI runners can starve real timers for
+    // seconds (observed flaking at a 1s ceiling on ubuntu-latest).
     for (let i = 0; i < 100 && completeReason === undefined; i++) {
-      await new Promise((r) => setTimeout(r, 10));
+      await new Promise((r) => setTimeout(r, 50));
     }
     expect(completeReason).toBe("done");
   });
@@ -3414,8 +3416,10 @@ describe("handleOne — COT bubble ordering (before the card)", () => {
     };
     const { unhandled } = await runTurn({ cotClient, cotBubbleCreateBudgetMs: 20, errorTurn: true });
     expect(unhandled).toEqual(["om_msg"]); // failed turn released as unhandled
+    // 5s ceiling: parallel-worker CI runners can starve real timers for
+    // seconds (observed flaking at a 1s ceiling on ubuntu-latest).
     for (let i = 0; i < 100 && completeReason === undefined; i++) {
-      await new Promise((r) => setTimeout(r, 10));
+      await new Promise((r) => setTimeout(r, 50));
     }
     expect(completeReason).toBe("error");
   });

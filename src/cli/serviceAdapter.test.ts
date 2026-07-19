@@ -233,6 +233,10 @@ describe("schtasks adapter (Windows)", () => {
     expect(create).toContain("/Create");
     expect(create).toContain("ONLOGON");
     expect(create).toContain("LIMITED");
+    // crash-restart layered on via PowerShell after /Create
+    const ps = calls[1]!;
+    expect(ps[0]).toBe("powershell.exe");
+    expect(ps.join(" ")).toContain("RestartCount 10");
     await rm(dir, { recursive: true, force: true });
   });
 

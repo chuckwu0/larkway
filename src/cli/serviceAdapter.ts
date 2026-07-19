@@ -376,10 +376,10 @@ export interface SchtasksAdapterOpts {
 }
 
 /**
- * Task Scheduler gives ONLOGON autostart; unlike launchd/systemd it has no
- * CLI-settable crash-restart, so on Windows crash recovery relies on the
- * bridge's in-process crash guard + WS reconnect (schtasks XML would allow
- * RestartOnFailure, but that's a follow-up).
+ * Task Scheduler gives ONLOGON autostart. schtasks.exe itself cannot set
+ * crash-restart, so install() layers RestartOnFailure on top via PowerShell
+ * Set-ScheduledTask (best-effort — autostart still works without it, and the
+ * bridge's in-process crash guard + WS reconnect remain the first line).
  */
 export function makeSchtasksAdapter(
   inputs: ServiceDefInputs,
@@ -403,6 +403,20 @@ export function makeSchtasksAdapter(
         "/TN", taskName,
         "/TR", `"${launcherPath}"`,
       ]);
+      // Crash-restart (launchd KeepAlive / systemd Restart=on-failure parity):
+      // restart up to 10 times, 1 minute apart, when the bridge exits non-zero.
+      // Best-effort — some managed environments restrict Set-ScheduledTask.
+      try {
+        await exec("powershell.exe", [
+          "-NoProfile",
+          "-NonInteractive",
+          "-Command",
+          `$s = New-ScheduledTaskSettingsSet -RestartCount 10 -RestartInterval (New-TimeSpan -Minutes 1); ` +
+            `Set-ScheduledTask -TaskName "${taskName}" -Settings $s`,
+        ]);
+      } catch {
+        /* autostart still works without crash-restart */
+      }
     },
     async start(): Promise<void> {
       await exec("schtasks", ["/Run", "/TN", taskName]);
