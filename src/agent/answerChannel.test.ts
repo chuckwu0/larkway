@@ -87,6 +87,89 @@ describe("AnswerChannelExtractor", () => {
     expect(events.filter((event) => event.type === "answer_delta")).toHaveLength(0);
   });
 
+  // 2026-07-19 排障: a turn whose ENTIRE reply has no marker used to produce
+  // ZERO events on the claude streaming path (deltas + growing snapshots all
+  // route through drain(), which only trims the waiting buffer), so the
+  // bridge's untrusted-text rescue could never fire. The growing-snapshot
+  // path must now emit the markerless snapshot as internal_text, aligned
+  // with what ingestSnapshot always did.
+  describe("markerless catch-up (growing-snapshot path)", () => {
+    it("emits the full markerless block as internal_text when the complete snapshot arrives after swallowed deltas", () => {
+      const extractor = new AnswerChannelExtractor();
+      const answer = "整轮没有写任何 marker 的完整答案正文,之前会被完全吞掉。";
+
+      const deltaEvents = [
+        ...extractor.ingestDelta(answer.slice(0, 10), { id: 1 }),
+        ...extractor.ingestDelta(answer.slice(10), { id: 2 }),
+      ];
+      const snapshotEvents = extractor.ingestGrowingSnapshot(answer, { id: 3 });
+
+      expect(deltaEvents).toEqual([]);
+      expect(snapshotEvents).toEqual([
+        { type: "internal_text", text: answer, raw: { id: 3 } },
+      ]);
+    });
+
+    it("re-emits a fuller catch-up as the markerless snapshot grows, but never an identical one twice", () => {
+      const extractor = new AnswerChannelExtractor();
+
+      const first = extractor.ingestGrowingSnapshot("第一段独白。", { id: 1 });
+      const repeat = extractor.ingestGrowingSnapshot("第一段独白。", { id: 2 });
+      const grown = extractor.ingestGrowingSnapshot("第一段独白。第二段独白。", { id: 3 });
+
+      expect(first).toEqual([
+        { type: "internal_text", text: "第一段独白。", raw: { id: 1 } },
+      ]);
+      expect(repeat).toEqual([]);
+      expect(grown).toEqual([
+        { type: "internal_text", text: "第一段独白。第二段独白。", raw: { id: 3 } },
+      ]);
+    });
+
+    it("does not fire once the BEGIN marker appears (marker semantics unchanged: before-text reported exactly once)", () => {
+      const extractor = new AnswerChannelExtractor();
+
+      const answer =
+        "可见答案正文足够长可以越过流式 hold 缓冲吐出来,可见答案正文足够长可以越过流式 hold 缓冲吐出来。";
+      const markerless = extractor.ingestGrowingSnapshot("前置独白", { id: 1 });
+      const withMarker = extractor.ingestGrowingSnapshot(
+        `前置独白\n${ANSWER_BEGIN_MARKER}\n${answer}`,
+        { id: 2 },
+      );
+
+      expect(markerless).toEqual([
+        { type: "internal_text", text: "前置独白", raw: { id: 1 } },
+      ]);
+      // The marker transition emits the before-text once via drain(); the
+      // catch-up must NOT add another internal_text carrying the answer.
+      const internal = withMarker.filter((e) => e.type === "internal_text");
+      expect(internal).toEqual([
+        { type: "internal_text", text: "前置独白", raw: { id: 2 } },
+      ]);
+      const answerText = withMarker
+        .filter((e) => e.type === "answer_delta")
+        .map((e) => e.text)
+        .join("");
+      expect(answer.startsWith(answerText)).toBe(true);
+      expect(answerText.length).toBeGreaterThan(0);
+    });
+
+    it("bounds a huge markerless snapshot to its 16KB tail", () => {
+      const extractor = new AnswerChannelExtractor();
+      const huge = "头".repeat(4 * 1024) + "尾".repeat(16 * 1024);
+
+      const events = extractor.ingestGrowingSnapshot(huge, { id: 1 });
+
+      expect(events).toHaveLength(1);
+      const event = events[0]!;
+      expect(event.type).toBe("internal_text");
+      if (event.type === "internal_text") {
+        expect(event.text).toHaveLength(16 * 1024);
+        expect(event.text).toBe("尾".repeat(16 * 1024));
+      }
+    });
+  });
+
   it("deduplicates a final snapshot after streamed deltas already reached the same answer", () => {
     const extractor = new AnswerChannelExtractor();
     const answer = "Visible answer starts here and keeps going for a while until complete.";

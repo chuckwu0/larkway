@@ -5,6 +5,13 @@ export const ANSWER_END_MARKER = "LARKWAY_ANSWER_END";
 
 const STREAM_HOLD_CHARS = ANSWER_END_MARKER.length + 2;
 
+// Upper bound on the markerless catch-up internal_text emitted from waiting
+// mode (see withWaitingCatchUp). Keeps memory bounded on huge markerless
+// turns; the TAIL is kept because the rescue consumer (bridge handler's
+// untrusted-text fallback) surfaces the end of the reply, where the
+// conclusion lives.
+const WAITING_CATCH_UP_MAX_CHARS = 16 * 1024;
+
 function stripLeadingNewline(text: string): string {
   return text.replace(/^\r?\n/, "");
 }
@@ -48,6 +55,7 @@ export class AnswerChannelExtractor {
   private buffer = "";
   private visibleText = "";
   private lastSnapshotText = "";
+  private lastWaitingCatchUpText = "";
 
   ingestDelta(text: string, raw: unknown): AgentStreamEvent[] {
     if (!text || this.mode === "closed") return [];
@@ -80,14 +88,52 @@ export class AnswerChannelExtractor {
     if (this.lastSnapshotText && text.startsWith(this.lastSnapshotText)) {
       const delta = text.slice(this.lastSnapshotText.length);
       this.lastSnapshotText = text;
-      return delta ? this.ingestDelta(delta, raw) : [];
+      const events = delta ? this.ingestDelta(delta, raw) : [];
+      return this.withWaitingCatchUp(events, text, raw);
     }
     if (this.lastSnapshotText === "") {
       this.lastSnapshotText = text;
-      return this.ingestDelta(text, raw);
+      return this.withWaitingCatchUp(this.ingestDelta(text, raw), text, raw);
     }
     this.lastSnapshotText = text;
     return this.ingestSnapshot(text, raw);
+  }
+
+  /**
+   * Markerless catch-up for the growing-snapshot (delta-routed) path.
+   *
+   * The two ingestDelta-backed branches above emit NOTHING while the
+   * extractor is still waiting for ANSWER_BEGIN — drain() just trims the
+   * waiting buffer. For a turn whose entire reply carries no marker at all
+   * (the agent forgot to write LARKWAY_ANSWER_BEGIN), the claude streaming
+   * path therefore produced ZERO events, so the bridge's untrusted-text
+   * rescue (handler.ts lastInternalText) could never fire and the user got
+   * the "没有产出正文" error card while the full answer existed in the
+   * transcript. The plain ingestSnapshot path already emits such text as
+   * internal_text (splitAnswerChannelText's no-marker branch) — this aligns
+   * the growing-snapshot path with that behavior: after a snapshot has been
+   * delta-routed, if the WHOLE snapshot still contains no BEGIN marker,
+   * re-emit it (bounded, deduped against the previous catch-up) as
+   * internal_text.
+   *
+   * Marker semantics are untouched: the moment BEGIN appears anywhere in the
+   * snapshot, ingestDelta's drain() has already transitioned out of waiting
+   * mode (emitting the before-text exactly once), so the catch-up never
+   * fires for marker-bearing turns.
+   */
+  private withWaitingCatchUp(
+    events: AgentStreamEvent[],
+    snapshotText: string,
+    raw: unknown,
+  ): AgentStreamEvent[] {
+    if (this.mode !== "waiting") return events;
+    const bounded =
+      snapshotText.length > WAITING_CATCH_UP_MAX_CHARS
+        ? snapshotText.slice(snapshotText.length - WAITING_CATCH_UP_MAX_CHARS)
+        : snapshotText;
+    if (!bounded.trim() || bounded === this.lastWaitingCatchUpText) return events;
+    this.lastWaitingCatchUpText = bounded;
+    return [...events, { type: "internal_text", text: bounded, raw }];
   }
 
   private drain(raw: unknown): AgentStreamEvent[] {

@@ -24,6 +24,8 @@ import type { OutboundCardKitClient } from "../lark/channelCardKitClient.js";
 import { CardKitReplyConversionError } from "../lark/channelCardKitClient.js";
 import type { OutboundCotClient } from "../lark/channelCotClient.js";
 import type { PerfSample } from "./perfLog.js";
+import { _parseLinesMulti } from "../claude/runner.js";
+import { AnswerChannelExtractor } from "../agent/answerChannel.js";
 
 // ---------------------------------------------------------------------------
 // handler.ts calls createRunner("claude").run(...) from agent/runner.
@@ -38,13 +40,21 @@ let runClaudeImpl: (opts: unknown) => {
 };
 let runnerBackends: string[] = [];
 
-vi.mock("../agent/runner.js", () => ({
-  createRunner: (backend: string) => {
-    runnerBackends.push(backend);
-    return { run: (opts: unknown) => runClaudeImpl(opts) };
-  },
-  registerRunner: () => {},
-}));
+vi.mock("../agent/runner.js", async (importOriginal) => {
+  // Spread the real module so pure helpers (createPerfMarker,
+  // markPerfForEventType, …) keep working for modules that import them
+  // through this mock (e.g. src/claude/runner.ts, imported below for the
+  // markerless-rescue integration test) — only the spawn surface is faked.
+  const actual = await importOriginal<typeof import("../agent/runner.js")>();
+  return {
+    ...actual,
+    createRunner: (backend: string) => {
+      runnerBackends.push(backend);
+      return { run: (opts: unknown) => runClaudeImpl(opts) };
+    },
+    registerRunner: () => {},
+  };
+});
 
 // ---------------------------------------------------------------------------
 // child_process is mocked so ensureRepoClone / execGit never run real git.
@@ -6322,6 +6332,52 @@ describe("handleOne — untrusted-text rescue (answer outside markers)", () => {
     expect(finalizeArgs).toHaveLength(1);
     expect(finalizeArgs[0]?.success).toBe(true);
     expect(finalizeArgs[0]?.finalText).toBe("这里是写在 marker 外的完整答案。");
+    expect(finalizeArgs[0]?.titleOverride).toBe("💬 已回复");
+    expect(finalizeArgs[0]?.colorOverride).toBe("neutral");
+  });
+
+  // 2026-07-19 第二轮排障: the claude STREAMING path (stream_event deltas +
+  // a final full assistant text block, both routed through
+  // AnswerChannelExtractor's waiting-mode drain) used to produce ZERO events
+  // for a turn whose entire reply had no marker — lastInternalText stayed
+  // empty, so even the rescue above could never fire and the user got the
+  // "没有产出正文" error card while the full answer sat in the transcript.
+  // Drive the REAL claude NDJSON parser end-to-end to prove the markerless
+  // full text now reaches the card as the 💬 已回复 fallback body.
+  it("claude 流式 markerless 整轮(真实 NDJSON 解析路径)→ 💬 已回复 正文回退,不再是错误卡", async () => {
+    const extractor = new AnswerChannelExtractor();
+    const answer = "整轮都没有写 marker 的完整答案正文,以前会被 waiting 模式整段吞掉。";
+    const ndjsonLines = [
+      JSON.stringify({ type: "system", subtype: "init", session_id: "sess_rescue" }),
+      JSON.stringify({
+        type: "stream_event",
+        event: {
+          type: "content_block_delta",
+          index: 0,
+          delta: { type: "text_delta", text: answer.slice(0, 12) },
+        },
+      }),
+      JSON.stringify({
+        type: "stream_event",
+        event: {
+          type: "content_block_delta",
+          index: 0,
+          delta: { type: "text_delta", text: answer.slice(12) },
+        },
+      }),
+      JSON.stringify({
+        type: "assistant",
+        message: { content: [{ type: "text", text: answer }] },
+      }),
+      JSON.stringify({ type: "result", stop_reason: "end_turn" }),
+    ];
+    const events = ndjsonLines.flatMap((line) => [..._parseLinesMulti(line, extractor)]);
+
+    const { finalizeArgs } = await runTurn(events as unknown as Array<Record<string, unknown>>);
+
+    expect(finalizeArgs).toHaveLength(1);
+    expect(finalizeArgs[0]?.success).toBe(true);
+    expect(finalizeArgs[0]?.finalText).toBe(answer);
     expect(finalizeArgs[0]?.titleOverride).toBe("💬 已回复");
     expect(finalizeArgs[0]?.colorOverride).toBe("neutral");
   });
