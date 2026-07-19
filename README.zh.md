@@ -115,6 +115,8 @@ Larkway 不注入 `ANTHROPIC_API_KEY` 或任何其他 API key。子进程继承�
 
 密钥只存在本机 `~/.larkway/.env`（权限 0600）。配置和 memory 不含密钥。
 
+默认所有 bot 共享宿主机的全局 lark-cli 配置目录——包括你在里面做过的个人 `lark-cli auth login`(日历/邮箱/云盘)。在 bot 的 yaml 里设 `lark_cli_isolated: true` 可给它一个私有配置目录(`~/.larkway/<botId>/lark-cli/`),里面只有它自己的应用 profile:默认 bot-only 身份,只有你显式在该目录内授权,agent 才能获得个人资源访问。
+
 ---
 
 ## 功能

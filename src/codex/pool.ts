@@ -127,6 +127,8 @@ export interface CodexProcessPoolOptions {
   codexBinPath?: string;
   botGitIdentity?: { name: string; email: string };
   gitlabToken?: string;
+  /** BL-50: per-bot LARKSUITE_CLI_CONFIG_DIR for identity isolation. */
+  larkCliConfigDir?: string;
   /** @default DEFAULT_WARM_PROCESS_IDLE_MS */
   idleMs?: number;
   /**
@@ -154,6 +156,7 @@ export class CodexProcessPool implements AgentRunner {
   readonly #codexBinPath: string | undefined;
   readonly #botGitIdentity?: { name: string; email: string };
   readonly #gitlabToken?: string;
+  readonly #larkCliConfigDir?: string;
   readonly #idleMs: number;
   readonly #pidFilePath: string | undefined;
 
@@ -187,6 +190,7 @@ export class CodexProcessPool implements AgentRunner {
     this.#codexBinPath = opts.codexBinPath;
     this.#botGitIdentity = opts.botGitIdentity;
     this.#gitlabToken = opts.gitlabToken;
+    this.#larkCliConfigDir = opts.larkCliConfigDir;
     this.#idleMs = opts.idleMs ?? DEFAULT_WARM_PROCESS_IDLE_MS;
     this.#pidFilePath = opts.pidFilePath;
   }
@@ -491,7 +495,7 @@ export class CodexProcessPool implements AgentRunner {
 
   #spawnChild(): void {
     const [bin, args] = buildCodexCommand({ prompt: "" }, this.#codexBinPath);
-    const env = buildCodexEnv(this.#botGitIdentity, this.#gitlabToken);
+    const env = buildCodexEnv(this.#botGitIdentity, this.#gitlabToken, this.#larkCliConfigDir);
     const child = spawnPiped(bin, args, { env });
     this.#child = child;
     this.#pending.clear();

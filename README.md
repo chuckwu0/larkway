@@ -141,6 +141,12 @@ not enforcement.
 - Secrets in `~/.larkway/.env` are shared across all bots on the bridge and
   visible to any agent that can read your home directory — don't mix a
   low-trust open bot and high-value credentials on the same host.
+- By default all bots share the host's global lark-cli config dir — including
+  any personal `lark-cli auth login` you did there (calendar/mail/drive).
+  Set `lark_cli_isolated: true` in a bot's yaml to give it a private config
+  dir (`~/.larkway/<botId>/lark-cli/`) holding only its own app profile:
+  bot-only identity by default, personal access only if you explicitly
+  authorize inside that dir.
 
 ---
 

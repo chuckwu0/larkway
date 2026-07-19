@@ -45,7 +45,7 @@ import {
   ensureSessionArtifacts,
 } from "../agent/sessionArtifacts.js";
 import type { FreshStartReason } from "../claude/sessionStore.js";
-import { resolveKnowledgeDir } from "../config/paths.js";
+import { resolveKnowledgeDir, resolveBotLarkCliDir } from "../config/paths.js";
 import {
   commitKnowledgeIfDirty,
   ensureKnowledgeRepo,
@@ -903,6 +903,8 @@ export interface BridgeHandlerDeps {
      */
     runnerKey?: string;
     runtime?: "legacy" | "agent_workspace";
+    /** BL-50: per-bot lark-cli identity isolation flag (from bots yaml). */
+    lark_cli_isolated?: boolean;
     git_token_env?: string;       // preferred: generic git PAT env-var name
     gitlab_token_env?: string;    // compat alias (legacy)
     response_surface_prototype?: ResponseSurfacePrototypeConfig;
@@ -2830,6 +2832,10 @@ export class BridgeHandler {
           // V2: inject per-bot git identity; absent in V1 → runner.ts uses "larkway-bot" fallback
           botGitIdentity: this.deps.botConfig?.git_identity,
           gitlabToken: this.deps.gitlabToken,
+          // BL-50: isolated bots get a private lark-cli config dir.
+          ...(this.deps.botConfig?.lark_cli_isolated && this.deps.botConfig.id
+            ? { larkCliConfigDir: resolveBotLarkCliDir(this.deps.botConfig.id) }
+            : {}),
           model: this.deps.botConfig?.model,
           effort: this.deps.botConfig?.effort,
           onPerfMarker: (marker, atMs) => {

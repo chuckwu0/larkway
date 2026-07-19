@@ -201,6 +201,8 @@ export interface ClaudeProcessPoolOptions {
   botId: string;
   botGitIdentity?: { name: string; email: string };
   gitlabToken?: string;
+  /** BL-50: per-bot LARKSUITE_CLI_CONFIG_DIR for identity isolation. */
+  larkCliConfigDir?: string;
   /** @default DEFAULT_WARM_PROCESS_IDLE_MS */
   idleMs?: number;
   /** @default DEFAULT_MAX_PROCESSES */
@@ -230,6 +232,7 @@ export class ClaudeProcessPool implements AgentRunner {
   readonly #botId: string;
   readonly #botGitIdentity?: { name: string; email: string };
   readonly #gitlabToken?: string;
+  readonly #larkCliConfigDir?: string;
   readonly #idleMs: number;
   readonly #maxProcesses: number;
   readonly #pidListFilePath: string | undefined;
@@ -275,6 +278,7 @@ export class ClaudeProcessPool implements AgentRunner {
     this.#botId = opts.botId;
     this.#botGitIdentity = opts.botGitIdentity;
     this.#gitlabToken = opts.gitlabToken;
+    this.#larkCliConfigDir = opts.larkCliConfigDir;
     this.#idleMs = opts.idleMs ?? DEFAULT_WARM_PROCESS_IDLE_MS;
     this.#maxProcesses = opts.maxProcesses ?? DEFAULT_MAX_PROCESSES;
     this.#pidListFilePath = opts.pidListFilePath;
@@ -808,7 +812,7 @@ export class ClaudeProcessPool implements AgentRunner {
 
   #spawnEntry(key: string, threadId: string, opts: RunOptions, flags?: { blank?: boolean }): PoolEntry {
     const [bin, args] = buildWarmCommand(opts);
-    const env = buildEnv(this.#botGitIdentity, this.#gitlabToken);
+    const env = buildEnv(this.#botGitIdentity, this.#gitlabToken, this.#larkCliConfigDir);
     const child = spawnPiped(bin, args, {
       env,
       ...(opts.cwd != null ? { cwd: opts.cwd } : {}),

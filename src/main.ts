@@ -21,6 +21,7 @@ import type { BotConfig } from "./config/botLoader.js";
 import {
   larkwayHome,
   resolveLarkwayDir,
+  resolveBotLarkCliDir,
   resolveSessionsPath,
   resolveLogsDir,
   resolveWorktreesDir,
@@ -334,7 +335,17 @@ async function runV2Mode({
     // lark-cli fails with "profile not found". (Previously single-bot mode skipped
     // this and assumed a default profile that the channel client never actually uses.)
     // Non-fatal: a failed setup only produces a warning.
-    ensureLarkCliProfile(bot.id, larkCliProfile, bot.app_id, appSecret);
+    // BL-50: isolated bots get a private lark-cli config dir; provision the
+    // profile INSIDE it so the shared global dir (and the maintainer's
+    // personal login there) stays invisible to this bot.
+    const larkCliConfigDir = bot.lark_cli_isolated ? resolveBotLarkCliDir(bot.id) : undefined;
+    if (larkCliConfigDir) {
+      mkdirSync(larkCliConfigDir, { recursive: true });
+      console.log(`[larkway] bot "${bot.id}": lark-cli identity isolation ON (${larkCliConfigDir})`);
+    }
+    ensureLarkCliProfile(bot.id, larkCliProfile, bot.app_id, appSecret, undefined, undefined, {
+      ...(larkCliConfigDir ? { configDir: larkCliConfigDir } : {}),
+    });
 
     // Per-bot directories
     const botDir = resolveLarkwayDir(bot.id);
@@ -377,6 +388,7 @@ async function runV2Mode({
       appId: bot.app_id,
       appSecret,
       larkCliProfile,
+      ...(larkCliConfigDir ? { larkCliConfigDir } : {}),
       larkwayDir: larkwayHome(),
     });
     // Gap-fill tracked-chat seeding (2026-07-17 p2p message-loss fix): the
@@ -819,6 +831,7 @@ async function runV2Mode({
       codexPool = new CodexProcessPool({
         botGitIdentity: bot.git_identity,
         gitlabToken: effectiveGitlabToken,
+        ...(larkCliConfigDir ? { larkCliConfigDir } : {}),
         idleMs: bot.warmProcessIdleMs,
         pidFilePath,
       });
@@ -839,6 +852,7 @@ async function runV2Mode({
         botId: bot.id,
         botGitIdentity: bot.git_identity,
         gitlabToken: effectiveGitlabToken,
+        ...(larkCliConfigDir ? { larkCliConfigDir } : {}),
         idleMs: bot.warmProcessIdleMs,
         maxProcesses: bot.warmProcessMaxProcesses,
         pidListFilePath,
@@ -900,6 +914,7 @@ async function runV2Mode({
         owner_open_id: bot.owner_open_id,
         cot: bot.cot,
         cotSurface: bot.cotSurface,
+        lark_cli_isolated: bot.lark_cli_isolated,
       },
       cardKitClient,
       cotClient,
@@ -916,7 +931,7 @@ async function runV2Mode({
       // live chat roster (per-chat cached), only when this bot actually has peers.
       resolveLiveRoster:
         resolvedPeers.length > 0
-          ? createCachedRosterResolver({ profile: larkCliProfile })
+          ? createCachedRosterResolver({ profile: larkCliProfile, ...(larkCliConfigDir ? { larkCliConfigDir } : {}) })
           : undefined,
       runtimeRequirements: runtimeRequirementsForBots([bot]),
       recordRuntimeEvent: async (patch) => {

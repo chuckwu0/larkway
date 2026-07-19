@@ -62,6 +62,21 @@ describe("deriveLarkCliProfile — profile name derivation (Layer 2)", () => {
 // ---------------------------------------------------------------------------
 
 describe("ensureLarkCliProfile — always provisions via config init on startup (Layer 3)", () => {
+  it("BL-50: opts.configDir routes provisioning into the bot's private config dir", () => {
+    const seenEnvs: (NodeJS.ProcessEnv | undefined)[] = [];
+    const spawn: SpawnSyncFn = (_cmd, _args, opts) => {
+      seenEnvs.push((opts as { env?: NodeJS.ProcessEnv } | undefined)?.env);
+      return { status: 0, stdout: "", stderr: "", pid: 0, signal: null, output: [], error: undefined };
+    };
+    ensureLarkCliProfile(BOT_ID, PROFILE_NAME, APP_ID, APP_SECRET, spawn, { log: vi.fn(), warn: vi.fn() }, {
+      configDir: "/tmp/iso/lark-cli",
+    });
+    expect(seenEnvs[0]?.["LARKSUITE_CLI_CONFIG_DIR"]).toBe("/tmp/iso/lark-cli");
+    // Without opts, no env override is passed at all (inherit = shared dir).
+    ensureLarkCliProfile(BOT_ID, PROFILE_NAME, APP_ID, APP_SECRET, spawn, { log: vi.fn(), warn: vi.fn() });
+    expect(seenEnvs[1]).toBeUndefined();
+  });
+
   it("calls config init on every startup, even when profile already appears registered", () => {
     // Self-heal rationale: config show returning exit 0 + correct appId does NOT
     // prove the stored credential is usable (e.g. keychain drift, legacy nameless

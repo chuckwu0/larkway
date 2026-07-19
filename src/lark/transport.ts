@@ -159,6 +159,8 @@ export interface LarkClientOptions {
    * passed (V1 single-bot uses default profile naturally).
    */
   larkCliProfile?: string;
+  /** BL-50: private lark-cli config dir for this bot (identity isolation). */
+  larkCliConfigDir?: string;
   /**
    * V2 multi-bot: per-bot state directory.
    * When set, all 4 state files (recover-attempts, chat-watermarks, seen-messages,

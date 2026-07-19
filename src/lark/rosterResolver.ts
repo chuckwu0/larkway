@@ -88,6 +88,8 @@ export function remapPeersToLiveRoster(peers: PeerBot[], liveRoster: LiveBotRost
 export interface ResolveRosterOpts {
   larkCliPath?: string;
   profile?: string;
+  /** BL-50: private lark-cli config dir for this bot (identity isolation). */
+  larkCliConfigDir?: string;
   /** Test seam: injected exec returning raw stdout. Defaults to a lark-cli spawn. */
   exec?: (cmd: string, args: string[]) => Promise<string>;
   timeoutMs?: number;
@@ -105,7 +107,7 @@ export async function resolveChatBotRoster(
   const cli = opts.larkCliPath ?? "lark-cli";
   const args = ["im", "chat.members", "bots", "--chat-id", chatId, "--as", "bot"];
   if (opts.profile) args.push("--profile", opts.profile);
-  const exec = opts.exec ?? defaultExec(opts.timeoutMs ?? 10_000);
+  const exec = opts.exec ?? defaultExec(opts.timeoutMs ?? 10_000, opts.larkCliConfigDir);
   try {
     const stdout = await exec(cli, args);
     const roster = parseBotRoster(stdout);
@@ -115,10 +117,17 @@ export async function resolveChatBotRoster(
   }
 }
 
-function defaultExec(timeoutMs: number): (cmd: string, args: string[]) => Promise<string> {
+function defaultExec(
+  timeoutMs: number,
+  larkCliConfigDir?: string,
+): (cmd: string, args: string[]) => Promise<string> {
+  // BL-50: isolated bots resolve rosters against their private config dir.
+  const env = larkCliConfigDir
+    ? { ...process.env, LARKSUITE_CLI_CONFIG_DIR: larkCliConfigDir }
+    : undefined;
   return (cmd, args) =>
     new Promise((resolve, reject) => {
-      execFile(cmd, args, { timeout: timeoutMs, maxBuffer: 1024 * 1024 }, (err, stdout) => {
+      execFile(cmd, args, { timeout: timeoutMs, maxBuffer: 1024 * 1024, ...(env ? { env } : {}) }, (err, stdout) => {
         if (err) reject(err);
         else resolve(stdout);
       });

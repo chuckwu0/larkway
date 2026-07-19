@@ -45,6 +45,11 @@ import type { OutboundCardClient } from "./outboundCardClient.js";
 import type { OutboundPostClient } from "./outboundPostClient.js";
 
 const execFile = promisify(execFileCallback);
+
+/** BL-50: env for this bot's lark-cli subprocesses (private config dir). */
+function larkCliEnvFor(configDir: string | undefined): NodeJS.ProcessEnv | undefined {
+  return configDir ? { ...process.env, LARKSUITE_CLI_CONFIG_DIR: configDir } : undefined;
+}
 const LEARNED_CHATS_LIMIT = 100;
 const SEEN_MESSAGES_LIMIT = 1000;
 /**
@@ -1410,7 +1415,12 @@ export class ChannelClient {
     for (let attempt = 1; attempt <= GAP_FILL_MAX_ATTEMPTS; attempt++) {
       if (this.closed) throw lastErr ?? new Error("closed");
       try {
-        return await execFile(larkCli, args);
+        {
+          // BL-50: only pass an options arg in isolated mode — the 2-arg call
+          // shape is a stable seam several test mocks rely on.
+          const isoEnv = larkCliEnvFor(this.opts.larkCliConfigDir);
+          return isoEnv ? await execFile(larkCli, args, { env: isoEnv }) : await execFile(larkCli, args);
+        }
       } catch (e) {
         lastErr = e;
         // 230002 is deterministic (bot removed from the chat) — in-cycle
@@ -1596,7 +1606,10 @@ export class ChannelClient {
         ];
         if (pageToken) args.push("--page-token", pageToken);
 
-        const { stdout } = await execFile(larkCli, args);
+        const isoEnv = larkCliEnvFor(this.opts.larkCliConfigDir);
+      const { stdout } = isoEnv
+        ? await execFile(larkCli, args, { env: isoEnv })
+        : await execFile(larkCli, args);
         const parsed = JSON.parse(stdout) as unknown;
         const chats = parseLarkCliMessages(stdout) ?? [];
         fetched += chats.length;

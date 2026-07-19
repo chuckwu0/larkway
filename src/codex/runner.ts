@@ -88,10 +88,16 @@ export function productizeCodexFailure(stderr: string): string | undefined {
 export function buildCodexEnv(
   botGitIdentity?: { name: string; email: string },
   gitlabToken?: string,
+  larkCliConfigDir?: string,
 ): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...process.env };
   delete env["OPENAI_API_KEY"];
   delete env["ANTHROPIC_API_KEY"];
+
+  // BL-50: point this bot's lark-cli at its private config dir.
+  if (larkCliConfigDir !== undefined) {
+    env["LARKSUITE_CLI_CONFIG_DIR"] = larkCliConfigDir;
+  }
 
   if (botGitIdentity) {
     env["GIT_AUTHOR_NAME"] = botGitIdentity.name;
@@ -461,7 +467,7 @@ export function* parseCodexLine(line: string): Generator<AgentStreamEvent> {
 export function runCodex(opts: RunOptions, codexBinPath = "codex"): RunHandle {
   const timeoutMs = opts.timeoutMs ?? 15 * 60 * 1000;
   const [bin, args] = buildCodexCommand(opts, codexBinPath);
-  const env = buildCodexEnv(opts.botGitIdentity, opts.gitlabToken);
+  const env = buildCodexEnv(opts.botGitIdentity, opts.gitlabToken, opts.larkCliConfigDir);
   const mode = opts.permissionMode ?? "acceptEdits";
   const requestById = new Map<number, string>();
   let nextRequestId = 1;

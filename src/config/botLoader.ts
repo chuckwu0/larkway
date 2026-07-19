@@ -279,6 +279,18 @@ export const BotConfigSchema = z.object({
   lark_cli_profile: z.string().min(1).optional(),
 
   /**
+   * BL-50: per-bot lark-cli identity isolation. When true, every lark-cli
+   * invocation for this bot (agent subprocess, gap-fill, roster, health scan)
+   * runs with LARKSUITE_CLI_CONFIG_DIR pointed at ~/.larkway/<botId>/lark-cli/
+   * — a private config dir holding ONLY this bot's app profile. The
+   * maintainer's personal lark-cli login (calendar/mail/drive access) in the
+   * shared global dir becomes invisible to this bot's agent ("bot-only" by
+   * default; grant user identity by running `lark-cli auth login` with the
+   * same LARKSUITE_CLI_CONFIG_DIR). Default false = shared dir (pre-BL-50).
+   */
+  lark_cli_isolated: z.boolean().optional(),
+
+  /**
    * Env-var *name* (not value) that holds this bot's Git PAT.
    * Read from process.env at startup and injected as GITLAB_TOKEN into the
    * agent subprocess env, so MRs/git ops use the bot's own account.

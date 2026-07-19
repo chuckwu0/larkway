@@ -75,6 +75,7 @@ export function ensureLarkCliProfile(
   appSecret: string,
   _spawnSync: SpawnSyncFn = spawnProcessSync as SpawnSyncFn,
   _console: Pick<Console, "log" | "warn"> = console,
+  opts?: { configDir?: string },
 ): void {
   // Always (re-)provision the named profile so credential drift self-heals.
   // `config init --name` is idempotent for named profiles: no re-key, no
@@ -90,6 +91,10 @@ export function ensureLarkCliProfile(
         input: appSecret,
         encoding: "utf-8",
         timeout: 10_000,
+        // BL-50: provision inside the bot's private config dir when isolated.
+        ...(opts?.configDir
+          ? { env: { ...process.env, LARKSUITE_CLI_CONFIG_DIR: opts.configDir } }
+          : {}),
       },
     );
     if (initResult.status === 0) {

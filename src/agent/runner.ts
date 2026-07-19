@@ -94,6 +94,12 @@ export interface RunOptions {
   /** @default 'claude' */
   agentBinPath?: string;
   /**
+   * BL-50: when set, the agent subprocess gets
+   * LARKSUITE_CLI_CONFIG_DIR=<dir> so its lark-cli calls only see this bot's
+   * private profile (identity isolation). Absent → shared global config dir.
+   */
+  larkCliConfigDir?: string;
+  /**
    * Git author/committer identity for commits made in this session.
    * V2: sourced from bots/*.yaml `git_identity` field.
    * If absent, the child uses the host repo/global git config naturally.

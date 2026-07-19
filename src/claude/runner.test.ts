@@ -88,6 +88,13 @@ describe("buildEnv", () => {
     }
   });
 
+  it("BL-50: sets LARKSUITE_CLI_CONFIG_DIR only when larkCliConfigDir is given", () => {
+    const isolated = buildEnv(undefined, undefined, "/home/u/.larkway/bot-a/lark-cli");
+    expect(isolated["LARKSUITE_CLI_CONFIG_DIR"]).toBe("/home/u/.larkway/bot-a/lark-cli");
+    const shared = buildEnv();
+    expect(shared["LARKSUITE_CLI_CONFIG_DIR"]).toBe(process.env["LARKSUITE_CLI_CONFIG_DIR"]);
+  });
+
   it("strips ANTHROPIC_API_KEY (subscription mode, never API-key billing)", () => {
     process.env["ANTHROPIC_API_KEY"] = "sk-test-should-be-stripped";
     const env = buildEnv();

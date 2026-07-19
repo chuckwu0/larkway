@@ -55,6 +55,11 @@ export function larkwayHome(): string {
  *
  * Backward-compat: V1 callers can omit botId entirely.
  */
+/** BL-50: per-bot private lark-cli config dir (LARKSUITE_CLI_CONFIG_DIR). */
+export function resolveBotLarkCliDir(botId: string): string {
+  return join(resolveLarkwayDir(botId), "lark-cli");
+}
+
 export function resolveLarkwayDir(botId?: string): string {
   if (botId === undefined || botId === LEGACY_BOT_ID) {
     return larkwayHome();

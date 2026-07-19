@@ -32,7 +32,7 @@ import {
   resetAgentWorkspacePermissions,
 } from "../agent/workspaceStore.js";
 import { permissionItemsFromCapabilities } from "../agent/permissionPlan.js";
-import { resolveAgentWorkspacePathFromHome } from "../config/paths.js";
+import { resolveAgentWorkspacePathFromHome, resolveBotLarkCliDir } from "../config/paths.js";
 import { computeBotMemoryLiveness } from "./memoryLiveness.js";
 import {
   resolveMemoryMetricsPath,
@@ -402,7 +402,7 @@ interface HealthCredentialItem {
 }
 
 async function runHealthScan(
-  bot: { id: string; backend?: string; app_id: string; lark_cli_profile?: string; repos?: unknown[]; git_token_env?: string; gitlab_token_env?: string },
+  bot: { id: string; backend?: string; app_id: string; lark_cli_profile?: string; lark_cli_isolated?: boolean; repos?: unknown[]; git_token_env?: string; gitlab_token_env?: string },
   hostConfigStore: { readSecret(envName: string): Promise<string | null> },
 ): Promise<Record<string, unknown>> {
   const credentials: HealthCredentialItem[] = [];
@@ -428,7 +428,14 @@ async function runHealthScan(
       ["--profile", profile, "auth", "status", "--json"],
       // commandProbeEnv:补齐 ~/.local/bin 等用户级安装目录(mini 实测:精简
       // PATH 的 UI 进程探测不到工具,与登录态探测自相矛盾)
-      { timeout: HEALTH_SCAN_PROBE_TIMEOUT_MS, maxBuffer: 1024 * 1024, env: commandProbeEnv() },
+      {
+        timeout: HEALTH_SCAN_PROBE_TIMEOUT_MS,
+        maxBuffer: 1024 * 1024,
+        // BL-50: probe an isolated bot inside its private config dir.
+        env: bot.lark_cli_isolated
+          ? { ...commandProbeEnv(), LARKSUITE_CLI_CONFIG_DIR: resolveBotLarkCliDir(bot.id) }
+          : commandProbeEnv(),
+      },
     );
     const payload = healthScanParseJson(stdout);
     const botIdentity = (payload?.identities as Record<string, { available?: boolean }> | undefined)?.bot;

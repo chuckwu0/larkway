@@ -58,9 +58,15 @@ const SIGKILL_GRACE_MS = 5_000;
 function buildEnv(
   botGitIdentity?: { name: string; email: string },
   gitlabToken?: string,
+  larkCliConfigDir?: string,
 ): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...process.env };
   delete env["ANTHROPIC_API_KEY"];
+
+  // BL-50: point this bot's lark-cli at its private config dir.
+  if (larkCliConfigDir !== undefined) {
+    env["LARKSUITE_CLI_CONFIG_DIR"] = larkCliConfigDir;
+  }
 
   if (botGitIdentity) {
     env["GIT_AUTHOR_NAME"] = botGitIdentity.name;
@@ -327,7 +333,7 @@ function* parseLinesMulti(
 export function runClaude(opts: RunOptions): RunHandle {
   const timeoutMs = opts.timeoutMs ?? 15 * 60 * 1000;
   const [bin, args] = buildCommand(opts);
-  const env = buildEnv(opts.botGitIdentity, opts.gitlabToken);
+  const env = buildEnv(opts.botGitIdentity, opts.gitlabToken, opts.larkCliConfigDir);
 
   // A0 (perf plan): dedup'd marker sink — see createPerfMarker/markPerfForEventType.
   const markPerf = createPerfMarker(opts.onPerfMarker);
