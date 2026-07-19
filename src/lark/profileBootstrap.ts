@@ -18,7 +18,8 @@
  *  - Secure: app secret is passed via stdin, never via argv or logs.
  */
 
-import { spawn, spawnSync, type SpawnSyncOptions, type SpawnSyncReturns } from "node:child_process";
+import type { SpawnSyncOptions, SpawnSyncReturns } from "node:child_process";
+import { spawnProcess, spawnProcessSync } from "../platform/spawn.js";
 
 // ---------------------------------------------------------------------------
 // Injectable spawn for testability
@@ -72,7 +73,7 @@ export function ensureLarkCliProfile(
   profileName: string,
   appId: string,
   appSecret: string,
-  _spawnSync: SpawnSyncFn = spawnSync as SpawnSyncFn,
+  _spawnSync: SpawnSyncFn = spawnProcessSync as SpawnSyncFn,
   _console: Pick<Console, "log" | "warn"> = console,
 ): void {
   // Always (re-)provision the named profile so credential drift self-heals.
@@ -142,7 +143,7 @@ export async function ensureLarkCliProfileAsync(
   profileName: string,
   appId: string,
   appSecret: string,
-  _spawn: SpawnAsyncFn = spawn as unknown as SpawnAsyncFn,
+  _spawn: SpawnAsyncFn = spawnProcess as unknown as SpawnAsyncFn,
   _console: Pick<Console, "log" | "warn"> = console,
 ): Promise<void> {
   _console.log(

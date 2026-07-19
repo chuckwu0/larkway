@@ -1,6 +1,6 @@
-import { execFileSync } from "node:child_process";
 import { homedir } from "node:os";
 import { delimiter } from "node:path";
+import { findOnPath, spawnProcessSync } from "./platform/spawn.js";
 import type { BotConfig } from "./config/botLoader.js";
 
 /**
@@ -40,21 +40,17 @@ export interface RuntimeRequirement {
 
 function checkCli(command: string): { ok: boolean; version?: string } {
   const env = commandProbeEnv();
-  try {
-    execFileSync("which", [command], { stdio: ["pipe", "pipe", "pipe"], env });
-  } catch {
+  // Pure-JS PATH scan instead of `which` — `which` doesn't exist on Windows.
+  if (findOnPath(command, env) === null) {
     return { ok: false };
   }
 
-  try {
-    const version = execFileSync(command, ["--version"], { stdio: ["pipe", "pipe", "pipe"], env })
-      .toString()
-      .trim()
-      .split("\n")[0];
+  const probe = spawnProcessSync(command, ["--version"], { encoding: "utf-8", env, timeout: 10_000 });
+  if (probe.status === 0 && typeof probe.stdout === "string") {
+    const version = probe.stdout.trim().split("\n")[0];
     return { ok: true, ...(version ? { version } : {}) };
-  } catch {
-    return { ok: true };
   }
+  return { ok: true };
 }
 
 function repoLooksGitLab(urlOrSlug: string): boolean {

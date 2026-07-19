@@ -53,6 +53,7 @@
  */
 
 import { execFile, spawn, type ChildProcess } from "node:child_process";
+import { spawnPiped } from "../platform/spawn.js";
 import { mkdir, readFile, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { createInterface } from "node:readline";
@@ -491,7 +492,7 @@ export class CodexProcessPool implements AgentRunner {
   #spawnChild(): void {
     const [bin, args] = buildCodexCommand({ prompt: "" }, this.#codexBinPath);
     const env = buildCodexEnv(this.#botGitIdentity, this.#gitlabToken);
-    const child = spawn(bin, args, { env, stdio: ["pipe", "pipe", "pipe"] });
+    const child = spawnPiped(bin, args, { env });
     this.#child = child;
     this.#pending.clear();
     this.#threadOwners.clear();

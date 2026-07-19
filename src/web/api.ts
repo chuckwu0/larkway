@@ -14,9 +14,7 @@
  */
 
 import { readdir, readFile, stat } from "node:fs/promises";
-import { execFile as execFileCallback } from "node:child_process";
 import path from "node:path";
-import { promisify } from "node:util";
 import yaml from "js-yaml";
 
 import * as botsStore from "../cli/botsStore.js";
@@ -61,8 +59,16 @@ import {
   type OnboardForm,
 } from "./onboardSession.js";
 import { commandProbeEnv, runtimeRequirementsForBots } from "../runtimeRequirements.js";
+import { execCollect } from "../platform/spawn.js";
 
-const execFileAsync = promisify(execFileCallback);
+// execFile-compatible runner over cross-spawn (Windows .cmd shims: lark-cli /
+// npm / larkway resolve correctly there; identical behaviour on POSIX).
+const execFileCompat = (
+  file: string,
+  args: string[],
+  opts: { timeout: number; maxBuffer?: number; env?: NodeJS.ProcessEnv },
+): Promise<{ stdout: string; stderr: string }> =>
+  execCollect(file, args, { timeout: opts.timeout, ...(opts.env ? { env: opts.env } : {}) });
 const CHAT_NAME_CACHE_MS = 5 * 60 * 1000;
 const chatNameCache = new Map<string, { expiresAt: number; names: Map<string, string> }>();
 type EventExecFile = (
@@ -70,22 +76,22 @@ type EventExecFile = (
   args: string[],
   opts: { timeout: number },
 ) => Promise<{ stdout: string; stderr: string }>;
-let eventExecFile: EventExecFile = execFileAsync as EventExecFile;
+let eventExecFile: EventExecFile = execFileCompat as EventExecFile;
 
 type UpdateExecFile = (
   file: string,
   args: string[],
   opts: { timeout: number; maxBuffer?: number },
 ) => Promise<{ stdout: string; stderr: string }>;
-let updateExecFile: UpdateExecFile = execFileAsync as UpdateExecFile;
+let updateExecFile: UpdateExecFile = execFileCompat as UpdateExecFile;
 
 export function _setEventNameResolverExecForTest(fn?: EventExecFile): void {
   chatNameCache.clear();
-  eventExecFile = fn ?? (execFileAsync as EventExecFile);
+  eventExecFile = fn ?? (execFileCompat as EventExecFile);
 }
 
 export function _setUpdateVersionExecForTest(fn?: UpdateExecFile): void {
-  updateExecFile = fn ?? (execFileAsync as UpdateExecFile);
+  updateExecFile = fn ?? (execFileCompat as UpdateExecFile);
 }
 
 /**
@@ -336,7 +342,7 @@ type HealthScanExecFile = (
   args: string[],
   opts: { timeout: number; maxBuffer: number; env?: NodeJS.ProcessEnv },
 ) => Promise<{ stdout: string; stderr: string }>;
-let healthScanExecFile: HealthScanExecFile = execFileAsync as HealthScanExecFile;
+let healthScanExecFile: HealthScanExecFile = execFileCompat as HealthScanExecFile;
 
 /** 底座登录态探针(生产=detectClaudeLogin / codex auth.json 文件探测)。 */
 let healthScanBackendLoginProbe: (backend: string) => Promise<boolean | null> =
@@ -346,7 +352,7 @@ export function _setHealthScanForTest(overrides?: {
   exec?: HealthScanExecFile;
   backendLogin?: (backend: string) => Promise<boolean | null>;
 }): void {
-  healthScanExecFile = overrides?.exec ?? (execFileAsync as HealthScanExecFile);
+  healthScanExecFile = overrides?.exec ?? (execFileCompat as HealthScanExecFile);
   healthScanBackendLoginProbe = overrides?.backendLogin ?? defaultBackendLoginProbe;
   healthScanCache.clear();
 }

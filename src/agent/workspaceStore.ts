@@ -63,7 +63,9 @@ async function ensureRelativeSymlink(linkPath: string, target: string): Promise<
   } catch {
     // missing: create it below
   }
-  await fs.symlink(target, linkPath);
+  // Windows: plain symlinks need admin/Developer Mode; "junction" works for
+  // directories without extra privileges (ignored on POSIX).
+  await fs.symlink(target, linkPath, process.platform === "win32" ? "junction" : null);
 }
 
 async function readTextIfExists(filePath: string): Promise<string | undefined> {

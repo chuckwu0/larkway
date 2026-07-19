@@ -16,6 +16,7 @@
  */
 
 import { spawn } from "node:child_process";
+import { spawnPiped } from "../platform/spawn.js";
 import { createInterface } from "node:readline";
 import type { AgentRunner } from "../agent/runner.js";
 import {
@@ -472,9 +473,8 @@ export function runCodex(opts: RunOptions, codexBinPath = "codex"): RunHandle {
   // stdin/stdout carry app-server JSON-RPC. This is the Codex surface that
   // emits item/agentMessage/delta during generation; `codex exec --json`
   // only emits the completed agent message at the end.
-  const child = spawn(bin, args, {
+  const child = spawnPiped(bin, args, {
     env,
-    stdio: ["pipe", "pipe", "pipe"],
     ...(opts.cwd != null ? { cwd: opts.cwd } : {}),
   });
   markPerf("spawn");

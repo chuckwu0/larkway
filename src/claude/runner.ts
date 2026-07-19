@@ -12,6 +12,7 @@
  */
 
 import { spawn } from "node:child_process";
+import { spawnPipedOutput } from "../platform/spawn.js";
 import { writeFile, unlink, mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
@@ -334,9 +335,8 @@ export function runClaude(opts: RunOptions): RunHandle {
   // ── spawn ─────────────────────────────────────────────────────────────────
   // opts.cwd is passed both as spawn's cwd (sandbox boundary) and --cwd flag
   // (claude internal logic). spawn cwd is the authoritative sandbox boundary.
-  const child = spawn(bin, args, {
+  const child = spawnPipedOutput(bin, args, {
     env,
-    stdio: ["ignore", "pipe", "pipe"],
     // Shell is NOT used — args are passed as array, safe for prompt content
     ...(opts.cwd != null ? { cwd: opts.cwd } : {}),
   });

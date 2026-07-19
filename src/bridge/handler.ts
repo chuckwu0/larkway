@@ -422,17 +422,19 @@ async function ensureRepoCloneImpl(
   // name or the token env var (current callers are sequential, but this keeps it
   // safe if clones are ever parallelised).
   const uniq = `${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
-  const tmpScript = path.join(basePath, "..", `.askpass-${uniq}.sh`);
+  // GIT_ASKPASS must point at something the OS can execute: a /bin/sh script
+  // on POSIX, a .cmd batch file on Windows (git-for-windows runs it via cmd).
+  const isWin = process.platform === "win32";
+  const tmpScript = path.join(basePath, "..", `.askpass-${uniq}.${isWin ? "cmd" : "sh"}`);
   const tokenEnvVar = `LARKWAY_GIT_TOKEN_${uniq.replace(/[^a-zA-Z0-9]/g, "_")}`;
   try {
     // Ensure parent dir exists so we can write the script.
     await fs.mkdir(path.dirname(basePath), { recursive: true });
 
     // Write a minimal ASKPASS script: prints the token for "Password" prompts.
-    const scriptContent = [
-      "#!/bin/sh",
-      `echo "\${${tokenEnvVar}}"`,
-    ].join("\n") + "\n";
+    const scriptContent = isWin
+      ? `@echo off\r\necho %${tokenEnvVar}%\r\n`
+      : ["#!/bin/sh", `echo "\${${tokenEnvVar}}"`].join("\n") + "\n";
     await fs.writeFile(tmpScript, scriptContent, { mode: 0o700, encoding: "utf8" });
 
     console.log(`[bridge.handler] cloning ${label} into ${basePath} …`);

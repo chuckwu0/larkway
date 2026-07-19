@@ -16,6 +16,7 @@
 
 import { readFile } from "node:fs/promises";
 import { spawn } from "node:child_process";
+import { spawnProcess } from "../../platform/spawn.js";
 import { tmpdir } from "node:os";
 import { mkdir, writeFile, rm } from "node:fs/promises";
 import path from "node:path";
@@ -98,7 +99,7 @@ async function openInEditor(initial: string): Promise<string | null> {
     await writeFile(tmpFile, initial, "utf-8");
 
     await new Promise<void>((resolve, reject) => {
-      const child = spawn(editor, [tmpFile], {
+      const child = spawnProcess(editor, [tmpFile], {
         stdio: "inherit",
         // shell needed for editor strings like "code --wait"
         shell: editor.includes(" "),

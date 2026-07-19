@@ -22,9 +22,7 @@
  *   logs    — tail ~/.larkway/logs/bridge.log; --follow for continuous tail
  */
 
-import { spawn, execFile } from "node:child_process";
 import { access } from "node:fs/promises";
-import { promisify } from "node:util";
 import path from "node:path";
 import type { CliContext } from "../types.js";
 import {
@@ -36,8 +34,6 @@ import {
   type BridgeStatus,
 } from "../bridgeControl.js";
 import { loadBots } from "../../config/botLoader.js";
-
-const execFileAsync = promisify(execFile);
 
 // ---------------------------------------------------------------------------
 // Log file helpers
@@ -53,13 +49,33 @@ async function logFileExists(logPath: string): Promise<boolean> {
 }
 
 /**
- * Read the last `n` lines of a file using tail. Returns empty string if the
- * file does not exist.
+ * Read the last `n` lines of a file — pure Node (no `tail`, which is absent on
+ * Windows). Reads at most the trailing 256 KB. Returns "" when missing.
  */
 async function tailFile(logPath: string, lines: number): Promise<string> {
   try {
-    const { stdout } = await execFileAsync("tail", ["-n", String(lines), logPath]);
-    return stdout;
+    const { stat, open } = await import("node:fs/promises");
+    const s = await stat(logPath);
+    const MAX_READ = 256 * 1024;
+    let content: string;
+    if (s.size > MAX_READ) {
+      const fh = await open(logPath, "r");
+      try {
+        const buf = Buffer.allocUnsafe(MAX_READ);
+        const { bytesRead } = await fh.read(buf, 0, MAX_READ, s.size - MAX_READ);
+        content = buf.subarray(0, bytesRead).toString("utf-8");
+        const firstNL = content.indexOf("\n");
+        if (firstNL >= 0) content = content.slice(firstNL + 1);
+      } finally {
+        await fh.close();
+      }
+    } else {
+      const { readFile } = await import("node:fs/promises");
+      content = await readFile(logPath, "utf-8");
+    }
+    const all = content.split("\n");
+    if (all.length > 0 && all[all.length - 1] === "") all.pop();
+    return all.slice(-lines).join("\n") + "\n";
   } catch {
     return "";
   }
@@ -336,16 +352,39 @@ async function cmdLogs(ctx: CliContext, args: string[]): Promise<number> {
       return 1;
     }
 
-    // tail -f: hand off to the shell and let the process run until Ctrl-C.
+    // Follow mode — pure Node (no `tail -f` on Windows): print the current
+    // tail, then poll for appended bytes until Ctrl-C. 500ms poll is plenty
+    // for human log-watching and avoids fs.watch's platform quirks.
     ui.print(ui.dim(`正在跟随日志 ${logPath}  (Ctrl-C 退出)`));
-    const child = spawn("tail", ["-f", logPath], {
-      stdio: ["ignore", "inherit", "inherit"],
-    });
+    process.stdout.write(await tailFile(logPath, 50));
+    const { stat: statFile, open: openFile } = await import("node:fs/promises");
+    let offset = await statFile(logPath).then((s) => s.size).catch(() => 0);
     return await new Promise<number>((resolve) => {
-      child.on("close", (code) => resolve(code ?? 0));
-      child.on("error", (e) => {
-        ui.failure(`tail -f 失败: ${e.message}`);
-        resolve(1);
+      const timer = setInterval(() => {
+        void (async () => {
+          try {
+            const s = await statFile(logPath);
+            if (s.size < offset) offset = 0; // rotated/truncated — restart from head
+            if (s.size > offset) {
+              const fh = await openFile(logPath, "r");
+              try {
+                const len = s.size - offset;
+                const buf = Buffer.allocUnsafe(len);
+                const { bytesRead } = await fh.read(buf, 0, len, offset);
+                offset += bytesRead;
+                process.stdout.write(buf.subarray(0, bytesRead).toString("utf-8"));
+              } finally {
+                await fh.close();
+              }
+            }
+          } catch {
+            // file temporarily missing (rotation) — keep polling
+          }
+        })();
+      }, 500);
+      process.on("SIGINT", () => {
+        clearInterval(timer);
+        resolve(0);
       });
     });
   }

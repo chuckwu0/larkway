@@ -395,13 +395,16 @@ function writeBody(
 async function openBrowser(url: string): Promise<void> {
   try {
     const { spawn } = await import("node:child_process");
-    const cmd =
+    // `start` is a cmd.exe builtin, not an executable — spawn it via cmd /c.
+    // The empty "" arg is start's window-title slot; without it a quoted URL
+    // would be consumed as the title.
+    const [cmd, args] =
       process.platform === "darwin"
-        ? "open"
+        ? ["open", [url]]
         : process.platform === "win32"
-          ? "start"
-          : "xdg-open";
-    spawn(cmd, [url], { stdio: "ignore", detached: true }).unref();
+          ? ["cmd", ["/c", "start", "", url]]
+          : ["xdg-open", [url]];
+    spawn(cmd, args as string[], { stdio: "ignore", detached: true }).unref();
   } catch {
     // Non-fatal: the URL is already printed for manual paste.
   }

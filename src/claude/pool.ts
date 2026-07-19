@@ -63,6 +63,7 @@
  */
 
 import { execFile, spawn, type ChildProcess } from "node:child_process";
+import { spawnPiped } from "../platform/spawn.js";
 import { mkdir, readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { createInterface } from "node:readline";
@@ -808,9 +809,8 @@ export class ClaudeProcessPool implements AgentRunner {
   #spawnEntry(key: string, threadId: string, opts: RunOptions, flags?: { blank?: boolean }): PoolEntry {
     const [bin, args] = buildWarmCommand(opts);
     const env = buildEnv(this.#botGitIdentity, this.#gitlabToken);
-    const child = spawn(bin, args, {
+    const child = spawnPiped(bin, args, {
       env,
-      stdio: ["pipe", "pipe", "pipe"],
       ...(opts.cwd != null ? { cwd: opts.cwd } : {}),
     });
 

@@ -36,7 +36,8 @@
  *     only, no app/role) cannot express.
  */
 
-import { spawnSync, type SpawnSyncOptions, type SpawnSyncReturns } from "node:child_process";
+import type { SpawnSyncOptions, SpawnSyncReturns } from "node:child_process";
+import { spawnProcessSync } from "../platform/spawn.js";
 import type { TaskMember } from "../tasklist/client.js";
 
 /** Simplified spawnSync signature — same shape as ownerIdentity.ts's SpawnSyncFn / profileBootstrap.ts's SpawnSyncFn. */
@@ -114,7 +115,7 @@ function runLarkCliJson(args: string[], spawnSyncFn: SpawnSyncFn): UserOpResult<
 export function searchUserTasklists(
   profile: string,
   query: string,
-  spawnSyncFn: SpawnSyncFn = spawnSync,
+  spawnSyncFn: SpawnSyncFn = spawnProcessSync,
 ): UserOpResult<UserTasklistSummary[]> {
   const result = runLarkCliJson(
     ["task", "+tasklist-search", "--as", "user", "--profile", profile, "--query", query, "--page-all", "--json"],
@@ -188,7 +189,7 @@ export function addTasklistMembersAsUser(
   profile: string,
   tasklistGuid: string,
   members: TaskMember[],
-  spawnSyncFn: SpawnSyncFn = spawnSync,
+  spawnSyncFn: SpawnSyncFn = spawnProcessSync,
 ): UserOpResult<unknown> {
   const dataJson = JSON.stringify({ members });
   return runLarkCliJson(
@@ -218,7 +219,7 @@ export function addTasklistMembersAsUser(
 export function getUserTasklistMembers(
   profile: string,
   tasklistGuid: string,
-  spawnSyncFn: SpawnSyncFn = spawnSync,
+  spawnSyncFn: SpawnSyncFn = spawnProcessSync,
 ): UserOpResult<Array<{ id: string; type?: string; role?: string }>> {
   const result = runLarkCliJson(
     ["task", "tasklists", "get", "--as", "user", "--profile", profile, "--tasklist-guid", tasklistGuid, "--json"],

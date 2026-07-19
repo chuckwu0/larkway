@@ -23,6 +23,7 @@
  */
 
 import { spawn } from "node:child_process";
+import { spawnPipedOutput } from "../../platform/spawn.js";
 import { readFile, access } from "node:fs/promises";
 import { createRequire } from "node:module";
 import path from "node:path";
@@ -171,7 +172,7 @@ function runCmd(
   printErr: (line: string) => void,
 ): Promise<number> {
   return new Promise((resolve) => {
-    const child = spawn(cmd, args, { cwd, stdio: ["ignore", "pipe", "pipe"] });
+    const child = spawnPipedOutput(cmd, args, { cwd });
 
     let stdoutBuf = "";
     child.stdout.on("data", (chunk: Buffer) => {

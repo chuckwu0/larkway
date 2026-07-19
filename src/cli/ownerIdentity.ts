@@ -27,7 +27,8 @@
  * flag when this returns undefined.
  */
 
-import { spawnSync, type SpawnSyncOptions, type SpawnSyncReturns } from "node:child_process";
+import type { SpawnSyncOptions, SpawnSyncReturns } from "node:child_process";
+import { spawnProcessSync } from "../platform/spawn.js";
 
 /** Simplified spawnSync signature — same shape as profileBootstrap.ts's SpawnSyncFn. */
 export type SpawnSyncFn = (
@@ -40,7 +41,7 @@ export type SpawnSyncFn = (
  * Returns the open_id of the human user currently logged into lark-cli under
  * `profile`, or undefined if it can't be determined. Never throws.
  */
-export function resolveOwnerOpenId(profile: string, _spawnSync: SpawnSyncFn = spawnSync): string | undefined {
+export function resolveOwnerOpenId(profile: string, _spawnSync: SpawnSyncFn = spawnProcessSync): string | undefined {
   try {
     const result = _spawnSync("lark-cli", ["auth", "status", "--profile", profile, "--json"], {
       encoding: "utf-8",

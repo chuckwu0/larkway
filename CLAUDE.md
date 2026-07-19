@@ -25,6 +25,7 @@ src/
   config/       Bot YAML loader, path helpers, zod config schema
   knowledge/    Host-level org knowledge repo (git; harvest/inbox/topics — docs/knowledge-base.md)
   housekeeping/ Idle-session GC, orphaned worktree cleanup
+  platform/     Cross-platform process helpers (spawn via cross-spawn on win32, PATH lookup)
   web/          Local management UI (REST + static assets)
   cli/          `larkway` CLI subcommands (init, bot, doctor, …)
   main.ts       Entry point: wires runners, bots, channel, bridge
