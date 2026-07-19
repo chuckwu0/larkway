@@ -62,7 +62,8 @@
 | v0.3.55 | v0.3.55 | patch / 已发布 | fix: 定时唤醒/handoff 镜像 post 的幂等 uuid 超飞书 50 字符上限被 99992402 拒收(首晨两次唤醒失败),统一 sha256 短哈希 |
 | v0.3.56 | v0.3.56 | patch / 已发布 | gap-fill: recover p2p messages lost during WS outages (seed tracked chats from session history, p2p dispatch without mentions gate); stop 230002 dead-chat replay loop (fail fast + untrack after 3 cycles) |
 | v0.3.57 | v0.3.57 | patch / 已发布 | schedule 热加载:改 bot yaml 的 schedules/schedule_chat_id 无需重启,≤30s 生效;坏编辑不清空已武装闹钟 |
-| v0.3.58 | v0.3.58 | 当前 patch / 已发布 | task_handle v5: declarative create/due/blocked — five-signal delegation contract; bridge creates task cards with topic backlink + follower, reschedules with reason, posts blocked comments; out-of-box prompt contract |
+| v0.3.58 | v0.3.58 | patch / 已发布 | task_handle v5: declarative create/due/blocked — five-signal delegation contract; bridge creates task cards with topic backlink + follower, reschedules with reason, posts blocked comments; out-of-box prompt contract |
+| v0.3.59 | v0.3.59 | 当前 patch / 已发布 | Windows install stopgap: Node bin shim with WSL guidance (was bash, broke npm on Windows); GitHub-first parity: Bash(gh *) core allow rule + doctor gh check |
 
 ## 使用原则
 
@@ -132,4 +133,5 @@ v0.3.55       = fix: 定时唤醒/handoff 镜像 post 的幂等 uuid 超飞书 5
 v0.3.56       = gap-fill: recover p2p messages lost during WS outages (seed tracked chats from session history, p2p dispatch without mentions gate); stop 230002 dead-chat replay loop (fail fast + untrack after 3 cycles)
 v0.3.57       = schedule 热加载:改 bot yaml 的 schedules/schedule_chat_id 无需重启,≤30s 生效;坏编辑不清空已武装闹钟
 v0.3.58       = task_handle v5: declarative create/due/blocked — five-signal delegation contract; bridge creates task cards with topic backlink + follower, reschedules with reason, posts blocked comments; out-of-box prompt contract
+v0.3.59       = Windows install stopgap: Node bin shim with WSL guidance (was bash, broke npm on Windows); GitHub-first parity: Bash(gh *) core allow rule + doctor gh check
 ```
