@@ -1385,7 +1385,7 @@ const getStatus: ApiHandler = async (req) => {
   // running we force all per-bot liveness to "offline" so the per-bot rows don't
   // show green while the top bar says "服务未运行". When the bridge IS running
   // we fall through to the normal status.json-based classification.
-  const bridgeStatus = await ctx.stores.bridgeControl.detectBridgeStatus(ctx.larkwayDir);
+  const bridgeStatus = await ctx.stores.bridgeControl.detectBridgeStatus(ctx.larkwayDir, { serviceAdapter: "auto" });
   const bridgeRunning = bridgeStatus.running;
 
   // Liveness: status.json always lives under the LOCAL runtime home
@@ -1752,7 +1752,7 @@ const postOnboardCancel: ApiHandler = async (req) => {
  */
 const getBridge: ApiHandler = async (req) => {
   const { ctx } = req;
-  const s = await ctx.stores.bridgeControl.detectBridgeStatus(ctx.larkwayDir);
+  const s = await ctx.stores.bridgeControl.detectBridgeStatus(ctx.larkwayDir, { serviceAdapter: "auto" });
   return {
     status: 200,
     json: { running: s.running, pid: s.pid, platform: s.platform, mode: s.mode },
@@ -1766,7 +1766,7 @@ const getBridge: ApiHandler = async (req) => {
  */
 const postBridgeRestart: ApiHandler = async (req) => {
   const { ctx } = req;
-  const r = await ctx.stores.bridgeControl.restartBridge(ctx.larkwayDir);
+  const r = await ctx.stores.bridgeControl.restartBridge(ctx.larkwayDir, { serviceAdapter: "auto" });
   return {
     status: r.ok ? 200 : 500,
     json: { ok: r.ok, status: r.status, message: r.message },

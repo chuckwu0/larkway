@@ -163,6 +163,7 @@ Secrets live only in `~/.larkway/.env` (mode 0600). Config and memory contain no
 - **Session continuity** — every Feishu thread maps to a persistent `session_id`; the agent remembers what it did in prior turns
 - **Agent Workspace** — each bot gets its own workspace where the agent clones the repo itself, with per-thread session dirs; concurrent threads don't trip over each other's git state (expect disk usage and a slower first turn on large repos — clones are per-session, GC'd after 24h idle)
 - **Codex runtime pre-checks** — `larkway doctor` validates Codex state directory writability before start
+- **OS-service daemon** — `larkway start` registers the bridge with launchd (macOS) / systemd (Linux): survives reboots and auto-restarts on crash; `larkway stop` stops it and disables autostart
 - **Topic ↔ Feishu task handle** — turn a topic into a Feishu task and the agent claims it, then keeps its lifecycle (done/failed/reopened, stalled, handed off, overdue) in sync automatically — see below
 
 ---

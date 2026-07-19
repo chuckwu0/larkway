@@ -7,6 +7,9 @@
  * (api.ts) without coupling either to the other.
  *
  * Platform behaviour:
+ *   - service mode (opts.serviceAdapter = "auto", installed package): registers
+ *     the bridge with launchd (macOS) / systemd (Linux) — boot autostart +
+ *     crash restart via the OS service manager. See serviceAdapter.ts.
  *   - linux-systemd: wraps `systemctl start|stop|is-active larkway-bridge`
  *   - mac / other:   background nohup supervisor + PID file in larkwayDir/bridge.pid
  *
@@ -27,6 +30,7 @@ import path from "node:path";
 import process from "node:process";
 import { stat } from "node:fs/promises";
 import { DEFAULT_STALE_MS } from "../bridge/statusFile.js";
+import { resolveServiceAdapter, type ServiceAdapter } from "./serviceAdapter.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -135,7 +139,7 @@ export interface BridgeStatus {
   running: boolean;
   pid: number | null;
   platform: BridgePlatform;
-  mode: "systemd" | "local" | "unknown";
+  mode: "systemd" | "local" | "unknown" | "launchd" | "systemd-user" | "systemd-system";
 }
 
 // ---------------------------------------------------------------------------
@@ -300,6 +304,23 @@ async function hasAnyFreshStatusJson(
 // ---------------------------------------------------------------------------
 
 export async function detectBridgeStatus(larkwayDir: string, opts?: BridgeControlOpts): Promise<BridgeStatus> {
+  // Service-manager mode: the service being active is authoritative; when it
+  // isn't, still run legacy detection (a pre-migration supervisor may hold the
+  // bridge), and surface the adapter kind as the configured mechanism.
+  const adapter = await effectiveServiceAdapter(larkwayDir, opts);
+  if (adapter) {
+    const serviceRunning = await adapter.isRunning().catch(() => false);
+    if (serviceRunning) {
+      const fresh = await hasAnyFreshStatusJson(larkwayDir, Date.now());
+      return { running: true, pid: fresh.pid, platform: detectPlatform(), mode: adapter.kind };
+    }
+    const legacy = await detectBridgeStatusLegacy(larkwayDir, opts);
+    return legacy.running ? legacy : { ...legacy, mode: adapter.kind };
+  }
+  return detectBridgeStatusLegacy(larkwayDir, opts);
+}
+
+async function detectBridgeStatusLegacy(larkwayDir: string, opts?: BridgeControlOpts): Promise<BridgeStatus> {
   const platform = detectPlatform();
 
   if (platform === "linux-systemd") {
@@ -368,19 +389,72 @@ export interface BridgeControlOpts {
    * hermetic without spawning a real bridge.
    */
   mainProcessPattern?: string;
+  /**
+   * OS service-manager mode (launchd / systemd — see serviceAdapter.ts).
+   *   - "auto":            resolve the host's adapter (real CLI / Web UI calls)
+   *   - a ServiceAdapter:  use as-is (unit tests inject fakes)
+   *   - undefined / null:  legacy supervisor path only (default — keeps existing
+   *                        tests hermetic and dev workflows unchanged)
+   */
+  serviceAdapter?: ServiceAdapter | "auto" | null;
 }
 
-export async function startBridge(
+/** Resolve the effective service adapter for these opts (null = legacy path). */
+async function effectiveServiceAdapter(
   larkwayDir: string,
   opts?: BridgeControlOpts,
-): Promise<{
+): Promise<ServiceAdapter | null> {
+  const setting = opts?.serviceAdapter;
+  if (!setting) return null;
+  if (setting !== "auto") return setting;
+  try {
+    return await resolveServiceAdapter({
+      larkwayDir,
+      distMain: await resolveDistMain(),
+      logPath: bridgeLogPath(larkwayDir),
+    });
+  } catch {
+    return null; // resolution failure → legacy path still works
+  }
+}
+
+export interface StartBridgeResult {
   ok: boolean;
   pid: number | null;
   alreadyRunning: boolean;
   platform: BridgePlatform;
   message: string;
-}> {
+}
+
+export async function startBridge(
+  larkwayDir: string,
+  opts?: BridgeControlOpts,
+): Promise<StartBridgeResult> {
   const platform = detectPlatform();
+
+  // Service-manager mode (launchd / systemd): register for boot autostart +
+  // crash restart, replacing the bash supervisor. Falls back to the legacy
+  // path when the service manager errors so `start` still yields a bridge.
+  const adapter = await effectiveServiceAdapter(larkwayDir, opts);
+  if (adapter) {
+    try {
+      if (await adapter.isRunning()) {
+        return { ok: true, pid: null, alreadyRunning: true, platform, message: `Bridge 已在运行(${adapter.kind} 服务 ${adapter.name})` };
+      }
+      // Migration: reap any legacy supervisor still holding this home so two
+      // daemons never race on one LARKWAY_HOME.
+      await stopLegacySupervisors(larkwayDir, opts);
+      await adapter.install();
+      await adapter.start();
+      return {
+        ok: true, pid: null, alreadyRunning: false, platform,
+        message: `Bridge 已注册为系统服务并启动(${adapter.kind}: ${adapter.name};开机自启 + 崩溃自动重启)`,
+      };
+    } catch (e) {
+      const legacy = await startLegacySupervisor(larkwayDir, opts, platform);
+      return { ...legacy, message: `服务注册失败(${(e as Error).message}),已回退本地 supervisor 模式。${legacy.message}` };
+    }
+  }
 
   if (platform === "linux-systemd") {
     try {
@@ -391,6 +465,15 @@ export async function startBridge(
     }
   }
 
+  return startLegacySupervisor(larkwayDir, opts, platform);
+}
+
+/** Legacy start path: bash supervisor (dev/server) or detached dist bundle. */
+async function startLegacySupervisor(
+  larkwayDir: string,
+  opts: BridgeControlOpts | undefined,
+  platform: BridgePlatform,
+): Promise<StartBridgeResult> {
   // mac / other. Single-instance guard (Bug① fix):
   const supervisorScript = opts?.supervisorScript ?? defaultSupervisorScript();
   const supervisors = await listSupervisorPids(supervisorScript, larkwayDir);
@@ -410,7 +493,7 @@ export async function startBridge(
   }
   // Multiple supervisors = orphans accumulated → reap them all, then spawn ONE.
   if (supervisors.length > 1) {
-    await stopBridge(larkwayDir, opts);
+    await stopLegacySupervisors(larkwayDir, opts);
   }
 
   const logPath = bridgeLogPath(larkwayDir);
@@ -468,10 +551,7 @@ export async function startBridge(
 // stopBridge
 // ---------------------------------------------------------------------------
 
-export async function stopBridge(
-  larkwayDir: string,
-  opts?: BridgeControlOpts,
-): Promise<{
+export interface StopBridgeResult {
   ok: boolean;
   wasRunning: boolean;
   /** True when graceful SIGTERM timed out and we escalated to SIGKILL. */
@@ -479,8 +559,39 @@ export async function stopBridge(
   /** The pid we signalled (mac/local), null on systemd / not-running. */
   pid: number | null;
   message: string;
-}> {
+}
+
+export async function stopBridge(
+  larkwayDir: string,
+  opts?: BridgeControlOpts,
+): Promise<StopBridgeResult> {
   const platform = detectPlatform();
+
+  // Service-manager mode: stop + disable autostart, then still reap any legacy
+  // supervisors (pre-migration daemons) so stop always means fully stopped.
+  const adapter = await effectiveServiceAdapter(larkwayDir, opts);
+  if (adapter) {
+    let serviceWasRunning = false;
+    try {
+      serviceWasRunning = await adapter.isRunning();
+      await adapter.stop();
+    } catch {
+      /* best-effort — the legacy reap below still runs */
+    }
+    const legacy = await stopLegacySupervisors(larkwayDir, opts);
+    const wasRunning = serviceWasRunning || legacy.wasRunning;
+    return {
+      ok: true,
+      wasRunning,
+      forcedKill: legacy.forcedKill,
+      pid: legacy.pid,
+      message: serviceWasRunning
+        ? `Bridge 服务已停止并禁用自启(${adapter.name})`
+        : wasRunning
+          ? legacy.message
+          : "Bridge 未在运行",
+    };
+  }
 
   if (platform === "linux-systemd") {
     try {
@@ -491,6 +602,14 @@ export async function stopBridge(
     }
   }
 
+  return stopLegacySupervisors(larkwayDir, opts);
+}
+
+/** Legacy stop path: kill every supervisor for this home (plus the pid-file pid). */
+async function stopLegacySupervisors(
+  larkwayDir: string,
+  opts?: BridgeControlOpts,
+): Promise<StopBridgeResult> {
   // mac / other: kill EVERY supervisor (Bug① fix — not just the pid-file one),
   // so orphaned crash-loopers can't survive a stop. Collect the pid-file pid (if
   // still alive) + all pgrep matches, de-duped.

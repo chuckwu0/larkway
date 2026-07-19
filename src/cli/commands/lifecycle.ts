@@ -5,8 +5,11 @@
  *
  * The dispatcher routes all four sub-commands here with the sub-command name
  * as args[0]. Platform detection:
- *   - macOS: background nohup supervisor, PID tracked in ~/.larkway/bridge.pid
- *   - Linux systemd host: wraps `systemctl start/stop/status larkway-bridge`
+ *   - installed package: OS service manager via serviceAdapter.ts ("auto") —
+ *     launchd LaunchAgent on macOS / systemd user unit on Linux, giving boot
+ *     autostart + crash restart; falls back to the paths below on failure
+ *   - dev checkout (no dist): background nohup supervisor, PID in ~/.larkway/bridge.pid
+ *   - Linux host with a provisioned system unit: wraps `systemctl … larkway-bridge`
  *
  * Design: this is a thin process-management wrapper. It does NOT embed bridge
  * logic — it delegates to bin/start-bridge.sh (local) or systemctl (server).
@@ -30,6 +33,7 @@ import {
   stopBridge,
   bridgeLogPath,
   tailBridgeLog,
+  type BridgeStatus,
 } from "../bridgeControl.js";
 import { loadBots } from "../../config/botLoader.js";
 
@@ -73,7 +77,7 @@ interface BridgeStatusDeep {
   /** Only filled by --deep probe: recent log snippet. */
   recentLog?: string;
   platform: string;
-  mode: "systemd" | "local" | "unknown";
+  mode: BridgeStatus["mode"];
 }
 
 /** Enrich a status with --deep log probe. */
@@ -151,7 +155,7 @@ export async function cmdStart(ctx: CliContext, deps: CmdStartDeps = defaultStar
     return 1;
   }
 
-  const result = await deps.startBridge(paths.larkwayDir);
+  const result = await deps.startBridge(paths.larkwayDir, { serviceAdapter: "auto" });
 
   if (!result.ok) {
     ui.failure(result.message);
@@ -181,7 +185,7 @@ export async function cmdStart(ctx: CliContext, deps: CmdStartDeps = defaultStar
   let alive = false;
   for (let i = 0; i < LIVENESS_POLL_TICKS; i++) {
     await deps.sleep(LIVENESS_POLL_TICK_MS);
-    const status = await deps.detectBridgeStatus(paths.larkwayDir);
+    const status = await deps.detectBridgeStatus(paths.larkwayDir, { serviceAdapter: "auto" });
     if (status.running) {
       alive = true;
       break;
@@ -217,14 +221,14 @@ async function cmdStop(ctx: CliContext): Promise<number> {
   const { ui, paths } = ctx;
 
   // Detect platform first for informational message.
-  const preStatus = await detectBridgeStatus(paths.larkwayDir);
+  const preStatus = await detectBridgeStatus(paths.larkwayDir, { serviceAdapter: "auto" });
   if (preStatus.platform === "linux-systemd") {
     ui.print("检测到 Linux 平台,使用 systemctl 停止…");
   } else if (preStatus.running && preStatus.pid) {
     ui.print(`正在停止 bridge (pid ${preStatus.pid})…`);
   }
 
-  const result = await stopBridge(paths.larkwayDir);
+  const result = await stopBridge(paths.larkwayDir, { serviceAdapter: "auto" });
 
   if (!result.ok) {
     ui.failure(result.message);
@@ -253,7 +257,7 @@ async function cmdStatus(ctx: CliContext, args: string[]): Promise<number> {
   const deep = args.includes("--deep");
   const logPath = bridgeLogPath(paths.larkwayDir);
 
-  let status: BridgeStatusDeep = await detectBridgeStatus(paths.larkwayDir);
+  let status: BridgeStatusDeep = await detectBridgeStatus(paths.larkwayDir, { serviceAdapter: "auto" });
 
   if (deep) {
     status = await deepProbe(status, logPath);
