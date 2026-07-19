@@ -63,9 +63,30 @@ async function ensureRelativeSymlink(linkPath: string, target: string): Promise<
   } catch {
     // missing: create it below
   }
-  // Windows: plain symlinks need admin/Developer Mode; "junction" works for
-  // directories without extra privileges (ignored on POSIX).
-  await fs.symlink(target, linkPath, process.platform === "win32" ? "junction" : null);
+  if (process.platform === "win32") {
+    // Junctions work for DIRECTORIES without admin/Developer Mode but cannot
+    // point at files (and they absolutize the target). For files, try a real
+    // file symlink (works for elevated users / Developer Mode) and fall back
+    // to a plain copy when symlink creation is not permitted.
+    const resolved = path.resolve(path.dirname(linkPath), target);
+    let isDir = false;
+    try {
+      isDir = (await fs.stat(resolved)).isDirectory();
+    } catch {
+      /* target missing — attempt the plain symlink below */
+    }
+    if (isDir) {
+      await fs.symlink(target, linkPath, "junction");
+      return;
+    }
+    try {
+      await fs.symlink(target, linkPath, "file");
+    } catch {
+      await fs.copyFile(resolved, linkPath);
+    }
+    return;
+  }
+  await fs.symlink(target, linkPath);
 }
 
 async function readTextIfExists(filePath: string): Promise<string | undefined> {

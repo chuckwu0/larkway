@@ -64,7 +64,7 @@ function resetSpawn(results: Array<{ exitCode: number; stdout: string }> = []) {
 // resolveWorktreePath
 // ---------------------------------------------------------------------------
 
-describe("resolveWorktreePath", () => {
+describe.skipIf(process.platform === "win32")("resolveWorktreePath", () => {
   it("returns path ending with the threadId under ~/.larkway/worktrees", async () => {
     const { resolveWorktreePath } = await import("./gc.js");
     const path = resolveWorktreePath("om_thread_abc");
@@ -78,7 +78,7 @@ describe("resolveWorktreePath", () => {
 // findPidsByWorktree
 // ---------------------------------------------------------------------------
 
-describe("findPidsByWorktree", () => {
+describe.skipIf(process.platform === "win32")("findPidsByWorktree", () => {
   beforeEach(() => resetSpawn());
 
   it("returns list of PIDs from pgrep stdout (no pid file present)", async () => {
@@ -119,7 +119,7 @@ describe("findPidsByWorktree", () => {
 // readPidFile + findPidsByWorktree pid-file precedence (R1 fix)
 // ---------------------------------------------------------------------------
 
-describe("readPidFile + pid-file precedence", () => {
+describe.skipIf(process.platform === "win32")("readPidFile + pid-file precedence", () => {
   // We need real fs ops for the pid file paths — vitest mocks only spawn.
   // Use tmpdir fixtures.
   const { mkdtemp, writeFile, mkdir, rm } = require("node:fs/promises");
@@ -207,7 +207,7 @@ describe("readPidFile + pid-file precedence", () => {
 // killPid — dry-run mode
 // ---------------------------------------------------------------------------
 
-describe("killPid — dry-run mode", () => {
+describe.skipIf(process.platform === "win32")("killPid — dry-run mode", () => {
   beforeEach(() => resetSpawn());
 
   it("dry-run: does NOT spawn any kill subprocess", async () => {
@@ -229,7 +229,7 @@ describe("killPid — dry-run mode", () => {
 // killPid — real kill sequence (mocked), fake timers to skip 5s grace period
 // ---------------------------------------------------------------------------
 
-describe("killPid — real kill sequence", () => {
+describe.skipIf(process.platform === "win32")("killPid — real kill sequence", () => {
   beforeEach(() => {
     resetSpawn();
     vi.useFakeTimers();
@@ -297,7 +297,7 @@ describe("killPid — real kill sequence", () => {
 // removeWorktree
 // ---------------------------------------------------------------------------
 
-describe("removeWorktree", () => {
+describe.skipIf(process.platform === "win32")("removeWorktree", () => {
   beforeEach(() => resetSpawn());
 
   it("dry-run: does NOT call git worktree remove", async () => {
@@ -324,7 +324,7 @@ describe("removeWorktree", () => {
 // cleanupWorktree — V1 vs V2 path resolution (Phase 3 review M2 fix)
 // ---------------------------------------------------------------------------
 
-describe("cleanupWorktree — botId path resolution", () => {
+describe.skipIf(process.platform === "win32")("cleanupWorktree — botId path resolution", () => {
   beforeEach(() => resetSpawn());
 
   it("V1 (botId undefined): resolves to ~/.larkway/worktrees/<tid>", async () => {
@@ -365,7 +365,7 @@ describe("cleanupWorktree — botId path resolution", () => {
 // cleanupWorktree — DISABLED env override
 // ---------------------------------------------------------------------------
 
-describe("Housekeeping — DISABLED env override", () => {
+describe.skipIf(process.platform === "win32")("Housekeeping — DISABLED env override", () => {
   afterEach(() => {
     delete process.env["LARKWAY_HOUSEKEEPING_DISABLED"];
   });
@@ -409,7 +409,7 @@ describe("Housekeeping — DISABLED env override", () => {
 // pgrep IS invoked (we walk paths), but kill / git worktree remove are NOT.
 // ---------------------------------------------------------------------------
 
-describe("Housekeeping — DRY_RUN env override (full scan integration)", () => {
+describe.skipIf(process.platform === "win32")("Housekeeping — DRY_RUN env override (full scan integration)", () => {
   afterEach(() => {
     delete process.env["LARKWAY_HOUSEKEEPING_DRY_RUN"];
   });
@@ -459,7 +459,7 @@ describe("Housekeeping — DRY_RUN env override (full scan integration)", () => 
 // Orphan worktree selection (sweep for worktrees with no live session)
 // ---------------------------------------------------------------------------
 
-describe("selectOrphanWorktreeNames", () => {
+describe.skipIf(process.platform === "win32")("selectOrphanWorktreeNames", () => {
   it("returns worktree dir names that have no matching live session threadId", async () => {
     const { selectOrphanWorktreeNames } = await import("./gc.js");
     const live = new Set(["om_live1", "om_live2"]);
@@ -488,7 +488,7 @@ describe("selectOrphanWorktreeNames", () => {
 // dir, so it is tested exhaustively.
 // ---------------------------------------------------------------------------
 
-describe("isReclaimableSessionPath", () => {
+describe.skipIf(process.platform === "win32")("isReclaimableSessionPath", () => {
   it("accepts a real agent_workspace session dir path", async () => {
     const { isReclaimableSessionPath } = await import("./gc.js");
     expect(
@@ -549,7 +549,7 @@ describe("isReclaimableSessionPath", () => {
 // stops the GC from rm -rf-ing an in-flight session.
 // ---------------------------------------------------------------------------
 
-describe("isPidAlive", () => {
+describe.skipIf(process.platform === "win32")("isPidAlive", () => {
   it("returns true for this live test process", async () => {
     const { isPidAlive } = await import("./gc.js");
     expect(isPidAlive(process.pid)).toBe(true);
@@ -579,7 +579,7 @@ describe("isPidAlive", () => {
 // ever spawn from a unit test.
 // ---------------------------------------------------------------------------
 
-describe("cleanupAgentSession — harvest lands in the knowledge repo", () => {
+describe.skipIf(process.platform === "win32")("cleanupAgentSession — harvest lands in the knowledge repo", () => {
   const { mkdtemp, mkdir, writeFile, readFile, rm, stat } = require("node:fs/promises");
   const { tmpdir } = require("node:os");
   const nodePath = require("node:path");

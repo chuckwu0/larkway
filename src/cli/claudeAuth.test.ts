@@ -14,15 +14,18 @@ import { detectClaudeLogin, claudeCredentialsPath } from "./claudeAuth.js";
 
 let tmpDir: string;
 let origHome: string | undefined;
+let origUserProfile: string | undefined;
 let origAuthToken: string | undefined;
 let origApiKey: string | undefined;
 
 beforeEach(async () => {
   tmpDir = await mkdtemp(path.join(tmpdir(), "larkway-claudeauth-test-"));
   origHome = process.env["HOME"];
+  origUserProfile = process.env["USERPROFILE"];
   origAuthToken = process.env["ANTHROPIC_AUTH_TOKEN"];
   origApiKey = process.env["ANTHROPIC_API_KEY"];
   process.env["HOME"] = tmpDir;
+  process.env["USERPROFILE"] = tmpDir;
   delete process.env["ANTHROPIC_AUTH_TOKEN"];
   delete process.env["ANTHROPIC_API_KEY"];
 });
@@ -30,6 +33,8 @@ beforeEach(async () => {
 afterEach(async () => {
   if (origHome !== undefined) process.env["HOME"] = origHome;
   else delete process.env["HOME"];
+  if (origUserProfile !== undefined) process.env["USERPROFILE"] = origUserProfile;
+  else delete process.env["USERPROFILE"];
   if (origAuthToken !== undefined) process.env["ANTHROPIC_AUTH_TOKEN"] = origAuthToken;
   else delete process.env["ANTHROPIC_AUTH_TOKEN"];
   if (origApiKey !== undefined) process.env["ANTHROPIC_API_KEY"] = origApiKey;

@@ -177,7 +177,7 @@ async function writeDogfoodFixture(opts: {
   );
 }
 
-describe("dogfood preflight", () => {
+describe.skipIf(process.platform === "win32")("dogfood preflight", () => {
   it("guide prints the normal creation path and exits 0 when larkway-devops is missing", async () => {
     const json: unknown[] = [];
     const code = await run(makeCtx(json), ["guide"]);

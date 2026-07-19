@@ -222,7 +222,9 @@ function buildCtx(
  */
 async function withFakeHome<T>(fn: () => Promise<T>): Promise<T> {
   const origHome = process.env.HOME;
+  const origUserProfile = process.env["USERPROFILE"];
   process.env.HOME = tmpRoot;
+  process.env["USERPROFILE"] = tmpRoot;
   // detectClaudeLogin() accepts proxy-env creds (ANTHROPIC_AUTH_TOKEN /
   // ANTHROPIC_BASE_URL / ANTHROPIC_API_KEY) in addition to the ~/.claude file.
   // HOME isolation alone is NOT enough — if these are set in the runner's env
@@ -239,6 +241,8 @@ async function withFakeHome<T>(fn: () => Promise<T>): Promise<T> {
   } finally {
     if (origHome !== undefined) process.env.HOME = origHome;
     else delete process.env.HOME;
+    if (origUserProfile !== undefined) process.env["USERPROFILE"] = origUserProfile;
+    else delete process.env["USERPROFILE"];
     for (const v of proxyVars) {
       if (origProxy[v] !== undefined) process.env[v] = origProxy[v];
       else delete process.env[v];

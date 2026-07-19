@@ -27,6 +27,7 @@ beforeEach(async () => {
   originalHome = process.env.HOME;
   originalLarkwayHome = process.env.LARKWAY_HOME;
   process.env.HOME = home;
+  process.env["USERPROFILE"] = home;
   process.env.LARKWAY_HOME = path.join(home, ".larkway");
   hc = await import("./hostConfig.js");
 });

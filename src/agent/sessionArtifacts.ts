@@ -138,11 +138,14 @@ export async function ensureSessionArtifacts(
   // The speed-note primitive is now one appended line to the org knowledge
   // repo's inbox (see prompt.ts's workspace block); distillation belongs to
   // the maintenance turn, not to conversation turns.
-  await fs.appendFile(
-    path.join(input.sessionPath, "transcript.md"),
-    `${renderTranscriptEntry(input)}\n`,
-    "utf8",
-  );
+  const transcriptPath = path.join(input.sessionPath, "transcript.md");
+  try {
+    await fs.appendFile(transcriptPath, `${renderTranscriptEntry(input)}\n`, "utf8");
+  } catch (e) {
+    // win32 fs errors omit the path for fd-based writes — name the file so
+    // the bridge's abort message stays actionable on every platform.
+    throw new Error(`failed to write ${transcriptPath}: ${e instanceof Error ? e.message : String(e)}`);
+  }
 }
 
 /** Answer excerpt cap for the per-turn transcript record (code points). */

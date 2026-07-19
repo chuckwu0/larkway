@@ -91,7 +91,8 @@ export function renderMemoryVisibilityTail(input: {
   if (input.changedWorkspaceFiles.length > 0) {
     // 「本轮期间」not「本轮修改」— 同 bot 并发 turn 共享 workspace,mtime
     // diff 只能证明变更发生在本轮时间窗内,不能证明是本轮所为。
-    lines.push(`📝 本轮期间变更了 ${input.changedWorkspaceFiles.join("、")}`);
+    // Feishu-facing repo-relative paths render with "/" on every platform.
+    lines.push(`📝 本轮期间变更了 ${input.changedWorkspaceFiles.map((f) => f.replaceAll("\\", "/")).join("、")}`);
   }
   if (input.knowledgeDiffstat && input.knowledgeDiffstat.trim() !== "") {
     const statLines = input.knowledgeDiffstat.trim().split("\n");

@@ -11,7 +11,8 @@
 import { describe, it, expect } from "vitest";
 import { readFileSync } from "node:fs";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
+import { tmpdir } from "node:os";
 import { resolveLarkwayVersion } from "./version.js";
 
 const pkg = JSON.parse(
@@ -35,7 +36,7 @@ describe("resolveLarkwayVersion", () => {
 
   it("returns the fallback when no larkway package.json is found above the file", () => {
     // A file URL deep under /tmp has no larkway package.json above it.
-    const bogus = "file:///tmp/__larkway_no_pkg__/nested/file.js";
+    const bogus = pathToFileURL(path.join(tmpdir(), "__larkway_no_pkg__", "nested", "file.js")).href;
     expect(resolveLarkwayVersion(bogus, "fallback-xyz")).toBe("fallback-xyz");
   });
 });

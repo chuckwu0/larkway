@@ -1798,6 +1798,7 @@ describe("backend model facts (看板 Model/Effort 动态事实)", () => {
     const dir = await mkdtemp(path.join(tmpdir(), "larkway-backends-facts-"));
     const oldHome = process.env.HOME;
     process.env.HOME = dir;
+    process.env["USERPROFILE"] = dir;
     try {
       await mkdir(path.join(dir, ".codex"), { recursive: true });
       await writeFile(

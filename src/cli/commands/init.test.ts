@@ -22,6 +22,7 @@ import { BotConfigSchema } from "../../config/botLoader.js";
 let tmpDir: string;
 let origBotsDir: string | undefined;
 let origHome: string | undefined;
+let origUserProfile: string | undefined;
 let origLarkwayHome: string | undefined;
 let origPath: string | undefined;
 let origCodexHome: string | undefined;
@@ -30,6 +31,7 @@ beforeEach(async () => {
   tmpDir = await mkdtemp(path.join(tmpdir(), "larkway-init-test-"));
   origBotsDir = process.env["LARKWAY_BOTS_DIR"];
   origHome = process.env["HOME"];
+  origUserProfile = process.env["USERPROFILE"];
   origLarkwayHome = process.env["LARKWAY_HOME"];
   origPath = process.env["PATH"];
   origCodexHome = process.env["CODEX_HOME"];
@@ -37,6 +39,7 @@ beforeEach(async () => {
   process.env["LARKWAY_BOTS_DIR"] = path.join(tmpDir, "bots");
   // 隔离 ~/.larkway 写入(用 HOME override)
   process.env["HOME"] = tmpDir;
+  process.env["USERPROFILE"] = tmpDir;
   process.env["LARKWAY_HOME"] = path.join(tmpDir, ".larkway");
   const fakeCodexHome = path.join(tmpDir, ".codex");
   process.env["CODEX_HOME"] = fakeCodexHome;

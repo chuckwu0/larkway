@@ -31,13 +31,17 @@ import process from "node:process";
 import crossSpawn from "cross-spawn";
 
 // POSIX: delegate straight to node's spawn — identical behaviour to before this
-// module existed (and test suites that mock node:child_process keep working).
-// Windows: cross-spawn, which resolves .cmd shims. Decided per-call so tests
-// can stub process.platform if they ever need the win32 path.
+// module existed. Windows: cross-spawn, which resolves .cmd shims. Under
+// vitest (VITEST env) ALWAYS use node's spawn, on every platform — the unit
+// suites mock node:child_process, and routing through cross-spawn's internal
+// CJS require would bypass those mocks; the real win32 shim path is covered
+// by the CI bin-shim smoke step instead.
+const useCrossSpawn = (): boolean =>
+  process.platform === "win32" && process.env["VITEST"] === undefined;
 const doSpawn: typeof nodeSpawn = ((...args: Parameters<typeof nodeSpawn>) =>
-  (process.platform === "win32" ? (crossSpawn as typeof nodeSpawn) : nodeSpawn)(...args)) as typeof nodeSpawn;
+  (useCrossSpawn() ? (crossSpawn as typeof nodeSpawn) : nodeSpawn)(...args)) as typeof nodeSpawn;
 const doSpawnSync: typeof nodeSpawnSync = ((...args: Parameters<typeof nodeSpawnSync>) =>
-  (process.platform === "win32" ? (crossSpawn.sync as unknown as typeof nodeSpawnSync) : nodeSpawnSync)(
+  (useCrossSpawn() ? (crossSpawn.sync as unknown as typeof nodeSpawnSync) : nodeSpawnSync)(
     ...args,
   )) as typeof nodeSpawnSync;
 

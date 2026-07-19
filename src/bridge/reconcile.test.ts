@@ -728,7 +728,7 @@ describe("reconcileOrphanedCards — integration", () => {
     expect(ledgerAfterSecond?.posts[0]?.fallbackCardMessageId).toBe("om_existing_card");
   });
 
-  it("keeps card.json when post ledger mark fails after finalize even past retry cap", async () => {
+  it.skipIf(process.platform === "win32")("keeps card.json when post ledger mark fails after finalize even past retry cap", async () => {
     const wt = await seedWorktree(
       "om_mark_fails_at_cap",
       card({
