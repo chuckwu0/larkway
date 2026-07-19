@@ -66,7 +66,8 @@
 | v0.3.59 | v0.3.59 | patch / 已发布 | Windows install stopgap: Node bin shim with WSL guidance (was bash, broke npm on Windows); GitHub-first parity: Bash(gh *) core allow rule + doctor gh check |
 | v0.3.60 | v0.3.60 | patch / 已发布 | OS-service daemon mode: larkway start now registers launchd (macOS) / systemd (Linux) with boot autostart + OS-level crash restart, replacing the bash supervisor; stop disables autostart; tasklistInit flake fix |
 | v0.3.61 | v0.3.61 | patch / 已发布 | Windows-native groundwork behind LARKWAY_EXPERIMENTAL_WINDOWS=1: cross-spawn layer for .cmd shims, schtasks service adapter, PowerShell process discovery, pure-Node log tail; POSIX behaviour unchanged |
-| v0.3.62 | v0.3.62 | 当前 patch / 已发布 | Windows experimental-path fixes surfaced by the new 3-OS CI: junctions no longer used for file links (workspace CLAUDE.md link broke on win32), memory-change card tail renders / on every platform, transcript write failures name the file |
+| v0.3.62 | v0.3.62 | patch / 已发布 | Windows experimental-path fixes surfaced by the new 3-OS CI: junctions no longer used for file links (workspace CLAUDE.md link broke on win32), memory-change card tail renders / on every platform, transcript write failures name the file |
+| v0.3.63 | v0.3.63 | 当前 patch / 已发布 | Native Windows support (beta): experimental gate removed — bridge runs natively on Windows with Task Scheduler service registration; WSL remains fully supported |
 
 ## 使用原则
 
@@ -140,4 +141,5 @@ v0.3.59       = Windows install stopgap: Node bin shim with WSL guidance (was ba
 v0.3.60       = OS-service daemon mode: larkway start now registers launchd (macOS) / systemd (Linux) with boot autostart + OS-level crash restart, replacing the bash supervisor; stop disables autostart; tasklistInit flake fix
 v0.3.61       = Windows-native groundwork behind LARKWAY_EXPERIMENTAL_WINDOWS=1: cross-spawn layer for .cmd shims, schtasks service adapter, PowerShell process discovery, pure-Node log tail; POSIX behaviour unchanged
 v0.3.62       = Windows experimental-path fixes surfaced by the new 3-OS CI: junctions no longer used for file links (workspace CLAUDE.md link broke on win32), memory-change card tail renders / on every platform, transcript write failures name the file
+v0.3.63       = Native Windows support (beta): experimental gate removed — bridge runs natively on Windows with Task Scheduler service registration; WSL remains fully supported
 ```
