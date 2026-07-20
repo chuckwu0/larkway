@@ -28,6 +28,7 @@ import { readFile, writeFile, unlink, mkdir, readdir, access } from "node:fs/pro
 import { promisify } from "node:util";
 import path from "node:path";
 import process from "node:process";
+import { fileURLToPath } from "node:url";
 import { stat } from "node:fs/promises";
 import { DEFAULT_STALE_MS } from "../bridge/statusFile.js";
 import { resolveServiceAdapter, type ServiceAdapter } from "./serviceAdapter.js";
@@ -71,7 +72,7 @@ export function bridgePidPath(larkwayDir: string): string {
  * same as tsc multi-file, so the same arithmetic works everywhere.
  */
 export function resolveRepoRoot(): string {
-  const here = new URL(import.meta.url).pathname;
+  const here = fileURLToPath(import.meta.url);
   return path.resolve(path.dirname(here), "..", "..");
 }
 
