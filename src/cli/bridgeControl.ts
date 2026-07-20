@@ -26,6 +26,7 @@ import { spawn, execFile } from "node:child_process";
 import { openSync, constants as fsConstants } from "node:fs";
 import { readFile, writeFile, unlink, mkdir, readdir, access } from "node:fs/promises";
 import { promisify } from "node:util";
+import { fileURLToPath } from "node:url";
 import path from "node:path";
 import process from "node:process";
 import { stat } from "node:fs/promises";
@@ -71,7 +72,10 @@ export function bridgePidPath(larkwayDir: string): string {
  * same as tsc multi-file, so the same arithmetic works everywhere.
  */
 export function resolveRepoRoot(): string {
-  const here = new URL(import.meta.url).pathname;
+  // fileURLToPath, not URL#pathname: on Windows the latter yields "/C:/…"
+  // which path.resolve turns into a nonexistent path, breaking dist/main.js
+  // lookup for npm-installed packages.
+  const here = fileURLToPath(import.meta.url);
   return path.resolve(path.dirname(here), "..", "..");
 }
 

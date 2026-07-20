@@ -38,6 +38,25 @@ async function getControl() {
 }
 
 // ---------------------------------------------------------------------------
+// resolveRepoRoot — must yield a real filesystem path on every platform
+// ---------------------------------------------------------------------------
+
+describe("resolveRepoRoot", () => {
+  it("resolves to the larkway package root (regression: URL#pathname broke win32 drive paths)", async () => {
+    const bc = await getControl();
+    const root = bc.resolveRepoRoot();
+    expect(path.isAbsolute(root)).toBe(true);
+    // On win32, URL#pathname yields "/C:/…" which path.resolve mangles into a
+    // nonexistent drive-prefixed path; reading package.json proves the path is real.
+    const { readFile } = await import("node:fs/promises");
+    const pkg = JSON.parse(await readFile(path.join(root, "package.json"), "utf-8")) as {
+      name?: string;
+    };
+    expect(pkg.name).toBe("larkway");
+  });
+});
+
+// ---------------------------------------------------------------------------
 // detectBridgeStatus — no pid file
 // ---------------------------------------------------------------------------
 
