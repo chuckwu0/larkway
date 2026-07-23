@@ -395,6 +395,18 @@ export const BotConfigSchema = z.object({
   backend: z.string().min(1).default("claude"),
 
   /**
+   * Idle-watchdog override, in seconds. The bridge interrupts a turn when the
+   * runner emits NO stream events for this long with no tool call in flight
+   * (default 180 s — see handler.ts DEFAULT_CARDKIT_IDLE_TIMEOUT_MS). The
+   * judged quantity is event silence, not total turn duration. Raise it for
+   * bots whose turns legitimately go silent for minutes: a huge tool result
+   * (e.g. dozens of MCP records) puts the model into a long prefill during
+   * which the CLI emits nothing, which the default watchdog misreads as a
+   * hang and kills. Floor 30 s — anything lower would interrupt normal turns.
+   */
+  idle_timeout_seconds: z.number().int().min(30).optional(),
+
+  /**
    * COT (思维链) 气泡:把 agent 的 thinking 思考过程 + 工具调用摘要实时推到飞书
    * 原生的可折叠思维链气泡(与最终答案卡片互不干扰,最终答案永远只走卡片)。
    *

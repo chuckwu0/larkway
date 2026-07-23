@@ -126,7 +126,8 @@ const DEFAULT_CARDKIT_RESPONSE_SURFACE_TIMEOUT_MS = 20 * 60 * 1000;
  * tool / any stream event) for this long — a real hang signal — never merely for
  * taking a long time. A turn that keeps streaming tokens or driving tools runs to
  * completion no matter the total duration. 3 min default (boss-approved),
- * overridable per bot via `responseSurfaceIdleTimeoutMs`.
+ * overridable per bot via bot yaml `idle_timeout_seconds` (wired through
+ * HandlerDeps.responseSurfaceIdleTimeoutMs in main.ts).
  *
  * NOTE (批A scope): activity here = runner output events (§12.1). The refined
  * "存活型活性" (process alive but silent — pure inference / awaiting upstream API,

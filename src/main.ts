@@ -938,6 +938,12 @@ async function runV2Mode({
       // Unset → handler defaults to bypassPermissions (aligns Claude with Codex
       // full-host posture); set to acceptEdits/ask to tighten via config.
       permissionMode: configJson.permissions.mode,
+      // Per-bot idle-watchdog override (bot yaml idle_timeout_seconds). Unset →
+      // handler's 3-min default. Raise for bots whose turns legitimately go
+      // silent for minutes (huge tool results → long prefill emits nothing).
+      ...(bot.idle_timeout_seconds !== undefined
+        ? { responseSurfaceIdleTimeoutMs: bot.idle_timeout_seconds * 1000 }
+        : {}),
       peers: resolvedPeers,
       taskHandleMentionRoster,
       localHandoffRegistry,

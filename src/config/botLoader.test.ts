@@ -748,6 +748,40 @@ workspace: /srv/team/claude_workspace
     expect(skipped[0]?.reason).toContain("agent_workspace");
   });
 
+  it("idle_timeout_seconds 可解析,低于 30s 下限被拒", async () => {
+    await createBotsDir();
+    await writeYaml(
+      "idle-ok.yaml",
+      `
+id: idle-ok
+name: Idle OK
+description: raised idle watchdog
+app_id: cli_idle_ok
+app_secret_env: IDLE_OK_SECRET
+bot_open_id: ou_idle_ok
+idle_timeout_seconds: 600
+`,
+    );
+    await writeYaml(
+      "idle-too-low.yaml",
+      `
+id: idle-too-low
+name: Idle Too Low
+description: below floor
+app_id: cli_idle_low
+app_secret_env: IDLE_LOW_SECRET
+bot_open_id: ou_idle_low
+idle_timeout_seconds: 5
+`,
+    );
+
+    const { bots, skipped } = await loadBotsDetailed(botsDir());
+    expect(bots).toHaveLength(1);
+    expect(bots[0]?.idle_timeout_seconds).toBe(600);
+    expect(skipped).toHaveLength(1);
+    expect(skipped[0]?.reason).toContain("idle_timeout_seconds");
+  });
+
   it("cot defaults to brief and cotSurface defaults to bubble (real-machine reversal 2026-07-05)", async () => {
     await createBotsDir();
     await writeYaml(
