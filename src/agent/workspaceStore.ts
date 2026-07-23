@@ -598,6 +598,30 @@ export async function ensureAgentWorkspace(
     renderPermissionsGranted(input),
   );
   await ensureMemoryScaffold(input.workspacePath);
+  await ensureSkillsScaffold(input.workspacePath);
+}
+
+/**
+ * Skills scaffold: one canonical `.agents/skills/` directory — the open agent
+ * skills layout Codex discovers natively from cwd — plus a `.claude/skills`
+ * directory symlink into it, so a skill dropped in the canonical directory is
+ * picked up by both backends. `.claude/skills` is only (re)linked when absent
+ * or already a symlink; an agent that created a real `.claude/skills`
+ * directory keeps ownership of it.
+ */
+async function ensureSkillsScaffold(workspacePath: string): Promise<void> {
+  const canonical = path.join(workspacePath, ".agents", "skills");
+  await fs.mkdir(canonical, { recursive: true });
+  const claudeDir = path.join(workspacePath, ".claude");
+  await fs.mkdir(claudeDir, { recursive: true });
+  const linkPath = path.join(claudeDir, "skills");
+  try {
+    const stat = await fs.lstat(linkPath);
+    if (!stat.isSymbolicLink()) return;
+  } catch {
+    // missing: create below
+  }
+  await ensureRelativeSymlink(linkPath, path.join("..", ".agents", "skills"));
 }
 
 // 批G P1 (R1/R2): the six-category per-agent scaffold is retired for NEW

@@ -150,6 +150,50 @@ describe("ensureAgentWorkspace", () => {
     await expect(fs.stat(path.join(workspacePath, "tasks"))).rejects.toThrow();
   });
 
+  it("scaffolds canonical .agents/skills with a .claude/skills symlink into it", async () => {
+    const workspacePath = path.join(dir, "workspace");
+    await ensureAgentWorkspace({
+      agentId: "devops",
+      workspacePath,
+      reposPath: path.join(workspacePath, "repos"),
+      bot: { name: "DevOps", description: "Develop and operate Larkway" },
+      taskDescription: "Skills scaffold test.",
+    });
+
+    expect((await fs.stat(path.join(workspacePath, ".agents", "skills"))).isDirectory()).toBe(
+      true,
+    );
+    const linkPath = path.join(workspacePath, ".claude", "skills");
+    expect((await fs.lstat(linkPath)).isSymbolicLink()).toBe(true);
+    expect(await fs.readlink(linkPath)).toBe(path.join("..", ".agents", "skills"));
+    // A skill dropped in the canonical directory is visible through both paths.
+    await fs.mkdir(path.join(workspacePath, ".agents", "skills", "demo"), { recursive: true });
+    await fs.writeFile(path.join(workspacePath, ".agents", "skills", "demo", "SKILL.md"), "x");
+    await expect(fs.stat(path.join(linkPath, "demo", "SKILL.md"))).resolves.toBeTruthy();
+  });
+
+  it("keeps a pre-existing real .claude/skills directory instead of replacing it", async () => {
+    const workspacePath = path.join(dir, "workspace");
+    const realSkills = path.join(workspacePath, ".claude", "skills", "mine");
+    await fs.mkdir(realSkills, { recursive: true });
+    await fs.writeFile(path.join(realSkills, "SKILL.md"), "agent-owned\n", "utf8");
+
+    await ensureAgentWorkspace({
+      agentId: "devops",
+      workspacePath,
+      reposPath: path.join(workspacePath, "repos"),
+      bot: { name: "DevOps", description: "Develop and operate Larkway" },
+      taskDescription: "Skills scaffold guard test.",
+    });
+
+    expect(
+      (await fs.lstat(path.join(workspacePath, ".claude", "skills"))).isSymbolicLink(),
+    ).toBe(false);
+    await expect(fs.readFile(path.join(realSkills, "SKILL.md"), "utf8")).resolves.toBe(
+      "agent-owned\n",
+    );
+  });
+
   it("does not overwrite existing durable workspace AGENTS.md", async () => {
     const workspacePath = path.join(dir, "workspace");
     const reposPath = path.join(workspacePath, "repos");
