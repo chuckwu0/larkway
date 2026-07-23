@@ -686,6 +686,68 @@ runtime: agent_workspace
     expect(bots[0]?.runtime).toBe("agent_workspace");
   });
 
+  it("workspace: 绝对路径 + agent_workspace 可被正确解析", async () => {
+    await createBotsDir();
+    await writeYaml(
+      "byo-workspace.yaml",
+      `
+id: byo-bot
+name: BYO Bot
+description: externally-owned workspace
+app_id: cli_byo
+app_secret_env: BYO_SECRET
+bot_open_id: ou_byo
+runtime: agent_workspace
+workspace: /srv/team/claude_workspace
+`,
+    );
+
+    const bots = await loadBots(botsDir());
+    expect(bots).toHaveLength(1);
+    expect(bots[0]?.workspace).toBe("/srv/team/claude_workspace");
+  });
+
+  it("workspace: 相对路径被拒(skip 该 bot)", async () => {
+    await createBotsDir();
+    await writeYaml(
+      "byo-relative.yaml",
+      `
+id: byo-relative
+name: BYO Relative
+description: relative path must be rejected
+app_id: cli_byo_rel
+app_secret_env: BYO_REL_SECRET
+bot_open_id: ou_byo_rel
+runtime: agent_workspace
+workspace: relative/dir
+`,
+    );
+
+    const { bots, skipped } = await loadBotsDetailed(botsDir());
+    expect(bots).toHaveLength(0);
+    expect(skipped[0]?.reason).toContain("absolute");
+  });
+
+  it("workspace: 配在 legacy runtime 上被拒(skip 该 bot)", async () => {
+    await createBotsDir();
+    await writeYaml(
+      "byo-legacy.yaml",
+      `
+id: byo-legacy
+name: BYO Legacy
+description: workspace requires agent_workspace runtime
+app_id: cli_byo_leg
+app_secret_env: BYO_LEG_SECRET
+bot_open_id: ou_byo_leg
+workspace: /srv/team/claude_workspace
+`,
+    );
+
+    const { bots, skipped } = await loadBotsDetailed(botsDir());
+    expect(bots).toHaveLength(0);
+    expect(skipped[0]?.reason).toContain("agent_workspace");
+  });
+
   it("cot defaults to brief and cotSurface defaults to bubble (real-machine reversal 2026-07-05)", async () => {
     await createBotsDir();
     await writeYaml(

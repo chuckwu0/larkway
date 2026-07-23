@@ -360,6 +360,29 @@ export const BotConfigSchema = z.object({
   runtime: z.enum(["legacy", "agent_workspace"]).default("legacy"),
 
   /**
+   * BYO workspace (agent_workspace runtime only): absolute path to an
+   * externally-owned directory used as the agent's working directory instead
+   * of the Larkway-managed `<LARKWAY_HOME>/agents/<id>/workspace`.
+   *
+   * Contract when set:
+   * - The directory is a pointer, not a Larkway artifact: Larkway never
+   *   creates it, never scaffolds into it (no AGENTS.md / CLAUDE.md symlink /
+   *   memory / permissions files), and never GCs inside it. The owner is
+   *   fully responsible for its contents (CLAUDE.md, .claude/, .mcp.json,
+   *   .agents/skills/, …) — which is exactly the point: the local runtime
+   *   discovers all of that natively from its cwd.
+   * - Larkway-owned runtime state (per-topic session artifact dirs) moves to
+   *   `<LARKWAY_HOME>/agents/<id>/sessions` — session pointers are injected
+   *   into the prompt as absolute paths, so nothing needs to live under cwd.
+   * - Resume is gated to the workspace path a session was recorded under
+   *   (agent CLI sessions encode their cwd); changing this value starts
+   *   fresh sessions rather than resuming into a dead cwd.
+   *
+   * Unset (default) = Larkway-managed workspace, existing behavior unchanged.
+   */
+  workspace: z.string().min(1).optional(),
+
+  /**
    * Agent backend to use when spawning the AI subprocess for this bot.
    *
    * Open string — not a 2-enum — so future backends (gemini, local-llm, …) can be
@@ -690,6 +713,20 @@ export async function loadBotsDetailed(botsDir: string): Promise<LoadBotsResult>
           `through to the backend CLI verbatim (claude: --effort; codex: mapped through ` +
           `codexEffortFromLarkway), but a typo here will silently fail the bot's spawn every turn.`,
       );
+    }
+
+    // BYO workspace is a hard config error when malformed: a wrong value here
+    // means the agent silently runs in the wrong cwd (the exact bug the field
+    // exists to fix), so unlike the advisory warns above this one skips the bot.
+    if (bot.workspace !== undefined) {
+      if (bot.runtime !== "agent_workspace") {
+        skip(filename, `workspace: is only supported with runtime: agent_workspace (got "${bot.runtime}")`);
+        continue;
+      }
+      if (!path.isAbsolute(bot.workspace)) {
+        skip(filename, `workspace: must be an absolute path (got "${bot.workspace}")`);
+        continue;
+      }
     }
 
     // perf plan §4: warmProcess only has an implementation for backend=codex

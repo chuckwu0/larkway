@@ -60,6 +60,14 @@ export class Housekeeping {
    * under <botId>/worktrees/ via `git worktree remove`.
    */
   readonly #runtime: string | undefined;
+  /**
+   * agent_workspace sessions parent override. Set for BYO-workspace bots
+   * (bot yaml `workspace:`), whose session dirs live under
+   * agents/<id>/sessions instead of <workspace>/sessions — GC must sweep
+   * there and must never walk the externally-owned workspace itself.
+   * Undefined = derive the default path from botId (existing behavior).
+   */
+  readonly #sessionsDir: string | undefined;
 
   /** thread_ids that have already received an idle-notify warn this session */
   readonly #notified = new Set<string>();
@@ -67,12 +75,13 @@ export class Housekeeping {
   #timer: ReturnType<typeof setInterval> | undefined;
 
   constructor(
-    deps: { sessionStore: SessionStore; botId?: string; runtime?: string },
+    deps: { sessionStore: SessionStore; botId?: string; runtime?: string; sessionsDir?: string },
     opts?: HousekeepingOptions,
   ) {
     this.#sessionStore = deps.sessionStore;
     this.#botId = deps.botId;
     this.#runtime = deps.runtime;
+    this.#sessionsDir = deps.sessionsDir;
     this.#scanIntervalMs = opts?.scanIntervalMs ?? DEFAULT_SCAN_INTERVAL_MS;
     this.#idleNotifyMs = opts?.idleNotifyMs ?? DEFAULT_IDLE_NOTIFY_MS;
     this.#idleCleanupMs = opts?.idleCleanupMs ?? DEFAULT_IDLE_CLEANUP_MS;
@@ -201,7 +210,7 @@ export class Housekeeping {
   async #sweepOrphans(liveThreadIds: Set<string>, now: number, dryRun: boolean): Promise<void> {
     const reclaimDir =
       this.#runtime === "agent_workspace"
-        ? resolveAgentWorkspaceSessionsDir(this.#botId ?? "")
+        ? (this.#sessionsDir ?? resolveAgentWorkspaceSessionsDir(this.#botId ?? ""))
         : resolveWorktreesDir(this.#botId);
     let dirNames: string[];
     try {
@@ -247,7 +256,7 @@ export class Housekeeping {
     dryRun: boolean,
   ): Promise<AgentSessionCleanupOutcome | void> {
     if (this.#runtime === "agent_workspace") {
-      return cleanupAgentSession(threadId, botId ?? this.#botId, dryRun);
+      return cleanupAgentSession(threadId, botId ?? this.#botId, dryRun, this.#sessionsDir);
     }
     return cleanupWorktree(threadId, botId, dryRun);
   }
@@ -574,7 +583,13 @@ export async function cleanupWorktree(
  * home, "/"). Pure — unit-testable without fs.
  */
 export function isReclaimableSessionPath(p: string): boolean {
-  const m = /[/\\]workspace[/\\]sessions[/\\]([^/\\]+)[/\\]?$/.exec(p);
+  // Two accepted layouts:
+  // - default:       .../agents/<id>/workspace/sessions/<tid>
+  // - BYO workspace: .../agents/<id>/sessions/<tid>  (bot yaml `workspace:` —
+  //   session dirs live beside, not inside, the externally-owned workspace)
+  const m =
+    /[/\\]workspace[/\\]sessions[/\\]([^/\\]+)[/\\]?$/.exec(p) ??
+    /[/\\]agents[/\\][^/\\]+[/\\]sessions[/\\]([^/\\]+)[/\\]?$/.exec(p);
   if (m === null) return false;
   const seg = m[1];
   // Reject traversal segments: ".../sessions/.." resolves to the workspace dir
@@ -626,6 +641,7 @@ export async function cleanupAgentSession(
   threadId: string,
   agentId: string | undefined,
   dryRun: boolean,
+  sessionsDir?: string,
 ): Promise<AgentSessionCleanupOutcome> {
   if (!agentId) {
     console.error(
@@ -635,7 +651,17 @@ export async function cleanupAgentSession(
   }
   let sessionPath: string;
   try {
-    sessionPath = resolveAgentSessionPath(agentId, threadId);
+    // threadId re-validated on both branches (join with an unchecked name
+    // would let a crafted dir name escape the sessions root).
+    if (sessionsDir) {
+      // Same segment rule paths.ts enforces for the default branch.
+      if (!/^[A-Za-z0-9_-]+$/.test(threadId)) {
+        throw new Error("threadId must be a safe path segment");
+      }
+      sessionPath = pathJoin(sessionsDir, threadId);
+    } else {
+      sessionPath = resolveAgentSessionPath(agentId, threadId);
+    }
   } catch (err) {
     console.error(`[gc] invalid session threadId=${threadId}:`, err);
     return "skipped-invalid";

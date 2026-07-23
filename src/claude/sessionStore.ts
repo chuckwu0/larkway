@@ -59,6 +59,17 @@ export interface SessionRecord {
   lastActiveTs: number;
   senderOpenId?: string;
   /**
+   * agent_workspace runtime: the workspace path (= agent cwd) this record's
+   * sessionId was created/last updated under. Agent CLI sessions encode their
+   * cwd (claude stores them per-project-dir), so resuming under a different
+   * cwd targets a session the CLI cannot find. The handler's resume gate
+   * compares this against the current workspace path and starts fresh on
+   * mismatch — the case where an operator adds/changes the bot yaml
+   * `workspace:` override. Absent on legacy-runtime records and on records
+   * written before this field existed (those pass the gate unchanged).
+   */
+  workspacePath?: string;
+  /**
    * v3 task-handle dispatch-time capture (docs/task-handle.md §5.2/§9.9
    * "dispatch 时捕获根消息文本"): the thread's ROOT message text, truncated
    * to ~200 chars, captured ONLY when the bridge creates this thread's

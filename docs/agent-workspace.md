@@ -30,6 +30,10 @@ Workspace 不是 Larkway 自建的厚任务系统。它的目录结构只解决�
   AGENTS.md
   CLAUDE.md -> AGENTS.md
 
+  .agents/skills/                ← canonical skills 目录(Codex 从 cwd 原生发现)
+  .claude/skills -> ../.agents/skills   ← 目录软链(Claude Code 原生发现);
+                                     已存在真实 .claude/skills 目录时不动它
+
   memory/
     README.md                ← P1 起:指向组织知识库的说明
     preferences.md           ← 本 agent 私有偏好(唯一保留的分类)
@@ -79,6 +83,31 @@ Workspace 不是 Larkway 自建的厚任务系统。它的目录结构只解决�
   启动时读取。
 - `CLAUDE.md` 是指向 `AGENTS.md` 的相对软链,不是第二份内容。
 - 不默认生成 root `memory.md`、`agent.md` 或 `tasks/` 目录。
+
+## 2.5 BYO Workspace(bot yaml `workspace:` 覆盖)
+
+企业接入方可能有自己的部署契约:agent 必须启动在一个**由接入方管辖的固定目录**
+(里面是他们交付的 `CLAUDE.md`、`.claude/skills/`、`.claude/settings.json`、
+`.mcp.json`、`.agents/skills/` 等)。此时在 bot yaml 配置:
+
+```yaml
+runtime: agent_workspace
+workspace: /abs/path/to/your/claude_workspace
+```
+
+契约(与 Larkway 管理的默认 workspace 的差异):
+
+- **指针,不是 Larkway 工件**:Larkway 不创建该目录(不存在则启动时跳过该 bot 并
+  告警)、不往里写任何 scaffold(无 AGENTS.md / CLAUDE.md 软链 / memory /
+  permissions / skills 软链)、GC 永不进入。目录内容完全由 owner 负责——这正是
+  目的:本地 runtime 从 cwd 原生发现所有配置。
+- **Larkway 运行态搬家**:per-topic session 工件目录移到
+  `~/.larkway/agents/<id>/sessions/`(默认布局下是 `<workspace>/sessions/`)。
+  session 指针以绝对路径注入 prompt,不依赖 cwd。
+- **resume 门**:agent CLI 的 session 按创建时的 cwd 编码存储。session 记录会盖
+  当时的 workspace 路径戳;路径变更(加/改/撤 `workspace:`)后旧 session 不再
+  resume,自动起新 session,避免 resume 撞死循环。
+- 仅支持 `runtime: agent_workspace`;必须是绝对路径。不填 = 现状行为不变。
 
 ## 3. Runtime 权限 vs Larkway 产品授权
 

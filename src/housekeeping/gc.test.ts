@@ -641,6 +641,29 @@ describe.skipIf(process.platform === "win32")("cleanupAgentSession — harvest l
     await expect(stat(nodePath.join(home, "knowledge", "README.md"))).resolves.toBeTruthy();
   });
 
+  it("sessionsDir override (BYO workspace): reclaims under agents/<id>/sessions, not <workspace>/sessions", async () => {
+    // BYO bots keep session dirs at agents/<id>/sessions (sibling of the
+    // default workspace/ slot). GC must sweep THERE via the override param.
+    const sessionsDir = nodePath.join(home, "agents", "turing", "sessions");
+    const sessionPath = nodePath.join(sessionsDir, "om_byo1");
+    await mkdir(sessionPath, { recursive: true });
+    await writeFile(nodePath.join(sessionPath, "transcript.md"), "byo session", "utf8");
+
+    const { cleanupAgentSession } = await import("./gc.js");
+    const outcome = await cleanupAgentSession("om_byo1", "turing", false, sessionsDir);
+    expect(outcome).toBe("reclaimed");
+    await expect(stat(sessionPath)).rejects.toThrow();
+  });
+
+  it("sessionsDir override rejects an unsafe threadId segment", async () => {
+    const sessionsDir = nodePath.join(home, "agents", "turing", "sessions");
+    await mkdir(sessionsDir, { recursive: true });
+    const { cleanupAgentSession } = await import("./gc.js");
+    expect(await cleanupAgentSession("../escape", "turing", false, sessionsDir)).toBe(
+      "skipped-invalid",
+    );
+  });
+
   it("dir already gone → already-clean no-op (record retained without a re-stamp loop)", async () => {
     const { cleanupAgentSession } = await import("./gc.js");
     expect(await cleanupAgentSession("om_never_existed", "turing", false)).toBe("already-clean");

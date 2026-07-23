@@ -784,6 +784,13 @@ export interface HandlerConventions {
   worktreesDir: string;
   /** V0.3: long-lived workspace root for this bot/agent. */
   agentWorkspacePath?: string;
+  /**
+   * True when agentWorkspacePath is a BYO workspace (bot yaml `workspace:`
+   * override): an externally-owned dir the bridge must never write into —
+   * ensureAgentWorkspace scaffolding is skipped entirely. Session artifact
+   * dirs (workspaceSessionsDir) live in the Larkway tree and are unaffected.
+   */
+  byoWorkspace?: boolean;
   /** V0.3: parent dir for per-topic sessions. */
   workspaceSessionsDir?: string;
   /** V0.3: suggested repo parent inside the agent workspace. */
@@ -2210,7 +2217,7 @@ export class BridgeHandler {
       const buildWorktree = hasRepo && !conventions.readOnly;
       const extraRepos = conventions.extraRepoPaths ?? [];
 
-      if (isAgentWorkspace) {
+      if (isAgentWorkspace && !conventions.byoWorkspace) {
         await ensureAgentWorkspace({
           agentId: botId ?? "v1-default",
           workspacePath: conventions.agentWorkspacePath!,
@@ -2807,6 +2814,25 @@ export class BridgeHandler {
         // computed against markers.spawn once the turn completes, below.
         const perfMarkers: Partial<Record<PerfMarkerName, number>> = {};
 
+        // Workspace-move resume gate: agent CLI sessions encode the cwd they
+        // were created under (claude keys session storage by project dir), so
+        // a record stamped with a DIFFERENT workspace path must not be
+        // resumed — the CLI would fail to find the session under the new cwd
+        // (and retry into the same wall every turn). Fires when the operator
+        // adds/changes/removes the bot yaml `workspace:` override; unstamped
+        // legacy records pass through unchanged.
+        const workspaceMoved =
+          currentExisting?.workspacePath !== undefined &&
+          conventions.agentWorkspacePath !== undefined &&
+          currentExisting.workspacePath !== conventions.agentWorkspacePath;
+        if (workspaceMoved && currentExisting?.sessionId) {
+          console.warn(
+            `[bridge.handler] thread ${threadId}: workspace moved ` +
+              `(${currentExisting.workspacePath} → ${conventions.agentWorkspacePath}) — ` +
+              "starting a fresh session instead of resuming",
+          );
+        }
+
         const handle = createRunner(runnerKey).run({
           prompt,
           // 批F (F2): reseed = no resume. The record itself is kept (write-back
@@ -2815,7 +2841,7 @@ export class BridgeHandler {
           // delete). `|| undefined`: a fresh-start-marked record carries
           // sessionId "" (批H H1) — an empty string must never reach the
           // runner as a resume target.
-          resumeSessionId: forceFreshSession
+          resumeSessionId: forceFreshSession || workspaceMoved
             ? undefined
             : currentExisting?.sessionId || undefined,
           // 批F (F2): tells ClaudeProcessPool to retire this thread's live warm
@@ -3367,6 +3393,10 @@ export class BridgeHandler {
               createdTs: now,
               lastActiveTs: now,
               senderOpenId,
+              // Resume gate stamp: the cwd this sessionId was created under.
+              ...(conventions.agentWorkspacePath
+                ? { workspacePath: conventions.agentWorkspacePath }
+                : {}),
               // BL-38: a brand-new thread that idle-killed on its very first turn
               // starts the counter at 1 (0 when clean; only persisted when > 0).
               consecutiveStuckCount: nextStuckCount,
@@ -3402,6 +3432,12 @@ export class BridgeHandler {
               rootText: currentExisting.rootText,
               chatId: currentExisting.chatId,
               chatType: currentExisting.chatType,
+              // Resume gate stamp: the turn that just completed ran under the
+              // CURRENT workspace path, so the (possibly new) sessionId belongs
+              // to it — re-stamp rather than preserve.
+              ...(conventions.agentWorkspacePath
+                ? { workspacePath: conventions.agentWorkspacePath }
+                : {}),
               // BL-38: +1 on an idle-stuck turn, 0 (cleared) on any clean turn.
               consecutiveStuckCount: nextStuckCount,
               // 批F (F2): a reseed turn restarts the count at 1 (this turn ran

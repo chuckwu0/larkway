@@ -209,6 +209,20 @@ export function resolveAgentWorkspaceSessionsDir(agentId: string): string {
   return join(resolveAgentWorkspacePath(agentId), "sessions");
 }
 
+/**
+ * Sessions parent for a BYO-workspace bot (bot yaml `workspace:` override).
+ *
+ * A BYO workspace is an externally-owned directory Larkway never writes into,
+ * so its Larkway-owned session artifacts live under the agent's home slot in
+ * the Larkway tree instead (`agents/<id>/sessions`, a SIBLING of the default
+ * `workspace/` dir — deliberately not inside it). Session dirs are handed to
+ * the agent as absolute-path pointers, so nothing requires them under cwd.
+ */
+export function resolveAgentHomeSessionsDir(agentId: string): string {
+  assertSafePathSegment("agentId", agentId);
+  return join(larkwayHome(), "agents", agentId, "sessions");
+}
+
 /** Resolve the session artifact directory for a Feishu topic/thread. */
 export function resolveAgentSessionPath(agentId: string, threadId: string): string {
   assertSafePathSegment("threadId", threadId);

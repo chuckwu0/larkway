@@ -1,4 +1,4 @@
-import { mkdirSync, writeFileSync, renameSync } from "node:fs";
+import { existsSync, mkdirSync, writeFileSync, renameSync } from "node:fs";
 import path from "node:path";
 import { resolveLarkwayVersion } from "./version.js";
 import { Client as LarkSdkClient } from "@larksuiteoapi/node-sdk";
@@ -28,6 +28,7 @@ import {
   resolveAgentWorkspacePath,
   resolveAgentWorkspaceSessionsDir,
   resolveAgentWorkspaceReposDir,
+  resolveAgentHomeSessionsDir,
 } from "./config/paths.js";
 import { reconcileOrphanedCards } from "./bridge/reconcile.js";
 import { writeStatusFile } from "./bridge/statusFile.js";
@@ -171,13 +172,28 @@ async function runV2Mode({
         }
       }
 
-      const permissionGate = await checkWorkspacePermissionGrant(resolveAgentWorkspacePath(bot.id), bot);
-      if (!permissionGate.ok) {
-        console.warn(
-          `[larkway] bot "${bot.id}": permission artifact is audit-only and will not block startup ` +
-            `(${permissionGate.reason}; ${permissionGate.filePath}). ` +
-            `Use \`larkway perms ${bot.id} --grant-from-request --grant-note "confirmed by <host>"\` only for audit notes.`,
-        );
+      if (bot.workspace) {
+        // BYO workspace: the dir must pre-exist (Larkway never creates it —
+        // see botLoader `workspace:` contract). Missing dir = config error;
+        // skip THIS bot, keep the rest of the fleet up.
+        if (!existsSync(bot.workspace)) {
+          console.warn(
+            `[larkway] bot "${bot.id}": workspace "${bot.workspace}" does not exist. ` +
+              "Larkway never creates a BYO workspace — create it (with its CLAUDE.md/.claude/... contents) and restart. Skipping this bot.",
+          );
+          continue;
+        }
+      } else {
+        // Permission artifacts are a Larkway-managed-workspace concept; a BYO
+        // workspace has none by contract, so the audit warn is skipped.
+        const permissionGate = await checkWorkspacePermissionGrant(resolveAgentWorkspacePath(bot.id), bot);
+        if (!permissionGate.ok) {
+          console.warn(
+            `[larkway] bot "${bot.id}": permission artifact is audit-only and will not block startup ` +
+              `(${permissionGate.reason}; ${permissionGate.filePath}). ` +
+              `Use \`larkway perms ${bot.id} --grant-from-request --grant-note "confirmed by <host>"\` only for audit notes.`,
+          );
+        }
       }
     }
     healthyBots.push(bot);
@@ -357,20 +373,33 @@ async function runV2Mode({
     const worktreesDir = path.join(botDir, "worktrees");
     const logsDir = resolveLogsDir(bot.id);
 
+    // BYO workspace (bot yaml `workspace:`): cwd is the externally-owned dir,
+    // Larkway-owned session artifacts move to agents/<id>/sessions, and the
+    // repos pointer is a prompt-level suggestion inside the BYO dir (agent-
+    // written, never bridge-written).
+    const byoWorkspace = bot.runtime === "agent_workspace" ? bot.workspace : undefined;
     const agentWorkspacePath =
-      bot.runtime === "agent_workspace" ? resolveAgentWorkspacePath(bot.id) : undefined;
+      bot.runtime === "agent_workspace"
+        ? (byoWorkspace ?? resolveAgentWorkspacePath(bot.id))
+        : undefined;
     const workspaceSessionsDir =
-      bot.runtime === "agent_workspace" ? resolveAgentWorkspaceSessionsDir(bot.id) : undefined;
+      bot.runtime === "agent_workspace"
+        ? (byoWorkspace ? resolveAgentHomeSessionsDir(bot.id) : resolveAgentWorkspaceSessionsDir(bot.id))
+        : undefined;
     const workspaceReposPath =
-      bot.runtime === "agent_workspace" ? resolveAgentWorkspaceReposDir(bot.id) : undefined;
+      bot.runtime === "agent_workspace"
+        ? (byoWorkspace ? path.join(byoWorkspace, "repos") : resolveAgentWorkspaceReposDir(bot.id))
+        : undefined;
 
     for (const dir of [
       sharedReposDir,
       worktreesDir,
       logsDir,
-      ...(agentWorkspacePath ? [agentWorkspacePath] : []),
+      // Zero-write contract for a BYO workspace: Larkway does not create the
+      // dir (checked at startup) and does not pre-create a repos/ inside it.
+      ...(agentWorkspacePath && !byoWorkspace ? [agentWorkspacePath] : []),
       ...(workspaceSessionsDir ? [workspaceSessionsDir] : []),
-      ...(workspaceReposPath ? [workspaceReposPath] : []),
+      ...(workspaceReposPath && !byoWorkspace ? [workspaceReposPath] : []),
     ]) {
       mkdirSync(dir, { recursive: true });
     }
@@ -438,6 +467,7 @@ async function runV2Mode({
       runtime: bot.runtime,
       worktreesDir,
       agentWorkspacePath,
+      ...(byoWorkspace ? { byoWorkspace: true } : {}),
       workspaceSessionsDir,
       workspaceReposPath,
       repoCachePath: primaryRepo
@@ -966,6 +996,9 @@ async function runV2Mode({
       sessionStore,
       botId: bot.id,
       runtime: bot.runtime,
+      // BYO workspace: session dirs live under agents/<id>/sessions instead of
+      // <workspace>/sessions — point GC there so it never walks the BYO dir.
+      sessionsDir: workspaceSessionsDir,
     });
 
     // Dumb-alarm-clock scheduler (docs/schedule.md): cron entries from the
@@ -1281,7 +1314,7 @@ async function runV2Mode({
     await reconcileOrphanedCards({
       botId: bot.id,
       worktreesDir: bot.runtime === "agent_workspace"
-        ? resolveAgentWorkspaceSessionsDir(bot.id)
+        ? (bot.workspace ? resolveAgentHomeSessionsDir(bot.id) : resolveAgentWorkspaceSessionsDir(bot.id))
         : resolveWorktreesDir(bot.id),
       cardRenderer,
       cardKitClient: shouldProvideResponseSurfaceCardKitClient(
