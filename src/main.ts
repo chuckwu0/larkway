@@ -938,6 +938,7 @@ async function runV2Mode({
       // Unset → handler defaults to bypassPermissions (aligns Claude with Codex
       // full-host posture); set to acceptEdits/ask to tighten via config.
       permissionMode: configJson.permissions.mode,
+      responseSurfaceIdleTimeoutMs: bot.responseSurfaceIdleTimeoutMs,
       peers: resolvedPeers,
       taskHandleMentionRoster,
       localHandoffRegistry,
