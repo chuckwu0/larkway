@@ -569,6 +569,18 @@ export const BotConfigSchema = z.object({
    * in src/claude/pool.ts.
    */
   warmProcessMaxProcesses: z.number().int().positive().optional(),
+
+  /**
+   * PRB-9 (§12) idle-stuck threshold override (ms). A CardKit turn is
+   * interrupted only after this long with NO runner activity (token / tool /
+   * stream event) — never for total duration. @default 3 * 60 * 1000 (3 min),
+   * see DEFAULT_CARDKIT_IDLE_TIMEOUT_MS in src/bridge/handler.ts. Raise this
+   * for bots whose agent legitimately goes quiet for stretches while still
+   * alive (e.g. large-payload post-processing with no intermediate tool/token
+   * activity) — it does not change the "hang" detection logic, only the
+   * threshold.
+   */
+  responseSurfaceIdleTimeoutMs: z.number().int().positive().optional(),
 }).strict();
 
 /**
