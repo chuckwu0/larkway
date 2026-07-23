@@ -2814,6 +2814,34 @@ export class BridgeHandler {
         // computed against markers.spawn once the turn completes, below.
         const perfMarkers: Partial<Record<PerfMarkerName, number>> = {};
 
+        // Repo-skills discovery (claude backend): each existing repo dir under
+        // the workspace repos/ parent rides along as --add-dir, which makes
+        // its .claude/skills/ discoverable at spawn (config discovery is a
+        // documented --add-dir-flag-only behavior). Recomputed every turn —
+        // spawn-per-turn means a repo the agent cloned LAST turn is picked up
+        // on the next. Backends without the mechanism ignore addDirs.
+        let addDirs: string[] | undefined;
+        if (isAgentWorkspace && conventions.workspaceReposPath) {
+          try {
+            const repoEntries = await fs.readdir(conventions.workspaceReposPath, {
+              withFileTypes: true,
+            });
+            const repoDirs = repoEntries
+              .filter((e) => e.isDirectory() || e.isSymbolicLink())
+              .map((e) => path.join(conventions.workspaceReposPath!, e.name));
+            const ADD_DIR_CAP = 16;
+            if (repoDirs.length > ADD_DIR_CAP) {
+              console.warn(
+                `[bridge.handler] ${repoDirs.length} repo dirs under ` +
+                  `${conventions.workspaceReposPath}; only the first ${ADD_DIR_CAP} ride as --add-dir`,
+              );
+            }
+            addDirs = repoDirs.slice(0, ADD_DIR_CAP);
+          } catch {
+            // repos/ parent absent (fresh workspace, or BYO dir without one) — nothing to add.
+          }
+        }
+
         // Workspace-move resume gate: agent CLI sessions encode the cwd they
         // were created under (claude keys session storage by project dir), so
         // a record stamped with a DIFFERENT workspace path must not be
@@ -2852,6 +2880,7 @@ export class BridgeHandler {
           permissionMode,
           timeoutMs,
           cwd: runCwd,
+          ...(addDirs && addDirs.length > 0 ? { addDirs } : {}),
           // Only consumed by ClaudeProcessPool's per-thread warm-process cache
           // key (src/claude/pool.ts) — every other runner ignores it.
           threadId,

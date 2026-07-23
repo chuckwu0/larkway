@@ -80,6 +80,16 @@ export interface RunOptions {
   /** Only passed as --cwd if explicitly provided; omit to let agent cd itself */
   cwd?: string;
   /**
+   * Additional working directories for backends that support them. The claude
+   * runner maps each entry to a repeated `--add-dir` flag — which (besides
+   * file access) makes that directory's `.claude/skills/` discoverable, the
+   * mechanism that surfaces skills shipped inside a repo the agent cloned
+   * under the workspace. Backends without an equivalent (codex: `--add-dir`
+   * is sandbox-write-only, no config discovery) ignore this — multica-style
+   * wide-options contract: consume what you support, ignore the rest.
+   */
+  addDirs?: string[];
+  /**
    * The Feishu thread this turn belongs to. Only consumed by a per-thread
    * pooled runner (src/claude/pool.ts) as part of its warm-process cache key
    * — every other runner (cold ClaudeRunner/CodexRunner, CodexProcessPool's

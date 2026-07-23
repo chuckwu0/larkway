@@ -117,6 +117,9 @@ function buildCommand(opts: RunOptions): [string, string[]] {
   if (opts.effort) {
     args.push("--effort", opts.effort);
   }
+  for (const dir of opts.addDirs ?? []) {
+    args.push("--add-dir", dir);
+  }
 
   // Note: claude CLI does NOT support a --cwd flag (verified: exits with
   // "error: unknown option '--cwd'"). The actual sandbox boundary is the
@@ -167,6 +170,11 @@ export function buildWarmCommand(opts: RunOptions): [string, string[]] {
   }
   if (opts.effort) {
     args.push("--effort", opts.effort);
+  }
+  // Spawn-time-only, like model/effort: a repo cloned AFTER this warm child
+  // started becomes discoverable on the next cold spawn / pool respawn.
+  for (const dir of opts.addDirs ?? []) {
+    args.push("--add-dir", dir);
   }
 
   return [bin, args];

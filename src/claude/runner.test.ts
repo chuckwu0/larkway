@@ -177,6 +177,21 @@ describe("buildCommand", () => {
     expect(args[args.indexOf("--permission-mode") + 1]).toBe("acceptEdits");
   });
 
+  it("addDirs map to repeated --add-dir flags (repo-skills discovery)", () => {
+    const [, args] = buildCommand({
+      prompt: "go",
+      addDirs: ["/ws/repos/alpha", "/ws/repos/beta"],
+    });
+
+    const flagIdxs = args.flatMap((a, i) => (a === "--add-dir" ? [i] : []));
+    expect(flagIdxs).toHaveLength(2);
+    expect(args[flagIdxs[0]! + 1]).toBe("/ws/repos/alpha");
+    expect(args[flagIdxs[1]! + 1]).toBe("/ws/repos/beta");
+    // Omitted → no flag at all (byte-identical legacy args).
+    const [, bare] = buildCommand({ prompt: "go" });
+    expect(bare).not.toContain("--add-dir");
+  });
+
   it("legacy callers can still opt into bypassPermissions explicitly", () => {
     const [, args] = buildCommand({
       prompt: "legacy",
