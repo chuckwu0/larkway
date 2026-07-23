@@ -41,6 +41,7 @@ import { ensureLarkCliProfile, deriveLarkCliProfile } from "./lark/profileBootst
 import { isSyntheticSessionKey } from "./lark/message.js";
 import { createCachedRosterResolver } from "./lark/rosterResolver.js";
 import { checkWorkspacePermissionGrant } from "./agent/permissionGate.js";
+import { ensureLocalBinOnPath, probeBackendReadiness } from "./agent/readiness.js";
 import { runtimeRequirementsForBots } from "./runtimeRequirements.js";
 import { registerCrashGuard } from "./crashGuard.js";
 import {
@@ -210,6 +211,25 @@ async function runV2Mode({
       `[larkway] Loaded ${healthyBots.length} of ${bots.length} bot(s); ` +
         `${bots.length - healthyBots.length} skipped (see warnings above).`,
     );
+  }
+
+  // ── Backend readiness probes (diagnostics only, never gates startup) ─────
+  // The two historical "bot silently unresponsive" families — CLI missing
+  // from the supervisor PATH, and auth unusable (claude's OAuth token lives
+  // in the macOS keychain; a locked keychain looks like "not logged in") —
+  // are detected here once per distinct backend and reported loudly, instead
+  // of surfacing as dead cards debugged one SSH session at a time.
+  for (const backend of new Set(healthyBots.map((b) => b.backend))) {
+    const readiness = await probeBackendReadiness(backend);
+    if (!readiness.ok) {
+      const botsOnBackend = healthyBots.filter((b) => b.backend === backend).map((b) => b.id);
+      console.warn(
+        `\n[larkway] ⚠️  BACKEND NOT READY: ${backend} (bots: ${botsOnBackend.join(", ")})\n` +
+          `[larkway] ${readiness.diagnosis}\n`,
+      );
+    } else {
+      console.log(`[larkway] backend "${backend}" readiness ✓`);
+    }
   }
 
   // ── Prepare per-bot instances ────────────────────────────────────────────
@@ -1359,6 +1379,16 @@ registerRunner("codex", () => new CodexRunner());
 
 async function main(): Promise<void> {
   const dryRun = process.env["LARKWAY_DRY_RUN"] === "1";
+
+  // PATH augmentation FIRST — before any CLI resolution. Supervisors
+  // (launchd/systemd/watchdog) start larkway with a minimal PATH missing
+  // ~/.local/bin, where claude's native installer lives; every turn then dies
+  // with "Claude CLI not found". Fixing PATH here covers the bridge's own
+  // lookups and every spawned subprocess (they inherit process.env).
+  const prependedBin = ensureLocalBinOnPath();
+  if (prependedBin) {
+    console.log(`[larkway] PATH augmented with ${prependedBin} (supervisor PATH was missing it)`);
+  }
 
   // ── Config (.env) ──────────────────────────────────────────────────────────
   let config;
