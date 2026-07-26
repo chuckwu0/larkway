@@ -72,7 +72,8 @@
 | v0.3.65 | v0.3.65 | patch / 已发布 | Per-bot lark-cli identity isolation (opt-in lark_cli_isolated): agents see only their bot's app profile in a private config dir — personal calendar/mail/drive login stays invisible |
 | v0.3.66 | v0.3.66 | patch / 已发布 | fix: Windows 下 larkway start 报「找不到 supervisor 脚本也找不到 dist/main.js」— resolveRepoRoot 改用 fileURLToPath 正确解析 win32 盘符路径 |
 | v0.3.67 | v0.3.67 | patch / 已发布 | BYO workspace override (bot yaml workspace:) with resume gate; cross-backend skills scaffold (.agents/skills + .claude/skills symlink); startup backend readiness probes + supervisor PATH fix; per-repo --add-dir for repo-shipped skills |
-| v0.3.68 | v0.3.68 | 当前 patch / 已发布 | expose idle watchdog as bot yaml idle_timeout_seconds (long-prefill turns were misread as hangs and interrupted) |
+| v0.3.68 | v0.3.68 | patch / 已发布 | expose idle watchdog as bot yaml idle_timeout_seconds (long-prefill turns were misread as hangs and interrupted) |
+| v0.3.69 | v0.3.69 | 当前 patch / 已发布 | fix: tasklist self-join hit the wrong endpoint (/members -> /add_members), a live 404 on every bridge startup |
 
 ## 使用原则
 
@@ -152,4 +153,5 @@ v0.3.65       = Per-bot lark-cli identity isolation (opt-in lark_cli_isolated): 
 v0.3.66       = fix: Windows 下 larkway start 报「找不到 supervisor 脚本也找不到 dist/main.js」— resolveRepoRoot 改用 fileURLToPath 正确解析 win32 盘符路径
 v0.3.67       = BYO workspace override (bot yaml workspace:) with resume gate; cross-backend skills scaffold (.agents/skills + .claude/skills symlink); startup backend readiness probes + supervisor PATH fix; per-repo --add-dir for repo-shipped skills
 v0.3.68       = expose idle watchdog as bot yaml idle_timeout_seconds (long-prefill turns were misread as hangs and interrupted)
+v0.3.69       = fix: tasklist self-join hit the wrong endpoint (/members -> /add_members), a live 404 on every bridge startup
 ```
