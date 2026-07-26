@@ -137,11 +137,11 @@ beforeEach(async () => {
           currentMembers = (data.members ?? []).filter((m) => !mockPlatformDropsUserMembers || m.type !== "user");
           return { data: { tasklist: { guid: "tl-created-1", members: currentMembers } } };
         }
-        if (config.url.includes("/members") && config.method === "POST") {
+        if (config.url.includes("/add_members") && config.method === "POST") {
           // Throw axios-shaped errors so the REAL TaskListClient.wrapErr path
           // constructs a realistic TaskApiError (status/code) — mirroring the
-          // real machine, where the members-endpoint gateway 404 body is plain
-          // text (no parseable code) and the message is axios's generic one.
+          // real machine, where a gateway 404 body is plain text (no parseable
+          // code) and the message is axios's generic one.
           if (mockAddMembersThrows404) {
             const e = new Error("Request failed with status code 404");
             (e as { response?: unknown }).response = { status: 404, data: "404 page not found" };
@@ -362,8 +362,10 @@ describe("tasklist-init --team", () => {
       // The whole point of the fix: no POST /tasklists (create) call at all.
       expect(capturedRequests.find((r) => r.url.endsWith("/tasklists") && r.method === "POST")).toBeUndefined();
 
-      const addMembersCall = capturedRequests.find((r) => r.url.includes("/members") && r.method === "POST");
-      expect(addMembersCall?.url).toBe("/open-apis/task/v2/tasklists/tl-pre-existing/members");
+      const addMembersCall = capturedRequests.find(
+        (r) => r.url.includes("/add_members") && r.method === "POST",
+      );
+      expect(addMembersCall?.url).toBe("/open-apis/task/v2/tasklists/tl-pre-existing/add_members");
       expect(addMembersCall?.data).toMatchObject({
         members: [
           { id: "ou_owner", type: "user", role: "editor" },
@@ -380,7 +382,7 @@ describe("tasklist-init --team", () => {
       const { claimTeamTasklistGuid, readTeamTasklistGuid } = await import("../../tasklist/teamRegistry.js");
       const { resolveTaskTeamRegistryPath } = await import("../../config/paths.js");
       await claimTeamTasklistGuid(resolveTaskTeamRegistryPath(), "tl-pre-existing");
-      mockAddMembersThrows404 = true; // app-type members endpoint 404s (bot already a member)
+      mockAddMembersThrows404 = true; // bare gateway 404 (no business code) stays best-effort
 
       const { run } = await import("./tasklistInit.js");
       const code = await run(makeCtx(), ["--team", "bot-a", "--owner", "ou_owner"]);

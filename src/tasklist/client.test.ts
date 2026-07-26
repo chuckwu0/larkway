@@ -261,7 +261,7 @@ describe("TaskListClient.getTasklist", () => {
 });
 
 describe("TaskListClient.addTasklistMembers", () => {
-  it("POSTs to /tasklists/:guid/members with the members payload", async () => {
+  it("POSTs to /tasklists/:guid/add_members with the members payload", async () => {
     let captured: LarkTaskRequestConfig | undefined;
     const client = new TaskListClient(
       fakeRequester((config) => {
@@ -271,7 +271,9 @@ describe("TaskListClient.addTasklistMembers", () => {
     );
     await client.addTasklistMembers("tl-1", [{ id: "cli_app1", type: "app", role: "editor" }]);
     expect(captured?.method).toBe("POST");
-    expect(captured?.url).toBe("/open-apis/task/v2/tasklists/tl-1/members");
+    // `add_members`, not `members` — the latter is a live 404 (see the method's
+    // doc comment); this assertion is the regression guard for that.
+    expect(captured?.url).toBe("/open-apis/task/v2/tasklists/tl-1/add_members");
     expect(captured?.data).toEqual({ members: [{ id: "cli_app1", type: "app", role: "editor" }] });
   });
 

@@ -492,9 +492,8 @@ export class TaskListClient {
   }
 
   /**
-   * Add members to an existing tasklist (verified against `lark-cli schema
-   * task tasklists add_members`, 1.0.64 — `POST /tasklists/:tasklist_guid/
-   * members`). Used by `tasklist-init --team` and by a bot's own first-run
+   * Add members to an existing tasklist — `POST /tasklists/:tasklist_guid/
+   * add_members`. Used by `tasklist-init --team` and by a bot's own first-run
    * self-join (docs/task-handle.md §7 "同一 owner 的一组 bot… 把自己加为
    * editor") to add sibling bot apps as `editor` members of the shared
    * "Agent Team" list. Idempotent from the caller's perspective: re-adding an
@@ -502,6 +501,12 @@ export class TaskListClient {
    * verified against a live 409/duplicate-shaped error — callers should treat
    * any failure here as best-effort, same swallow-and-warn posture as the
    * rest of this feature).
+   *
+   * The path segment is `add_members`, NOT `members`. A live A/B against the
+   * same tenant/app token: `POST …/tasklists/:guid/members` → 404 not_found,
+   * `POST …/tasklists/:guid/add_members` → 200. The unit test below pinned the
+   * wrong URL against a mock, so the 404 only ever surfaced as the
+   * swallow-and-warn self-join line in the bridge log on every startup.
    */
   async addTasklistMembers(tasklistGuid: string, members: TaskMember[]): Promise<void> {
     const label = `addTasklistMembers(${tasklistGuid})`;
@@ -509,7 +514,7 @@ export class TaskListClient {
       await this.#request(
         {
           method: "POST",
-          url: `${TASK_V2_BASE}/tasklists/${encodeURIComponent(tasklistGuid)}/members`,
+          url: `${TASK_V2_BASE}/tasklists/${encodeURIComponent(tasklistGuid)}/add_members`,
           params: { user_id_type: "open_id" },
           data: { members },
         },
