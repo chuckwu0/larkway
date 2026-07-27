@@ -284,6 +284,29 @@ describe("CodexProcessPool — wire protocol", () => {
     expect(turnStart?.params).toMatchObject({ threadId: "thread-a", cwd: "/repo/wt", approvalPolicy: "on-request" });
   });
 
+  // Pooling is default-on for codex bots, so this is the LIVE path: without
+  // turn/start.summary the pooled turn gets no reasoning deltas and the idle
+  // watchdog goes blind for the whole model request (see runner.ts's
+  // CODEX_TURN_REASONING_SUMMARY for the measurement).
+  it("sends turn/start.summary=detailed on the pooled path too", async () => {
+    const pool = new CodexProcessPool({});
+    const handle = pool.run({ prompt: "hi" });
+    await flush();
+    const child = spawnedChildren[0]!;
+
+    child.stdout.write(initResponse(1) + "\n");
+    await flush();
+    child.stdout.write(threadResponse(2, "thread-a") + "\n");
+    await flush();
+    child.stdout.write(turnStartResponse(3, "turn-a") + "\n");
+    child.stdout.write(turnCompleted("thread-a", "turn-a") + "\n");
+    await flush();
+    await handle.done;
+
+    const turnStart = readOutboundRequests(child).find((r) => r.method === "turn/start");
+    expect(turnStart?.params).toMatchObject({ summary: "detailed" });
+  });
+
   it("sends state.opts.effort through turn/start.effort, mapped through codexEffortFromLarkway (max → xhigh)", async () => {
     const pool = new CodexProcessPool({});
     const handle = pool.run({ prompt: "hi", effort: "max" });

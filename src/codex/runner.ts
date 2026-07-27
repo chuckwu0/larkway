@@ -128,17 +128,54 @@ export function buildCodexCommand(
 ): [string, string[]] {
   void opts;
   // `-c model_reasoning_summary=detailed`: a per-invocation config override
-  // (global codex flag, so it precedes the subcommand) that makes the model
-  // emit its reasoning summary as item/reasoning/summaryTextDelta events —
-  // without it, app-server yields zero reasoning output and the COT bubble
-  // stays empty. `detailed` is the richest of auto/concise/detailed. This is
-  // a CLI flag, NOT a mutation of the user's ~/.codex/config.toml (confirmed
-  // supported, codex-cli 0.140.0).
+  // (global codex flag, so it precedes the subcommand) that asks the model to
+  // emit its reasoning summary as item/reasoning/summaryTextDelta events.
+  // `detailed` is the richest of auto/concise/detailed. This is a CLI flag,
+  // NOT a mutation of the user's ~/.codex/config.toml (confirmed supported,
+  // codex-cli 0.140.0).
+  //
+  // NOT RELIABLE ON ITS OWN (measured 2026-07-27, codex-cli 0.145.0): on a
+  // thinking-heavy prompt this flag alone produced 0, 0 and 3 summaryTextDelta
+  // events across three runs, while additionally passing `summary` on turn/start
+  // (see CODEX_TURN_REASONING_SUMMARY) produced 9, 11, 21 and 30. The flag is
+  // kept — it is the thread-level default and costs nothing — but the per-turn
+  // param is what actually delivers the deltas.
   return [
     codexBinPath,
     ["-c", "model_reasoning_summary=detailed", "app-server", "--stdio"],
   ];
 }
+
+/**
+ * `turn/start` param that turns reasoning streaming on for THIS turn.
+ *
+ * Why a per-turn param when buildCodexCommand already passes the equivalent
+ * global config override: the flag alone stopped producing
+ * item/reasoning/summaryTextDelta events somewhere between codex-cli 0.140.0
+ * (where the flag was verified) and 0.145.0. `TurnStartParams.summary`
+ * (schema-confirmed enum: auto | concise | detailed | none) still works.
+ *
+ * This is load-bearing beyond the COT bubble. Reasoning deltas are the only
+ * events codex emits WHILE a model request is in flight; without them the
+ * bridge's idle watchdog (bridge/handler.ts) sees nothing between one request
+ * finishing and the next one starting, so a single long request on a large
+ * context is indistinguishable from a hang and the turn gets interrupted
+ * ("长时间无活性，判定卡死"). Measured on the same thinking-heavy prompt: worst
+ * observed watchdog silence 22.7 s / 28.6 s without this param vs 11.6 s /
+ * 10.9 s with it.
+ *
+ * Scope of the protection, honestly bounded: the effect scales with reasoning
+ * effort. At high effort the param clearly dominates (21-30 deltas vs 3); at
+ * default effort both arms produced 0-1 deltas, so a low-effort bot gets little
+ * from it and still depends on request-boundary events. Closing that residue is
+ * BL-48's phase-aware threshold, not this param.
+ *
+ * Open item (not measured here): asking for detailed summaries adds
+ * reasoning-summary output tokens. Two high-effort runs took 167 s / 224 s with
+ * the param vs 64 s without — n far too small to attribute, but latency is worth
+ * a look before this is assumed free.
+ */
+const CODEX_TURN_REASONING_SUMMARY = "detailed";
 
 type JsonRecord = Record<string, unknown>;
 
@@ -323,8 +360,167 @@ class CodexLineParser {
 
 }
 
+/**
+ * codex ThreadItem types that wrap a genuinely long-running operation, and so
+ * must reach the bridge as a tool_use / tool_result PAIR rather than as inert
+ * traffic.
+ *
+ * Why this list exists (field failure 2026-07-27): the idle watchdog in
+ * bridge/handler.ts learns "the runner is alive" only from events this parser
+ * yields, and suspends its judgment only while some tool_use has no matching
+ * tool_result yet. Every item type this parser used to swallow was therefore a
+ * blind window — `item/started` and `item/completed` both returned WITHOUT
+ * yielding anything. Measured against a real app-server: a 25 s MCP tool call
+ * produced 26.6 s with not a single byte on the wire and no in-flight exemption.
+ * The silence tracks the tool's own duration with no upper bound, so a call that
+ * outlasts the idle threshold (default 180 s, handler.ts's
+ * DEFAULT_CARDKIT_IDLE_TIMEOUT_MS) gets the whole turn interrupted — the 25 s
+ * measurement demonstrates the mechanism, not a kill by itself.
+ * commandExecution was the only protected kind, which is exactly why the failure
+ * only ever reproduced on MCP-heavy bots.
+ *
+ * Membership rule — an unclosed tool_use is WORSE than an unmapped item (it
+ * pins toolsInFlight above zero and disables idle-kill for the rest of the
+ * turn, i.e. fails open on a real hang), so a type earns a place here only with
+ * evidence that codex closes it:
+ *  - it carries a status enum with a terminal state (`inProgress | completed |
+ *    failed`, exactly like commandExecution) in the generated protocol schema
+ *    (`codex app-server generate-json-schema`, codex-cli 0.145.0) → mcpToolCall,
+ *    dynamicToolCall, collabAgentToolCall; or
+ *  - a paired item/started + item/completed was observed live → webSearch
+ *    (no status field in the schema, so this one rests on observation only).
+ *
+ * Deliberately EXCLUDED, each for a reason:
+ *  - `subAgentActivity`: schema says its only states are started | interacted |
+ *    interrupted — there is no completion to pair with.
+ *  - `imageGeneration`: has a status, but as a bare string with no enumerated
+ *    terminal value — not evidence enough.
+ *  - `sleep` / `imageView` / `contextCompaction` / review-mode items: no status
+ *    field and no observed pairing. `contextCompaction` in particular wraps a
+ *    whole model round-trip and stays a known dark window — that residue is
+ *    BL-48's graded-handling job, not something to paper over with a tool_use
+ *    that might never close.
+ *  - `fileChange`: observed to start and complete within the same millisecond,
+ *    so it buys no exemption, and mapping it would push the entire patch into
+ *    the COT "detailed" tier for nothing.
+ *
+ * Excluded types still degrade to `raw`, which pokes the watchdog at both item
+ * boundaries — strictly better than the old silence.
+ *
+ * Accepted trade-off (F6): an MCP tool that truly hangs now holds its exemption
+ * for the whole turn, so detection moves from the idle threshold to the 60-min
+ * subprocess runaway guard in handler.ts. That is the same deal commandExecution
+ * has had since A3, now extended to the tool class most likely to hang on the
+ * network. Bounding a single exemption is BL-48 territory.
+ */
+const CODEX_TOOL_ITEM_TYPES = new Set([
+  "mcpToolCall",
+  "dynamicToolCall",
+  "collabAgentToolCall",
+  "webSearch",
+]);
+
+/**
+ * Display name for a tool-ish ThreadItem. Cosmetic only (COT bubble + card
+ * progress line) — the watchdog cares about the event, not the label.
+ */
+function codexToolItemName(itemType: string, item: JsonRecord): string {
+  const str = (key: string): string | undefined =>
+    typeof item[key] === "string" ? (item[key] as string) : undefined;
+  switch (itemType) {
+    case "mcpToolCall": {
+      const server = str("server");
+      const tool = str("tool");
+      if (server && tool) return `${server}.${tool}`;
+      return tool ?? "mcp";
+    }
+    case "dynamicToolCall": {
+      const namespace = str("namespace");
+      const tool = str("tool");
+      if (namespace && tool) return `${namespace}.${tool}`;
+      return tool ?? "dynamic_tool";
+    }
+    case "collabAgentToolCall":
+      return str("tool") ?? "collab_agent";
+    case "webSearch":
+      return "web_search";
+    default:
+      return itemType;
+  }
+}
+
+/**
+ * Identifying inputs for a tool-ish ThreadItem — only the fields that name
+ * WHAT is being called, never the result payload (which can be arbitrarily
+ * large and is what the COT "detailed" tier would then push to Lark).
+ */
+function codexToolItemInput(itemType: string, item: JsonRecord): JsonRecord {
+  switch (itemType) {
+    case "mcpToolCall":
+      return { server: item["server"], tool: item["tool"], arguments: item["arguments"] };
+    case "dynamicToolCall":
+      return { namespace: item["namespace"], tool: item["tool"], arguments: item["arguments"] };
+    case "collabAgentToolCall":
+      return { tool: item["tool"], model: item["model"] };
+    case "webSearch":
+      return { query: item["query"] };
+    default:
+      return {};
+  }
+}
+
+/**
+ * `raw` for a non-shell tool item's tool_result: the notification with the
+ * item's PAYLOAD fields dropped (`result`, `results`, `changes`,
+ * `contentItems`, `agentsStates`).
+ *
+ * Not cosmetic — two live consumers make the full payload actively harmful:
+ *  1. handler.ts's 批H H2 session-volume accounting sums JSON.stringify(raw)
+ *     over tool_result events and forces a fresh session past a fixed
+ *     char budget. That budget was calibrated when codex emitted tool_result
+ *     for shell ONLY; a single MCP completion measured 55 KB on the wire, so
+ *     carrying payloads here would blow the budget in one or two turns and
+ *     force MCP-heavy bots — exactly the bots this fix is for — to restart
+ *     their session on nearly every @.
+ *  2. the COT "detailed" tier pushes tool payloads into the Lark bubble
+ *     (cotProgress.ts / cardkitProgress.ts).
+ *
+ * The tool's own output still reaches the model through codex; larkway is a
+ * thin bridge and never needed a copy of it. Field selection only — no
+ * interpretation of what remains.
+ */
+function codexToolItemResultRaw(obj: unknown, item: JsonRecord): unknown {
+  const notification = asRecord(obj);
+  const params = asRecord(notification?.["params"]);
+  if (!notification || !params) return obj;
+  const HEAVY = ["result", "results", "changes", "contentItems", "agentsStates"];
+  const trimmedItem: JsonRecord = { ...item };
+  let dropped = false;
+  for (const key of HEAVY) {
+    if (key in trimmedItem) {
+      delete trimmedItem[key];
+      dropped = true;
+    }
+  }
+  if (!dropped) return obj;
+  return { ...notification, params: { ...params, item: trimmedItem } };
+}
+
 class CodexAppServerLineParser {
   private readonly answerExtractor = new AnswerChannelExtractor();
+  /**
+   * Item ids opened as tool_use and not yet closed by a tool_result. Exists so
+   * the pairing is EXACT: a tool_result is emitted only for an id this parser
+   * itself opened, which keeps handler.ts's toolsInFlight counter from drifting
+   * in either direction (drift up = watchdog suspended forever, drift down =
+   * exemption lost mid-call).
+   *
+   * Both current callers already give each turn its own parser (runner.ts spawns
+   * one per run, pool.ts builds one per TurnState), so the turn-boundary resets
+   * below are belt-and-suspenders for a future caller that reuses an instance —
+   * not a live code path.
+   */
+  private readonly openToolItems = new Set<string>();
 
   *parseMessage(obj: unknown): Generator<AgentStreamEvent> {
     if (typeof obj !== "object" || obj === null) {
@@ -344,23 +540,36 @@ class CodexAppServerLineParser {
     if (method === "thread/started") {
       const thread = asRecord(params?.["thread"]);
       const threadId = typeof thread?.["id"] === "string" ? thread["id"] : undefined;
+      this.openToolItems.clear();
       if (threadId) yield { type: "system_init", sessionId: threadId, raw: obj };
       return;
     }
 
     if (method === "turn/completed") {
+      this.openToolItems.clear();
       yield { type: "result", stopReason: "end_turn", raw: obj };
       return;
     }
 
     if (method === "item/agentMessage/delta") {
       const delta = typeof params?.["delta"] === "string" ? params["delta"] : "";
-      yield* this.answerExtractor.ingestDelta(delta, obj);
+      // The extractor yields nothing while it is still waiting for
+      // LARKWAY_ANSWER_BEGIN (agent/answerChannel.ts) — i.e. every delta of a
+      // preamble written before the marker used to be invisible to the idle
+      // watchdog. Fall back to `raw` so any delta at all counts as activity.
+      let emitted = false;
+      for (const event of this.answerExtractor.ingestDelta(delta, obj)) {
+        emitted = true;
+        yield event;
+      }
+      if (!emitted && delta) yield { type: "raw", raw: obj };
       return;
     }
 
     // ── reasoning summary deltas → thinking_delta (COT) ──────────────────
-    // Enabled by `-c model_reasoning_summary=detailed` (see buildCodexCommand).
+    // Enabled by turn/start's `summary` param (see
+    // CODEX_TURN_REASONING_SUMMARY — the buildCodexCommand config flag alone
+    // no longer delivers these as of codex-cli 0.145.0).
     // Mirrors item/agentMessage/delta exactly: incremental text in
     // params.delta. params.summaryIndex segments the summary into parts; a
     // new part is announced by summaryPartAdded below. Confirmed live shape,
@@ -392,6 +601,35 @@ class CodexAppServerLineParser {
         };
         return;
       }
+      // Long-running non-shell tool call → tool_use, so the idle watchdog
+      // suspends its judgment for the whole call (see CODEX_TOOL_ITEM_TYPES).
+      // Requires an item id: without one the matching tool_result could never
+      // be paired, and an unclosed tool_use disables idle-kill for the rest of
+      // the turn — so an id-less item degrades to `raw` (still pokes) instead.
+      //
+      // A repeat item/started for an id already open is NOT re-counted either:
+      // handler.ts increments per tool_use event but this parser can only ever
+      // close an id once, so a duplicate would pin toolsInFlight above zero and
+      // disable idle-kill for the rest of the turn.
+      const itemType = item?.["type"];
+      if (typeof itemType === "string" && CODEX_TOOL_ITEM_TYPES.has(itemType)) {
+        const id = typeof item?.["id"] === "string" ? (item["id"] as string) : undefined;
+        if (id && !this.openToolItems.has(id)) {
+          this.openToolItems.add(id);
+          yield {
+            type: "tool_use",
+            toolName: codexToolItemName(itemType, item as JsonRecord),
+            toolInput: codexToolItemInput(itemType, item as JsonRecord),
+            raw: obj,
+          };
+          return;
+        }
+      }
+      // Every other started item (userMessage, reasoning, agentMessage, plan,
+      // future types, …) degrades to `raw`. Yielding NOTHING here is what made
+      // these boundaries invisible to the idle watchdog; `raw` is inert
+      // downstream and only costs an activity timestamp.
+      yield { type: "raw", raw: obj };
       return;
     }
 
@@ -413,9 +651,23 @@ class CodexAppServerLineParser {
       // empty summary (a short task can complete an empty reasoning shell).
       if (item?.["type"] === "reasoning") {
         const summary = reasoningSummaryText(item["summary"]);
+        // An empty summary still means "the model finished a thinking step" —
+        // emit `raw` rather than nothing, same reason as item/started below.
         if (summary) yield { type: "thinking_snapshot", text: summary, raw: obj };
+        else yield { type: "raw", raw: obj };
         return;
       }
+      // Close the tool_use opened by item/started — but only for an id this
+      // parser actually opened, so the in-flight count stays balanced. A
+      // completion whose start was never seen (mid-turn attach, dropped
+      // notification) falls through to `raw`: it still pokes the watchdog
+      // without faking a result for a call we never counted.
+      const completedId = typeof item?.["id"] === "string" ? (item["id"] as string) : undefined;
+      if (completedId && item && this.openToolItems.delete(completedId)) {
+        yield { type: "tool_result", raw: codexToolItemResultRaw(obj, item) };
+        return;
+      }
+      yield { type: "raw", raw: obj };
       return;
     }
 
@@ -751,6 +1003,8 @@ export function runCodex(opts: RunOptions, codexBinPath = "codex"): RunHandle {
                 input: [{ type: "text", text: opts.prompt, text_elements: [] }],
                 approvalPolicy: codexApprovalPolicy(mode),
                 sandboxPolicy: codexTurnSandboxPolicy(mode),
+                // Reasoning streaming — watchdog liveness, not just COT.
+                summary: CODEX_TURN_REASONING_SUMMARY,
               };
               if (opts.cwd != null) turnParams["cwd"] = opts.cwd;
               // Per-bot model/effort override (perf plan 批C): `turn/start`
@@ -838,6 +1092,7 @@ export {
   codexApprovalPolicy,
   codexThreadSandboxMode,
   codexTurnSandboxPolicy,
+  CODEX_TURN_REASONING_SUMMARY,
   asRecord,
   extractThreadIdFromThreadResponse,
   CodexAppServerLineParser,

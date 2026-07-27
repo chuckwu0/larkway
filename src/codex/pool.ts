@@ -71,6 +71,7 @@ import {
   asRecord,
   buildCodexCommand,
   buildCodexEnv,
+  CODEX_TURN_REASONING_SUMMARY,
   CodexAppServerLineParser,
   codexApprovalPolicy,
   codexEffortFromLarkway,
@@ -349,6 +350,11 @@ export class CodexProcessPool implements AgentRunner {
       input: [{ type: "text", text: state.opts.prompt, text_elements: [] }],
       approvalPolicy: codexApprovalPolicy(mode),
       sandboxPolicy: codexTurnSandboxPolicy(mode),
+      // Same rationale as the cold path in runner.ts: reasoning deltas are the
+      // only in-flight liveness signal the idle watchdog gets. Pooling is
+      // default-on for codex bots, so omitting it here would leave the LIVE
+      // path unfixed.
+      summary: CODEX_TURN_REASONING_SUMMARY,
     };
     if (state.opts.cwd != null) turnParams["cwd"] = state.opts.cwd;
     if (state.opts.model) turnParams["model"] = state.opts.model;

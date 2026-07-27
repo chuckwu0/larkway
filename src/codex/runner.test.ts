@@ -414,10 +414,14 @@ describe("CodexAppServerLineParser", () => {
     expect(second).toEqual([{ type: "thinking_delta", text: "\n\n", raw: expect.anything() }]);
   });
 
-  it("emits nothing for a started (empty-shell) reasoning item", () => {
+  // A started reasoning item carries no text worth showing, but it MUST still
+  // produce an event: the bridge's idle watchdog only learns the runner is
+  // alive from yielded events, and "model started thinking" is precisely the
+  // boundary that used to be invisible (see CODEX_TOOL_ITEM_TYPES' doc).
+  it("degrades a started (empty-shell) reasoning item to raw instead of dropping it", () => {
     const parser = new CodexAppServerLineParser();
     const events = [...parser.parseMessage(JSON.parse(appReasoningStarted()))];
-    expect(events).toHaveLength(0);
+    expect(events).toEqual([{ type: "raw", raw: expect.anything() }]);
   });
 
   it("emits completed reasoning summary as a thinking_snapshot fallback", () => {
@@ -432,10 +436,187 @@ describe("CodexAppServerLineParser", () => {
     ]);
   });
 
-  it("tolerates a completed reasoning item with an empty summary (no event)", () => {
+  // An empty summary carries no COT text, but "a thinking step just finished"
+  // is still a liveness signal the idle watchdog needs.
+  it("tolerates a completed reasoning item with an empty summary (raw, not silence)", () => {
     const parser = new CodexAppServerLineParser();
     const events = [...parser.parseMessage(JSON.parse(appReasoningCompleted([])))];
-    expect(events).toHaveLength(0);
+    expect(events).toEqual([{ type: "raw", raw: expect.anything() }]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Non-shell tool items — idle-watchdog visibility
+//
+// Regression suite for the 2026-07-27 field failure: every ThreadItem type
+// other than commandExecution / agentMessage / reasoning used to be swallowed
+// whole (both item/started and item/completed returned without yielding), so an
+// MCP tool call that ran for minutes looked exactly like a hung process to the
+// bridge's idle watchdog and got the turn interrupted. Measured against a real
+// app-server: a 25 s MCP call = 26.6 s of total silence, no in-flight exemption.
+// ---------------------------------------------------------------------------
+
+const APP_MCP_ITEM_ID = "exec-fakemcp01";
+
+function appToolItem(
+  phase: "item/started" | "item/completed",
+  item: Record<string, unknown>,
+): string {
+  return JSON.stringify({
+    method: phase,
+    params: { item, threadId: APP_THREAD_ID, turnId: "turn-1" },
+  });
+}
+
+const mcpItem = (status: string, overrides: Record<string, unknown> = {}) => ({
+  type: "mcpToolCall",
+  id: APP_MCP_ITEM_ID,
+  server: "nbi",
+  tool: "execute_sql",
+  arguments: { sql: "select 1" },
+  status,
+  ...overrides,
+});
+
+describe("CodexAppServerLineParser — non-shell tool items", () => {
+  it("maps an MCP tool call to a tool_use / tool_result pair (the in-flight exemption)", () => {
+    const parser = new CodexAppServerLineParser();
+
+    const started = [...parser.parseMessage(JSON.parse(appToolItem("item/started", mcpItem("inProgress"))))];
+    expect(started).toEqual([
+      {
+        type: "tool_use",
+        toolName: "nbi.execute_sql",
+        toolInput: { server: "nbi", tool: "execute_sql", arguments: { sql: "select 1" } },
+        raw: expect.anything(),
+      },
+    ]);
+
+    const completed = [...parser.parseMessage(JSON.parse(appToolItem("item/completed", mcpItem("completed"))))];
+    expect(completed).toEqual([{ type: "tool_result", raw: expect.anything() }]);
+  });
+
+  it("maps webSearch the same way (started → tool_use, completed → tool_result)", () => {
+    const parser = new CodexAppServerLineParser();
+    const item = { type: "webSearch", id: "ws-1", query: "larkway" };
+
+    expect([...parser.parseMessage(JSON.parse(appToolItem("item/started", item)))]).toEqual([
+      { type: "tool_use", toolName: "web_search", toolInput: { query: "larkway" }, raw: expect.anything() },
+    ]);
+    expect([...parser.parseMessage(JSON.parse(appToolItem("item/completed", item)))]).toEqual([
+      { type: "tool_result", raw: expect.anything() },
+    ]);
+  });
+
+  // handler.ts's 批H H2 accounting sums JSON.stringify(tool_result.raw) and
+  // forces a fresh session past a fixed char budget calibrated on shell-only
+  // output. A measured 55 KB MCP result per call would blow it in one or two
+  // turns, restarting the session of exactly the MCP-heavy bots this fix serves.
+  it("strips the result payload from a tool_result raw (session-volume budget + COT detailed tier)", () => {
+    const parser = new CodexAppServerLineParser();
+    const bigResult = { content: [{ type: "text", text: "x".repeat(50_000) }] };
+    [...parser.parseMessage(JSON.parse(appToolItem("item/started", mcpItem("inProgress"))))];
+
+    const [event] = [
+      ...parser.parseMessage(
+        JSON.parse(appToolItem("item/completed", mcpItem("completed", { result: bigResult }))),
+      ),
+    ];
+    expect(event?.type).toBe("tool_result");
+    const raw = JSON.stringify(event?.raw);
+    expect(raw).not.toContain("xxxx");
+    expect(raw.length).toBeLessThan(2_000);
+    // The identity of the call survives — only the payload is dropped.
+    expect(raw).toContain("execute_sql");
+  });
+
+  // Drift-up guard, the dangerous direction: handler.ts increments per tool_use
+  // event, but this parser can only ever close an id once, so a re-announced
+  // start would pin toolsInFlight above zero and disable idle-kill for the whole
+  // remaining turn.
+  it("does not re-open an item id that is already in flight", () => {
+    const parser = new CodexAppServerLineParser();
+    const first = [...parser.parseMessage(JSON.parse(appToolItem("item/started", mcpItem("inProgress"))))];
+    const second = [...parser.parseMessage(JSON.parse(appToolItem("item/started", mcpItem("inProgress"))))];
+
+    expect(first[0]?.type).toBe("tool_use");
+    expect(second).toEqual([{ type: "raw", raw: expect.anything() }]);
+
+    // One completion closes it, and the count is back to balanced.
+    const completed = [...parser.parseMessage(JSON.parse(appToolItem("item/completed", mcpItem("completed"))))];
+    expect(completed[0]?.type).toBe("tool_result");
+  });
+
+  // Types kept OUT of CODEX_TOOL_ITEM_TYPES on purpose (no evidence codex closes
+  // them): fileChange starts and completes in the same millisecond, sleep and
+  // imageGeneration have no enumerated terminal status. They must not pretend to
+  // be tool calls — but must still poke the watchdog.
+  it.each(["fileChange", "sleep", "imageGeneration", "contextCompaction"])(
+    "leaves %s unmapped (raw on both phases), never opening an exemption it cannot close",
+    (type) => {
+      const parser = new CodexAppServerLineParser();
+      const item = { type, id: `${type}-1`, status: "inProgress" };
+      expect([...parser.parseMessage(JSON.parse(appToolItem("item/started", item)))]).toEqual([
+        { type: "raw", raw: expect.anything() },
+      ]);
+      expect([...parser.parseMessage(JSON.parse(appToolItem("item/completed", item)))]).toEqual([
+        { type: "raw", raw: expect.anything() },
+      ]);
+    },
+  );
+
+  // Balance guard: a tool_result for a call we never counted would decrement
+  // handler.ts's toolsInFlight below the number of open calls and drop the
+  // exemption for a DIFFERENT in-flight tool.
+  it("does not fake a tool_result for a completion whose start was never seen", () => {
+    const parser = new CodexAppServerLineParser();
+    const events = [...parser.parseMessage(JSON.parse(appToolItem("item/completed", mcpItem("completed"))))];
+    expect(events).toEqual([{ type: "raw", raw: expect.anything() }]);
+  });
+
+  // Opposite drift, and the more dangerous one: an unclosable tool_use pins
+  // toolsInFlight above zero and disables idle-kill for the rest of the turn.
+  it("degrades an id-less tool item to raw rather than opening an uncloseable tool_use", () => {
+    const parser = new CodexAppServerLineParser();
+    const { id: _id, ...noId } = mcpItem("inProgress");
+    const events = [...parser.parseMessage(JSON.parse(appToolItem("item/started", noId)))];
+    expect(events).toEqual([{ type: "raw", raw: expect.anything() }]);
+  });
+
+  // Defensive only: both production callers already build a parser per turn, so
+  // this documents the reset rather than a live path.
+  it("clears open tool items at the turn boundary (defense if an instance is ever reused)", () => {
+    const parser = new CodexAppServerLineParser();
+    [...parser.parseMessage(JSON.parse(appToolItem("item/started", mcpItem("inProgress"))))];
+    [...parser.parseMessage(JSON.parse(APP_TURN_COMPLETED))];
+
+    const late = [...parser.parseMessage(JSON.parse(appToolItem("item/completed", mcpItem("completed"))))];
+    expect(late).toEqual([{ type: "raw", raw: expect.anything() }]);
+  });
+
+  // subAgentActivity is deliberately NOT in CODEX_TOOL_ITEM_TYPES — its
+  // started/completed lifecycle is unconfirmed, so mapping it risks the
+  // unclosable-tool_use failure above. It must still poke the watchdog.
+  it("degrades a deliberately unmapped item type (subAgentActivity) to raw, both phases", () => {
+    const parser = new CodexAppServerLineParser();
+    const item = { type: "subAgentActivity", id: "sa-1", kind: "started" };
+    expect([...parser.parseMessage(JSON.parse(appToolItem("item/started", item)))]).toEqual([
+      { type: "raw", raw: expect.anything() },
+    ]);
+    expect([...parser.parseMessage(JSON.parse(appToolItem("item/completed", item)))]).toEqual([
+      { type: "raw", raw: expect.anything() },
+    ]);
+  });
+
+  it("degrades a future/unknown item type to raw instead of dropping it", () => {
+    const parser = new CodexAppServerLineParser();
+    const item = { type: "somethingCodexAddsNextRelease", id: "x-1" };
+    expect([...parser.parseMessage(JSON.parse(appToolItem("item/started", item)))]).toEqual([
+      { type: "raw", raw: expect.anything() },
+    ]);
+    expect([...parser.parseMessage(JSON.parse(appToolItem("item/completed", item)))]).toEqual([
+      { type: "raw", raw: expect.anything() },
+    ]);
   });
 });
 
@@ -875,6 +1056,41 @@ describe("runCodex() — spawn-level integration", () => {
 
     const turnStart = requests.find((request) => request.method === "turn/start");
     expect(turnStart?.params).toMatchObject({ model: "gpt-5.4-codex" });
+  });
+
+  // Reasoning deltas are the ONLY events codex emits while a model request is
+  // in flight, which makes them the idle watchdog's sole liveness signal during
+  // prefill + thinking. The equivalent global config flag stopped delivering
+  // them as of codex-cli 0.145.0 (measured: 0 deltas with the flag alone vs
+  // 9-11 with this param, same model and prompt), so it must go on turn/start.
+  it("passes turn/start.summary=detailed so reasoning deltas keep feeding the idle watchdog", async () => {
+    const fake = makeFakeCodexChild();
+    __nextFakeCodexChild = fake;
+
+    const { runCodex } = await import("./runner.js");
+    const handle = runCodex({ prompt: "continue the task" });
+
+    const eventsPromise = collectEvents(handle.events);
+    await new Promise<void>((res) => setImmediate(() => {
+      fake.stdout.write(APP_INIT_RESPONSE + "\n");
+      fake.stdout.write(APP_THREAD_RESPONSE + "\n");
+      fake.stdout.write(APP_TURN_RESPONSE + "\n");
+      fake.stdout.write(APP_TURN_COMPLETED + "\n");
+      res();
+    }));
+
+    await eventsPromise;
+    await handle.done;
+
+    const stdinText: string = fake.child.stdin.read()?.toString("utf8") ?? "";
+    const requests: Array<{ method?: string; params?: Record<string, unknown> }> = stdinText
+      .trim()
+      .split("\n")
+      .filter(Boolean)
+      .map((line: string) => JSON.parse(line) as { method?: string; params?: Record<string, unknown> });
+
+    const turnStart = requests.find((request) => request.method === "turn/start");
+    expect(turnStart?.params).toMatchObject({ summary: "detailed" });
   });
 
   it("passes opts.effort through as turn/start.effort, mapped through codexEffortFromLarkway (max → xhigh)", async () => {
