@@ -2870,6 +2870,63 @@ describe("handleOne — thin-channel finalize", () => {
     expect(finalizeArgs[0]?.failureReason).toBeUndefined();
   });
 
+  // BL-49 (2026-07-27 dogfood): a bridge-CREATED card (v5 `create`) must be
+  // claimed in comment mode, exactly like a 任务派单 claim. Before this, it fell
+  // through to full mode and the pre-v4.1 writeback patched the description,
+  // auto-ticked completion off `done: true`, and auto-reopened — so the user's
+  // very first sight of the task was already `status: done`.
+  it("claims a BRIDGE-CREATED task in comment mode (no description patch / no auto-complete)", async () => {
+    const threadId = "om_msg";
+    const wt = await seedWorktree(threadId);
+    await seedRepoCachePath();
+    runClaudeImpl = () => ({
+      events: (async function* () {
+        yield { type: "system_init", sessionId: "sess_bl49", raw: {} };
+        await writeFile(
+          stateFileMod.stateFilePathOf(wt),
+          JSON.stringify(
+            {
+              status: "ready",
+              last_message: "查完了",
+              task_handle: { create: { summary: "跨轮次的活" }, done: true },
+              updated_at: "2026-07-27T08:00:00.000Z",
+            },
+            null,
+            2,
+          ),
+          "utf8",
+        );
+      })(),
+      done: Promise.resolve({ exitCode: 0, sessionId: "sess_bl49" }),
+      kill: () => {},
+    });
+
+    const claimCalls: Array<Record<string, unknown>> = [];
+    const { renderer, whenFinalized } = makeCardRenderer();
+    const { store } = makeSessionStore();
+    const { client } = makeClient(makeEvent());
+    const handler = new BridgeHandler({
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      client: client as any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      cardRenderer: renderer as any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      sessionStore: store as any,
+      conventions: makeConventions(),
+      botConfig: { id: "frontend", name: "Frontend", turn_taking_limit: 10, backend: "claude" },
+      taskHandleDeclare: async () => ({ createdGuid: "g-new", outcomes: [] }),
+      taskHandleClaim: async (patch) => {
+        claimCalls.push(patch as unknown as Record<string, unknown>);
+      },
+    });
+
+    await handler.run();
+    await whenFinalized;
+
+    expect(claimCalls).toHaveLength(1);
+    expect(claimCalls[0]).toMatchObject({ taskGuid: "g-new", mode: "comment" });
+  });
+
   it("passes agent-declared image_blocks from fresh state.json into card.finalize", async () => {
     const threadId = "om_msg";
     const finalState = {

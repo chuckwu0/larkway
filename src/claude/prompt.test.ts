@@ -852,6 +852,47 @@ describe("renderPrompt — advisory runtime warnings", () => {
 // task-handle v3: candidate injection (docs/task-handle.md §5.1)
 // ---------------------------------------------------------------------------
 
+describe("renderPrompt — 建卡判据事实 (BL-49)", () => {
+  it("renders no turn-count facts when the bridge did not supply them", async () => {
+    const prompt = await renderPrompt(makeInput({}));
+    // The padded forms are the <thread-context> FACT lines; the contract prose
+    // mentions the field names too, so match on the fact-line shape only.
+    expect(prompt).not.toContain("thread_turn_count:   ");
+    // Line-start form = the fact line; the contract prose only ever mentions the
+    // field inside backticks, so anchoring on the newline keeps them apart.
+    expect(prompt).not.toContain("\nthread_has_task_card:");
+  });
+
+  it("renders the observed turn count and card state as plain facts", async () => {
+    const prompt = await renderPrompt(makeInput({ threadTurnCount: 2, threadHasTaskCard: false }));
+    expect(prompt).toContain("thread_turn_count:   2");
+    expect(prompt).toContain("thread_has_task_card: no");
+  });
+
+  it("reports an existing card so the agent does not create a second one", async () => {
+    const prompt = await renderPrompt(makeInput({ threadTurnCount: 5, threadHasTaskCard: true }));
+    expect(prompt).toContain("thread_has_task_card: yes");
+  });
+
+  // The 判据 must key off observed facts, not a prediction about future turns —
+  // that prediction is what failed in the 2026-07-27 dogfood.
+  it("states the fact-based 判据 and both directions of the cost in the state contract", async () => {
+    const prompt = await renderPrompt(makeInput({}));
+    expect(prompt).toContain("`thread_turn_count` ≥ 2");
+    expect(prompt).toContain("该建没建");
+  });
+
+  // Round 2 of the same dogfood: with BOTH rules living in one paragraph, the
+  // agent kept applying "一问一答不建卡" to a turn-2 message it happened to
+  // answer in one shot — the two rules cancelled out. The turn-1 rule must be
+  // explicitly scoped so it cannot be used as a reason to skip a cross-turn card.
+  it("scopes the 一问一答 exemption to turn 1 so it cannot veto a cross-turn card", async () => {
+    const prompt = await renderPrompt(makeInput({}));
+    expect(prompt).toContain("`thread_turn_count: 1`");
+    expect(prompt).toContain("不是不建的理由");
+  });
+});
+
 describe("renderPrompt — task-handle candidate injection (v3)", () => {
   it("renders no <task-handle> block when the bot has no tasklistGuid", async () => {
     const prompt = await renderPrompt(makeInput({}));
