@@ -73,7 +73,8 @@
 | v0.3.66 | v0.3.66 | patch / 已发布 | fix: Windows 下 larkway start 报「找不到 supervisor 脚本也找不到 dist/main.js」— resolveRepoRoot 改用 fileURLToPath 正确解析 win32 盘符路径 |
 | v0.3.67 | v0.3.67 | patch / 已发布 | BYO workspace override (bot yaml workspace:) with resume gate; cross-backend skills scaffold (.agents/skills + .claude/skills symlink); startup backend readiness probes + supervisor PATH fix; per-repo --add-dir for repo-shipped skills |
 | v0.3.68 | v0.3.68 | patch / 已发布 | expose idle watchdog as bot yaml idle_timeout_seconds (long-prefill turns were misread as hangs and interrupted) |
-| v0.3.69 | v0.3.69 | 当前 patch / 已发布 | fix: tasklist self-join hit the wrong endpoint (/members -> /add_members), a live 404 on every bridge startup |
+| v0.3.69 | v0.3.69 | patch / 已发布 | fix: tasklist self-join hit the wrong endpoint (/members -> /add_members), a live 404 on every bridge startup |
+| v0.3.70 | v0.3.70 | 当前 patch / 已发布 | codex idle watchdog 不再把正常工作判为卡死(MCP/工具 item 生命周期映射 + turn/start reasoning 流式) + BL-49 任务卡片七条修复 |
 
 ## 使用原则
 
@@ -154,4 +155,5 @@ v0.3.66       = fix: Windows 下 larkway start 报「找不到 supervisor 脚本
 v0.3.67       = BYO workspace override (bot yaml workspace:) with resume gate; cross-backend skills scaffold (.agents/skills + .claude/skills symlink); startup backend readiness probes + supervisor PATH fix; per-repo --add-dir for repo-shipped skills
 v0.3.68       = expose idle watchdog as bot yaml idle_timeout_seconds (long-prefill turns were misread as hangs and interrupted)
 v0.3.69       = fix: tasklist self-join hit the wrong endpoint (/members -> /add_members), a live 404 on every bridge startup
+v0.3.70       = codex idle watchdog 不再把正常工作判为卡死(MCP/工具 item 生命周期映射 + turn/start reasoning 流式) + BL-49 任务卡片七条修复
 ```
