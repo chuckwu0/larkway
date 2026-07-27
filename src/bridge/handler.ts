@@ -193,6 +193,14 @@ const DEFAULT_SESSION_RESEED_CHARS = 300_000;
 const RESEED_WARNING_WINDOW_TURNS = 5;
 const RESEED_WARNING_CHARS_RATIO = 0.85;
 
+/**
+ * BL-49: turns a thread may run with no task card before the bridge records a
+ * "任务卡黑洞" diagnostic runtime event. 4 = comfortably past the 2-turn 判据
+ * (see prompt.ts's threadTurnCount doc), so a thread that legitimately stayed a
+ * short Q&A never trips it. Diagnostic only — never user-visible, never a nudge.
+ */
+const TASK_CARD_BLACKHOLE_TURNS = 4;
+
 function resolveStuckSessionResetAfter(): number {
   const raw = process.env.LARKWAY_STUCK_SESSION_RESET_AFTER;
   if (raw === undefined) return DEFAULT_STUCK_SESSION_RESET_AFTER;
@@ -2062,7 +2070,24 @@ export class BridgeHandler {
       // goes (real-machine screenshot 2026-07-10). Those turns fall through to
       // the post-card site below and anchor on the in-topic answer card.
       const triggerInTopic = realTopicThreadId(parsed.raw.thread_id) !== undefined;
-      if (!isNewThread && (triggerInTopic || !taskCardAnchorId)) await createCotBubble(messageId);
+      // BL-49 round-4: a SYNTHETIC turn (stall nudge / task-comment relay) has no
+      // real trigger message in the topic — `raw.message_id` is a fabricated
+      // `synthetic-…` string and `raw.thread_id` carries the session key (an
+      // `om_` root id), not an `omt_`. `parsed.messageId` therefore resolves to
+      // `reply_anchor_message_id` = the topic ROOT, and anchoring the bubble
+      // there is exactly the pos=-1 case that quote-replies at GROUP TOP LEVEL
+      // (see createCotBubble's probe note). Real-machine 2026-07-27: every
+      // leaked 「任务已完成」 bubble in the group main stream came from a stall
+      // nudge. The root IS the right anchor for the turn's REPLY (main.ts's
+      // reply_anchor_message_id fix) and the wrong one for the bubble — the
+      // earlier fix simply had no reason to consider the bubble. Defer these
+      // turns to the post-card site, which anchors on the in-topic answer card,
+      // the same treatment a brand-new topic already gets.
+      const triggerIsRealMessage =
+        typeof parsed.raw.message_id === "string" && parsed.raw.message_id.startsWith("om_");
+      if (!isNewThread && triggerIsRealMessage && (triggerInTopic || !taskCardAnchorId)) {
+        await createCotBubble(messageId);
+      }
 
       // CardKit response surface: default main surface when the transport and
       // rollout gates are available. It streams bounded progress into a
@@ -2765,6 +2790,10 @@ export class BridgeHandler {
           runtimeWarnings: this.runtimeWarnings(),
           taskHandleTasklistGuid: this.deps.botConfig?.taskHandle?.tasklistGuid,
           taskHandleClaimed: this.deps.taskHandleClaimedLookup?.(threadId) ?? false,
+          // BL-49: mechanical 建卡 判据 facts. Counts THIS turn (a brand-new
+          // topic is 1), matching the number the agent can see in the thread.
+          threadTurnCount: (existing?.turnCount ?? 0) + 1,
+          threadHasTaskCard: this.deps.taskHandleClaimedLookup?.(threadId) ?? false,
           taskHandleCandidates: this.deps.taskHandleCandidatesLookup?.() ?? [],
           taskRoot: taskRootInfo
             ? {
@@ -3277,10 +3306,48 @@ export class BridgeHandler {
                 // grants read+comment; no tasklist/editor rights needed, and
                 // completion is ALWAYS ticked by the human). Mechanical
                 // equality check, not a judgment call.
-                mode: taskRootInfo?.guid === claimedTaskGuid ? "comment" : undefined,
+                //
+                // BL-49 (2026-07-27 dogfood): a BRIDGE-CREATED card (v5
+                // `create`) gets the same treatment. It used to fall through to
+                // undefined → the pre-v4.1 full-mode writeback, which patched a
+                // status block into the description, auto-ticked completion off
+                // `done: true`, and auto-reopened — all three explicitly retired
+                // by v4.1 (§15.3/§15.6). Real-machine symptoms: a task that was
+                // already `status: done` the moment the user first saw it (so
+                // the human confirmation step vanished), and a description log
+                // nobody reads (description changes don't push; comments do).
+                // v4.1's semantics are path-independent — the reason completion
+                // belongs to the human doesn't change just because the bridge
+                // opened the card.
+                mode:
+                  taskRootInfo?.guid === claimedTaskGuid || claimedTaskGuid === bridgeCreatedTaskGuid
+                    ? "comment"
+                    : undefined,
               });
             } catch (err) {
               console.warn("[bridge.handler] taskHandleClaim hook failed (continuing):", err);
+            }
+          }
+
+          // BL-49 "任务卡黑洞" diagnostic. The v5 main path has no equivalent of
+          // the 辅路径's candidate black-hole alert (§14.1): if the agent simply
+          // never declares `task_handle.create`, a long-running thread silently
+          // has no tracking handle and NOBODY finds out — which is precisely why
+          // the low create rate went unnoticed until the 2026-07-27 dogfood.
+          // This is observability only: a runtime-event line for the operator
+          // dashboard, no user-visible output, no nudge, no bridge-side judgment
+          // about whether a card SHOULD exist (that stays the agent's call).
+          {
+            const turnsSoFar = (existing?.turnCount ?? 0) + 1;
+            const stillNoCard = !(this.deps.taskHandleClaimedLookup?.(threadId) ?? false);
+            if (stillNoCard && turnsSoFar >= TASK_CARD_BLACKHOLE_TURNS) {
+              await recordEvent({
+                status: "running",
+                appendPath: "任务卡黑洞",
+                reason:
+                  `本话题已进行 ${turnsSoFar} 轮仍无任务卡(agent 未声明 task_handle.create)。` +
+                  `跨轮次的活没有任务卡 = 用户没有追踪入口/推送。仅诊断,不影响本轮。`,
+              });
             }
           }
 

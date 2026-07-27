@@ -2870,6 +2870,63 @@ describe("handleOne — thin-channel finalize", () => {
     expect(finalizeArgs[0]?.failureReason).toBeUndefined();
   });
 
+  // BL-49 (2026-07-27 dogfood): a bridge-CREATED card (v5 `create`) must be
+  // claimed in comment mode, exactly like a 任务派单 claim. Before this, it fell
+  // through to full mode and the pre-v4.1 writeback patched the description,
+  // auto-ticked completion off `done: true`, and auto-reopened — so the user's
+  // very first sight of the task was already `status: done`.
+  it("claims a BRIDGE-CREATED task in comment mode (no description patch / no auto-complete)", async () => {
+    const threadId = "om_msg";
+    const wt = await seedWorktree(threadId);
+    await seedRepoCachePath();
+    runClaudeImpl = () => ({
+      events: (async function* () {
+        yield { type: "system_init", sessionId: "sess_bl49", raw: {} };
+        await writeFile(
+          stateFileMod.stateFilePathOf(wt),
+          JSON.stringify(
+            {
+              status: "ready",
+              last_message: "查完了",
+              task_handle: { create: { summary: "跨轮次的活" }, done: true },
+              updated_at: "2026-07-27T08:00:00.000Z",
+            },
+            null,
+            2,
+          ),
+          "utf8",
+        );
+      })(),
+      done: Promise.resolve({ exitCode: 0, sessionId: "sess_bl49" }),
+      kill: () => {},
+    });
+
+    const claimCalls: Array<Record<string, unknown>> = [];
+    const { renderer, whenFinalized } = makeCardRenderer();
+    const { store } = makeSessionStore();
+    const { client } = makeClient(makeEvent());
+    const handler = new BridgeHandler({
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      client: client as any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      cardRenderer: renderer as any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      sessionStore: store as any,
+      conventions: makeConventions(),
+      botConfig: { id: "frontend", name: "Frontend", turn_taking_limit: 10, backend: "claude" },
+      taskHandleDeclare: async () => ({ createdGuid: "g-new", outcomes: [] }),
+      taskHandleClaim: async (patch) => {
+        claimCalls.push(patch as unknown as Record<string, unknown>);
+      },
+    });
+
+    await handler.run();
+    await whenFinalized;
+
+    expect(claimCalls).toHaveLength(1);
+    expect(claimCalls[0]).toMatchObject({ taskGuid: "g-new", mode: "comment" });
+  });
+
   it("passes agent-declared image_blocks from fresh state.json into card.finalize", async () => {
     const threadId = "om_msg";
     const finalState = {
@@ -3091,6 +3148,8 @@ describe("handleOne — COT bubble ordering (before the card)", () => {
     existingTopic?: boolean;
     /** true → both card surfaces fail so no card message id exists (fallback path). */
     noCard?: boolean;
+    /** true → a stall-nudge/comment-relay shaped event (fake message_id + root anchor). */
+    syntheticTrigger?: boolean;
   }) {
     const threadId = "om_msg";
     const wt = await seedWorktree(threadId);
@@ -3124,7 +3183,19 @@ describe("handleOne — COT bubble ordering (before the card)", () => {
       store.get = (() =>
         ({ threadId, sessionId: "prev", lastActiveTs: 0 })) as unknown as typeof store.get;
     }
-    const { client, acked, unhandled } = makeClient(makeEvent());
+    const event = opts.syntheticTrigger
+      ? {
+          // Exactly what main.ts's enqueueNudgeTurn builds: a fabricated id for
+          // dedup plus the topic ROOT as the real reply anchor.
+          ...makeEvent(),
+          message_id: `synthetic-task-stall-${threadId}-1700000000000`,
+          reply_anchor_message_id: threadId,
+          thread_id: threadId,
+          root_id: threadId,
+          larkway_trigger_type: "task_stall",
+        }
+      : makeEvent();
+    const { client, acked, unhandled } = makeClient(event);
     const handler = new BridgeHandler({
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       client: client as any,
@@ -3167,6 +3238,38 @@ describe("handleOne — COT bubble ordering (before the card)", () => {
     expect(order).toContain("cot_create");
     expect(order).toContain("card_create");
     expect(order.indexOf("cot_create")).toBeLessThan(order.indexOf("card_create"));
+  });
+
+  // BL-49 round-4: a stall nudge / comment relay has no real trigger message in
+  // the topic, so `parsed.messageId` resolves to the topic ROOT (pos=-1) and
+  // anchoring there quote-replies at the GROUP TOP LEVEL — every leaked
+  // 「任务已完成」 bubble on the real machine came from this path. Such turns must
+  // be deferred to the post-card site and anchor on the in-topic answer card.
+  it("synthetic turn on an existing topic: defers the bubble to after the card and anchors on it", async () => {
+    const order: string[] = [];
+    let createdOrigin: string | undefined;
+    const cotClient: OutboundCotClient = {
+      async create(target) {
+        order.push("cot_create");
+        createdOrigin = target.originMessageId;
+        return { cotId: "cot_1", messageId: "om_cot_1" };
+      },
+      async resolveThreadId() {
+        return undefined;
+      },
+      async update() {},
+      async complete() {},
+    };
+    await runTurn({
+      cotClient,
+      existingTopic: true,
+      syntheticTrigger: true,
+      onCardCreate: () => order.push("card_create"),
+    });
+
+    expect(order.indexOf("card_create")).toBeLessThan(order.indexOf("cot_create"));
+    // NOT the topic root ("om_msg") — that is the group-top-level anchor.
+    expect(createdOrigin).not.toBe("om_msg");
   });
 
   it("new topic (first turn): sends the card BEFORE creating the bubble (so it anchors in the topic)", async () => {

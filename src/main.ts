@@ -54,6 +54,7 @@ import { TaskListClient, type LarkTaskRequester } from "./tasklist/client.js";
 import { applyTaskHandleWriteback, applyAutoBindConfirmation } from "./tasklist/writeback.js";
 import { applyTaskHandleDeclarations } from "./tasklist/declare.js";
 import { CommentPoller } from "./tasklist/commentPoller.js";
+import { applyVerifiedClaim } from "./tasklist/claim.js";
 import { TasklistPoller, type RootTextEntry } from "./tasklist/tasklistPoller.js";
 import { CandidateAlertStore } from "./tasklist/candidateAlertStore.js";
 import { StallDetector } from "./tasklist/stallDetector.js";
@@ -657,13 +658,13 @@ async function runV2Mode({
         // agent already made its declaration in state.json; the bridge just
         // couldn't honor it, it doesn't get to "argue back" mid-turn).
         taskHandleClaim = async (patch) => {
-          const result = await taskHandleStore.claim(patch);
-          if (!result.claimed) {
-            console.warn(
-              `[larkway] bot "${bot.id}": thread ${patch.threadId}'s declared claim on task ${patch.taskGuid} ` +
-                `was rejected (${result.reason ?? "unknown reason"}) — continuing without claiming.`,
-            );
-          }
+          // BL-49 round-5: the guid is agent-declared and was taken on faith —
+          // see src/tasklist/claim.ts for the failure that cost us.
+          await applyVerifiedClaim(patch, {
+            store: taskHandleStore,
+            client: taskListClient,
+            botId: bot.id,
+          });
         };
         // Dogfood fix V2 — a plain in-memory fact lookup (no I/O, no judgment):
         // handler.ts calls this at prompt-build time to inject

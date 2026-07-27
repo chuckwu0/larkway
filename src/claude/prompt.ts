@@ -235,6 +235,28 @@ export interface RenderPromptInput {
    * Pure injected facts (guid/summary/deep link/claimed state); what to do
    * with them is the task-handle SKILL's 任务派单 section.
    */
+  /**
+   * BL-49: how many turns this thread has already run, INCLUDING the current
+   * one (1 on a brand-new topic). Purely mechanical — the bridge already keeps
+   * `SessionRecord.turnCount`; this just surfaces it.
+   *
+   * Why it exists: the v5 建卡 判据 used to ask the agent to PREDICT whether the
+   * work would span turns ("三个月后复盘会找它 / 跨越本轮对话"), and the decision
+   * point sat at the end of turn 1 — exactly when the evidence is weakest.
+   * 2026-07-27 dogfood: a request that explicitly said "后面我会分几次回来追进度"
+   * was still judged 一问一答 and no card was created. Handing the agent the
+   * OBSERVED turn count replaces a prediction with a fact; whether to create a
+   * card is still 100% the agent's call (thin bridge unchanged).
+   * Absent = unknown (legacy callers/tests) → no fact line rendered.
+   */
+  threadTurnCount?: number;
+  /**
+   * BL-49: whether this thread already carries ANY task-handle claim. Unlike
+   * {@link taskHandleClaimed} (gated behind a configured tasklist guid), this
+   * one is tasklist-independent — the v5 main path needs no tasklist, so the
+   * 判据 fact line must render for every bot.
+   */
+  threadHasTaskCard?: boolean;
   taskRoot?: {
     guid: string;
     summary: string;
@@ -384,7 +406,11 @@ function renderStateContract(stateFilePath?: string): string[] {
     "- 需要覆盖卡片正文:status=ready + last_message(不写时正文=答案通道内容);dev_url/mr_url 等业务字段可自由写入,但 bridge 不感知其含义,要让用户看到就写进正文。",
     "- 需要在终态卡上 @ 人:response_surface 写 `{post:{mentions:[{user_id}]}}`;这只是视觉提示,要 peer bot 消费正文必须走 handoffs 或另发真实 post(卡片对 agent 不可读)。",
     "- 交接给 peer bot:handoffs(最多 3 条 `{to, text}`,to 写 peer-bots 名册里的名字)。bridge 替你发一条带真实 at 标签的 post 留痕,同桥进程内的 peer 还会被**本地直递**立即唤醒——比自己用 lark-cli 发 post 更快更可靠。text 必须自包含:对方只看得到这条文本,背景、要做什么、期望产出都写清楚。",
-    "- **任务卡(五信号委托契约,值得追踪的活必用)**:判断标准——三个月后复盘会找它、或执行跨越本轮对话(要跑很久/等外部/分阶段)→ 写 task_handle。一问一答聊完就完的**不建卡**。",
+    "- **任务卡(五信号委托契约)**:建不建只看 `<thread-context>` 里那两条**已发生的事实**,不预测未来:",
+    "  - `thread_turn_count: 1` —— 只在明显是长活时建(要跑很久/等外部/分阶段);一问一答聊完就完的不建。",
+    "  - `thread_turn_count` ≥ 2 且 `thread_has_task_card: no` —— **建卡**。用户回来追第二轮,这件事已经跨轮了。**「我这一轮一句话就答完了」不是不建的理由** —— 判据看的是话题跨了几轮,不是本轮答没答完;上面第 1 轮那条到这里不再适用,别拿它当借口。",
+    "  - `thread_has_task_card: yes` —— 已有卡,只用 note/due/blocked/done 维护,别重复建。",
+    "  - 两边都有代价,别只怕一边:滥建卡会把任务中心刷成日志;**该建没建 = 用户永久失去这件事的追踪入口和推送**,而且没有任何人会发现漏了。拿不准且已跨轮,就建。",
     "  - 接了:`task_handle: {create: {summary, due?}}`——bridge 自动建卡、把话题回链写进任务描述、把发起人加进关注列表,并绑定本话题。已有任务则用 `{guid}` 认领。",
     "  - 进展:`{note: \"一句话里程碑\"}` 只在实质进展时写(阶段结论/关键转折),bridge 落到任务侧;不要每轮都写。",
     "  - 改期:`{due: \"<ISO 或 YYYY-MM-DD>\", due_reason: \"一句原因\"}`——延期必须带原因,bridge 会改卡上截止并评论说明。",
@@ -816,6 +842,8 @@ export async function renderPrompt(input: RenderPromptInput): Promise<string> {
     taskHandleClaimed = false,
     taskHandleCandidates = [],
     taskRoot,
+    threadTurnCount,
+    threadHasTaskCard = false,
     mtimeFacts = [],
     queuedFollowups = [],
   } = input;
@@ -855,6 +883,17 @@ export async function renderPrompt(input: RenderPromptInput): Promise<string> {
   const sessionKeyLine = input.stickySessionKey
     ? [`session_key:      ${input.stickySessionKey} (单聊粘连 session,同一单聊的顶层消息共享)`]
     : [];
+  // BL-49: the 建卡 判据 facts (see RenderPromptInput.threadTurnCount). Two
+  // plain fact lines in <thread-context> — no judgment, no instruction; the
+  // state-contract text tells the agent what they mean. Omitted entirely when
+  // the bridge doesn't know the turn count (legacy callers/tests).
+  const taskCardFactLines =
+    threadTurnCount === undefined
+      ? []
+      : [
+          `thread_turn_count:   ${threadTurnCount}`,
+          `thread_has_task_card: ${threadHasTaskCard ? "yes" : "no"}`,
+        ];
   const isAgentWorkspace = conventions.runtime === "agent_workspace";
   // Legacy: repoCachePath means bridge-prepared cache/worktree.
   // Agent workspace: defaultProjectSlug/url are only pointers.
@@ -920,6 +959,7 @@ export async function renderPrompt(input: RenderPromptInput): Promise<string> {
       `feishu_doc_links: ${csv(parsed.feishuDocLinks)}`,
       `images:           ${csv(imageKeys)}`,
       `scene_hint:       ${scene.hint}`,
+      ...taskCardFactLines,
       "</thread-context>",
       "",
       ...renderContractAnchor(conventions.stateFilePath),
@@ -1094,6 +1134,7 @@ export async function renderPrompt(input: RenderPromptInput): Promise<string> {
       `feishu_doc_links: ${csv(parsed.feishuDocLinks)}`,
       `images:           ${csv(imageKeys)}`,
       `scene_hint:       ${scene.hint}`,
+      ...taskCardFactLines,
       "",
       "约定路径:",
       ...(isAgentWorkspace
@@ -1176,6 +1217,7 @@ export async function renderPrompt(input: RenderPromptInput): Promise<string> {
     `feishu_doc_links: ${csv(parsed.feishuDocLinks)}`,
     `images:           ${csv(imageKeys)}`,
     `scene_hint:       ${scene.hint}`,
+    ...taskCardFactLines,
     "",
     "约定路径:",
     ...(isAgentWorkspace

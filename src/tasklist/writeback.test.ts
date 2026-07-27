@@ -54,17 +54,17 @@ describe("mergeDescriptionSnapshot", () => {
   it("appends the marker+block when no prior description", () => {
     const merged = mergeDescriptionSnapshot(undefined, { status: "completed", summary: "已完成", now: fixedNow });
     expect(merged.startsWith(STATUS_SNAPSHOT_MARKER)).toBe(true);
-    expect(merged).toContain("**状态**:已完成 (completed)");
-    expect(merged).toContain("**进展**");
+    expect(merged).toContain("状态:已完成 (completed)");
+    expect(merged).toContain("进展");
     expect(merged).toContain("- ");
     expect(merged).toContain("已完成");
   });
 
   it("renders the status line's updated_at in local YYYY-MM-DD HH:mm shape, not raw UTC ISO (V3)", () => {
     const merged = mergeDescriptionSnapshot(undefined, { status: "failed", summary: "boom", now: fixedNow });
-    const updatedAtLine = merged.split("\n").find((l) => l.startsWith("**更新**:"));
+    const updatedAtLine = merged.split("\n").find((l) => l.startsWith("更新:"));
     expect(updatedAtLine).toBeDefined();
-    expect(updatedAtLine).toMatch(/^\*\*更新\*\*:\d{4}-\d{2}-\d{2} \d{2}:\d{2}$/);
+    expect(updatedAtLine).toMatch(/^更新:\d{4}-\d{2}-\d{2} \d{2}:\d{2}$/);
     expect(updatedAtLine).not.toContain("T");
     expect(updatedAtLine).not.toContain("Z");
   });
@@ -78,8 +78,8 @@ describe("mergeDescriptionSnapshot", () => {
     // Simulates a description a PRIOR v3-bridge turn already wrote (same
     // format this version renders) — the "- " bullet must round-trip.
     const original =
-      `人写的需求描述\n\n${STATUS_SNAPSHOT_MARKER}\n**状态**:进行中 (in_progress)\n**更新**:07-01 10:00\n\n` +
-      `**进展**\n- 07-01 10:00 收到需求`;
+      `人写的需求描述\n\n${STATUS_SNAPSHOT_MARKER}\n状态:进行中 (in_progress)\n更新:07-01 10:00\n\n` +
+      `进展\n- 07-01 10:00 收到需求`;
     const merged = mergeDescriptionSnapshot(original, { status: "completed", summary: "已完成", now: fixedNow });
     expect(merged.startsWith("人写的需求描述")).toBe(true);
     expect(merged).toContain("收到需求"); // earlier entry preserved
@@ -131,11 +131,16 @@ describe("mergeDescriptionSnapshot", () => {
     const merged = mergeDescriptionSnapshot(preV3Blob, { status: "completed", summary: "新版本记录", now: fixedNow });
     expect(merged).not.toContain("旧版本记录"); // old bullet char not recognized — dropped, not carried forward
     expect(merged).toContain("新版本记录");
-    expect(merged).toContain("**状态**:已完成 (completed)");
+    expect(merged).toContain("状态:已完成 (completed)");
   });
 });
 
 describe("parseStatusSnapshotStatus", () => {
+  it("still parses the pre-BL-49 bold label so live tasks written by an older bridge keep their status", () => {
+    const legacy = "--- larkway status ---\n**状态**:进行中 (in_progress)\n**更新**:2026-07-03 13:30";
+    expect(parseStatusSnapshotStatus(legacy)).toBe("in_progress");
+  });
+
   it("round-trips each status value through a rendered block", () => {
     for (const status of ["completed", "in_progress", "failed"] as const) {
       const merged = mergeDescriptionSnapshot(undefined, { status, summary: "x" });
@@ -260,7 +265,7 @@ describe("applyTaskHandleWriteback", () => {
     const descBody = (descPatch!.config.data as { task: { description: string } }).task.description;
     expect(descBody).toContain("原始需求");
     expect(descBody).toContain("已完成,见 MR");
-    expect(descBody).toContain("**状态**:已完成 (completed)");
+    expect(descBody).toContain("状态:已完成 (completed)");
     const completePatch = patchCalls.find(
       (c) => (c.config.data as { update_fields: string[] }).update_fields.includes("completed_at"),
     );
@@ -281,7 +286,7 @@ describe("applyTaskHandleWriteback", () => {
     const patchCalls = calls.filter((c) => c.config.method === "PATCH");
     expect(patchCalls.length).toBe(1); // description only — no completed_at patch
     const descBody = (patchCalls[0]!.config.data as { task: { description: string } }).task.description;
-    expect(descBody).toContain("**状态**:进行中 (in_progress)");
+    expect(descBody).toContain("状态:进行中 (in_progress)");
     expect(descBody).toContain("已派给下游 agent");
     expect(calls.some((c) => (c.config.data as { update_fields?: string[] })?.update_fields?.includes("completed_at"))).toBe(
       false,
@@ -529,7 +534,7 @@ describe("applyAutoBindConfirmation", () => {
     const descBody = (patchCall!.config.data as { task: { description: string } }).task.description;
     expect(descBody).toContain("原始需求"); // human content preserved
     expect(descBody).toContain("已自动绑定本话题");
-    expect(descBody).toContain("**状态**:进行中 (in_progress)");
+    expect(descBody).toContain("状态:进行中 (in_progress)");
   });
 
   it("no-ops when the task is gone (best-effort, never throws)", async () => {
