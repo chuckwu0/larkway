@@ -2070,7 +2070,24 @@ export class BridgeHandler {
       // goes (real-machine screenshot 2026-07-10). Those turns fall through to
       // the post-card site below and anchor on the in-topic answer card.
       const triggerInTopic = realTopicThreadId(parsed.raw.thread_id) !== undefined;
-      if (!isNewThread && (triggerInTopic || !taskCardAnchorId)) await createCotBubble(messageId);
+      // BL-49 round-4: a SYNTHETIC turn (stall nudge / task-comment relay) has no
+      // real trigger message in the topic — `raw.message_id` is a fabricated
+      // `synthetic-…` string and `raw.thread_id` carries the session key (an
+      // `om_` root id), not an `omt_`. `parsed.messageId` therefore resolves to
+      // `reply_anchor_message_id` = the topic ROOT, and anchoring the bubble
+      // there is exactly the pos=-1 case that quote-replies at GROUP TOP LEVEL
+      // (see createCotBubble's probe note). Real-machine 2026-07-27: every
+      // leaked 「任务已完成」 bubble in the group main stream came from a stall
+      // nudge. The root IS the right anchor for the turn's REPLY (main.ts's
+      // reply_anchor_message_id fix) and the wrong one for the bubble — the
+      // earlier fix simply had no reason to consider the bubble. Defer these
+      // turns to the post-card site, which anchors on the in-topic answer card,
+      // the same treatment a brand-new topic already gets.
+      const triggerIsRealMessage =
+        typeof parsed.raw.message_id === "string" && parsed.raw.message_id.startsWith("om_");
+      if (!isNewThread && triggerIsRealMessage && (triggerInTopic || !taskCardAnchorId)) {
+        await createCotBubble(messageId);
+      }
 
       // CardKit response surface: default main surface when the transport and
       // rollout gates are available. It streams bounded progress into a
