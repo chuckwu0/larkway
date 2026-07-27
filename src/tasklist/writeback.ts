@@ -89,7 +89,7 @@ function pad2(n: number): string {
  * unreadable). Deliberately NOT `toISOString()`/UTC: this is a human-facing
  * task description, not a machine-parsed field.
  */
-function formatLocalDateTime(d: Date): string {
+export function formatLocalDateTime(d: Date): string {
   return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())} ${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
 }
 
@@ -175,13 +175,18 @@ function renderDescriptionBlock(input: {
   now: Date;
   entries: string[];
 }): string {
+  // NO markdown bold here (BL-49 round-3, real-machine probe): the Feishu task
+  // description renders `[text](url)` as a link, but `**bold**` / `*italic*` are
+  // SWALLOWED WHOLE — markers AND the wrapped text. The v3 "人类友好化" change
+  // shipped `**状态**:进行中` and every operator has been seeing a bare
+  // `:进行中 (in_progress)` ever since. Plain labels are the only safe form.
   const lines = [
     STATUS_SNAPSHOT_MARKER,
-    `**状态**:${STATUS_LABELS[input.status]} (${input.status})`,
-    `**更新**:${formatLocalDateTime(input.now)}`,
+    `状态:${STATUS_LABELS[input.status]} (${input.status})`,
+    `更新:${formatLocalDateTime(input.now)}`,
   ];
   if (input.entries.length > 0) {
-    lines.push("", "**进展**", ...input.entries.map((entry) => `${LOG_LINE_PREFIX}${entry}`));
+    lines.push("", "进展", ...input.entries.map((entry) => `${LOG_LINE_PREFIX}${entry}`));
   }
   return lines.join("\n");
 }
@@ -201,7 +206,10 @@ export function parseStatusSnapshotStatus(
   description: string | undefined,
 ): "completed" | "in_progress" | "failed" | undefined {
   if (!description) return undefined;
-  const match = description.match(/\*\*状态\*\*:.*\((completed|in_progress|failed)\)/);
+  // Accepts BOTH the current plain `状态:` and the pre-BL-49 `**状态**:` form —
+  // tasks written by an older bridge are still live on the platform, and losing
+  // their status would make the poller treat them as never-touched.
+  const match = description.match(/(?:\*\*)?状态(?:\*\*)?:.*\((completed|in_progress|failed)\)/);
   return match ? (match[1] as "completed" | "in_progress" | "failed") : undefined;
 }
 

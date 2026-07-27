@@ -78,7 +78,7 @@ describe("parseDueInput", () => {
 describe("renderCreateDescription", () => {
   it("puts the topic deep link first when available", () => {
     const desc = renderCreateDescription(basePatch(), "DevBot");
-    expect(desc.startsWith("话题：https://applink.feishu.cn/client/message/link/open")).toBe(true);
+    expect(desc.startsWith("话题：[点击进入工作话题](https://applink.feishu.cn/client/message/link/open")).toBe(true);
     expect(desc).toContain("DevBot");
   });
   it("degrades EXPLICITLY to the chat link — never silently missing", () => {

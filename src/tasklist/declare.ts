@@ -19,6 +19,7 @@
 
 import type { TaskListClient, TaskMember } from "./client.js";
 import type { TaskHandleStore } from "./store.js";
+import { formatLocalDateTime } from "./writeback.js";
 import type {
   TaskHandleDeclarationPatch,
   TaskHandleDeclarationResult,
@@ -64,14 +65,23 @@ function formatDueForComment(due: { timestamp: string; is_all_day?: boolean }): 
 /** Description body for a bridge-created task — backlink first, always present. */
 export function renderCreateDescription(patch: TaskHandleDeclarationPatch, botName?: string): string {
   const lines: string[] = [];
+  // Markdown LINK syntax renders in the Feishu task description (BL-49 round-3
+  // real-machine probe) — a bare applink URL wraps to three unreadable lines,
+  // `[text](url)` collapses to one clickable label. Bold/italic do NOT render
+  // (they are swallowed along with their text), so links are the only markdown
+  // used here.
   if (patch.topicLink) {
-    lines.push(`话题：${patch.topicLink}`);
+    lines.push(`话题：[点击进入工作话题](${patch.topicLink})`);
   } else if (patch.chatLink) {
-    lines.push(`话题深链不可用（非话题消息），所在群：${patch.chatLink}`);
+    lines.push(`话题深链不可用（非话题消息），所在群：[打开群聊](${patch.chatLink})`);
   } else {
     lines.push("话题深链不可用（未解析到话题/群链接）");
   }
-  lines.push(`由 ${botName ?? patch.botId} 创建 · ${new Date().toISOString()}`);
+  // Local time, not `toISOString()` (BL-49 round-3): the raw UTC `…T08:22:37.894Z`
+  // is unreadable in the Feishu client and off by the operator's UTC offset.
+  // writeback.ts's status block was fixed for exactly this reason in dogfood V3;
+  // the create description was simply missed at the time.
+  lines.push(`由 ${botName ?? patch.botId} 创建 · ${formatLocalDateTime(new Date())}`);
   return lines.join("\n");
 }
 
