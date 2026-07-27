@@ -15,11 +15,34 @@ function comment(id: string, createMillis: string, creatorType?: string): TaskCo
 }
 
 describe("selectNewComments", () => {
-  it("seeds the cursor without emitting anything on first-ever poll", () => {
+  it("seeds the cursor without emitting anything on first-ever poll (no claimedTs)", () => {
     const comments = [comment("c1", "100"), comment("c2", "200")];
     const { newComments, nextCursorId } = selectNewComments(comments, undefined);
     expect(newComments).toEqual([]);
     expect(nextCursorId).toBe("c2");
+  });
+
+  // 2026-07-27 dogfood bug: on a bridge-created (v5 `create`) task the comment
+  // history is necessarily empty, so the user's FIRST comment used to be
+  // swallowed as "pre-existing history" and 反馈回流 never fired.
+  it("emits post-claim comments on first-ever poll when claimedTs is known", () => {
+    const comments = [comment("c1", "100"), comment("c2", "200")];
+    const { newComments, nextCursorId } = selectNewComments(comments, undefined, 150);
+    expect(newComments.map((c) => c.id)).toEqual(["c2"]);
+    expect(nextCursorId).toBe("c2");
+  });
+
+  it("still skips pre-claim history on first-ever poll (adopted task)", () => {
+    const comments = [comment("c1", "100"), comment("c2", "200")];
+    const { newComments, nextCursorId } = selectNewComments(comments, undefined, 500);
+    expect(newComments).toEqual([]);
+    expect(nextCursorId).toBe("c2");
+  });
+
+  it("treats a comment with no usable timestamp as history, not as fresh", () => {
+    const noTs: TaskComment = { id: "cx", content: "no ts", creatorType: "user" };
+    const { newComments } = selectNewComments([noTs], undefined, 100);
+    expect(newComments).toEqual([]);
   });
 
   it("returns comments after the cursor, sorted by createMillis", () => {
@@ -88,9 +111,11 @@ function makeFakeCommentRequester(items: Array<Record<string, unknown>>): LarkTa
 }
 
 describe("CommentPoller", () => {
-  it("does not replay pre-existing comments on the very first poll", async () => {
+  it("does not replay comments that pre-date the claim on the very first poll", async () => {
     const store = await TaskHandleStore.load(join(dir, "task-handles.json"));
-    await store.put({ threadId: "t1", taskGuid: "guid-1", chatId: "oc_1", claimedTs: 1 });
+    // Claimed AFTER the comment was written (the adopt case: a task the human
+    // already discussed on before an agent picked it up).
+    await store.put({ threadId: "t1", taskGuid: "guid-1", chatId: "oc_1", claimedTs: 500 });
     const client = new TaskListClient(
       makeFakeCommentRequester([
         { id: "c1", content: "old comment", created_at: "100", creator: { type: "user", id: "ou_1" } },
@@ -102,6 +127,31 @@ describe("CommentPoller", () => {
     await poller.pollOnceForTest();
 
     expect(enqueueSyntheticTurn).not.toHaveBeenCalled();
+    expect(store.get("t1")?.lastSeenCommentId).toBe("c1");
+  });
+
+  // The 2026-07-27 dogfood repro, end-to-end: task created by the bridge (v5
+  // `create`), user comments once, first poll must deliver it. Before the fix
+  // this branch emitted nothing and the comment was lost forever.
+  it("delivers the FIRST post-claim comment even with no cursor yet", async () => {
+    const store = await TaskHandleStore.load(join(dir, "task-handles.json"));
+    await store.put({ threadId: "t1", taskGuid: "guid-1", chatId: "oc_1", claimedTs: 100 });
+    const client = new TaskListClient(
+      makeFakeCommentRequester([
+        { id: "c1", content: "周报优先，渠道拆分放后面", created_at: "200", creator: { type: "user", id: "ou_1" } },
+      ]),
+    );
+    const enqueueSyntheticTurn = vi.fn();
+    const poller = new CommentPoller({ store, client, enqueueSyntheticTurn });
+
+    await poller.pollOnceForTest();
+
+    expect(enqueueSyntheticTurn).toHaveBeenCalledWith({
+      threadId: "t1",
+      chatId: "oc_1",
+      senderId: "ou_1",
+      text: "[任务评论] 周报优先，渠道拆分放后面",
+    });
     expect(store.get("t1")?.lastSeenCommentId).toBe("c1");
   });
 
@@ -157,10 +207,10 @@ describe("CommentPoller", () => {
     const enqueueSyntheticTurn = vi.fn();
     const poller = new CommentPoller({ store, client, enqueueSyntheticTurn });
 
-    await poller.pollOnceForTest(); // seeds cursor, no emit (first poll)
+    await poller.pollOnceForTest(); // post-claim comment → delivered once
     await poller.pollOnceForTest(); // same comments again — must not re-emit
 
-    expect(enqueueSyntheticTurn).not.toHaveBeenCalled();
+    expect(enqueueSyntheticTurn).toHaveBeenCalledTimes(1);
   });
 
   // B2 regression: handler.ts's taskHandleClaim hook (wired to store.claim())

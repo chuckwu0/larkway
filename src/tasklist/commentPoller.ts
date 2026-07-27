@@ -57,9 +57,16 @@ export interface CommentPollerOptions {
  * to API return order when timestamps are missing) so result is stable
  * regardless of the API's actual list direction.
  *
- * - `lastSeenCommentId` undefined (first ever poll for this claim): seed the
- *   cursor to the newest comment WITHOUT emitting anything — avoids replaying
- *   a task's pre-existing comment history the moment it's claimed.
+ * - `lastSeenCommentId` undefined (first ever poll for this claim): fall back to
+ *   the claim timestamp — emit only comments created AFTER the claim, seed the
+ *   cursor to the newest. This keeps the original intent (never replay a task's
+ *   pre-existing comment history the moment it's claimed) while fixing the
+ *   2026-07-27 dogfood bug it caused: the OLD behaviour emitted nothing at all
+ *   on this branch, so on a v5 bridge-CREATED task (comment history necessarily
+ *   empty) the user's FIRST comment was always swallowed as "history" — the
+ *   反馈回流 path was dead for exactly the case it matters most. `claimedTs`
+ *   undefined (records written before it existed) keeps the old seed-only
+ *   behaviour, since without it we cannot tell history from fresh.
  * - `lastSeenCommentId` found in the fetched window: everything after it is new.
  * - `lastSeenCommentId` set but NOT found in the fetched window (e.g. it aged
  *   out of the page(s) pulled): conservative no-emit — see commentPoller.ts
@@ -69,6 +76,7 @@ export interface CommentPollerOptions {
 export function selectNewComments(
   comments: readonly TaskComment[],
   lastSeenCommentId: string | undefined,
+  claimedTs?: number,
 ): { newComments: TaskComment[]; nextCursorId: string | undefined } {
   if (comments.length === 0) {
     return { newComments: [], nextCursorId: lastSeenCommentId };
@@ -81,7 +89,16 @@ export function selectNewComments(
   const nextCursorId = sorted[sorted.length - 1]!.id;
 
   if (lastSeenCommentId === undefined) {
-    return { newComments: [], nextCursorId };
+    // No cursor yet. With a claim timestamp we can still tell "posted after we
+    // claimed" (real feedback) from "already there when we claimed" (history);
+    // a comment whose createMillis is missing/unparseable stays on the history
+    // side — conservative, same direction as the pre-fix behaviour.
+    if (claimedTs === undefined) return { newComments: [], nextCursorId };
+    const fresh = sorted.filter((c) => {
+      const ms = Number(c.createMillis ?? 0);
+      return Number.isFinite(ms) && ms > claimedTs;
+    });
+    return { newComments: fresh, nextCursorId };
   }
   const idx = sorted.findIndex((c) => c.id === lastSeenCommentId);
   if (idx === -1) {
@@ -187,7 +204,11 @@ export class CommentPoller {
     try {
       const { comments } = await this.#deps.client.listComments(record.taskGuid);
       this.#permissionBackoff.delete(threadId); // a successful call clears any prior backoff
-      const { newComments, nextCursorId } = selectNewComments(comments, record.lastSeenCommentId);
+      const { newComments, nextCursorId } = selectNewComments(
+        comments,
+        record.lastSeenCommentId,
+        record.claimedTs,
+      );
 
       for (const comment of newComments) {
         if (isOwnAppComment(comment)) continue;
