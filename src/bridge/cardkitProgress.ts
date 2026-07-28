@@ -165,15 +165,24 @@ export function formatSilence(silentMs: number): string {
  * which during a stall is indistinguishable from healthy progress.
  *
  * BL-48 修订: now that a silent turn is NOT killed by default, this line is the
- * whole interface for a stall, so it also names the way out. The stop control is
- * the platform's own ⏹ on the in-progress 思考气泡 (it sends `@bot /stop`, which
- * BL-42 intercepts); `/stop` is spelled out too because the bubble is absent
- * when a bot runs `cot: off` or the bubble create failed.
+ * whole interface for a stall, so it also names the way out.
+ *
+ * `/stop` is always named because it always works. The platform's ⏹ (on the
+ * in-progress 思考气泡; clicking it sends `@bot /stop`, which BL-42 intercepts)
+ * is named only when this turn actually HAS a bubble — a `cotSurface: "card"`
+ * bot folds reasoning into the card and renders no bubble at all, so pointing at
+ * a ⏹ there would name a control the operator cannot find (independent review
+ * 2026-07-28). Same for `cot: "off"` and a failed bubble create.
  */
-function idleWaitingStatusText(silentMs: number, toolUseCount: number): string {
+function idleWaitingStatusText(
+  silentMs: number,
+  toolUseCount: number,
+  hasBubble: boolean,
+): string {
   const base = `⏳ 模型已 ${formatSilence(silentMs)} 没有输出,仍在等待...`;
   const tools = toolUseCount > 0 ? ` · 已用 ${toolUseCount} 个工具` : "";
-  return `${base}${tools} · 想停可点思考气泡的 ⏹ 或发 /stop`;
+  const stop = hasBubble ? "想停可点思考气泡的 ⏹ 或发 /stop" : "想停发 /stop";
+  return `${base}${tools} · ${stop}`;
 }
 
 function clip(value: unknown, max: number): string {
@@ -396,7 +405,10 @@ class LiveCardKitProgressHandle implements CardKitProgressHandle {
   markIdleWaiting(silentMs: number): void {
     if (this.closed) return;
     this.idleWaiting = true;
-    this.patchStatus(idleWaitingStatusText(silentMs, this.metrics.toolUseCount));
+    // No in-card COT panel ⇒ this bot renders the bubble surface ⇒ a ⏹ exists.
+    this.patchStatus(
+      idleWaitingStatusText(silentMs, this.metrics.toolUseCount, this.cotDetail === undefined),
+    );
   }
 
   clearIdleWaiting(): void {

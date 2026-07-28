@@ -795,6 +795,20 @@ bot_open_id: ou_kill_ok
 idle_kill_seconds: 600
 `,
     );
+    // A bot that raises only the SUSPECT threshold — it must not acquire a kill
+    // budget as a side effect.
+    await writeYaml(
+      "suspect-only.yaml",
+      `
+id: suspect-only
+name: Suspect Only
+description: raised notice threshold, no automatic interrupt
+app_id: cli_suspect_only
+app_secret_env: SUSPECT_ONLY_SECRET
+bot_open_id: ou_suspect_only
+idle_timeout_seconds: 600
+`,
+    );
     await writeYaml(
       "kill-too-low.yaml",
       `
@@ -810,9 +824,12 @@ idle_kill_seconds: 5
 
     const { bots, skipped } = await loadBotsDetailed(botsDir());
     expect(bots.find((b) => b.id === "kill-ok")?.idle_kill_seconds).toBe(600);
-    // Unset stays unset on every other bot — that IS the "never auto-interrupt"
-    // default the handler reads (BL-48 修订).
-    expect(bots.find((b) => b.id === "kill-ok")?.idle_timeout_seconds).toBeUndefined();
+    // Unset stays unset — an absent `idle_kill_seconds` IS the "never
+    // auto-interrupt" default the handler reads (BL-48 修订), so a bot that only
+    // sets the suspect threshold must not acquire a kill budget by accident.
+    const idleOnly = bots.find((b) => b.id === "suspect-only");
+    expect(idleOnly?.idle_timeout_seconds).toBe(600);
+    expect(idleOnly?.idle_kill_seconds).toBeUndefined();
     expect(skipped[0]?.reason).toContain("idle_kill_seconds");
   });
 
