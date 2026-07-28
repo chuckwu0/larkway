@@ -48,7 +48,13 @@ export interface CotProgressHandle {
   /** Feed one runner event. Reasoning + tool events map to COT; others ignored. */
   handle(event: AgentStreamEvent): void;
   /** Flush + complete the bubble. `done` on normal end, `error` otherwise. */
-  finalize(reason: "done" | "error", opts?: { message?: string }): Promise<void>;
+  /**
+   * Resolves `true` only when the platform actually accepted the `complete` call.
+   * The caller uses that to decide whether the crash-recovery ledger may be
+   * dropped — a swallowed `complete` failure leaves the bubble spinning `Working`,
+   * so the ledger has to survive it (independent review, round 4).
+   */
+  finalize(reason: "done" | "error", opts?: { message?: string }): Promise<boolean>;
   /** Cancel any pending flush without completing (e.g. the run threw). */
   close(): void;
 }
@@ -203,6 +209,8 @@ class LiveCotProgressHandle implements CotProgressHandle {
   private ref: CotRef | undefined;
   private _disabled = false;
   private closed = false;
+  /** Whether `complete` was accepted by the platform; memoized for repeat finalizes. */
+  private completeAccepted: boolean | undefined;
   private buffer: CotEvent[] = [];
   private timer: ReturnType<typeof setTimeout> | undefined;
   private flushing: Promise<void> | undefined;
@@ -393,10 +401,15 @@ class LiveCotProgressHandle implements CotProgressHandle {
    *   (3) complete.
    * Any step failing warns and continues — the bubble must leave 思考中.
    */
-  async finalize(reason: "done" | "error", opts?: { message?: string }): Promise<void> {
+  async finalize(reason: "done" | "error", opts?: { message?: string }): Promise<boolean> {
     if (this.closed || !this.ref) {
       this.closed = true;
-      return;
+      // A second finalize (the finally-block backstop, which in the normal flow
+      // runs AFTER the primary one) reports what the FIRST call achieved, not
+      // "nothing" — the caller keys the ledger delete on this, and answering
+      // `false` here would strand the ledger on every healthy turn. Undefined
+      // memo = never completed at all (no ref) → false.
+      return this.completeAccepted ?? false;
     }
     this.closed = true;
     if (this.timer) {
@@ -431,8 +444,12 @@ class LiveCotProgressHandle implements CotProgressHandle {
     try {
       await this.cotClient.complete(ref, reason);
       console.info("[cot_progress] completed", `cotId=${ref.cotId}`, `reason=${reason}`);
+      this.completeAccepted = true;
+      return true;
     } catch (err) {
       console.warn("[cot_progress] complete failed (continuing):", summarizeError(err));
+      this.completeAccepted = false;
+      return false;
     }
   }
 

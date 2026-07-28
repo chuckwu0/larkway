@@ -407,7 +407,7 @@ describe("CotProgressHandle degradation (bypass rule)", () => {
     expect(handle.disabled).toBe(true);
     // Feeding events + finalizing must be safe no-ops.
     expect(() => handle.handle({ type: "thinking_delta", text: "x", raw: {} })).not.toThrow();
-    await expect(handle.finalize("done")).resolves.toBeUndefined();
+    await expect(handle.finalize("done")).resolves.toBe(false); // no bubble to complete
     expect(rec.events).toHaveLength(0);
     expect(rec.completeReason).toBeUndefined();
   });
@@ -424,7 +424,8 @@ describe("CotProgressHandle degradation (bypass rule)", () => {
     });
     const handle = await startHandle(rec);
     handle.handle({ type: "thinking_delta", text: "x", raw: {} });
-    await expect(handle.finalize("done")).resolves.toBeUndefined();
+    // The update failure must not stop the completion — and it is reported as done.
+    await expect(handle.finalize("done")).resolves.toBe(true);
     expect(rec.completeReason).toBe("done");
   });
 
@@ -435,7 +436,9 @@ describe("CotProgressHandle degradation (bypass rule)", () => {
       },
     });
     const handle = await startHandle(rec);
-    await expect(handle.finalize("done")).resolves.toBeUndefined();
+    // false is LOAD-BEARING: the caller keeps cot.json so boot reconcile can still
+    // reach a bubble whose `complete` was rejected (round-4 finding).
+    await expect(handle.finalize("done")).resolves.toBe(false);
   });
 
   it("feeding an unknown/raw event never throws", async () => {
@@ -478,7 +481,7 @@ describe("CotProgressHandle end-to-end hang guard", () => {
     const handle = await handlePromise;
     expect(handle.disabled).toBe(true);
     // A disabled handle finalizes as a no-op, again without hanging.
-    await expect(handle.finalize("done")).resolves.toBeUndefined();
+    await expect(handle.finalize("done")).resolves.toBe(false); // publisher degraded, nothing completed
   });
 });
 
@@ -621,7 +624,7 @@ describe("CotProgressHandle create degradation chain (thread → chat_id)", () =
 
     expect(handle.disabled).toBe(true);
     expect(state.targets.map((t) => t.threadId)).toEqual(["omt_topic", undefined]);
-    await expect(handle.finalize("done")).resolves.toBeUndefined();
+    await expect(handle.finalize("done")).resolves.toBe(false); // both channels dead
     expect(state.completeReason).toBeUndefined();
   });
 
