@@ -564,3 +564,45 @@ describe("CardKitProgressHandle — COT-in-card panel (方案 B)", () => {
     expect(calls.some((c) => c.name === "updateCardEntity")).toBe(true);
   });
 });
+
+// S5 (second review round): the ⏹ named in the waiting notice is the platform's
+// button on the in-progress 思考气泡. It only exists when this turn HAS a bubble,
+// so the caller passes that in — inferring it inside the handle (from the absence
+// of an in-card COT panel) was wrong for `cot: "off"`, where there is neither a
+// panel nor a bubble, and for a bubble whose create failed.
+async function makeIdleHandle() {
+  const { client, calls } = fakeCardKitClient();
+  const handle = await createCardKitProgressHandle({
+    cardKitClient: client,
+    replyToMessageId: "trigger_message",
+    replyInThread: true,
+    facts: { botId: "bot", threadId: "thread", triggerMessageId: "trigger_message" },
+    patchIntervalMs: 1,
+  });
+  const statusTexts = (): string[] =>
+    calls
+      .filter((c) => c.name === "updateElement")
+      .map((c) => JSON.stringify(c.args));
+  return { handle, statusTexts };
+}
+
+describe("BL-48 修订: the waiting notice only names ⏹ when a bubble exists", () => {
+  it("names both ⏹ and /stop when the turn has a live bubble", async () => {
+    const { handle, statusTexts } = await makeIdleHandle();
+    handle.markIdleWaiting(200_000, { hasBubble: true });
+    await handle.drain();
+    expect(statusTexts().at(-1)).toContain("⏹");
+    expect(statusTexts().at(-1)).toContain("/stop");
+  });
+
+  it("names only /stop when there is no bubble (cot off / card surface / failed create)", async () => {
+    for (const opts of [undefined, {}, { hasBubble: false }]) {
+      const { handle, statusTexts } = await makeIdleHandle();
+      handle.markIdleWaiting(200_000, opts);
+      await handle.drain();
+      expect(statusTexts().at(-1)).toContain("/stop");
+      expect(statusTexts().at(-1)).not.toContain("⏹");
+      expect(statusTexts().at(-1)).not.toContain("思考气泡");
+    }
+  });
+});

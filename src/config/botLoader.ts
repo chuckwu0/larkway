@@ -395,16 +395,51 @@ export const BotConfigSchema = z.object({
   backend: z.string().min(1).default("claude"),
 
   /**
-   * Idle-watchdog override, in seconds. The bridge interrupts a turn when the
-   * runner emits NO stream events for this long with no tool call in flight
-   * (default 180 s — see handler.ts DEFAULT_CARDKIT_IDLE_TIMEOUT_MS). The
-   * judged quantity is event silence, not total turn duration. Raise it for
-   * bots whose turns legitimately go silent for minutes: a huge tool result
-   * (e.g. dozens of MCP records) puts the model into a long prefill during
-   * which the CLI emits nothing, which the default watchdog misreads as a
-   * hang and kills. Floor 30 s — anything lower would interrupt normal turns.
+   * When a silent turn starts SAYING it is silent, in seconds.
+   *
+   * BL-48 修订 (2026-07-28): this no longer interrupts anything. Past this much
+   * event silence the card's status line switches to
+   * 「⏳ 模型已 X 没有输出,仍在等待...」 (refreshed while the silence lasts) and the
+   * turn keeps running. Automatic interruption is a separate, opt-in knob —
+   * `idle_kill_seconds` below.
+   *
+   * Raise it for bots whose turns legitimately go quiet for minutes (a huge tool
+   * result puts the model into a long prefill during which the CLI emits
+   * nothing); lower it to be told sooner. Floor 30 s.
+   *
+   * ⚠️ Only a UX choice while `idle_kill_seconds` is UNSET. If that knob IS set,
+   * the effective interrupt point is `min(max(this, idle_kill_seconds), 15min)`,
+   * so raising this ALSO delays the interrupt — do not treat it as "just tell me
+   * later" on an opted-in bot (independent review, round 3).
+   *
+   * ⚠️ The ⏳ line can only be rendered on the CardKit status line. A bot degraded
+   * to the legacy card / post fallback gets no visible stall notice at all — see
+   * handler.ts's KNOWN GAP note next to the watchdog.
    */
   idle_timeout_seconds: z.number().int().min(30).optional(),
+
+  /**
+   * Automatic-interrupt budget, in seconds of continuous silence. **Unset (the
+   * default) = the bridge never interrupts a silent turn.**
+   *
+   * The bridge cannot tell a hung turn from a legitimately slow one — silence
+   * looks identical for a real hang, a long prefill, upstream backoff, and any
+   * phase the backend doesn't report — and it has no idea what the operator is
+   * using the agent for, so it does not decide. A silent turn instead says so on
+   * the card (⏳ …, threshold = `idle_timeout_seconds`) and keeps running; it
+   * ends when the runner finishes, when the user clicks the 思考气泡's ⏹ (or
+   * sends `/stop`), or at the 60-min subprocess runaway guard.
+   *
+   * Set this only where nobody is watching the card — cron / batch dispatch /
+   * unattended fleets — and a wedged turn would otherwise sit for the full hour.
+   * Effective value = `min(max(idle_timeout_seconds, this), 15min)`
+   * (handler.ts IDLE_KILL_CEILING_MS). The 15-min clamp is absolute, so on a bot
+   * with a very large `idle_timeout_seconds` the interrupt CAN land before the ⏳
+   * notice is due — the clamp wins, because letting the interrupt drift past the
+   * 60-min subprocess runaway guard costs both the 已中断 card and BL-38's
+   * self-heal counting.
+   */
+  idle_kill_seconds: z.number().int().min(30).optional(),
 
   /**
    * COT (思维链) 气泡:把 agent 的 thinking 思考过程 + 工具调用摘要实时推到飞书
