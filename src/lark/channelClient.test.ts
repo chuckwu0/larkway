@@ -2871,6 +2871,58 @@ describe("ChannelClient — gap-fill window + paging (BL-55)", () => {
     vi.resetModules();
   });
 
+  it("洞 E/回归: an incomplete pull must NOT mark the chat's replay window resolved", async () => {
+    // Review finding: converting the parse-failure branch from `continue` to a
+    // page-loop `break` made control fall through to resolveUnresolvedGapWindow,
+    // so a chat that yielded NOTHING was recorded as covered — silently dropping
+    // a queued replay. The window must survive an incomplete pull.
+    vi.resetModules();
+    vi.doMock("node:child_process", () => ({
+      execFile: (
+        _cmd: string,
+        _args: string[],
+        cb: (err: null, result: { stdout: string; stderr: string }) => void,
+      ) => {
+        // Unparseable stdout → parseLarkCliMessages throws on page 1.
+        cb(null, { stdout: "not json at all <<<", stderr: "" });
+      },
+    }));
+    const chObj = makeFakeChannelWithHandlers();
+    vi.doMock("@larksuiteoapi/node-sdk", () => ({ createLarkChannel: () => chObj.ch }));
+
+    const { ChannelClient } = await import("./channelClient.js");
+    const client = new ChannelClient({
+      allowedChatIds: new Set(["oc_1"]),
+      botOpenId: "ou_bot",
+      appId: "cli_x",
+      appSecret: "secret",
+      connectGraceMs: 0,
+      channelStaleMs: 0,
+      openChatDiscoveryMs: 0,
+    });
+    void (async () => {
+      for await (const _ev of client.events()) { /* drain */ }
+    })();
+    for (let i = 0; i < 200 && !chObj.handlers["reconnected"]; i++) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
+
+    chObj.handlers["reconnecting"]!(undefined);
+    chObj.handlers["reconnected"]!(undefined);
+
+    for (let i = 0; i < 200 && client.unresolvedGapWindowsForTest().size === 0; i++) {
+      await new Promise((r) => setTimeout(r, 20));
+    }
+    // The chat stays queued for a later, wider replay instead of being
+    // considered covered by a pull that returned nothing.
+    expect(client.unresolvedGapWindowsForTest().has("oc_1")).toBe(true);
+
+    await client.close();
+    vi.doUnmock("@larksuiteoapi/node-sdk");
+    vi.doUnmock("node:child_process");
+    vi.resetModules();
+  });
+
   it("洞 A: anchors the window at the last healthy moment, not at the noticed-disconnect moment", async () => {
     const starts: string[] = [];
 
@@ -2910,14 +2962,28 @@ describe("ChannelClient — gap-fill window + paging (BL-55)", () => {
         await new Promise((r) => setTimeout(r, 10));
       }
 
-      // Connect happened at ~t0 → that is the last CONFIRMED-healthy moment.
-      // The fake channel exposes no getConnectionStatus, so the liveness sampler
-      // can never advance it — exactly like a machine that was asleep.
-      const t0 = Date.now();
-      const SLEEP_MS = 3 * 60 * 60 * 1000; // 3h
-      vi.setSystemTime(t0 + SLEEP_MS);
+      // Let the sampler run a few ON-SCHEDULE ticks first (30s interval), so the
+      // anchor is genuinely being advanced by a live process — this is the state
+      // an idle-but-healthy bot is in, and it must NOT produce a wide window.
+      for (let i = 0; i < 3; i++) await vi.advanceTimersByTimeAsync(30_000);
+      const lastHealthyTick = Date.now();
 
-      // On wake the SDK notices the socket is dead for the first time.
+      // Now suspend the machine: the wall clock jumps but NO timer fires (that
+      // is what a sleeping process looks like). The next tick therefore arrives
+      // impossibly late, which is the evidence the sampler keys off — no
+      // dependence on what the SDK reports about the socket, because
+      // getConnectionStatus() says "connected" for a half-open socket too.
+      const SLEEP_MS = 90 * 60 * 1000; // 90 min — inside the 2h reconnect ceiling
+      vi.setSystemTime(lastHealthyTick + SLEEP_MS);
+      await vi.advanceTimersByTimeAsync(30_000); // the first post-wake tick
+
+      // Several more on-schedule ticks BEFORE the reconnect is noticed. The
+      // anchor must stay pinned at the pre-sleep moment across all of them —
+      // this is the regression the sticky flag exists for (an unpinned anchor
+      // would be dragged forward to "now" and the window would collapse).
+      for (let i = 0; i < 3; i++) await vi.advanceTimersByTimeAsync(30_000);
+
+      // Only now does the SDK notice the socket is dead.
       chObj.handlers["reconnecting"]!(undefined);
       chObj.handlers["reconnected"]!(undefined);
 
@@ -2927,11 +2993,11 @@ describe("ChannelClient — gap-fill window + paging (BL-55)", () => {
       expect(starts.length).toBeGreaterThan(0);
 
       const startMs = Date.parse(starts[0]!);
-      // Fixed: reaches back to ~t0 (the pre-sleep healthy moment).
-      // Unfixed it would be ~t0 + 3h - 30s, i.e. it would cover ~30s of a 3h
-      // blind window and declare the gap closed.
-      expect(startMs).toBeLessThanOrEqual(t0 + 60_000);
-      expect(startMs).toBeGreaterThan(t0 - 5 * 60_000);
+      // Reaches back to ~the pre-sleep tick. Unfixed (anchor = when the
+      // disconnect was NOTICED) this would be ~90min later, covering ~30s of a
+      // 90-minute blind window and declaring the gap closed.
+      expect(startMs).toBeLessThanOrEqual(lastHealthyTick + 60_000);
+      expect(startMs).toBeGreaterThan(lastHealthyTick - 5 * 60_000);
 
       await client.close();
     } finally {
