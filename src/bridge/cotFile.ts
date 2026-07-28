@@ -130,3 +130,23 @@ export async function deleteCotFile(worktreePath: string): Promise<void> {
     console.warn(`[cotFile] delete ${file} failed (ignoring):`, err);
   }
 }
+
+/**
+ * Delete the ledger ONLY if it still describes `cotId`.
+ *
+ * The turn's own delete is unawaited (it trails a fire-and-forget bubble
+ * finalize), and the ledger path is keyed on threadId alone — so on the degraded
+ * slow-create path a turn can still be tearing its bubble down while the NEXT
+ * turn on the same thread has already written its own ledger. A blind delete
+ * there removes the live turn's ledger and re-opens the exact orphan this file
+ * exists to prevent (independent review 2026-07-28).
+ */
+export async function deleteCotFileIfMatches(
+  worktreePath: string,
+  cotId: string,
+): Promise<void> {
+  const current = await readCotFile(worktreePath);
+  if (!current) return; // already gone
+  if (current.cotId !== cotId) return; // a newer turn owns this path now
+  await deleteCotFile(worktreePath);
+}
