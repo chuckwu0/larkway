@@ -2942,3 +2942,152 @@ describe("ChannelClient — gap-fill window + paging (BL-55)", () => {
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// BL-55 洞 B — self-hosted keepalive. A half-open socket the SDK never reports
+// is currently unrecoverable: gap-fill only ever runs off `reconnected`. The
+// watchdog's job is to CONVERT that silence into an explicit reconnect.
+// ---------------------------------------------------------------------------
+
+describe("ChannelClient — keepalive watchdog (BL-55 洞 B)", () => {
+  function makeChannel(opts: { withStatus: boolean }) {
+    const handlers: Record<string, ((arg: unknown) => void) | undefined> = {};
+    const calls = { connect: 0, disconnect: 0 };
+    const ch: Record<string, unknown> = {
+      botIdentity: { openId: "ou_bot", name: "test-bot" },
+      state: "connected" as string,
+      on(event: string, handler: (arg: unknown) => void) {
+        handlers[event] = handler;
+      },
+      async connect() { calls.connect++; },
+      async disconnect() { calls.disconnect++; },
+      async updateCard() {},
+      rawClient: { im: { v1: { message: { async reply() { return { data: { message_id: "om_r" } }; } } } } },
+    };
+    if (opts.withStatus) {
+      ch["getConnectionStatus"] = () => ({ state: ch["state"] as string });
+    }
+    return { ch, handlers, calls };
+  }
+
+  async function bootClient(chObj: { ch: unknown; handlers: Record<string, unknown> }, execCalls: string[][]) {
+    vi.doMock("node:child_process", () => ({
+      execFile: (
+        _cmd: string,
+        args: string[],
+        cb: (err: null, result: { stdout: string; stderr: string }) => void,
+      ) => {
+        execCalls.push(args);
+        cb(null, { stdout: JSON.stringify({ ok: true, data: { messages: [] } }), stderr: "" });
+      },
+    }));
+    vi.doMock("@larksuiteoapi/node-sdk", () => ({ createLarkChannel: () => chObj.ch }));
+    const { ChannelClient } = await import("./channelClient.js");
+    const client = new ChannelClient({
+      allowedChatIds: new Set(["oc_1"]),
+      botOpenId: "ou_bot",
+      appId: "cli_x",
+      appSecret: "secret",
+      connectGraceMs: 0,
+      channelStaleMs: 0,
+      openChatDiscoveryMs: 0,
+    });
+    void (async () => {
+      for await (const _ev of client.events()) { /* drain */ }
+    })();
+    for (let i = 0; i < 200 && !chObj.handlers["reconnected"]; i++) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    return client;
+  }
+
+  it("forces a reconnect (and gap-fills) after N confirmed-down ticks while Feishu is reachable", async () => {
+    vi.resetModules();
+    // Feishu answers → "the network is fine, the socket is wedged".
+    vi.stubGlobal("fetch", vi.fn(async () => ({ status: 200 })));
+    const chObj = makeChannel({ withStatus: true });
+    const execCalls: string[][] = [];
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      const client = await bootClient(chObj, execCalls);
+      const connectsAfterBoot = chObj.calls.connect;
+
+      // The socket goes half-open: the SDK still holds it, but it is not connected.
+      (chObj.ch as Record<string, unknown>)["state"] = "closed";
+
+      // Three ticks at 15s → threshold crossed on the third.
+      for (let i = 0; i < 3; i++) await vi.advanceTimersByTimeAsync(15_000);
+      // Let the async force-reconnect chain (disconnect → connect → gapFill) settle.
+      for (let i = 0; i < 20 && chObj.calls.connect === connectsAfterBoot; i++) {
+        await vi.advanceTimersByTimeAsync(50);
+      }
+
+      expect(chObj.calls.disconnect).toBeGreaterThan(0);
+      expect(chObj.calls.connect).toBeGreaterThan(connectsAfterBoot);
+      // …and the whole point: the blind window actually got pulled.
+      expect(execCalls.some((a) => a.includes("+chat-messages-list"))).toBe(true);
+
+      await client.close();
+    } finally {
+      vi.useRealTimers();
+      vi.unstubAllGlobals();
+      vi.doUnmock("@larksuiteoapi/node-sdk");
+      vi.doUnmock("node:child_process");
+      vi.resetModules();
+    }
+  });
+
+  it("never force-reconnects when the SDK exposes no connection status (no signal → no action)", async () => {
+    vi.resetModules();
+    const probe = vi.fn(async () => ({ status: 200 }));
+    vi.stubGlobal("fetch", probe);
+    const chObj = makeChannel({ withStatus: false });
+    const execCalls: string[][] = [];
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      const client = await bootClient(chObj, execCalls);
+      const connectsAfterBoot = chObj.calls.connect;
+
+      for (let i = 0; i < 6; i++) await vi.advanceTimersByTimeAsync(15_000);
+
+      expect(chObj.calls.connect).toBe(connectsAfterBoot);
+      expect(chObj.calls.disconnect).toBe(0);
+      // And it must not even probe the network — there is nothing to judge.
+      expect(probe).not.toHaveBeenCalled();
+
+      await client.close();
+    } finally {
+      vi.useRealTimers();
+      vi.unstubAllGlobals();
+      vi.doUnmock("@larksuiteoapi/node-sdk");
+      vi.doUnmock("node:child_process");
+      vi.resetModules();
+    }
+  });
+
+  it("holds off when the network itself is unreachable (outage, not a wedged socket)", async () => {
+    vi.resetModules();
+    vi.stubGlobal("fetch", vi.fn(async () => { throw new Error("ENETDOWN"); }));
+    const chObj = makeChannel({ withStatus: true });
+    const execCalls: string[][] = [];
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      const client = await bootClient(chObj, execCalls);
+      const connectsAfterBoot = chObj.calls.connect;
+      (chObj.ch as Record<string, unknown>)["state"] = "closed";
+
+      for (let i = 0; i < 6; i++) await vi.advanceTimersByTimeAsync(15_000);
+
+      expect(chObj.calls.connect).toBe(connectsAfterBoot);
+      expect(chObj.calls.disconnect).toBe(0);
+
+      await client.close();
+    } finally {
+      vi.useRealTimers();
+      vi.unstubAllGlobals();
+      vi.doUnmock("@larksuiteoapi/node-sdk");
+      vi.doUnmock("node:child_process");
+      vi.resetModules();
+    }
+  });
+});
