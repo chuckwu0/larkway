@@ -2775,3 +2775,236 @@ describe("ChannelClient ingestLocalEvent — local dispatch + WS-copy dedup", ()
     vi.resetModules();
   });
 });
+
+// ---------------------------------------------------------------------------
+// BL-55 洞 A + 洞 E — the reconnect gap-fill window must be anchored at the last
+// CONFIRMED-healthy moment (not at the moment the socket's death was noticed),
+// and a chat's history pull must PAGINATE (a single asc page of 50 keeps the
+// oldest 50 and drops exactly the recent @ the pull exists to recover).
+// ---------------------------------------------------------------------------
+
+describe("ChannelClient — gap-fill window + paging (BL-55)", () => {
+  function makeFakeChannelWithHandlers() {
+    const handlers: Record<string, ((arg: unknown) => void) | undefined> = {};
+    const ch = {
+      botIdentity: { openId: "ou_bot", name: "test-bot" },
+      on(event: string, handler: (arg: unknown) => void) {
+        handlers[event] = handler;
+      },
+      async connect() {},
+      async disconnect() {},
+      async updateCard() {},
+      rawClient: { im: { v1: { message: { async reply() { return { data: { message_id: "om_r" } }; } } } } },
+    };
+    return { ch, handlers };
+  }
+
+  const gapMsg = (id: string) => ({
+    message_id: id,
+    chat_id: "oc_1",
+    chat_type: "group",
+    content: JSON.stringify({ text: "@bot 在吗" }),
+    sender: { id: "ou_sender" },
+    create_time: String(Date.now()),
+    mentions: [{ id: { open_id: "ou_bot" } }],
+  });
+
+  it("洞 E: follows page_token and dispatches a message that only appears on page 2", async () => {
+    const page2Id = "om_on_page_2";
+    const seenTokens: string[] = [];
+
+    vi.resetModules();
+    vi.doMock("node:child_process", () => ({
+      execFile: (
+        _cmd: string,
+        args: string[],
+        cb: (err: null, result: { stdout: string; stderr: string }) => void,
+      ) => {
+        const tokenIdx = args.indexOf("--page-token");
+        const token = tokenIdx >= 0 ? args[tokenIdx + 1]! : "";
+        seenTokens.push(token);
+        // Page 1: a filler message + has_more. Page 2: the message we care about.
+        const body =
+          token === "p2"
+            ? { ok: true, data: { messages: [gapMsg(page2Id)], has_more: false, page_token: "" } }
+            : { ok: true, data: { messages: [gapMsg("om_on_page_1")], has_more: true, page_token: "p2" } };
+        cb(null, { stdout: JSON.stringify(body), stderr: "" });
+      },
+    }));
+    const chObj = makeFakeChannelWithHandlers();
+    vi.doMock("@larksuiteoapi/node-sdk", () => ({ createLarkChannel: () => chObj.ch }));
+
+    const { ChannelClient } = await import("./channelClient.js");
+    const client = new ChannelClient({
+      allowedChatIds: new Set(["oc_1"]),
+      botOpenId: "ou_bot",
+      appId: "cli_x",
+      appSecret: "secret",
+      connectGraceMs: 0,
+      channelStaleMs: 0,
+      openChatDiscoveryMs: 0,
+    });
+
+    const dispatched: string[] = [];
+    void (async () => {
+      for await (const ev of client.events()) dispatched.push(ev.message_id);
+    })();
+    for (let i = 0; i < 100 && !chObj.handlers["reconnected"]; i++) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
+
+    chObj.handlers["reconnecting"]!(undefined);
+    chObj.handlers["reconnected"]!(undefined);
+
+    for (let i = 0; i < 100 && !dispatched.includes(page2Id); i++) {
+      await new Promise((r) => setTimeout(r, 20));
+    }
+
+    // The whole point: page 2 was actually requested, and its message landed.
+    expect(seenTokens).toContain("p2");
+    expect(dispatched).toContain(page2Id);
+    expect(dispatched).toContain("om_on_page_1");
+
+    await client.close();
+    vi.doUnmock("@larksuiteoapi/node-sdk");
+    vi.doUnmock("node:child_process");
+    vi.resetModules();
+  });
+
+  it("洞 E/回归: an incomplete pull must NOT mark the chat's replay window resolved", async () => {
+    // Review finding: converting the parse-failure branch from `continue` to a
+    // page-loop `break` made control fall through to resolveUnresolvedGapWindow,
+    // so a chat that yielded NOTHING was recorded as covered — silently dropping
+    // a queued replay. The window must survive an incomplete pull.
+    vi.resetModules();
+    vi.doMock("node:child_process", () => ({
+      execFile: (
+        _cmd: string,
+        _args: string[],
+        cb: (err: null, result: { stdout: string; stderr: string }) => void,
+      ) => {
+        // Unparseable stdout → parseLarkCliMessages throws on page 1.
+        cb(null, { stdout: "not json at all <<<", stderr: "" });
+      },
+    }));
+    const chObj = makeFakeChannelWithHandlers();
+    vi.doMock("@larksuiteoapi/node-sdk", () => ({ createLarkChannel: () => chObj.ch }));
+
+    const { ChannelClient } = await import("./channelClient.js");
+    const client = new ChannelClient({
+      allowedChatIds: new Set(["oc_1"]),
+      botOpenId: "ou_bot",
+      appId: "cli_x",
+      appSecret: "secret",
+      connectGraceMs: 0,
+      channelStaleMs: 0,
+      openChatDiscoveryMs: 0,
+    });
+    void (async () => {
+      for await (const _ev of client.events()) { /* drain */ }
+    })();
+    for (let i = 0; i < 200 && !chObj.handlers["reconnected"]; i++) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
+
+    chObj.handlers["reconnecting"]!(undefined);
+    chObj.handlers["reconnected"]!(undefined);
+
+    for (let i = 0; i < 200 && client.unresolvedGapWindowsForTest().size === 0; i++) {
+      await new Promise((r) => setTimeout(r, 20));
+    }
+    // The chat stays queued for a later, wider replay instead of being
+    // considered covered by a pull that returned nothing.
+    expect(client.unresolvedGapWindowsForTest().has("oc_1")).toBe(true);
+
+    await client.close();
+    vi.doUnmock("@larksuiteoapi/node-sdk");
+    vi.doUnmock("node:child_process");
+    vi.resetModules();
+  });
+
+  it("洞 A: anchors the window at the last healthy moment, not at the noticed-disconnect moment", async () => {
+    const starts: string[] = [];
+
+    vi.resetModules();
+    vi.doMock("node:child_process", () => ({
+      execFile: (
+        _cmd: string,
+        args: string[],
+        cb: (err: null, result: { stdout: string; stderr: string }) => void,
+      ) => {
+        const i = args.indexOf("--start");
+        if (i >= 0) starts.push(args[i + 1]!);
+        cb(null, { stdout: JSON.stringify({ ok: true, data: { messages: [] } }), stderr: "" });
+      },
+    }));
+    const chObj = makeFakeChannelWithHandlers();
+    vi.doMock("@larksuiteoapi/node-sdk", () => ({ createLarkChannel: () => chObj.ch }));
+
+    // shouldAdvanceTime keeps the test's own async polling alive while letting
+    // us jump the wall clock to simulate a suspended machine.
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      const { ChannelClient } = await import("./channelClient.js");
+      const client = new ChannelClient({
+        allowedChatIds: new Set(["oc_1"]),
+        botOpenId: "ou_bot",
+        appId: "cli_x",
+        appSecret: "secret",
+        connectGraceMs: 0,
+        channelStaleMs: 0,
+        openChatDiscoveryMs: 0,
+      });
+      void (async () => {
+        for await (const _ev of client.events()) { /* drain */ }
+      })();
+      for (let i = 0; i < 200 && !chObj.handlers["reconnected"]; i++) {
+        await new Promise((r) => setTimeout(r, 10));
+      }
+
+      // Let the sampler run a few ON-SCHEDULE ticks first (30s interval), so the
+      // anchor is genuinely being advanced by a live process — this is the state
+      // an idle-but-healthy bot is in, and it must NOT produce a wide window.
+      for (let i = 0; i < 3; i++) await vi.advanceTimersByTimeAsync(30_000);
+      const lastHealthyTick = Date.now();
+
+      // Now suspend the machine: the wall clock jumps but NO timer fires (that
+      // is what a sleeping process looks like). The next tick therefore arrives
+      // impossibly late, which is the evidence the sampler keys off — no
+      // dependence on what the SDK reports about the socket, because
+      // getConnectionStatus() says "connected" for a half-open socket too.
+      const SLEEP_MS = 90 * 60 * 1000; // 90 min — inside the 2h reconnect ceiling
+      vi.setSystemTime(lastHealthyTick + SLEEP_MS);
+      await vi.advanceTimersByTimeAsync(30_000); // the first post-wake tick
+
+      // Several more on-schedule ticks BEFORE the reconnect is noticed. The
+      // anchor must stay pinned at the pre-sleep moment across all of them —
+      // this is the regression the sticky flag exists for (an unpinned anchor
+      // would be dragged forward to "now" and the window would collapse).
+      for (let i = 0; i < 3; i++) await vi.advanceTimersByTimeAsync(30_000);
+
+      // Only now does the SDK notice the socket is dead.
+      chObj.handlers["reconnecting"]!(undefined);
+      chObj.handlers["reconnected"]!(undefined);
+
+      for (let i = 0; i < 200 && starts.length === 0; i++) {
+        await new Promise((r) => setTimeout(r, 10));
+      }
+      expect(starts.length).toBeGreaterThan(0);
+
+      const startMs = Date.parse(starts[0]!);
+      // Reaches back to ~the pre-sleep tick. Unfixed (anchor = when the
+      // disconnect was NOTICED) this would be ~90min later, covering ~30s of a
+      // 90-minute blind window and declaring the gap closed.
+      expect(startMs).toBeLessThanOrEqual(lastHealthyTick + 60_000);
+      expect(startMs).toBeGreaterThan(lastHealthyTick - 5 * 60_000);
+
+      await client.close();
+    } finally {
+      vi.useRealTimers();
+      vi.doUnmock("@larksuiteoapi/node-sdk");
+      vi.doUnmock("node:child_process");
+      vi.resetModules();
+    }
+  });
+});

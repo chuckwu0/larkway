@@ -129,6 +129,64 @@ const UNRESOLVED_WINDOW_MAX_CHATS = 50;
  */
 const UNRESOLVED_WINDOW_MAX_AGE_MS = 30 * 60 * 1000; // 30 min
 /**
+ * BL-55 洞 A — reconnect-path gap-fill ceiling. Deliberately far larger than
+ * {@link UNRESOLVED_WINDOW_MAX_AGE_MS}: a reconnect pull is ONE-SHOT (once per
+ * reconnect), while the unresolved-window replay is RECURRING (every timer
+ * cycle) — the flood risk the 30-min cap guards against simply isn't the same
+ * shape. The real-world case this exists for: a laptop/mini sleeps for hours,
+ * and the SDK only notices the socket is dead on wake, so the 30-min ceiling
+ * would silently truncate the recovery to the last half hour.
+ *
+ * This is a CEILING, not a window: the actual look-back is
+ * `now - min(lastDisconnectAt, lastHealthyAt)` (see the "reconnected" handler),
+ * which stays small whenever the connection was observed healthy recently. So
+ * a flapping-but-alive socket keeps pulling tiny windows; only a genuinely
+ * blind stretch widens it.
+ */
+const RECONNECT_GAP_FILL_MAX_AGE_MS = 2 * 60 * 60 * 1000; // 2h
+/**
+ * Per-RUN page budget across ALL chats (review finding: request volume).
+ *
+ * `+chat-messages-list` is not one API call per page — lark-cli auto-expands
+ * thread replies, so a single page can fan out to ~50 calls. Multiplying the
+ * per-chat page cap by an open-mode bot's full chat set (recentlySeenChatIds
+ * is only trimmed when PERSISTED, so in memory it is every group the bot has
+ * ever seen) by N bots on one host reproduces the storm shape this file's
+ * STORM FIX comment was written for.
+ *
+ * When the budget runs out the remaining chats are left with an unresolved
+ * window — they are retried on a later cycle rather than dropped, so coverage
+ * is deferred, never silently lost.
+ */
+const GAP_FILL_MAX_PAGES_PER_RUN = 40;
+/** Boundary overlap added to the reconnect look-back — see the call site. */
+const RECONNECT_GAP_FILL_LOOKBACK_BUFFER_MS = 30_000;
+/**
+ * BL-55 洞 A — how often we sample the SDK's connection state to refresh
+ * {@link ChannelClient.lastHealthyAt}. Cheap and in-process (no network): it
+ * only reads the SDK's own status object. Doubles as the sleep detector — a
+ * suspended machine doesn't fire timers, so the gap between two samples is
+ * itself the evidence that we were blind.
+ */
+const LIVENESS_SAMPLE_MS = 30_000;
+/**
+ * A tick gap larger than this cannot occur while the process is running
+ * normally (the interval above is 30s), so it is positive evidence that the
+ * machine was suspended — and, unlike anything the SDK exposes, it is a signal
+ * that cannot be fooled by a socket whose `readyState` is still OPEN.
+ * See {@link ChannelClient.blindSince}.
+ */
+const LIVENESS_SUSPEND_DETECT_MS = 90_000;
+/**
+ * BL-55 洞 E — page cap for a single chat's history pull. gapFill used to send
+ * ONE `--page-size 50` request per chat with `--sort asc`, so any window
+ * holding more than 50 messages yielded the OLDEST 50 — dropping exactly the
+ * recent @ the pull existed to recover. Paginating fixes that; this cap keeps
+ * a pathological window (busy group × wide reconnect window) from turning into
+ * an unbounded pull. Hitting it is logged, never silent.
+ */
+const GAP_FILL_MAX_PAGES = 10;
+/**
  * Untrack a chat after this many CONSECUTIVE gap-fill cycles whose history pull
  * failed with Feishu 230002 ("Bot/User can NOT be out of the chat" — the bot is
  * no longer a member). Such a failure is deterministic: retrying within a cycle
@@ -360,6 +418,15 @@ interface LarkChannel extends OutboundLarkChannel {
   on(event: "error", handler: (err: { code?: string; message?: string }) => void): void;
   connect(): Promise<void>;
   disconnect(): Promise<void>;
+  /**
+   * BL-55 洞 A: the SDK's own view of the socket. Sampled on a timer to keep
+   * {@link ChannelClient.lastHealthyAt} honest — "connected" here means the
+   * transport is up, independent of whether any MESSAGE happened to arrive
+   * (an idle-but-healthy bot must not look like a blind window).
+   * Optional because the local `LarkChannel` shape is a hand-written subset;
+   * present on node-sdk ≥1.64 (verified against 1.67.0 and 1.71.1 types).
+   */
+  getConnectionStatus?(): { state?: string } | undefined;
 }
 
 // ---------------------------------------------------------------------------
@@ -535,6 +602,35 @@ export class ChannelClient {
    * rebuilding gets replayed.
    */
   private lastDisconnectAt = 0;
+  /**
+   * BL-55 洞 A — ms epoch when we last OBSERVED the transport healthy (0 before
+   * the first connect).
+   *
+   * Why this exists: `lastDisconnectAt` records when we NOTICED the socket was
+   * down, which can be arbitrarily later than when it actually went blind. The
+   * canonical case is machine sleep — the process is frozen, nothing fires, and
+   * on wake the SDK reports "reconnecting" for the first time. Gap-filling from
+   * that moment pulls ~30s of history and declares the window covered, while
+   * every @ sent during the sleep is lost with no trace (no Typing reaction, no
+   * log line). Anchoring the pull at the last CONFIRMED-healthy moment closes
+   * that hole.
+   *
+   * Refreshed by the liveness sampler (transport state, not message traffic) so
+   * an idle-but-connected bot never looks like a blind window.
+   */
+  private lastHealthyAt = 0;
+  /** Interval handle for the liveness sampler; cleared in {@link close}. */
+  private livenessTimer: ReturnType<typeof setInterval> | undefined;
+  /** Wall-clock of the most recent liveness tick (0 = none yet). */
+  private livenessLastTickAt = 0;
+  /** Wall-clock of the most recent ON-SCHEDULE tick — the honest pre-suspend anchor. */
+  private livenessLastTickAtBeforeGap = 0;
+  /**
+   * Set when a suspend was detected; holds the last confirmed-healthy instant
+   * until a gap-fill has actually covered it (then cleared). Sticky on purpose
+   * — see the sampler.
+   */
+  private blindSince: number | undefined;
   /**
    * Message_ids that have reached a terminal SUCCESS (handler.markHandled) OR
    * were explicitly acknowledged. These are persisted so open-chat recovery
@@ -953,15 +1049,55 @@ export class ChannelClient {
       // @ this bot but weren't delivered. Runs in background; never throws into
       // the event handler.
       if (this.lastDisconnectAt > 0) {
-        void this.gapFill(this.lastDisconnectAt, log);
+        // BL-55 洞 A: anchor the pull at the last CONFIRMED-healthy moment, not
+        // at the moment we noticed the socket was down. These are the same
+        // instant for an ordinary network blip (the sampler ran seconds ago),
+        // and differ by hours exactly when it matters — a suspended machine,
+        // where `reconnecting` first fires on wake and the naive window covers
+        // ~30s of a multi-hour blind stretch.
+        const anchor = this.blindSince ?? (this.lastHealthyAt > 0 ? this.lastHealthyAt : undefined);
+        const healthyStart = anchor != null ? Math.min(this.lastDisconnectAt, anchor) : this.lastDisconnectAt;
+        // The suspend anchor has now been handed to a pull; release it so the
+        // sampler can start advancing again. Cleared BEFORE the await so a
+        // failed pull doesn't pin it forever — a failed chat is tracked by its
+        // own unresolved window instead.
+        this.blindSince = undefined;
+        const blindMs = now - healthyStart;
+        // Only worth a line when the two anchors actually diverge (beyond one
+        // sampling period of jitter) — that's the sleep/blind-window case.
+        if (blindMs > gapMs + LIVENESS_SAMPLE_MS) {
+          log(
+            `blind window detected: last healthy sample ${new Date(healthyStart).toISOString()} ` +
+              `(~${Math.round(blindMs / 1000)}s ago) is older than the recorded disconnect — ` +
+              `widening gap-fill look-back accordingly (likely machine sleep/suspend)`,
+          );
+        }
+        // `blindMs + buffer`, mirroring how discovery passes `interval + buffer`:
+        // with a bare `blindMs` the ceiling lands exactly on `healthyStart`, so
+        // the 30s boundary overlap gapFill applies is clamped straight back off
+        // — precisely on the widened path where a near-boundary message is most
+        // likely to be the one we're trying to recover.
+        void this.gapFill(
+          healthyStart,
+          log,
+          undefined,
+          blindMs + RECONNECT_GAP_FILL_LOOKBACK_BUFFER_MS,
+          RECONNECT_GAP_FILL_MAX_AGE_MS,
+        );
       }
+      // The socket is up again — restart the healthy clock from here, AFTER the
+      // window above has been computed off the pre-reconnect value.
+      this.lastHealthyAt = now;
     });
     channel.on("error", (e) => log(`WS error (non-fatal): ${e?.code ?? ""} ${e?.message ?? ""}`));
 
     this.channel = channel;
     await channel.connect();
     this.connected = true;
+    // BL-55 洞 A: the connect itself is the first confirmed-healthy moment.
+    this.lastHealthyAt = Date.now();
     log(`connected as ${channel.botIdentity?.name ?? "?"} (${channel.botIdentity?.openId ?? "?"})`);
+    this.startLivenessSampler(log);
     this.startOpenChatDiscovery(log);
     this.startUnresolvedReplayTimer(log);
   }
@@ -1154,15 +1290,23 @@ export class ChannelClient {
     log: (s: string) => void,
     chatIdsOverride?: ReadonlySet<string>,
     minWindowMs?: number,
+    /**
+     * BL-55 洞 A — absolute ceiling on how far back this run may reach. Defaults
+     * to the recurring-replay cap; the reconnect path passes the (much larger)
+     * {@link RECONNECT_GAP_FILL_MAX_AGE_MS} because it fires once per reconnect
+     * rather than on every timer tick. See that constant for why the two paths
+     * legitimately differ.
+     */
+    maxAgeMs: number = UNRESOLVED_WINDOW_MAX_AGE_MS,
   ): Promise<void> {
     // Normal clamp ceiling. `minWindowMs` (used by periodic discovery) raises it
     // so a requested look-back of "discovery interval + buffer" isn't truncated
     // below the interval — otherwise a chat first seen BETWEEN two cycles (up to
     // `interval` apart) whose @ was also dropped live would fall outside the
-    // window and never be recovered. Bounded by the replay max age either way.
+    // window and never be recovered. Bounded by `maxAgeMs` either way.
     const MAX_GAP_FILL_WINDOW_MS = Math.min(
       Math.max(5 * 60 * 1000, minWindowMs ?? 0), // ≥5 minutes, or the caller's floor
-      UNRESOLVED_WINDOW_MAX_AGE_MS,
+      maxAgeMs,
     );
     const BUFFER_MS = 30_000; // 30 s overlap to catch near-boundary messages
     const now = Date.now();
@@ -1197,8 +1341,8 @@ export class ChannelClient {
     const hasReplay = oldestRelevantUnresolved !== Infinity;
     const lookBackFrom = Math.min(disconnectAt, hasReplay ? oldestRelevantUnresolved : disconnectAt);
     // Normal runs clamp at 5 min to avoid flooding; replay runs widen the ceiling
-    // to the replay max age so an old unresolved window can actually be reached.
-    const clampCeilingMs = hasReplay ? UNRESOLVED_WINDOW_MAX_AGE_MS : MAX_GAP_FILL_WINDOW_MS;
+    // to `maxAgeMs` so an old unresolved window can actually be reached.
+    const clampCeilingMs = hasReplay ? maxAgeMs : MAX_GAP_FILL_WINDOW_MS;
     const windowStart = Math.max(lookBackFrom - BUFFER_MS, now - clampCeilingMs);
     const startIso = new Date(windowStart).toISOString();
     const endIso = new Date(now + BUFFER_MS).toISOString();
@@ -1212,36 +1356,114 @@ export class ChannelClient {
     }
 
     let anyChatFailed = false;
+    // Review finding (request volume): shared across every chat in THIS run.
+    let runPageBudget = GAP_FILL_MAX_PAGES_PER_RUN;
+    let budgetExhaustedFor = 0;
     for (const chatId of gapFillChatIds) {
       if (this.closed) break;
+      if (runPageBudget <= 0) {
+        // Defer, don't drop: queue this chat's window so a later cycle pulls it.
+        budgetExhaustedFor++;
+        anyChatFailed = true;
+        this.recordUnresolvedGapWindow(chatId, windowStart, log);
+        continue;
+      }
       try {
-        const args = [
-          "im",
-          "+chat-messages-list",
-          "--as", "bot",
-          "--chat-id", chatId,
-          "--start", startIso,
-          "--end", endIso,
-          "--sort", "asc",
-          "--page-size", "50",
-          "--format", "json",
-          "--no-reactions",
-          ...profileArgs,
-        ];
-        // Bounded retry + exponential backoff: the history pull itself can撞上 a
-        // transient TLS timeout. Retrying turns a one-off blip into a recovered
-        // window instead of a permanently-dropped @ (root cause B).
-        const { stdout } = await this.execWithRetry(larkCli, args, chatId, log);
+        // BL-55 洞 E: PAGINATE. This used to be a single `--page-size 50` call.
+        // Combined with `--sort asc` that silently kept the OLDEST 50 messages
+        // of the window and discarded the rest — i.e. exactly the recent @ this
+        // pull exists to recover, whenever a chat had >50 messages in the
+        // window. Widening the window (洞 A) makes that far more likely to bite,
+        // so the two fixes ship together.
+        const messages: unknown[] = [];
+        let pageToken = "";
+        let pagesPulled = 0;
+        let truncated = false;
+        // Review finding: any early exit from the page loop means this chat's
+        // window was NOT fully covered. Without this flag the code below falls
+        // straight through to resolveUnresolvedGapWindow and marks the window
+        // covered anyway — silently discarding a queued replay that nothing
+        // ever pulled. (Pre-diff the parse-failure branch used `continue`,
+        // which skipped that resolve; converting it to a page-loop `break`
+        // introduced the fall-through.)
+        let pullIncomplete = false;
+        for (let page = 0; page < GAP_FILL_MAX_PAGES; page++) {
+          if (this.closed) {
+            pullIncomplete = true;
+            break;
+          }
+          if (runPageBudget <= 0) {
+            pullIncomplete = true;
+            break;
+          }
+          runPageBudget--;
+          const args = [
+            "im",
+            "+chat-messages-list",
+            "--as", "bot",
+            "--chat-id", chatId,
+            "--start", startIso,
+            "--end", endIso,
+            "--sort", "asc",
+            "--page-size", "50",
+            "--format", "json",
+            "--no-reactions",
+            ...profileArgs,
+          ];
+          if (pageToken) args.push("--page-token", pageToken);
+          // Bounded retry + exponential backoff: the history pull itself can撞上 a
+          // transient TLS timeout. Retrying turns a one-off blip into a recovered
+          // window instead of a permanently-dropped @ (root cause B).
+          const { stdout } = await this.execWithRetry(larkCli, args, chatId, log);
+          pagesPulled++;
 
-        let messages: unknown[];
-        try {
-          // lark-cli versions have returned all of these envelopes over time:
-          //   [ ... ], { items: [...] }, { messages: [...] }, { data: { messages: [...] } }.
-          // Treat unknown-but-valid shapes as empty, but keep JSON parse errors visible.
-          messages = parseLarkCliMessages(stdout) ?? [];
-        } catch {
-          log(`gap-fill: failed to parse lark-cli output for chat ${chatId}`);
-          continue;
+          let pageMessages: unknown[];
+          try {
+            // lark-cli versions have returned all of these envelopes over time:
+            //   [ ... ], { items: [...] }, { messages: [...] }, { data: { messages: [...] } }.
+            // Treat unknown-but-valid shapes as empty, but keep JSON parse errors visible.
+            pageMessages = parseLarkCliMessages(stdout) ?? [];
+          } catch {
+            log(`gap-fill: failed to parse lark-cli output for chat ${chatId} (page ${page + 1})`);
+            pullIncomplete = true;
+            break; // keep whatever earlier pages yielded rather than dropping the chat
+          }
+          messages.push(...pageMessages);
+
+          // Envelope shapes vary the same way the message list does — read
+          // has_more/page_token from `data` first, then the top level (mirrors
+          // discoverOpenChatsAndGapFill).
+          let hasMore = false;
+          let nextToken = "";
+          try {
+            const parsed = JSON.parse(stdout) as unknown;
+            const data =
+              parsed && typeof parsed === "object" ? (parsed as Record<string, unknown>)["data"] : undefined;
+            hasMore = Boolean(
+              (data && typeof data === "object" && (data as Record<string, unknown>)["has_more"]) ??
+                (parsed && typeof parsed === "object" && (parsed as Record<string, unknown>)["has_more"]),
+            );
+            nextToken = stringField(data, "page_token") ?? stringField(parsed, "page_token") ?? "";
+          } catch {
+            /* unparseable envelope → treat as last page; pageMessages already banked */
+          }
+          if (!hasMore || !nextToken) break;
+          if (page === GAP_FILL_MAX_PAGES - 1) {
+            truncated = true;
+            pullIncomplete = true;
+          }
+          pageToken = nextToken;
+        }
+        if (truncated) {
+          // Never silent: a capped pull means we may NOT have recovered
+          // everything in the window, which is precisely the failure mode 洞 E
+          // is about.
+          log(
+            `gap-fill: chat ${chatId} hit the ${GAP_FILL_MAX_PAGES}-page cap ` +
+              `(${messages.length} message(s) pulled) — window may be incompletely covered`,
+          );
+        } else if (pagesPulled > 1) {
+          log(`gap-fill: chat ${chatId} pulled ${pagesPulled} pages (${messages.length} message(s))`);
         }
 
         const messagesWithReplies = expandMessagesWithThreadReplies(messages);
@@ -1368,7 +1590,18 @@ export class ChannelClient {
         // (i.e. <=) the tracked windowStart (BLOCKER 2). If the clamp kept
         // windowStart NEWER than the tracked window, the old window wasn't really
         // covered — keep it queued for a later, wider replay.
-        this.resolveUnresolvedGapWindow(chatId, windowStart);
+        //
+        // `pullIncomplete` extends the same invariant to the PAGE dimension: a
+        // pull that stopped early (parse failure, page cap, shutdown) covered
+        // the window's start but not its whole content, so resolving it here
+        // would drop a queued replay that nothing actually pulled. Re-record
+        // instead, so a later run retries it.
+        if (pullIncomplete) {
+          anyChatFailed = true;
+          this.recordUnresolvedGapWindow(chatId, windowStart, log);
+        } else {
+          this.resolveUnresolvedGapWindow(chatId, windowStart);
+        }
         this.chatAccessGoneCountByChat.delete(chatId);
       } catch (e) {
         if (isChatAccessGoneError(e)) {
@@ -1392,8 +1625,12 @@ export class ChannelClient {
 
     log(
       `gap-fill complete: window=${startIso}..${endIso}, ` +
-        `fetched=${totalFetched}, dispatched=${totalDispatched}` +
-        (anyChatFailed ? ` (some chats failed — per-chat windows queued for replay)` : ``),
+        `fetched=${totalFetched}, dispatched=${totalDispatched}, ` +
+        `pages=${GAP_FILL_MAX_PAGES_PER_RUN - runPageBudget}/${GAP_FILL_MAX_PAGES_PER_RUN}` +
+        (budgetExhaustedFor > 0
+          ? ` — page budget exhausted, ${budgetExhaustedFor} chat(s) deferred to a later cycle`
+          : ``) +
+        (anyChatFailed ? ` (some chats incomplete/failed — per-chat windows queued for replay)` : ``),
     );
   }
 
@@ -1442,7 +1679,13 @@ export class ChannelClient {
 
   /** Drop per-chat unresolved windows older than the replay max age (unrecoverable). */
   private pruneUnresolvedGapWindows(now: number): void {
-    const cutoff = now - UNRESOLVED_WINDOW_MAX_AGE_MS;
+    // Must track the WIDEST ceiling any path can actually pull with, not just
+    // the recurring-replay one. The reconnect path reaches back
+    // RECONNECT_GAP_FILL_MAX_AGE_MS; pruning at the 30-min cap would drop a
+    // window recorded by a post-suspend pull within a single discovery cycle —
+    // i.e. exactly the windows the wider ceiling exists to recover, deleted
+    // minutes after being queued, with no log.
+    const cutoff = now - Math.max(UNRESOLVED_WINDOW_MAX_AGE_MS, RECONNECT_GAP_FILL_MAX_AGE_MS);
     for (const [chatId, windowStart] of this.unresolvedGapWindowByChat) {
       if (windowStart < cutoff) this.unresolvedGapWindowByChat.delete(chatId);
     }
@@ -1515,6 +1758,62 @@ export class ChannelClient {
         `consecutive inaccessible cycles (bot removed from chat?) — ` +
         `re-tracks automatically on the next live message`,
     );
+  }
+
+  /**
+   * BL-55 洞 A — keep {@link lastHealthyAt} honest.
+   *
+   * Samples the SDK's own connection state (no network, no API call) and
+   * advances the healthy clock only while the transport reports "connected".
+   * Two properties this buys, both load-bearing for the reconnect gap-fill
+   * window:
+   *   - an IDLE but connected bot keeps its clock current, so a later reconnect
+   *     pulls a small window instead of hours of history it doesn't need;
+   *   - a SUSPENDED machine stops ticking entirely, so the clock freezes at the
+   *     pre-sleep moment and the post-wake pull reaches back across the sleep.
+   *
+   * Deliberately does NOT force a reconnect when it sees a non-connected state
+   * — that's BL-55 洞 B (self-hosted keepalive), kept as a separate change so
+   * this one stays reviewable as "window arithmetic only".
+   */
+  private startLivenessSampler(log: (s: string) => void): void {
+    if (this.livenessTimer) return;
+    const timer = setInterval(() => {
+      if (this.closed) return;
+      const now = Date.now();
+      const sinceLast = this.livenessLastTickAt > 0 ? now - this.livenessLastTickAt : 0;
+      this.livenessLastTickAt = now;
+      if (sinceLast > LIVENESS_SUSPEND_DETECT_MS) {
+        // The interval could not have been this late while the process was
+        // running normally — the machine was suspended (or the event loop was
+        // wedged) for that whole stretch. The last tick we actually observed is
+        // therefore the last moment we can honestly call healthy. STICKY: keep
+        // the earliest such anchor until a gap-fill has actually covered it,
+        // otherwise the very next on-schedule tick would move the anchor
+        // forward and silently shrink the recovery window back to nothing.
+        if (this.blindSince == null) {
+          this.blindSince = this.livenessLastTickAtBeforeGap > 0 ? this.livenessLastTickAtBeforeGap : this.lastHealthyAt;
+          log(
+            `liveness: tick gap of ~${Math.round(sinceLast / 1000)}s — machine was suspended; ` +
+              `holding the recovery anchor at ${new Date(this.blindSince).toISOString()} until the next gap-fill`,
+          );
+        }
+        return;
+      }
+      this.livenessLastTickAtBeforeGap = now;
+      // On-schedule tick with no pending blind stretch → the process was alive
+      // and the anchor may advance. Deliberately NOT gated on the SDK's
+      // connection state: `getConnectionStatus()` reports "connected" whenever
+      // `readyState === OPEN`, which is exactly what a half-open socket looks
+      // like — using it here would move the anchor forward across the very
+      // outage the anchor exists to cover. The 5-minute floor inside gapFill
+      // already covers the ordinary half-open detection latency (~180s worst
+      // case via the SDK's own pingTimeout); this anchor's job is the case that
+      // floor cannot reach — a multi-hour suspend.
+      if (this.blindSince == null) this.lastHealthyAt = now;
+    }, LIVENESS_SAMPLE_MS);
+    timer.unref?.();
+    this.livenessTimer = timer;
   }
 
   /**
@@ -2002,6 +2301,10 @@ export class ChannelClient {
     if (this.unresolvedReplayTimer) {
       clearInterval(this.unresolvedReplayTimer);
       this.unresolvedReplayTimer = null;
+    }
+    if (this.livenessTimer) {
+      clearInterval(this.livenessTimer);
+      this.livenessTimer = undefined;
     }
     this.queue.close();
     if (this.channel && this.connected) {
