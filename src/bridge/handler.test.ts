@@ -6,7 +6,7 @@
  * thin-channel behaviour: a late-stage state.json WITHOUT dev_url is NOT probed
  * and NOT demoted — finalize follows status=ready → success.
  */
-import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach, beforeAll } from "vitest";
 import { mkdtemp, rm, mkdir, writeFile, readFile, stat, utimes } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -1191,6 +1191,107 @@ describe("handleOne — thin-channel finalize", () => {
     expect(JSON.stringify(finalUpdate?.payload)).toContain("工具计数完成");
   });
 
+  // BL-48 修订 (owner decision 2026-07-28): a silent turn is NOT killed unless
+  // the operator opted in via `idle_kill_seconds`. The bridge cannot tell a hang
+  // from a slow turn, and it does not know what the agent is being used for, so
+  // it marks + reports instead of deciding. This test is the guard on that
+  // default — it is the same stalled runner the PRB-9 test above kills, minus
+  // responseSurfaceIdleKillMs.
+  it("BL-48 修订: a silent turn is NOT killed when idle_kill_seconds is unset (default), and the card says it is still waiting", async () => {
+    const threadId = "om_msg";
+    await seedWorktree(threadId);
+    await seedRepoCachePath();
+    const { client: cardKitClient, calls: cardKitCalls } = makeCardKitClient();
+    let killed = false;
+    let released = false;
+
+    runClaudeImpl = () => {
+      let resolveDone: (r: { exitCode: number; sessionId?: string }) => void = () => {};
+      const done = new Promise<{ exitCode: number; sessionId?: string }>((res) => {
+        resolveDone = res;
+      });
+      return {
+        events: (async function* () {
+          yield { type: "system_init", sessionId: "sess_quiet", raw: {} };
+          // Silent well past the threshold, then finishes normally — exactly the
+          // shape the old watchdog destroyed.
+          while (!released) await new Promise((r) => setTimeout(r, 5));
+          yield {
+            type: "answer_snapshot",
+            text: "LARKWAY_ANSWER_BEGIN\n熬过来了\nLARKWAY_ANSWER_END",
+            raw: {},
+          };
+          resolveDone({ exitCode: 0, sessionId: "sess_quiet" });
+        })(),
+        done,
+        kill: () => {
+          killed = true;
+          resolveDone({ exitCode: 143, sessionId: "sess_quiet" });
+        },
+      };
+    };
+
+    const { renderer } = makeCardRenderer();
+    const { store } = makeSessionStore();
+    const { client, acked } = makeClient(makeEvent());
+
+    const handler = new BridgeHandler({
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      client: client as any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      cardRenderer: renderer as any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      sessionStore: store as any,
+      conventions: makeConventions(),
+      botConfig: {
+        id: "frontend",
+        name: "Frontend",
+        turn_taking_limit: 10,
+        backend: "claude",
+        cot: "brief",
+        cotSurface: "card",
+        response_surface_prototype: {
+          enabled: true,
+          allowed_chats: [],
+          allowed_threads: ["om_msg"],
+          kill_switch: false,
+          post_outbound_enabled: false,
+          cardkit_streaming_enabled: true,
+          allow_agent_mentions: true,
+          denied_mention_open_ids: [],
+          allowed_mention_open_ids: [],
+        },
+      },
+      cardKitClient,
+      responseSurfaceIdleTimeoutMs: 30, // suspect quickly…
+      // …and NO responseSurfaceIdleKillMs — the whole point of this test.
+    });
+
+    await handler.run();
+
+    // Let the watchdog tick many times over its threshold.
+    await new Promise((r) => setTimeout(r, 400));
+    expect(killed).toBe(false);
+
+    // The stall is visible on the card, and the notice names the way out —
+    // with no automatic kill, this status line IS the entire interface for a
+    // stall, so it has to carry the stop affordance.
+    const statusPatches = cardKitCalls
+      .filter((c) => c.kind === "updateElement" && c.elementId === "footer_md")
+      .map((c) => JSON.stringify(c.payload));
+    const waiting = statusPatches.filter((p) => p.includes("仍在等待"));
+    expect(waiting.length).toBeGreaterThan(0);
+    expect(waiting.at(-1) ?? "").toContain("/stop");
+
+    // Releasing the runner lets the turn finish normally — the work survived.
+    released = true;
+    for (let i = 0; i < 300 && acked.length === 0; i++) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    expect(killed).toBe(false);
+    expect(acked).toEqual(["om_msg"]);
+  });
+
   it("PRB-9: interrupts an idle-stuck CardKit turn as explicit failure (idle, not wall-clock)", async () => {
     const threadId = "om_msg";
     const wt = await seedWorktree(threadId);
@@ -1258,6 +1359,9 @@ describe("handleOne — thin-channel finalize", () => {
       },
       cardKitClient,
       responseSurfaceIdleTimeoutMs: 30, // tiny idle threshold for a fast, deterministic test
+      // BL-48 修订: idle-kill is opt-in now — this suite is ABOUT the kill path,
+      // so it asks for it explicitly (a default-config bot would just keep running).
+      responseSurfaceIdleKillMs: 30,
     });
 
     await handler.run();
@@ -1364,6 +1468,10 @@ describe("handleOne — thin-channel finalize", () => {
       },
       cardKitClient,
       responseSurfaceIdleTimeoutMs: 400, // cadence = 100ms → the 1000ms stall spans ~10 ticks
+      // Opt into a kill budget WIDER than the stall (the old hard-coded 3×
+      // equivalent): the point is that a turn which resumes inside the grace is
+      // never killed, so the budget has to be reachable-but-not-reached.
+      responseSurfaceIdleKillMs: 1200
     });
 
     await handler.run();
@@ -1446,7 +1554,8 @@ describe("handleOne — thin-channel finalize", () => {
         },
       },
       cardKitClient,
-      responseSurfaceIdleTimeoutMs: 300, // kill at 900ms of continuous silence
+      responseSurfaceIdleTimeoutMs: 300,
+      responseSurfaceIdleKillMs: 900, // opt-in kill at 900ms of continuous silence
     });
 
     await handler.run();
@@ -1535,6 +1644,9 @@ describe("handleOne — thin-channel finalize", () => {
       },
       cardKitClient,
       responseSurfaceIdleTimeoutMs: 30, // tiny idle threshold — would fire many times over during the 200ms tool call if not exempted
+      // Kill deliberately ENABLED: proves the in-flight exemption holds even for a
+      // bot that opted into automatic interrupts.
+      responseSurfaceIdleKillMs: 30,
     });
 
     await handler.run();
@@ -1612,6 +1724,7 @@ describe("handleOne — thin-channel finalize", () => {
       },
       cardKitClient,
       responseSurfaceIdleTimeoutMs: 30,
+      responseSurfaceIdleKillMs: 30,
     });
 
     await handler.run();
@@ -4824,6 +4937,7 @@ describe("BL-38: poison-session self-heal", () => {
       botConfig: botConfig(),
       cardKitClient,
       responseSurfaceIdleTimeoutMs: 30, // tiny idle threshold → fast deterministic kill
+      responseSurfaceIdleKillMs: 30, // BL-48 修订: opt in — this suite tests post-kill behavior
     });
     await handler.run();
     for (let i = 0; i < 400 && acked.length === 0; i++) {
@@ -5828,7 +5942,12 @@ function makeWorkspaceHandler(opts: {
     },
     ...(cardKit ? { cardKitClient: cardKit.client } : {}),
     ...(opts.idleTimeoutMs !== undefined
-      ? { responseSurfaceIdleTimeoutMs: opts.idleTimeoutMs }
+      ? {
+          responseSurfaceIdleTimeoutMs: opts.idleTimeoutMs,
+          // BL-48 修订: harnesses that set an idle threshold do so to exercise the
+          // kill; opt in at the same value so they still reach it.
+          responseSurfaceIdleKillMs: opts.idleTimeoutMs,
+        }
       : {}),
     recordMemoryMetric: (e) => metrics.push(e),
   });
@@ -6739,5 +6858,37 @@ describe("handleOne — untrusted-text rescue (answer outside markers)", () => {
     );
     expect(finalizeArgs).toHaveLength(1);
     expect(finalizeArgs[0]?.finalText).toBe("state.json 里的正式正文");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// BL-48 修订 — resolveIdleKillAfterMs (pure)
+// ---------------------------------------------------------------------------
+
+describe("resolveIdleKillAfterMs (BL-48 修订: idle-kill is opt-in)", () => {
+  let resolveIdleKillAfterMs: typeof import("./handler.js").resolveIdleKillAfterMs;
+  beforeAll(async () => {
+    ({ resolveIdleKillAfterMs } = await import("./handler.js"));
+  });
+
+  it("returns undefined when unset — the default is never to interrupt", () => {
+    expect(resolveIdleKillAfterMs(undefined, 180_000)).toBeUndefined();
+  });
+
+  it("honors a configured budget", () => {
+    expect(resolveIdleKillAfterMs(600_000, 180_000)).toBe(600_000);
+  });
+
+  // The ceiling exists so an opted-in kill can never drift past the 60-min
+  // subprocess runaway guard: beyond it the generic 进程异常退出 card would win
+  // and BL-38's consecutive-idle-kill reset would stop counting.
+  it("clamps a huge budget to the 15-min ceiling", () => {
+    expect(resolveIdleKillAfterMs(60 * 60_000, 180_000)).toBe(15 * 60_000);
+  });
+
+  // A kill earlier than the suspect mark would interrupt before the card ever
+  // told the user anything — the notice must always come first.
+  it("never kills before the suspect threshold", () => {
+    expect(resolveIdleKillAfterMs(30_000, 180_000)).toBe(180_000);
   });
 });

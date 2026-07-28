@@ -407,6 +407,25 @@ export const BotConfigSchema = z.object({
   idle_timeout_seconds: z.number().int().min(30).optional(),
 
   /**
+   * Automatic-interrupt budget, in seconds of continuous silence. **Unset (the
+   * default) = the bridge never interrupts a silent turn.**
+   *
+   * The bridge cannot tell a hung turn from a legitimately slow one — silence
+   * looks identical for a real hang, a long prefill, upstream backoff, and any
+   * phase the backend doesn't report — and it has no idea what the operator is
+   * using the agent for, so it does not decide. A silent turn instead says so on
+   * the card (⏳ …, threshold = `idle_timeout_seconds`) and keeps running; it
+   * ends when the runner finishes, when the user clicks the 思考气泡's ⏹ (or
+   * sends `/stop`), or at the 60-min subprocess runaway guard.
+   *
+   * Set this only where nobody is watching the card — cron / batch dispatch /
+   * unattended fleets — and a wedged turn would otherwise sit for the full hour.
+   * Clamped to 15 min (handler.ts IDLE_KILL_CEILING_MS) and never lower than
+   * `idle_timeout_seconds`.
+   */
+  idle_kill_seconds: z.number().int().min(30).optional(),
+
+  /**
    * COT (思维链) 气泡:把 agent 的 thinking 思考过程 + 工具调用摘要实时推到飞书
    * 原生的可折叠思维链气泡(与最终答案卡片互不干扰,最终答案永远只走卡片)。
    *

@@ -74,6 +74,7 @@ import {
 } from "./stateFile.js";
 import { processHandoffs, type LocalHandoffRegistry } from "./localHandoff.js";
 import { writeCardFile, deleteCardFile } from "./cardFile.js";
+import { writeCotFile, deleteCotFile } from "./cotFile.js";
 import {
   writeCardKitFile,
   deleteCardKitFile,
@@ -171,6 +172,57 @@ const DEFAULT_CARDKIT_IDLE_TIMEOUT_MS = 3 * 60 * 1000;
 const IDLE_SUSPECT_TO_KILL_MULTIPLIER = 3;
 
 /**
+ * BL-48 修订 (2026-07-28, owner decision): **the idle watchdog no longer
+ * terminates a turn by default.** Crossing the threshold marks the turn suspect
+ * and says so on the card; nothing kills it. Opt in per bot with
+ * `idle_kill_seconds` (bot yaml → HandlerDeps.responseSurfaceIdleKillMs).
+ *
+ * Why the default flipped, recorded so it doesn't get "optimized" back:
+ *
+ * 1. **The judgment is undecidable and we made it load-bearing for a
+ *    destructive act.** Silence has at least four causes (real hang, long
+ *    prefill, upstream backoff, a phase the vendor doesn't report) and the
+ *    bridge cannot tell them apart. Three releases in a row tried to make the
+ *    inference sharper (more event types, a bigger threshold, grading); none
+ *    questioned whether an inference we cannot verify should authorize killing
+ *    a user's work. Owner's framing: 「你没办法判断用户是怎么使用这个 Agent 的」.
+ *
+ * 2. **The user already has the stop control, in exactly this window.** Feishu
+ *    renders a ⏹ button on the in-progress COT bubble; clicking it sends
+ *    `@bot /stop`, which BL-42 already intercepts and stops the turn. The
+ *    automatic kill was therefore not just a guess on the user's behalf — it was
+ *    redundant with a control they had all along. And it actively shortened it:
+ *    killing the turn completes the bubble, which removes the ⏹.
+ *
+ * 3. **The card can still reach a terminal state without it.** What finalizes a
+ *    card is the run ending, and the 60-min subprocess runaway guard
+ *    (subprocessTimeoutMs) already guarantees that unconditionally. The 3-min
+ *    kill only made it terminal *sooner*, at the price of destroying the work.
+ *
+ * 4. **It defended the cheap failure and was blind to the expensive one.** A
+ *    silent hang costs a concurrency slot and zero tokens; a livelock (looping
+ *    while emitting) burns money and never trips an *idle* watchdog at all.
+ *    Bounding that one needs a cost/budget net, which is orthogonal and
+ *    tracked separately.
+ *
+ * What still terminates a turn: the runner finishing, the user's ⏹ / `/stop`,
+ * the 60-min runaway guard, and `idle_kill_seconds` where an operator asks for
+ * it — unattended fleets (cron, batch dispatch) have nobody reading the bubble,
+ * so they can still opt into a shorter automatic cut.
+ *
+ * @returns ms of continuous silence after which to interrupt, or undefined for
+ *   "never" (the default). A configured budget is clamped to
+ *   IDLE_KILL_CEILING_MS and raised to at least the suspect threshold.
+ */
+export function resolveIdleKillAfterMs(
+  configuredKillMs: number | undefined,
+  suspectAfterMs: number,
+): number | undefined {
+  if (configuredKillMs === undefined) return undefined;
+  return Math.max(suspectAfterMs, Math.min(configuredKillMs, IDLE_KILL_CEILING_MS));
+}
+
+/**
  * Absolute ceiling on the graded grace, independent of `idle_timeout_seconds`.
  *
  * Two things break if the kill point drifts past the 60-min subprocess runaway
@@ -188,11 +240,20 @@ const IDLE_KILL_CEILING_MS = 15 * 60 * 1000;
  * the global default — a bot already running `idle_timeout_seconds: 600` would
  * otherwise be told "默认 180", which is both wrong for it and useless advice.
  */
-function idleThresholdHint(idleTimeoutMs: number): string {
+function idleThresholdHint(idleTimeoutMs: number, idleKillAfterMs?: number): string {
+  // BL-48 修订: reachable only when an operator opted into `idle_kill_seconds`
+  // (idle-kill is off by default), so the advice is about THAT knob — telling
+  // them to raise `idle_timeout_seconds`, which now only moves the ⏳ notice,
+  // would not stop the interrupt they just hit.
+  const killed =
+    idleKillAfterMs === undefined
+      ? ""
+      : `本 bot 配了 \`idle_kill_seconds\`（生效 ${Math.round(idleKillAfterMs / 1000)} 秒，` +
+        `上限 ${Math.round(IDLE_KILL_CEILING_MS / 60_000)} 分钟）。`;
   return (
-    `若这类任务本来就要长时间静默思考，可在 bot 配置里调大 \`idle_timeout_seconds\`` +
-    `（当前 ${Math.round(idleTimeoutMs / 1000)} 秒，判死为其 ${IDLE_SUSPECT_TO_KILL_MULTIPLIER} 倍、` +
-    `最多 ${Math.round(IDLE_KILL_CEILING_MS / 60_000)} 分钟）。`
+    `${killed}若这类任务本来就要长时间静默思考，调大或直接删掉 \`idle_kill_seconds\`` +
+    `（删掉 = 不再自动中断，只在卡片上提示等待；当前提示阈值 ` +
+    `${Math.round(idleTimeoutMs / 1000)} 秒 = \`idle_timeout_seconds\`）。`
   );
 }
 
@@ -923,11 +984,21 @@ export interface BridgeHandlerDeps {
    */
   responseSurfaceTimeoutMs?: number;
   /**
-   * PRB-9 (§12): idle-stuck threshold in ms. A CardKit turn is interrupted only
-   * after this long with NO runner activity (a real hang), never for total
-   * duration. @default 3 * 60 * 1000 (3 min), overridable per bot.
+   * PRB-9 (§12) idle threshold in ms — now the **suspect** mark, not a death
+   * sentence: past this much silence the card says the turn has gone quiet and
+   * the turn keeps running. @default 3 * 60 * 1000 (3 min), overridable per bot
+   * via `idle_timeout_seconds`.
    */
   responseSurfaceIdleTimeoutMs?: number;
+  /**
+   * BL-48 修订: opt-in automatic interrupt, in ms of continuous silence. Unset →
+   * **no idle-kill at all** (see IDLE_KILL_DEFAULT_ENABLED for the full
+   * rationale); the turn ends via the runner, the user's ⏹ / `/stop`, or the
+   * 60-min runaway guard. Set it for unattended fleets where nobody is watching
+   * the bubble. Clamped to IDLE_KILL_CEILING_MS and to at least the suspect
+   * threshold. Wired from bot yaml `idle_kill_seconds`.
+   */
+  responseSurfaceIdleKillMs?: number;
   /**
    * Max ms the COT bubble create may precede the answer card (timeline
    * ordering). Past this, the card is sent and the bubble handle is adopted in
@@ -1558,6 +1629,12 @@ export class BridgeHandler {
     // without this a slow create + a trivial (fast) turn would leave the bubble
     // orphaned (created + RUN_STARTED, but nobody ever completes it).
     let bubbleCreate: Promise<CotProgressHandle> | undefined;
+    /**
+     * BL-48: set to the worktree path once cot.json has been written (both adopt
+     * paths share the guard). Also carries the path out to handleOne's outer
+     * finally, which is a wider scope than worktreePath's own declaration.
+     */
+    let cotFileAt: string | undefined;
     let cotTurnOutcome: "done" | "error" = "done";
     const settle = (ok: boolean): void => {
       if (settled) return;
@@ -2092,6 +2169,27 @@ export class BridgeHandler {
             originMessageId,
           },
         });
+        // BL-48: persist the bubble's ref so a crash before finalize can't
+        // leave it spinning `Working` forever (see cotFile.ts). Runs on BOTH
+        // adopt paths below, once, and never affects the turn on failure.
+        const persistBubbleRef = async (handle: CotProgressHandle): Promise<void> => {
+          const ref = handle.bubbleRef;
+          if (!ref || cotFileAt) return;
+          cotFileAt = worktreePath;
+          try {
+            await writeCotFile(worktreePath, {
+              cotId: ref.cotId,
+              messageId: ref.messageId,
+              botId: this.deps.botConfig?.id ?? "",
+              chatId: parsed.chatId,
+              threadId,
+              createdAt: new Date().toISOString(),
+            });
+          } catch (err) {
+            console.warn("[larkway] cot.json write failed (bubble reconcile degraded):", err);
+          }
+        };
+
         const raced = await Promise.race([
           bubbleCreate.then((handle) => ({ ready: true as const, handle })),
           new Promise<{ ready: false }>((resolve) => {
@@ -2104,11 +2202,13 @@ export class BridgeHandler {
         ]);
         if (raced.ready) {
           cotPublisher = raced.handle;
+          void persistBubbleRef(raced.handle);
         } else {
           // Slow create — proceed now; adopt the handle in the background once
           // it resolves (never throws; the finally guarantees it's finalized).
           void bubbleCreate.then((handle) => {
             cotPublisher = handle;
+            void persistBubbleRef(handle);
           });
         }
       };
@@ -3011,6 +3111,12 @@ export class BridgeHandler {
         // so the card states a measured number rather than the threshold.
         let idleSuspected = false;
         let idleKilledAfterMs = 0;
+        /**
+         * Resolved opt-in kill budget for this turn (undefined = never, the
+         * default). Turn-scoped, not watchdog-block-scoped, because the
+         * interrupt cards quote it back to the operator.
+         */
+        let idleKillAfterMs: number | undefined;
         // BL-42: set by the /stop kill hook (registered below) — a
         // user-initiated stop, finalized as neutral 已停止 (not failure red),
         // never counted into the BL-38 consecutive-idle-kill breaker.
@@ -3035,9 +3141,14 @@ export class BridgeHandler {
           // consecutive-idle-kill session reset (it only counts confirmed
           // idle-kills). An operator raising idle_timeout_seconds must not
           // disable either by accident.
-          const idleKillAfterMs = Math.max(
+          //
+          // BL-48 修订: this is now opt-in. `undefined` = never kill on idle
+          // (the default — see IDLE_KILL_DEFAULT_ENABLED). An operator who sets
+          // `idle_kill_seconds` gets exactly that budget, still clamped by the
+          // ceiling and never below the suspect threshold.
+          idleKillAfterMs = resolveIdleKillAfterMs(
+            this.deps.responseSurfaceIdleKillMs,
             idleTimeoutMs,
-            Math.min(idleTimeoutMs * IDLE_SUSPECT_TO_KILL_MULTIPLIER, IDLE_KILL_CEILING_MS),
           );
           idleWatchdog = setInterval(() => {
             if (toolsInFlight > 0) return; // real tool call pending — exempt from idle judgment
@@ -3051,8 +3162,11 @@ export class BridgeHandler {
               idleSuspected = true;
               console.warn(
                 `[larkway] turn silent for ${Math.round(silentMs / 1000)}s ` +
-                  `(idle threshold ${Math.round(idleTimeoutMs / 1000)}s) — suspect, not killing yet; ` +
-                  `will interrupt at ${Math.round(idleKillAfterMs / 1000)}s of continuous silence` +
+                  `(idle threshold ${Math.round(idleTimeoutMs / 1000)}s) — suspect, not dead; ` +
+                  (idleKillAfterMs === undefined
+                    ? `no idle-kill configured, the turn keeps running ` +
+                      `(ends on the runner, the user's ⏹ / /stop, or the runaway guard)`
+                    : `will interrupt at ${Math.round(idleKillAfterMs / 1000)}s of continuous silence`) +
                   (this.deps.botConfig?.id ? ` [bot ${this.deps.botConfig.id}]` : ""),
               );
               try {
@@ -3064,8 +3178,8 @@ export class BridgeHandler {
               // already past the grace (host sleep, a blocked event loop) must
               // kill now rather than burn another full cadence in suspect.
             }
-            // Stage 2: still nothing after the full grace — treat as hung.
-            if (silentMs >= idleKillAfterMs) {
+            // Stage 2: only when an operator opted into an automatic cut.
+            if (idleKillAfterMs !== undefined && silentMs >= idleKillAfterMs) {
               interruptedByIdle = true;
               idleKilledAfterMs = silentMs;
               if (idleWatchdog) clearInterval(idleWatchdog);
@@ -3789,7 +3903,7 @@ export class BridgeHandler {
               // card means several turns in a row were judged stuck, which is
               // itself evidence the threshold may be too tight for this bot.
               ? `⚠️ 本轮被中断（连续 ${formatSilence(idleKilledAfterMs)}没有任何输出，判定卡死）。连续多次卡死，已重置本话题上下文 —— 下次 @ 我将全新开始，请把需求重新说一遍。\n` +
-                idleThresholdHint(idleTimeoutMs)
+                idleThresholdHint(idleTimeoutMs, idleKillAfterMs)
               : cardKitTimeoutFailure
                 // PRB-9/§12.2: idle-stuck → unified explicit-failure sink, never a
                 // passive wait. 批A does NOT auto-replay it — the owner retries
@@ -3799,7 +3913,7 @@ export class BridgeHandler {
                 // legitimately slow turn, and names the knob that fixes the
                 // latter without asking us.
                 ? `⚠️ 本轮被中断（连续 ${formatSilence(idleKilledAfterMs)}没有任何输出，判定卡死），未完成。请重试。\n` +
-                  idleThresholdHint(idleTimeoutMs)
+                  idleThresholdHint(idleTimeoutMs, idleKillAfterMs)
                 : reportedState?.last_message ??
                   (fallbackAnswer ? fallbackAnswer : noOutputFallback);
 
@@ -4386,7 +4500,17 @@ export class BridgeHandler {
       // adopted) handle no-ops via its closed guard; a late one gets completed
       // when it resolves. Never throws.
       if (bubbleCreate) {
-        void bubbleCreate.then((handle) => handle.finalize(cotTurnOutcome).catch(() => {}));
+        void bubbleCreate.then((handle) =>
+          handle
+            .finalize(cotTurnOutcome)
+            .catch(() => {})
+            // BL-48: the bubble is completed (or unreachable) — drop cot.json so
+            // boot reconcile doesn't re-complete a finished bubble. Deleted after
+            // finalize, never before: a crash in between must leave the file so
+            // the sweep can still reach the bubble.
+            .then(() => (cotFileAt ? deleteCotFile(cotFileAt) : undefined))
+            .catch(() => {}),
+        );
       }
       // BL-42: drop this turn's /stop kill hook on every exit path (no-op if
       // the happy path already deleted it).

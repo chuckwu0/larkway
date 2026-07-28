@@ -16,8 +16,10 @@ import { join } from "node:path";
 import {
   selectOrphanCards,
   reconcileOrphanedCards,
+  shouldReconcileCotBubble,
   type OrphanCandidate,
 } from "./reconcile.js";
+import { writeCotFile, readCotFile, type CotFile } from "./cotFile.js";
 import type { CardFile } from "./cardFile.js";
 import { writeCardFile, readCardFile } from "./cardFile.js";
 import { writeCardKitFile, readCardKitFile, type CardKitFile } from "./cardkitFile.js";
@@ -901,5 +903,173 @@ describe("reconcileOrphanedCards — integration", () => {
         log: () => {},
       }),
     ).resolves.toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// BL-48 — orphaned COT bubble sweep
+//
+// A bubble is "in progress" purely because nobody called complete on it. Live
+// API probe (2026-07-28): an un-completed bubble still rendered `Working` after
+// 30+ minutes — the platform applies no timeout of its own — and Feishu draws
+// its ⏹ stop button on that bubble, so an orphan is also a control that lies.
+// ---------------------------------------------------------------------------
+
+describe("shouldReconcileCotBubble — pure gate", () => {
+  const cot = (over: Partial<CotFile> = {}): CotFile => ({
+    cotId: "7667460769511984313",
+    messageId: "om_bubble",
+    botId: "gitlab",
+    retryCount: 0,
+    createdAt: new Date().toISOString(),
+    ...over,
+  });
+
+  it("selects a dead, old, own-bot bubble", () => {
+    expect(
+      shouldReconcileCotBubble({
+        cot: cot(),
+        botId: "gitlab",
+        pidAlive: false,
+        ageMs: 120_000,
+        minAgeMs: 60_000,
+      }),
+    ).toBe(true);
+  });
+
+  it("skips when there is no ledger", () => {
+    expect(
+      shouldReconcileCotBubble({
+        cot: null,
+        botId: "gitlab",
+        pidAlive: false,
+        ageMs: 120_000,
+        minAgeMs: 60_000,
+      }),
+    ).toBe(false);
+  });
+
+  it("skips another bot's bubble (per-bot scope)", () => {
+    expect(
+      shouldReconcileCotBubble({
+        cot: cot({ botId: "frontend" }),
+        botId: "gitlab",
+        pidAlive: false,
+        ageMs: 120_000,
+        minAgeMs: 60_000,
+      }),
+    ).toBe(false);
+  });
+
+  // The invariant that matters most now that a silent turn is never killed: a
+  // legitimately quiet turn can hold a live bubble for the better part of an
+  // hour, and reaping it would complete the bubble UNDER a running turn.
+  it("skips a live pid (turn still in flight)", () => {
+    expect(
+      shouldReconcileCotBubble({
+        cot: cot(),
+        botId: "gitlab",
+        pidAlive: true,
+        ageMs: 3_600_000,
+        minAgeMs: 60_000,
+      }),
+    ).toBe(false);
+  });
+
+  it("skips a too-young worktree", () => {
+    expect(
+      shouldReconcileCotBubble({
+        cot: cot(),
+        botId: "gitlab",
+        pidAlive: false,
+        ageMs: 5_000,
+        minAgeMs: 60_000,
+      }),
+    ).toBe(false);
+  });
+});
+
+describe("reconcileOrphanedCards — COT bubble integration", () => {
+  async function seedBubble(name: string, c: CotFile, ageMs = 120_000): Promise<string> {
+    const wt = join(root, name);
+    await mkdir(join(wt, ".larkway"), { recursive: true });
+    await writeCotFile(wt, c);
+    const past = new Date(Date.now() - ageMs);
+    await utimes(wt, past, past);
+    return wt;
+  }
+
+  const bubble = (over: Partial<CotFile> = {}): CotFile => ({
+    cotId: "cot_1",
+    messageId: "om_bubble_1",
+    botId: "gitlab",
+    retryCount: 0,
+    createdAt: new Date(Date.now() - 120_000).toISOString(),
+    ...over,
+  });
+
+  it("completes an orphaned bubble as error and drops cot.json", async () => {
+    const wt = await seedBubble("om_b1", bubble());
+    const completes: Array<{ cotId: string; messageId: string; reason: string }> = [];
+
+    await reconcileOrphanedCards({
+      botId: "gitlab",
+      worktreesDir: root,
+      cardRenderer: makeFakeRenderer().renderer,
+      cotClient: {
+        complete: async (ref, reason) => {
+          completes.push({ cotId: ref.cotId, messageId: ref.messageId, reason });
+        },
+      },
+      log: () => {},
+    });
+
+    expect(completes).toEqual([
+      { cotId: "cot_1", messageId: "om_bubble_1", reason: "error" },
+    ]);
+    expect(await readCotFile(wt)).toBeNull();
+  });
+
+  it("keeps cot.json for the next boot when no COT client is wired", async () => {
+    const wt = await seedBubble("om_b2", bubble({ cotId: "cot_2" }));
+
+    await reconcileOrphanedCards({
+      botId: "gitlab",
+      worktreesDir: root,
+      cardRenderer: makeFakeRenderer().renderer,
+      log: () => {},
+    });
+
+    expect((await readCotFile(wt))?.cotId).toBe("cot_2");
+  });
+
+  it("bumps retryCount on a complete failure, and drops the ledger past the cap", async () => {
+    const wt = await seedBubble("om_b3", bubble({ cotId: "cot_3", retryCount: 0 }));
+    const failing = {
+      complete: async (): Promise<void> => {
+        throw new Error("message_cot complete 500");
+      },
+    };
+
+    await reconcileOrphanedCards({
+      botId: "gitlab",
+      worktreesDir: root,
+      cardRenderer: makeFakeRenderer().renderer,
+      cotClient: failing,
+      log: () => {},
+    });
+    expect((await readCotFile(wt))?.retryCount).toBe(1);
+
+    // Past the cap the ledger is dropped rather than retried forever (e.g. the
+    // bubble message was deleted in Feishu, so complete can never succeed).
+    await writeCotFile(wt, bubble({ cotId: "cot_3", retryCount: 3 }));
+    await reconcileOrphanedCards({
+      botId: "gitlab",
+      worktreesDir: root,
+      cardRenderer: makeFakeRenderer().renderer,
+      cotClient: failing,
+      log: () => {},
+    });
+    expect(await readCotFile(wt)).toBeNull();
   });
 });

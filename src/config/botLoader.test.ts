@@ -781,6 +781,41 @@ idle_timeout_seconds: 5
     expect(skipped).toHaveLength(1);
     expect(skipped[0]?.reason).toContain("idle_timeout_seconds");
   });
+  it("idle_kill_seconds 可解析(opt-in 自动中断),低于 30s 下限被拒", async () => {
+    await createBotsDir();
+    await writeYaml(
+      "kill-ok.yaml",
+      `
+id: kill-ok
+name: Unattended
+description: opted into automatic interrupt
+app_id: cli_kill_ok
+app_secret_env: KILL_OK_SECRET
+bot_open_id: ou_kill_ok
+idle_kill_seconds: 600
+`,
+    );
+    await writeYaml(
+      "kill-too-low.yaml",
+      `
+id: kill-too-low
+name: Kill Too Low
+description: below floor
+app_id: cli_kill_low
+app_secret_env: KILL_LOW_SECRET
+bot_open_id: ou_kill_low
+idle_kill_seconds: 5
+`,
+    );
+
+    const { bots, skipped } = await loadBotsDetailed(botsDir());
+    expect(bots.find((b) => b.id === "kill-ok")?.idle_kill_seconds).toBe(600);
+    // Unset stays unset on every other bot — that IS the "never auto-interrupt"
+    // default the handler reads (BL-48 修订).
+    expect(bots.find((b) => b.id === "kill-ok")?.idle_timeout_seconds).toBeUndefined();
+    expect(skipped[0]?.reason).toContain("idle_kill_seconds");
+  });
+
 
   it("cot defaults to brief and cotSurface defaults to bubble (real-machine reversal 2026-07-05)", async () => {
     await createBotsDir();

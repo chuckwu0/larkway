@@ -56,9 +56,16 @@ import {
   type PostLedgerEntry,
 } from "./postFile.js";
 import { readStateFile, stateFilePathOf, type StateFile } from "./stateFile.js";
+import {
+  deleteCotFile,
+  readCotFile,
+  writeCotFile,
+  type CotFile,
+} from "./cotFile.js";
 import type { CardHandle, CardRenderer } from "../lark/card.js";
 import type { OutboundCardKitClient } from "../lark/channelCardKitClient.js";
 import type { OutboundPostClient } from "../lark/outboundPostClient.js";
+import type { OutboundCotClient } from "../lark/channelCotClient.js";
 import { buildPostContent } from "../lark/postContent.js";
 import { derivePostIdempotencyKey, digestPostContent } from "../lark/idempotency.js";
 
@@ -97,6 +104,31 @@ export interface SelectOrphanOpts {
   botId: string;
   /** Minimum state.json age before a card is eligible. */
   minAgeMs: number;
+}
+
+/**
+ * PURE gate for an orphaned COT bubble (BL-48). Same three invariants the card
+ * sweep uses — per-bot scope, dead pid, old enough — and nothing else: a bubble
+ * carries no status of its own, so "nobody completed it and the process that
+ * would have is gone" IS the whole judgment.
+ *
+ * Deliberately does NOT consult state.json. A bubble left `Working` is wrong
+ * regardless of how the turn ended (ready / failed / never wrote state), and
+ * completing it as `error` is honest in every one of those cases: the turn did
+ * not end normally through the surface that owns the bubble.
+ */
+export function shouldReconcileCotBubble(input: {
+  cot: CotFile | null;
+  botId: string;
+  pidAlive: boolean;
+  ageMs: number;
+  minAgeMs: number;
+}): boolean {
+  if (!input.cot) return false;
+  if (input.cot.botId !== input.botId) return false; // per-bot scope
+  if (input.pidAlive) return false; // turn still in flight
+  if (input.ageMs < input.minAgeMs) return false; // too young to judge
+  return true;
 }
 
 export interface SelectedOrphan {
@@ -316,6 +348,48 @@ function shouldReconcileCardKit(input: {
     };
   }
   return null;
+}
+
+/**
+ * Complete one orphaned COT bubble as `error` and drop its ledger.
+ *
+ * `error` (not `done`) is the honest terminal: the turn that owned this bubble
+ * died without finalizing it, so whatever it was doing did not complete.
+ * Failures keep the file for the next boot, bumping retryCount to the same cap
+ * the card sweep uses so an uncompletable bubble can't loop forever.
+ */
+async function reconcileCotBubble(input: {
+  deps: ReconcileDeps;
+  worktreePath: string;
+  name: string;
+  cot: CotFile;
+  log: (msg: string) => void;
+}): Promise<void> {
+  const { deps, worktreePath, name, cot, log } = input;
+  if (!deps.cotClient) {
+    log(`[reconcile] cot ${name}: no COT client; keeping cot.json for next boot`);
+    return;
+  }
+  try {
+    await deps.cotClient.complete({ cotId: cot.cotId, messageId: cot.messageId }, "error");
+    await deleteCotFile(worktreePath);
+    log(`[reconcile] cot ${name}: orphaned bubble completed as error (cotId=${cot.cotId})`);
+  } catch (err) {
+    const nextRetry = cot.retryCount + 1;
+    log(
+      `[reconcile] cot ${name}: complete FAILED (retry ${nextRetry}/${RETRY_CAP}): ${String(err)}`,
+    );
+    if (nextRetry > RETRY_CAP) {
+      await deleteCotFile(worktreePath);
+      log(`[reconcile] cot ${name}: retry cap reached, dropping cot.json`);
+      return;
+    }
+    try {
+      await writeCotFile(worktreePath, { ...cot, retryCount: nextRetry });
+    } catch (writeErr) {
+      log(`[reconcile] cot ${name}: retry bump write failed (ignoring): ${String(writeErr)}`);
+    }
+  }
 }
 
 async function reconcileCardKitRecord(input: {
@@ -620,6 +694,14 @@ export interface ReconcileDeps {
    * fallback when CardKit and the legacy interactive card fallback both fail.
    */
   postClient?: OutboundPostClient;
+  /**
+   * Optional COT transport (BL-48). When present, reconcile also completes
+   * bubbles left spinning `Working` by a crash between bubble create and
+   * finalize — the platform never times them out on its own (probe 2026-07-28:
+   * still `Working` after 15+ min), and the ⏹ button it renders on them would
+   * otherwise be a control that does nothing.
+   */
+  cotClient?: Pick<OutboundCotClient, "complete">;
   /** Minimum state.json age before a card is eligible. @default 60000 */
   minAgeMs?: number;
   /** Logger. @default console.log */
@@ -657,6 +739,7 @@ export async function reconcileOrphanedCards(deps: ReconcileDeps): Promise<void>
     try {
       const card = await readCardFile(wtPath);
       const cardKit = await readCardKitFile(wtPath);
+      const cot = await readCotFile(wtPath);
       const state = await readStateFile(wtPath);
 
       // Liveness: any pid associated with the worktree still alive?
@@ -718,6 +801,17 @@ export async function reconcileOrphanedCards(deps: ReconcileDeps): Promise<void>
           }
         } catch (err) {
           log(`[reconcile] post ledger failed for ${name} (skipping): ${String(err)}`);
+        }
+      }
+
+      // BL-48: COT bubble sweep. Independent of the card surfaces — a turn can
+      // crash with a live bubble and no card at all — so it runs on its own
+      // gate rather than inside any card branch.
+      if (cot) {
+        if (
+          shouldReconcileCotBubble({ cot, botId: deps.botId, pidAlive, ageMs, minAgeMs })
+        ) {
+          await reconcileCotBubble({ deps, worktreePath: wtPath, name, cot, log });
         }
       }
 
