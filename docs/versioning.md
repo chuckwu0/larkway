@@ -74,7 +74,8 @@
 | v0.3.67 | v0.3.67 | patch / 已发布 | BYO workspace override (bot yaml workspace:) with resume gate; cross-backend skills scaffold (.agents/skills + .claude/skills symlink); startup backend readiness probes + supervisor PATH fix; per-repo --add-dir for repo-shipped skills |
 | v0.3.68 | v0.3.68 | patch / 已发布 | expose idle watchdog as bot yaml idle_timeout_seconds (long-prefill turns were misread as hangs and interrupted) |
 | v0.3.69 | v0.3.69 | patch / 已发布 | fix: tasklist self-join hit the wrong endpoint (/members -> /add_members), a live 404 on every bridge startup |
-| v0.3.70 | v0.3.70 | 当前 patch / 已发布 | codex idle watchdog 不再把正常工作判为卡死(MCP/工具 item 生命周期映射 + turn/start reasoning 流式) + BL-49 任务卡片七条修复 |
+| v0.3.70 | v0.3.70 | patch / 已发布 | codex idle watchdog 不再把正常工作判为卡死(MCP/工具 item 生命周期映射 + turn/start reasoning 流式) + BL-49 任务卡片七条修复 |
+| v0.3.71 | v0.3.71 | 当前 patch / 已发布 | idle 看门狗改分级处置(撞阈值只标记 suspect + 卡片可见等待,3 倍且封顶 15min 才中断;中断卡片给出实测静默时长与 idle_timeout_seconds 提示) |
 
 ## 使用原则
 
@@ -156,4 +157,5 @@ v0.3.67       = BYO workspace override (bot yaml workspace:) with resume gate; c
 v0.3.68       = expose idle watchdog as bot yaml idle_timeout_seconds (long-prefill turns were misread as hangs and interrupted)
 v0.3.69       = fix: tasklist self-join hit the wrong endpoint (/members -> /add_members), a live 404 on every bridge startup
 v0.3.70       = codex idle watchdog 不再把正常工作判为卡死(MCP/工具 item 生命周期映射 + turn/start reasoning 流式) + BL-49 任务卡片七条修复
+v0.3.71       = idle 看门狗改分级处置(撞阈值只标记 suspect + 卡片可见等待,3 倍且封顶 15min 才中断;中断卡片给出实测静默时长与 idle_timeout_seconds 提示)
 ```
