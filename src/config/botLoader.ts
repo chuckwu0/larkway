@@ -405,8 +405,16 @@ export const BotConfigSchema = z.object({
    *
    * Raise it for bots whose turns legitimately go quiet for minutes (a huge tool
    * result puts the model into a long prefill during which the CLI emits
-   * nothing); lower it to be told sooner. Either way nothing is killed, so the
-   * value is a UX choice, not a safety one. Floor 30 s.
+   * nothing); lower it to be told sooner. Floor 30 s.
+   *
+   * ⚠️ Only a UX choice while `idle_kill_seconds` is UNSET. If that knob IS set,
+   * the effective interrupt point is `min(max(this, idle_kill_seconds), 15min)`,
+   * so raising this ALSO delays the interrupt — do not treat it as "just tell me
+   * later" on an opted-in bot (independent review, round 3).
+   *
+   * ⚠️ The ⏳ line can only be rendered on the CardKit status line. A bot degraded
+   * to the legacy card / post fallback gets no visible stall notice at all — see
+   * handler.ts's KNOWN GAP note next to the watchdog.
    */
   idle_timeout_seconds: z.number().int().min(30).optional(),
 
@@ -424,8 +432,12 @@ export const BotConfigSchema = z.object({
    *
    * Set this only where nobody is watching the card — cron / batch dispatch /
    * unattended fleets — and a wedged turn would otherwise sit for the full hour.
-   * Clamped to 15 min (handler.ts IDLE_KILL_CEILING_MS) and never lower than
-   * `idle_timeout_seconds`.
+   * Effective value = `min(max(idle_timeout_seconds, this), 15min)`
+   * (handler.ts IDLE_KILL_CEILING_MS). The 15-min clamp is absolute, so on a bot
+   * with a very large `idle_timeout_seconds` the interrupt CAN land before the ⏳
+   * notice is due — the clamp wins, because letting the interrupt drift past the
+   * 60-min subprocess runaway guard costs both the 已中断 card and BL-38's
+   * self-heal counting.
    */
   idle_kill_seconds: z.number().int().min(30).optional(),
 
