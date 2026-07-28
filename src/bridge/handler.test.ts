@@ -3599,6 +3599,95 @@ describe("handleOne — COT bubble ordering (before the card)", () => {
   // platform never times one out (still `Working` after 58 min), so a bridge that
   // dies with the ref only in memory leaves it spinning forever. Boot reconcile
   // can only fix that if the ledger exists.
+  // S3 (second review round): the bubble's terminal must mirror the answer card's
+  // verdict. The documented success case is `state.json status=ready` + a non-zero
+  // exit (the runner's grace timer SIGTERMs claude when a non-detached grandchild
+  // blocks exit — an OS quirk, not a failure). Deriving the bubble outcome from
+  // the exit code alone completed THAT as `error`, i.e. a green success card next
+  // to a bubble reporting a failed run.
+  it("BL-48: a status=ready turn killed by the grandchild grace still completes the bubble as done", async () => {
+    const wt = join(root, "om_msg");
+    const completions: string[] = [];
+    const cotClient: OutboundCotClient = {
+      async create() {
+        return { cotId: "cot_ready", messageId: "om_cot_ready" };
+      },
+      async resolveThreadId() {
+        return undefined;
+      },
+      async update() {},
+      async complete(_ref, reason) {
+        completions.push(reason);
+      },
+    };
+
+    await seedWorktree("om_msg");
+    await seedRepoCachePath();
+    const { client: cardKitClient } = makeCardKitClient();
+    runClaudeImpl = () => ({
+      events: (async function* () {
+        yield { type: "system_init", sessionId: "sess_ready", raw: {} };
+        yield {
+          type: "answer_snapshot",
+          text: "LARKWAY_ANSWER_BEGIN\n干完了\nLARKWAY_ANSWER_END",
+          raw: {},
+        };
+        await writeFile(
+          stateFileMod.stateFilePathOf(wt),
+          JSON.stringify({ status: "ready", updated_at: new Date().toISOString() }, null, 2),
+          "utf8",
+        );
+      })(),
+      // SIGTERM'd grandchild: non-zero exit on a turn the agent itself reported ready.
+      done: Promise.resolve({ exitCode: 143, sessionId: "sess_ready" }),
+      kill: () => {},
+    });
+
+    const { renderer } = makeCardRenderer();
+    const { store } = makeSessionStore();
+    store.get = (() =>
+      ({ threadId: "om_msg", sessionId: "prev", lastActiveTs: 0 })) as unknown as typeof store.get;
+    const { client, acked } = makeClient(makeEvent());
+    const handler = new BridgeHandler({
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      client: client as any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      cardRenderer: renderer as any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      sessionStore: store as any,
+      conventions: makeConventions(),
+      botConfig: {
+        id: "frontend",
+        name: "Frontend",
+        turn_taking_limit: 10,
+        backend: "claude",
+        cot: "brief",
+        cotSurface: "bubble",
+        response_surface_prototype: {
+          enabled: true,
+          allowed_chats: [],
+          allowed_threads: ["om_msg"],
+          kill_switch: false,
+          post_outbound_enabled: false,
+          cardkit_streaming_enabled: true,
+          allow_agent_mentions: true,
+          denied_mention_open_ids: [],
+          allowed_mention_open_ids: [],
+        },
+      },
+      cardKitClient,
+      cotClient,
+    });
+    await handler.run();
+    for (let i = 0; i < 300 && acked.length === 0; i++) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    for (let i = 0; i < 200 && completions.length === 0; i++) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    expect(completions).toEqual(["done"]);
+  });
+
   it("BL-48: persists the bubble ref to cot.json, and removes it after a normal finish", async () => {
     const cotFileMod = await import("./cotFile.js");
     const ledgerSamples: Array<import("./cotFile.js").CotFile | null> = [];
@@ -5097,6 +5186,52 @@ describe("BL-38: poison-session self-heal", () => {
     expect(stuckCountOf(records)).toBe(1);
     const text = finalCardText(cardKitCalls);
     expect(text).toContain("请重试");
+    expect(text).not.toContain("已重置本话题上下文");
+  });
+
+  // The mirror-image regression, caught by the SECOND review round: keying the
+  // counter off the suspect mark alone counted SUCCESSFUL turns as hangs, because
+  // `idleSuspected` is only cleared by the next stream event — the gap between a
+  // turn's last event and the process exiting routinely exceeds the threshold on
+  // its own. Three good turns then poison-reset a healthy session: sessionId
+  // dropped, and the real answer replaced by a 已重置 card.
+  it("(a3) a SUCCESSFUL turn that went quiet before exiting resets the counter instead of counting as a hang", async () => {
+    const { store, records } = seedStore(2); // one more "hang" would reset
+    const wt = await seedWorktree(threadId);
+    await seedRepoCachePath();
+
+    runClaudeImpl = () => ({
+      events: (async function* () {
+        yield { type: "system_init", sessionId: "sess_ok", raw: {} };
+        yield {
+          type: "answer_snapshot",
+          text: "LARKWAY_ANSWER_BEGIN\n真的答案\nLARKWAY_ANSWER_END",
+          raw: {},
+        };
+        await writeFile(
+          stateFileMod.stateFilePathOf(wt),
+          JSON.stringify({ status: "ready", updated_at: new Date().toISOString() }, null, 2),
+          "utf8",
+        );
+        // Quiet well past the 30ms threshold before the process "exits" — the
+        // shape every normal turn has (the claude runner alone allows a 30s
+        // grandchild grace).
+        await new Promise((r) => setTimeout(r, 150));
+      })(),
+      done: Promise.resolve({ exitCode: 0, sessionId: "sess_ok" }),
+      kill: () => {},
+    });
+
+    const { cardKitCalls, acked } = await runTurn(store, { noIdleKill: true });
+
+    expect(acked).toEqual([threadId]);
+    // A clean success ALWAYS resets — BL-38's own contract.
+    expect(stuckCountOf(records)).toBe(0);
+    // The session survives, and the user gets the real answer, not a 已重置 card.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    expect((records.get(key) as any)?.needsFreshStart).toBeUndefined();
+    const text = finalCardText(cardKitCalls);
+    expect(text).toContain("真的答案");
     expect(text).not.toContain("已重置本话题上下文");
   });
 
