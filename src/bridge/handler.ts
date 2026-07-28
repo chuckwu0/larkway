@@ -3192,6 +3192,22 @@ export class BridgeHandler {
         /** Silence (ms) at the last ⏳ notice patch — drives the refresh cadence. */
         let idleNoticeAtMs = 0;
         /**
+         * Peak silence the watchdog ever observed this turn, NEVER reset.
+         *
+         * The BL-38 evidence needs a signal no stream event can erase, and every
+         * previous attempt failed on exactly that: `idleSuspected` (rounds 3-4) and
+         * `Date.now() - lastActivityAt` (round 5) are both cleared by the `result`
+         * line the pooled claude path pushes onto the queue immediately before
+         * settling — and pooling is ON by default, so the predicate was dead on the
+         * DEFAULT backend both times (independent review, rounds 5 and 6).
+         *
+         * Kept separate from `idleObservedSilenceMs` on purpose: that one is reset on
+         * recovery because the CARD quotes it as "how long it has been quiet", and a
+         * card must describe the current stall. Two consumers, two fields — trying to
+         * serve both with one field is what produced four rounds of defects.
+         */
+        let idlePeakSilenceMs = 0;
+        /**
          * Longest silence the current stall was observed in, whether or not anything
          * interrupted it. The BL-38 reset card reports it: with idle-kill off,
          * `idleKilledAfterMs` stays 0 and the card would claim「连续 0 秒」.
@@ -3258,12 +3274,14 @@ export class BridgeHandler {
             // below must stay reachable even when the ceiling clamped the kill
             // budget below this threshold.
             if (silentMs >= idleTimeoutMs) {
-              // Longest silence of the CURRENT stall — the cards quote it. A tool
-              // call's silence is expected and must not become wedge evidence
-              // (three 20-minute builds would otherwise poison-reset the session —
-              // independent review, round 5), but it is still worth SHOWING.
+              // A tool call's silence is expected, so it neither advances the figure
+              // the card quotes nor the BL-38 peak. (The protection that actually
+              // stops a slow build from being counted is `endedMidTool` at finalize —
+              // an earlier comment credited this guard with that job, which was
+              // wrong: by the time a build finishes, `toolsInFlight` is back to 0.)
               if (!toolExemptsKill) {
                 idleObservedSilenceMs = Math.max(idleObservedSilenceMs, silentMs);
+                idlePeakSilenceMs = Math.max(idlePeakSilenceMs, silentMs);
               }
               // BL-48 分级处置 stage 1: threshold crossed → suspect, NOT dead. The
               // turn keeps running; the card says so (markIdleWaiting), and the
@@ -3336,8 +3354,14 @@ export class BridgeHandler {
               // Record the hang on the SAME two fields the no-kill path uses so
               // everything downstream (BL-38's evidence, the reset card's silence
               // figure) has one notion of "this turn hung", whoever ended it.
-              idleSuspected = true;
-              idleObservedSilenceMs = Math.max(idleObservedSilenceMs, silentMs);
+              // Only the peak matters here: it is the BL-38 evidence, and the kill
+              // path is the one case where the watchdog may fire before any notice
+              // tick recorded it. `idleSuspected` / `idleObservedSilenceMs` used to
+              // be written too, with a comment claiming downstream consumers needed
+              // them — nothing reads either on this path (the reset card branches on
+              // `interruptedByIdle` and quotes `idleKilledAfterMs`), so the writes
+              // were dead and the rationale invented (independent review, round 6).
+              idlePeakSilenceMs = Math.max(idlePeakSilenceMs, silentMs);
               if (idleWatchdog) clearInterval(idleWatchdog);
               idleWatchdog = undefined;
               try {
@@ -3821,7 +3845,10 @@ export class BridgeHandler {
           // before settling, so it is always false at finalize. Terminal silence is
           // sampled here instead — and `interruptedByIdle`, which the watchdog sets
           // and no event clears, covers the opted-in kill on every path.
-          const terminalSilenceMs = Date.now() - lastActivityAt;
+          // NOT `Date.now() - lastActivityAt`: that is reset by every stream event,
+          // including the trailing `result` line on the pooled claude path, which made
+          // this predicate structurally dead on the default backend (round 6).
+          const observedPeakSilenceMs = idlePeakSilenceMs;
           // A turn still inside a tool call is silent for a REASON, and the reason is
           // not a wedge: a 20-minute build emits nothing between tool_use and
           // tool_result. Counting those would let three slow builds poison-reset a
@@ -3835,7 +3862,7 @@ export class BridgeHandler {
           const endedMidTool = toolsInFlight > 0;
           const endedQuiet =
             interruptedByIdle ||
-            (!endedMidTool && idleTimeoutMs > 0 && terminalSilenceMs >= idleTimeoutMs);
+            (!endedMidTool && idleTimeoutMs > 0 && observedPeakSilenceMs >= idleTimeoutMs);
 
           // Everything the user will actually be shown as this turn's body. Read by
           // BOTH the counter and the card: the counter must not punish a turn that
@@ -4240,7 +4267,7 @@ export class BridgeHandler {
                 // latter without asking us.
                 ? `⚠️ 本轮被中断（连续 ${formatSilence(idleKilledAfterMs)}没有任何输出，判定卡死），未完成。请重试。\n` +
                   idleThresholdHint(idleTimeoutMs, idleKillAfterMs)
-                : idleHangObserved && !willShowBodyText
+                : idleHangObserved
                   // BL-48 修订: silent, produced nothing, and NOBODY interrupted it
                   // — the ending this change makes the common one. It used to fall
                   // through to the generic 没有产出正文/可能崩溃 text, i.e. a crash
@@ -4719,7 +4746,22 @@ export class BridgeHandler {
       // cancels the throttle timer.
       cotTurnOutcome = "error";
       if (cotPublisher) {
-        void cotPublisher.finalize("error", { message: String(err) }).catch(() => {
+        const publisher = cotPublisher;
+        const ledgerAt = cotFileAt;
+        void publisher
+          .finalize("error", { message: String(err) })
+          // The ledger delete belongs on THIS chain too. Round 5 moved it onto the
+          // success path's finalize and left the catch without one, so every
+          // rejecting turn — the documented cold-claude contract for a self-initiated
+          // non-zero exit, and the pooled mid-stream-death contract — stranded
+          // cot.json. The finally's backstop cannot cover it: it reads the memo,
+          // which this call has not written yet (independent review, round 6).
+          .then(async (completed) => {
+            if (!completed || !ledgerAt || !publisher.bubbleRef) return;
+            await cotPersistWriteSettled();
+            await deleteCotFileIfMatches(ledgerAt, publisher.bubbleRef.cotId);
+          })
+          .catch(() => {
           /* best-effort COT completion — never affects error teardown */
         });
       }

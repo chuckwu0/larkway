@@ -3772,6 +3772,34 @@ describe("handleOne — COT bubble ordering (before the card)", () => {
     return { acked, unhandled, cardKitCalls };
   }
 
+  // Round-6 finding 2: the ledger delete was added to the success path only, so every
+  // turn whose `done` REJECTS — the documented cold-claude contract for a
+  // self-initiated non-zero exit — stranded cot.json, leaving the boot sweep to
+  // re-complete an already-completed bubble.
+  it("BL-48: a rejecting turn still drops cot.json (the outer-catch path)", async () => {
+    const cotFileMod = await import("./cotFile.js");
+    const wtPath = join(root, "om_msg");
+    const cotClient: OutboundCotClient = {
+      async create() {
+        return { cotId: "cot_reject", messageId: "om_cot_reject" };
+      },
+      async resolveThreadId() {
+        return undefined;
+      },
+      async update() {},
+      async complete() {
+        await new Promise((r) => setTimeout(r, 40)); // model a real round-trip
+      },
+    };
+
+    await runTurn({ cotClient, existingTopic: true, errorTurn: true });
+
+    for (let i = 0; i < 200 && (await cotFileMod.readCotFile(wtPath)) !== null; i++) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    expect(await cotFileMod.readCotFile(wtPath)).toBeNull();
+  });
+
   // BL-48: the bubble's cot_id/message_id must reach disk. A bubble is "in
   // progress" purely because nobody completed it, and a live probe confirms the
   // platform never times one out (still `Working` after 58 min), so a bridge that
@@ -5415,7 +5443,12 @@ describe("BL-38: poison-session self-heal", () => {
         yield { type: "system_init", sessionId: "sess_ready", raw: {} };
         await writeFile(
           stateFileMod.stateFilePathOf(wt),
-          JSON.stringify({ status: "ready", last_message: "干完了", updated_at: new Date().toISOString() }, null, 2),
+          // NO last_message on purpose: with one, `willShowBodyText` already excludes
+          // this turn and the `reportedStatus !== "ready"` clause is never exercised —
+          // the first version of this test passed for that reason while claiming to
+          // guard the clause (independent review, round 6). A ready state with the
+          // answer delivered through the marker channel is the shape that isolates it.
+          JSON.stringify({ status: "ready", updated_at: new Date().toISOString() }, null, 2),
           "utf8",
         );
         await new Promise((r) => setTimeout(r, 120)); // quiet, then the grace kills it
@@ -5430,7 +5463,7 @@ describe("BL-38: poison-session self-heal", () => {
     expect(stuckCountOf(records)).toBe(0); // a success resets, never counts
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     expect((records.get(key) as any)?.needsFreshStart).toBeUndefined();
-    expect(finalCardText(cardKitCalls)).toContain("干完了");
+    void cardKitCalls;
   });
 
   it("(a10) an agent that reports failed is not a wedge, even if it went quiet first", async () => {
@@ -5589,6 +5622,77 @@ describe("BL-38: poison-session self-heal", () => {
     // Quoting the FIRST stall would be a lie about what just happened.
     expect(text).not.toContain("静默 3 秒");
     expect(text).toContain("静默 0 秒");
+  });
+
+  // Covers: an opted-in kill counts. It does NOT guard the `interruptedByIdle ||`
+  // arm of `endedQuiet` — verified by revert: in any configuration a test can build,
+  // the notice tick runs before the kill gate and records a peak, so the peak arm
+  // already covers it. That clause is load-bearing only when the 15-min ceiling
+  // clamps the kill BELOW the notice threshold, i.e. `idle_timeout_seconds > 900`,
+  // which no fast test can reach. Stated rather than claimed (independent review,
+  // round 6, found four fabricated guard claims across earlier rounds).
+  it("(a15) an opted-in kill counts", async () => {
+    const { store, records } = seedStore(1);
+    await seedWorktree(threadId);
+    await seedRepoCachePath();
+    let killed = false;
+    runClaudeImpl = () => {
+      let resolveDone: (r: { exitCode: number; sessionId?: string }) => void = () => {};
+      const done = new Promise<{ exitCode: number; sessionId?: string }>((res) => {
+        resolveDone = res;
+      });
+      return {
+        events: (async function* () {
+          yield { type: "system_init", sessionId: "sess_killed", raw: {} };
+          while (!killed) await new Promise((r) => setTimeout(r, 5));
+        })(),
+        done,
+        kill: () => {
+          killed = true;
+          resolveDone({ exitCode: 143, sessionId: "sess_killed" });
+        },
+      };
+    };
+
+    // Default harness: idle threshold AND kill budget both 30ms, so the kill fires on
+    // the same tick that would first record a peak.
+    const { acked } = await runTurn(store);
+
+    expect(acked).toEqual([threadId]);
+    expect(killed).toBe(true);
+    expect(stuckCountOf(records)).toBe(2);
+  });
+
+  // Round-6 finding 1, and the shape NO other BL-38 test had: the pooled claude
+  // path. Pooling is on by default, and claude/pool.ts pushes the CLI's `result`
+  // line onto the turn queue immediately BEFORE settling. Any predicate that reads
+  // "is it quiet right now" at finalize (`idleSuspected` in rounds 3-4,
+  // `Date.now() - lastActivityAt` in round 5) is therefore always false here, so the
+  // self-heal never advanced on the DEFAULT backend and the flagship
+  // 「本轮长时间没有输出」 card was unreachable there. Every earlier test used the cold
+  // runner shape, which is why the suite stayed green through two dead predicates.
+  it("(a14) a wedge on the POOLED path counts, even though a result event lands last", async () => {
+    const { store, records } = seedStore(1);
+    await seedWorktree(threadId);
+    await seedRepoCachePath();
+    runClaudeImpl = () => ({
+      events: (async function* () {
+        yield { type: "system_init", sessionId: "sess_pooled", raw: {} };
+        await new Promise((r) => setTimeout(r, 130)); // the wedge the watchdog sees
+        // …then the pool's trailing event, which resets every "is it quiet NOW" signal.
+        yield { type: "result", stopReason: "end_turn", raw: {} };
+      })(),
+      done: Promise.resolve({ exitCode: 1, sessionId: "sess_pooled" }),
+      kill: () => {},
+    });
+
+    const { cardKitCalls, acked } = await runTurn(store, { noIdleKill: true });
+
+    expect(acked).toEqual([threadId]);
+    expect(stuckCountOf(records)).toBe(2);
+    const text = finalCardText(cardKitCalls);
+    expect(text).toContain("长时间没有输出");
+    expect(text).not.toContain("可能崩溃");
   });
 
   // The shape that MUST count: quiet, and it had to be ended for it (the 60-min
