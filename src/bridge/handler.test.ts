@@ -5383,6 +5383,36 @@ describe("BL-38: poison-session self-heal", () => {
     expect(text).not.toContain("可能崩溃");
   });
 
+  // Self-review during round 3: the same failure family as the round-2 bug. A quiet
+  // turn whose answer landed OUTSIDE the LARKWAY_ANSWER markers is rescued by
+  // untrustedAnswerFallback and shown to the user — but judging "produced nothing"
+  // on the marker channels alone declared it a hang, overwrote the rescued answer
+  // with 「没有产出正文」, and fed BL-38 toward a session reset.
+  it("(a5) a quiet turn whose answer only came through the untrusted channel is NOT a hang", async () => {
+    const { store, records } = seedStore(1);
+    await seedWorktree(threadId);
+    await seedRepoCachePath();
+    runClaudeImpl = () => ({
+      events: (async function* () {
+        yield { type: "system_init", sessionId: "sess_rescue", raw: {} };
+        // Answer written OUTSIDE the markers — internal_text only, no state.json.
+        yield { type: "internal_text", text: "这就是答案，只是没写在标记里", raw: {} };
+        await new Promise((r) => setTimeout(r, 120)); // quiet past the 30ms threshold
+      })(),
+      done: Promise.resolve({ exitCode: 0, sessionId: "sess_rescue" }),
+      kill: () => {},
+    });
+
+    const { cardKitCalls, acked } = await runTurn(store, { noIdleKill: true });
+
+    expect(acked).toEqual([threadId]);
+    // Not a hang: streak resets, and the rescued answer survives.
+    expect(stuckCountOf(records)).toBe(0);
+    const text = finalCardText(cardKitCalls);
+    expect(text).toContain("这就是答案");
+    expect(text).not.toContain("长时间没有输出");
+  });
+
   // The mirror-image regression, caught by the SECOND review round: keying the
   // counter off the suspect mark alone counted SUCCESSFUL turns as hangs, because
   // `idleSuspected` is only cleared by the next stream event — the gap between a
