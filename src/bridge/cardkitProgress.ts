@@ -163,10 +163,17 @@ export function formatSilence(silentMs: number): string {
  * BL-48 stage-1 status line. Says what is true — the model has produced nothing
  * for a while and we are still waiting — instead of the unchanged 努力回答中,
  * which during a stall is indistinguishable from healthy progress.
+ *
+ * BL-48 修订: now that a silent turn is NOT killed by default, this line is the
+ * whole interface for a stall, so it also names the way out. The stop control is
+ * the platform's own ⏹ on the in-progress 思考气泡 (it sends `@bot /stop`, which
+ * BL-42 intercepts); `/stop` is spelled out too because the bubble is absent
+ * when a bot runs `cot: off` or the bubble create failed.
  */
 function idleWaitingStatusText(silentMs: number, toolUseCount: number): string {
   const base = `⏳ 模型已 ${formatSilence(silentMs)} 没有输出,仍在等待...`;
-  return toolUseCount > 0 ? `${base} · 已用 ${toolUseCount} 个工具` : base;
+  const tools = toolUseCount > 0 ? ` · 已用 ${toolUseCount} 个工具` : "";
+  return `${base}${tools} · 想停可点思考气泡的 ⏹ 或发 /stop`;
 }
 
 function clip(value: unknown, max: number): string {

@@ -37,6 +37,14 @@ const COT_INPUT_PREVIEW_MAX = 200;
 export interface CotProgressHandle {
   /** True once COT has been disabled (create/write failure) — handle is a no-op. */
   readonly disabled: boolean;
+  /**
+   * The live bubble's `cot_id` / `message_id`, or undefined if create never
+   * landed. Exposed so the handler can persist it to `cot.json`
+   * (src/bridge/cotFile.ts) — a bubble is "in progress" purely because nobody
+   * completed it, so a crash with the ref only in memory leaves it spinning
+   * `Working` forever with no way to reach it.
+   */
+  readonly bubbleRef: CotRef | undefined;
   /** Feed one runner event. Reasoning + tool events map to COT; others ignored. */
   handle(event: AgentStreamEvent): void;
   /** Flush + complete the bubble. `done` on normal end, `error` otherwise. */
@@ -222,6 +230,11 @@ class LiveCotProgressHandle implements CotProgressHandle {
 
   get disabled(): boolean {
     return this._disabled;
+  }
+
+  /** See CotProgressHandle.bubbleRef — undefined until create lands. */
+  get bubbleRef(): CotRef | undefined {
+    return this.ref;
   }
 
   async start(target: CotTarget, inputPreview: string): Promise<void> {

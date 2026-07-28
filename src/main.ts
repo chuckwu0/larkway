@@ -945,6 +945,12 @@ async function runV2Mode({
       ...(bot.idle_timeout_seconds !== undefined
         ? { responseSurfaceIdleTimeoutMs: bot.idle_timeout_seconds * 1000 }
         : {}),
+      // BL-48 修订: automatic interrupt is OPT-IN. Unset → the handler never
+      // idle-kills (the card shows ⏳ and the turn runs on). Only set for
+      // unattended bots — see botLoader's idle_kill_seconds doc.
+      ...(bot.idle_kill_seconds !== undefined
+        ? { responseSurfaceIdleKillMs: bot.idle_kill_seconds * 1000 }
+        : {}),
       peers: resolvedPeers,
       taskHandleMentionRoster,
       localHandoffRegistry,
@@ -1352,6 +1358,13 @@ async function runV2Mode({
       postClient: shouldProvideResponseSurfacePostClient(bot.response_surface_prototype)
         ? client.outboundPostClient()
         : undefined,
+      // BL-48: same client the handler uses for bubbles, so an orphaned
+      // `Working` bubble left by a crash gets completed under this bot's own
+      // identity. Only wired when the bot actually renders bubbles.
+      cotClient:
+        bot.cot !== "off" && bot.cotSurface === "bubble"
+          ? client.outboundCotClient()
+          : undefined,
       log: (m) => console.log(m),
     });
   }
