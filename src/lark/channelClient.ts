@@ -151,41 +151,7 @@ const RECONNECT_GAP_FILL_MAX_AGE_MS = 6 * 60 * 60 * 1000; // 6h
  * suspended machine doesn't fire timers, so the gap between two samples is
  * itself the evidence that we were blind.
  */
-const LIVENESS_SAMPLE_MS = 15_000;
-/**
- * BL-55 洞 B — keepalive thresholds.
- *
- * Why a self-hosted watchdog at all: the ONLY thing that triggers gap-fill is
- * the SDK's `reconnected` event. A socket that goes half-open WITHOUT the SDK
- * noticing therefore drops messages with no recovery path and no trace. The
- * SDK's own `wsConfig.pingTimeout` is a real half-open detector but it hangs
- * off the server's ping cadence (~120s); this one is independent and faster,
- * and — more importantly — it CONVERTS a silent half-open into an explicit
- * reconnect, which is what lets the existing gap-fill do its job.
- *
- * The shape is borrowed from the official `@larksuite/channel` keepalive (see
- * BL-51's 2026-07-28 复核: that package has it, `@larksuiteoapi/node-sdk` does
- * not — not even at 1.71.1). We implement rather than migrate because our
- * pinned 1.67.0 already exposes every primitive it needs
- * (`getConnectionStatus` / `disconnect` / `connect`).
- */
-/** A tick this soon after the previous one is a timer storm (common right after wake) — ignore it. */
-const KEEPALIVE_STORM_GUARD_MS = 5_000;
-/** A gap this large between ticks means the machine was suspended, not that the socket died. */
-const KEEPALIVE_SLEEP_DETECT_MS = 30_000;
-/** Budget for the "is Feishu even reachable" probe. */
-const KEEPALIVE_PROBE_TIMEOUT_MS = 5_000;
-/** Consecutive confirmed-down ticks before we force a reconnect (debounce). */
-const KEEPALIVE_DEAD_THRESHOLD = 3;
-/** While the network itself is down, log every Nth tick instead of every tick. */
-const KEEPALIVE_NETWORK_DOWN_LOG_EVERY = 20;
-/**
- * Reachability probe target. Any HTTP answer at all (even 4xx) proves the path
- * to Feishu works, which is what distinguishes "our socket is wedged" (force a
- * reconnect) from "this machine has no network" (reconnecting is pointless and
- * would just burn auth quota).
- */
-const KEEPALIVE_PROBE_URL = "https://open.feishu.cn/";
+const LIVENESS_SAMPLE_MS = 30_000;
 /**
  * BL-55 洞 E — page cap for a single chat's history pull. gapFill used to send
  * ONE `--page-size 50` request per chat with `--sort asc`, so any window
@@ -628,18 +594,8 @@ export class ChannelClient {
    * an idle-but-connected bot never looks like a blind window.
    */
   private lastHealthyAt = 0;
-  /** Interval handle for the keepalive/liveness tick; cleared in {@link close}. */
+  /** Interval handle for the liveness sampler; cleared in {@link close}. */
   private livenessTimer: ReturnType<typeof setInterval> | undefined;
-  /** BL-55 洞 B — keepalive tick bookkeeping (see the KEEPALIVE_* constants). */
-  private keepaliveLastTickAt = 0;
-  private keepaliveConsecutiveDown = 0;
-  private keepaliveNetworkDownTicks = 0;
-  /** Reentrancy guard: a tick's probe/reconnect is async and outlives its interval slot. */
-  private keepaliveTickRunning = false;
-  /** Set while a forced reconnect (incl. its gap-fill) is in flight, so ticks don't stack. */
-  private forcedReconnectInFlight = false;
-  /** One-shot warning latch for an SDK that exposes no connection status. */
-  private keepaliveUnsupportedLogged = false;
   /**
    * Message_ids that have reached a terminal SUCCESS (handler.markHandled) OR
    * were explicitly acknowledged. These are persisted so open-chat recovery
@@ -1090,7 +1046,7 @@ export class ChannelClient {
     // BL-55 洞 A: the connect itself is the first confirmed-healthy moment.
     this.lastHealthyAt = Date.now();
     log(`connected as ${channel.botIdentity?.name ?? "?"} (${channel.botIdentity?.openId ?? "?"})`);
-    this.startLivenessSampler(log);
+    this.startLivenessSampler();
     this.startOpenChatDiscovery(log);
     this.startUnresolvedReplayTimer(log);
   }
@@ -1714,166 +1670,24 @@ export class ChannelClient {
    *   - a SUSPENDED machine stops ticking entirely, so the clock freezes at the
    *     pre-sleep moment and the post-wake pull reaches back across the sleep.
    *
-   * BL-55 洞 B — the same tick also acts as the keepalive watchdog: when the
-   * transport reports NOT connected for {@link KEEPALIVE_DEAD_THRESHOLD}
-   * consecutive ticks AND Feishu is provably reachable, force a reconnect. That
-   * conversion is the whole point — gap-fill only ever runs off a reconnect, so
-   * a half-open socket the SDK never notices is currently unrecoverable.
+   * Deliberately does NOT force a reconnect when it sees a non-connected state
+   * — that's BL-55 洞 B (self-hosted keepalive), kept as a separate change so
+   * this one stays reviewable as "window arithmetic only".
    */
-  private startLivenessSampler(log: (s: string) => void): void {
+  private startLivenessSampler(): void {
     if (this.livenessTimer) return;
     const timer = setInterval(() => {
-      void this.keepaliveTick(log);
-    }, LIVENESS_SAMPLE_MS);
-    timer.unref?.();
-    this.livenessTimer = timer;
-  }
-
-  /** One keepalive/liveness tick. Never throws; never blocks the interval. */
-  private async keepaliveTick(log: (s: string) => void): Promise<void> {
-    if (this.closed || this.keepaliveTickRunning || this.forcedReconnectInFlight) return;
-    this.keepaliveTickRunning = true;
-    try {
-      const now = Date.now();
-      const sinceLast = this.keepaliveLastTickAt > 0 ? now - this.keepaliveLastTickAt : 0;
-      // Timer storm: several intervals firing back-to-back (typical right after
-      // a wake). Counting these as evidence would trip the threshold instantly.
-      if (sinceLast > 0 && sinceLast < KEEPALIVE_STORM_GUARD_MS) return;
-      // Suspend detected. Deliberately does NOT advance lastHealthyAt: the whole
-      // point of 洞 A is that the pre-sleep moment is the honest anchor for the
-      // recovery window. Just reset the counters and let the next tick judge.
-      if (sinceLast > KEEPALIVE_SLEEP_DETECT_MS) {
-        log(`keepalive: wake-up detected (no tick for ~${Math.round(sinceLast / 1000)}s) — counters reset`);
-        this.keepaliveConsecutiveDown = 0;
-        this.keepaliveNetworkDownTicks = 0;
-        this.keepaliveLastTickAt = now;
-        return;
-      }
-      this.keepaliveLastTickAt = now;
-
-      const readStatus = this.channel?.getConnectionStatus;
-      if (typeof readStatus !== "function") {
-        // No liveness signal from this SDK build. Forcing reconnects blind would
-        // be reckless, and freezing lastHealthyAt would silently widen every
-        // reconnect window to the 6h ceiling — so keep the pre-BL-55 behaviour
-        // (treat as healthy) and say so once.
-        if (!this.keepaliveUnsupportedLogged) {
-          this.keepaliveUnsupportedLogged = true;
-          log("keepalive: SDK exposes no getConnectionStatus() — watchdog disabled, treating link as healthy");
-        }
-        this.lastHealthyAt = now;
-        return;
-      }
+      if (this.closed) return;
       let state: string | undefined;
       try {
         state = this.channel?.getConnectionStatus?.()?.state;
       } catch {
         return; // never let a diagnostic read break the client
       }
-      if (state === "connected") {
-        if (this.keepaliveConsecutiveDown > 0) {
-          log(`keepalive: link recovered on its own after ${this.keepaliveConsecutiveDown} down tick(s)`);
-        }
-        this.lastHealthyAt = now;
-        this.keepaliveConsecutiveDown = 0;
-        this.keepaliveNetworkDownTicks = 0;
-        return;
-      }
-
-      // Not connected. Before blaming the socket, check whether this machine has
-      // a working path to Feishu at all — reconnecting into a dead network just
-      // burns auth quota and muddies the logs.
-      if (!(await this.probeFeishuReachable())) {
-        this.keepaliveNetworkDownTicks++;
-        if (
-          this.keepaliveNetworkDownTicks === 1 ||
-          this.keepaliveNetworkDownTicks % KEEPALIVE_NETWORK_DOWN_LOG_EVERY === 0
-        ) {
-          log(
-            `keepalive: network unreachable (${KEEPALIVE_PROBE_URL}), ` +
-              `${this.keepaliveNetworkDownTicks} tick(s) — not a WS problem, holding off`,
-          );
-        }
-        this.keepaliveConsecutiveDown = 0;
-        return;
-      }
-      if (this.keepaliveNetworkDownTicks > 0) {
-        log(`keepalive: network reachable again after ${this.keepaliveNetworkDownTicks} tick(s)`);
-        this.keepaliveNetworkDownTicks = 0;
-      }
-
-      this.keepaliveConsecutiveDown++;
-      log(
-        `keepalive: WS not connected (state=${state ?? "unknown"}) but Feishu is reachable — ` +
-          `${this.keepaliveConsecutiveDown}/${KEEPALIVE_DEAD_THRESHOLD} confirmed down tick(s)`,
-      );
-      if (this.keepaliveConsecutiveDown >= KEEPALIVE_DEAD_THRESHOLD) {
-        this.keepaliveConsecutiveDown = 0;
-        await this.forceReconnect(log);
-      }
-    } catch (err) {
-      log(`keepalive: tick failed (ignored): ${(err as Error).message}`);
-    } finally {
-      this.keepaliveTickRunning = false;
-    }
-  }
-
-  /**
-   * BL-55 洞 B — is there a working path to Feishu right now? Any HTTP answer
-   * (including 4xx) counts: we're testing reachability, not authorization.
-   */
-  private async probeFeishuReachable(): Promise<boolean> {
-    try {
-      const res = await fetch(KEEPALIVE_PROBE_URL, {
-        method: "HEAD",
-        signal: AbortSignal.timeout(KEEPALIVE_PROBE_TIMEOUT_MS),
-      });
-      return typeof res.status === "number" && res.status > 0;
-    } catch {
-      return false;
-    }
-  }
-
-  /**
-   * BL-55 洞 B — cycle the transport on the EXISTING channel object (so our
-   * already-registered handlers survive) and then drive gap-fill ourselves.
-   *
-   * Driving gap-fill explicitly is not belt-and-braces: a caller-initiated
-   * disconnect/connect is not guaranteed to emit the SDK's own
-   * `reconnecting`/`reconnected` pair, and that pair is the ONLY thing wired to
-   * gap-fill. If the SDK does emit it too, the duplicate pull is harmless —
-   * dispatch is gated by seenMessageIds/inFlightMessageIds — and the in-flight
-   * flag keeps ticks from stacking on top of it.
-   */
-  private async forceReconnect(log: (s: string) => void): Promise<void> {
-    const ch = this.channel;
-    if (!ch || this.closed || this.forcedReconnectInFlight) return;
-    this.forcedReconnectInFlight = true;
-    const blindFrom = this.lastHealthyAt > 0 ? this.lastHealthyAt : Date.now();
-    try {
-      log(`keepalive: forcing reconnect (blind since ${new Date(blindFrom).toISOString()})`);
-      try {
-        await ch.disconnect();
-      } catch {
-        /* already down — the connect below is what matters */
-      }
-      await ch.connect();
-      if (this.lastDisconnectAt === 0) this.lastDisconnectAt = blindFrom;
-      log("keepalive: forced reconnect ✓ — running gap-fill for the blind window");
-      const blindMs = Date.now() - blindFrom;
-      await this.gapFill(blindFrom, log, undefined, blindMs, RECONNECT_GAP_FILL_MAX_AGE_MS);
-      this.lastHealthyAt = Date.now();
-      this.keepaliveLastTickAt = Date.now();
-    } catch (err) {
-      // Unrecoverable for now. Deliberately NOT fatal: the next threshold
-      // crossing retries, and the supervisor/watchdog owns the restart policy.
-      log(
-        `keepalive: forced reconnect FAILED: ${(err as Error).message} — ` +
-          "will retry after the next confirmed-down threshold",
-      );
-    } finally {
-      this.forcedReconnectInFlight = false;
-    }
+      if (state === "connected") this.lastHealthyAt = Date.now();
+    }, LIVENESS_SAMPLE_MS);
+    timer.unref?.();
+    this.livenessTimer = timer;
   }
 
   /**
