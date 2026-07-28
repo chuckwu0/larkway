@@ -169,7 +169,10 @@ const DEFAULT_CARDKIT_IDLE_TIMEOUT_MS = 3 * 60 * 1000;
  * Operators who need a different budget move `idle_timeout_seconds`; both the
  * suspect mark and the kill scale with it.
  */
-const IDLE_SUSPECT_TO_KILL_MULTIPLIER = 3;
+// Retired with the owner's 2026-07-28 decision (idle-kill is opt-in now, so there is
+// no multiplier to apply to a default that no longer kills). Kept only as the
+// documented history of what the graded default used to be.
+// const IDLE_SUSPECT_TO_KILL_MULTIPLIER = 3;
 // RETIRED as a behavior knob (BL-48 修订 2026-07-28): the kill is no longer
 // derived from the suspect threshold at all — it is opt-in via
 // `idle_kill_seconds` (see resolveIdleKillAfterMs). Kept only because the v0.3.71
@@ -3219,8 +3222,15 @@ export class BridgeHandler {
             idleTimeoutMs,
           );
           idleWatchdog = setInterval(() => {
-            if (toolsInFlight > 0) return; // real tool call pending — exempt from idle judgment
             const silentMs = Date.now() - lastActivityAt;
+            // A3's exemption applies to the INTERRUPT only. It used to sit here as a
+            // bare `return`, which also suppressed the ⏳ notice and the hang
+            // evidence: a turn wedged mid-tool (tool_use with a tool_result that
+            // never comes) showed the user nothing for the full hour and fed BL-38
+            // nothing either, so its session could never self-heal (independent
+            // review, round 4). "No output for X minutes" is TRUE during a long
+            // tool call, and worth saying.
+            const toolExemptsKill = toolsInFlight > 0;
             // Suspect + ⏳ notice. A BLOCK, not an early return: the kill gate
             // below must stay reachable even when the ceiling clamped the kill
             // budget below this threshold.
@@ -3291,7 +3301,7 @@ export class BridgeHandler {
             // When the clamp puts the kill below the suspect threshold, the
             // interrupt lands without a notice — unavoidable (the notice is not due
             // yet) and strictly better than crossing the guard.
-            if (idleKillAfterMs !== undefined && silentMs >= idleKillAfterMs) {
+            if (!toolExemptsKill && idleKillAfterMs !== undefined && silentMs >= idleKillAfterMs) {
               interruptedByIdle = true;
               idleKilledAfterMs = silentMs;
               // Record the hang on the SAME two fields the no-kill path uses so
@@ -3393,6 +3403,11 @@ export class BridgeHandler {
             // size (a turn that recovers at 2.9× means it is nearly too tight).
             if (idleSuspected) {
               idleSuspected = false;
+              // Reset with the suspicion: the cards quote this as "how long it was
+              // quiet", and a turn that stalled 10 min, recovered, then stalled 4 min
+              // must not report 10 (independent review, round 4). It is a
+              // whole-STALL max, not a whole-TURN one.
+              idleObservedSilenceMs = 0;
               console.warn(
                 `[larkway] turn resumed after ${Math.round(silentBeforeThisEventMs / 1000)}s of silence ` +
                   `(threshold ${Math.round(idleTimeoutMs / 1000)}s — a hard idle-kill there would have been ` +
@@ -3753,32 +3768,54 @@ export class BridgeHandler {
            * must always reset the counter to 0, which is also what BL-38's own
            * contract promises.
            */
-          // A turn that produced SOMETHING is not a poison hang, whatever its exit
-          // code — that is what separates "slow but fine" from "wedged".
+          // BL-38's question is "does this SESSION wedge?", so the predicate keys on
+          // HOW THE TURN ENDED, never on what it produced.
           //
-          // `lastInternalText` and `reportedState.last_message` are LOAD-BEARING
-          // here, not thoroughness. A turn whose answer landed OUTSIDE the
-          // LARKWAY_ANSWER markers is a documented real failure mode that
-          // `untrustedAnswerFallback` (below) rescues and shows the user. Judging
-          // "produced nothing" on the marker channels alone would declare exactly
-          // those turns hung — overwriting a rescued answer with
-          // 「没有产出正文」 and feeding BL-38 toward a session reset. Same family as
-          // the round-2 bug: a destructive decision keyed to a signal that does
-          // not mean what it looks like it means.
-          const producedAnswerText =
-            (
-              trustedAnswerText.trim() ||
-              cardKitProgress?.answerText.trim() ||
-              lastInternalText.trim() ||
-              reportedState?.last_message?.trim() ||
-              ""
-            ).length > 0;
+          // Three rounds of review went in circles on an output-based predicate and
+          // every version was wrong in one direction or the other:
+          //   - `!success` (exit 0 = fine) let a zero-output turn reset the streak;
+          //   - marker-channel text only declared a rescued out-of-marker answer a
+          //     hang and overwrote it;
+          //   - adding `lastInternalText` then counted a mere PREAMBLE ("我先看一下
+          //     代码。") as delivery, re-opening the first hole through a new signal.
+          // The lesson: output cannot separate "wedged" from "finished badly",
+          // because a turn that says something and then wedges says something.
+          //
+          // How it ended can. A process that exits 0 CHOSE to exit — it was not
+          // wedged, whatever the quality of its output (an empty answer is the
+          // card's problem, not the session's). A turn that went quiet and then had
+          // to be ended for it — the 60-min runaway guard, an opted-in idle kill, a
+          // crash — is the wedge BL-38 exists to break out of.
+          const endedExternally = result.exitCode !== 0;
           const idleHangObserved =
             !stoppedByUser &&
             idleSuspected &&
+            endedExternally &&
+            // An agent that reported its own terminal status was talking to us at
+            // the end; that is not a wedge. `ready` also protects the documented
+            // "status=ready, grandchild reaped by the grace period" success — the
+            // round-2 catastrophe was exactly this turn being poison-reset.
             reportedStatus !== "failed" &&
-            reportedStatus !== "ready" &&
-            !producedAnswerText;
+            reportedStatus !== "ready";
+
+          // Separate question, separate flag (conflating the two is what produced
+          // the round-3 and round-4 bugs): will the user be shown any body text?
+          // Only consulted to keep the hang CARD from overwriting something real —
+          // never to decide whether the turn hung.
+          const willShowBodyText =
+            (
+              trustedAnswerText.trim() ||
+              cardKitProgress?.answerText.trim() ||
+              reportedState?.last_message?.trim() ||
+              ""
+            ).length > 0 ||
+            // Mirrors untrustedAnswerFallback's own conditions below — the ONLY
+            // circumstances under which lastInternalText reaches the user.
+            (result.exitCode === 0 &&
+              reportedState?.last_message == null &&
+              !trustedAnswerText.trim() &&
+              !cardKitProgress?.answerText.trim() &&
+              lastInternalText.trim().length > 0);
           let success: boolean;
           let failureReason: string | undefined;
           if (reportedStatus === "failed") {
@@ -3804,7 +3841,18 @@ export class BridgeHandler {
               appendPath: "Agent 卡死中断",
               reason: failureReason,
             });
-          } else if (result.exitCode === 0 && !idleHangObserved) {
+          } else if (result.exitCode === 0) {
+            // Exited on its own → not a wedge. `idleHangObserved` cannot be true
+            // here (it requires a non-zero exit), so no guard is needed.
+            //
+            // KNOWN PRE-EXISTING INCOHERENCE, deliberately left alone: a turn that
+            // exits 0 having produced no body text renders the ⚠️ 没有产出正文 card
+            // while every internal record says success (round 3 objected to this,
+            // correctly). Fixing it here — `success = willShowBodyText` — was tried
+            // and reverted: that shape is the suite's canonical "successful turn"
+            // stub, so it silently changes session accounting, the 批G harvest
+            // stamp and transcript outcomes. It is a real bug but its own bug, not
+            // something to slip into a watchdog change. Tracked separately.
             success = true;
           } else if (idleHangObserved) {
             // BL-48 修订: the flagship ending of this change — the turn went silent,
@@ -4128,7 +4176,7 @@ export class BridgeHandler {
                 // latter without asking us.
                 ? `⚠️ 本轮被中断（连续 ${formatSilence(idleKilledAfterMs)}没有任何输出，判定卡死），未完成。请重试。\n` +
                   idleThresholdHint(idleTimeoutMs, idleKillAfterMs)
-                : idleHangObserved
+                : idleHangObserved && !willShowBodyText
                   // BL-48 修订: silent, produced nothing, and NOBODY interrupted it
                   // — the ending this change makes the common one. It used to fall
                   // through to the generic 没有产出正文/可能崩溃 text, i.e. a crash
@@ -4738,13 +4786,17 @@ export class BridgeHandler {
           .then((handle) =>
           handle
             .finalize(cotTurnOutcome)
-            .catch(() => {})
-            // BL-48: the bubble is completed (or unreachable) — drop cot.json so
-            // boot reconcile doesn't re-complete a finished bubble. Deleted after
-            // finalize, never before: a crash in between must leave the file so
-            // the sweep can still reach the bubble.
-            .then(() =>
-              cotFileAt && handle.bubbleRef
+            .catch(() => false as boolean)
+            // BL-48: drop cot.json so boot reconcile doesn't re-complete a finished
+            // bubble — but ONLY when the platform actually accepted the completion.
+            // Deleting unconditionally (the first version) also dropped it when
+            // `complete` had been attempted and REJECTED — a transient 500 / expired
+            // token / WS blip — leaving the bubble spinning `Working` with the one
+            // record that could have recovered it already gone (independent review,
+            // round 4). A crash between finalize and delete likewise leaves the file,
+            // which is the whole point of the ordering.
+            .then((completed) =>
+              completed && cotFileAt && handle.bubbleRef
                 ? deleteCotFileIfMatches(cotFileAt, handle.bubbleRef.cotId)
                 : undefined,
             )

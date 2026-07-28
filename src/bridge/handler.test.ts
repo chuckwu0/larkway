@@ -1268,6 +1268,11 @@ describe("handleOne — thin-channel finalize", () => {
       await new Promise((r) => setTimeout(r, 10));
     }
     released = true;
+    // Drain before asserting: every other test in this change does, and without it
+    // the turn's post-finalize writes under <wt>/.larkway race afterEach's rm(),
+    // which showed up as a 3-in-10 ENOTEMPTY flake on the full suite only
+    // (independent review, round 4).
+    await handler.whenAllTurnsSettled();
 
     const notice = noticeOf();
     expect(notice).not.toBe(""); // the sampling itself must not be a no-op
@@ -5352,13 +5357,71 @@ describe("BL-38: poison-session self-heal", () => {
     expect(text).not.toContain("已重置本话题上下文");
   });
 
-  // Round-3 finding 1: `success` is true whenever the runner merely exits 0 —
-  // including a turn that emitted NOTHING. Keying the counter off it both missed
-  // that hang and RESET the streak, so a thread alternating endings
-  // (guard-reaped 143 → +1, silent exit 0 → back to 0) could never reach three in
-  // a row and never self-heal. The user meanwhile got a ⚠️ 没有产出正文 card, so
-  // the counter recorded a success the user was told was a failure.
-  it("(a4) a silent turn that produced NOTHING counts even when the runner exits 0", async () => {
+  // Round-4 finding 7: these three exclusions had NO failing guard, and (a) is the
+  // round-2 catastrophe itself — a status=ready success being poison-reset. The a3
+  // rewrite moved away from `status: "ready"`, which removed the only coverage it
+  // had.
+  it("(a8) a status=ready turn reaped by the grandchild grace is NEVER a wedge", async () => {
+    const { store, records } = seedStore(2); // one more strike would reset the session
+    const wt = await seedWorktree(threadId);
+    await seedRepoCachePath();
+    runClaudeImpl = () => ({
+      events: (async function* () {
+        yield { type: "system_init", sessionId: "sess_ready", raw: {} };
+        await writeFile(
+          stateFileMod.stateFilePathOf(wt),
+          JSON.stringify({ status: "ready", last_message: "干完了", updated_at: new Date().toISOString() }, null, 2),
+          "utf8",
+        );
+        await new Promise((r) => setTimeout(r, 120)); // quiet, then the grace kills it
+      })(),
+      done: Promise.resolve({ exitCode: 143, sessionId: "sess_ready" }),
+      kill: () => {},
+    });
+
+    const { cardKitCalls, acked } = await runTurn(store, { noIdleKill: true });
+
+    expect(acked).toEqual([threadId]);
+    expect(stuckCountOf(records)).toBe(0); // a success resets, never counts
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    expect((records.get(key) as any)?.needsFreshStart).toBeUndefined();
+    expect(finalCardText(cardKitCalls)).toContain("干完了");
+  });
+
+  it("(a10) an agent that reports failed is not a wedge, even if it went quiet first", async () => {
+    const { store, records } = seedStore(1);
+    const wt = await seedWorktree(threadId);
+    await seedRepoCachePath();
+    runClaudeImpl = () => ({
+      events: (async function* () {
+        yield { type: "system_init", sessionId: "sess_failed", raw: {} };
+        await writeFile(
+          stateFileMod.stateFilePathOf(wt),
+          JSON.stringify({ status: "failed", error: "编译失败", updated_at: new Date().toISOString() }, null, 2),
+          "utf8",
+        );
+        await new Promise((r) => setTimeout(r, 120));
+      })(),
+      done: Promise.resolve({ exitCode: 1, sessionId: "sess_failed" }),
+      kill: () => {},
+    });
+
+    const { acked } = await runTurn(store, { noIdleKill: true });
+
+    expect(acked).toEqual([threadId]);
+    // It talked to us at the end — a reported failure is not a wedged session.
+    expect(stuckCountOf(records)).toBe(1);
+  });
+
+  // Round 3 asked for the opposite of what this now asserts, and round 4 showed why
+  // it had to change. Round 3's shape was "silent + exit 0 + no output must count as
+  // a hang"; every output-based way to express that was wrong in one direction or
+  // the other (see the predicate's comment in handler.ts). The semantics settled on
+  // HOW THE TURN ENDED: a process that exits 0 chose to exit, so it was not wedged —
+  // its empty output is the card's problem, not the session's. Round 3's real
+  // complaint (a failure card recorded as a success) is fixed at the source instead:
+  // the turn is no longer called a success.
+  it("(a4) a silent turn that exits 0 with no output is NOT a session wedge", async () => {
     const { store, records } = seedStore(1);
     await seedWorktree(threadId);
     await seedRepoCachePath();
@@ -5374,13 +5437,63 @@ describe("BL-38: poison-session self-heal", () => {
     const { cardKitCalls, acked } = await runTurn(store, { noIdleKill: true });
 
     expect(acked).toEqual([threadId]);
-    // Counted, NOT reset — this is the poison shape BL-38 exists to catch.
-    expect(stuckCountOf(records)).toBe(2);
-    // And the card no longer tells a crash story about a turn we had been
-    // reporting as ⏳ 仍在等待 (round-3 finding 5).
+    // Exited on its own → not a wedge, and `success` stays true so the streak
+    // resets. That `success` coexists with a ⚠️ 没有产出正文 card is a PRE-EXISTING
+    // incoherence, deliberately not fixed inside this change (see handler.ts's note
+    // on the exit-0 branch) — this test pins today's behavior, not the ideal.
+    expect(stuckCountOf(records)).toBe(0);
     const text = finalCardText(cardKitCalls);
+    expect(text).toContain("没有产出正文");
+    expect(text).not.toContain("可能崩溃");
+  });
+
+  // The shape that MUST count: quiet, and it had to be ended for it (the 60-min
+  // runaway guard reaping a wedged turn is the flagship ending of this change).
+  it("(a6) a quiet turn ended externally with nothing reported counts as a wedge", async () => {
+    const { store, records } = seedStore(1);
+    await seedWorktree(threadId);
+    await seedRepoCachePath();
+    runClaudeImpl = () => ({
+      events: (async function* () {
+        yield { type: "system_init", sessionId: "sess_wedge", raw: {} };
+        await new Promise((r) => setTimeout(r, 120));
+      })(),
+      // Non-zero: something else ended it (guard reap / kill), it did not choose to.
+      done: Promise.resolve({ exitCode: 143, sessionId: "sess_wedge" }),
+      kill: () => {},
+    });
+
+    const { cardKitCalls, acked } = await runTurn(store, { noIdleKill: true });
+
+    expect(acked).toEqual([threadId]);
+    expect(stuckCountOf(records)).toBe(2);
+    const text = finalCardText(cardKitCalls);
+    // Idle-aware wording, not a crash story about a turn we showed as ⏳ 仍在等待.
     expect(text).toContain("长时间没有输出");
     expect(text).not.toContain("可能崩溃");
+  });
+
+  // Round-4 finding 1: a mere PREAMBLE is not delivery. "我先看一下代码。" arrives as
+  // internal_text, so keying the wedge predicate on that buffer let a turn that
+  // spoke once and then wedged escape counting entirely.
+  it("(a7) a preamble followed by a wedge still counts (output does not enter the predicate)", async () => {
+    const { store, records } = seedStore(1);
+    await seedWorktree(threadId);
+    await seedRepoCachePath();
+    runClaudeImpl = () => ({
+      events: (async function* () {
+        yield { type: "system_init", sessionId: "sess_pre", raw: {} };
+        yield { type: "internal_text", text: "我先看一下代码。", raw: {} };
+        await new Promise((r) => setTimeout(r, 120));
+      })(),
+      done: Promise.resolve({ exitCode: 143, sessionId: "sess_pre" }),
+      kill: () => {},
+    });
+
+    const { acked } = await runTurn(store, { noIdleKill: true });
+
+    expect(acked).toEqual([threadId]);
+    expect(stuckCountOf(records)).toBe(2);
   });
 
   // Self-review during round 3: the same failure family as the round-2 bug. A quiet
@@ -6226,8 +6339,9 @@ describe("run() /stop — kill in-flight turn, drop queue, keep session (BL-42)"
     return { prompts, kills, releases, firstRunStarted };
   }
 
-  function makeHandler(client: unknown, renderer: unknown, store: unknown) {
+  function makeHandler(client: unknown, renderer: unknown, store: unknown, idleTimeoutMs?: number) {
     return new BridgeHandler({
+      ...(idleTimeoutMs !== undefined ? { responseSurfaceIdleTimeoutMs: idleTimeoutMs } : {}),
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       client: client as any,
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -6245,12 +6359,20 @@ describe("run() /stop — kill in-flight turn, drop queue, keep session (BL-42)"
     const { store, puts } = makeSessionStore();
     const { client, acked, unhandled } = makeStopClient(async function* (gates) {
       yield topicEvent("om_s1", undefined, "跑一个很长的任务");
-      await gates.firstRunStarted; // turn is live — /stop must reach the kill hook
+      await gates.firstRunStarted;
+      // Let the turn go quiet past the 30 ms suspect threshold (and past a watchdog
+      // tick) BEFORE stopping it — otherwise `idleSuspected` is still false and the
+      // predicate's `!stoppedByUser` clause is unreachable, i.e. unguarded.
+      await new Promise((r) => setTimeout(r, 140)); // turn is live — /stop must reach the kill hook
       yield topicEvent("om_s2", "om_s1", "@_user_1 /stop");
     }, firstRunStarted);
     await seedRepoCachePath();
 
-    const handler = makeHandler(client, renderer, store);
+    // Tiny idle threshold on purpose: a /stop'd turn is quiet while it waits, so
+    // this is the ONLY configuration where the wedge predicate's `!stoppedByUser`
+    // clause can matter. Without it the test guards nothing (round-4 finding 7b —
+    // and my first attempt at this guard was itself a false one).
+    const handler = makeHandler(client, renderer, store, 30);
     const runDone = handler.run();
     await runDone;
     await whenFinalized;
@@ -6269,6 +6391,12 @@ describe("run() /stop — kill in-flight turn, drop queue, keep session (BL-42)"
     // neither may ever be replayed by a gap-fill window.
     expect(acked).toContain("om_s2");
     expect(acked).toContain("om_s1");
+    // Round-4 finding 7b: `!stoppedByUser` in the wedge predicate had no failing
+    // guard. A /stop'd turn is quiet by construction (the runner is wedged on
+    // purpose) and ends non-zero, so without that clause it would feed BL-38 and
+    // march a session the user deliberately interrupted toward a reset.
+    const stopped = puts.at(-1) as { consecutiveStuckCount?: number } | undefined;
+    expect(stopped?.consecutiveStuckCount ?? 0).toBe(0);
     expect(unhandled).toHaveLength(0);
     // Session record kept (a later @ resumes the thread).
     expect(puts.some((r) => r.sessionId === "sess_stop")).toBe(true);
