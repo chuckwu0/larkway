@@ -81,6 +81,7 @@ import {
 } from "./cardkitFile.js";
 import {
   createCardKitProgressHandle,
+  formatSilence,
   type CardKitProgressHandle,
   type CardKitLiveMetrics,
 } from "./cardkitProgress.js";
@@ -135,6 +136,65 @@ const DEFAULT_CARDKIT_RESPONSE_SURFACE_TIMEOUT_MS = 20 * 60 * 1000;
  * silent hang that also stops emitting — the proper budget soft-net is 批B (§12.7).
  */
 const DEFAULT_CARDKIT_IDLE_TIMEOUT_MS = 3 * 60 * 1000;
+
+/**
+ * BL-48 分级处置: crossing the idle threshold marks the turn SUSPECT (logged,
+ * turn keeps running); the runner is only interrupted after the silence reaches
+ * `idleTimeoutMs × this`.
+ *
+ * Why grading beats one hard threshold. The judged quantity is "no events" —
+ * and silence has several causes, only one of which deserves a kill: a genuine
+ * hang, versus a long prefill on a large context, versus upstream throttling /
+ * retry backoff, versus a phase the runner simply does not report. The bridge
+ * cannot tell them apart from the event stream alone, and the costs are wildly
+ * asymmetric: killing a working turn destroys minutes of real work and reads as
+ * a product defect (2026-07, an MCP-heavy adopter lost turn after turn this
+ * way), while waiting longer on a truly hung one costs only time that the
+ * 60-min subprocess runaway guard already bounds. Same asymmetry the task
+ * patrol is designed around: false alarms are absorbable, structural
+ * misjudgment is not.
+ *
+ * 3× is deliberately blunt, and uniform. BL-48 also specced a phase split —
+ * wide grace while awaiting a response, TIGHT once tokens have started, on the
+ * theory that a mid-generation stall is the strongest hang signal available.
+ * That split is rejected here on the evidence: the 2026-07 field failure this
+ * grading exists for was killed mid-turn, after 38 tool calls and 22 minutes of
+ * real work, and a "tight once streaming" rule would have killed it again. The
+ * bridge cannot distinguish "stopped mid-answer because it hung" from "stopped
+ * mid-answer because the next model request is slow", and guessing wrong is the
+ * expensive direction. If a split is ever revisited it belongs here, but it
+ * needs data on recovery times first — which the resume log now records.
+ *
+ * Operators who need a different budget move `idle_timeout_seconds`; both the
+ * suspect mark and the kill scale with it.
+ */
+const IDLE_SUSPECT_TO_KILL_MULTIPLIER = 3;
+
+/**
+ * Absolute ceiling on the graded grace, independent of `idle_timeout_seconds`.
+ *
+ * Two things break if the kill point drifts past the 60-min subprocess runaway
+ * guard: the interrupt card degrades to the generic 进程异常退出 wording, and
+ * BL-38's consecutive-idle-kill session reset stops counting (it only counts
+ * confirmed idle-kills). `idle_timeout_seconds: 1200` — a plausible value, and
+ * bigger than the 600 we hand out as a stopgap — would cross that line with a
+ * bare 3×. The ceiling also bounds how long one wedged turn can hold a pooled
+ * concurrency slot.
+ */
+const IDLE_KILL_CEILING_MS = 15 * 60 * 1000;
+
+/**
+ * The knob hint on both interrupt cards. Quotes THIS bot's live threshold, not
+ * the global default — a bot already running `idle_timeout_seconds: 600` would
+ * otherwise be told "默认 180", which is both wrong for it and useless advice.
+ */
+function idleThresholdHint(idleTimeoutMs: number): string {
+  return (
+    `若这类任务本来就要长时间静默思考，可在 bot 配置里调大 \`idle_timeout_seconds\`` +
+    `（当前 ${Math.round(idleTimeoutMs / 1000)} 秒，判死为其 ${IDLE_SUSPECT_TO_KILL_MULTIPLIER} 倍、` +
+    `最多 ${Math.round(IDLE_KILL_CEILING_MS / 60_000)} 分钟）。`
+  );
+}
 
 /**
  * Max time the COT bubble create may sit in front of the answer card's first
@@ -2945,6 +3005,12 @@ export class BridgeHandler {
         // it still backstops a tool call that never returns at all.
         let lastActivityAt = Date.now();
         let interruptedByIdle = false;
+        // BL-48 分级处置 state: `idleSuspected` flips when silence first crosses
+        // idleTimeoutMs and clears the moment any event arrives.
+        // `idleKilledAfterMs` records the silence actually observed at kill time,
+        // so the card states a measured number rather than the threshold.
+        let idleSuspected = false;
+        let idleKilledAfterMs = 0;
         // BL-42: set by the /stop kill hook (registered below) — a
         // user-initiated stop, finalized as neutral 已停止 (not failure red),
         // never counted into the BL-38 consecutive-idle-kill breaker.
@@ -2962,10 +3028,46 @@ export class BridgeHandler {
         // 60-min subprocess timeout meant the worst path waited the longest.
         {
           const cadenceMs = Math.max(50, Math.min(Math.floor(idleTimeoutMs / 4), 15_000));
+          // Grace is capped, and never below the threshold itself: past
+          // IDLE_KILL_CEILING_MS the multiplier would push the kill beyond the
+          // 60-min subprocess runaway guard, which silently costs BOTH the idle
+          // card (the generic 进程异常退出 card would win) and BL-38's
+          // consecutive-idle-kill session reset (it only counts confirmed
+          // idle-kills). An operator raising idle_timeout_seconds must not
+          // disable either by accident.
+          const idleKillAfterMs = Math.max(
+            idleTimeoutMs,
+            Math.min(idleTimeoutMs * IDLE_SUSPECT_TO_KILL_MULTIPLIER, IDLE_KILL_CEILING_MS),
+          );
           idleWatchdog = setInterval(() => {
             if (toolsInFlight > 0) return; // real tool call pending — exempt from idle judgment
-            if (Date.now() - lastActivityAt >= idleTimeoutMs) {
+            const silentMs = Date.now() - lastActivityAt;
+            if (silentMs < idleTimeoutMs) return;
+            // BL-48 分级处置 stage 1: threshold crossed → suspect, NOT dead. The
+            // turn keeps running; the card says so (markIdleWaiting), and the
+            // silence is recorded so a false kill can be told apart from a real
+            // hang after the fact.
+            if (!idleSuspected) {
+              idleSuspected = true;
+              console.warn(
+                `[larkway] turn silent for ${Math.round(silentMs / 1000)}s ` +
+                  `(idle threshold ${Math.round(idleTimeoutMs / 1000)}s) — suspect, not killing yet; ` +
+                  `will interrupt at ${Math.round(idleKillAfterMs / 1000)}s of continuous silence` +
+                  (this.deps.botConfig?.id ? ` [bot ${this.deps.botConfig.id}]` : ""),
+              );
+              try {
+                cardKitProgress?.markIdleWaiting(silentMs);
+              } catch {
+                /* status notice is best-effort — never let it affect the turn */
+              }
+              // Deliberately NOT returning: a tick that first observes a gap
+              // already past the grace (host sleep, a blocked event loop) must
+              // kill now rather than burn another full cadence in suspect.
+            }
+            // Stage 2: still nothing after the full grace — treat as hung.
+            if (silentMs >= idleKillAfterMs) {
               interruptedByIdle = true;
+              idleKilledAfterMs = silentMs;
               if (idleWatchdog) clearInterval(idleWatchdog);
               idleWatchdog = undefined;
               try {
@@ -3048,7 +3150,29 @@ export class BridgeHandler {
         try {
           for await (const ev of handle.events) {
             // PRB-9: any runner event = activity; resets the idle watchdog.
+            // Measure the gap BEFORE resetting — this is the only place the real
+            // silence of a recovered turn can still be read.
+            const silentBeforeThisEventMs = Date.now() - lastActivityAt;
             lastActivityAt = Date.now();
+            // BL-48: the turn came back. Logged at warn because each of these
+            // lines is a turn the pre-grading watchdog would have killed while
+            // it was still working — the running tally of avoided false kills,
+            // and the only data that can say whether the 3× grace is the right
+            // size (a turn that recovers at 2.9× means it is nearly too tight).
+            if (idleSuspected) {
+              idleSuspected = false;
+              console.warn(
+                `[larkway] turn resumed after ${Math.round(silentBeforeThisEventMs / 1000)}s of silence ` +
+                  `(threshold ${Math.round(idleTimeoutMs / 1000)}s — a hard idle-kill there would have been ` +
+                  `a false positive)` +
+                  (this.deps.botConfig?.id ? ` [bot ${this.deps.botConfig.id}]` : ""),
+              );
+              try {
+                cardKitProgress?.clearIdleWaiting();
+              } catch {
+                /* status notice is best-effort */
+              }
+            }
             // A3: track real tool-call in-flight state from the actual
             // tool_use/tool_result event pair (both claude and codex runners
             // emit these — see src/claude/runner.ts parseLinesMulti and
@@ -3395,7 +3519,9 @@ export class BridgeHandler {
             });
           } else if (cardKitTimeoutFailure) {
             success = false;
-            failureReason = `agent turn idle for ${idleTimeoutMs}ms with no activity (treated as stuck); run interrupted`;
+            failureReason =
+              `agent turn idle for ${idleKilledAfterMs}ms with no activity ` +
+              `(threshold ${idleTimeoutMs}ms × ${IDLE_SUSPECT_TO_KILL_MULTIPLIER} grace, treated as stuck); run interrupted`;
             await recordEvent({
               status: "running",
               appendPath: "Agent 卡死中断",
@@ -3658,12 +3784,22 @@ export class BridgeHandler {
               // dropped the poisoned session (Step 4e), so tell the user this
               // topic was reset and the next @ starts clean. Distinct from the
               // single-idle-kill "请重试" below, which keeps the session.
-              ? "⚠️ 本轮被中断（长时间无活性，判定卡死）。连续多次卡死，已重置本话题上下文 —— 下次 @ 我将全新开始，请把需求重新说一遍。"
+              // BL-48: same vocabulary and the same knob hint as the single-kill
+              // card below — arguably MORE needed here, because reaching this
+              // card means several turns in a row were judged stuck, which is
+              // itself evidence the threshold may be too tight for this bot.
+              ? `⚠️ 本轮被中断（连续 ${formatSilence(idleKilledAfterMs)}没有任何输出，判定卡死）。连续多次卡死，已重置本话题上下文 —— 下次 @ 我将全新开始，请把需求重新说一遍。\n` +
+                idleThresholdHint(idleTimeoutMs)
               : cardKitTimeoutFailure
                 // PRB-9/§12.2: idle-stuck → unified explicit-failure sink, never a
                 // passive wait. 批A does NOT auto-replay it — the owner retries
                 // manually (safe auto-replay + idempotency is 批B §11.6).
-                ? "⚠️ 本轮被中断（长时间无活性，判定卡死），未完成。请重试。"
+                // BL-48: state the ACTUAL silence, not a vague "长时间" — it tells
+                // the owner whether this looks like a real hang or a
+                // legitimately slow turn, and names the knob that fixes the
+                // latter without asking us.
+                ? `⚠️ 本轮被中断（连续 ${formatSilence(idleKilledAfterMs)}没有任何输出，判定卡死），未完成。请重试。\n` +
+                  idleThresholdHint(idleTimeoutMs)
                 : reportedState?.last_message ??
                   (fallbackAnswer ? fallbackAnswer : noOutputFallback);
 

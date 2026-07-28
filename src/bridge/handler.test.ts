@@ -1274,8 +1274,11 @@ describe("handleOne — thin-channel finalize", () => {
     expect(finalizeArgs).toHaveLength(0);
     const stream = cardKitCalls.find((c) => c.kind === "stream" && c.elementId === "final_md");
     expect(stream?.content).toContain("被中断");
-    expect(stream?.content).toContain("无活性");
+    expect(stream?.content).toContain("判定卡死");
     expect(stream?.content).toContain("请重试");
+    // BL-48: the card names the knob so an owner can fix a too-tight threshold
+    // without coming to us.
+    expect(stream?.content).toContain("idle_timeout_seconds");
     expect(stream?.content).not.toContain("请再 @ 我一次");
     const settings = cardKitCalls.find((c) => c.kind === "settings");
     expect(JSON.stringify(settings?.payload)).toContain("本轮被中断");
@@ -1288,6 +1291,181 @@ describe("handleOne — thin-channel finalize", () => {
     expect(panelCreate).toBeDefined();
     const finalCard = cardKitCalls.filter((c) => c.kind === "updateCard").at(-1);
     expect(JSON.stringify(finalCard?.payload)).toContain("思考过程（本轮出错）");
+  });
+
+  // BL-48 分级处置: the exact scenario that cost an adopter turn after turn —
+  // a turn goes quiet well past the idle threshold (long prefill / silent
+  // thinking / a phase the runner does not report) and then comes BACK. Before
+  // grading, the watchdog killed it at 1× and the work was lost. Now 1× only
+  // marks it suspect; the turn must survive and finalize normally.
+  it("BL-48: silence past the idle threshold does NOT kill a turn that resumes before the 3× grace", async () => {
+    const threadId = "om_msg";
+    await seedWorktree(threadId);
+    await seedRepoCachePath();
+    const { client: cardKitClient, calls: cardKitCalls } = makeCardKitClient();
+    let killed = false;
+
+    runClaudeImpl = () => {
+      let resolveDone: (r: { exitCode: number; sessionId?: string }) => void = () => {};
+      const done = new Promise<{ exitCode: number; sessionId?: string }>((res) => {
+        resolveDone = res;
+      });
+      return {
+        events: (async function* () {
+          yield { type: "system_init", sessionId: "sess_slow", raw: {} };
+          // 2.5× the threshold of silence, spread over ~10 watchdog ticks.
+          // Threshold must stay well above the 50ms cadence FLOOR: at a 30ms
+          // threshold the whole stall fits in one tick, and the test would pass
+          // even with the grace multiplier set to 1 (i.e. prove nothing).
+          await new Promise((r) => setTimeout(r, 1000));
+          yield {
+            type: "answer_snapshot",
+            text: "慢，但没死",
+            raw: {},
+          };
+          resolveDone({ exitCode: 0, sessionId: "sess_slow" });
+        })(),
+        done,
+        kill: () => {
+          killed = true;
+          resolveDone({ exitCode: 143, sessionId: "sess_slow" });
+        },
+      };
+    };
+
+    const { renderer } = makeCardRenderer();
+    const { store } = makeSessionStore();
+    const { client, acked } = makeClient(makeEvent());
+
+    const handler = new BridgeHandler({
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      client: client as any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      cardRenderer: renderer as any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      sessionStore: store as any,
+      conventions: makeConventions(),
+      botConfig: {
+        id: "frontend",
+        name: "Frontend",
+        turn_taking_limit: 10,
+        backend: "claude",
+        response_surface_prototype: {
+          enabled: true,
+          allowed_chats: [],
+          allowed_threads: ["om_msg"],
+          kill_switch: false,
+          post_outbound_enabled: false,
+          cardkit_streaming_enabled: true,
+          allow_agent_mentions: true,
+          denied_mention_open_ids: [],
+          allowed_mention_open_ids: [],
+        },
+      },
+      cardKitClient,
+      responseSurfaceIdleTimeoutMs: 400, // cadence = 100ms → the 1000ms stall spans ~10 ticks
+    });
+
+    await handler.run();
+    for (let i = 0; i < 400 && acked.length === 0; i++) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
+
+    expect(killed).toBe(false);
+    expect(acked).toEqual(["om_msg"]);
+    const stream = cardKitCalls.find((c) => c.kind === "stream" && c.elementId === "final_md");
+    expect(stream?.content).toContain("慢，但没死");
+    expect(stream?.content ?? "").not.toContain("判定卡死");
+
+    // Stage 1 must be VISIBLE: the status line said we were still waiting…
+    const statusPatches = cardKitCalls
+      .filter((c) => c.kind === "updateElement" && c.elementId === "footer_md")
+      .map((c) => JSON.stringify(c.payload));
+    expect(statusPatches.some((p) => p.includes("仍在等待"))).toBe(true);
+    // …and stopped saying so once the turn came back.
+    expect(statusPatches.at(-1) ?? "").not.toContain("仍在等待");
+  });
+
+  // Re-arm: a turn may stall, recover, and stall again. The second stall must
+  // be judged on its OWN silence (suspect state re-armed), and the card must
+  // report that second gap — not the first one, and not the threshold.
+  it("BL-48: suspect state re-arms after a recovery, and the kill card reports the measured silence", async () => {
+    const threadId = "om_msg";
+    await seedWorktree(threadId);
+    await seedRepoCachePath();
+    const { client: cardKitClient, calls: cardKitCalls } = makeCardKitClient();
+    let killed = false;
+
+    runClaudeImpl = () => {
+      let resolveDone: (r: { exitCode: number; sessionId?: string }) => void = () => {};
+      const done = new Promise<{ exitCode: number; sessionId?: string }>((res) => {
+        resolveDone = res;
+      });
+      return {
+        events: (async function* () {
+          yield { type: "system_init", sessionId: "sess_x", raw: {} };
+          await new Promise((r) => setTimeout(r, 500)); // stall past 1×, recover
+          yield { type: "thinking_delta", text: "回来了", raw: {} };
+          while (!killed) await new Promise((r) => setTimeout(r, 10)); // stall again → kill
+        })(),
+        done,
+        kill: () => {
+          killed = true;
+          resolveDone({ exitCode: 143, sessionId: "sess_x" });
+        },
+      };
+    };
+
+    const { renderer } = makeCardRenderer();
+    const { store } = makeSessionStore();
+    const { client, acked } = makeClient(makeEvent());
+
+    const handler = new BridgeHandler({
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      client: client as any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      cardRenderer: renderer as any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      sessionStore: store as any,
+      conventions: makeConventions(),
+      botConfig: {
+        id: "frontend",
+        name: "Frontend",
+        turn_taking_limit: 10,
+        backend: "claude",
+        response_surface_prototype: {
+          enabled: true,
+          allowed_chats: [],
+          allowed_threads: ["om_msg"],
+          kill_switch: false,
+          post_outbound_enabled: false,
+          cardkit_streaming_enabled: true,
+          allow_agent_mentions: true,
+          denied_mention_open_ids: [],
+          allowed_mention_open_ids: [],
+        },
+      },
+      cardKitClient,
+      responseSurfaceIdleTimeoutMs: 300, // kill at 900ms of continuous silence
+    });
+
+    await handler.run();
+    for (let i = 0; i < 600 && acked.length === 0; i++) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
+
+    // The recovery did not spend the grace: the kill came from the SECOND
+    // stall, which had to accumulate its own 900ms after 回来了.
+    expect(killed).toBe(true);
+    const stream = cardKitCalls.find((c) => c.kind === "stream" && c.elementId === "final_md");
+    expect(stream?.content).toContain("判定卡死");
+    // Measured silence, rendered in seconds (~1s here) — NOT "1 分钟", which is
+    // what a threshold-based or minute-rounded message would print.
+    expect(stream?.content).toMatch(/连续 \d+ 秒没有任何输出/);
+    // The hint quotes THIS bot's threshold (300ms → 0s after rounding is
+    // meaningless, so just assert it is not the hard-coded global default).
+    expect(stream?.content).toContain("idle_timeout_seconds");
+    expect(stream?.content).not.toContain("默认 180");
   });
 
   it("A3: does not kill an idle-stuck turn while a real tool call is in flight (tool_use with no matching tool_result yet)", async () => {

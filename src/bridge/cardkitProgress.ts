@@ -66,6 +66,15 @@ export interface CardKitProgressHandle {
   close(): void;
   /** COT-in-card: mark this turn errored so the panel's settled title reflects it. */
   markCotError(): void;
+  /**
+   * BL-48 分级处置 stage 1: the runner has been silent past the idle threshold
+   * but is NOT being killed yet. Replaces the status line so a suspect turn
+   * stops looking byte-identical to a healthy one — without this the user just
+   * sees 努力回答中 for the whole grace and cannot tell working from dead.
+   */
+  markIdleWaiting(silentMs: number): void;
+  /** Silence ended — restore the normal progress status line. */
+  clearIdleWaiting(): void;
 }
 
 export interface CreateCardKitProgressHandleOpts {
@@ -144,6 +153,22 @@ function toolStatusText(toolUseCount: number): string {
     : "努力回答中...";
 }
 
+/** Human-readable silence, seconds under two minutes so short waits aren't rounded up. */
+export function formatSilence(silentMs: number): string {
+  const seconds = Math.round(silentMs / 1000);
+  return seconds < 120 ? `${seconds} 秒` : `${Math.round(seconds / 60)} 分钟`;
+}
+
+/**
+ * BL-48 stage-1 status line. Says what is true — the model has produced nothing
+ * for a while and we are still waiting — instead of the unchanged 努力回答中,
+ * which during a stall is indistinguishable from healthy progress.
+ */
+function idleWaitingStatusText(silentMs: number, toolUseCount: number): string {
+  const base = `⏳ 模型已 ${formatSilence(silentMs)} 没有输出,仍在等待...`;
+  return toolUseCount > 0 ? `${base} · 已用 ${toolUseCount} 个工具` : base;
+}
+
 function clip(value: unknown, max: number): string {
   const text = String(value ?? "");
   return text.length > max ? `${text.slice(0, max)}…` : text;
@@ -220,6 +245,8 @@ class LiveCardKitProgressHandle implements CardKitProgressHandle {
   private cotToolIndex = 0;
   private readonly cotPendingTools: string[] = [];
   private cotErrored = false;
+  /** BL-48: status line currently shows the stage-1 waiting notice. */
+  private idleWaiting = false;
   // Panel formatting state: keep a tool line and following reasoning on
   // separate lines, and collapse consecutive same-name tool calls into a count.
   private cotAfterTool = false;
@@ -357,6 +384,21 @@ class LiveCardKitProgressHandle implements CardKitProgressHandle {
   /** Mark the reasoning panel's turn as errored so its settled title reflects it. */
   markCotError(): void {
     this.cotErrored = true;
+  }
+
+  markIdleWaiting(silentMs: number): void {
+    if (this.closed) return;
+    this.idleWaiting = true;
+    this.patchStatus(idleWaitingStatusText(silentMs, this.metrics.toolUseCount));
+  }
+
+  clearIdleWaiting(): void {
+    if (this.closed || !this.idleWaiting) return;
+    this.idleWaiting = false;
+    // Back to the normal line. Repatched explicitly because the answer path
+    // patches the ANSWER element, not the footer — without this a turn that
+    // resumes with pure token output would keep showing 仍在等待 to the end.
+    this.patchStatus(toolStatusText(this.metrics.toolUseCount));
   }
 
   // ── COT-in-card (方案 B) ────────────────────────────────────────────────
