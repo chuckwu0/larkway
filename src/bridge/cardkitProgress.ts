@@ -72,7 +72,7 @@ export interface CardKitProgressHandle {
    * stops looking byte-identical to a healthy one — without this the user just
    * sees 努力回答中 for the whole grace and cannot tell working from dead.
    */
-  markIdleWaiting(silentMs: number): void;
+  markIdleWaiting(silentMs: number, opts?: { hasBubble?: boolean }): void;
   /** Silence ended — restore the normal progress status line. */
   clearIdleWaiting(): void;
 }
@@ -169,10 +169,11 @@ export function formatSilence(silentMs: number): string {
  *
  * `/stop` is always named because it always works. The platform's ⏹ (on the
  * in-progress 思考气泡; clicking it sends `@bot /stop`, which BL-42 intercepts)
- * is named only when this turn actually HAS a bubble — a `cotSurface: "card"`
- * bot folds reasoning into the card and renders no bubble at all, so pointing at
- * a ⏹ there would name a control the operator cannot find (independent review
- * 2026-07-28). Same for `cot: "off"` and a failed bubble create.
+ * is named only when this turn actually HAS a LIVE bubble — the caller passes
+ * that in (`cotPublisher?.bubbleRef !== undefined`), because only it knows.
+ * A `cotSurface: "card"` bot folds reasoning into the card, a `cot: "off"` bot
+ * renders nothing, and a bubble create can fail; in all three there is no ⏹ to
+ * point at (independent review 2026-07-28).
  */
 function idleWaitingStatusText(
   silentMs: number,
@@ -402,12 +403,15 @@ class LiveCardKitProgressHandle implements CardKitProgressHandle {
     this.cotErrored = true;
   }
 
-  markIdleWaiting(silentMs: number): void {
+  markIdleWaiting(silentMs: number, opts?: { hasBubble?: boolean }): void {
     if (this.closed) return;
     this.idleWaiting = true;
-    // No in-card COT panel ⇒ this bot renders the bubble surface ⇒ a ⏹ exists.
+    // `hasBubble` comes from the CALLER, which is the only place that knows
+    // whether a bubble actually exists right now. Inferring it here from
+    // `cotDetail === undefined` was wrong for `cot: "off"` (no panel AND no
+    // bubble) and for a failed bubble create (independent review 2026-07-28).
     this.patchStatus(
-      idleWaitingStatusText(silentMs, this.metrics.toolUseCount, this.cotDetail === undefined),
+      idleWaitingStatusText(silentMs, this.metrics.toolUseCount, opts?.hasBubble === true),
     );
   }
 

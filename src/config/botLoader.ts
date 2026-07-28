@@ -395,14 +395,18 @@ export const BotConfigSchema = z.object({
   backend: z.string().min(1).default("claude"),
 
   /**
-   * Idle-watchdog override, in seconds. The bridge interrupts a turn when the
-   * runner emits NO stream events for this long with no tool call in flight
-   * (default 180 s — see handler.ts DEFAULT_CARDKIT_IDLE_TIMEOUT_MS). The
-   * judged quantity is event silence, not total turn duration. Raise it for
-   * bots whose turns legitimately go silent for minutes: a huge tool result
-   * (e.g. dozens of MCP records) puts the model into a long prefill during
-   * which the CLI emits nothing, which the default watchdog misreads as a
-   * hang and kills. Floor 30 s — anything lower would interrupt normal turns.
+   * When a silent turn starts SAYING it is silent, in seconds.
+   *
+   * BL-48 修订 (2026-07-28): this no longer interrupts anything. Past this much
+   * event silence the card's status line switches to
+   * 「⏳ 模型已 X 没有输出,仍在等待...」 (refreshed while the silence lasts) and the
+   * turn keeps running. Automatic interruption is a separate, opt-in knob —
+   * `idle_kill_seconds` below.
+   *
+   * Raise it for bots whose turns legitimately go quiet for minutes (a huge tool
+   * result puts the model into a long prefill during which the CLI emits
+   * nothing); lower it to be told sooner. Either way nothing is killed, so the
+   * value is a UX choice, not a safety one. Floor 30 s.
    */
   idle_timeout_seconds: z.number().int().min(30).optional(),
 
