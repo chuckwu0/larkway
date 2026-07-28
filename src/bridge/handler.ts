@@ -280,7 +280,10 @@ function idleThresholdHint(idleTimeoutMs: number, idleKillAfterMs?: number): str
   if (idleKillAfterMs === undefined) {
     return (
       `本 bot 未配置自动中断（\`idle_kill_seconds\` 未设）——` +
-      `静默不会被我们打断，本轮是自己结束的。提示阈值 ` +
+      // NOT "本轮是自己结束的": this hint also renders on the runaway-guard ending,
+      // where something else DID end the turn. Claiming otherwise contradicted the
+      // very branch that produced it (independent review, round 5).
+      `我们不会因为静默打断它；本轮结束另有原因（子进程退出或 60 分钟兜底）。提示阈值 ` +
       `${Math.round(idleTimeoutMs / 1000)} 秒 = \`idle_timeout_seconds\`。`
     );
   }
@@ -1687,6 +1690,21 @@ export class BridgeHandler {
     let cotFileAt: string | undefined;
     /** BL-48: resolves once this turn's cot.json write has settled (or failed). */
     let cotPersistSettled: Promise<unknown> = Promise.resolve();
+    /**
+     * write-before-DELETE. The ledger delete must not outrun the ledger write —
+     * a delete that runs first finds nothing, the write lands after it, and the
+     * file is stranded until the next boot sweep. Raced against a short deadline
+     * because the write is best-effort and local: a stalled fs must never hold the
+     * bubble completion or its cleanup hostage (independent review, rounds 3, 5).
+     */
+    const cotPersistWriteSettled = (): Promise<unknown> =>
+      Promise.race([
+        cotPersistSettled.catch(() => {}),
+        new Promise((resolve) => {
+          const t = setTimeout(resolve, COT_LEDGER_WRITE_GRACE_MS);
+          t.unref?.();
+        }),
+      ]);
     let cotTurnOutcome: "done" | "error" = "done";
     const settle = (ok: boolean): void => {
       if (settled) return;
@@ -3162,14 +3180,19 @@ export class BridgeHandler {
         let lastActivityAt = Date.now();
         let interruptedByIdle = false;
         // BL-48 分级处置 state: `idleSuspected` flips when silence first crosses
-        // idleTimeoutMs and clears the moment any event arrives.
+        // idleTimeoutMs and clears the moment any event arrives. NOTICE STATE ONLY —
+        // it drives the ⏳ patch/refresh cadence and nothing else. It was briefly the
+        // wedge predicate's evidence (rounds 3-4); that was wrong precisely because
+        // any event clears it, including the `result` line the pooled claude path
+        // pushes right before settling, which made the predicate structurally dead on
+        // the default backend (independent review, round 5).
         // `idleKilledAfterMs` records the silence actually observed at kill time,
         // so the card states a measured number rather than the threshold.
         let idleSuspected = false;
         /** Silence (ms) at the last ⏳ notice patch — drives the refresh cadence. */
         let idleNoticeAtMs = 0;
         /**
-         * Longest silence this turn was ever observed in, whether or not anything
+         * Longest silence the current stall was observed in, whether or not anything
          * interrupted it. The BL-38 reset card reports it: with idle-kill off,
          * `idleKilledAfterMs` stays 0 and the card would claim「连续 0 秒」.
          */
@@ -3235,9 +3258,13 @@ export class BridgeHandler {
             // below must stay reachable even when the ceiling clamped the kill
             // budget below this threshold.
             if (silentMs >= idleTimeoutMs) {
-              // Longest silence this turn has shown, kill or no kill — the BL-38
-              // reset card quotes it, and without a kill `idleKilledAfterMs` is 0.
-              idleObservedSilenceMs = Math.max(idleObservedSilenceMs, silentMs);
+              // Longest silence of the CURRENT stall — the cards quote it. A tool
+              // call's silence is expected and must not become wedge evidence
+              // (three 20-minute builds would otherwise poison-reset the session —
+              // independent review, round 5), but it is still worth SHOWING.
+              if (!toolExemptsKill) {
+                idleObservedSilenceMs = Math.max(idleObservedSilenceMs, silentMs);
+              }
               // BL-48 分级处置 stage 1: threshold crossed → suspect, NOT dead. The
               // turn keeps running; the card says so (markIdleWaiting), and the
               // silence is recorded so a false kill can be told apart from a real
@@ -3255,6 +3282,7 @@ export class BridgeHandler {
                 try {
                   cardKitProgress?.markIdleWaiting(silentMs, {
                     hasBubble: cotPublisher?.bubbleRef !== undefined,
+                    toolInFlight: toolExemptsKill,
                   });
                 } catch {
                   /* best-effort — never let the notice affect the turn */
@@ -3275,6 +3303,7 @@ export class BridgeHandler {
                 try {
                   cardKitProgress?.markIdleWaiting(silentMs, {
                     hasBubble: cotPublisher?.bubbleRef !== undefined,
+                    toolInFlight: toolExemptsKill,
                   });
                 } catch {
                   /* status notice is best-effort — never let it affect the turn */
@@ -3768,40 +3797,50 @@ export class BridgeHandler {
            * must always reset the counter to 0, which is also what BL-38's own
            * contract promises.
            */
-          // BL-38's question is "does this SESSION wedge?", so the predicate keys on
-          // HOW THE TURN ENDED, never on what it produced.
+          // BL-38's question, settled after five review rounds of flip-flopping:
+          // **does this session repeatedly go quiet and deliver nothing?**
+          // Two conditions, both required — every previous version dropped one and
+          // broke in that direction:
           //
-          // Three rounds of review went in circles on an output-based predicate and
-          // every version was wrong in one direction or the other:
-          //   - `!success` (exit 0 = fine) let a zero-output turn reset the streak;
-          //   - marker-channel text only declared a rescued out-of-marker answer a
-          //     hang and overwrote it;
-          //   - adding `lastInternalText` then counted a mere PREAMBLE ("我先看一下
-          //     代码。") as delivery, re-opening the first hole through a new signal.
-          // The lesson: output cannot separate "wedged" from "finished badly",
-          // because a turn that says something and then wedges says something.
+          //   quiet at the end   — otherwise a turn that fails fast counts as a wedge
+          //   delivered nothing  — otherwise a turn that ANSWERED and then went quiet
+          //                        counts, and three of them poison-reset a session,
+          //                        overwriting the delivered answer with 已重置
+          //                        (measured, round 5 — the round-2 catastrophe in a
+          //                        new guise)
           //
-          // How it ended can. A process that exits 0 CHOSE to exit — it was not
-          // wedged, whatever the quality of its output (an empty answer is the
-          // card's problem, not the session's). A turn that went quiet and then had
-          // to be ended for it — the 60-min runaway guard, an opted-in idle kill, a
-          // crash — is the wedge BL-38 exists to break out of.
-          const endedExternally = result.exitCode !== 0;
-          const idleHangObserved =
-            !stoppedByUser &&
-            idleSuspected &&
-            endedExternally &&
-            // An agent that reported its own terminal status was talking to us at
-            // the end; that is not a wedge. `ready` also protects the documented
-            // "status=ready, grandchild reaped by the grace period" success — the
-            // round-2 catastrophe was exactly this turn being poison-reset.
-            reportedStatus !== "failed" &&
-            reportedStatus !== "ready";
+          // NOT keyed on the exit code, which round 4 tried: there is no process exit
+          // on the pooled path at all (claude/pool.ts synthesises
+          // `subtype === "success" ? 0 : 1`), and claude/runner.ts resolves with
+          // `code ?? 1`, so a child that traps SIGTERM and exits 0 makes every kill
+          // look voluntary. Round 5 measured that predicate as structurally dead on
+          // the DEFAULT backend.
+          //
+          // NOT keyed on `idleSuspected` either: any stream event clears it, and the
+          // pooled claude path pushes the CLI's `result` line onto the queue right
+          // before settling, so it is always false at finalize. Terminal silence is
+          // sampled here instead — and `interruptedByIdle`, which the watchdog sets
+          // and no event clears, covers the opted-in kill on every path.
+          const terminalSilenceMs = Date.now() - lastActivityAt;
+          // A turn still inside a tool call is silent for a REASON, and the reason is
+          // not a wedge: a 20-minute build emits nothing between tool_use and
+          // tool_result. Counting those would let three slow builds poison-reset a
+          // session, which cannot possibly help a slow build.
+          //
+          // Accepted cost, stated plainly: a turn genuinely wedged INSIDE a tool
+          // (the tool_result never comes) is not counted either, so its session
+          // cannot self-heal. That is the conservative side of a destructive action
+          // — BL-38 drops a session's context, so a missed wedge costs one slow
+          // recovery while a false one costs the user their thread.
+          const endedMidTool = toolsInFlight > 0;
+          const endedQuiet =
+            interruptedByIdle ||
+            (!endedMidTool && idleTimeoutMs > 0 && terminalSilenceMs >= idleTimeoutMs);
 
-          // Separate question, separate flag (conflating the two is what produced
-          // the round-3 and round-4 bugs): will the user be shown any body text?
-          // Only consulted to keep the hang CARD from overwriting something real —
-          // never to decide whether the turn hung.
+          // Everything the user will actually be shown as this turn's body. Read by
+          // BOTH the counter and the card: the counter must not punish a turn that
+          // delivered, and the hang card must not overwrite what it delivered.
+          // Splitting these two readers is what let round 5's over-count through.
           const willShowBodyText =
             (
               trustedAnswerText.trim() ||
@@ -3816,6 +3855,17 @@ export class BridgeHandler {
               !trustedAnswerText.trim() &&
               !cardKitProgress?.answerText.trim() &&
               lastInternalText.trim().length > 0);
+
+          const idleHangObserved =
+            !stoppedByUser &&
+            endedQuiet &&
+            !willShowBodyText &&
+            // An agent that reported its own terminal status was talking to us at the
+            // end; that is not a wedge. `ready` also protects the documented
+            // "status=ready, grandchild reaped by the grace period" success — the
+            // round-2 catastrophe was exactly that turn being poison-reset.
+            reportedStatus !== "failed" &&
+            reportedStatus !== "ready";
           let success: boolean;
           let failureReason: string | undefined;
           if (reportedStatus === "failed") {
@@ -3841,9 +3891,7 @@ export class BridgeHandler {
               appendPath: "Agent 卡死中断",
               reason: failureReason,
             });
-          } else if (result.exitCode === 0) {
-            // Exited on its own → not a wedge. `idleHangObserved` cannot be true
-            // here (it requires a non-zero exit), so no guard is needed.
+          } else if (result.exitCode === 0 && !idleHangObserved) {
             //
             // KNOWN PRE-EXISTING INCOHERENCE, deliberately left alone: a turn that
             // exits 0 having produced no body text renders the ⚠️ 没有产出正文 card
@@ -3912,7 +3960,9 @@ export class BridgeHandler {
           // background-adopted bubble may not exist as cotPublisher yet here).
           cotTurnOutcome = success ? "done" : "error";
           if (cotPublisher) {
-            void cotPublisher
+            const publisher = cotPublisher;
+            const ledgerAt = cotFileAt;
+            void publisher
               .finalize(
                 cotTurnOutcome,
                 stoppedByUser
@@ -3921,6 +3971,20 @@ export class BridgeHandler {
                     ? { message: "idle timeout" }
                     : undefined,
               )
+              // The ledger delete belongs to THIS call — the one that actually
+              // performs the completion. Round 4 hung it off the finally-block's
+              // second finalize instead, which returns the memo; since the memo is
+              // only written after this `await complete()` resolves, and the second
+              // call routinely runs first, round 5 measured the ledger STRANDED at
+              // every `complete()` latency ≥ 20 ms — i.e. on every real turn, with
+              // the existing guard passing only because its stub was local and
+              // sub-millisecond.
+              .then(async (completed) => {
+                if (!completed || !ledgerAt || !publisher.bubbleRef) return;
+                // write-before-delete (see ledgerWriteSettled in the finally block)
+                await cotPersistWriteSettled();
+                await deleteCotFileIfMatches(ledgerAt, publisher.bubbleRef.cotId);
+              })
               .catch(() => {
                 /* best-effort COT completion — never affects the turn */
               });
@@ -4770,23 +4834,15 @@ export class BridgeHandler {
       // adopted) handle no-ops via its closed guard; a late one gets completed
       // when it resolves. Never throws.
       if (bubbleCreate) {
-        // Raced against a short deadline: this is a best-effort LOCAL write, and
-        // gating the anti-orphan finalize on it unconditionally would mean a
-        // stalled fs (network mount, full disk) leaves the bubble `Working`
-        // forever — precisely the orphan cot.json exists to prevent (independent
-        // review, round 3). Ordering is still honored in every normal case.
-        void Promise.race([
-          cotPersistSettled.catch(() => {}),
-          new Promise((resolve) => {
-            const t = setTimeout(resolve, COT_LEDGER_WRITE_GRACE_MS);
-            t.unref?.();
-          }),
-        ])
-          .then(() => bubbleCreate!)
+        void Promise.resolve(bubbleCreate!)
           .then((handle) =>
           handle
             .finalize(cotTurnOutcome)
             .catch(() => false as boolean)
+            // `completed` is true only when THIS call performed the completion (a
+            // late-adopted bubble the primary path never saw). When the primary
+            // already completed it, the memo says so and the delete has already
+            // happened there.
             // BL-48: drop cot.json so boot reconcile doesn't re-complete a finished
             // bubble — but ONLY when the platform actually accepted the completion.
             // Deleting unconditionally (the first version) also dropped it when
@@ -4795,11 +4851,11 @@ export class BridgeHandler {
             // record that could have recovered it already gone (independent review,
             // round 4). A crash between finalize and delete likewise leaves the file,
             // which is the whole point of the ordering.
-            .then((completed) =>
-              completed && cotFileAt && handle.bubbleRef
-                ? deleteCotFileIfMatches(cotFileAt, handle.bubbleRef.cotId)
-                : undefined,
-            )
+            .then(async (completed) => {
+              if (!completed || !cotFileAt || !handle.bubbleRef) return;
+              await cotPersistWriteSettled();
+              await deleteCotFileIfMatches(cotFileAt, handle.bubbleRef.cotId);
+            })
             .catch(() => {}),
         );
       }

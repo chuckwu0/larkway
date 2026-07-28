@@ -3694,6 +3694,13 @@ describe("handleOne — COT bubble ordering (before the card)", () => {
     existingTopic?: boolean;
     /** true → both card surfaces fail so no card message id exists (fallback path). */
     noCard?: boolean;
+    /**
+     * true -> the turn RESOLVES with a non-zero exit and no state.json: a failure
+     * that is neither an idle interrupt nor a /stop. `errorTurn` cannot stand in
+     * for it (it rejects, so the outer catch sets the bubble outcome and the
+     * derivation under test is bypassed).
+     */
+    resolvedFailure?: boolean;
     /** true → a stall-nudge/comment-relay shaped event (fake message_id + root anchor). */
     syntheticTrigger?: boolean;
   }) {
@@ -3713,13 +3720,16 @@ describe("handleOne — COT bubble ordering (before the card)", () => {
     runClaudeImpl = () => ({
       events: (async function* () {
         yield { type: "system_init", sessionId: "sess_order", raw: {} };
-        if (!opts.errorTurn) {
+        if (!opts.errorTurn && !opts.resolvedFailure) {
           await writeFile(stateFileMod.stateFilePathOf(wt), JSON.stringify(READY_STATE, null, 2), "utf8");
         }
       })(),
       done: opts.errorTurn
         ? Promise.reject(new Error("mock runner crash"))
-        : Promise.resolve({ exitCode: 0, sessionId: "sess_order" }),
+        : Promise.resolve({
+            exitCode: opts.resolvedFailure ? 1 : 0,
+            sessionId: "sess_order",
+          }),
       kill: () => {},
     });
     const { renderer } = makeCardRenderer(opts.noCard ? { failStart: true } : {});
@@ -3767,12 +3777,41 @@ describe("handleOne — COT bubble ordering (before the card)", () => {
   // platform never times one out (still `Working` after 58 min), so a bridge that
   // dies with the ref only in memory leaves it spinning forever. Boot reconcile
   // can only fix that if the ledger exists.
-  // S3 (second review round): the bubble's terminal must mirror the answer card's
-  // verdict. The documented success case is `state.json status=ready` + a non-zero
-  // exit (the runner's grace timer SIGTERMs claude when a non-detached grandchild
-  // blocks exit — an OS quirk, not a failure). Deriving the bubble outcome from
-  // the exit code alone completed THAT as `error`, i.e. a green success card next
-  // to a bubble reporting a failed run.
+  // The REAL guard for deriving the bubble outcome from `success` rather than from
+  // `interruptedByIdle || stoppedByUser`: a turn that fails WITHOUT either flag set.
+  // The baseline expression yields `done` for it while the card is red — the two
+  // surfaces disagreeing is exactly what the move fixed, and nothing else in the
+  // suite discriminates (independent review, round 5).
+  it("BL-48: a failed turn completes the bubble as error, not done", async () => {
+    const completes: string[] = [];
+    const cotClient: OutboundCotClient = {
+      async create() {
+        return { cotId: "cot_fail", messageId: "om_cot_fail" };
+      },
+      async resolveThreadId() {
+        return undefined;
+      },
+      async update() {},
+      async complete(_ref, reason) {
+        completes.push(reason);
+      },
+    };
+
+    await runTurn({ cotClient, existingTopic: true, resolvedFailure: true });
+
+    expect(completes).toEqual(["error"]);
+  });
+
+  // Documents the bubble outcome for the `state.json status=ready` + non-zero exit
+  // case (the runner's grace timer SIGTERMs claude when a non-detached grandchild
+  // blocks exit — an OS quirk, not a failure).
+  //
+  // NOT a guard for moving `cotTurnOutcome` behind the success computation: the
+  // baseline expression (`interruptedByIdle || stoppedByUser ? "error" : "done"`)
+  // already yielded `done` for this exact input, so reverting the move leaves this
+  // test green. The claim that it guarded that move was fabricated (independent
+  // review, round 5). The real discriminator is an agent-reported failure, which
+  // (a10) covers.
   it("BL-48: a status=ready turn killed by the grandchild grace still completes the bubble as done", async () => {
     const wt = join(root, "om_msg");
     const completions: string[] = [];
@@ -3873,6 +3912,12 @@ describe("handleOne — COT bubble ordering (before the card)", () => {
         // Sampled at teardown — the ledger must still be on disk here, so a
         // crash DURING complete() is still recoverable at next boot.
         ledgerSamples.push(await cotFileMod.readCotFile(wtPath));
+        // Model a real Feishu round-trip. Round 5 measured the ledger STRANDED at
+        // every latency ≥ 20 ms, while this test passed — because a local,
+        // sub-millisecond stub let the finally-block's finalize win the race that
+        // the delete had been (wrongly) hung off. A guard for an ordering bug has
+        // to model the latency that exposes it.
+        await new Promise((r) => setTimeout(r, 40));
       },
     };
 
@@ -5413,15 +5458,18 @@ describe("BL-38: poison-session self-heal", () => {
     expect(stuckCountOf(records)).toBe(1);
   });
 
-  // Round 3 asked for the opposite of what this now asserts, and round 4 showed why
-  // it had to change. Round 3's shape was "silent + exit 0 + no output must count as
-  // a hang"; every output-based way to express that was wrong in one direction or
-  // the other (see the predicate's comment in handler.ts). The semantics settled on
-  // HOW THE TURN ENDED: a process that exits 0 chose to exit, so it was not wedged —
-  // its empty output is the card's problem, not the session's. Round 3's real
-  // complaint (a failure card recorded as a success) is fixed at the source instead:
-  // the turn is no longer called a success.
-  it("(a4) a silent turn that exits 0 with no output is NOT a session wedge", async () => {
+  // ⚠️ This expectation moved THREE times across five review rounds. The history is
+  // the point — each move was a real correction, and the final rule is the one to
+  // defend:
+  //   round 3: "silent + exit 0 + no output must count" → keyed on output alone, so
+  //            a mere PREAMBLE counted as delivery (found in round 4).
+  //   round 4: "exit 0 = it chose to exit, never a wedge" → keyed on the exit code,
+  //            which round 5 measured as structurally dead on the DEFAULT pooled
+  //            claude path (synthesised code; no process exit at all).
+  //   round 5 (settled): quiet at the end AND delivered nothing. The exit code is not
+  //            consulted at all. A turn that goes quiet and hands the user nothing is
+  //            exactly what BL-38 exists to escape, however the process exited.
+  it("(a4) a quiet turn that delivered nothing counts, whatever its exit code", async () => {
     const { store, records } = seedStore(1);
     await seedWorktree(threadId);
     await seedRepoCachePath();
@@ -5437,14 +5485,110 @@ describe("BL-38: poison-session self-heal", () => {
     const { cardKitCalls, acked } = await runTurn(store, { noIdleKill: true });
 
     expect(acked).toEqual([threadId]);
-    // Exited on its own → not a wedge, and `success` stays true so the streak
-    // resets. That `success` coexists with a ⚠️ 没有产出正文 card is a PRE-EXISTING
-    // incoherence, deliberately not fixed inside this change (see handler.ts's note
-    // on the exit-0 branch) — this test pins today's behavior, not the ideal.
-    expect(stuckCountOf(records)).toBe(0);
+    expect(stuckCountOf(records)).toBe(2);
     const text = finalCardText(cardKitCalls);
-    expect(text).toContain("没有产出正文");
+    // Idle-aware wording, not a crash story about a turn shown as ⏳ 仍在等待.
+    expect(text).toContain("长时间没有输出");
     expect(text).not.toContain("可能崩溃");
+  });
+
+  // Round-5 finding 2, measured on the real handler: a turn that DELIVERED an answer,
+  // then went quiet and exited non-zero, was counted as a wedge — and the third such
+  // turn poison-reset the session AND replaced the delivered answer with
+  // 「已重置本话题上下文」. The round-2 catastrophe in a new guise, reached because the
+  // counter and the card read different notions of "produced something".
+  it("(a11) a turn that DELIVERED an answer is never a wedge, however quietly it ended", async () => {
+    const { store, records } = seedStore(2); // one more strike would reset the session
+    await seedWorktree(threadId);
+    await seedRepoCachePath();
+    runClaudeImpl = () => ({
+      events: (async function* () {
+        yield { type: "system_init", sessionId: "sess_ans", raw: {} };
+        yield {
+          type: "answer_snapshot",
+          text: "LARKWAY_ANSWER_BEGIN\n这是真的答案\nLARKWAY_ANSWER_END",
+          raw: {},
+        };
+        await new Promise((r) => setTimeout(r, 120)); // quiet past the threshold…
+      })(),
+      done: Promise.resolve({ exitCode: 1, sessionId: "sess_ans" }), // …and a non-zero end
+      kill: () => {},
+    });
+
+    const { cardKitCalls, acked } = await runTurn(store, { noIdleKill: true });
+
+    expect(acked).toEqual([threadId]);
+    // The streak must not ADVANCE (it stays where it was). It does not reset either,
+    // because a non-zero exit is not a `success` — that is baseline behavior and is
+    // deliberately not widened here. What matters: no third strike, so no reset.
+    expect(stuckCountOf(records)).toBe(2);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    expect((records.get(key) as any)?.needsFreshStart).toBeUndefined();
+    const text = finalCardText(cardKitCalls);
+    expect(text).toContain("这是真的答案");
+    expect(text).not.toContain("已重置");
+  });
+
+  // Round-5 finding 4: the tool exemption change was completely unguarded (reverting
+  // it passed all 293 tests). A running tool is silent by construction, so its
+  // silence must be SHOWN (with tool-aware wording) but must never become wedge
+  // evidence — otherwise three slow builds poison-reset the session.
+  it("(a12) a long tool call shows a tool-aware notice and never counts as a wedge", async () => {
+    const { store, records } = seedStore(1);
+    await seedWorktree(threadId);
+    await seedRepoCachePath();
+    runClaudeImpl = () => ({
+      events: (async function* () {
+        yield { type: "system_init", sessionId: "sess_tool", raw: {} };
+        // tool_use with no matching tool_result: the shape of a slow build.
+        yield { type: "tool_use", toolName: "shell", toolInput: { command: "make" }, raw: {} };
+        await new Promise((r) => setTimeout(r, 130));
+      })(),
+      done: Promise.resolve({ exitCode: 1, sessionId: "sess_tool" }),
+      kill: () => {},
+    });
+
+    const { cardKitCalls, acked } = await runTurn(store, { noIdleKill: true });
+
+    expect(acked).toEqual([threadId]);
+    // A slow tool is not a wedged session.
+    expect(stuckCountOf(records)).toBe(1);
+    const notices = cardKitCalls
+      .filter((c) => c.kind === "updateElement" && c.elementId === "footer_md")
+      .map((c) => JSON.stringify(c.payload));
+    // It is still surfaced — with wording that does not read as "the model hung".
+    expect(notices.some((n) => n.includes("工具已运行"))).toBe(true);
+    expect(notices.some((n) => n.includes("模型已"))).toBe(false);
+  });
+
+  // Round-5 finding 8 / round-4 finding 8: the cards quote the silence figure as
+  // "how long it was quiet", so it must describe the CURRENT stall. Without the
+  // reset on recovery a turn that stalled, recovered, then stalled again reports the
+  // first (longer) stall.
+  it("(a13) the reported silence describes the current stall, not the whole turn", async () => {
+    const { store } = seedStore(0);
+    await seedWorktree(threadId);
+    await seedRepoCachePath();
+    runClaudeImpl = () => ({
+      events: (async function* () {
+        yield { type: "system_init", sessionId: "sess_two_stalls", raw: {} };
+        // Durations chosen so they RENDER differently: formatSilence rounds to whole
+        // seconds, so the first attempt (200ms vs 60ms) compared "0 秒" with "0 秒"
+        // and asserted nothing at all.
+        await new Promise((r) => setTimeout(r, 2600)); // long stall -> "3 秒"
+        yield { type: "internal_text", text: "回来了", raw: {} }; // recovery
+        await new Promise((r) => setTimeout(r, 60)); // short terminal stall -> "0 秒"
+      })(),
+      done: Promise.resolve({ exitCode: 1, sessionId: "sess_two_stalls" }),
+      kill: () => {},
+    });
+
+    const { cardKitCalls } = await runTurn(store, { noIdleKill: true });
+    const text = finalCardText(cardKitCalls);
+    expect(text).toContain("长时间没有输出");
+    // Quoting the FIRST stall would be a lie about what just happened.
+    expect(text).not.toContain("静默 3 秒");
+    expect(text).toContain("静默 0 秒");
   });
 
   // The shape that MUST count: quiet, and it had to be ended for it (the 60-min
