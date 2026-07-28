@@ -72,7 +72,7 @@ export interface CardKitProgressHandle {
    * stops looking byte-identical to a healthy one — without this the user just
    * sees 努力回答中 for the whole grace and cannot tell working from dead.
    */
-  markIdleWaiting(silentMs: number, opts?: { hasBubble?: boolean }): void;
+  markIdleWaiting(silentMs: number, opts?: { hasBubble?: boolean; toolInFlight?: boolean }): void;
   /** Silence ended — restore the normal progress status line. */
   clearIdleWaiting(): void;
 }
@@ -179,8 +179,15 @@ function idleWaitingStatusText(
   silentMs: number,
   toolUseCount: number,
   hasBubble: boolean,
+  toolInFlight: boolean,
 ): string {
-  const base = `⏳ 模型已 ${formatSilence(silentMs)} 没有输出,仍在等待...`;
+  // A running tool is silent BY CONSTRUCTION — a 20-minute build emits nothing
+  // between its tool_use and tool_result. Saying "模型没有输出" there reads as a
+  // hang for something entirely healthy (independent review, round 5), so the
+  // in-flight case gets its own honest wording.
+  const base = toolInFlight
+    ? `🔧 工具已运行 ${formatSilence(silentMs)},仍在等待返回...`
+    : `⏳ 模型已 ${formatSilence(silentMs)} 没有输出,仍在等待...`;
   const tools = toolUseCount > 0 ? ` · 已用 ${toolUseCount} 个工具` : "";
   const stop = hasBubble ? "想停可点思考气泡的 ⏹ 或发 /stop" : "想停发 /stop";
   return `${base}${tools} · ${stop}`;
@@ -403,7 +410,7 @@ class LiveCardKitProgressHandle implements CardKitProgressHandle {
     this.cotErrored = true;
   }
 
-  markIdleWaiting(silentMs: number, opts?: { hasBubble?: boolean }): void {
+  markIdleWaiting(silentMs: number, opts?: { hasBubble?: boolean; toolInFlight?: boolean }): void {
     if (this.closed) return;
     this.idleWaiting = true;
     // `hasBubble` comes from the CALLER, which is the only place that knows
@@ -411,7 +418,12 @@ class LiveCardKitProgressHandle implements CardKitProgressHandle {
     // `cotDetail === undefined` was wrong for `cot: "off"` (no panel AND no
     // bubble) and for a failed bubble create (independent review 2026-07-28).
     this.patchStatus(
-      idleWaitingStatusText(silentMs, this.metrics.toolUseCount, opts?.hasBubble === true),
+      idleWaitingStatusText(
+        silentMs,
+        this.metrics.toolUseCount,
+        opts?.hasBubble === true,
+        opts?.toolInFlight === true,
+      ),
     );
   }
 
