@@ -259,6 +259,13 @@ const IDLE_KILL_CEILING_MS = 15 * 60 * 1000;
 const IDLE_NOTICE_REFRESH_MS = 60_000;
 
 /**
+ * Max wait for this turn's cot.json write before the bubble is finalized anyway.
+ * The ledger only matters if we CRASH; a completed bubble matters always, so a
+ * stalled local write must never hold the completion hostage.
+ */
+const COT_LEDGER_WRITE_GRACE_MS = 2_000;
+
+/**
  * The knob hint on both interrupt cards. Quotes THIS bot's live threshold, not
  * the global default — a bot already running `idle_timeout_seconds: 600` would
  * otherwise be told "默认 180", which is both wrong for it and useless advice.
@@ -278,13 +285,15 @@ function idleThresholdHint(idleTimeoutMs: number, idleKillAfterMs?: number): str
   // (idle-kill is off by default), so the advice is about THAT knob — telling
   // them to raise `idle_timeout_seconds`, which now only moves the ⏳ notice,
   // would not stop the interrupt they just hit.
-  const killed =
-    idleKillAfterMs === undefined
-      ? ""
-      : `本 bot 配了 \`idle_kill_seconds\`（生效 ${Math.round(idleKillAfterMs / 1000)} 秒，` +
-        `上限 ${Math.round(IDLE_KILL_CEILING_MS / 60_000)} 分钟）。`;
+  // Reachable only past the early return above, so a budget always exists.
+  const atCeiling = idleKillAfterMs >= IDLE_KILL_CEILING_MS;
   return (
-    `${killed}若这类任务本来就要长时间静默思考，调大或直接删掉 \`idle_kill_seconds\`` +
+    `本 bot 配了 \`idle_kill_seconds\`（生效 ${Math.round(idleKillAfterMs / 1000)} 秒` +
+    (atCeiling ? `，已顶到 ${Math.round(IDLE_KILL_CEILING_MS / 60_000)} 分钟上限` : "") +
+    `）。若这类任务本来就要长时间静默思考，` +
+    // Once clamped at the ceiling, raising the knob cannot move the interrupt —
+    // only deleting it can (independent review, round 3).
+    (atCeiling ? "把它删掉" : "调大或直接删掉它") +
     `（删掉 = 不再自动中断，只在卡片上提示等待；当前提示阈值 ` +
     `${Math.round(idleTimeoutMs / 1000)} 秒 = \`idle_timeout_seconds\`）。`
   );
@@ -3203,8 +3212,8 @@ export class BridgeHandler {
           //
           // BL-48 修订: this is now opt-in. `undefined` = never kill on idle
           // (the default — see resolveIdleKillAfterMs). An operator who sets
-          // `idle_kill_seconds` gets exactly that budget, still clamped by the
-          // ceiling and never below the suspect threshold.
+          // `idle_kill_seconds` gets exactly that budget, clamped by the ceiling
+          // (which can put it BELOW the suspect threshold — see the kill gate).
           idleKillAfterMs = resolveIdleKillAfterMs(
             this.deps.responseSurfaceIdleKillMs,
             idleTimeoutMs,
@@ -3212,24 +3221,82 @@ export class BridgeHandler {
           idleWatchdog = setInterval(() => {
             if (toolsInFlight > 0) return; // real tool call pending — exempt from idle judgment
             const silentMs = Date.now() - lastActivityAt;
-            // The opted-in kill is judged FIRST and independently of the suspect
-            // threshold. Behind the early-return below, IDLE_KILL_CEILING_MS was
-            // not actually a ceiling: `idle_timeout_seconds: 1800` made the real
-            // interrupt point 30 min no matter what the clamp said, crossing the
-            // 60-min runaway guard the ceiling exists to stay inside (independent
-            // review 2026-07-28). When the clamp puts the kill BELOW the suspect
-            // threshold the interrupt now lands without a preceding ⏳ notice —
-            // accepted: an operator who sets both knobs past the ceiling has
-            // asked for the interrupt, and losing the guard is worse.
+            // Suspect + ⏳ notice. A BLOCK, not an early return: the kill gate
+            // below must stay reachable even when the ceiling clamped the kill
+            // budget below this threshold.
+            if (silentMs >= idleTimeoutMs) {
+              // Longest silence this turn has shown, kill or no kill — the BL-38
+              // reset card quotes it, and without a kill `idleKilledAfterMs` is 0.
+              idleObservedSilenceMs = Math.max(idleObservedSilenceMs, silentMs);
+              // BL-48 分级处置 stage 1: threshold crossed → suspect, NOT dead. The
+              // turn keeps running; the card says so (markIdleWaiting), and the
+              // silence is recorded so a false kill can be told apart from a real
+              // hang after the fact.
+              // The ⏳ line is REFRESHED while the silence lasts, not stamped once:
+              // with no automatic kill it is the whole interface for a stall, and a
+              // frozen "已 3 分钟" reading would leave a 55-minute wedge looking
+              // identical to a brief pause (independent review 2026-07-28).
+              // Rate-limited so a long stall costs a handful of patches, not one
+              // per cadence tick.
+              const noticeRefreshMs =
+                this.deps.idleNoticeRefreshMs ?? IDLE_NOTICE_REFRESH_MS;
+              if (idleSuspected && silentMs - idleNoticeAtMs >= noticeRefreshMs) {
+                idleNoticeAtMs = silentMs;
+                try {
+                  cardKitProgress?.markIdleWaiting(silentMs, {
+                    hasBubble: cotPublisher?.bubbleRef !== undefined,
+                  });
+                } catch {
+                  /* best-effort — never let the notice affect the turn */
+                }
+              }
+              if (!idleSuspected) {
+                idleSuspected = true;
+                idleNoticeAtMs = silentMs;
+                console.warn(
+                  `[larkway] turn silent for ${Math.round(silentMs / 1000)}s ` +
+                    `(idle threshold ${Math.round(idleTimeoutMs / 1000)}s) — suspect, not dead; ` +
+                    (idleKillAfterMs === undefined
+                      ? `no idle-kill configured, the turn keeps running ` +
+                        `(ends on the runner, the user's ⏹ / /stop, or the runaway guard)`
+                      : `will interrupt at ${Math.round(idleKillAfterMs / 1000)}s of continuous silence`) +
+                    (this.deps.botConfig?.id ? ` [bot ${this.deps.botConfig.id}]` : ""),
+                );
+                try {
+                  cardKitProgress?.markIdleWaiting(silentMs, {
+                    hasBubble: cotPublisher?.bubbleRef !== undefined,
+                  });
+                } catch {
+                  /* status notice is best-effort — never let it affect the turn */
+                }
+                // Deliberately NOT returning: a tick that first observes a gap
+                // already past the grace (host sleep, a blocked event loop) must
+                // kill now rather than burn another full cadence in suspect.
+              }
+            }
+            // The opted-in kill is judged LAST in the tick but independently of the
+            // suspect early-return above, so both properties hold at once:
+            //   - the ⏳ notice always precedes an interrupt whenever the silence
+            //     has crossed the suspect threshold. Judging the kill FIRST (the
+            //     previous attempt) meant any bot with
+            //     `idle_kill_seconds <= idle_timeout_seconds` — e.g. the plausible
+            //     "warn me at 10 min, kill at 5 min" — killed with ZERO on-card
+            //     warning and no suspect log line (independent review 2026-07-28).
+            //   - IDLE_KILL_CEILING_MS still binds. Sitting behind the early
+            //     return alone, a suspect threshold past the ceiling made the real
+            //     interrupt point the THRESHOLD, not the clamp — so a bot with
+            //     `idle_timeout_seconds > 3600` could push its interrupt past the
+            //     60-min runaway guard the ceiling exists to stay inside, which
+            //     silently costs the 已中断 card and BL-38's counting.
+            // When the clamp puts the kill below the suspect threshold, the
+            // interrupt lands without a notice — unavoidable (the notice is not due
+            // yet) and strictly better than crossing the guard.
             if (idleKillAfterMs !== undefined && silentMs >= idleKillAfterMs) {
               interruptedByIdle = true;
               idleKilledAfterMs = silentMs;
-              // Record the hang on the SAME two fields the no-kill path uses, so
+              // Record the hang on the SAME two fields the no-kill path uses so
               // everything downstream (BL-38's evidence, the reset card's silence
-              // figure) has one notion of "this turn hung" regardless of who ended
-              // it. Without this, a bot whose kill budget equals its suspect
-              // threshold kills on the very first tick, never sets the suspect
-              // mark, and silently stops feeding BL-38.
+              // figure) has one notion of "this turn hung", whoever ended it.
               idleSuspected = true;
               idleObservedSilenceMs = Math.max(idleObservedSilenceMs, silentMs);
               if (idleWatchdog) clearInterval(idleWatchdog);
@@ -3240,55 +3307,6 @@ export class BridgeHandler {
                 /* best-effort: kill failure still finalizes as interrupted below */
               }
               return;
-            }
-            if (silentMs < idleTimeoutMs) return;
-            // Longest silence this turn has shown, kill or no kill — the BL-38
-            // reset card quotes it, and without a kill `idleKilledAfterMs` is 0.
-            idleObservedSilenceMs = Math.max(idleObservedSilenceMs, silentMs);
-            // BL-48 分级处置 stage 1: threshold crossed → suspect, NOT dead. The
-            // turn keeps running; the card says so (markIdleWaiting), and the
-            // silence is recorded so a false kill can be told apart from a real
-            // hang after the fact.
-            // The ⏳ line is REFRESHED while the silence lasts, not stamped once:
-            // with no automatic kill it is the whole interface for a stall, and a
-            // frozen "已 3 分钟" reading would leave a 55-minute wedge looking
-            // identical to a brief pause (independent review 2026-07-28).
-            // Rate-limited so a long stall costs a handful of patches, not one
-            // per cadence tick.
-            const noticeRefreshMs =
-              this.deps.idleNoticeRefreshMs ?? IDLE_NOTICE_REFRESH_MS;
-            if (idleSuspected && silentMs - idleNoticeAtMs >= noticeRefreshMs) {
-              idleNoticeAtMs = silentMs;
-              try {
-                cardKitProgress?.markIdleWaiting(silentMs, {
-                  hasBubble: cotPublisher?.bubbleRef !== undefined,
-                });
-              } catch {
-                /* best-effort — never let the notice affect the turn */
-              }
-            }
-            if (!idleSuspected) {
-              idleSuspected = true;
-              idleNoticeAtMs = silentMs;
-              console.warn(
-                `[larkway] turn silent for ${Math.round(silentMs / 1000)}s ` +
-                  `(idle threshold ${Math.round(idleTimeoutMs / 1000)}s) — suspect, not dead; ` +
-                  (idleKillAfterMs === undefined
-                    ? `no idle-kill configured, the turn keeps running ` +
-                      `(ends on the runner, the user's ⏹ / /stop, or the runaway guard)`
-                    : `will interrupt at ${Math.round(idleKillAfterMs / 1000)}s of continuous silence`) +
-                  (this.deps.botConfig?.id ? ` [bot ${this.deps.botConfig.id}]` : ""),
-              );
-              try {
-                cardKitProgress?.markIdleWaiting(silentMs, {
-                  hasBubble: cotPublisher?.bubbleRef !== undefined,
-                });
-              } catch {
-                /* status notice is best-effort — never let it affect the turn */
-              }
-              // Deliberately NOT returning: a tick that first observes a gap
-              // already past the grace (host sleep, a blocked event loop) must
-              // kill now rather than burn another full cadence in suspect.
             }
           }, cadenceMs);
           idleWatchdog.unref?.();
@@ -3697,6 +3715,7 @@ export class BridgeHandler {
           const cardKitTimeoutFailure =
             !stoppedByUser &&
             interruptedByIdle && reportedStatus !== "ready" && reportedStatus !== "failed";
+
           /**
            * BL-38 evidence, decoupled from the kill (BL-48 修订).
            *
@@ -3712,7 +3731,17 @@ export class BridgeHandler {
            * came back", which the suspect mark records whether or not anything
            * killed the turn.
            *
-           * `!success` is LOAD-BEARING, not belt-and-suspenders. `idleSuspected`
+           * The predicate deliberately does NOT key off `success`. `success` is
+           * true whenever the runner merely exits 0 — including a turn that
+           * emitted absolutely nothing — so keying off it both failed to count
+           * that hang AND reset the streak, letting a thread that alternates
+           * endings (guard-reaped 143 → +1, silent exit 0 → back to 0) never reach
+           * three in a row and never self-heal. Worse, that same turn renders a
+           * ⚠️ 没有产出正文 card, so the counter recorded a clean success while the
+           * user was told it failed (independent review, round 3).
+           *
+           * Excluding `ready` / any produced answer text is LOAD-BEARING, not
+           * belt-and-suspenders. `idleSuspected`
            * is only cleared when the NEXT stream event arrives, and the gap
            * between a turn's last event and the process actually exiting can
            * exceed the threshold on its own (the claude runner alone allows a
@@ -3724,6 +3753,16 @@ export class BridgeHandler {
            * must always reset the counter to 0, which is also what BL-38's own
            * contract promises.
            */
+          // A turn that produced SOMETHING is not a poison hang, whatever its exit
+          // code — that is what separates "slow but fine" from "wedged".
+          const producedAnswerText =
+            (trustedAnswerText.trim() || cardKitProgress?.answerText.trim() || "").length > 0;
+          const idleHangObserved =
+            !stoppedByUser &&
+            idleSuspected &&
+            reportedStatus !== "failed" &&
+            reportedStatus !== "ready" &&
+            !producedAnswerText;
           let success: boolean;
           let failureReason: string | undefined;
           if (reportedStatus === "failed") {
@@ -3749,8 +3788,25 @@ export class BridgeHandler {
               appendPath: "Agent 卡死中断",
               reason: failureReason,
             });
-          } else if (result.exitCode === 0) {
+          } else if (result.exitCode === 0 && !idleHangObserved) {
             success = true;
+          } else if (idleHangObserved) {
+            // BL-48 修订: the flagship ending of this change — the turn went silent,
+            // nothing interrupted it, and it produced nothing. Without this branch
+            // it fell through to 可能崩溃 below and told the operator a crash story
+            // about a turn the bridge had been reporting as ⏳ 仍在等待 for the whole
+            // hour (independent review, round 3). `cardKitTimeoutFailure` can't
+            // cover it — that one requires an actual interrupt.
+            success = false;
+            failureReason =
+              `agent turn produced nothing and was silent for ${idleObservedSilenceMs}ms ` +
+              `(suspect at ${idleTimeoutMs}ms; no idle_kill configured — ended by ` +
+              `exit ${result.exitCode})`;
+            await recordEvent({
+              status: "running",
+              appendPath: "Agent 长时间无输出",
+              reason: failureReason,
+            });
           } else {
             success = false;
             failureReason = `claude exited ${result.exitCode} 且 bot 未更新 state.json status — 可能崩溃`;
@@ -3806,11 +3862,7 @@ export class BridgeHandler {
               });
           }
 
-          const idleHangObserved =
-            !stoppedByUser &&
-            idleSuspected &&
-            !success &&
-            reportedStatus !== "failed";
+
           const nextStuckCount = idleHangObserved
             ? prevStuckCount + 1
             : success
@@ -4060,6 +4112,14 @@ export class BridgeHandler {
                 // latter without asking us.
                 ? `⚠️ 本轮被中断（连续 ${formatSilence(idleKilledAfterMs)}没有任何输出，判定卡死），未完成。请重试。\n` +
                   idleThresholdHint(idleTimeoutMs, idleKillAfterMs)
+                : idleHangObserved
+                  // BL-48 修订: silent, produced nothing, and NOBODY interrupted it
+                  // — the ending this change makes the common one. It used to fall
+                  // through to the generic 没有产出正文/可能崩溃 text, i.e. a crash
+                  // story about a turn we had been showing as ⏳ 仍在等待 the whole
+                  // time (independent review, round 3).
+                  ? `⚠️ 本轮长时间没有输出（静默 ${formatSilence(idleObservedSilenceMs)}）后结束，没有产出正文。\n` +
+                    idleThresholdHint(idleTimeoutMs, idleKillAfterMs)
                 : reportedState?.last_message ??
                   (fallbackAnswer ? fallbackAnswer : noOutputFallback);
 
@@ -4646,8 +4706,18 @@ export class BridgeHandler {
       // adopted) handle no-ops via its closed guard; a late one gets completed
       // when it resolves. Never throws.
       if (bubbleCreate) {
-        void cotPersistSettled
-          .catch(() => {})
+        // Raced against a short deadline: this is a best-effort LOCAL write, and
+        // gating the anti-orphan finalize on it unconditionally would mean a
+        // stalled fs (network mount, full disk) leaves the bubble `Working`
+        // forever — precisely the orphan cot.json exists to prevent (independent
+        // review, round 3). Ordering is still honored in every normal case.
+        void Promise.race([
+          cotPersistSettled.catch(() => {}),
+          new Promise((resolve) => {
+            const t = setTimeout(resolve, COT_LEDGER_WRITE_GRACE_MS);
+            t.unref?.();
+          }),
+        ])
           .then(() => bubbleCreate!)
           .then((handle) =>
           handle

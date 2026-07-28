@@ -1191,6 +1191,169 @@ describe("handleOne — thin-channel finalize", () => {
     expect(JSON.stringify(finalUpdate?.payload)).toContain("工具计数完成");
   });
 
+  // Round-3 finding 3: the ⏹ hint's CALLER wiring had no coverage — dropping the
+  // `{hasBubble}` argument at both call sites turned nothing red. One case is
+  // enough to close that: with the argument gone, `opts?.hasBubble === true` is
+  // false for EVERY bot, so a bubble bot losing its ⏹ catches it. The three
+  // no-bubble shapes are covered deterministically in cardkitProgress.test.ts.
+  it("BL-48 修订: a bubble bot's waiting notice names ⏹ (caller wiring, not just the formatter)", async () => {
+    await seedWorktree("om_msg");
+    await seedRepoCachePath();
+    const { client: cardKitClient, calls: cardKitCalls } = makeCardKitClient();
+    let released = false;
+    runClaudeImpl = () => ({
+      events: (async function* () {
+        yield { type: "system_init", sessionId: "sess_hint", raw: {} };
+        while (!released) await new Promise((r) => setTimeout(r, 5));
+      })(),
+      done: Promise.resolve({ exitCode: 0, sessionId: "sess_hint" }),
+      kill: () => {},
+    });
+    const cotClient: OutboundCotClient = {
+      async create() {
+        return { cotId: "cot_hint", messageId: "om_cot_hint" };
+      },
+      async resolveThreadId() {
+        return undefined;
+      },
+      async update() {},
+      async complete() {},
+    };
+
+    const { renderer } = makeCardRenderer();
+    const { store } = makeSessionStore();
+    store.get = (() =>
+      ({ threadId: "om_msg", sessionId: "prev", lastActiveTs: 0 })) as unknown as typeof store.get;
+    const { client } = makeClient(makeEvent());
+    const handler = new BridgeHandler({
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      client: client as any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      cardRenderer: renderer as any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      sessionStore: store as any,
+      conventions: makeConventions(),
+      botConfig: {
+        id: "frontend",
+        name: "Frontend",
+        turn_taking_limit: 10,
+        backend: "claude",
+        cot: "brief",
+        cotSurface: "bubble",
+        response_surface_prototype: {
+          enabled: true,
+          allowed_chats: [],
+          allowed_threads: ["om_msg"],
+          kill_switch: false,
+          post_outbound_enabled: false,
+          cardkit_streaming_enabled: true,
+          allow_agent_mentions: true,
+          denied_mention_open_ids: [],
+          allowed_mention_open_ids: [],
+        },
+      },
+      cardKitClient,
+      cotClient,
+      responseSurfaceIdleTimeoutMs: 30,
+    });
+
+    await handler.run();
+    const noticeOf = (): string =>
+      cardKitCalls
+        .filter((c) => c.kind === "updateElement" && c.elementId === "footer_md")
+        .map((c) => JSON.stringify(c.payload))
+        .filter((p) => p.includes("仍在等待"))
+        .at(-1) ?? "";
+    for (let i = 0; i < 400 && noticeOf() === ""; i++) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    released = true;
+
+    const notice = noticeOf();
+    expect(notice).not.toBe(""); // the sampling itself must not be a no-op
+    expect(notice).toContain("⏹");
+    expect(notice).toContain("/stop");
+  });
+
+  // Round-3 finding 2: judging the kill BEFORE the suspect gate meant any bot with
+  // `idle_kill_seconds <= idle_timeout_seconds` — e.g. the plausible "warn me at
+  // 10 min, kill at 5 min" — was killed with ZERO on-card warning, because the
+  // kill branch returned before the notice was ever patched. The notice must come
+  // first whenever the silence has crossed the suspect threshold.
+  it("BL-48 修订: an opted-in kill still shows the ⏳ notice first (kill budget == suspect threshold)", async () => {
+    const threadId = "om_msg";
+    await seedWorktree(threadId);
+    await seedRepoCachePath();
+    const { client: cardKitClient, calls: cardKitCalls } = makeCardKitClient();
+    let killed = false;
+
+    runClaudeImpl = () => {
+      let resolveDone: (r: { exitCode: number; sessionId?: string }) => void = () => {};
+      const done = new Promise<{ exitCode: number; sessionId?: string }>((res) => {
+        resolveDone = res;
+      });
+      return {
+        events: (async function* () {
+          yield { type: "system_init", sessionId: "sess_both", raw: {} };
+          while (!killed) await new Promise((r) => setTimeout(r, 5));
+        })(),
+        done,
+        kill: () => {
+          killed = true;
+          resolveDone({ exitCode: 143, sessionId: "sess_both" });
+        },
+      };
+    };
+
+    const { renderer } = makeCardRenderer();
+    const { store } = makeSessionStore();
+    const { client, acked } = makeClient(makeEvent());
+    const handler = new BridgeHandler({
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      client: client as any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      cardRenderer: renderer as any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      sessionStore: store as any,
+      conventions: makeConventions(),
+      botConfig: {
+        id: "frontend",
+        name: "Frontend",
+        turn_taking_limit: 10,
+        backend: "claude",
+        cot: "off",
+        response_surface_prototype: {
+          enabled: true,
+          allowed_chats: [],
+          allowed_threads: ["om_msg"],
+          kill_switch: false,
+          post_outbound_enabled: false,
+          cardkit_streaming_enabled: true,
+          allow_agent_mentions: true,
+          denied_mention_open_ids: [],
+          allowed_mention_open_ids: [],
+        },
+      },
+      cardKitClient,
+      // Same value for both — the shape every BL-38 harness uses, and what a
+      // "kill sooner than you warn me" config collapses to after the clamp.
+      responseSurfaceIdleTimeoutMs: 30,
+      responseSurfaceIdleKillMs: 30,
+    });
+
+    await handler.run();
+    for (let i = 0; i < 400 && acked.length === 0; i++) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
+
+    expect(killed).toBe(true); // the interrupt still happens…
+    const statusPatches = cardKitCalls
+      .filter((c) => c.kind === "updateElement" && c.elementId === "footer_md")
+      .map((c) => JSON.stringify(c.payload));
+    // …and the user was told before it did.
+    expect(statusPatches.some((p) => p.includes("仍在等待"))).toBe(true);
+  });
+
   // BL-48 修订 (owner decision 2026-07-28): a silent turn is NOT killed unless
   // the operator opted in via `idle_kill_seconds`. The bridge cannot tell a hang
   // from a slow turn, and it does not know what the agent is being used for, so
@@ -5189,6 +5352,37 @@ describe("BL-38: poison-session self-heal", () => {
     expect(text).not.toContain("已重置本话题上下文");
   });
 
+  // Round-3 finding 1: `success` is true whenever the runner merely exits 0 —
+  // including a turn that emitted NOTHING. Keying the counter off it both missed
+  // that hang and RESET the streak, so a thread alternating endings
+  // (guard-reaped 143 → +1, silent exit 0 → back to 0) could never reach three in
+  // a row and never self-heal. The user meanwhile got a ⚠️ 没有产出正文 card, so
+  // the counter recorded a success the user was told was a failure.
+  it("(a4) a silent turn that produced NOTHING counts even when the runner exits 0", async () => {
+    const { store, records } = seedStore(1);
+    await seedWorktree(threadId);
+    await seedRepoCachePath();
+    runClaudeImpl = () => ({
+      events: (async function* () {
+        yield { type: "system_init", sessionId: "sess_void", raw: {} };
+        await new Promise((r) => setTimeout(r, 120)); // silent past the 30ms threshold
+      })(),
+      done: Promise.resolve({ exitCode: 0, sessionId: "sess_void" }),
+      kill: () => {},
+    });
+
+    const { cardKitCalls, acked } = await runTurn(store, { noIdleKill: true });
+
+    expect(acked).toEqual([threadId]);
+    // Counted, NOT reset — this is the poison shape BL-38 exists to catch.
+    expect(stuckCountOf(records)).toBe(2);
+    // And the card no longer tells a crash story about a turn we had been
+    // reporting as ⏳ 仍在等待 (round-3 finding 5).
+    const text = finalCardText(cardKitCalls);
+    expect(text).toContain("长时间没有输出");
+    expect(text).not.toContain("可能崩溃");
+  });
+
   // The mirror-image regression, caught by the SECOND review round: keying the
   // counter off the suspect mark alone counted SUCCESSFUL turns as hangs, because
   // `idleSuspected` is only cleared by the next stream event — the gap between a
@@ -5200,6 +5394,12 @@ describe("BL-38: poison-session self-heal", () => {
     const wt = await seedWorktree(threadId);
     await seedRepoCachePath();
 
+    // The trigger shape that actually discriminates: NO fresh state.json (the
+    // documented plain-reply fast path), answer only in the marker channel, exit 0.
+    // An earlier version of this test wrote `status: "ready"`, which the buggy
+    // predicate already excluded — so it passed against the bug it claimed to
+    // guard (independent review, round 3).
+    void wt;
     runClaudeImpl = () => ({
       events: (async function* () {
         yield { type: "system_init", sessionId: "sess_ok", raw: {} };
@@ -5208,11 +5408,6 @@ describe("BL-38: poison-session self-heal", () => {
           text: "LARKWAY_ANSWER_BEGIN\n真的答案\nLARKWAY_ANSWER_END",
           raw: {},
         };
-        await writeFile(
-          stateFileMod.stateFilePathOf(wt),
-          JSON.stringify({ status: "ready", updated_at: new Date().toISOString() }, null, 2),
-          "utf8",
-        );
         // Quiet well past the 30ms threshold before the process "exits" — the
         // shape every normal turn has (the claude runner alone allows a 30s
         // grandchild grace).
