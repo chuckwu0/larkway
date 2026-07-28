@@ -3755,8 +3755,24 @@ export class BridgeHandler {
            */
           // A turn that produced SOMETHING is not a poison hang, whatever its exit
           // code — that is what separates "slow but fine" from "wedged".
+          //
+          // `lastInternalText` and `reportedState.last_message` are LOAD-BEARING
+          // here, not thoroughness. A turn whose answer landed OUTSIDE the
+          // LARKWAY_ANSWER markers is a documented real failure mode that
+          // `untrustedAnswerFallback` (below) rescues and shows the user. Judging
+          // "produced nothing" on the marker channels alone would declare exactly
+          // those turns hung — overwriting a rescued answer with
+          // 「没有产出正文」 and feeding BL-38 toward a session reset. Same family as
+          // the round-2 bug: a destructive decision keyed to a signal that does
+          // not mean what it looks like it means.
           const producedAnswerText =
-            (trustedAnswerText.trim() || cardKitProgress?.answerText.trim() || "").length > 0;
+            (
+              trustedAnswerText.trim() ||
+              cardKitProgress?.answerText.trim() ||
+              lastInternalText.trim() ||
+              reportedState?.last_message?.trim() ||
+              ""
+            ).length > 0;
           const idleHangObserved =
             !stoppedByUser &&
             idleSuspected &&
