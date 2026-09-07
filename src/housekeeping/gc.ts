@@ -555,6 +555,20 @@ export async function cleanupWorktree(
     `[gc] found ${pids.length} process(es) for path=${worktreePath}: [${pids.join(", ")}]`,
   );
 
+  // A stale lastActiveTs is not proof that a legacy worktree is idle: it is
+  // only persisted when a turn finishes, so housekeeping can race an
+  // in-flight runner. Treat any live associated PID as authoritative and
+  // leave the worktree intact for a later scan. This mirrors the safety gate
+  // used by cleanupAgentSession and prevents the observed SIGTERM/143 race.
+  const alivePids = pids.filter(isPidAlive);
+  if (alivePids.length > 0) {
+    console.warn(
+      `[gc] skip live worktree thread=${threadId} path=${worktreePath}: ` +
+        `runner pid(s) [${alivePids.join(", ")}] still alive — not reclaiming in-flight work`,
+    );
+    return;
+  }
+
   // Kill each process individually (never pkill -9 -f <pattern>)
   for (const pid of pids) {
     try {

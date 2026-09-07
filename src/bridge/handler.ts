@@ -1522,8 +1522,23 @@ export class BridgeHandler {
       // receipt lookup must still hit. (批F: sessionKey may be the sticky
       // `p2p-<chat>` key — handleOne's turnReceivedAt lookup uses the same
       // derivation, so it keeps hitting.)
-      this.threadReceivedAt.set(key, Date.now());
-      if (sessionKey !== key) this.threadReceivedAt.set(sessionKey, Date.now());
+      const receivedAt = Date.now();
+      this.threadReceivedAt.set(key, receivedAt);
+      if (sessionKey !== key) this.threadReceivedAt.set(sessionKey, receivedAt);
+
+      // Housekeeping only sees lastActiveTs, which is normally written when a
+      // turn finishes. Refresh existing records at receipt time as well so a
+      // queued or in-flight legacy turn cannot look idle long enough for GC to
+      // reclaim its worktree. The optional call keeps lightweight test doubles
+      // and older embedders compatible with the SessionStore contract.
+      const touch = this.deps.sessionStore.touch;
+      if (typeof touch === "function") {
+        for (const touchedKey of new Set([key, sessionKey])) {
+          void touch.call(this.deps.sessionStore, touchedKey, this.deps.botConfig?.id).catch((err: unknown) => {
+            console.warn(`[bridge.handler] session touch failed for ${touchedKey} (continuing):`, err);
+          });
+        }
+      }
       let pendingList = pendingByKey.get(key);
       if (pendingList == null) {
         pendingList = [];

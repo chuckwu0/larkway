@@ -359,6 +359,17 @@ describe.skipIf(process.platform === "win32")("cleanupWorktree — botId path re
     const pgrepPath = pgrepCall?.args[pgrepCall.args.length - 1] ?? "";
     expect(pgrepPath).toMatch(/\.larkway[/\\]lee-qa[/\\]worktrees[/\\]om_v2_thread$/);
   });
+
+  it("skips cleanup when a runner PID is still alive", async () => {
+    // Use this test process as the mocked runner so the liveness probe is
+    // deterministic without spawning or signalling a real child.
+    resetSpawn([{ exitCode: 0, stdout: `${process.pid}\n` }]);
+    const { cleanupWorktree } = await import("./gc.js");
+    await cleanupWorktree("om_live_thread", "lee-qa", false);
+
+    expect(_spawnCalls.some((c) => c.cmd === "kill")).toBe(false);
+    expect(_spawnCalls.some((c) => c.cmd === "git")).toBe(false);
+  });
 });
 
 // ---------------------------------------------------------------------------
