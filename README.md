@@ -8,7 +8,7 @@
 
 You @ the bot in a Feishu thread. It runs on your machine — reading your real codebase, executing commands, opening MRs — and posts the result back. Connect a workspace that already works with Claude Code or Codex, or create a managed one. Larkway connects Feishu triggers to that local runtime.
 
-**Current release: v0.3.72**
+**Current release: v0.3.73**
 
 ---
 

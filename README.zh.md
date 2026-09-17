@@ -8,7 +8,7 @@
 
 你在飞书话题里 @ bot，它在你的机器上运行——读真实代码库、执行命令、开 MR——把结果贴回飞书。你可以直接接入已经配置好的 Claude Code / Codex workspace，或创建托管 workspace。Larkway 负责飞书触发与本地 runtime 的连接。
 
-**当前版本：v0.3.72**
+**当前版本：v0.3.73**
 
 ---
 
