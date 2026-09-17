@@ -182,6 +182,14 @@ export function resolveKnowledgeDir(): string {
   return join(larkwayHome(), "knowledge");
 }
 
+/** Bridge recovery archives stay private unless organization sharing is opted in. */
+export function resolveSessionArchiveDir(agentId: string, sharedKnowledge = false): string {
+  assertSafePathSegment("agentId", agentId);
+  return sharedKnowledge
+    ? resolveKnowledgeDir()
+    : join(larkwayHome(), "agents", agentId, "runtime", "archive");
+}
+
 function assertSafePathSegment(label: string, value: string): void {
   if (!/^[A-Za-z0-9_-]+$/.test(value)) {
     throw new Error(`${label} must be a safe path segment`);

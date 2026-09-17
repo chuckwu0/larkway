@@ -590,7 +590,7 @@ describe.skipIf(process.platform === "win32")("isPidAlive", () => {
 // ever spawn from a unit test.
 // ---------------------------------------------------------------------------
 
-describe.skipIf(process.platform === "win32")("cleanupAgentSession — harvest lands in the knowledge repo", () => {
+describe.skipIf(process.platform === "win32")("cleanupAgentSession — private archives and opt-in shared knowledge", () => {
   const { mkdtemp, mkdir, writeFile, readFile, rm, stat } = require("node:fs/promises");
   const { tmpdir } = require("node:os");
   const nodePath = require("node:path");
@@ -633,7 +633,7 @@ describe.skipIf(process.platform === "win32")("cleanupAgentSession — harvest l
     );
 
     const { cleanupAgentSession } = await import("./gc.js");
-    const outcome = await cleanupAgentSession("om_gc1", "turing", false);
+    const outcome = await cleanupAgentSession("om_gc1", "turing", false, undefined, true);
     expect(outcome).toBe("reclaimed");
 
     // The session dir is gone…
@@ -652,6 +652,22 @@ describe.skipIf(process.platform === "win32")("cleanupAgentSession — harvest l
     await expect(stat(nodePath.join(home, "knowledge", "README.md"))).resolves.toBeTruthy();
   });
 
+  it("archives privately by default without creating organization knowledge or running git", async () => {
+    const sessionPath = nodePath.join(home, "agents", "demo", "workspace", "sessions", "om_private");
+    await mkdir(sessionPath, { recursive: true });
+    await writeFile(nodePath.join(sessionPath, "summary.md"), "Private task context", "utf8");
+    const knowledgeExec = vi.fn(async () => ({ stdout: "", stderr: "" }));
+    const { setKnowledgeExecFileForTest } = await import("../knowledge/store.js");
+    setKnowledgeExecFileForTest(knowledgeExec);
+    const { cleanupAgentSession } = await import("./gc.js");
+    expect(await cleanupAgentSession("om_private", "demo", false)).toBe("reclaimed");
+    await expect(stat(sessionPath)).rejects.toThrow();
+    const archive = nodePath.join(home, "agents", "demo", "runtime", "archive", "raw", "sessions", "demo", "om_private.md");
+    expect(await readFile(archive, "utf8")).toContain("Private task context");
+    await expect(stat(nodePath.join(home, "knowledge"))).rejects.toThrow();
+    expect(knowledgeExec).not.toHaveBeenCalled();
+  });
+
   it("sessionsDir override (BYO workspace): reclaims under agents/<id>/sessions, not <workspace>/sessions", async () => {
     // BYO bots keep session dirs at agents/<id>/sessions (sibling of the
     // default workspace/ slot). GC must sweep THERE via the override param.
@@ -664,6 +680,9 @@ describe.skipIf(process.platform === "win32")("cleanupAgentSession — harvest l
     const outcome = await cleanupAgentSession("om_byo1", "turing", false, sessionsDir);
     expect(outcome).toBe("reclaimed");
     await expect(stat(sessionPath)).rejects.toThrow();
+    const archive = nodePath.join(home, "agents", "turing", "runtime", "archive", "raw", "sessions", "turing", "om_byo1.md");
+    expect(await readFile(archive, "utf8")).toContain("byo session");
+    await expect(stat(nodePath.join(home, "knowledge"))).rejects.toThrow();
   });
 
   it("sessionsDir override rejects an unsafe threadId segment", async () => {
@@ -694,5 +713,6 @@ describe.skipIf(process.platform === "win32")("cleanupAgentSession — harvest l
     await expect(
       stat(nodePath.join(home, "knowledge", "raw", "sessions", "turing", "om_gc2.md")),
     ).rejects.toThrow();
+    await expect(stat(nodePath.join(home, "agents", "turing", "runtime", "archive"))).rejects.toThrow();
   });
 });

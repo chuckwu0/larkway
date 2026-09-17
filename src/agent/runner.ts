@@ -89,6 +89,8 @@ export interface RunOptions {
    * wide-options contract: consume what you support, ignore the rest.
    */
   addDirs?: string[];
+  /** PID hint location. null disables cwd writes; the bridge tracks managed sessions separately. */
+  pidFilePath?: string | null;
   /**
    * The Feishu thread this turn belongs to. Only consumed by a per-thread
    * pooled runner (src/claude/pool.ts) as part of its warm-process cache key
@@ -212,16 +214,14 @@ export function markPerfForEventType(
 export interface RunHandle {
   events: AsyncIterable<AgentStreamEvent>;
   /**
-   * `pooled`/`resumeMode` (perf plan 批B Phase 1 A0 extension): set only by a
-   * pooled runner (src/codex/pool.ts); absent/undefined for the existing
-   * one-shot runners, which is what makes this an additive, non-breaking
-   * change to the interface. `pooled` = this turn ran on a bot's warm
-   * per-process pool (not a fresh cold-started subprocess). `resumeMode` is
-   * only meaningful when the turn is a resume (`RunOptions.resumeSessionId`
-   * set): "same-process" = resumed on the same still-warm process (the
-   * actual perf win — zero repeat MCP handshake per the spike); "cold" =
-   * resumed via a fresh subprocess (either pooling is off, or this specific
-   * turn fell back to a cold start after a pool crash/init failure).
+   * Set by pooled runners; absent for one-shot runners. `pooled` means this
+   * turn ran in a pool-managed child, including that child's first turn;
+   * false means the pool fell back to a one-shot child or never dispatched.
+   * `resumeMode` is only meaningful when `RunOptions.resumeSessionId` is set:
+   * "same-process" means this native thread was already loaded in the
+   * current child; "cold" means its history had to be loaded into that
+   * child, including a new pool child or one-shot fallback. Thus a pooled
+   * resume may still be cold. A new native session has no resumeMode.
    */
   done: Promise<{
     exitCode: number;

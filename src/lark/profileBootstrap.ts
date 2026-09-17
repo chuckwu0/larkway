@@ -77,6 +77,15 @@ export function ensureLarkCliProfile(
   _console: Pick<Console, "log" | "warn"> = console,
   opts?: { configDir?: string },
 ): void {
+  const quote = (value: string) => process.platform === "win32"
+    ? `'${value.replace(/'/g, "''")}'`
+    : `'${value.replace(/'/g, "'\"'\"'")}'`;
+  const configPrefix = opts?.configDir
+    ? (process.platform === "win32"
+      ? `$env:LARKSUITE_CLI_CONFIG_DIR=${quote(opts.configDir)}; `
+      : `LARKSUITE_CLI_CONFIG_DIR=${quote(opts.configDir)} `)
+    : "";
+  const repairCommand = `${configPrefix}lark-cli config init --app-id ${quote(appId)} --app-secret-stdin --name ${quote(profileName)}`;
   // Always (re-)provision the named profile so credential drift self-heals.
   // `config init --name` is idempotent for named profiles: no re-key, no
   // impact on other profiles. See module-level design comment for rationale.
@@ -106,7 +115,7 @@ export function ensureLarkCliProfile(
         `[larkway] WARNING: bot "${botId}" failed to provision lark-cli profile "${profileName}" ` +
           `(exit ${initResult.status}${stderr ? `: ${stderr}` : ""}). ` +
           `Multi-bot lark-cli calls may use the wrong app credentials. ` +
-          `Fix: lark-cli config init --app-id ${appId} --app-secret-stdin --name ${profileName}`,
+          `Fix: ${repairCommand}`,
       );
     }
   } catch (err) {
@@ -114,7 +123,7 @@ export function ensureLarkCliProfile(
     _console.warn(
       `[larkway] WARNING: bot "${botId}" lark-cli profile setup failed: ${String(err)}. ` +
         `Multi-bot lark-cli calls may use the wrong app credentials. ` +
-        `Fix: lark-cli config init --app-id ${appId} --app-secret-stdin --name ${profileName}`,
+        `Fix: ${repairCommand}`,
     );
   }
 }

@@ -62,8 +62,7 @@ describe("ensureAgentWorkspace", () => {
       fs.stat(path.join(workspacePath, "memory")),
     ).resolves.toBeTruthy();
     // 批G P1 (R1/R2): the six-category scaffold is retired for NEW workspaces.
-    // Per-agent memory keeps ONLY identity/preferences; shared knowledge lives
-    // in the host-level knowledge repo (src/knowledge/store.ts).
+    // Native memory stays local by default; sharing is an explicit opt-in.
     await expect(
       fs.stat(path.join(workspacePath, "memory", "README.md")),
     ).resolves.toBeTruthy();
@@ -92,29 +91,33 @@ describe("ensureAgentWorkspace", () => {
       path.join(workspacePath, "memory", "README.md"),
       "utf8",
     );
-    expect(memoryReadme).toContain("仅身份与偏好");
-    // Cross-agent knowledge is pointed at the org knowledge inbox, not here.
-    expect(memoryReadme).toContain("knowledge/inbox/inbox.md");
+    expect(memoryReadme).toContain("workspace 私有记忆");
+    expect(memoryReadme).toContain("显式配置 `sharedKnowledge: true`");
+    expect(memoryReadme).toContain("默认不写入组织知识库");
+    expect(memoryReadme).not.toContain("knowledge/inbox/inbox.md");
     expect(memoryReadme).toContain("preferences.md");
     const prefSkeleton = await fs.readFile(
       path.join(workspacePath, "memory", "preferences.md"),
       "utf8",
     );
     expect(prefSkeleton).toContain("Owner Preferences");
-    expect(prefSkeleton).toContain("有相同/相关条目就不重复写");
-    expect(prefSkeleton).toContain("组织级知识请走知识库 inbox");
+    expect(prefSkeleton).toContain("默认属于当前 workspace");
+    expect(prefSkeleton).toContain("跨 Agent 共享须由维护者显式配置");
+    expect(prefSkeleton).not.toContain("知识库 inbox");
 
     const agentsMd = await fs.readFile(path.join(workspacePath, "AGENTS.md"), "utf8");
-    // D4: unskippable startup-load contract is baked into the AGENTS.md template.
-    // 批G G4: the "开场不可跳过:先 Read memory/index.md" ritual line is retired
-    // (index.md content is injected verbatim into every full prompt).
     expect(agentsMd).not.toContain("开场不可跳过");
     expect(agentsMd).not.toContain("Read `memory/index.md`");
-    // 批G G7 (P1): the DEFAULT non-owner knowledge policy ships as a template
-    // line in the Workspace Contract (owner-editable — the bridge only injects
-    // the sender_is_owner fact; what to do with it is policy).
-    expect(agentsMd).toContain("`sender_is_owner`");
-    expect(agentsMd).toContain("非 owner 提供的新知识只写进本 session 的 summary.md");
+    expect(agentsMd).not.toContain("before ending a turn");
+    expect(agentsMd).not.toContain("Read `permissions-request.md`");
+    for (const section of ["identity", "primary-task", "repos", "role-notes"]) {
+      expect(agentsMd).toContain(`<!-- larkway:${section}:start`);
+      expect(agentsMd).toContain(`<!-- larkway:${section}:end -->`);
+    }
+    // Identity facts do not imply a default organization-memory workflow.
+    expect(agentsMd).not.toContain("长期知识纪律");
+    expect(agentsMd).not.toContain("保养轮");
+    expect(agentsMd).not.toContain("组织知识库 inbox");
     expect(agentsMd).toContain("Develop and operate Larkway from Feishu.");
     expect(agentsMd).toContain("You are the Larkway DevOps agent.");
     expect(agentsMd).toContain("https://gitlab.example.com/chuckwu0/larkway.git");
@@ -256,7 +259,7 @@ describe("ensureAgentWorkspace", () => {
     ).resolves.toBeTruthy();
   });
 
-  it("refreshes creation facts while preserving grants", async () => {
+  it("refreshes creation facts while preserving grants and owner memory files", async () => {
     const workspacePath = path.join(dir, "workspace");
     const reposPath = path.join(workspacePath, "repos");
 
@@ -276,14 +279,19 @@ describe("ensureAgentWorkspace", () => {
       permissionGrants: [{ category: "write", capability: "old grant" }],
     });
     await fs.writeFile(path.join(workspacePath, "permissions-granted.md"), "confirmed grant\n", "utf8");
+    const memoryReadme = "# Owner memory policy\nUse the configured team knowledge/inbox/inbox.md.\n";
+    const preferences = "# Owner preferences\nKeep my custom rules.\n";
+    await fs.writeFile(path.join(workspacePath, "memory", "README.md"), memoryReadme, "utf8");
+    await fs.writeFile(path.join(workspacePath, "memory", "preferences.md"), preferences, "utf8");
+    await fs.appendFile(path.join(workspacePath, "AGENTS.md"), "\n## Custom Rules\n\nKeep this owner-written instruction.\n");
 
-    await ensureAgentWorkspace({
+    const result = await ensureAgentWorkspace({
       agentId: "devops",
       workspacePath,
       reposPath,
       refreshFacts: true,
       bot: {
-        name: "DevOps",
+        name: "New Agent",
         description: "New description",
         chats: ["oc_new"],
         gitlab_token_env: "NEW_TOKEN_ENV",
@@ -297,15 +305,17 @@ describe("ensureAgentWorkspace", () => {
     });
 
     const agentsMd = await fs.readFile(path.join(workspacePath, "AGENTS.md"), "utf8");
-    // 批G G4 (adversarial-review fix): refreshFacts on an EXISTING AGENTS.md
-    // no longer full-rewrites the file (that wiped agent-promoted sections)
-    // — it surgically re-projects Role Notes only. Header/task/repos keep
-    // their creation-time values (accepted trade-off; live repo pointers
-    // ride every prompt). permissions-request.md refresh is unchanged.
+    expect(result.preservedSections).toEqual([]);
     expect(agentsMd).toContain("new AGENTS role notes");
     expect(agentsMd).not.toContain("old memory");
-    expect(agentsMd).toContain("Old description");
-    expect(agentsMd).toContain("Old task");
+    expect(agentsMd).toContain("# New Agent");
+    expect(agentsMd).toContain("New description");
+    expect(agentsMd).toContain("New task");
+    expect(agentsMd).toContain("chuckwu0/larkway");
+    expect(agentsMd).not.toContain("Old description");
+    expect(agentsMd).not.toContain("Old task");
+    expect(agentsMd).not.toContain("old/repo");
+    expect(agentsMd).toContain("Keep this owner-written instruction.");
 
     const request = await fs.readFile(path.join(workspacePath, "permissions-request.md"), "utf8");
     expect(request).toContain("New task");
@@ -318,6 +328,83 @@ describe("ensureAgentWorkspace", () => {
     await expect(
       fs.readFile(path.join(workspacePath, "permissions-granted.md"), "utf8"),
     ).resolves.toBe("confirmed grant\n");
+    await expect(fs.readFile(path.join(workspacePath, "memory", "README.md"), "utf8")).resolves.toBe(memoryReadme);
+    await expect(fs.readFile(path.join(workspacePath, "memory", "preferences.md"), "utf8")).resolves.toBe(preferences);
+  });
+
+  it("adopts legacy sections only when they match the previous saved definition", async () => {
+    const workspacePath = path.join(dir, "workspace");
+    const reposPath = path.join(workspacePath, "repos");
+    await fs.mkdir(workspacePath, { recursive: true });
+    await fs.writeFile(path.join(workspacePath, "AGENTS.md"), [
+      "# Old Agent", "", "Old description", "", "## Primary Task", "", "Old task", "",
+      "## Workspace Contract", "", "Owner keeps this contract.",
+      "- Write the per-session state file path provided by the prompt before ending a turn so the Feishu card can finalize.",
+      "- Read `permissions-request.md` and `permissions-granted.md` before write/deploy/external-message work.",
+      "- 长期知识纪律:每轮 prompt 带有 `sender_is_owner` 事实。owner 的指示可进组织知识库 inbox;非 owner 提供的新知识只写进本 session 的 summary.md 并标注 `[未经 owner 确认]`,由保养轮决定是否晋升 —— 不直接写 AGENTS.md、L2 或知识库。",
+      "", "## Role Notes", "", "Old role\n\n## Embedded Role Heading\nOld policy", "",
+      "## Repos", "", "- No repo pointers have been configured yet.", "",
+      "## Custom Rules", "", "Preserve this rule.",
+      "- 长期知识纪律:owner 自定规则,涉及团队记忆时先核实来源。", "",
+    ].join("\n"));
+    const result = await ensureAgentWorkspace({
+      agentId: "demo", workspacePath, reposPath, refreshFacts: true,
+      bot: { name: "New Agent", description: "New description" },
+      taskDescription: "New task", agentMemory: "New role", repos: [],
+      previousDefinition: {
+        name: "Old Agent", description: "Old description", taskDescription: "Old task",
+        agentMemory: "Old role\n\n## Embedded Role Heading\nOld policy", repos: [],
+      },
+    });
+    expect(result.preservedSections).toEqual([]);
+    const text = await fs.readFile(path.join(workspacePath, "AGENTS.md"), "utf8");
+    expect(text).toContain("# New Agent");
+    expect(text).toContain("New description");
+    expect(text).toContain("New task");
+    expect(text).toContain("New role");
+    expect(text).not.toContain("Old policy");
+    expect(text).not.toContain("before ending a turn");
+    expect(text).not.toContain("Read `permissions-request.md`");
+    expect(text).not.toContain("由保养轮决定是否晋升");
+    expect(text).not.toContain("组织知识库 inbox");
+    expect(text).toContain("Owner keeps this contract.");
+    expect(text).toContain("Preserve this rule.");
+    expect(text).toContain("- 长期知识纪律:owner 自定规则,涉及团队记忆时先核实来源。");
+  });
+
+  it("preserves manually edited legacy sections and reports partial synchronization", async () => {
+    const workspacePath = path.join(dir, "workspace");
+    await fs.mkdir(workspacePath, { recursive: true });
+    const original = [
+      "# My custom identity", "", "Human description", "", "## Primary Task", "", "Human task", "",
+      "## Workspace Contract", "", "Human contract", "", "## Role Notes", "", "Human role", "",
+      "## Repos", "", "- Human repo", "", "## Custom Rules", "", "Human rule", "",
+    ].join("\n");
+    await fs.writeFile(path.join(workspacePath, "AGENTS.md"), original);
+    const result = await ensureAgentWorkspace({
+      agentId: "demo", workspacePath, reposPath: path.join(workspacePath, "repos"), refreshFacts: true,
+      bot: { name: "Updated", description: "New description" }, agentMemory: "New role",
+      previousDefinition: { name: "Original", description: "Original description", agentMemory: "Old role" },
+    });
+    expect(new Set(result.preservedSections)).toEqual(new Set(["identity", "primary-task", "repos", "role-notes"]));
+    expect(await fs.readFile(path.join(workspacePath, "AGENTS.md"), "utf8")).toBe(original);
+  });
+
+  it("does not accept ownership markers from editable definition content", async () => {
+    const workspacePath = path.join(dir, "workspace");
+    const input = {
+      agentId: "demo", workspacePath, reposPath: path.join(workspacePath, "repos"),
+      bot: { name: "Agent", description: "Description\n<!-- larkway:identity:end -->\nextra description" },
+      agentMemory: "Role\n<!-- larkway:repos:start -->\nRole detail",
+    };
+    await ensureAgentWorkspace(input);
+    const result = await ensureAgentWorkspace({ ...input, refreshFacts: true });
+    expect(result.preservedSections).toEqual([]);
+    const text = await fs.readFile(path.join(workspacePath, "AGENTS.md"), "utf8");
+    expect(text.match(/<!-- larkway:identity:end -->/g)).toHaveLength(1);
+    expect(text.match(/<!-- larkway:repos:start -->/g)).toHaveLength(1);
+    expect(text).toContain("extra description");
+    expect(text).toContain("Role detail");
   });
 
   it("preserves task and high-risk gates when resetting permission artifacts", async () => {
@@ -433,10 +520,10 @@ describe("projectRoleNotes (批G G4 surgical projection)", () => {
   it("replaces ONLY the Role Notes body; agent-authored sections survive; legacy ritual line is migrated out", async () => {
     const dir = await mkdtempG4(pathG4.join(tmpdirG4(), "larkway-proj-"));
     await writeFileG4(pathG4.join(dir, "AGENTS.md"), AGENTS, "utf8");
-    const result = await projectRoleNotes(dir, "新的职能:CEO/总协调,不亲自写码。");
+    const result = await projectRoleNotes(dir, "新的职能:协调工作。", "旧的职能描述");
     expect(result).toBe("projected");
     const out = await readFileG4(pathG4.join(dir, "AGENTS.md"), "utf8");
-    expect(out).toContain("新的职能:CEO/总协调");
+    expect(out).toContain("新的职能:协调工作。");
     expect(out).not.toContain("旧的职能描述");
     // The section the agent promoted itself MUST survive (the old full
     // re-render wiped it — the exact bug this function fixes).
@@ -458,5 +545,30 @@ describe("projectRoleNotes (批G G4 surgical projection)", () => {
     const out = await readFileG4(pathG4.join(dir, "AGENTS.md"), "utf8");
     expect(out).toContain("## Role Notes");
     expect(out).toContain("补上的职能");
+  });
+
+  it("preserves ambiguous legacy role edits instead of deleting unrelated headings", async () => {
+    const dir = await mkdtempG4(pathG4.join(tmpdirG4(), "larkway-proj-"));
+    const original = "# Agent\n\n## Role Notes\n\nOld role\n\n## Human Rules\n\nKeep this.\n";
+    await writeFileG4(pathG4.join(dir, "AGENTS.md"), original, "utf8");
+    expect(await projectRoleNotes(dir, "New role", "Old role")).toBe("preserved");
+    expect(await readFileG4(pathG4.join(dir, "AGENTS.md"), "utf8")).toBe(original);
+  });
+
+  it("adopts the legacy empty-role placeholder when the previous editor value was empty", async () => {
+    const dir = await mkdtempG4(pathG4.join(tmpdirG4(), "larkway-proj-"));
+    await writeFileG4(pathG4.join(dir, "AGENTS.md"), "# Agent\n\n## Role Notes\n\nNo extra role notes have been configured yet.\n\n## Repos\n\n- none\n", "utf8");
+    expect(await projectRoleNotes(dir, "New role", "")).toBe("projected");
+    const text = await readFileG4(pathG4.join(dir, "AGENTS.md"), "utf8");
+    expect(text).toContain("New role");
+    expect(text).not.toContain("No extra role notes have been configured yet.");
+  });
+
+  it("preserves malformed ownership markers with a visible result", async () => {
+    const dir = await mkdtempG4(pathG4.join(tmpdirG4(), "larkway-proj-"));
+    const original = "# Agent\n<!-- larkway:role-notes:start -->\nOld role\n\n## Human Rules\nKeep this.\n";
+    await writeFileG4(pathG4.join(dir, "AGENTS.md"), original, "utf8");
+    expect(await projectRoleNotes(dir, "New role")).toBe("preserved");
+    expect(await readFileG4(pathG4.join(dir, "AGENTS.md"), "utf8")).toBe(original);
   });
 });

@@ -12,7 +12,7 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { chmod, lstat, mkdir, mkdtemp, readFile, readlink, rm, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, mkdtemp, readFile, readlink, rm, writeFile, stat, readdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { execFile } from "node:child_process";
@@ -1822,5 +1822,62 @@ describe("backend model facts (看板 Model/Effort 动态事实)", () => {
       else process.env.HOME = oldHome;
       await rm(dir, { recursive: true, force: true });
     }
+  });
+});
+
+
+describe("BYO workspace configuration", () => {
+  it("saves native workspace pointers and edits metadata without generating either scaffold", async () => {
+    const dir = await makeTmpDir();
+    const workspace = path.join(dir, "owner-project");
+    await mkdir(workspace);
+    await writeFile(path.join(workspace, "AGENTS.md"), "# Native definition\n");
+    const ctx = makeCtx(dir);
+    expect((await call(ctx, "PUT /api/bot/:id", {
+      params: { id: "test-bot" }, body: { ...SAMPLE_BOT, workspace },
+    })).status).toBe(200);
+    expect((await call(ctx, "PUT /api/bot/:id", {
+      params: { id: "test-bot" }, body: { description: "New label", chats: ["oc_new"] },
+    })).status).toBe(200);
+    const saved = yaml.load(await readFile(path.join(dir, "test-bot.yaml"), "utf8")) as Record<string, unknown>;
+    expect(saved.workspace).toBe(workspace);
+    expect(saved.description).toBe("New label");
+    expect(await readdir(workspace)).toEqual(["AGENTS.md"]);
+    expect(await readFile(path.join(workspace, "AGENTS.md"), "utf8")).toBe("# Native definition\n");
+    await expect(stat(path.join(dir, "agents", "test-bot", "workspace"))).rejects.toThrow();
+    expect((await call(ctx, "PUT /api/memory/:id", {
+      params: { id: "test-bot" }, body: { content: "Must not write" },
+    })).status).toBe(409);
+    await expect(stat(path.join(dir, "test-bot.memory.md"))).rejects.toThrow();
+  });
+
+  it("rejects invalid paths without saving configuration or credentials", async () => {
+    const dir = await makeTmpDir();
+    const ctx = makeCtx(dir);
+    const writeSecret = vi.fn();
+    ctx.stores.hostConfig.writeSecret = writeSecret;
+    const file = path.join(dir, "a-file");
+    await writeFile(file, "unchanged");
+    for (const workspace of ["relative", path.join(dir, "missing"), file, 123]) {
+      const res = await call(ctx, "PUT /api/bot/:id", {
+        params: { id: "test-bot" }, body: { ...SAMPLE_BOT, workspace, gitlab_token_value: "test-secret" },
+      });
+      expect(res.status).toBe(400);
+    }
+    expect(writeSecret).not.toHaveBeenCalled();
+    await expect(stat(path.join(dir, "test-bot.yaml"))).rejects.toThrow();
+  });
+
+  it("allows clearing a native pointer to create a managed workspace without touching native files", async () => {
+    const dir = await makeTmpDir();
+    const workspace = path.join(dir, "native");
+    await mkdir(workspace);
+    const ctx = makeCtx(dir);
+    await call(ctx, "PUT /api/bot/:id", { params: { id: "test-bot" }, body: { ...SAMPLE_BOT, workspace } });
+    const res = await call(ctx, "PUT /api/bot/:id", { params: { id: "test-bot" }, body: { workspace: "" } });
+    expect(res.status).toBe(200);
+    expect((yaml.load(await readFile(path.join(dir, "test-bot.yaml"), "utf8")) as Record<string, unknown>).workspace).toBeUndefined();
+    expect(await readFile(path.join(dir, "agents", "test-bot", "workspace", "AGENTS.md"), "utf8")).toContain("A bot used in tests");
+    expect(await readdir(workspace)).toEqual([]);
   });
 });

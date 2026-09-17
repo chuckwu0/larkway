@@ -686,6 +686,26 @@ runtime: agent_workspace
     expect(bots[0]?.runtime).toBe("agent_workspace");
   });
 
+  it("does not require obsolete managed memory files for a BYO workspace", async () => {
+    await createBotsDir();
+    await writeYaml("native.yaml", `
+id: native-bot
+name: Native Bot
+description: Uses native instructions
+app_id: cli_native
+app_secret_env: NATIVE_SECRET
+bot_open_id: ou_native
+runtime: agent_workspace
+workspace: ${JSON.stringify(path.join(tmpDir, "native"))}
+memory_file: missing-retired.memory.md
+`);
+    const bots = await loadBots(botsDir());
+    expect(bots).toHaveLength(1);
+    expect(bots[0]?.memory_file).toBe("missing-retired.memory.md");
+    expect(bots[0]?.agent_memory).toBeUndefined();
+    expect(bots[0]?.agent_memory_path).toBeUndefined();
+  });
+
   it("workspace: 绝对路径 + agent_workspace 可被正确解析", async () => {
     await createBotsDir();
     await writeYaml(

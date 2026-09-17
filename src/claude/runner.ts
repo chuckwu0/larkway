@@ -14,7 +14,7 @@
 import { spawn } from "node:child_process";
 import { spawnPipedOutput } from "../platform/spawn.js";
 import { writeFile, unlink, mkdir } from "node:fs/promises";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { createInterface } from "node:readline";
 import type { AgentRunner } from "../agent/runner.js";
 import {
@@ -347,8 +347,8 @@ export function runClaude(opts: RunOptions): RunHandle {
   const markPerf = createPerfMarker(opts.onPerfMarker);
 
   // ── spawn ─────────────────────────────────────────────────────────────────
-  // opts.cwd is passed both as spawn's cwd (sandbox boundary) and --cwd flag
-  // (claude internal logic). spawn cwd is the authoritative sandbox boundary.
+  // cwd selects native project configuration and session storage; it is not
+  // an operating-system sandbox boundary.
   const child = spawnPipedOutput(bin, args, {
     env,
     // Shell is NOT used — args are passed as array, safe for prompt content
@@ -364,7 +364,8 @@ export function runClaude(opts: RunOptions): RunHandle {
   // Fire-and-forget: write failure must never crash the runner.
   // Skipped when opts.cwd is undefined (no sandbox cwd configured).
   const pidFilePath =
-    opts.cwd != null ? join(opts.cwd, ".larkway", "runner.pid") : null;
+    opts.pidFilePath !== undefined ? opts.pidFilePath :
+      opts.cwd != null ? join(opts.cwd, ".larkway", "runner.pid") : null;
 
   if (pidFilePath !== null && child.pid != null) {
     const pidPayload = JSON.stringify({
@@ -372,7 +373,7 @@ export function runClaude(opts: RunOptions): RunHandle {
       spawnedAt: new Date().toISOString(),
       binPath: bin,
     });
-    void mkdir(join(opts.cwd!, ".larkway"), { recursive: true })
+    void mkdir(dirname(pidFilePath), { recursive: true })
       .then(() => writeFile(pidFilePath, pidPayload, "utf8"))
       .catch((err: unknown) => {
         console.warn("[runner] failed to write pid file:", err);

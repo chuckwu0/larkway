@@ -1,3 +1,4 @@
+import { discoverWorkspaceRepoDirs } from "./agent/workspaceRepos.js";
 import { existsSync, mkdirSync, writeFileSync, renameSync } from "node:fs";
 import path from "node:path";
 import { resolveLarkwayVersion } from "./version.js";
@@ -375,7 +376,7 @@ async function runV2Mode({
     // BL-50: isolated bots get a private lark-cli config dir; provision the
     // profile INSIDE it so the shared global dir (and the maintainer's
     // personal login there) stays invisible to this bot.
-    const larkCliConfigDir = bot.lark_cli_isolated ? resolveBotLarkCliDir(bot.id) : undefined;
+    const larkCliConfigDir = bot.lark_cli_isolated !== false ? resolveBotLarkCliDir(bot.id) : undefined;
     if (larkCliConfigDir) {
       mkdirSync(larkCliConfigDir, { recursive: true });
       console.log(`[larkway] bot "${bot.id}": lark-cli identity isolation ON (${larkCliConfigDir})`);
@@ -919,6 +920,8 @@ async function runV2Mode({
       if (effectivePrewarmProcess(bot) && bot.runtime === "agent_workspace" && agentWorkspacePath) {
         claudePool.prewarm({
           cwd: agentWorkspacePath,
+          addDirs: await discoverWorkspaceRepoDirs(path.join(agentWorkspacePath, "repos")),
+          pidFilePath: null,
           model: bot.model,
           effort: bot.effort,
           // Mirrors handler.ts's own default ("bypassPermissions" when
@@ -969,6 +972,7 @@ async function runV2Mode({
         taskHandle: effectiveTaskHandleTasklistGuid ? { tasklistGuid: effectiveTaskHandleTasklistGuid } : undefined,
         model: bot.model,
         effort: bot.effort,
+        sharedKnowledge: bot.sharedKnowledge,
         promptMode: bot.promptMode,
         p2pStickySession: bot.p2pStickySession,
         sessionReseedTurns: bot.sessionReseedTurns,
@@ -1032,6 +1036,7 @@ async function runV2Mode({
       // BYO workspace: session dirs live under agents/<id>/sessions instead of
       // <workspace>/sessions — point GC there so it never walks the BYO dir.
       sessionsDir: workspaceSessionsDir,
+      sharedKnowledge: bot.sharedKnowledge,
     });
 
     // Dumb-alarm-clock scheduler (docs/schedule.md): cron entries from the
@@ -1516,8 +1521,10 @@ async function main(): Promise<void> {
   // pays nothing and the boot log states plainly whether git versioning is
   // live. Failure is non-fatal (handleOne retries lazily and degrades).
   try {
-    const knowledge = await ensureKnowledgeRepo();
-    console.log(
+    const knowledge = bots.some((bot) => bot.sharedKnowledge === true)
+      ? await ensureKnowledgeRepo()
+      : undefined;
+    if (knowledge) console.log(
       `[larkway] 组织知识库: ${knowledge.knowledgeDir}` +
         (knowledge.gitReady ? "(git 版本化已就绪)" : "(⚠️ git 不可用,降级为纯目录模式)"),
     );

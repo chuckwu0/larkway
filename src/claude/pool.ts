@@ -121,6 +121,8 @@ interface TurnState {
   killRequested: boolean;
   sessionId: string | undefined;
   answerExtractor: AnswerChannelExtractor;
+  /** Whether this turn continues an entry that already accepted a prior turn. */
+  reusedProcess: boolean;
   /**
    * The warm process this turn is queued/running on, once run() has picked
    * or spawned one. Undefined only in the brief synchronous window before
@@ -140,6 +142,7 @@ interface PoolEntry {
   key: string;
   threadId: string;
   readonly cwd: string | undefined;
+  readonly pidFilePath: string | null;
   /**
    * 批D blank standby: true for a pre-warmed child spawned WITHOUT a thread
    * (no --resume, prompt never sent) waiting to be adopted by the first
@@ -163,6 +166,8 @@ interface PoolEntry {
   lastUsedAt: number;
   /** The turn currently occupying this entry's single stdin/stdout wire, if any. */
   current: TurnState | undefined;
+  /** A blank or newly spawned --resume child has not served a turn yet. */
+  hasRunTurn: boolean;
   /**
    * Serializes turns onto this entry: the claude CLI's stream-json mode
    * processes exactly one turn at a time per process, so a second turn
@@ -185,6 +190,8 @@ interface PoolEntry {
  */
 export interface ClaudePrewarmOptions {
   cwd?: string;
+  addDirs?: string[];
+  pidFilePath?: string | null;
   model?: string;
   effort?: string;
   permissionMode?: RunOptions["permissionMode"];
@@ -226,7 +233,7 @@ export interface ClaudeProcessPoolOptions {
  * One instance per pooled bot (main.ts), registered via `registerRunner`
  * under a per-bot key — same wiring shape as CodexProcessPool. Internally it
  * holds up to `maxProcesses` warm children, one per distinct
- * (threadId, cwd, model, effort) key.
+ * (threadId, spawn signature) key.
  */
 export class ClaudeProcessPool implements AgentRunner {
   readonly #botId: string;
@@ -340,6 +347,7 @@ export class ClaudeProcessPool implements AgentRunner {
       killRequested: false,
       sessionId: undefined,
       answerExtractor: new AnswerChannelExtractor(),
+      reusedProcess: false,
       entry: undefined,
     };
 
@@ -368,12 +376,29 @@ export class ClaudeProcessPool implements AgentRunner {
     const threadId = opts.threadId ?? `__unkeyed-${this.#nextUnkeyedId++}__`;
     const key = this.#computeKey(threadId, opts);
 
+    // A workspace can gain repo directories after boot. Refresh the standby
+    // prototype for that same cwd, otherwise every later new topic cold-starts
+    // while an unusable blank occupies a slot indefinitely.
+    if (this.#prewarmProto && this.#prewarmProto.cwd === opts.cwd &&
+        this.#spawnSignatureOf(this.#prewarmProto) !== this.#spawnSignatureOf(opts)) {
+      this.#prewarmProto = {
+        cwd: opts.cwd, addDirs: opts.addDirs, pidFilePath: opts.pidFilePath,
+        model: opts.model, effort: opts.effort,
+        permissionMode: opts.permissionMode, agentBinPath: opts.agentBinPath,
+      };
+      for (const blank of this.#entries.values()) {
+        if (blank.blank && blank.current == null) this.#destroyEntry(blank, "standby spawn options changed");
+      }
+      // Reserve the real turn's slot first; replenish only spare capacity.
+      queueMicrotask(() => this.#maybeSpawnBlank());
+    }
+
     // Key drift: a prior warm process for this SAME thread under different
     // params (cwd/model/effort changed) is now stale — retire it immediately
     // rather than let it linger until its own idle timeout. "禁止假装可复用."
     for (const existing of this.#entries.values()) {
-      if (existing.threadId === threadId && existing.key !== key) {
-        this.#destroyEntry(existing, "superseded by a new key for the same thread (cwd/model/effort changed)");
+      if (existing.threadId === threadId && existing.key !== key && existing.current == null) {
+        this.#destroyEntry(existing, "superseded by changed spawn options for the same thread");
       }
     }
 
@@ -492,16 +517,13 @@ export class ClaudeProcessPool implements AgentRunner {
   // -- key computation ---------------------------------------------------------
 
   /**
-   * Composite cache key: botId + threadId + cwd + model + effort. `botId` is
+   * Composite cache key: botId + threadId + the full native spawn signature. `botId` is
    * constant for a given pool instance (one instance per bot, like
    * CodexProcessPool) — included anyway for unambiguous log lines and so the
    * key formula matches the design literally, not just in effect.
    */
   #computeKey(threadId: string, opts: RunOptions): string {
-    const cwd = opts.cwd ?? "__no-cwd__";
-    const model = opts.model ?? "__default-model__";
-    const effort = opts.effort ?? "__default-effort__";
-    return `${this.#botId}::${threadId}::${cwd}::${model}::${effort}`;
+    return JSON.stringify([this.#botId, threadId, this.#spawnSignatureOf(opts)]);
   }
 
   #pickLruIdleVictim(): PoolEntry | undefined {
@@ -530,6 +552,7 @@ export class ClaudeProcessPool implements AgentRunner {
 
     entry.current = state;
     entry.lastUsedAt = Date.now();
+    state.reusedProcess = entry.hasRunTurn;
 
     const line =
       JSON.stringify({
@@ -539,6 +562,7 @@ export class ClaudeProcessPool implements AgentRunner {
 
     try {
       entry.child.stdin?.write(line);
+      entry.hasRunTurn = true;
     } catch (err) {
       entry.current = undefined;
       this.#fallbackToCold(state, err instanceof Error ? err : new Error(String(err)));
@@ -572,7 +596,9 @@ export class ClaudeProcessPool implements AgentRunner {
       exitCode,
       sessionId: state.sessionId,
       pooled: true,
-      resumeMode: state.opts.resumeSessionId != null ? "same-process" : undefined,
+      resumeMode: state.opts.resumeSessionId != null
+        ? state.reusedProcess ? "same-process" : "cold"
+        : undefined,
     });
   }
 
@@ -716,22 +742,17 @@ export class ClaudeProcessPool implements AgentRunner {
    * attempted for turns with no resume (run() guards), and the blank itself
    * is spawned without one.
    */
-  #spawnSignatureOf(opts: {
-    cwd?: string;
-    model?: string;
-    effort?: string;
-    permissionMode?: RunOptions["permissionMode"];
-    agentBinPath?: string;
-  }): string {
+  #spawnSignatureOf(opts: ClaudePrewarmOptions): string {
     const [bin, args] = buildWarmCommand({
       prompt: "",
       cwd: opts.cwd,
+      addDirs: opts.addDirs,
       model: opts.model,
       effort: opts.effort,
       permissionMode: opts.permissionMode,
       agentBinPath: opts.agentBinPath,
     } as RunOptions);
-    return JSON.stringify([bin, args, opts.cwd ?? null]);
+    return JSON.stringify([bin, args, opts.cwd ?? null, opts.pidFilePath === null ? null : opts.pidFilePath ?? "cwd-default"]);
   }
 
   /**
@@ -798,6 +819,8 @@ export class ClaudeProcessPool implements AgentRunner {
     const opts: RunOptions = {
       prompt: "",
       cwd: proto.cwd,
+      addDirs: proto.addDirs,
+      pidFilePath: proto.pidFilePath,
       model: proto.model,
       effort: proto.effort,
       permissionMode: proto.permissionMode,
@@ -822,12 +845,15 @@ export class ClaudeProcessPool implements AgentRunner {
       key,
       threadId,
       cwd: opts.cwd,
+      pidFilePath: opts.pidFilePath !== undefined ? opts.pidFilePath :
+        opts.cwd != null ? path.join(opts.cwd, ".larkway", "runner.pid") : null,
       blank: flags?.blank === true,
       spawnSignature: this.#spawnSignatureOf(opts),
       child,
       spawnedAt: Date.now(),
       lastUsedAt: Date.now(),
       current: undefined,
+      hasRunTurn: false,
       queueChain: Promise.resolve(),
       destroyed: false,
       stderrChunks: [],
@@ -1045,9 +1071,9 @@ export class ClaudeProcessPool implements AgentRunner {
    * (non-per-thread) cwd correctly.
    */
   async #writeRunnerPidFileBestEffort(entry: PoolEntry): Promise<void> {
-    if (entry.cwd == null || entry.child.pid == null) return;
+    if (entry.pidFilePath == null || entry.child.pid == null) return;
     try {
-      const pidFilePath = path.join(entry.cwd, ".larkway", "runner.pid");
+      const pidFilePath = entry.pidFilePath;
       await mkdir(path.dirname(pidFilePath), { recursive: true });
       await writeFile(
         pidFilePath,
@@ -1060,8 +1086,8 @@ export class ClaudeProcessPool implements AgentRunner {
   }
 
   async #deleteRunnerPidFileIfMine(entry: PoolEntry): Promise<void> {
-    if (entry.cwd == null) return;
-    const pidFilePath = path.join(entry.cwd, ".larkway", "runner.pid");
+    if (entry.pidFilePath == null) return;
+    const pidFilePath = entry.pidFilePath;
     try {
       const raw = await readFile(pidFilePath, "utf8");
       const parsed = JSON.parse(raw) as { pid?: unknown };

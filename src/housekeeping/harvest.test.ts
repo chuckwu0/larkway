@@ -2,15 +2,68 @@
  * 批G G3 — GC harvest protocol tests (P1 R1: destination = org knowledge repo).
  */
 
-import { describe, it, expect } from "vitest";
-import { mkdtemp, mkdir, writeFile, readFile, readdir, utimes } from "node:fs/promises";
+import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { mkdtemp, mkdir, writeFile, readFile, readdir, utimes, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import {
   harvestSessionArtifacts,
   enforceHarvestCaps,
   HARVEST_MAX_FILES,
+  findSessionHarvest,
 } from "./harvest.js";
+
+describe("findSessionHarvest sharing-policy compatibility", () => {
+  let home: string;
+  let previousHome: string | undefined;
+  const archivePath = (shared: boolean, agentId = "demo") => path.join(
+    shared ? path.join(home, "knowledge") : path.join(home, "agents", agentId, "runtime", "archive"),
+    "raw", "sessions", agentId, "om_history.md",
+  );
+  const seed = async (shared: boolean, agentId = "demo") => {
+    const file = archivePath(shared, agentId);
+    await mkdir(path.dirname(file), { recursive: true });
+    await writeFile(file, `history for ${agentId}`, "utf8");
+    return file;
+  };
+  beforeEach(async () => {
+    home = await mkdtemp(path.join(tmpdir(), "larkway-archive-compat-"));
+    previousHome = process.env.LARKWAY_HOME;
+    process.env.LARKWAY_HOME = home;
+  });
+  afterEach(async () => {
+    if (previousHome === undefined) delete process.env.LARKWAY_HOME;
+    else process.env.LARKWAY_HOME = previousHome;
+    await rm(home, { recursive: true, force: true });
+  });
+
+  it.each([false, true])("prefers the configured layout when archive timestamps tie (shared=%s)", async (shared) => {
+    const alternate = await seed(!shared);
+    const preferred = await seed(shared);
+    await utimes(alternate, 100, 100);
+    await utimes(preferred, 100, 100);
+    expect(await findSessionHarvest("demo", "om_history", shared)).toBe(preferred);
+  });
+
+  it.each([false, true])("uses the newer archive even when it is outside the current sharing layout (shared=%s)", async (shared) => {
+    const configured = await seed(shared);
+    const newest = await seed(!shared);
+    await utimes(configured, 100, 100);
+    await utimes(newest, 200, 200);
+    expect(await findSessionHarvest("demo", "om_history", shared)).toBe(newest);
+  });
+
+  it.each([false, true])("retains access to this agent's archive after sharing changes (shared=%s)", async (shared) => {
+    const oldArchive = await seed(!shared);
+    expect(await findSessionHarvest("demo", "om_history", shared)).toBe(oldArchive);
+  });
+
+  it("does not recover another agent's same-topic archive", async () => {
+    await seed(false, "other");
+    await seed(true, "other");
+    expect(await findSessionHarvest("demo", "om_history")).toBeUndefined();
+  });
+});
 
 const PLACEHOLDER = [
   "# Session Summary",

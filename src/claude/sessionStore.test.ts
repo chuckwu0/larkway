@@ -40,6 +40,50 @@ async function readCurrentFile(): Promise<{ version: number; records: Record<str
   return JSON.parse(raw) as { version: number; records: Record<string, unknown> };
 }
 
+describe("runtime session identity", () => {
+  it("retains cwd and backend immediately, on disk, and after reload", async () => {
+    const store = await SessionStore.load(sessionsPath);
+    const record = {
+      threadId: "om_runtime", botId: "demo", sessionId: "native-session",
+      createdTs: 1000, lastActiveTs: 2000,
+      workspacePath: path.join(tmpDir, "project"), backend: "claude",
+    };
+    await store.put(record);
+    expect(store.get("om_runtime", "demo")).toEqual(record);
+    expect((await readCurrentFile()).records["om_runtime::demo"]).toEqual(record);
+    await store.close();
+    const reloaded = await SessionStore.load(sessionsPath);
+    expect(reloaded.get("om_runtime", "demo")).toEqual(record);
+    // A fresh session can replace both stamps, rather than inheriting stale identity.
+    await reloaded.put({ ...record, sessionId: "new-session", workspacePath: path.join(tmpDir, "other-project"), backend: "codex" });
+    expect(reloaded.get("om_runtime", "demo")).toMatchObject({ backend: "codex", workspacePath: path.join(tmpDir, "other-project") });
+    await reloaded.close();
+  });
+
+  it("keeps unstamped legacy records compatible", async () => {
+    await writeV2Fixture({ "om_old::demo": {
+      threadId: "om_old", botId: "demo", sessionId: "old", createdTs: 1, lastActiveTs: 2,
+    } });
+    const store = await SessionStore.load(sessionsPath);
+    expect(store.get("om_old", "demo")).toMatchObject({ sessionId: "old" });
+    expect(store.get("om_old", "demo")?.workspacePath).toBeUndefined();
+    expect(store.get("om_old", "demo")?.backend).toBeUndefined();
+    await store.close();
+  });
+
+  it.each(["workspacePath", "backend"])("rejects a malformed %s stamp without losing healthy records", async (field) => {
+    const base = { botId: "demo", sessionId: "native", createdTs: 1, lastActiveTs: 2 };
+    await writeV2Fixture({
+      "om_bad::demo": { ...base, threadId: "om_bad", [field]: { invalid: true } },
+      "om_good::demo": { ...base, threadId: "om_good", workspacePath: "/project", backend: "codex" },
+    });
+    const store = await SessionStore.load(sessionsPath);
+    expect(store.get("om_bad", "demo")).toBeUndefined();
+    expect(store.get("om_good", "demo")).toMatchObject({ workspacePath: "/project", backend: "codex" });
+    await store.close();
+  });
+});
+
 // ---------------------------------------------------------------------------
 // V1 → V2 migration
 // ---------------------------------------------------------------------------

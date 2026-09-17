@@ -33,16 +33,19 @@ import { resolveAgentWorkspacePath } from "../../config/paths.js";
  * surgical section replacement, so agent-authored AGENTS.md content survives.
  * Best-effort: a projection failure warns but never fails the save itself.
  */
-async function projectMemoryToWorkspace(ctx: CliContext, id: string): Promise<void> {
+async function projectMemoryToWorkspace(ctx: CliContext, id: string, previousMemory?: string): Promise<void> {
   try {
     // Adversarial-review fix: only agent_workspace bots have a workspace
     // AGENTS.md to project into — a legacy bot would otherwise get a
     // misleading "尚未初始化,下次会生成" warning on every save (the promised
     // ensure never happens for legacy).
     const bot = await ctx.botsStore.readBot(id);
-    if (bot.runtime !== "agent_workspace") return;
+    if (bot.runtime !== "agent_workspace" || bot.workspace) return;
     const content = await ctx.botsStore.readMemory(id);
-    const result = await projectRoleNotes(resolveAgentWorkspacePath(id), content);
+    const result = await projectRoleNotes(resolveAgentWorkspacePath(id), content, previousMemory);
+    if (result === "preserved") {
+      ctx.ui.warning("memory 已保存;AGENTS.md 的身份说明含自行维护的内容,已保留,请直接核对原生文件。");
+    }
     if (result === "skipped") {
       ctx.ui.warning(
         `workspace AGENTS.md 不存在(agent workspace 尚未初始化)——memory 已保存,投影跳过;` +
@@ -134,6 +137,15 @@ async function assertBotExists(ctx: CliContext, id: string): Promise<boolean> {
   return true;
 }
 
+async function assertManagedMemory(ctx: CliContext, id: string): Promise<boolean> {
+  const bot = await ctx.botsStore.readBot(id);
+  if (!bot.workspace) return true;
+  const error = `Bot "${id}" 使用现有 workspace;请直接编辑 ${bot.workspace} 中的 AGENTS.md / CLAUDE.md。`;
+  if (ctx.flags.json) ctx.ui.emitJson({ ok: false, error, id });
+  else ctx.ui.failure(error);
+  return false;
+}
+
 // ---------------------------------------------------------------------------
 // Sub-command: show
 // ---------------------------------------------------------------------------
@@ -167,6 +179,7 @@ async function subShow(ctx: CliContext, id: string): Promise<number> {
 
 async function subSet(ctx: CliContext, id: string, file: string): Promise<number> {
   if (!(await assertBotExists(ctx, id))) return 1;
+  if (!(await assertManagedMemory(ctx, id))) return 1;
 
   let content: string;
   try {
@@ -181,8 +194,9 @@ async function subSet(ctx: CliContext, id: string, file: string): Promise<number
     return 1;
   }
 
+  const previousMemory = await ctx.botsStore.readMemory(id).catch(() => undefined);
   await ctx.botsStore.writeMemory(id, content);
-  await projectMemoryToWorkspace(ctx, id);
+  await projectMemoryToWorkspace(ctx, id, previousMemory);
 
   if (ctx.flags.json) {
     ctx.ui.emitJson({ ok: true, id, written: content.length });
@@ -198,6 +212,7 @@ async function subSet(ctx: CliContext, id: string, file: string): Promise<number
 
 async function subEdit(ctx: CliContext, id: string): Promise<number> {
   if (!(await assertBotExists(ctx, id))) return 1;
+  if (!(await assertManagedMemory(ctx, id))) return 1;
 
   // Read existing memory, or create from template if absent.
   let initial: string;
@@ -248,7 +263,7 @@ async function subEdit(ctx: CliContext, id: string): Promise<number> {
   }
 
   await ctx.botsStore.writeMemory(id, edited);
-  await projectMemoryToWorkspace(ctx, id);
+  await projectMemoryToWorkspace(ctx, id, isNew ? undefined : initial);
   if (ctx.flags.json) {
     ctx.ui.emitJson({ ok: true, id, written: edited.length });
   } else {

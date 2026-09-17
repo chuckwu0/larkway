@@ -23,6 +23,7 @@ import path from "node:path";
 import { ensureAgentWorkspace, resetAgentWorkspacePermissions } from "../../agent/workspaceStore.js";
 import { permissionItemsFromCapabilities } from "../../agent/permissionPlan.js";
 import { resolveAgentWorkspacePathFromHome } from "../../config/paths.js";
+import { syncManagedWorkspaceDefinition } from "../workspaceDefinition.js";
 
 // ---------------------------------------------------------------------------
 // Entry point
@@ -372,8 +373,7 @@ async function runAdd(ctx: CliContext, args: string[]): Promise<number> {
   const memoryContent = botsStore.genMemoryTemplate(name);
   await botsStore.writeMemory(id, memoryContent);
 
-  const workspaceHome = inferLarkwayHome(ctx.paths.botsDir, ctx.paths.larkwayDir);
-  const workspacePath = resolveAgentWorkspacePathFromHome(workspaceHome, id);
+  const workspacePath = resolveAgentWorkspacePathFromHome(ctx.paths.larkwayDir, id);
   const reposPath = path.join(workspacePath, "repos");
   await ensureAgentWorkspace({
     agentId: id,
@@ -559,6 +559,7 @@ async function runEdit(ctx: CliContext, args: string[]): Promise<number> {
     }
 
     await botsStore.writeBot(valid);
+    const warnings = await syncManagedWorkspaceDefinition(ctx, config, valid);
     const resetGrantedPath = await resetPermissionArtifactsIfNeeded(
       ctx,
       config,
@@ -567,7 +568,7 @@ async function runEdit(ctx: CliContext, args: string[]): Promise<number> {
     );
 
     if (flags.json) {
-      ui.emitJson({ ok: true, id, permissions_reset_path: resetGrantedPath });
+      ui.emitJson({ ok: true, id, permissions_reset_path: resetGrantedPath, ...(warnings.length ? { warnings } : {}) });
     } else {
       if (resetGrantedPath) {
         ui.warning(`权限面已变化,已重置授权记录: ${resetGrantedPath}`);
@@ -651,6 +652,7 @@ async function applySetPatches(
   }
 
   await botsStore.writeBot(valid);
+  const warnings = await syncManagedWorkspaceDefinition(ctx, config, valid);
   const resetGrantedPath = await resetPermissionArtifactsIfNeeded(
     ctx,
     config,
@@ -659,7 +661,7 @@ async function applySetPatches(
   );
 
   if (flags.json) {
-    ui.emitJson({ ok: true, id, patched: [...setMap.keys()], permissions_reset_path: resetGrantedPath });
+    ui.emitJson({ ok: true, id, patched: [...setMap.keys()], permissions_reset_path: resetGrantedPath, ...(warnings.length ? { warnings } : {}) });
   } else {
     if (resetGrantedPath) {
       ui.warning(`权限面已变化,已重置授权记录: ${resetGrantedPath}`);
@@ -714,10 +716,9 @@ async function resetPermissionArtifactsIfNeeded(
   after: BotConfig,
   reason: string,
 ): Promise<string | undefined> {
-  if (after.runtime !== "agent_workspace") return undefined;
+  if (after.runtime !== "agent_workspace" || after.workspace) return undefined;
   if (permissionSurfaceKey(before) === permissionSurfaceKey(after)) return undefined;
-  const workspaceHome = inferLarkwayHome(ctx.paths.botsDir, ctx.paths.larkwayDir);
-  const workspacePath = resolveAgentWorkspacePathFromHome(workspaceHome, after.id);
+  const workspacePath = resolveAgentWorkspacePathFromHome(ctx.paths.larkwayDir, after.id);
   await resetAgentWorkspacePermissions({
     workspacePath,
     reposPath: path.join(workspacePath, "repos"),
@@ -788,9 +789,4 @@ function defaultPermissionRequests(input: {
   }
   items.push("Local shell inside the Agent Workspace for task execution and verification");
   return items;
-}
-
-function inferLarkwayHome(botsDir: string, fallback: string): string {
-  if (path.basename(botsDir) === "bots") return path.dirname(botsDir);
-  return fallback === path.dirname(botsDir) ? botsDir : fallback;
 }

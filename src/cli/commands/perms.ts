@@ -32,6 +32,7 @@ import path from "node:path";
 import { permissionItemsFromCapabilities } from "../../agent/permissionPlan.js";
 import { resolveAgentWorkspacePathFromHome } from "../../config/paths.js";
 import { resetAgentWorkspacePermissions } from "../../agent/workspaceStore.js";
+import { syncManagedWorkspaceDefinition } from "../workspaceDefinition.js";
 
 // ---------------------------------------------------------------------------
 // Arg parsing (command-local flags only — global flags already stripped)
@@ -266,7 +267,7 @@ async function resetPermissionArtifactsIfNeeded(
   after: BotConfig,
   reason: string,
 ): Promise<string | undefined> {
-  if (after.runtime !== "agent_workspace") return undefined;
+  if (after.runtime !== "agent_workspace" || after.workspace) return undefined;
   if (permissionSurfaceKey(before) === permissionSurfaceKey(after)) return undefined;
   const workspacePath = resolveAgentWorkspacePathFromHome(ctx.paths.larkwayDir, after.id);
   await resetAgentWorkspacePermissions({
@@ -309,6 +310,8 @@ async function writePermissionGrants(
   id: string,
   flags: PermsFlags,
 ): Promise<{ filePath: string; grants: string[] }> {
+  const bot = await ctx.botsStore.readBot(id);
+  if (bot.workspace) throw new Error("现有 workspace 的授权由原生文件管理;请直接维护该目录,不生成托管权限记录。");
   const workspacePath = resolveAgentWorkspacePathFromHome(ctx.paths.larkwayDir, id);
   const requestPath = path.join(workspacePath, "permissions-request.md");
   const grantedPath = path.join(workspacePath, "permissions-granted.md");
@@ -614,10 +617,18 @@ export async function run(ctx: CliContext, args: string[]): Promise<number> {
   const hasGrantMutations =
     permsFlags.grantFromRequest || permsFlags.grantPermissions.length > 0;
 
+  if (hasGrantMutations && config.workspace) {
+    const error = "现有 workspace 的授权由原生文件管理;请直接维护该目录,不生成托管权限记录。";
+    ui.failure(error);
+    if (flags.json) ui.emitJson({ ok: false, error, id });
+    return 1;
+  }
+
   if (hasConfigMutations || hasGrantMutations) {
     // Apply mutations directly (non-interactive / scripted path)
     const beforeConfig = config;
     let resetGrantedPath: string | undefined;
+    let warnings: string[] = [];
     if (hasConfigMutations) {
       config = applyNonInteractiveMutations(id, config, permsFlags);
 
@@ -631,6 +642,7 @@ export async function run(ctx: CliContext, args: string[]): Promise<number> {
       }
 
       await botsStore.writeBot(config);
+      warnings = await syncManagedWorkspaceDefinition(ctx, beforeConfig, config);
       resetGrantedPath = await resetPermissionArtifactsIfNeeded(
         ctx,
         beforeConfig,
@@ -661,6 +673,7 @@ export async function run(ctx: CliContext, args: string[]): Promise<number> {
         permissions_reset_path: resetGrantedPath,
         permissions_granted_path: grantResult?.filePath,
         permissions_granted_count: grantResult?.grants.length,
+        ...(warnings.length ? { warnings } : {}),
       });
     } else {
       renderSummary(config, ui);
@@ -726,6 +739,7 @@ export async function run(ctx: CliContext, args: string[]): Promise<number> {
   }
 
   await botsStore.writeBot(config);
+  await syncManagedWorkspaceDefinition(ctx, beforeConfig, config);
   const resetGrantedPath = await resetPermissionArtifactsIfNeeded(
     ctx,
     beforeConfig,

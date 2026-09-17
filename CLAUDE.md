@@ -19,7 +19,7 @@ operations happen inside the agent subprocess.
 src/
   agent/        AgentRunner interface + backend registry — the extension point
   claude/       ClaudeRunner: spawns `claude --output-format stream-json`
-  codex/        CodexRunner: spawns `codex exec --json`
+  codex/        CodexRunner: JSON-RPC over `codex app-server --stdio`
   bridge/       Message handler, card renderer, session state files
   lark/         Feishu WS channel client, card/message parsing utilities
   config/       Bot YAML loader, path helpers, zod config schema
@@ -39,7 +39,13 @@ Key files:
 | `src/bridge/handler.ts` | Core per-message dispatch loop |
 | `src/lark/card.ts` | Card rendering + throttled Feishu PATCH |
 | `src/claude/runner.ts` | Reference runner implementation |
+| `src/codex/runner.ts` | Codex app-server lifecycle and protocol adapter |
 | `src/config/botLoader.ts` | Loads `bots/*.yaml` into typed `BotConfig` |
+
+Current behavior and boundaries: [native runtime alignment](docs/native-runtime.md),
+[workspace ownership](docs/agent-workspace.md), and
+[runtime validation](docs/runtime-validation.md). Check these before adding
+prompt instructions, changing session lifetime, or claiming performance parity.
 
 ## Iron rules
 
@@ -49,7 +55,8 @@ Do not add business logic to `bridge/` or `main.ts`. "Should this be done?",
 
 Things Larkway must NOT do:
 - Call external APIs on the agent's behalf (GitLab, Jira, Slack, …)
-- Parse or interpret the agent's text output beyond card rendering
+- Turn the agent's prose into workflow decisions; only normalize the runtime
+  protocol and documented answer channels for presentation
 - Make multi-step workflow decisions
 
 **2. Reuse CLIs, not SDKs — with one deliberate exception.**
@@ -62,9 +69,10 @@ that swap is settled; don't "fix" it back. Do not add NEW SDK dependencies
 without the same level of justification.
 
 **3. Subscription auth, not API keys.**
-The `claude` subprocess reads `~/.claude/.credentials.json` (local subscription
-login). Never inject `ANTHROPIC_API_KEY` into the subprocess env — that would
-switch billing to API key mode.
+Use the CLI's existing local subscription login. The Claude runner strips
+`ANTHROPIC_API_KEY`; the Codex runner strips both `OPENAI_API_KEY` and
+`ANTHROPIC_API_KEY`. Do not reintroduce billing-key overrides or copy account
+credentials into configuration or test evidence.
 
 **4. Changes to workflow go in the agent's config/skills, not in Larkway.**
 If you want the agent to behave differently (new commit convention, extra test
@@ -81,6 +89,11 @@ pnpm test           # unit tests (vitest, no network/subprocess)
 
 All tests are pure unit tests. Do not add tests that spawn real subprocesses or
 make network calls.
+
+Real-runtime and Feishu validation is a separate, explicitly authorized workflow;
+it must not become an implicit `pnpm test` dependency. Follow
+[runtime validation](docs/runtime-validation.md) for isolated fixtures, retained
+failure evidence, and the limits of character, token and latency measurements.
 
 ## Adding a new agent backend
 

@@ -6,7 +6,7 @@
 
 ---
 
-你在飞书话题里 @ bot，它在你的机器上运行——读真实代码库、执行命令、开 MR——把结果贴回飞书。你定义 agent 知道什么、能做什么。Larkway 只负责传递消息。
+你在飞书话题里 @ bot，它在你的机器上运行——读真实代码库、执行命令、开 MR——把结果贴回飞书。你可以直接接入已经配置好的 Claude Code / Codex workspace，或创建托管 workspace。Larkway 负责飞书触发与本地 runtime 的连接。
 
 **当前版本：v0.3.72**
 
@@ -109,13 +109,24 @@ Larkway 不注入 `ANTHROPIC_API_KEY` 或任何其他 API key。子进程继承�
 
 | 层 | 是什么 | 放在哪 |
 |---|---|---|
-| **L1 权限** | App 凭据、repo 路径、允许的飞书用户/群、token scope | `~/.larkway/bots/<id>.yaml` |
-| **L2 身份 memory** | "我是谁、禁止什么、工作流指针"（薄） | `~/.larkway/bots/<id>.memory.md` |
-| **L3 工作流** | 状态机、gate、命令——实际的工作内容 | **业务 repo**：`AGENTS.md`、`CLAUDE.md`、`.agents/skills/`、`.claude/skills/` |
+| **运行连接** | App 凭据、backend、workspace、响应群范围、repo 指针 | `~/.larkway/bots/<id>.yaml` |
+| **身份与职责** | 托管 workspace 的简短角色定义 | `~/.larkway/bots/<id>.memory.md`，同步到 workspace `AGENTS.md` |
+| **原生指南与 skills** | 项目流程、知识与工具用法 | **workspace / 业务 repo**：`AGENTS.md`、`CLAUDE.md`、`.agents/skills/`、`.claude/skills/` |
 
 密钥只存在本机 `~/.larkway/.env`（权限 0600）。配置和 memory 不含密钥。
 
-默认所有 bot 共享宿主机的全局 lark-cli 配置目录——包括你在里面做过的个人 `lark-cli auth login`(日历/邮箱/云盘)。在 bot 的 yaml 里设 `lark_cli_isolated: true` 可给它一个私有配置目录(`~/.larkway/<botId>/lark-cli/`),里面只有它自己的应用 profile:默认 bot-only 身份,只有你显式在该目录内授权,agent 才能获得个人资源访问。
+默认每个 bot 使用自己的 lark-cli 配置目录（`~/.larkway/<botId>/lark-cli/`）和应用 profile，不通过配置继承宿主机的个人登录态。显式设置 `lark_cli_isolated: false` 可保留原先的共享配置行为。这是身份配置隔离，并非 OS 沙箱；默认全权限 runtime 仍可访问宿主用户有权限的本机文件。
+
+接入已经配置好的本机 workspace，可在 Web 管理面的「接入现有 workspace」高级选项中填写绝对路径，或写入 YAML：
+
+```yaml
+runtime: agent_workspace
+workspace: /absolute/path/to/existing-workspace
+```
+
+目录必须已存在。Larkway 直接使用其中的原生指南、skills 和底座配置，不向其中生成文件。此模式请直接维护 `AGENTS.md` / `CLAUDE.md`，管理面的身份说明编辑器会禁用。留空则使用 Larkway 托管目录；更换路径后，话题下次运行会开启新的底座 session。
+
+仓库配置是默认工作指针，不是访问白名单；关闭它不会撤销本机文件访问或 Git 凭据。轮次设置只是协作提醒，不是工具调用的硬预算。组织知识库按需开启：只有需要共享同一知识库的 Agent 才设置 `sharedKnowledge: true`。默认行为与兼容说明见[原生运行时约定](docs/native-runtime.md)。
 
 ---
 
@@ -124,7 +135,7 @@ Larkway 不注入 `ANTHROPIC_API_KEY` 或任何其他 API key。子进程继承�
 - **一个 bridge 跑多个 bot** —— 只读答疑 bot 和有写权限的工程 bot 可以共用同一个进程，各自有独立的 L1/L2/L3 定义
 - **Web 管理面** —— `larkway ui` 打开本地管理后台（127.0.0.1 + token），可以建 bot、编辑 memory、查看实时日志
 - **Session 续接** —— 每个飞书话题映射到持久 `session_id`，agent 记得之前做了什么
-- **Agent Workspace** —— 每个话题独立 git worktree，agent 并发处理多个话题不冲突
+- **Agent Workspace** —— 可创建托管目录或接入现有目录，每个话题有独立 session 工件。多个话题共享 workspace；并发改代码需要 Agent 自行创建独立 worktree。
 - **Codex 运行时预检** —— `larkway doctor` 在启动前验证 Codex 状态目录可写
 - **话题↔飞书任务句柄** —— 把话题转成飞书任务，agent 自动认领并自己维护整个生命周期（完成/失败重开/停滞唤醒/协作断链检测/过期催更）——详见下方
 

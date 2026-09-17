@@ -16,7 +16,7 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdtemp, rm, readFile, stat } from "node:fs/promises";
+import { mkdtemp, rm, readFile, stat, mkdir, writeFile, readdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import yaml from "js-yaml";
@@ -78,6 +78,67 @@ describe("deriveBotId", () => {
 // ---------------------------------------------------------------------------
 
 describe("createBotFromCreds", () => {
+  it("keeps managed artifacts in runtime home when the definition directory is separate", async () => {
+    const separateBotsDir = path.join(dir, "configuration", "bots");
+    const runtimeHome = path.join(dir, "runtime");
+    const runtimeEnv = path.join(runtimeHome, ".env");
+    const { botId, config } = await createBotFromCreds({
+      creds: FAKE_CREDS,
+      form: { name: "Runtime Bot", memory_content: "Runtime identity" },
+      botsDir: separateBotsDir,
+      envPath: runtimeEnv,
+    });
+    const workspace = path.join(runtimeHome, "agents", botId, "workspace");
+    expect(await readFile(path.join(workspace, "AGENTS.md"), "utf8")).toContain("Runtime identity");
+    expect(await readFile(path.join(separateBotsDir, `${botId}.memory.md`), "utf8")).toBe("Runtime identity");
+    expect(await readFile(path.join(separateBotsDir, `${botId}.yaml`), "utf8")).toContain(config.app_secret_env);
+    expect(await readFile(runtimeEnv, "utf8")).toContain(config.app_secret_env);
+    await expect(stat(path.join(dir, "configuration", "agents"))).rejects.toThrow();
+    await expect(stat(path.join(separateBotsDir, "agents"))).rejects.toThrow();
+  });
+
+  it("persists identity notes and all allowed groups before reporting creation success", async () => {
+    const memory = "# Release assistant\n\nCoordinate releases; use the workspace skills.";
+    const { botId, config } = await createBotFromCreds({
+      creds: FAKE_CREDS,
+      form: { name: "Release Bot", memory_content: memory, chats: ["oc_first", "oc_second"] },
+      botsDir, envPath,
+    });
+    expect(config.chats).toEqual(["oc_first", "oc_second"]);
+    expect(config.lark_cli_isolated).toBe(true);
+    expect(await readFile(path.join(botsDir, `${botId}.memory.md`), "utf8")).toBe(memory);
+    expect(await readFile(path.join(dir, "agents", botId, "workspace", "AGENTS.md"), "utf8")).toContain(memory);
+  });
+
+  it("connects a BYO workspace without scaffolding it or creating a shadow workspace", async () => {
+    const workspace = path.join(dir, "existing-workspace");
+    await mkdir(workspace);
+    await writeFile(path.join(workspace, "AGENTS.md"), "# Owner-managed instructions\n");
+    const { botId, config } = await createBotFromCreds({
+      creds: FAKE_CREDS,
+      form: { name: "Native Bot", workspace, memory_content: "Must not project this" },
+      botsDir, envPath,
+    });
+    expect(config.workspace).toBe(workspace);
+    expect(config.memory_file).toBeUndefined();
+    expect(await readdir(workspace)).toEqual(["AGENTS.md"]);
+    expect(await readFile(path.join(workspace, "AGENTS.md"), "utf8")).toBe("# Owner-managed instructions\n");
+    await expect(stat(path.join(dir, "agents", botId, "workspace"))).rejects.toThrow();
+    await expect(stat(path.join(botsDir, `${botId}.memory.md`))).rejects.toThrow();
+  });
+
+  it("rejects nonexistent, relative and file workspace paths before saving credentials", async () => {
+    const file = path.join(dir, "not-a-directory");
+    await writeFile(file, "content");
+    for (const workspace of ["relative/path", path.join(dir, "missing"), file]) {
+      await expect(createBotFromCreds({
+        creds: FAKE_CREDS, form: { name: "Invalid Bot", workspace }, botsDir, envPath,
+      })).rejects.toThrow(/workspace/);
+    }
+    await expect(stat(envPath)).rejects.toThrow();
+    await expect(stat(botsDir)).rejects.toThrow();
+  });
+
   it.skipIf(process.platform === "win32")("writes secret (0600) + yaml + memory; yaml passes BotConfigSchema", async () => {
     const form: OnboardForm = {
       name: "Frontend Bot",

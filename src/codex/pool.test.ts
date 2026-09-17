@@ -73,6 +73,12 @@ function jsonRpcErrorResponse(id: number, message: string) {
   return JSON.stringify({ id, error: { code: -32601, message } });
 }
 
+function agentStarted(threadId: string, turnId: string, phase = "final_answer") {
+  return JSON.stringify({ method: "item/started", params: {
+    threadId, turnId, item: { type: "agentMessage", id: "msg-1", text: "", phase },
+  } });
+}
+
 function agentDelta(threadId: string, turnId: string, delta: string) {
   return JSON.stringify({ method: "item/agentMessage/delta", params: { threadId, turnId, itemId: "msg-1", delta } });
 }
@@ -226,7 +232,8 @@ describe("CodexProcessPool — spawn-once/reuse", () => {
     child.stdout.write(threadResponse(2, "thread-a") + "\n");
     await flush();
     child.stdout.write(turnStartResponse(3, "turn-a") + "\n");
-    child.stdout.write(agentDelta("thread-a", "turn-a", "LARKWAY_ANSWER_BEGIN\nhi\nLARKWAY_ANSWER_END") + "\n");
+    child.stdout.write(agentStarted("thread-a", "turn-a") + "\n");
+    child.stdout.write(agentDelta("thread-a", "turn-a", "hi") + "\n");
     child.stdout.write(turnCompleted("thread-a", "turn-a") + "\n");
     await flush();
 
@@ -284,11 +291,7 @@ describe("CodexProcessPool — wire protocol", () => {
     expect(turnStart?.params).toMatchObject({ threadId: "thread-a", cwd: "/repo/wt", approvalPolicy: "on-request" });
   });
 
-  // Pooling is default-on for codex bots, so this is the LIVE path: without
-  // turn/start.summary the pooled turn gets no reasoning deltas and the idle
-  // watchdog goes blind for the whole model request (see runner.ts's
-  // CODEX_TURN_REASONING_SUMMARY for the measurement).
-  it("sends turn/start.summary=detailed on the pooled path too", async () => {
+  it("inherits host reasoning-summary settings on the pooled path", async () => {
     const pool = new CodexProcessPool({});
     const handle = pool.run({ prompt: "hi" });
     await flush();
@@ -304,7 +307,7 @@ describe("CodexProcessPool — wire protocol", () => {
     await handle.done;
 
     const turnStart = readOutboundRequests(child).find((r) => r.method === "turn/start");
-    expect(turnStart?.params).toMatchObject({ summary: "detailed" });
+    expect(turnStart?.params).not.toHaveProperty("summary");
   });
 
   it("sends state.opts.effort through turn/start.effort, mapped through codexEffortFromLarkway (max → xhigh)", async () => {
@@ -347,7 +350,7 @@ describe("CodexProcessPool — wire protocol", () => {
     expect(turnStart?.params).not.toHaveProperty("effort");
   });
 
-  it("resume: sends thread/resume with the resumeSessionId, marks resumeMode same-process", async () => {
+  it("loads an existing native thread on a new process as a cold resume", async () => {
     const pool = new CodexProcessPool({});
     const handle = pool.run({ prompt: "continue", resumeSessionId: "prior-thread-id" });
     await flush();
@@ -363,11 +366,72 @@ describe("CodexProcessPool — wire protocol", () => {
 
     const result = await handle.done;
     expect(result.pooled).toBe(true);
-    expect(result.resumeMode).toBe("same-process");
+    expect(result.resumeMode).toBe("cold");
 
     const requests = readOutboundRequests(child);
     const threadResume = requests.find((r) => r.method === "thread/resume");
     expect(threadResume?.params).toMatchObject({ threadId: "prior-thread-id" });
+  });
+
+  it("reports same-process only for a thread already loaded by this live child", async () => {
+    const pool = new CodexProcessPool({});
+    const first = pool.run({ prompt: "remember this" });
+    await flush();
+    const child = spawnedChildren[0]!;
+    child.stdout.write(initResponse(1) + "\n");
+    await flush();
+    child.stdout.write(threadResponse(2, "thread-a") + "\n");
+    await flush();
+    child.stdout.write(turnStartResponse(3, "turn-a") + "\n");
+    child.stdout.write(turnCompleted("thread-a", "turn-a") + "\n");
+    await first.done;
+
+    const second = pool.run({ prompt: "continue", resumeSessionId: "thread-a" });
+    await flush();
+    child.stdout.write(threadResponse(4, "thread-a") + "\n");
+    await flush();
+    child.stdout.write(turnStartResponse(5, "turn-b") + "\n");
+    child.stdout.write(turnCompleted("thread-a", "turn-b") + "\n");
+    await expect(second.done).resolves.toMatchObject({ pooled: true, resumeMode: "same-process" });
+
+    // A warm OS process alone is insufficient: this different thread still
+    // needs its first load from native session history.
+    const external = pool.run({ prompt: "continue other task", resumeSessionId: "external-thread" });
+    await flush();
+    child.stdout.write(threadResponse(6, "external-thread") + "\n");
+    await flush();
+    child.stdout.write(turnStartResponse(7, "turn-c") + "\n");
+    child.stdout.write(turnCompleted("external-thread", "turn-c") + "\n");
+    await expect(external.done).resolves.toMatchObject({ pooled: true, resumeMode: "cold" });
+    expect(spawnedChildren).toHaveLength(1);
+
+    child.emit("exit", 0);
+    const afterRestart = pool.run({ prompt: "continue after restart", resumeSessionId: "thread-a" });
+    await flush();
+    const replacement = spawnedChildren[1]!;
+    expect(replacement.pid).not.toBe(child.pid);
+    replacement.stdout.write(initResponse(8) + "\n");
+    await flush();
+    replacement.stdout.write(threadResponse(9, "thread-a") + "\n");
+    await flush();
+    replacement.stdout.write(turnStartResponse(10, "turn-d") + "\n");
+    replacement.stdout.write(turnCompleted("thread-a", "turn-d") + "\n");
+    await expect(afterRestart.done).resolves.toMatchObject({ pooled: true, resumeMode: "cold" });
+  });
+
+  it("does not claim same-process when an imported thread is interrupted", async () => {
+    const pool = new CodexProcessPool({});
+    const handle = pool.run({ prompt: "continue", resumeSessionId: "prior-thread" });
+    await flush();
+    const child = spawnedChildren[0]!;
+    child.stdout.write(initResponse(1) + "\n");
+    await flush();
+    child.stdout.write(threadResponse(2, "prior-thread") + "\n");
+    await flush();
+    child.stdout.write(turnStartResponse(3, "turn-a") + "\n");
+    await flush();
+    handle.kill();
+    await expect(handle.done).resolves.toMatchObject({ pooled: true, resumeMode: "cold", exitCode: 1 });
   });
 
   it("a fresh (non-resume) turn has resumeMode undefined", async () => {
@@ -414,7 +478,8 @@ describe("CodexProcessPool — crash fallback", () => {
     coldChild.stdout.write(threadResponse(2, "thread-cold", "/wt/a") + "\n");
     await flush();
     coldChild.stdout.write(turnStartResponse(3, "turn-cold") + "\n");
-    coldChild.stdout.write(agentDelta("thread-cold", "turn-cold", "LARKWAY_ANSWER_BEGIN\nok\nLARKWAY_ANSWER_END") + "\n");
+    coldChild.stdout.write(agentStarted("thread-cold", "turn-cold") + "\n");
+    coldChild.stdout.write(agentDelta("thread-cold", "turn-cold", "ok") + "\n");
     coldChild.stdout.write(turnCompleted("thread-cold", "turn-cold") + "\n");
     await flush();
 
@@ -528,7 +593,8 @@ describe("CodexProcessPool — kill() semantics", () => {
     await flush();
 
     // B keeps flowing normally on the same still-alive process.
-    child.stdout.write(agentDelta("thread-b", "turn-b", "LARKWAY_ANSWER_BEGIN\nstill going\nLARKWAY_ANSWER_END") + "\n");
+    child.stdout.write(agentStarted("thread-b", "turn-b") + "\n");
+    child.stdout.write(agentDelta("thread-b", "turn-b", "still going") + "\n");
     child.stdout.write(turnCompleted("thread-b", "turn-b") + "\n");
     await flush();
 
@@ -582,10 +648,12 @@ describe("CodexProcessPool — concurrent turns on one process", () => {
     await flush();
 
     // Interleaved deltas for both threads on the shared stdout stream.
-    child.stdout.write(agentDelta("thread-a", "turn-a", "LARKWAY_ANSWER_BEGIN\nAAA") + "\n");
-    child.stdout.write(agentDelta("thread-b", "turn-b", "LARKWAY_ANSWER_BEGIN\nBBB") + "\n");
-    child.stdout.write(agentDelta("thread-a", "turn-a", "111\nLARKWAY_ANSWER_END") + "\n");
-    child.stdout.write(agentDelta("thread-b", "turn-b", "222\nLARKWAY_ANSWER_END") + "\n");
+    child.stdout.write(agentStarted("thread-a", "turn-a") + "\n");
+    child.stdout.write(agentDelta("thread-a", "turn-a", "AAA") + "\n");
+    child.stdout.write(agentStarted("thread-b", "turn-b") + "\n");
+    child.stdout.write(agentDelta("thread-b", "turn-b", "BBB") + "\n");
+    child.stdout.write(agentDelta("thread-a", "turn-a", "111") + "\n");
+    child.stdout.write(agentDelta("thread-b", "turn-b", "222") + "\n");
     child.stdout.write(turnCompleted("thread-a", "turn-a") + "\n");
     child.stdout.write(turnCompleted("thread-b", "turn-b") + "\n");
     await flush();

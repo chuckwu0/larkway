@@ -26,7 +26,7 @@
  */
 
 import { randomUUID } from "node:crypto";
-import { mkdir, writeFile, rename, chmod, readFile } from "node:fs/promises";
+import { mkdir, writeFile, rename, chmod, readFile, stat } from "node:fs/promises";
 import path from "node:path";
 import * as QRCode from "qrcode";
 import {
@@ -188,6 +188,10 @@ export interface OnboardForm {
   description?: string;
   /** Task-first description used to seed the Agent Workspace. */
   task_description?: string;
+  /** Managed workspace identity notes, persisted before creation succeeds. */
+  memory_content?: string;
+  /** Existing owner-managed workspace; no scaffold or memory is written there. */
+  workspace?: string;
   /**
    * Optional允许群限制 chat_id (oc_…). Convenience single-value shorthand kept for
    * cancelOnboard (default-name path) and backward compat. When both chatId and
@@ -201,11 +205,11 @@ export interface OnboardForm {
   chats?: string[];
   /**
    * Repos to warm up (slug + branch + optional url).
-   * Empty / absent → pure 答疑 bot with no code access.
+   * Empty / absent → no default repo pointers (not an access boundary).
    */
   repos?: OnboardRepoEntry[];
   /**
-   * Max consecutive turns before the bot stops.
+   * Consecutive turns without a human before a collaboration reminder is suggested.
    * Absent → schema default (10).
    */
   turn_taking_limit?: number;
@@ -276,7 +280,7 @@ export interface CreateBotFromCredsOptions {
   form: OnboardForm;
   /** Absolute bots/ dir to write <id>.yaml + <id>.memory.md into. */
   botsDir: string;
-  /** Absolute path to the .env to write the secret into (0600). */
+  /** Runtime home's .env path (hostConfig.resolveEnvPath); independent of botsDir. */
   envPath: string;
   /**
    * Resolve the bot's group open_id + avatar + display name from its credentials
@@ -362,6 +366,24 @@ async function botYamlExists(botsDir: string, id: string): Promise<boolean> {
   }
 }
 
+/** Validate a BYO workspace without creating or changing anything in it. */
+export async function validateExistingWorkspace(value: unknown): Promise<string | undefined> {
+  if (value === undefined || value === "") return undefined;
+  if (typeof value !== "string") throw new Error("workspace 必须是现有目录的绝对路径");
+  const workspace = value.trim();
+  if (!workspace) return undefined;
+  if (!path.isAbsolute(workspace)) throw new Error("workspace 必须是绝对路径");
+  let info;
+  try {
+    info = await stat(workspace);
+  } catch {
+    throw new Error("workspace 目录不存在或不可访问;请先在本机创建并配置该目录");
+  }
+  if (!info.isDirectory()) throw new Error("workspace 必须是目录");
+  return workspace;
+}
+
+
 /**
  * Build a bot from registerApp creds + the onboarding form, writing all three
  * artifacts (secret → envPath, <id>.yaml → botsDir, <id>.memory.md → botsDir).
@@ -372,7 +394,7 @@ async function botYamlExists(botsDir: string, id: string): Promise<boolean> {
  *   2. Best-effort resolve bot_open_id + avatar via injected resolveBotIdentity.
  *   3. Assemble BotConfig (env-ref for secret, chats/repos per form) + validate
  *      against BotConfigSchema BEFORE any disk write (invalid never lands).
- *   4. writeSecret(0600) → write yaml (atomic) → write memory template (atomic).
+ *   4. writeSecret(0600) → write yaml (atomic) → write managed identity notes (atomic).
  *
  * Returns { botId, config }. Throws (with no disk side-effects on validation
  * failure / id conflict) on any problem.
@@ -381,6 +403,7 @@ export async function createBotFromCreds(
   opts: CreateBotFromCredsOptions,
 ): Promise<CreateBotResult> {
   const { creds, form, botsDir, envPath } = opts;
+  const byoWorkspace = await validateExistingWorkspace(form.workspace);
 
   // 1. botId —— 此刻飞书 app 已建好,**绝不能因 id 派生/冲突而落盘失败、留下孤儿 app**。
   const explicit = form.botId?.trim();
@@ -457,8 +480,9 @@ export async function createBotFromCreds(
     repos,
     turn_taking_limit: form.turn_taking_limit ?? 10,
     schedules: [],
+    lark_cli_isolated: true,
     ...(git_token_env ? { git_token_env } : {}),
-    memory_file: memoryFile,
+    ...(byoWorkspace ? { workspace: byoWorkspace } : { memory_file: memoryFile }),
     read_only: false,
     response_surface_prototype: DEFAULT_RESPONSE_SURFACE_PROTOTYPE,
     runtime: "agent_workspace",
@@ -481,14 +505,14 @@ export async function createBotFromCreds(
     await writeSecretTo(envPath, git_token_env, gitlabTokenValue);
   }
   await atomicWrite(path.join(botsDir, `${botId}.yaml`), renderBotYaml(config));
-  await atomicWrite(
-    path.join(botsDir, memoryFile),
-    genMemoryTemplate(config.name),
-  );
-  const workspaceHome = inferLarkwayHomeFromBotsDir(botsDir);
+  if (byoWorkspace) return { botId, config };
+  const memoryContent = form.memory_content ?? genMemoryTemplate(config.name);
+  await atomicWrite(path.join(botsDir, memoryFile), memoryContent);
+  // The injected hostConfig .env path is <LARKWAY_HOME>/.env. A separately
+  // configured botsDir contains definitions, not the runtime workspace tree.
+  const workspaceHome = path.dirname(envPath);
   const workspacePath = resolveAgentWorkspacePathFromHome(workspaceHome, botId);
   const reposPath = path.join(workspacePath, "repos");
-  const memoryContent = genMemoryTemplate(config.name);
   await ensureAgentWorkspace({
     agentId: botId,
     workspacePath,
@@ -516,10 +540,6 @@ export async function createBotFromCreds(
   });
 
   return { botId, config };
-}
-
-function inferLarkwayHomeFromBotsDir(botsDir: string): string {
-  return path.basename(botsDir) === "bots" ? path.dirname(botsDir) : botsDir;
 }
 
 function defaultOnboardPermissionRequests(input: {

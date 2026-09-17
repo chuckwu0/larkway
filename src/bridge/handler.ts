@@ -44,13 +44,14 @@ import {
   buildFreshStartSeed,
   ensureSessionArtifacts,
 } from "../agent/sessionArtifacts.js";
+import { findSessionHarvest } from "../housekeeping/harvest.js";
+import { discoverWorkspaceRepoDirs } from "../agent/workspaceRepos.js";
 import type { FreshStartReason } from "../claude/sessionStore.js";
-import { resolveKnowledgeDir, resolveBotLarkCliDir } from "../config/paths.js";
+import { resolveKnowledgeDir, resolveBotLarkCliDir, resolveAgentWorkspacePath, resolveAgentHomeSessionsDir } from "../config/paths.js";
 import {
   commitKnowledgeIfDirty,
   ensureKnowledgeRepo,
   knowledgeMapSummary,
-  resolveHarvestPath,
 } from "../knowledge/store.js";
 import {
   diffMemoryMtimes,
@@ -327,28 +328,10 @@ const COT_BUBBLE_CREATE_BUDGET_MS = 3_000;
  */
 const DEFAULT_STUCK_SESSION_RESET_AFTER = 3;
 
-/**
- * 批F (F2) session-reseed defaults. Turn-count trigger applies to ALL
- * sessions (`sessionReseedTurns`, 0 disables): past this many completed
- * turns, the next turn starts a fresh backend session seeded from summary.md
- * + the transcript tail instead of resuming the ever-growing history — the
- * "resume 无压缩,话题越滚越慢" fix at the bridge layer. The idle-gap trigger
- * applies ONLY to sticky p2p sessions (`p2pStickyIdleMs`): a 1:1 chat quiet
- * past this gap very likely starts a new topic, so reseed rather than drag a
- * huge stale context in. Both are per-bot yaml knobs; these are the
- * effective defaults when the yaml omits them.
- */
-const DEFAULT_SESSION_RESEED_TURNS = 60;
-const DEFAULT_P2P_STICKY_IDLE_MS = 12 * 60 * 60 * 1000;
-
-/**
- * 批H (H2) volume-trigger default: reseed once the session's approxChars
- * (assistant answer text + JSON.stringify of visible tool_result raws — an
- * explicit LOWER-BOUND estimate) crosses this. Complements the turn counter:
- * a few turns with huge tool outputs can bloat a session long before turn 60.
- * Per-bot `sessionReseedChars` overrides; 0 disables.
- */
-const DEFAULT_SESSION_RESEED_CHARS = 300_000;
+// Native runtimes own context compaction. Session replacement is opt-in.
+const DEFAULT_SESSION_RESEED_TURNS = 0;
+const DEFAULT_P2P_STICKY_IDLE_MS = 0;
+const DEFAULT_SESSION_RESEED_CHARS = 0;
 
 /**
  * 批G G1 (P1) pre-reseed warning window: the last N turns before the
@@ -1119,6 +1102,8 @@ export interface BridgeHandlerDeps {
     /** Perf plan 批C model/effort knobs — passed through to RunOptions verbatim. */
     model?: string;
     effort?: string;
+    /** Explicit opt-in to the host's shared organization knowledge. */
+    sharedKnowledge?: boolean;
     /** 批E (E1) continuation-prompt mode — see BotConfig.promptMode. */
     promptMode?: "full" | "delta";
     /** 批F (F1) p2p sticky sessions — see BotConfig.p2pStickySession. */
@@ -2107,7 +2092,7 @@ export class BridgeHandler {
       // the fresh start proceeds seedless (old behavior, unchanged).
       let sessionReseed:
         | {
-            reason: FreshStartReason;
+            reason: FreshStartReason | "configuration-change";
             summaryExcerpt?: string;
             transcriptTail?: string;
             transcriptPath: string;
@@ -2117,7 +2102,7 @@ export class BridgeHandler {
         let harvestFallbackPath: string | undefined;
         if (existing?.harvestedAt) {
           try {
-            harvestFallbackPath = resolveHarvestPath(resolveKnowledgeDir(), metricBotId, threadId);
+            harvestFallbackPath = await findSessionHarvest(metricBotId, threadId, this.deps.botConfig?.sharedKnowledge === true);
           } catch {
             /* unsafe path segment — no fallback */
           }
@@ -2694,28 +2679,16 @@ export class BridgeHandler {
         });
       }
 
-      // Step 4a-iii: write .claude/settings.local.json with Bash allow rules (idempotent)
-      //   Failure here is non-fatal: Claude can still run, just may prompt for perms.
-      //
-      // 批H H5 (adversarial-audit fix): the settings file must live where the
-      // agent process actually starts — Claude Code resolves project settings
-      // from its CWD. agent_workspace runs with cwd = the WORKSPACE ROOT
-      // (runCwd above), so the old per-session-dir write was a dead write:
-      // rewritten every turn, read by nobody, and it falsely suggested the
-      // allow/deny list was in effect. Legacy runtime keeps the worktree
-      // target — there cwd IS the worktree, and under permissions.mode
-      // acceptEdits this file is the live permission source.
-      try {
-        await writeWorktreeSettings(isAgentWorkspace ? runCwd : worktreePath, {
-          allowExtra: this.deps.permissionsAllowExtra,
-          // agent_workspace: allow-only + never clobber an owner-authored
-          // file (see WriteWorktreeSettingsOpts docs). Legacy: unchanged
-          // full behavior — there the file was always live.
-          includeDeny: !isAgentWorkspace,
-          respectForeignFile: isAgentWorkspace,
-        });
-      } catch (err) {
-        console.warn("[bridge.handler] writeWorktreeSettings failed (continuing):", err);
+      // Legacy worktrees retain their generated permission file. Managed and
+      // BYO workspaces inherit native configuration without bridge writes.
+      if (!isAgentWorkspace) {
+        try {
+          await writeWorktreeSettings(worktreePath, {
+            allowExtra: this.deps.permissionsAllowExtra,
+          });
+        } catch (err) {
+          console.warn("[bridge.handler] writeWorktreeSettings failed (continuing):", err);
+        }
       }
 
       // Step 4a-v: ensure .larkway/state.json exists with initial state
@@ -2835,9 +2808,11 @@ export class BridgeHandler {
       let knowledgeDir: string | undefined;
       let knowledgeGitReady = false;
       try {
-        const ensured = await ensureKnowledgeRepo(resolveKnowledgeDir());
-        knowledgeDir = ensured.knowledgeDir;
-        knowledgeGitReady = ensured.gitReady;
+        if (this.deps.botConfig?.sharedKnowledge === true) {
+          const ensured = await ensureKnowledgeRepo(resolveKnowledgeDir());
+          knowledgeDir = ensured.knowledgeDir;
+          knowledgeGitReady = ensured.gitReady;
+        }
       } catch (err) {
         console.warn("[bridge.handler] knowledge repo unavailable (continuing):", err);
       }
@@ -2873,7 +2848,35 @@ export class BridgeHandler {
         attempt++;
 
         // Step 4b: render prompt — isNewThread reflects current attempt's state.
-        const currentIsNewThread = currentExisting === undefined;
+        const backend = this.deps.botConfig?.backend ?? "claude";
+        const workspaceMoved = currentExisting?.workspacePath !== undefined &&
+          currentExisting.workspacePath !== runCwd;
+        const backendChanged = currentExisting?.backend !== undefined &&
+          currentExisting.backend !== backend;
+        const incompatibleSession = workspaceMoved || backendChanged;
+        if (incompatibleSession && isAgentWorkspace) {
+          // Configuration changes cannot resume the old native conversation.
+          // Carry available bridge artifacts forward without writing to the old
+          // project, including when managed/BYO session locations differ.
+          const previousSessionPath = workspaceMoved && currentExisting?.workspacePath
+            ? path.join(currentExisting.workspacePath === resolveAgentWorkspacePath(metricBotId)
+              ? path.join(currentExisting.workspacePath, "sessions")
+              : resolveAgentHomeSessionsDir(metricBotId), threadId)
+            : worktreePath;
+          const harvestPath = currentExisting?.harvestedAt
+            ? await findSessionHarvest(metricBotId, threadId, this.deps.botConfig?.sharedKnowledge === true)
+            : undefined;
+          let seed = await buildFreshStartSeed({ sessionPath: previousSessionPath, harvestPath });
+          if (!seed.summaryExcerpt && !seed.transcriptTail && previousSessionPath !== worktreePath) {
+            seed = await buildFreshStartSeed({ sessionPath: worktreePath });
+          }
+          sessionReseed = { reason: "configuration-change", ...seed };
+        }
+        // Decide lifecycle BEFORE rendering. A new backend conversation must
+        // never receive a continuation-only prompt, even if its Feishu topic
+        // and artifacts are retained.
+        const currentIsNewThread = !currentExisting?.sessionId || incompatibleSession;
+        const promptMode = this.deps.botConfig?.promptMode ?? (isAgentWorkspace ? "delta" : "full");
         // PRB-6/§11.3: resolve peer @ targets to their same-app-scope open_id
         // from the LIVE chat roster before building the prompt, so a handoff @
         // actually wakes the peer (the static config id may be cross-scope).
@@ -2962,7 +2965,7 @@ export class BridgeHandler {
         const rendersFullPrompt =
           currentIsNewThread ||
           forceFreshSession ||
-          (this.deps.botConfig?.promptMode ?? "full") !== "delta";
+          promptMode !== "delta";
         let knowledgeMap: string | undefined;
         if (knowledgeDir && rendersFullPrompt) {
           try {
@@ -3006,7 +3009,7 @@ export class BridgeHandler {
           turn_taking_limit: this.deps.botConfig?.turn_taking_limit,
           botName: this.deps.botConfig?.name,
           backend: this.deps.botConfig?.backend,
-          promptMode: this.deps.botConfig?.promptMode,
+          promptMode,
           // 批G G1 (P1): pre-reseed handover warning (one line, bounded
           // window). `&& !forceFreshSession`: the ghost-purge retry flips
           // forceFreshSession mid-loop — without the guard, a warned record
@@ -3070,7 +3073,6 @@ export class BridgeHandler {
         // would silently stop responding. Operators who want a stricter gate can
         // opt back into acceptEdits / ask via `~/.larkway/config.json`'s
         // `permissions.mode` (the future "real allow-list" path).
-        const backend = this.deps.botConfig?.backend ?? "claude";
         // 批B Phase 1: runnerKey defaults to backend, so this is a no-op for
         // every bot that doesn't opt into pooling (see botConfig.runnerKey doc).
         const runnerKey = this.deps.botConfig?.runnerKey ?? backend;
@@ -3093,33 +3095,10 @@ export class BridgeHandler {
         // computed against markers.spawn once the turn completes, below.
         const perfMarkers: Partial<Record<PerfMarkerName, number>> = {};
 
-        // Repo-skills discovery (claude backend): each existing repo dir under
-        // the workspace repos/ parent rides along as --add-dir, which makes
-        // its .claude/skills/ discoverable at spawn (config discovery is a
-        // documented --add-dir-flag-only behavior). Recomputed every turn —
-        // spawn-per-turn means a repo the agent cloned LAST turn is picked up
-        // on the next. Backends without the mechanism ignore addDirs.
-        let addDirs: string[] | undefined;
-        if (isAgentWorkspace && conventions.workspaceReposPath) {
-          try {
-            const repoEntries = await fs.readdir(conventions.workspaceReposPath, {
-              withFileTypes: true,
-            });
-            const repoDirs = repoEntries
-              .filter((e) => e.isDirectory() || e.isSymbolicLink())
-              .map((e) => path.join(conventions.workspaceReposPath!, e.name));
-            const ADD_DIR_CAP = 16;
-            if (repoDirs.length > ADD_DIR_CAP) {
-              console.warn(
-                `[bridge.handler] ${repoDirs.length} repo dirs under ` +
-                  `${conventions.workspaceReposPath}; only the first ${ADD_DIR_CAP} ride as --add-dir`,
-              );
-            }
-            addDirs = repoDirs.slice(0, ADD_DIR_CAP);
-          } catch {
-            // repos/ parent absent (fresh workspace, or BYO dir without one) — nothing to add.
-          }
-        }
+        // Share the exact discovery inputs with prewarm. Changes in repo
+        // directories invalidate the warm child's spawn signature.
+        const addDirs = isAgentWorkspace && conventions.workspaceReposPath
+          ? await discoverWorkspaceRepoDirs(conventions.workspaceReposPath) : [];
 
         // Workspace-move resume gate: agent CLI sessions encode the cwd they
         // were created under (claude keys session storage by project dir), so
@@ -3128,10 +3107,6 @@ export class BridgeHandler {
         // (and retry into the same wall every turn). Fires when the operator
         // adds/changes/removes the bot yaml `workspace:` override; unstamped
         // legacy records pass through unchanged.
-        const workspaceMoved =
-          currentExisting?.workspacePath !== undefined &&
-          conventions.agentWorkspacePath !== undefined &&
-          currentExisting.workspacePath !== conventions.agentWorkspacePath;
         if (workspaceMoved && currentExisting?.sessionId) {
           console.warn(
             `[bridge.handler] thread ${threadId}: workspace moved ` +
@@ -3148,18 +3123,19 @@ export class BridgeHandler {
           // delete). `|| undefined`: a fresh-start-marked record carries
           // sessionId "" (批H H1) — an empty string must never reach the
           // runner as a resume target.
-          resumeSessionId: forceFreshSession || workspaceMoved
+          resumeSessionId: forceFreshSession || incompatibleSession
             ? undefined
             : currentExisting?.sessionId || undefined,
           // 批F (F2): tells ClaudeProcessPool to retire this thread's live warm
           // process first — the pool key excludes sessionId, so without this a
           // warm entry would silently continue the OLD session. Cold runners
           // and the codex pool (no per-thread process cache) ignore it.
-          forceFreshSession,
+          forceFreshSession: forceFreshSession || incompatibleSession,
           permissionMode,
           timeoutMs,
           cwd: runCwd,
           ...(addDirs && addDirs.length > 0 ? { addDirs } : {}),
+          ...(isAgentWorkspace ? { pidFilePath: null } : {}),
           // Only consumed by ClaudeProcessPool's per-thread warm-process cache
           // key (src/claude/pool.ts) — every other runner ignores it.
           threadId,
@@ -3167,7 +3143,7 @@ export class BridgeHandler {
           botGitIdentity: this.deps.botConfig?.git_identity,
           gitlabToken: this.deps.gitlabToken,
           // BL-50: isolated bots get a private lark-cli config dir.
-          ...(this.deps.botConfig?.lark_cli_isolated && this.deps.botConfig.id
+          ...(this.deps.botConfig?.id && this.deps.botConfig.lark_cli_isolated !== false
             ? { larkCliConfigDir: resolveBotLarkCliDir(this.deps.botConfig.id) }
             : {}),
           model: this.deps.botConfig?.model,
@@ -3244,6 +3220,8 @@ export class BridgeHandler {
         // toolsInFlight above (which decrements on tool_result); this one only
         // ever grows, for the perf sample recorded once the turn completes.
         let toolUseTotalCount = 0;
+        let firstAnswerAt: number | undefined;
+        let perfRecorded = false;
         let idleWatchdog: ReturnType<typeof setInterval> | undefined;
         // Armed for EVERY response surface, not just CardKit: the idle judgment
         // (activity timestamps + toolsInFlight exemption) is surface-independent,
@@ -3520,6 +3498,9 @@ export class BridgeHandler {
             if (ev.type === "system_init") {
               sessionId = ev.sessionId;
             }
+            if ((ev.type === "answer_delta" || ev.type === "answer_snapshot") && ev.text.trim()) {
+              firstAnswerAt ??= Date.now();
+            }
             if (ev.type === "answer_delta") {
               trustedAnswerText += ev.text;
             } else if (ev.type === "answer_snapshot") {
@@ -3570,25 +3551,12 @@ export class BridgeHandler {
             });
           }
 
-          // A0: record the perf sample for this turn. Deltas are undefined
-          // when a marker was never observed (e.g. the runner crashed before
-          // emitting anything) — never treated as 0, which would be a false
-          // "instant" reading.
-          //
-          // Known limitation (recorded, not fixed — low-probability/
-          // acceptable per perf plan review): this call site is only reached
-          // on the success path (this try block reaching handle.done). A
-          // turn whose spawn/stream throws before getting here (the spawnErr
-          // catch below, or the outer handleOne catch) records no perf
-          // sample at all — those variables live inside this while-loop
-          // iteration's scope and the outer catch can't see them. A0's stated
-          // purpose is sizing batch B off typical-turn latency, and a crashed
-          // turn's timing isn't representative of that anyway, so this gap is
-          // an intentional scope decision, not an oversight.
+          // Missing markers stay undefined; record each runner attempt once.
           const deltaFrom = (marker: PerfMarkerName): number | undefined =>
             perfMarkers.spawn != null && perfMarkers[marker] != null
               ? perfMarkers[marker]! - perfMarkers.spawn
               : undefined;
+          perfRecorded = true;
           void recordPerf({
             botId,
             threadId,
@@ -3597,6 +3565,10 @@ export class BridgeHandler {
             spawnToFirstLineMs: deltaFrom("first_line"),
             spawnToSessionInitMs: deltaFrom("session_init"),
             spawnToFirstContentMs: deltaFrom("first_content"),
+            spawnToFirstAnswerMs: firstAnswerAt === undefined ? undefined : firstAnswerAt - runnerStartedAt,
+            promptChars: prompt.length,
+            promptMode: currentIsNewThread || forceFreshSession || promptMode === "full" ? "full" : "delta",
+            exitCode: result.exitCode,
             toolUseCount: toolUseTotalCount,
             turnDurationMs: Date.now() - runnerStartedAt,
             // 批B Phase 1 A0 extension: only a pooled runner (src/codex/
@@ -4091,9 +4063,8 @@ export class BridgeHandler {
               lastActiveTs: now,
               senderOpenId,
               // Resume gate stamp: the cwd this sessionId was created under.
-              ...(conventions.agentWorkspacePath
-                ? { workspacePath: conventions.agentWorkspacePath }
-                : {}),
+              workspacePath: runCwd,
+              backend,
               // BL-38: a brand-new thread that idle-killed on its very first turn
               // starts the counter at 1 (0 when clean; only persisted when > 0).
               consecutiveStuckCount: nextStuckCount,
@@ -4132,19 +4103,18 @@ export class BridgeHandler {
               // Resume gate stamp: the turn that just completed ran under the
               // CURRENT workspace path, so the (possibly new) sessionId belongs
               // to it — re-stamp rather than preserve.
-              ...(conventions.agentWorkspacePath
-                ? { workspacePath: conventions.agentWorkspacePath }
-                : {}),
+              workspacePath: runCwd,
+              backend,
               // BL-38: +1 on an idle-stuck turn, 0 (cleared) on any clean turn.
               consecutiveStuckCount: nextStuckCount,
               // 批F (F2): a reseed turn restarts the count at 1 (this turn ran
               // on the fresh session); ordinary turns accrue.
-              turnCount: forceFreshSession ? 1 : (currentExisting.turnCount ?? 0) + 1,
+              turnCount: forceFreshSession || incompatibleSession ? 1 : (currentExisting.turnCount ?? 0) + 1,
               // 批H (H2): same fresh-start reset semantics as turnCount. This
               // branch also drops any needsFreshStart marker (the fields
               // are rebuilt explicitly) — the marked thread just completed
               // its fresh start, so the marker's job is done.
-              approxChars: forceFreshSession
+              approxChars: forceFreshSession || incompatibleSession
                 ? turnToolResultChars + trustedAnswerText.length
                 : (currentExisting.approxChars ?? 0) +
                   turnToolResultChars +
@@ -4649,6 +4619,19 @@ export class BridgeHandler {
           // Success — exit the retry loop
           break;
         } catch (spawnErr) {
+          if (!perfRecorded) {
+            perfRecorded = true;
+            void recordPerf({
+              botId, threadId, backend,
+              spawnedAt: new Date(runnerStartedAt).toISOString(),
+              promptChars: prompt.length,
+              promptMode: currentIsNewThread || forceFreshSession || promptMode === "full" ? "full" : "delta",
+              spawnToFirstAnswerMs: firstAnswerAt === undefined ? undefined : firstAnswerAt - runnerStartedAt,
+              toolUseCount: toolUseTotalCount,
+              turnDurationMs: Date.now() - runnerStartedAt,
+              runnerError: true,
+            });
+          }
           // The watchdog interval is created BEFORE this try; the success path
           // clears it after handle.done, but this path used to leak it — worst
           // when toolsInFlight>0 froze the tick (a tool_use whose subprocess
@@ -4715,7 +4698,7 @@ export class BridgeHandler {
               let harvestFallbackPath: string | undefined;
               if (currentExisting.harvestedAt) {
                 try {
-                  harvestFallbackPath = resolveHarvestPath(resolveKnowledgeDir(), metricBotId, threadId);
+                  harvestFallbackPath = await findSessionHarvest(metricBotId, threadId, this.deps.botConfig?.sharedKnowledge === true);
                 } catch {
                   /* unsafe path segment — no fallback */
                 }

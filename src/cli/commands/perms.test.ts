@@ -17,7 +17,7 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { mkdtemp, rm, mkdir, writeFile, readFile } from "node:fs/promises";
+import { mkdtemp, rm, mkdir, writeFile, readFile, stat, readdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import yaml from "js-yaml";
@@ -547,5 +547,31 @@ describe("perms multiple flags in one invocation", () => {
     expect(saved.chats).toContain("oc_newchat");
     expect(saved.repos[0].slug).toBe("mygroup/repo");
     expect(saved.repos[0].branch).toBe("main");
+  });
+});
+
+
+describe("perms BYO boundary", () => {
+  it("saves repo pointers without creating shadow permission records", async () => {
+    const workspace = path.join(tmpBotsDir, "native");
+    await mkdir(workspace);
+    await writeBotYaml(tmpBotsDir, "test-bot", { runtime: "agent_workspace", workspace });
+    const fakeUi = makeFakeUI();
+    expect(await run(makeCtx(fakeUi), ["test-bot", "--add-repo", "acme/release:stable"])).toBe(0);
+    expect((await botsStore.readBot("test-bot")).repos[0]?.branch).toBe("stable");
+    await expect(stat(path.join(tmpBotsDir, "agents", "test-bot", "workspace"))).rejects.toThrow();
+    expect(await readdir(workspace)).toEqual([]);
+  });
+
+  it("refuses managed grants before applying combined BYO configuration changes", async () => {
+    const workspace = path.join(tmpBotsDir, "native");
+    await mkdir(workspace);
+    await writeBotYaml(tmpBotsDir, "test-bot", { runtime: "agent_workspace", workspace });
+    const fakeUi = makeFakeUI();
+    expect(await run(makeCtx(fakeUi, { json: true }), ["test-bot", "--add-chat", "oc_new", "--grant-permission", "deploy"])).toBe(1);
+    expect((await botsStore.readBot("test-bot")).chats).toEqual(["oc_aaa111"]);
+    expect(fakeUi.jsonLines).toContainEqual(expect.objectContaining({ ok: false, error: expect.stringContaining("原生文件") }));
+    await expect(stat(path.join(tmpBotsDir, "agents", "test-bot", "workspace"))).rejects.toThrow();
+    expect(await readdir(workspace)).toEqual([]);
   });
 });

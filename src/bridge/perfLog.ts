@@ -26,6 +26,14 @@ export interface PerfSample {
   spawnToFirstContentMs?: number;
   /** Total tool_use events observed this turn (cumulative — distinct from the idle-watchdog's in-flight counter in handler.ts, which decrements on tool_result). */
   toolUseCount: number;
+  /** Size of the submitted prompt in JS characters; never a token estimate. */
+  promptChars?: number;
+  promptMode?: "full" | "delta";
+  /** Time to the first trusted answer event, excluding internal narration. */
+  spawnToFirstAnswerMs?: number;
+  /** Native runner result; absent for a rejected attempt. */
+  exitCode?: number;
+  runnerError?: boolean;
   /** Wall-clock turn duration (spawn to the runner's `done` resolving), ms. */
   turnDurationMs: number;
   /**

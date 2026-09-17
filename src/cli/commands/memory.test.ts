@@ -15,7 +15,7 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, rm, writeFile, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import type { BotConfig } from "../../config/botLoader.js";
@@ -44,6 +44,7 @@ const sampleBot = (id = "test-bot"): BotConfig =>
     repos: [{ slug: "group/repo", branch: "master" }],
     turn_taking_limit: 10,
     schedules: [],
+    lark_cli_isolated: true,
     read_only: false,
     response_surface_prototype: DEFAULT_RESPONSE_SURFACE_PROTOTYPE,
     runtime: "legacy",
@@ -139,6 +140,21 @@ afterEach(async () => {
 // ---------------------------------------------------------------------------
 
 describe("memory set --file", () => {
+  it("rejects BYO memory edits before writing either native or shadow files", async () => {
+    const workspace = path.join(tmp, "owner-workspace");
+    const bot = { ...sampleBot("native-bot"), runtime: "agent_workspace" as const, workspace };
+    await store.writeBot(bot);
+    await store.writeMemory("native-bot", "Existing managed note");
+    const source = path.join(tmp, "source.md");
+    await writeFile(source, "New note");
+    const { ctx, captured } = makeCtx({ json: true });
+    expect(await memoryRun(ctx, ["set", "native-bot", "--file", source])).toBe(1);
+    expect(captured.json).toContainEqual(expect.objectContaining({ ok: false, error: expect.stringContaining("AGENTS.md") }));
+    expect(await store.readMemory("native-bot")).toBe("Existing managed note");
+    await expect(stat(workspace)).rejects.toThrow();
+    await expect(stat(path.join(tmp, "agents", "native-bot", "workspace"))).rejects.toThrow();
+  });
+
   it("writes content from file and round-trips via show", async () => {
     // Setup: create a bot yaml so the id is valid.
     await store.writeBot(sampleBot("alpha-bot"));

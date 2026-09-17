@@ -127,55 +127,10 @@ export function buildCodexCommand(
   codexBinPath = "codex",
 ): [string, string[]] {
   void opts;
-  // `-c model_reasoning_summary=detailed`: a per-invocation config override
-  // (global codex flag, so it precedes the subcommand) that asks the model to
-  // emit its reasoning summary as item/reasoning/summaryTextDelta events.
-  // `detailed` is the richest of auto/concise/detailed. This is a CLI flag,
-  // NOT a mutation of the user's ~/.codex/config.toml (confirmed supported,
-  // codex-cli 0.140.0).
-  //
-  // NOT RELIABLE ON ITS OWN (measured 2026-07-27, codex-cli 0.145.0): on a
-  // thinking-heavy prompt this flag alone produced 0, 0 and 3 summaryTextDelta
-  // events across three runs, while additionally passing `summary` on turn/start
-  // (see CODEX_TURN_REASONING_SUMMARY) produced 9, 11, 21 and 30. The flag is
-  // kept — it is the thread-level default and costs nothing — but the per-turn
-  // param is what actually delivers the deltas.
-  return [
-    codexBinPath,
-    ["-c", "model_reasoning_summary=detailed", "app-server", "--stdio"],
-  ];
+  // Inherit the host's reasoning-summary setting. Liveness reporting must
+  // not silently change model output or force additional summary tokens.
+  return [codexBinPath, ["app-server", "--stdio"]];
 }
-
-/**
- * `turn/start` param that turns reasoning streaming on for THIS turn.
- *
- * Why a per-turn param when buildCodexCommand already passes the equivalent
- * global config override: the flag alone stopped producing
- * item/reasoning/summaryTextDelta events somewhere between codex-cli 0.140.0
- * (where the flag was verified) and 0.145.0. `TurnStartParams.summary`
- * (schema-confirmed enum: auto | concise | detailed | none) still works.
- *
- * This is load-bearing beyond the COT bubble. Reasoning deltas are the only
- * events codex emits WHILE a model request is in flight; without them the
- * bridge's idle watchdog (bridge/handler.ts) sees nothing between one request
- * finishing and the next one starting, so a single long request on a large
- * context is indistinguishable from a hang and the turn gets interrupted
- * ("长时间无活性，判定卡死"). Measured on the same thinking-heavy prompt: worst
- * observed watchdog silence 22.7 s / 28.6 s without this param vs 11.6 s /
- * 10.9 s with it.
- *
- * Scope of the protection, honestly bounded: the effect scales with reasoning
- * effort. At high effort the param clearly dominates (21-30 deltas vs 3); at
- * default effort both arms produced 0-1 deltas, so a low-effort bot gets little
- * from it and still depends on request-boundary events. Closing that residue is
- * BL-48's phase-aware threshold, not this param.
- *
- * Open item (not measured here): asking for detailed summaries adds
- * reasoning-summary output tokens. Two high-effort runs took 167 s / 224 s with
- * the param vs 64 s without — n far too small to attribute, but latency is worth
- * a look before this is assumed free.
- */
-const CODEX_TURN_REASONING_SUMMARY = "detailed";
 
 type JsonRecord = Record<string, unknown>;
 
@@ -296,6 +251,13 @@ class CodexLineParser {
 
   const agentMessageText = agentMessageTextFrom(record);
   if (agentMessageText !== undefined) {
+    const phase = asRecord(record["item"])?.["phase"];
+    if (typeof phase === "string") {
+      yield phase === "final_answer"
+        ? { type: "answer_snapshot", text: agentMessageText, raw: obj }
+        : { type: "raw", raw: obj };
+      return;
+    }
     if (topType === "item.completed") {
       yield* this.answerExtractor.ingestSnapshot(agentMessageText, obj);
       return;
@@ -508,6 +470,19 @@ function codexToolItemResultRaw(obj: unknown, item: JsonRecord): unknown {
 
 class CodexAppServerLineParser {
   private readonly answerExtractor = new AnswerChannelExtractor();
+  private readonly messagePhases = new Map<string, string>();
+  private activeFinalItemId: string | undefined;
+  private visibleAnswer = "";
+
+  private *nativeFinalSnapshot(text: string, itemId: string | undefined, raw: unknown): Generator<AgentStreamEvent> {
+    this.activeFinalItemId = itemId;
+    if (text !== this.visibleAnswer) {
+      this.visibleAnswer = text;
+      yield { type: "answer_snapshot", text, raw };
+    } else {
+      yield { type: "raw", raw };
+    }
+  }
   /**
    * Item ids opened as tool_use and not yet closed by a tool_result. Exists so
    * the pairing is EXACT: a tool_result is emitted only for an id this parser
@@ -541,35 +516,42 @@ class CodexAppServerLineParser {
       const thread = asRecord(params?.["thread"]);
       const threadId = typeof thread?.["id"] === "string" ? thread["id"] : undefined;
       this.openToolItems.clear();
+      this.messagePhases.clear();
+      this.activeFinalItemId = undefined;
+      this.visibleAnswer = "";
       if (threadId) yield { type: "system_init", sessionId: threadId, raw: obj };
       return;
     }
 
     if (method === "turn/completed") {
       this.openToolItems.clear();
+      this.messagePhases.clear();
       yield { type: "result", stopReason: "end_turn", raw: obj };
       return;
     }
 
     if (method === "item/agentMessage/delta") {
       const delta = typeof params?.["delta"] === "string" ? params["delta"] : "";
-      // The extractor yields nothing while it is still waiting for
-      // LARKWAY_ANSWER_BEGIN (agent/answerChannel.ts) — i.e. every delta of a
-      // preamble written before the marker used to be invisible to the idle
-      // watchdog. Fall back to `raw` so any delta at all counts as activity.
-      let emitted = false;
-      for (const event of this.answerExtractor.ingestDelta(delta, obj)) {
-        emitted = true;
-        yield event;
+      const itemId = typeof params?.["itemId"] === "string" ? params["itemId"] : undefined;
+      // Phase belongs to the native item, not its text. Unknown phase waits
+      // for completion: a marker cannot override a later commentary verdict.
+      if (delta && itemId && this.messagePhases.get(itemId) === "final_answer") {
+        if (this.activeFinalItemId !== itemId) {
+          this.activeFinalItemId = itemId;
+          if (this.visibleAnswer) yield { type: "answer_snapshot", text: "", raw: obj };
+          this.visibleAnswer = "";
+        }
+        this.visibleAnswer += delta;
+        yield { type: "answer_delta", text: delta, raw: obj };
+      } else if (delta) {
+        yield { type: "raw", raw: obj };
       }
-      if (!emitted && delta) yield { type: "raw", raw: obj };
       return;
     }
 
     // ── reasoning summary deltas → thinking_delta (COT) ──────────────────
-    // Enabled by turn/start's `summary` param (see
-    // CODEX_TURN_REASONING_SUMMARY — the buildCodexCommand config flag alone
-    // no longer delivers these as of codex-cli 0.145.0).
+    // Forward whatever summary the host runtime elects to provide; the
+    // bridge does not enable summaries or override their verbosity.
     // Mirrors item/agentMessage/delta exactly: incremental text in
     // params.delta. params.summaryIndex segments the summary into parts; a
     // new part is announced by summaryPartAdded below. Confirmed live shape,
@@ -592,6 +574,17 @@ class CodexAppServerLineParser {
 
     if (method === "item/started") {
       const item = asRecord(params?.["item"]);
+      if (item?.["type"] === "agentMessage") {
+        const itemId = typeof item["id"] === "string" ? item["id"] : undefined;
+        const phase = typeof item["phase"] === "string" ? item["phase"] : undefined;
+        if (itemId && phase) this.messagePhases.set(itemId, phase);
+        if (phase === "final_answer" && typeof item["text"] === "string" && item["text"]) {
+          yield* this.nativeFinalSnapshot(item["text"], itemId, obj);
+        } else {
+          yield { type: "raw", raw: obj };
+        }
+        return;
+      }
       if (item?.["type"] === "commandExecution" && typeof item["command"] === "string") {
         yield {
           type: "tool_use",
@@ -640,7 +633,24 @@ class CodexAppServerLineParser {
         return;
       }
       if (item?.["type"] === "agentMessage" && typeof item["text"] === "string") {
-        yield* this.answerExtractor.ingestSnapshot(item["text"], obj);
+        const itemId = typeof item["id"] === "string" ? item["id"] : undefined;
+        const phase = typeof item["phase"] === "string"
+          ? item["phase"]
+          : itemId ? this.messagePhases.get(itemId) : undefined;
+        if (itemId) this.messagePhases.delete(itemId);
+        if (phase === "final_answer") {
+          yield* this.nativeFinalSnapshot(item["text"], itemId, obj);
+        } else if (phase !== undefined) {
+          // Keep commentary out of internal_text too: the handler's legacy
+          // last-text rescue must never surface an explicitly non-final item.
+          yield { type: "raw", raw: obj };
+        } else {
+          // Older runtimes without a phase retain the marker protocol.
+          for (const event of this.answerExtractor.ingestSnapshot(item["text"], obj)) {
+            if (event.type === "answer_snapshot") this.visibleAnswer = event.text;
+            yield event;
+          }
+        }
         return;
       }
       // Completed reasoning item: the full summary lives in item.summary (a
@@ -1003,8 +1013,6 @@ export function runCodex(opts: RunOptions, codexBinPath = "codex"): RunHandle {
                 input: [{ type: "text", text: opts.prompt, text_elements: [] }],
                 approvalPolicy: codexApprovalPolicy(mode),
                 sandboxPolicy: codexTurnSandboxPolicy(mode),
-                // Reasoning streaming — watchdog liveness, not just COT.
-                summary: CODEX_TURN_REASONING_SUMMARY,
               };
               if (opts.cwd != null) turnParams["cwd"] = opts.cwd;
               // Per-bot model/effort override (perf plan 批C): `turn/start`
@@ -1092,7 +1100,6 @@ export {
   codexApprovalPolicy,
   codexThreadSandboxMode,
   codexTurnSandboxPolicy,
-  CODEX_TURN_REASONING_SUMMARY,
   asRecord,
   extractThreadIdFromThreadResponse,
   CodexAppServerLineParser,

@@ -28,6 +28,24 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { stripSummaryPlaceholder } from "../agent/sessionArtifacts.js";
 import { resolveHarvestPath } from "../knowledge/store.js";
+import { resolveSessionArchiveDir } from "../config/paths.js";
+
+/** Read compatibility: an existing archive survives changing the sharing policy. */
+export async function findSessionHarvest(agentId: string, threadId: string, sharedKnowledge = false): Promise<string | undefined> {
+  let newest: { file: string; mtimeMs: number } | undefined;
+  for (const shared of [sharedKnowledge, !sharedKnowledge]) {
+    const file = resolveHarvestPath(resolveSessionArchiveDir(agentId, shared), agentId, threadId);
+    try {
+      const info = await fs.stat(file);
+      if (info.isFile() && (!newest || info.mtimeMs > newest.mtimeMs)) {
+        newest = { file, mtimeMs: info.mtimeMs };
+      }
+    } catch {
+      // Missing archive; try the previous layout for this same agent only.
+    }
+  }
+  return newest?.file;
+}
 
 /** Cap on harvest file count (across ALL agents) — oldest are dropped past this. */
 export const HARVEST_MAX_FILES = 200;

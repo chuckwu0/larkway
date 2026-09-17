@@ -6,7 +6,7 @@
 
 ---
 
-You @ the bot in a Feishu thread. It runs on your machine — reading your real codebase, executing commands, opening MRs — and posts the result back. You define what the agent knows and what it can do. Larkway just carries the messages.
+You @ the bot in a Feishu thread. It runs on your machine — reading your real codebase, executing commands, opening MRs — and posts the result back. Connect a workspace that already works with Claude Code or Codex, or create a managed one. Larkway connects Feishu triggers to that local runtime.
 
 **Current release: v0.3.72**
 
@@ -141,12 +141,12 @@ not enforcement.
 - Secrets in `~/.larkway/.env` are shared across all bots on the bridge and
   visible to any agent that can read your home directory — don't mix a
   low-trust open bot and high-value credentials on the same host.
-- By default all bots share the host's global lark-cli config dir — including
-  any personal `lark-cli auth login` you did there (calendar/mail/drive).
-  Set `lark_cli_isolated: true` in a bot's yaml to give it a private config
-  dir (`~/.larkway/<botId>/lark-cli/`) holding only its own app profile:
-  bot-only identity by default, personal access only if you explicitly
-  authorize inside that dir.
+- By default each bot uses its own lark-cli config directory
+  (`~/.larkway/<botId>/lark-cli/`) with its application profile. The host's
+  personal lark-cli login is not inherited through that config. Explicit
+  `lark_cli_isolated: false` retains the old shared-config behavior. This is
+  identity configuration isolation, not an OS sandbox; full-access agents
+  can still read files permitted to the host user.
 
 ---
 
@@ -154,11 +154,33 @@ not enforcement.
 
 | Layer | What it is | Where it lives |
 |---|---|---|
-| **L1 permissions** | App credentials, repo path, allowed Feishu users/groups, token scopes | `~/.larkway/bots/<id>.yaml` |
-| **L2 identity memory** | "Who I am, what I must not do, where to find the workflow" (thin) | `~/.larkway/bots/<id>.memory.md` |
-| **L3 workflow** | State machine, gates, commands — the actual job | **Your business repo**: `AGENTS.md`, `CLAUDE.md`, `.agents/skills/`, `.claude/skills/` |
+| **Runtime connection** | App credentials, backend, workspace path, allowed groups, repo pointers | `~/.larkway/bots/<id>.yaml` |
+| **Identity and responsibilities** | Short role definition for a managed workspace | `~/.larkway/bots/<id>.memory.md`, projected into workspace `AGENTS.md` |
+| **Native instructions and skills** | Project workflows and knowledge | **Your workspace / repo**: `AGENTS.md`, `CLAUDE.md`, `.agents/skills/`, `.claude/skills/` |
 
 Secrets live only in `~/.larkway/.env` (mode 0600). Config and memory contain no secrets.
+
+To connect an existing workspace, open the Web UI's advanced **existing workspace**
+field and enter its absolute path, or configure:
+
+```yaml
+runtime: agent_workspace
+workspace: /absolute/path/to/existing-workspace
+```
+
+The directory must already exist. Larkway uses its native instructions, skills,
+and runtime configuration without generating files inside it. Edit its
+`AGENTS.md` / `CLAUDE.md` directly; the dashboard role editor is disabled for
+this mode. Omit `workspace` to use a Larkway-managed directory. Changing the
+workspace path starts a fresh runtime session on the next message.
+
+Repository entries are default pointers, not an access allowlist. Disabling
+repo pointers does not revoke host file access or Git credentials. The
+turn-taking setting is a collaboration reminder, not a hard tool-call budget.
+Shared organization knowledge is optional: set `sharedKnowledge: true` only
+for agents that should participate in the same knowledge repository. See
+[native runtime behavior](docs/native-runtime.md) for defaults and compatibility.
+
 
 ---
 
@@ -167,7 +189,7 @@ Secrets live only in `~/.larkway/.env` (mode 0600). Config and memory contain no
 - **Multiple bots on one bridge** — a read-only Q&A bot and a write-capable engineering bot can share the same process, each with its own L1/L2/L3 definition
 - **Web UI** — `larkway ui` opens a local management dashboard (127.0.0.1 + token); create bots, edit memory, watch live logs
 - **Session continuity** — every Feishu thread maps to a persistent `session_id`; the agent remembers what it did in prior turns
-- **Agent Workspace** — each bot gets its own workspace where the agent clones the repo itself, with per-thread session dirs; concurrent threads don't trip over each other's git state (expect disk usage and a slower first turn on large repos — clones are per-session, GC'd after 24h idle)
+- **Agent Workspace** — create a managed workspace or connect an existing one, with separate session artifacts per Feishu topic. Topics share the workspace; agents must create separate worktrees when concurrent edits need Git isolation.
 - **Codex runtime pre-checks** — `larkway doctor` validates Codex state directory writability before start
 - **OS-service daemon** — `larkway start` registers the bridge with launchd (macOS) / systemd (Linux): survives reboots and auto-restarts on crash; `larkway stop` stops it and disables autostart
 - **Topic ↔ Feishu task handle** — turn a topic into a Feishu task and the agent claims it, then keeps its lifecycle (done/failed/reopened, stalled, handed off, overdue) in sync automatically — see below

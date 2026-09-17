@@ -3037,7 +3037,7 @@ function inferRepoSlugFromUrl(url) {
 }
 
 /**
- * 生成一个仓库行的 HTML。UI 只暴露 Git 地址;slug/branch 都是内部细节。
+ * 生成仓库地址与默认分支;旧的 slug-only 指针保留至用户填写地址。
  * @param {number} idx
  * @param {{slug:string,branch:string,url:string}} repo
  */
@@ -3045,10 +3045,12 @@ function acRepoRowHTML(idx, repo) {
   const xIcon = `<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M18 6 6 18M6 6l12 12"/></svg>`;
   const displayUrl = repo.url || "";
   return (
-    `<div class="ac-repo-row" data-repo-idx="${idx}">` +
+    `<div class="ac-repo-row" data-repo-idx="${idx}" data-repo-slug="${esc(repo.slug || "")}">` +
     `<div class="ac-field">` +
-    `<label class="ac-label" for="ac-repo-url-${idx}">仓库 Git 地址 <span class="ac-required">必填</span></label>` +
-    `<input id="ac-repo-url-${idx}" class="ac-input ac-mono" type="text" placeholder="git@github.com:org/repo.git" spellcheck="false" data-repo="url" data-repo-idx="${idx}" value="${esc(displayUrl)}" />` +
+    `<label class="ac-label" for="ac-repo-url-${idx}">仓库 Git 地址</label>` +
+    `<input id="ac-repo-url-${idx}" class="ac-input ac-mono" type="text" placeholder="${esc(repo.slug || "git@github.com:org/repo.git")}" spellcheck="false" data-repo="url" data-repo-idx="${idx}" value="${esc(displayUrl)}" />` +
+    `<label class="ac-label" for="ac-repo-branch-${idx}">默认分支</label>` +
+    `<input id="ac-repo-branch-${idx}" class="ac-input ac-mono" type="text" data-repo="branch" value="${esc(repo.branch || "main")}" />` +
     `</div>` +
     `<button type="button" class="ac-repo-del" title="移除这个仓库" data-repo-idx="${idx}" aria-label="移除仓库 ${esc(repo.slug || repo.url || idx + 1)}">` +
     xIcon +
@@ -3079,6 +3081,7 @@ function acPillHTML(tone, iconD, text) {
  */
 function buildAgentConfigHTML(bot, memContent, mode, prefill) {
   const isCreate = mode === "create";
+  const byoWorkspace = bot.workspace || "";
   const repos = normalizeRepos(bot.repos);
   // ① 用 git_token_env(兼容旧 gitlab_token_env)非空来判断「已配置」——新保存契约:值存后端,前端只知道「有/无」
   const gitlabConfigured = !!(bot.git_token_env || bot.gitlab_token_env);
@@ -3091,15 +3094,15 @@ function buildAgentConfigHTML(bot, memContent, mode, prefill) {
 
   // 层二 summary 药丸(收起态)
   const permSummaryHTML = codeAccess
-    ? acPillHTML("brand", "m16 18 6-6-6-6M8 6l-6 6 6 6", "可访问代码仓库") +
+    ? acPillHTML("brand", "m16 18 6-6-6-6M8 6l-6 6 6 6", "已配置默认仓库") +
       acPillHTML("muted", "M21 8 12 3 3 8v8l9 5 9-5ZM3 8l9 5 9-5M12 13v8", repos.length ? `${repos.length} 个仓库` : "待添加仓库") +
       acPillHTML("muted", "M5 11h14a1 1 0 0 1 1 1v7a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1v-7a1 1 0 0 1 1-1ZM8 11V7a4 4 0 0 1 8 0v4", gitlabConfigured ? "Agent 级 Git 身份" : "沿用本机 Git 身份")
-    : acPillHTML("muted", "M5 11h14a1 1 0 0 1 1 1v7a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1v-7a1 1 0 0 1 1-1ZM8 11V7a4 4 0 0 1 8 0v4", "纯对话 · 不碰任何代码仓库");
+    : acPillHTML("muted", "M5 11h14a1 1 0 0 1 1 1v7a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1v-7a1 1 0 0 1 1-1ZM8 11V7a4 4 0 0 1 8 0v4", "未设置默认仓库");
 
   // 层三 summary 药丸
   const chatCount = chatsVal.split("\n").map((s) => s.trim()).filter(Boolean).length;
   const advSummaryHTML =
-    acPillHTML("muted", "M13 2 3 14h7l-1 8 10-12h-7l1-6Z", `最多连做 ${turnLimit} 步`) +
+    acPillHTML("muted", "M13 2 3 14h7l-1 8 10-12h-7l1-6Z", `${turnLimit} 轮协作提醒`) +
     acPillHTML("muted", "M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2M9 11a4 4 0 1 0 0-8 4 4 0 0 0 0 8M22 21v-2a4 4 0 0 0-3-3.9M16 3.1a4 4 0 0 1 0 7.8", chatCount === 0 ? "任何群都能 @" : `仅 ${chatCount} 个群`);
 
   // 飞书机器人绑定行(只读)
@@ -3146,12 +3149,20 @@ function buildAgentConfigHTML(bot, memContent, mode, prefill) {
     `<p class="ac-hint">它能帮人做什么 —— 同事看到这句就知道能 @ 它干嘛。</p>` +
     `<textarea id="ac-desc" name="description" class="ac-input" rows="2" placeholder="比如：回答 Larkway 的配置和功能问题。">${esc(bot.description ?? "")}</textarea>` +
     `</div>` +
+    // Existing workspaces retain ownership of all native instructions and skills.
+    `<details class="ac-token-advanced" ${byoWorkspace ? "open" : ""}>` +
+    `<summary>接入现有 workspace <span>高级 · 可选</span></summary>` +
+    `<div class="ac-field"><label class="ac-label" for="ac-workspace">本机 workspace 绝对路径</label>` +
+    `<input id="ac-workspace" class="ac-input ac-mono" type="text" value="${esc(byoWorkspace)}" placeholder="留空则由 Larkway 创建独立 workspace" spellcheck="false" />` +
+    `<p class="ac-hint">填写现有目录，直接使用其中的 AGENTS.md / CLAUDE.md、skills 和底座配置。Larkway 不修改该目录；更换路径后，旧话题下次运行会开启新的底座 session。</p></div>` +
+    `</details>` +
     // memory
     `<div class="ac-field">` +
-    `<label class="ac-label" for="ac-memory">工作方式 / 流程（memory）</label>` +
-    `<p class="ac-hint">用大白话写它的使命、知识、怎么干活、边界 —— 它会照这个来工作。这是它的 memory 文件，可在这里直接编辑。</p>` +
-    `<textarea id="ac-memory" class="ac-input ac-mono ac-memory-editor" rows="8">${esc(memContent ?? "")}</textarea>` +
-    `<div class="ac-memory-hint"><svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" style="flex-shrink:0"><circle cx="12" cy="12" r="9"/><path d="M12 16v-4M12 8h.01"/></svg>存为独立 memory 文件，随「保存」一起写入。</div>` +
+    `<label class="ac-label" for="ac-memory">身份与职责</label>` +
+    `<p class="ac-hint">简要说明它是谁、负责什么、有哪些边界。项目流程与知识放在 workspace 的原生指南或 skills 中。</p>` +
+    `<textarea id="ac-memory" class="ac-input ac-mono ac-memory-editor" rows="8" ${byoWorkspace ? "disabled" : ""}>${esc(memContent ?? "")}</textarea>` +
+    `<p class="ac-hint" id="ac-native-memory-hint" ${byoWorkspace ? "" : 'style="display:none"'}>此 Agent 的行为由现有 workspace 内的原生文件管理，请直接编辑 AGENTS.md / CLAUDE.md。这里的旧身份说明不再注入。</p>` +
+    `<div class="ac-memory-hint" id="ac-managed-memory-hint" ${byoWorkspace ? 'style="display:none"' : ""}><svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" style="flex-shrink:0"><circle cx="12" cy="12" r="9"/><path d="M12 16v-4M12 8h.01"/></svg>随「保存」写入身份说明，并同步到托管 workspace 的 AGENTS.md。</div>` +
     `</div>` +
     `</div>` + // ac-layer-body
     `</section>` +
@@ -3162,11 +3173,11 @@ function buildAgentConfigHTML(bot, memContent, mode, prefill) {
     `<span class="ac-index">三</span>` +
     `<div class="ac-layer-meta">` +
     `<div class="ac-layer-title-row">` +
-    `<h3 class="ac-layer-title">Agent 的权限</h3>` +
+    `<h3 class="ac-layer-title">代码仓库与 Git 身份</h3>` +
     `<span class="ac-optional-badge">可选</span>` +
     (codeAccess ? `<span class="ac-open-badge"><svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m16 18 6-6-6-6M8 6l-6 6 6 6"/></svg>已开</span>` : "") +
     `</div>` +
-    `<p class="ac-layer-role">它能不能、以及大概会碰哪些代码仓库。不需要碰代码就别开 —— 光有「定义」就够。</p>` +
+    `<p class="ac-layer-role">配置默认仓库指针和可选 Git 身份。实际访问能力由本机凭据与底座权限决定。</p>` +
     `<div class="ac-perm-summary" id="ac-perm-summary">${codeAccess ? "" : permSummaryHTML}</div>` +
     `</div>` +
     `<svg class="ac-chevron" id="ac-perm-chevron" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" style="transform:${codeAccess ? "rotate(180deg)" : "none"}"><path d="m6 9 6 6 6-6"/></svg>` +
@@ -3175,27 +3186,27 @@ function buildAgentConfigHTML(bot, memContent, mode, prefill) {
     // 核心开关
     `<div class="ac-access-toggle-row${codeAccess ? " is-on" : ""}" id="ac-access-row">` +
     `<div class="ac-access-info">` +
-    `<div class="ac-access-title">给它访问代码仓库的权限</div>` +
-    `<p class="ac-access-desc">打开后给这个 Agent 配一组仓库地址；它只有这些 repo 作为默认工作范围。Git 身份是 Agent 级的：不填就沿用这台机器现有的 SSH key、credential helper 或环境变量。</p>` +
+    `<div class="ac-access-title">设置默认代码仓库</div>` +
+    `<p class="ac-access-desc">这些地址是默认工作范围，不是访问白名单。未填 Git 身份时，沿用本机 SSH key、credential helper 或环境变量；关闭此项也不会限制本机文件访问。</p>` +
     `</div>` +
-    `<button type="button" class="ac-toggle${codeAccess ? " is-on" : ""}" id="ac-code-access-btn" role="switch" aria-checked="${codeAccess}" title="开 / 关代码访问权限">` +
+    `<button type="button" class="ac-toggle${codeAccess ? " is-on" : ""}" id="ac-code-access-btn" role="switch" aria-checked="${codeAccess}" title="设置 / 清除默认仓库">` +
     `<span class="ac-toggle-thumb"></span>` +
     `</button>` +
     `</div>` +
     // 关闭态提示
     `<div class="ac-no-access-hint" id="ac-no-access-hint" ${codeAccess ? 'style="display:none"' : ""}>` +
     `<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" style="flex-shrink:0;color:var(--faint)"><path d="M5 11h14a1 1 0 0 1 1 1v7a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1v-7a1 1 0 0 1 1-1ZM8 11V7a4 4 0 0 1 8 0v4"/></svg>` +
-    `当前这个 agent 不访问任何代码仓库。需要它读 / 改代码时，再打开上面的开关。` +
+    `当前未设置默认仓库。Agent 仍可使用底座允许的本机文件和 Git 身份。` +
     `</div>` +
     // 开启态:仓库 + Agent 级 Git 身份
     `<div class="ac-access-fields" id="ac-access-fields" ${codeAccess ? "" : 'style="display:none"'}>` +
     // 仓库列表
     `<div class="ac-repos-section">` +
     `<div class="ac-repos-header">` +
-    `<span class="ac-repos-title">这个 Agent 可碰的仓库</span>` +
+    `<span class="ac-repos-title">默认工作仓库</span>` +
     `<span class="ac-optional-badge">可多个</span>` +
     `</div>` +
-    `<p class="ac-hint">每行只填 clone 地址。分支默认 main；同一个 Agent 的所有仓库共用下面的 Git 身份。</p>` +
+    `<p class="ac-hint">每行填写 clone 地址与默认分支。同一个 Agent 的所有仓库共用下面的 Git 身份。</p>` +
     `<div class="ac-repos-empty" id="ac-repos-empty" ${repos.length ? 'style="display:none"' : ""}><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" style="flex-shrink:0"><path d="M12 3l1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9L12 3Z"/></svg>还没有仓库。需要访问代码时，请添加仓库 Git 地址。</div>` +
     `<div class="ac-repos-list" id="ac-repos-list" ${repos.length ? "" : 'style="display:none"'}>${repos.map((r, i) => acRepoRowHTML(i, r)).join("")}</div>` +
     `<button type="button" class="ac-add-repo-btn" id="ac-add-repo-btn">` +
@@ -3237,15 +3248,15 @@ function buildAgentConfigHTML(bot, memContent, mode, prefill) {
     `<h3 class="ac-layer-title">行为约束</h3>` +
     `<span class="ac-optional-badge">可选</span>` +
     `</div>` +
-    `<p class="ac-layer-role">兜底护栏 —— 一般用默认就好。</p>` +
+    `<p class="ac-layer-role">协作提示与响应群范围。</p>` +
     `<div class="ac-adv-summary" id="ac-adv-summary">${advSummaryHTML}</div>` +
     `</div>` +
     `<svg class="ac-chevron" id="ac-adv-chevron" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>` +
     `</div>` +
     `<div class="ac-layer-body" id="ac-adv-body" style="display:none">` +
     `<div class="ac-field">` +
-    `<label class="ac-label" for="ac-turn-limit">最多连做几步就停下问人</label>` +
-    `<p class="ac-hint">防止它一口气干太多步；默认 10。</p>` +
+    `<label class="ac-label" for="ac-turn-limit">无人介入时的协作提醒（轮）</label>` +
+    `<p class="ac-hint">连续这些轮没有人类介入时，提示 Agent 汇报或寻求协助。这是行为建议，不是工具调用次数限制，也不会强制停止；默认 10。</p>` +
     `<input id="ac-turn-limit" name="turn_taking_limit" class="ac-input" type="number" min="1" value="${esc(turnLimit)}" style="width:130px" />` +
     `</div>` +
     `<div class="ac-field">` +
@@ -3259,7 +3270,7 @@ function buildAgentConfigHTML(bot, memContent, mode, prefill) {
     // ─── 底部操作 ───
     (isCreate
       ? `<div class="ac-create-footer">` +
-        `<span class="ac-create-hint" id="ac-create-hint">${codeAccess ? "有代码访问权 · " : "纯对话 · "}加完去本机跑 <code>larkway start</code> 让它上线。</span>` +
+        `<span class="ac-create-hint" id="ac-create-hint">${codeAccess ? "已配置默认仓库 · " : "未设置默认仓库 · "}加完去本机跑 <code>larkway start</code> 让它上线。</span>` +
         `<button type="button" class="btn btn-primary ac-create-btn" id="ac-create-btn">` +
         `<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>` +
         ` 添加到名册` +
@@ -3301,6 +3312,19 @@ function acRenderAvatar(panel, id, name, avatarUrl, liveKey) {
 function wireAgentConfigEvents(panel, id, bot) {
   const ac = panel.querySelector("#ac-panel");
   if (!ac) return;
+
+  const workspaceInput = ac.querySelector("#ac-workspace");
+  const syncWorkspaceMode = () => {
+    const native = !!workspaceInput?.value.trim();
+    const editor = ac.querySelector("#ac-memory");
+    if (editor) editor.disabled = native;
+    const nativeHint = ac.querySelector("#ac-native-memory-hint");
+    const managedHint = ac.querySelector("#ac-managed-memory-hint");
+    if (nativeHint) nativeHint.style.display = native ? "" : "none";
+    if (managedHint) managedHint.style.display = native ? "none" : "";
+  };
+  workspaceInput?.addEventListener("input", syncWorkspaceMode);
+  syncWorkspaceMode();
 
   // ── 层折叠:层二 ──
   const permToggle = ac.querySelector("#ac-perm-toggle");
@@ -3402,7 +3426,7 @@ function wireAgentConfigEvents(panel, id, bot) {
     acUpdateAdvSummary(ac);
     // create 态底部 hint 同步
     const createHint = ac.querySelector("#ac-create-hint");
-    if (createHint) createHint.innerHTML = `${on ? "有代码访问权 · " : "纯对话 · "}加完去本机跑 <code>larkway start</code> 让它上线。`;
+    if (createHint) createHint.innerHTML = `${on ? "已配置默认仓库 · " : "未设置默认仓库 · "}加完去本机跑 <code>larkway start</code> 让它上线。`;
     // 触发脏检测
     ac.dispatchEvent(new Event("ac-change", { bubbles: true }));
   }
@@ -3455,7 +3479,8 @@ function readAgentConfigValues(panel) {
   const v = (sel) => ac.querySelector(sel)?.value?.trim() ?? "";
   const name = v("#ac-name");
   const description = v("#ac-desc");
-  const memContent = v("#ac-memory");
+  const workspace = v("#ac-workspace");
+  const memContent = workspace ? undefined : v("#ac-memory");
   const turnLimit = parseInt(v("#ac-turn-limit"), 10) || 10;
   const chatsRaw = v("#ac-chats");
   const chats = chatsRaw.split("\n").map((s) => s.trim()).filter(Boolean);
@@ -3492,9 +3517,10 @@ function readAgentConfigValues(panel) {
     const repoRows = ac.querySelectorAll(".ac-repo-row");
     for (const row of repoRows) {
       const url = (row.querySelector("[data-repo='url']")?.value ?? "").trim();
-      const inferredSlug = inferRepoSlugFromUrl(url);
+      const inferredSlug = url ? inferRepoSlugFromUrl(url) : (row.dataset.repoSlug ?? "");
       if (inferredSlug || url) {
-        const r = { slug: inferredSlug, branch: "main" };
+        const branch = row.querySelector("[data-repo='branch']")?.value?.trim() || "main";
+        const r = { slug: inferredSlug, branch };
         if (url) r.url = url;
         repos.push(r);
       }
@@ -3510,7 +3536,8 @@ function readAgentConfigValues(panel) {
     chats,
     repos,
     turn_taking_limit: turnLimit,
-    _memContent: memContent, // 带出,由调用方分别 PUT /api/memory
+    workspace,
+    ...(memContent === undefined ? {} : { _memContent: memContent }), // BYO retains native definition ownership
   };
   // model/effort:控件挂在底座卡片(lk-bk-card)里,在 #ac-panel 之外,所以从
   // panel(而非 ac)查找;仅编辑态渲染(create 模式下查不到,值为 undefined 时
@@ -3534,8 +3561,8 @@ function acGetRepos(ac) {
   return Array.from(rows).map((row) => {
     const url = (row.querySelector("[data-repo='url']")?.value ?? "").trim();
     return {
-      slug: inferRepoSlugFromUrl(url),
-      branch: "main",
+      slug: url ? inferRepoSlugFromUrl(url) : (row.dataset.repoSlug ?? ""),
+      branch: row.querySelector("[data-repo='branch']")?.value?.trim() || "main",
       url,
       _idx: parseInt(row.dataset.repoIdx ?? "-1", 10),
     };
@@ -3551,7 +3578,7 @@ function validateCodeAccessConfig(panel) {
 
   const repos = acGetRepos(ac);
   if (repos.length === 0) {
-    toast("已打开代码访问，请至少添加一个仓库。", "warn");
+    toast("已启用默认仓库，请至少添加一个仓库。", "warn");
     ac.querySelector("#ac-add-repo-btn")?.focus();
     return false;
   }
@@ -3559,7 +3586,7 @@ function validateCodeAccessConfig(panel) {
   for (const repo of repos) {
     const row = ac.querySelector(`.ac-repo-row[data-repo-idx="${repo._idx}"]`);
     const urlInput = row?.querySelector("[data-repo='url']");
-    if (!repo.url) {
+    if (!repo.url && !repo.slug) {
       toast("请填写代码仓库 Git 地址。Git Access Token 是选填。", "warn");
       urlInput?.focus();
       return false;
@@ -3626,10 +3653,10 @@ function acUpdatePermSummary(ac) {
   const codeAccess = ac.querySelector("#ac-code-access-btn")?.getAttribute("aria-checked") === "true";
   const repoCount = ac.querySelectorAll(".ac-repo-row").length;
   const html = codeAccess
-    ? acPillHTML("brand", "m16 18 6-6-6-6M8 6l-6 6 6 6", "可访问代码仓库") +
+    ? acPillHTML("brand", "m16 18 6-6-6-6M8 6l-6 6 6 6", "已配置默认仓库") +
       acPillHTML("muted", "M21 8 12 3 3 8v8l9 5 9-5ZM3 8l9 5 9-5M12 13v8", repoCount ? `${repoCount} 个仓库` : "待添加仓库") +
       acPillHTML("muted", "M5 11h14a1 1 0 0 1 1 1v7a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1v-7a1 1 0 0 1 1-1ZM8 11V7a4 4 0 0 1 8 0v4", acHasAgentGitIdentity(ac) ? "Agent 级 Git 身份" : "沿用本机 Git 身份")
-    : acPillHTML("muted", "M5 11h14a1 1 0 0 1 1 1v7a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1v-7a1 1 0 0 1 1-1ZM8 11V7a4 4 0 0 1 8 0v4", "纯对话 · 不碰任何代码仓库");
+    : acPillHTML("muted", "M5 11h14a1 1 0 0 1 1 1v7a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1v-7a1 1 0 0 1 1-1ZM8 11V7a4 4 0 0 1 8 0v4", "未设置默认仓库");
   summaryEl.innerHTML = html;
 }
 
@@ -3649,7 +3676,7 @@ function acUpdateAdvSummary(ac) {
   const chatsRaw = ac.querySelector("#ac-chats")?.value ?? "";
   const chatCount = chatsRaw.split("\n").map((s) => s.trim()).filter(Boolean).length;
   summaryEl.innerHTML =
-    acPillHTML("muted", "M13 2 3 14h7l-1 8 10-12h-7l1-6Z", `最多连做 ${turnLimit} 步`) +
+    acPillHTML("muted", "M13 2 3 14h7l-1 8 10-12h-7l1-6Z", `${turnLimit} 轮协作提醒`) +
     acPillHTML("muted", "M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2M9 11a4 4 0 1 0 0-8 4 4 0 0 0 0 8M22 21v-2a4 4 0 0 0-3-3.9M16 3.1a4 4 0 0 1 0 7.8", chatCount === 0 ? "任何群都能 @" : `仅 ${chatCount} 个群`);
 }
 
@@ -4315,12 +4342,13 @@ async function saveAcBot(panel, id) {
   // 串行避免两个请求并发时 AGENTS.md 被旧的 description 或 memory 覆盖。
   const botRes = await api("PUT", `/api/bot/${encodeURIComponent(id)}`, botConfig);
   const memRes = botRes.ok
-    ? await api("PUT", `/api/memory/${encodeURIComponent(id)}`, { content: memContent })
+    ? (botConfig.workspace ? { ok: true, json: {} } : await api("PUT", `/api/memory/${encodeURIComponent(id)}`, { content: memContent }))
     : { ok: false, json: { error: null } };
   restore();
 
   if (botRes.ok && memRes.ok) {
-    toast("已保存", "ok");
+    const warnings = [...(botRes.json?.warnings ?? []), ...(memRes.json?.warnings ?? [])];
+    toast(warnings.length ? `配置已保存；${warnings.join("；")}` : "已保存", warnings.length ? "warn" : "ok");
     flashSave(btnSave);
     // 更新脏检测基线
     panel._acBaseline = acFormSnapshot(panel);
@@ -5089,7 +5117,7 @@ function renderOnboardNameForm(prefill, sessionId) {
     `</div>`;
 
   modal.innerHTML =
-    ob2Head("配置新助手", "扫码拿到的资料已自动填好 —— 填上职能、配好权限就能用。") +
+    ob2Head("配置新助手", "扫码资料已填好 —— 定义职责，或接入已经配置好的本机 workspace。") +
     `<div class="ob2-ac-scroll">` +
     backendSlotHTML +
     acHTML +
@@ -5117,8 +5145,7 @@ function renderOnboardNameForm(prefill, sessionId) {
 
   // 「添加到名册」按钮(在 ac-create-btn 或 ac-panel 上的 _acSubmit 回调)
   modal._acSubmit = () => submitOnboardName(prefill, sessionId, modal);
-  const createBtn = modal.querySelector("#ac-create-btn");
-  if (createBtn) createBtn.addEventListener("click", () => submitOnboardName(prefill, sessionId, modal));
+  // wireAgentConfigEvents already binds the create button to _acSubmit.
 
   // 聚焦名字输入
   setTimeout(() => modal.querySelector("#ac-name")?.focus(), 50);
@@ -5147,9 +5174,9 @@ async function submitOnboardName(prefill, sessionId, modal) {
   // 序列化:符合后端 onboard/finalize 契约
   const payload = { session: sid, name };
   if (vals.description) payload.description = vals.description;
-  // chats 取第一条(onboard finalize 接 chatId)
-  const chatId = Array.isArray(vals.chats) && vals.chats.length > 0 ? vals.chats[0] : "";
-  if (chatId) payload.chatId = chatId;
+  payload.chats = vals.chats ?? [];
+  if (vals.workspace) payload.workspace = vals.workspace;
+  else payload.memory_content = vals._memContent ?? "";
   if (botId) payload.botId = botId;
   // 扩展字段:gitlab + repos + turn_limit(后端支持就传,不支持忽略)
   // ① 新保存契约:发 gitlab_token_value(真值),不再发变量名
@@ -5168,12 +5195,8 @@ async function submitOnboardName(prefill, sessionId, modal) {
     return;
   }
 
-  // done — 如有 memory 内容,异步写入(不阻断)
-  const memContent = vals._memContent ?? "";
+  // finalize succeeds only after the complete definition has been persisted.
   const newId = res.json?.botId ?? null;
-  if (newId && memContent) {
-    void api("PUT", `/api/memory/${encodeURIComponent(newId)}`, { content: memContent });
-  }
 
   onboard.sessionId = null;
   await loadBots({ silent: true });

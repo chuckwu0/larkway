@@ -58,6 +58,10 @@ Larkway 不做这些事:
 - 项目知识和工作流优先写在 `AGENTS.md` / `CLAUDE.md` / `.agents/skills` / `.claude/skills`。
 - Agent 自己决定是否读取上下文、下载附件、clone repo、建 worktree、跑测试、开 MR、写结果。
 - Larkway 只把飞书场景和本地 runtime 接起来,让 Agent runtime 升级时,Larkway 自然获得复利。
+- 原生 session 默认持续使用，由 runtime 负责上下文压缩；bridge 不按轮数或字符数默认丢弃上下文。
+- 同任务、模型、权限与工具下，以完成质量、耗时、原生 token usage、工具调用和连续性衡量通道开销；prompt 字符数只是一项局部指标。
+
+当前默认行为、迁移边界及尚未对齐的能力见 [原生 runtime 对齐](native-runtime.md)。
 
 ## Workspace 与 Session
 
@@ -68,9 +72,8 @@ Larkway 不做这些事:
   AGENTS.md
   CLAUDE.md -> AGENTS.md    # Claude backend 入口兼容,不维护第二份内容
   memory/
-  permissions/
-    request.md
-    granted.md
+  permissions-request.md
+  permissions-granted.md
   sessions/
     <larkway-session-key>/
       transcript.md
@@ -85,8 +88,8 @@ Larkway 不做这些事:
 - `AGENTS.md`:Agent 的启动级说明,包括身份、职责、边界、repo pointer、workspace 契约和工作方式。用户侧文案叫"身份与职责";来源是 Web 表单的 `description` + 工作方式内容。
 - `CLAUDE.md`:指向 `AGENTS.md` 的软链,只解决 Claude Code 入口文件名兼容。
 - `memory/`:跨 session 可复用记忆,例如长期偏好、可复用经验、工作方式、决策和素材索引。
-- `permissions/request.md`:内部产品层权限申请,不作为 Web 主界面配置项。
-- `permissions/granted.md`:内部产品层授权记录,不作为 Web 主界面配置项。
+- `permissions-request.md`:内部产品层权限申请,不作为 Web 主界面配置项。
+- `permissions-granted.md`:内部产品层授权记录,不作为 Web 主界面配置项。
 - `sessions/<larkway-session-key>/`:飞书话题对应的 Agent session;通常使用 root message id 作为稳定锚点。原始飞书 topic id 作为 `feishu_thread_id` 单独传给 Agent。
 - `sessions/<key>/transcript.md`:bridge append-only 的输入事实日志,记录触发事实、消息 id、sender、raw message pointer、文档/附件指针;不做业务总结。
 - `sessions/<key>/summary.md`:Agent 自己维护的工作记忆和交接摘要,记录需求理解、已读材料、决策、当前状态和下一步。
@@ -126,7 +129,7 @@ Agent 只使用 Agent 自己的身份(飞书应用/bot 身份,tenant token),**�
 |---|---|---|
 | 外壳 | 创建卡片、PATCH、节流、失败兜底、崩溃恢复 | 不直接 PATCH 卡片 |
 | 头部 | 默认 CardKit 不渲染顶部标题色条;legacy/fallback 卡片保留可见状态语义 | `card_title` / `card_color` 仅作兼容字段 |
-| 正文 | 安全渲染 markdown、分片、只渲染可信答案通道 | 用 `last_message` 决定展示内容 |
+| 正文 | 安全渲染 markdown、分片、展示 runtime 可信答案通道 | 直接回答；自定义卡片时可选 `last_message` |
 | 内部诊断 | 记录工具/runner 事件,但运行中不展示工具 dump 或思考 | 不依赖工具摘要表达业务阶段 |
 | 底部动作 | 把 `choices` 渲染成按钮并回传 value | 只在单个离散选择时声明 `choices` |
 

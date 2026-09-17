@@ -7,7 +7,7 @@
  * and NOT demoted — finalize follows status=ready → success.
  */
 import { describe, it, expect, vi, beforeEach, afterEach, beforeAll } from "vitest";
-import { mkdtemp, rm, mkdir, writeFile, readFile, stat, utimes } from "node:fs/promises";
+import { mkdtemp, rm, mkdir, writeFile, readFile, readdir, stat, utimes } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -259,6 +259,8 @@ function makePersistentSessionStore() {
     harvestedAt?: number;
     approxChars?: number;
     needsFreshStart?: { reason: string; at: number };
+    workspacePath?: string;
+    backend?: string;
   };
   const records = new Map<string, Rec>();
   const puts: Rec[] = [];
@@ -610,9 +612,8 @@ describe("handleOne — thin-channel finalize", () => {
     expect(runnerBackends).toEqual(["claude"]);
     expect(runOpts?.prompt).toContain("<runtime-warnings>");
     expect(runOpts?.prompt).toContain("Feishu CLI (lark-cli)");
-    expect(runOpts?.prompt).toContain("这是提示,不是强制停止条件");
-    expect(runOpts?.prompt).toContain("不要额外 @ 用户");
-    expect(runOpts?.prompt).toContain("npx -y @larksuite/cli@latest install");
+    expect(runOpts?.prompt).toContain("是否影响当前任务由你判断");
+    expect(runOpts?.prompt).toContain("Install and configure lark-cli before starting Feishu bots.");
   });
 
   it("adds a received reaction before card start, then removes it once the processing card exists", async () => {
@@ -2065,7 +2066,9 @@ describe("handleOne — thin-channel finalize", () => {
     await seedRepoCachePath();
     const { client: cardKitClient } = makeCardKitClient();
 
+    let actualPrompt = "";
     runClaudeImpl = (opts: unknown) => {
+      actualPrompt = (opts as { prompt: string }).prompt;
       const { onPerfMarker } = opts as {
         onPerfMarker?: (marker: string, atMs: number) => void;
       };
@@ -2141,9 +2144,15 @@ describe("handleOne — thin-channel finalize", () => {
       spawnToSessionInitMs: 40,
       spawnToFirstContentMs: 900,
       toolUseCount: 2, // cumulative — both tool_use events, even though each already resolved (toolsInFlight back to 0)
+      promptChars: actualPrompt.length,
+      promptMode: "full",
+      exitCode: 0,
     });
     expect(typeof capturedSample?.turnDurationMs).toBe("number");
     expect(capturedSample?.turnDurationMs).toBeGreaterThanOrEqual(0);
+    expect(capturedSample?.spawnToFirstAnswerMs).toBeGreaterThanOrEqual(0);
+    expect(capturedSample?.spawnToFirstAnswerMs).toBeLessThanOrEqual(capturedSample!.turnDurationMs);
+    expect(capturedSample?.runnerError).toBeUndefined();
   });
 
   it("A1 (agent_workspace): creates the CardKit placeholder card BEFORE the (local-fs-only) prewarm work", async () => {
@@ -4405,7 +4414,7 @@ describe("handleOne — provisioning decision tree (unified model)", () => {
     // bot classes, aligning the Claude backend with Codex's full-host posture.
     expect(runOpts?.permissionMode).toBe("bypassPermissions");
     expect(runOpts?.prompt).toContain("<agent-workspace>");
-    expect(runOpts?.prompt).toContain(`topic_session_path:  ${sessionPath}`);
+    expect(runOpts?.prompt).toContain(`topic_session_path: ${sessionPath}`);
     await expect(import("node:fs/promises").then((fs) => fs.stat(sessionPath))).resolves.toBeTruthy();
     await expect(
       import("node:fs/promises").then((fs) =>
@@ -4672,11 +4681,13 @@ describe("handleOne — provisioning decision tree (unified model)", () => {
     expect(runOpts).toHaveLength(2);
     expect(runOpts[0]?.cwd).toBe(workspacePath);
     expect(runOpts[0]?.resumeSessionId).toBeUndefined();
-    expect(runOpts[0]?.prompt).toContain(`topic_session_path:  ${sessionPath}`);
+    expect(runOpts[0]?.prompt).toContain(`topic_session_path: ${sessionPath}`);
     expect(runOpts[0]?.prompt).toContain("is_new_thread:    true");
     expect(runOpts[1]?.cwd).toBe(workspacePath);
     expect(runOpts[1]?.resumeSessionId).toBe("sess_first");
-    expect(runOpts[1]?.prompt).toContain(`topic_session_path:  ${sessionPath}`);
+    expect(runOpts[1]?.prompt).not.toContain("<agent-workspace>");
+    expect(runOpts[1]?.prompt).toContain("<contract-anchor>");
+    expect(runOpts[1]?.prompt).toContain(stateFileMod.stateFilePathOf(sessionPath));
     expect(runOpts[1]?.prompt).toContain("is_new_thread:    false");
     expect(firstCard.startArgs[0]).toMatchObject({
       messageId: threadId,
@@ -6125,7 +6136,7 @@ describe("handleOne — v4 task-share root probe", () => {
     expect(claimCalls.length).toBe(1);
     expect(claimCalls[0]).toMatchObject({ taskGuid: "g-42", threadId: "om_root", mode: "comment" });
     expect(runOpts?.prompt ?? "").toContain("task_root_claimed: yes");
-    expect(runOpts?.prompt ?? "").toContain("已自动认领");
+    expect(runOpts?.prompt ?? "").toContain("task_root_just_claimed: yes");
   });
 
   it("in-thread turn carries the topic deep link built from the event's own thread_id (not the probe cache)", async () => {
@@ -6355,7 +6366,7 @@ describe("run() gated coalescing — drain, merged prompt, shared settle (批D)"
     for (let i = 0; i < 200 && prompts.length < 2; i++) await new Promise((r) => setTimeout(r, 10));
     expect(prompts).toHaveLength(2);
     // Turn 2 = om_c2 as primary + om_c3 absorbed as its single followup.
-    expect(prompts[1]).toContain("1 条追加消息");
+    expect(prompts[1]).toContain("追加消息(按到达顺序,已合并进本轮)");
     expect(prompts[1]).toContain("ou_sender: 补充:也看 B");
     expect(prompts[1]).toContain("ou_sender: 顺便 bump 版本");
     releases[1]!({ exitCode: 0, sessionId: "sess_x" });
@@ -6753,6 +6764,8 @@ type CapturedRunOpts = {
   prompt?: string;
   resumeSessionId?: string;
   forceFreshSession?: boolean;
+  cwd?: string;
+  pidFilePath?: string | null;
 };
 
 /** The persistent fake's record shape (put()'s parameter type). */
@@ -6787,16 +6800,24 @@ function seedWsRecord(
 
 function makeWorkspaceHandler(opts: {
   store: unknown;
+  event?: Record<string, unknown>;
+  workspacePath?: string;
+  sessionsDir?: string;
+  byoWorkspace?: boolean;
   botConfigExtra?: Partial<NonNullable<import("./handler.js").BridgeHandlerDeps["botConfig"]>>;
   cardKit?: boolean;
   /** Arm a tiny idle watchdog threshold (ms) for idle-kill scenarios. */
   idleTimeoutMs?: number;
 }) {
-  const { workspacePath, sessionsDir, reposDir } = workspacePaths();
+  const defaults = workspacePaths();
+  const workspacePath = opts.workspacePath ?? defaults.workspacePath;
+  const sessionsDir = opts.sessionsDir ?? defaults.sessionsDir;
+  const reposDir = join(workspacePath, "repos");
   const metrics: MemoryMetricEvent[] = [];
+  const perfSamples: PerfSample[] = [];
   const card = makeCardRenderer();
   const cardKit = opts.cardKit ? makeCardKitClient() : undefined;
-  const { client, acked } = makeClient(makeEvent());
+  const { client, acked } = makeClient(opts.event ?? makeEvent());
   const handler = new BridgeHandler({
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     client: client as any,
@@ -6810,6 +6831,7 @@ function makeWorkspaceHandler(opts: {
       agentWorkspacePath: workspacePath,
       workspaceSessionsDir: sessionsDir,
       workspaceReposPath: reposDir,
+      ...(opts.byoWorkspace ? { byoWorkspace: true } : {}),
       devHostname: "10.0.0.1",
       portRangeStart: 3000,
       portRangeEnd: 3999,
@@ -6847,11 +6869,13 @@ function makeWorkspaceHandler(opts: {
         }
       : {}),
     recordMemoryMetric: (e) => metrics.push(e),
+    recordPerfSample: async (sample) => { perfSamples.push(sample); },
   });
   return {
     handler,
     card,
     metrics,
+    perfSamples,
     acked,
     cardKitCalls: cardKit?.calls,
     workspacePath,
@@ -6951,6 +6975,199 @@ function ghostThenIdleRunner(retrySessionId: string): CapturedRunOpts[] {
   return captured;
 }
 
+describe("native session continuity defaults", () => {
+  it.each([
+    { turnCount: 1000, approxChars: 0 },
+    { turnCount: 1, approxChars: 5_000_000 },
+    { turnCount: 1000, approxChars: 5_000_000 },
+  ])("preserves long native history without opt-in reseeding (%j)", async (volume) => {
+    const sessionStore = makePersistentSessionStore();
+    const { workspacePath } = workspacePaths();
+    seedWsRecord(sessionStore, { ...volume, workspacePath, backend: "codex" });
+    const captured = captureWorkspaceRunner("sess_prev");
+    const h = makeWorkspaceHandler({ store: sessionStore.store });
+    await h.handler.run();
+    await h.handler.whenAllTurnsSettled();
+
+    expect(captured).toHaveLength(1);
+    expect(captured[0]).toMatchObject({ resumeSessionId: "sess_prev", forceFreshSession: false, cwd: workspacePath, pidFilePath: null });
+    expect(captured[0]?.prompt).toContain("<contract-anchor>");
+    expect(captured[0]?.prompt).not.toContain("<agent-workspace>");
+    expect(captured[0]?.prompt).not.toContain("<session-reseed>");
+    expect(captured[0]?.prompt).not.toContain("reseed_threshold_near");
+    expect(sessionStore.records.get("wsbot:om_msg")?.turnCount).toBe(volume.turnCount + 1);
+    expect(sessionStore.markNeedsFreshStartCalls).toEqual([]);
+    expect(h.metrics.filter((m) => m.type === "reseed" || m.type === "reseed-warning")).toEqual([]);
+    expect(h.perfSamples).toHaveLength(1);
+    expect(h.perfSamples[0]).toMatchObject({ promptChars: captured[0]!.prompt!.length, promptMode: "delta", exitCode: 0 });
+    expect(h.perfSamples[0]?.spawnToFirstAnswerMs).toBeUndefined();
+    await expect(stat(join(workspacePath, ".claude", "settings.local.json"))).rejects.toThrow();
+    await expect(stat(join(workspacePath, ".larkway", "runner.pid"))).rejects.toThrow();
+    await expect(stat(join(process.env.LARKWAY_HOME!, "knowledge"))).rejects.toThrow();
+  });
+
+  it("resumes a sticky p2p conversation after a long idle gap by default", async () => {
+    const sessionStore = makePersistentSessionStore();
+    seedWsRecord(sessionStore);
+    const record = sessionStore.records.get("wsbot:om_msg")!;
+    sessionStore.records.delete("wsbot:om_msg");
+    sessionStore.records.set("wsbot:p2p-oc_chat", { ...record, threadId: "p2p-oc_chat", lastActiveTs: 1 });
+    // Receipt-time touch must not conceal the actual long idle gap in this regression.
+    sessionStore.store.touch = async () => {};
+    const captured = captureWorkspaceRunner("sess_prev");
+    const h = makeWorkspaceHandler({
+      store: sessionStore.store,
+      event: { ...makeEvent(), chat_type: "p2p" },
+      botConfigExtra: { p2pStickySession: true },
+    });
+    await h.handler.run();
+    await h.handler.whenAllTurnsSettled();
+    expect(captured[0]?.resumeSessionId).toBe("sess_prev");
+    expect(captured[0]?.forceFreshSession).toBe(false);
+    expect(captured[0]?.prompt).toContain("session_key:      p2p-oc_chat");
+    expect(captured[0]?.prompt).not.toContain("<session-reseed>");
+    expect(sessionStore.records.get("wsbot:p2p-oc_chat")?.sessionId).toBe("sess_prev");
+  });
+
+  it.each(["workspace", "backend"] as const)("starts fresh with full context when %s changes", async (changed) => {
+    const sessionStore = makePersistentSessionStore();
+    const { workspacePath, sessionsDir } = workspacePaths();
+    seedWsRecord(sessionStore, {
+      workspacePath: changed === "workspace" ? join(root, "previous-workspace") : workspacePath,
+      backend: changed === "backend" ? "claude" : "codex",
+      turnCount: 8, approxChars: 900,
+    });
+    const oldSessionPath = changed === "workspace"
+      ? join(process.env.LARKWAY_HOME!, "agents", "wsbot", "sessions", "om_msg")
+      : join(sessionsDir, "om_msg");
+    await mkdir(oldSessionPath, { recursive: true });
+    await writeFile(join(oldSessionPath, "summary.md"), "Keep the accepted accessibility requirements.\n");
+    await writeFile(join(oldSessionPath, "transcript.md"), "Previous user: keep the keyboard shortcuts.\n");
+    const captured = captureWorkspaceRunner("sess_replacement");
+    const h = makeWorkspaceHandler({ store: sessionStore.store });
+    await h.handler.run();
+    await h.handler.whenAllTurnsSettled();
+    expect(captured).toHaveLength(1);
+    expect(captured[0]?.resumeSessionId).toBeUndefined();
+    expect(captured[0]?.forceFreshSession).toBe(true);
+    expect(captured[0]?.prompt).toContain("is_new_thread:    true");
+    expect(captured[0]?.prompt).toContain("<state-contract>");
+    expect(captured[0]?.prompt).toContain("<agent-workspace>");
+    expect(captured[0]?.prompt).toContain(`topic_session_path: ${join(sessionsDir, "om_msg")}`);
+    expect(captured[0]?.prompt).not.toContain("<contract-anchor>");
+    expect(captured[0]?.prompt).toContain("<session-reseed>");
+    expect(captured[0]?.prompt).toContain("fresh_start_reason: configuration-change");
+    expect(captured[0]?.prompt).toContain("此前后端对话不在本会话上下文中");
+    expect(captured[0]?.prompt).toContain("Keep the accepted accessibility requirements.");
+    expect(captured[0]?.prompt).toContain("Previous user: keep the keyboard shortcuts.");
+    expect(captured[0]?.prompt).toContain(`transcript_path: ${join(oldSessionPath, "transcript.md")}`);
+    expect(h.perfSamples).toHaveLength(1);
+    expect(h.perfSamples[0]).toMatchObject({ promptMode: "full", promptChars: captured[0]!.prompt!.length, exitCode: 0 });
+    expect(sessionStore.records.get("wsbot:om_msg")).toMatchObject({
+      sessionId: "sess_replacement", workspacePath, backend: "codex", turnCount: 1,
+      approxChars: 0, createdTs: 111, rootText: "修登录页", chatId: "oc_chat",
+    });
+  });
+
+  it.each(["managed-to-byo", "byo-to-managed"] as const)("seeds %s from the old bridge artifacts without writing the old directory", async (direction) => {
+    const home = process.env.LARKWAY_HOME!;
+    const managedWorkspace = join(home, "agents", "wsbot", "workspace");
+    const externalWorkspace = join(root, "owner-project");
+    const managedSessions = join(managedWorkspace, "sessions");
+    const byoSessions = join(home, "agents", "wsbot", "sessions");
+    const toByo = direction === "managed-to-byo";
+    const oldWorkspace = toByo ? managedWorkspace : externalWorkspace;
+    const newWorkspace = toByo ? externalWorkspace : managedWorkspace;
+    const oldSessionPath = join(toByo ? managedSessions : byoSessions, "om_msg");
+    const newSessionsDir = toByo ? byoSessions : managedSessions;
+    const newSessionPath = join(newSessionsDir, "om_msg");
+    await mkdir(externalWorkspace, { recursive: true });
+    await writeFile(join(externalWorkspace, "AGENTS.md"), "Owner-written project rules.\n");
+    await mkdir(oldSessionPath, { recursive: true });
+    await writeFile(join(oldSessionPath, "summary.md"), "Authoritative old task summary.\n");
+    await writeFile(join(oldSessionPath, "transcript.md"), "Authoritative old conversation.\n");
+    await mkdir(newSessionPath, { recursive: true });
+    await writeFile(join(newSessionPath, "summary.md"), "Unrelated destination summary.\n");
+    const externalDecoy = join(externalWorkspace, "sessions", "om_msg");
+    await mkdir(externalDecoy, { recursive: true });
+    await writeFile(join(externalDecoy, "summary.md"), "Unrelated owner-project session.\n");
+
+    const sessionStore = makePersistentSessionStore();
+    seedWsRecord(sessionStore, { workspacePath: oldWorkspace, backend: "codex", turnCount: 7 });
+    const captured = captureWorkspaceRunner("sess_moved");
+    const h = makeWorkspaceHandler({
+      store: sessionStore.store, workspacePath: newWorkspace,
+      sessionsDir: newSessionsDir, byoWorkspace: toByo,
+    });
+    await h.handler.run();
+    await h.handler.whenAllTurnsSettled();
+    expect(captured[0]).toMatchObject({ cwd: newWorkspace, forceFreshSession: true });
+    expect(captured[0]?.resumeSessionId).toBeUndefined();
+    expect(captured[0]?.prompt).toContain("fresh_start_reason: configuration-change");
+    expect(captured[0]?.prompt).toContain("Authoritative old task summary.");
+    expect(captured[0]?.prompt).toContain("Authoritative old conversation.");
+    expect(captured[0]?.prompt).toContain(`transcript_path: ${join(oldSessionPath, "transcript.md")}`);
+    expect(captured[0]?.prompt).not.toContain("Unrelated destination summary.");
+    expect(captured[0]?.prompt).not.toContain("Unrelated owner-project session.");
+    expect(await readFile(join(oldSessionPath, "summary.md"), "utf8")).toBe("Authoritative old task summary.\n");
+    expect(await readFile(join(oldSessionPath, "transcript.md"), "utf8")).toBe("Authoritative old conversation.\n");
+    expect((await readdir(oldSessionPath)).sort()).toEqual(["summary.md", "transcript.md"]);
+    expect(await readFile(join(externalWorkspace, "AGENTS.md"), "utf8")).toBe("Owner-written project rules.\n");
+    expect(sessionStore.records.get("wsbot:om_msg")).toMatchObject({
+      sessionId: "sess_moved", workspacePath: newWorkspace, backend: "codex", turnCount: 1,
+    });
+  });
+
+  it("keeps explicit full prompts available for resumed sessions", async () => {
+    const sessionStore = makePersistentSessionStore();
+    seedWsRecord(sessionStore);
+    const captured = captureWorkspaceRunner("sess_prev");
+    const h = makeWorkspaceHandler({ store: sessionStore.store, botConfigExtra: { promptMode: "full" } });
+    await h.handler.run();
+    await h.handler.whenAllTurnsSettled();
+    expect(captured[0]?.resumeSessionId).toBe("sess_prev");
+    expect(captured[0]?.prompt).toContain("is_new_thread:    false");
+    expect(captured[0]?.prompt).toContain("<state-contract>");
+    expect(captured[0]?.prompt).toContain("<agent-workspace>");
+  });
+
+  it("enables the organization knowledge map only on explicit opt-in", async () => {
+    const sessionStore = makePersistentSessionStore();
+    const captured = captureWorkspaceRunner("sess_new");
+    const h = makeWorkspaceHandler({ store: sessionStore.store, botConfigExtra: { sharedKnowledge: true } });
+    await h.handler.run();
+    await h.handler.whenAllTurnsSettled();
+    expect(captured[0]?.prompt).toContain("<org-knowledge-map>");
+    expect(captured[0]?.prompt).toContain(`org_knowledge_dir: ${join(process.env.LARKWAY_HOME!, "knowledge")}`);
+    await expect(stat(join(process.env.LARKWAY_HOME!, "knowledge", "README.md"))).resolves.toBeTruthy();
+  });
+
+  it("records a rejected stream attempt without treating internal narration as a trusted answer", async () => {
+    const sessionStore = makePersistentSessionStore();
+    seedWsRecord(sessionStore);
+    let actualPrompt = "";
+    runClaudeImpl = (opts: unknown) => {
+      actualPrompt = (opts as { prompt: string }).prompt;
+      return {
+        events: (async function* () {
+          yield { type: "internal_text", text: "Internal process update", raw: {} };
+          throw new Error("synthetic stream rejection");
+        })(),
+        done: Promise.resolve({ exitCode: 1 }),
+        kill: () => {},
+      };
+    };
+    const h = makeWorkspaceHandler({ store: sessionStore.store });
+    await h.handler.run();
+    await h.handler.whenAllTurnsSettled();
+    expect(h.perfSamples).toHaveLength(1);
+    expect(h.perfSamples[0]).toMatchObject({ runnerError: true, promptMode: "delta", promptChars: actualPrompt.length });
+    expect(h.perfSamples[0]?.exitCode).toBeUndefined();
+    expect(h.perfSamples[0]?.spawnToFirstAnswerMs).toBeUndefined();
+    expect(h.perfSamples[0]?.turnDurationMs).toBeGreaterThanOrEqual(0);
+  });
+});
+
 describe("批H H1 — marker-driven fresh start", () => {
   it("a needsFreshStart(poison-reset) record runs fresh (no resume) with the seeded <session-reseed> block, then clears the marker (turnCount=1)", async () => {
     const sessionStore = makePersistentSessionStore();
@@ -6975,7 +7192,7 @@ describe("批H H1 — marker-driven fresh start", () => {
     expect(captured[0]?.resumeSessionId).toBeUndefined(); // sessionId "" never reaches the runner
     expect(captured[0]?.forceFreshSession).toBe(true);
     expect(captured[0]?.prompt).toContain("<session-reseed>");
-    expect(captured[0]?.prompt).toContain("判定卡死"); // poison-reset wording
+    expect(captured[0]?.prompt).toContain("fresh_start_reason: poison-reset"); // poison-reset wording
     expect(captured[0]?.prompt).toContain("已确认登录页 bug 在 auth.ts"); // summary excerpt
     expect(captured[0]?.prompt).toContain("查登录页"); // transcript tail
 
@@ -7007,7 +7224,7 @@ describe("批H H1 — ghost-session purge (resume rejected)", () => {
     expect(captured[1]?.resumeSessionId).toBeUndefined();
     expect(captured[1]?.forceFreshSession).toBe(true);
     expect(captured[1]?.prompt).toContain("<session-reseed>");
-    expect(captured[1]?.prompt).toContain("旧后端 session 已失效"); // ghost-purge wording
+    expect(captured[1]?.prompt).toContain("fresh_start_reason: ghost-purge"); // ghost-purge wording
     expect(sessionStore.markNeedsFreshStartCalls).toEqual([
       expect.objectContaining({ threadId: "om_msg", botId: "wsbot", reason: "ghost-purge" }),
     ]);
@@ -7101,11 +7318,11 @@ describe("批H H1 — ghost-session purge (resume rejected)", () => {
     await h.handler.whenAllTurnsSettled();
 
     expect(captured).toHaveLength(2);
-    expect(captured[0]?.prompt).toContain("交接预警"); // window genuinely armed on attempt 1
+    expect(captured[0]?.prompt).toContain("reseed_threshold_near: true"); // window genuinely armed on attempt 1
     expect(captured[1]?.prompt).toContain("<session-reseed>");
     // The warning promises "下次将带种子重开" — contradictory next to the
     // reseed block this very prompt already carries; it must be dropped.
-    expect(captured[1]?.prompt).not.toContain("交接预警");
+    expect(captured[1]?.prompt).not.toContain("reseed_threshold_near: true");
   });
 });
 
@@ -7140,7 +7357,7 @@ describe("批H H2 — approxChars volume accounting", () => {
     expect(captured[0]?.resumeSessionId).toBeUndefined();
     expect(captured[0]?.forceFreshSession).toBe(true);
     expect(captured[0]?.prompt).toContain("<session-reseed>");
-    expect(captured[0]?.prompt).toContain("累计轮数/体量已超阈值"); // history-limit wording
+    expect(captured[0]?.prompt).toContain("fresh_start_reason: history-limit"); // history-limit wording
     const rec = sessionStore.records.get("wsbot:om_msg");
     const ownContribution = JSON.stringify(raw).length + answer.length;
     expect(rec?.approxChars).toBe(ownContribution); // reset — NOT 150 + contribution
@@ -7261,7 +7478,7 @@ describe("批G G1 — pre-reseed warning window", () => {
     await h.handler.whenAllTurnsSettled();
 
     expect(captured[0]?.resumeSessionId).toBe("sess_prev"); // a warning is NOT a reseed
-    expect(captured[0]?.prompt).toContain("交接预警");
+    expect(captured[0]?.prompt).toContain("reseed_threshold_near: true");
     expect(captured[0]?.prompt).not.toContain("<session-reseed>");
     expect(h.metrics.filter((m) => m.type === "reseed-warning")).toHaveLength(1);
   });
@@ -7278,7 +7495,7 @@ describe("批G G1 — pre-reseed warning window", () => {
     await h.handler.run();
     await h.handler.whenAllTurnsSettled();
 
-    expect(captured[0]?.prompt).not.toContain("交接预警");
+    expect(captured[0]?.prompt).not.toContain("reseed_threshold_near: true");
     expect(h.metrics.filter((m) => m.type === "reseed-warning")).toHaveLength(0);
   });
 
@@ -7297,7 +7514,7 @@ describe("批G G1 — pre-reseed warning window", () => {
     expect(captured[0]?.resumeSessionId).toBeUndefined();
     expect(captured[0]?.forceFreshSession).toBe(true);
     expect(captured[0]?.prompt).toContain("<session-reseed>");
-    expect(captured[0]?.prompt).not.toContain("交接预警");
+    expect(captured[0]?.prompt).not.toContain("reseed_threshold_near: true");
     expect(h.metrics.filter((m) => m.type === "reseed-warning")).toHaveLength(0);
     // No agent-authored summary.md existed → placeholder handover, metered.
     expect(h.metrics).toContainEqual(
@@ -7551,14 +7768,14 @@ describe("批G G7 — sender_is_owner under 批D coalescing (adversarial fix)", 
 
   it("a bystander's followup folded into an owner-triggered turn → sender_is_owner: no (conservative)", async () => {
     const prompt = await mergedTurnPrompt("ou_bystander");
-    expect(prompt).toContain("1 条追加消息"); // the merge really happened
+    expect(prompt).toContain("追加消息(按到达顺序,已合并进本轮)"); // the merge really happened
     expect(prompt).toContain("sender_is_owner:  no");
     expect(prompt).not.toContain("sender_is_owner:  yes");
   });
 
   it("an all-owner merged turn → sender_is_owner: yes", async () => {
     const prompt = await mergedTurnPrompt("ou_owner");
-    expect(prompt).toContain("1 条追加消息");
+    expect(prompt).toContain("追加消息(按到达顺序,已合并进本轮)");
     expect(prompt).toContain("sender_is_owner:  yes");
   });
 });

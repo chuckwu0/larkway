@@ -56,6 +56,7 @@ import {
   getOnboard,
   cancelOnboard,
   finalizeOnboard,
+  validateExistingWorkspace,
   type OnboardForm,
 } from "./onboardSession.js";
 import { commandProbeEnv, runtimeRequirementsForBots } from "../runtimeRequirements.js";
@@ -432,7 +433,7 @@ async function runHealthScan(
         timeout: HEALTH_SCAN_PROBE_TIMEOUT_MS,
         maxBuffer: 1024 * 1024,
         // BL-50: probe an isolated bot inside its private config dir.
-        env: bot.lark_cli_isolated
+        env: bot.lark_cli_isolated !== false
           ? { ...commandProbeEnv(), LARKSUITE_CLI_CONFIG_DIR: resolveBotLarkCliDir(bot.id) }
           : commandProbeEnv(),
       },
@@ -1001,6 +1002,18 @@ const putBot: ApiHandler = async (req) => {
     void _stripCallerTokenEnv;
     void _stripCallerGitTokenEnv;
 
+    const hasWorkspace = Object.prototype.hasOwnProperty.call(bodyWithoutTokenFields, "workspace");
+    const requestedWorkspace = hasWorkspace
+      ? await validateExistingWorkspace(bodyWithoutTokenFields.workspace)
+      : undefined;
+    if (requestedWorkspace && bodyWithoutTokenFields.runtime !== undefined && bodyWithoutTokenFields.runtime !== "agent_workspace") {
+      throw new Error("workspace 仅支持 runtime: agent_workspace");
+    }
+    if (hasWorkspace) {
+      if (requestedWorkspace) bodyWithoutTokenFields.workspace = requestedWorkspace;
+      else delete bodyWithoutTokenFields.workspace;
+    }
+
     let toWrite: unknown = bodyWithoutTokenFields;
     let existing: Awaited<ReturnType<typeof ctx.stores.botsStore.readBot>> | null = null;
     try {
@@ -1012,6 +1025,14 @@ const putBot: ApiHandler = async (req) => {
       const merged: Record<string, unknown> = { ...existing };
       for (const k of ["name", "description", "chats", "repos", "turn_taking_limit", "backend"]) {
         if (k in bodyWithoutTokenFields) merged[k] = bodyWithoutTokenFields[k];
+      }
+      if (hasWorkspace) {
+        if (requestedWorkspace) {
+          merged.workspace = requestedWorkspace;
+          merged.runtime = "agent_workspace";
+        } else {
+          delete merged.workspace;
+        }
       }
       // model/effort: schema requires a non-empty string when present (zod
       // `.min(1).optional()`), so the UI's "默认（不覆盖）" option sends "" to
@@ -1089,14 +1110,15 @@ const putBot: ApiHandler = async (req) => {
       permissionSurfaceKey(existing) !== permissionSurfaceKey(valid);
 
     await ctx.stores.botsStore.writeBot(valid);
-    if (valid.runtime === "agent_workspace") {
-      await ensureWorkspaceForPutBot(ctx, valid, await readMemoryIfExists(ctx, id));
+    let warnings: string[] = [];
+    if (valid.runtime === "agent_workspace" && !valid.workspace) {
+      warnings = await ensureWorkspaceForPutBot(ctx, valid, await readMemoryIfExists(ctx, id), existing ?? undefined);
       if (permissionSurfaceChanged) {
         await resetWorkspacePermissionsForBot(ctx, valid, "bot permission surface changed through Web API");
       }
     }
     // Response never contains the real token value — only the env-var name (or absent).
-    return { status: 200, json: { ok: true, id } };
+    return { status: 200, json: { ok: true, id, ...(warnings.length ? { warnings } : {}) } };
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     return { status: 400, json: { error: msg } };
@@ -1136,15 +1158,24 @@ async function ensureWorkspaceForPutBot(
   ctx: ManagementContext,
   bot: Awaited<ReturnType<typeof botsStore.readBot>>,
   agentMemory?: string,
-): Promise<void> {
+  previousBot?: Awaited<ReturnType<typeof botsStore.readBot>>,
+): Promise<string[]> {
+  if (bot.workspace) return [];
   const workspacePath = resolveAgentWorkspacePathFromHome(ctx.larkwayDir, bot.id);
   const reposPath = path.join(workspacePath, "repos");
-  await ensureAgentWorkspace({
+  const result = await ensureAgentWorkspace({
     agentId: bot.id,
     workspacePath,
     reposPath,
     sessionPath: path.join(workspacePath, "sessions", "_creation"),
     refreshFacts: true,
+    ...(previousBot ? { previousDefinition: {
+      name: previousBot.name,
+      description: previousBot.description,
+      taskDescription: previousBot.description,
+      agentMemory,
+      repos: workspaceRepoPointersFromBot(workspacePath, previousBot.repos),
+    } } : {}),
     bot: {
       name: bot.name,
       description: bot.description,
@@ -1159,6 +1190,7 @@ async function ensureWorkspaceForPutBot(
       "Deploy/restart, production messages, and destructive changes require explicit human confirmation.",
     ],
   });
+  return result.preservedSections.map((section) => `AGENTS.md 的 ${section} 含自行维护的内容,已保留;请直接核对该段`);
 }
 
 async function readMemoryIfExists(ctx: ManagementContext, id: string): Promise<string | undefined> {
@@ -1324,8 +1356,13 @@ const putMemory: ApiHandler = async (req) => {
   }
 
   try {
-    await ctx.stores.botsStore.writeMemory(id, body.content);
     const bot = await ctx.stores.botsStore.readBot(id);
+    if (bot.workspace) {
+      return { status: 409, json: { error: "这个 Agent 使用现有 workspace;请直接编辑该目录的 AGENTS.md / CLAUDE.md,这里不写入身份说明。" } };
+    }
+    const previousMemory = await readMemoryIfExists(ctx, id);
+    await ctx.stores.botsStore.writeMemory(id, body.content);
+    let warnings: string[] = [];
     if (bot.runtime === "agent_workspace") {
       // 批G G4: a memory save projects ONLY the Role Notes section
       // (surgical). The previous full ensureWorkspaceForPutBot with
@@ -1336,12 +1373,15 @@ const putMemory: ApiHandler = async (req) => {
       const projected = await projectRoleNotes(
         resolveAgentWorkspacePathFromHome(ctx.larkwayDir, id),
         body.content,
+        previousMemory,
       );
-      if (projected === "skipped") {
-        await ensureWorkspaceForPutBot(ctx, bot, body.content);
+      if (projected === "preserved") {
+        warnings = ["AGENTS.md 的身份说明含自行维护的内容,已保留;新说明已保存,请直接核对原生文件"];
+      } else if (projected === "skipped") {
+        warnings = await ensureWorkspaceForPutBot(ctx, bot, body.content);
       }
     }
-    return { status: 200, json: { ok: true, id } };
+    return { status: 200, json: { ok: true, id, ...(warnings.length ? { warnings } : {}) } };
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     return { status: 500, json: { error: msg } };
@@ -1663,6 +1703,8 @@ const postOnboardFinalize: ApiHandler = async (req) => {
     session?: unknown;
     name?: unknown;
     description?: unknown;
+    memory_content?: unknown;
+    workspace?: unknown;
     chatId?: unknown;
     chats?: unknown;
     repos?: unknown;
@@ -1687,9 +1729,17 @@ const postOnboardFinalize: ApiHandler = async (req) => {
   const gitlabTokenValue =
     typeof body?.gitlab_token_value === "string" ? body.gitlab_token_value : undefined;
 
+  let workspace: string | undefined;
+  try {
+    workspace = await validateExistingWorkspace(body?.workspace);
+  } catch (error) {
+    return { status: 400, json: { error: error instanceof Error ? error.message : String(error) } };
+  }
   const form: OnboardForm = {
     name,
     ...(typeof body?.description === "string" ? { description: body.description } : {}),
+    ...(typeof body?.memory_content === "string" ? { memory_content: body.memory_content } : {}),
+    ...(workspace ? { workspace } : {}),
     ...(typeof body?.task_description === "string" ? { task_description: body.task_description } : {}),
     ...(typeof body?.chatId === "string" ? { chatId: body.chatId } : {}),
     // chats[] takes precedence over chatId in createBotFromCreds.

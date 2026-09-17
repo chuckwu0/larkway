@@ -213,6 +213,19 @@ describe("ensureLarkCliProfile — profile missing, create succeeds (Layer 3)", 
 // ---------------------------------------------------------------------------
 
 describe("ensureLarkCliProfile — profile provisioning fails, degrades gracefully (Layer 3)", () => {
+  it.each([false, true])("targets the isolated config directory in repair instructions (spawn throws %s)", (throws) => {
+    const spawn: SpawnSyncFn = throws
+      ? () => { throw new Error("spawn failed"); }
+      : makeSpawn([{ status: 1, stderr: "config unavailable" }]);
+    const log = { log: vi.fn(), warn: vi.fn() };
+    ensureLarkCliProfile(BOT_ID, PROFILE_NAME, APP_ID, APP_SECRET, spawn, log, { configDir: "/tmp/agent home/lark-cli" });
+    const warning = log.warn.mock.calls[0]?.[0] as string;
+    expect(warning).toContain("LARKSUITE_CLI_CONFIG_DIR='/tmp/agent home/lark-cli'");
+    expect(warning).toContain("lark-cli config init");
+    expect(warning).toContain("--app-secret-stdin");
+    expect(warning).not.toContain(APP_SECRET);
+  });
+
   it("emits a WARNING when config init exits non-zero, does not throw", () => {
     const spawn = makeSpawn([
       { status: 1, stderr: "unsupported flag" },  // init: failure

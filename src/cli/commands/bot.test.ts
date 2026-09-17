@@ -9,7 +9,7 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { lstat, mkdir, mkdtemp, readFile, readlink, rm, writeFile } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, readFile, readlink, rm, writeFile, stat, readdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import * as ui from "../ui.js";
@@ -17,19 +17,20 @@ import * as botsStore from "../botsStore.js";
 import * as hostConfig from "../hostConfig.js";
 import type { CliContext } from "../types.js";
 import { run } from "./bot.js";
+import { run as runPerms } from "./perms.js";
 
 // ---------------------------------------------------------------------------
 // Test helpers
 // ---------------------------------------------------------------------------
 
 /** Create a minimal CliContext for testing. Non-interactive by default. */
-function makeCtx(botsDir: string, overrides: Partial<CliContext["flags"]> = {}): CliContext {
+function makeCtx(botsDir: string, overrides: Partial<CliContext["flags"]> = {}, larkwayDir = botsDir): CliContext {
   return {
     paths: {
-      larkwayDir: path.dirname(botsDir),
+      larkwayDir,
       botsDir,
-      configJsonPath: path.join(path.dirname(botsDir), "config.json"),
-      envPath: path.join(path.dirname(botsDir), ".env"),
+      configJsonPath: path.join(larkwayDir, "config.json"),
+      envPath: path.join(larkwayDir, ".env"),
     },
     ui,
     botsStore,
@@ -128,6 +129,30 @@ describe("bot list — empty", () => {
 // ---------------------------------------------------------------------------
 
 describe("bot add", () => {
+  it("keeps create, definition edits and permission resets under runtime home when botsDir is separate", async () => {
+    const botsDir = path.join(tmpDir, "configuration", "bots");
+    const runtimeHome = path.join(tmpDir, "runtime");
+    process.env.LARKWAY_BOTS_DIR = botsDir;
+    const ctx = makeCtx(botsDir, {}, runtimeHome);
+    expect(await run(ctx, ["add", ...addArgs(MINIMAL_BOT)])).toBe(0);
+
+    const workspace = path.join(runtimeHome, "agents", "test-bot", "workspace");
+    const guide = path.join(workspace, "AGENTS.md");
+    expect(await readFile(guide, "utf8")).toContain("# Test Bot");
+    await writeFile(path.join(workspace, "permissions-granted.md"), "old grant\n");
+    expect(await run(ctx, ["edit", "test-bot", "--set", "name=Runtime Bot", "--set", "repos=acme/app:release"])).toBe(0);
+    expect(await readFile(guide, "utf8")).toContain("# Runtime Bot");
+    expect(await readFile(guide, "utf8")).toContain("branch=release");
+    expect(await readFile(path.join(workspace, "permissions-granted.md"), "utf8")).toContain("larkway bot edit --set");
+
+    expect(await runPerms(ctx, ["test-bot", "--add-repo", "acme/docs:stable"])).toBe(0);
+    expect(await readFile(guide, "utf8")).toContain("acme/docs");
+    expect(await readFile(path.join(workspace, "permissions-granted.md"), "utf8")).toContain("acme/docs");
+    await expect(stat(path.join(tmpDir, "configuration", "agents"))).rejects.toThrow();
+    await expect(stat(path.join(botsDir, "agents"))).rejects.toThrow();
+    expect(await botsStore.readBot("test-bot")).toMatchObject({ name: "Runtime Bot" });
+  });
+
   it("creates yaml + memory.md for a valid bot", async () => {
     const ctx = makeCtx(tmpDir);
     const code = await run(ctx, ["add", ...addArgs(MINIMAL_BOT)]);
@@ -376,6 +401,36 @@ describe("bot list — with bots", () => {
 // ---------------------------------------------------------------------------
 
 describe("bot edit", () => {
+  it("projects changed CLI identity and repo fields while retaining user-authored native notes", async () => {
+    const workspace = path.join(tmpDir, "agents", "test-bot", "workspace");
+    const guide = path.join(workspace, "AGENTS.md");
+    const original = await readFile(guide, "utf8");
+    // Exercise migration from an unmarked but unmodified legacy definition.
+    const legacy = original.replace(/^<!-- larkway:(?:identity|primary-task|repos):(?:start|end) -->\n/gm, "");
+    await writeFile(guide, `${legacy}\n## Local convention\nKeep release checks.\n`);
+    const code = await run(makeCtx(tmpDir), ["edit", "test-bot", "--set", "name=Release Bot", "--set", "description=Ship releases", "--set", "repos=acme/release:stable"]);
+    expect(code).toBe(0);
+    const updated = await readFile(guide, "utf8");
+    expect(updated).toContain("# Release Bot");
+    expect(updated).toContain("Ship releases");
+    expect(updated).toContain("branch=stable");
+    expect(updated).toContain("Keep release checks.");
+    expect(updated).not.toContain("A bot for testing");
+  });
+
+  it("edits a BYO bot without creating managed artifacts or modifying native instructions", async () => {
+    const native = path.join(tmpDir, "native");
+    await mkdir(native);
+    await writeFile(path.join(native, "AGENTS.md"), "Native owner instructions");
+    await botsStore.writeBot({ ...await botsStore.readBot("test-bot"), workspace: native });
+    const shadow = path.join(tmpDir, "agents", "test-bot", "workspace");
+    await rm(shadow, { recursive: true });
+    expect(await run(makeCtx(tmpDir), ["edit", "test-bot", "--set", "description=New directory label", "--set", "repos=acme/new:release"])).toBe(0);
+    expect(await readdir(native)).toEqual(["AGENTS.md"]);
+    expect(await readFile(path.join(native, "AGENTS.md"), "utf8")).toBe("Native owner instructions");
+    await expect(stat(shadow)).rejects.toThrow();
+  });
+
   beforeEach(async () => {
     const ctx = makeCtx(tmpDir);
     await run(ctx, ["add", ...addArgs(MINIMAL_BOT)]);

@@ -134,27 +134,37 @@ const APP_TURN_RESPONSE = JSON.stringify({
   },
 });
 
-function appAgentDelta(delta: string): string {
+function appAgentStarted(phase: string | null = "final_answer", itemId = "msg-1"): string {
+  return JSON.stringify({
+    method: "item/started",
+    params: {
+      threadId: APP_THREAD_ID, turnId: "turn-1",
+      item: { type: "agentMessage", id: itemId, text: "", ...(phase ? { phase } : {}) },
+    },
+  });
+}
+
+function appAgentDelta(delta: string, itemId = "msg-1"): string {
   return JSON.stringify({
     method: "item/agentMessage/delta",
     params: {
       threadId: APP_THREAD_ID,
       turnId: "turn-1",
-      itemId: "msg-1",
+      itemId,
       delta,
     },
   });
 }
 
-function appAgentCompleted(text: string): string {
+function appAgentCompleted(text: string, phase: string | null = "final_answer", itemId = "msg-1"): string {
   return JSON.stringify({
     method: "item/completed",
     params: {
       item: {
         type: "agentMessage",
-        id: "msg-1",
+        id: itemId,
         text,
-        phase: "final_answer",
+        ...(phase ? { phase } : {}),
         memoryCitation: null,
       },
       threadId: APP_THREAD_ID,
@@ -358,29 +368,80 @@ describe("parseCodexLine", () => {
 });
 
 describe("CodexAppServerLineParser", () => {
-  it("turns app-server agentMessage deltas into marker-gated answer deltas", () => {
+  it("streams an explicitly final native item without prompt markers", () => {
     const parser = new CodexAppServerLineParser();
     const events = [
-      ...parser.parseMessage(JSON.parse(appAgentDelta("LARKWAY_ANSWER_BEGIN\nHel"))),
-      ...parser.parseMessage(JSON.parse(appAgentDelta("lo wor"))),
-      ...parser.parseMessage(JSON.parse(appAgentDelta("ld\nLARKWAY_ANSWER_END"))),
+      ...parser.parseMessage(JSON.parse(appAgentStarted())),
+      ...parser.parseMessage(JSON.parse(appAgentDelta("Hello "))),
+      ...parser.parseMessage(JSON.parse(appAgentDelta("world"))),
+      ...parser.parseMessage(JSON.parse(appAgentCompleted("Hello world"))),
     ];
-
-    const deltas = events.filter((event) => event.type === "answer_delta");
-    expect(deltas.map((event) => event.text).join("")).toBe("Hello world");
-    expect(events.some((event) => event.type === "answer_snapshot")).toBe(false);
+    expect(events.filter((event) => event.type === "answer_delta").map((event) => event.text).join("")).toBe("Hello world");
+    expect(events.filter((event) => event.type === "answer_snapshot")).toHaveLength(0);
   });
 
-  it("uses completed agentMessage as a final snapshot fallback without duplicating prior deltas", () => {
+  it("uses native completion when the start or deltas were not received", () => {
     const parser = new CodexAppServerLineParser();
-    const answer = "LARKWAY_ANSWER_BEGIN\nHello world\nLARKWAY_ANSWER_END";
-    const events = [
-      ...parser.parseMessage(JSON.parse(appAgentDelta(answer))),
-      ...parser.parseMessage(JSON.parse(appAgentCompleted(answer))),
-    ];
+    expect([...parser.parseMessage(JSON.parse(appAgentCompleted("Final result")))]).toEqual([
+      { type: "answer_snapshot", text: "Final result", raw: expect.anything() },
+    ]);
+  });
 
-    expect(events.filter((event) => event.type === "answer_delta")).not.toHaveLength(0);
-    expect(events.filter((event) => event.type === "answer_snapshot")).toHaveLength(0);
+  it("reconciles native deltas against the authoritative completed item", () => {
+    const parser = new CodexAppServerLineParser();
+    [...parser.parseMessage(JSON.parse(appAgentStarted()))];
+    [...parser.parseMessage(JSON.parse(appAgentDelta("Part of the result")))];
+    const completed = [...parser.parseMessage(JSON.parse(appAgentCompleted("Part of the result plus the rest")))];
+    expect(completed).toContainEqual({ type: "answer_snapshot", text: "Part of the result plus the rest", raw: expect.anything() });
+  });
+
+  it.each([true, false])("never surfaces commentary markers, even with start missing=%s", (missingStart) => {
+    const parser = new CodexAppServerLineParser();
+    const commentary = "LARKWAY_ANSWER_BEGIN\nINTERNAL_SENTINEL\nLARKWAY_ANSWER_END";
+    const events = [
+      ...(!missingStart ? [...parser.parseMessage(JSON.parse(appAgentStarted("commentary")))] : []),
+      ...parser.parseMessage(JSON.parse(appAgentDelta(commentary))),
+      ...parser.parseMessage(JSON.parse(appAgentCompleted(commentary, "commentary"))),
+    ];
+    // internal_text also feeds the handler's legacy final-answer rescue.
+    expect(events.every((event) => event.type === "raw")).toBe(true);
+  });
+
+  it("does not let commentary contaminate a following native final item", () => {
+    const parser = new CodexAppServerLineParser();
+    const events = [
+      ...parser.parseMessage(JSON.parse(appAgentStarted("commentary", "progress"))),
+      ...parser.parseMessage(JSON.parse(appAgentDelta("Working", "progress"))),
+      ...parser.parseMessage(JSON.parse(appAgentCompleted("Working", "commentary", "progress"))),
+      ...parser.parseMessage(JSON.parse(appAgentStarted("final_answer", "answer"))),
+      ...parser.parseMessage(JSON.parse(appAgentDelta("Done", "answer"))),
+      ...parser.parseMessage(JSON.parse(appAgentCompleted("Done", "final_answer", "answer"))),
+    ];
+    expect(events.filter((event) => event.type === "answer_delta").map((event) => event.text).join("")).toBe("Done");
+    expect(events.some((event) => event.type === "internal_text")).toBe(false);
+  });
+
+  it("retains marker compatibility only after a phase-less item completes", () => {
+    const parser = new CodexAppServerLineParser();
+    const answer = "LARKWAY_ANSWER_BEGIN\nLegacy result\nLARKWAY_ANSWER_END";
+    const pending = [...parser.parseMessage(JSON.parse(appAgentDelta(answer)))];
+    expect(pending.every((event) => event.type === "raw")).toBe(true);
+    const completed = [...parser.parseMessage(JSON.parse(appAgentCompleted(answer, null)))];
+    expect(completed).toContainEqual({ type: "answer_snapshot", text: "Legacy result", raw: expect.anything() });
+  });
+
+  it("keeps markerless legacy text available for the existing end-of-turn fallback", () => {
+    const parser = new CodexAppServerLineParser();
+    expect([...parser.parseMessage(JSON.parse(appAgentCompleted("Legacy reply", null)))]).toContainEqual({
+      type: "internal_text", text: "Legacy reply", raw: expect.anything(),
+    });
+  });
+
+  it("retains an explicit non-final phase from started when completion omits it", () => {
+    const parser = new CodexAppServerLineParser();
+    [...parser.parseMessage(JSON.parse(appAgentStarted("commentary")))];
+    const events = [...parser.parseMessage(JSON.parse(appAgentCompleted("LARKWAY_ANSWER_BEGIN\nHidden\nLARKWAY_ANSWER_END", null)))];
+    expect(events.every((event) => event.type === "raw")).toBe(true);
   });
 
   it("maps reasoning summaryTextDelta to thinking_delta (not the answer channel)", () => {
@@ -628,7 +689,7 @@ describe("buildCodexCommand", () => {
   it("fresh session: runs codex app-server over stdio", () => {
     const [bin, args] = buildCodexCommand({ prompt: "hello" });
     expect(bin).toBe("codex");
-    expect(args).toEqual(["-c", "model_reasoning_summary=detailed", "app-server", "--stdio"]);
+    expect(args).toEqual(["app-server", "--stdio"]);
   });
 
   it("resume session: still uses app-server; resume is a JSON-RPC request", () => {
@@ -637,12 +698,12 @@ describe("buildCodexCommand", () => {
       resumeSessionId: "019eabc123def456",
     });
     expect(bin).toBe("codex");
-    expect(args).toEqual(["-c", "model_reasoning_summary=detailed", "app-server", "--stdio"]);
+    expect(args).toEqual(["app-server", "--stdio"]);
   });
 
   it("cwd is not encoded in argv; it is sent through app-server params", () => {
     const [, args] = buildCodexCommand({ prompt: "hello", cwd: "/wt" });
-    expect(args).toEqual(["-c", "model_reasoning_summary=detailed", "app-server", "--stdio"]);
+    expect(args).toEqual(["app-server", "--stdio"]);
   });
 
   it("permission mode is not encoded in argv; it is sent through app-server params", () => {
@@ -650,7 +711,7 @@ describe("buildCodexCommand", () => {
       prompt: "hello",
       permissionMode: "acceptEdits",
     });
-    expect(args).toEqual(["-c", "model_reasoning_summary=detailed", "app-server", "--stdio"]);
+    expect(args).toEqual(["app-server", "--stdio"]);
   });
 
   it("custom codexBinPath overrides default 'codex'", () => {
@@ -865,9 +926,10 @@ describe("runCodex() — spawn-level integration", () => {
       fake.stdout.write(APP_INIT_RESPONSE + "\n");
       fake.stdout.write(APP_THREAD_RESPONSE + "\n");
       fake.stdout.write(APP_TURN_RESPONSE + "\n");
-      fake.stdout.write(appAgentDelta("LARKWAY_ANSWER_BEGIN\nHel") + "\n");
-      fake.stdout.write(appAgentDelta("lo world\nLARKWAY_ANSWER_END") + "\n");
-      fake.stdout.write(appAgentCompleted("LARKWAY_ANSWER_BEGIN\nHello world\nLARKWAY_ANSWER_END") + "\n");
+      fake.stdout.write(appAgentStarted() + "\n");
+      fake.stdout.write(appAgentDelta("Hel") + "\n");
+      fake.stdout.write(appAgentDelta("lo world") + "\n");
+      fake.stdout.write(appAgentCompleted("Hello world") + "\n");
       fake.stdout.write(APP_TURN_COMPLETED + "\n");
       // Wait for events loop to observe system_init before emitting close,
       // so discoveredSessionId is populated in runner.ts before done resolves.
@@ -932,7 +994,8 @@ describe("runCodex() — spawn-level integration", () => {
       fake.stdout.write(APP_INIT_RESPONSE + "\n");
       fake.stdout.write(APP_THREAD_RESPONSE + "\n");
       fake.stdout.write(APP_TURN_RESPONSE + "\n");
-      fake.stdout.write(appAgentDelta("LARKWAY_ANSWER_BEGIN\nHello\nLARKWAY_ANSWER_END") + "\n");
+      fake.stdout.write(appAgentStarted() + "\n");
+      fake.stdout.write(appAgentDelta("Hello") + "\n");
       fake.stdout.write(APP_TURN_COMPLETED + "\n");
       void firstEventSeen.then(() => {
         fake.child.emit("close", 0);
@@ -995,7 +1058,7 @@ describe("runCodex() — spawn-level integration", () => {
     await handle.done;
 
     expect(__lastSpawnArgs).not.toBeNull();
-    expect(__lastSpawnArgs!.args).toEqual(["-c", "model_reasoning_summary=detailed", "app-server", "--stdio"]);
+    expect(__lastSpawnArgs!.args).toEqual(["app-server", "--stdio"]);
 
     const stdinText: string = fake.child.stdin.read()?.toString("utf8") ?? "";
     const requests: Array<{
@@ -1058,12 +1121,7 @@ describe("runCodex() — spawn-level integration", () => {
     expect(turnStart?.params).toMatchObject({ model: "gpt-5.4-codex" });
   });
 
-  // Reasoning deltas are the ONLY events codex emits while a model request is
-  // in flight, which makes them the idle watchdog's sole liveness signal during
-  // prefill + thinking. The equivalent global config flag stopped delivering
-  // them as of codex-cli 0.145.0 (measured: 0 deltas with the flag alone vs
-  // 9-11 with this param, same model and prompt), so it must go on turn/start.
-  it("passes turn/start.summary=detailed so reasoning deltas keep feeding the idle watchdog", async () => {
+  it("inherits the host reasoning-summary setting without a turn override", async () => {
     const fake = makeFakeCodexChild();
     __nextFakeCodexChild = fake;
 
@@ -1090,7 +1148,7 @@ describe("runCodex() — spawn-level integration", () => {
       .map((line: string) => JSON.parse(line) as { method?: string; params?: Record<string, unknown> });
 
     const turnStart = requests.find((request) => request.method === "turn/start");
-    expect(turnStart?.params).toMatchObject({ summary: "detailed" });
+    expect(turnStart?.params).not.toHaveProperty("summary");
   });
 
   it("passes opts.effort through as turn/start.effort, mapped through codexEffortFromLarkway (max → xhigh)", async () => {
@@ -1207,7 +1265,7 @@ describe("runCodex() — spawn-level integration", () => {
 
     // Verify spawn received correct argv for resume
     expect(__lastSpawnArgs).not.toBeNull();
-    expect(__lastSpawnArgs!.args).toEqual(["-c", "model_reasoning_summary=detailed", "app-server", "--stdio"]);
+    expect(__lastSpawnArgs!.args).toEqual(["app-server", "--stdio"]);
     const stdinText = fake.child.stdin.read()?.toString("utf8") ?? "";
     expect(stdinText).toContain('"method":"thread/resume"');
     expect(stdinText).toContain('"threadId":"019eabc123def456"');

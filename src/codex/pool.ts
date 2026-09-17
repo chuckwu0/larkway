@@ -71,7 +71,6 @@ import {
   asRecord,
   buildCodexCommand,
   buildCodexEnv,
-  CODEX_TURN_REASONING_SUMMARY,
   CodexAppServerLineParser,
   codexApprovalPolicy,
   codexEffortFromLarkway,
@@ -112,6 +111,8 @@ interface TurnState {
   settled: boolean;
   threadId?: string;
   turnId?: string;
+  /** This native thread was already loaded by the current child before this turn. */
+  reusedProcess?: boolean;
   /** Set only when this specific turn fell back to a cold one-shot runner. */
   coldHandle?: RunHandle;
   /** B3: per-turn runaway guard, mirrors the cold runner's timeoutMs contract. */
@@ -167,6 +168,8 @@ export class CodexProcessPool implements AgentRunner {
   readonly #pending = new Map<number, PendingRequest>();
   readonly #turns = new Map<number, TurnState>();
   readonly #threadOwners = new Map<string, number>();
+  /** Completed thread/start|resume requests on the current app-server child. */
+  readonly #loadedThreadIds = new Set<string>();
 
   /** Resolves once `initialize`'s response is observed on the current child; rejects if the child dies first. */
   #ready: Promise<void> | undefined;
@@ -327,6 +330,8 @@ export class CodexProcessPool implements AgentRunner {
     }
     if (state.settled) return; // e.g. killed/timed-out before it ever got going
 
+    state.reusedProcess = state.opts.resumeSessionId != null &&
+      this.#loadedThreadIds.has(state.opts.resumeSessionId);
     const mode = state.opts.permissionMode ?? "acceptEdits";
     const threadMethod = state.opts.resumeSessionId != null ? "thread/resume" : "thread/start";
     const threadParams: JsonRecord = state.opts.resumeSessionId != null
@@ -350,11 +355,6 @@ export class CodexProcessPool implements AgentRunner {
       input: [{ type: "text", text: state.opts.prompt, text_elements: [] }],
       approvalPolicy: codexApprovalPolicy(mode),
       sandboxPolicy: codexTurnSandboxPolicy(mode),
-      // Same rationale as the cold path in runner.ts: reasoning deltas are the
-      // only in-flight liveness signal the idle watchdog gets. Pooling is
-      // default-on for codex bots, so omitting it here would leave the LIVE
-      // path unfixed.
-      summary: CODEX_TURN_REASONING_SUMMARY,
     };
     if (state.opts.cwd != null) turnParams["cwd"] = state.opts.cwd;
     if (state.opts.model) turnParams["model"] = state.opts.model;
@@ -463,7 +463,7 @@ export class CodexProcessPool implements AgentRunner {
   #abandonTurn(state: TurnState): void {
     if (state.settled) return;
     if (state.threadId) this.#threadOwners.delete(state.threadId);
-    // M4 fix: only claim pooled:true/resumeMode:same-process if this turn
+    // M4 fix: only claim pooled:true if this turn
     // genuinely reached the wire (threadId set) — a turn killed before that
     // never ran on the pool at all, and shouldn't be misreported as if it did.
     const reachedPool = state.threadId != null;
@@ -473,7 +473,9 @@ export class CodexProcessPool implements AgentRunner {
       exitCode: 1,
       sessionId: state.threadId,
       pooled: reachedPool,
-      resumeMode: reachedPool && state.opts.resumeSessionId != null ? "same-process" : undefined,
+      resumeMode: reachedPool && state.opts.resumeSessionId != null
+        ? state.reusedProcess ? "same-process" : "cold"
+        : undefined,
     });
   }
 
@@ -506,6 +508,7 @@ export class CodexProcessPool implements AgentRunner {
     this.#child = child;
     this.#pending.clear();
     this.#threadOwners.clear();
+    this.#loadedThreadIds.clear();
     this.#currentSpawnReadyResolved = false;
 
     // A write after the child has died (e.g. a turn racing the process's own
@@ -573,6 +576,7 @@ export class CodexProcessPool implements AgentRunner {
     }
     this.#child = undefined;
     this.#pending.clear();
+    this.#loadedThreadIds.clear();
     this.#readyReject?.(err);
     const readyEverResolvedForThisChild = this.#currentSpawnReadyResolved;
     this.#ready = undefined;
@@ -647,6 +651,7 @@ export class CodexProcessPool implements AgentRunner {
     const child = this.#child;
     this.#child = undefined;
     this.#ready = undefined;
+    this.#loadedThreadIds.clear();
     if (child == null) return;
     let exited = false;
     child.once("exit", () => {
@@ -748,6 +753,7 @@ export class CodexProcessPool implements AgentRunner {
           return;
         }
         state.threadId = threadId;
+        this.#loadedThreadIds.add(threadId);
         this.#threadOwners.set(threadId, state.turnKey);
         markPerfForEventType(state.markPerf, "system_init");
         state.queue.push({ type: "system_init", sessionId: threadId, raw });
@@ -804,7 +810,9 @@ export class CodexProcessPool implements AgentRunner {
           exitCode: 0,
           sessionId: threadId,
           pooled: true,
-          resumeMode: state.opts.resumeSessionId != null ? "same-process" : undefined,
+          resumeMode: state.opts.resumeSessionId != null
+            ? state.reusedProcess ? "same-process" : "cold"
+            : undefined,
         });
         return;
       }

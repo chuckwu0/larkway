@@ -20,7 +20,7 @@ import { join as pathJoin } from "node:path";
 import {
   resolveAgentSessionPath,
   resolveAgentWorkspaceSessionsDir,
-  resolveKnowledgeDir,
+  resolveSessionArchiveDir,
   resolveWorktreePath as pathsResolveWorktreePath,
   resolveWorktreesDir,
 } from "../config/paths.js";
@@ -68,6 +68,7 @@ export class Housekeeping {
    * Undefined = derive the default path from botId (existing behavior).
    */
   readonly #sessionsDir: string | undefined;
+  readonly #sharedKnowledge: boolean;
 
   /** thread_ids that have already received an idle-notify warn this session */
   readonly #notified = new Set<string>();
@@ -75,13 +76,14 @@ export class Housekeeping {
   #timer: ReturnType<typeof setInterval> | undefined;
 
   constructor(
-    deps: { sessionStore: SessionStore; botId?: string; runtime?: string; sessionsDir?: string },
+    deps: { sessionStore: SessionStore; botId?: string; runtime?: string; sessionsDir?: string; sharedKnowledge?: boolean },
     opts?: HousekeepingOptions,
   ) {
     this.#sessionStore = deps.sessionStore;
     this.#botId = deps.botId;
     this.#runtime = deps.runtime;
     this.#sessionsDir = deps.sessionsDir;
+    this.#sharedKnowledge = deps.sharedKnowledge === true;
     this.#scanIntervalMs = opts?.scanIntervalMs ?? DEFAULT_SCAN_INTERVAL_MS;
     this.#idleNotifyMs = opts?.idleNotifyMs ?? DEFAULT_IDLE_NOTIFY_MS;
     this.#idleCleanupMs = opts?.idleCleanupMs ?? DEFAULT_IDLE_CLEANUP_MS;
@@ -256,7 +258,7 @@ export class Housekeeping {
     dryRun: boolean,
   ): Promise<AgentSessionCleanupOutcome | void> {
     if (this.#runtime === "agent_workspace") {
-      return cleanupAgentSession(threadId, botId ?? this.#botId, dryRun, this.#sessionsDir);
+      return cleanupAgentSession(threadId, botId ?? this.#botId, dryRun, this.#sessionsDir, this.#sharedKnowledge);
     }
     return cleanupWorktree(threadId, botId, dryRun);
   }
@@ -656,6 +658,7 @@ export async function cleanupAgentSession(
   agentId: string | undefined,
   dryRun: boolean,
   sessionsDir?: string,
+  sharedKnowledge = false,
 ): Promise<AgentSessionCleanupOutcome> {
   if (!agentId) {
     console.error(
@@ -724,10 +727,10 @@ export async function cleanupAgentSession(
   // disaster case where every dir turns orphan at once. A harvest failure
   // SKIPS the removal: deleting unharvested raw material is the exact loss
   // this exists to prevent; the next scan retries both steps.
-  const knowledgeDir = resolveKnowledgeDir();
+  const knowledgeDir = resolveSessionArchiveDir(agentId, sharedKnowledge);
   let knowledgeGitReady = false;
   try {
-    knowledgeGitReady = (await ensureKnowledgeRepo(knowledgeDir)).gitReady;
+    if (sharedKnowledge && !dryRun) knowledgeGitReady = (await ensureKnowledgeRepo(knowledgeDir)).gitReady;
   } catch (err) {
     // Knowledge dir unusable (disk/permissions) — the harvest write below
     // will fail for the same reason and skip the removal, which is the

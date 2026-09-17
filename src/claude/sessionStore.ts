@@ -69,6 +69,8 @@ export interface SessionRecord {
    * written before this field existed (those pass the gate unchanged).
    */
   workspacePath?: string;
+  /** Backend that created sessionId. A backend change must start a new session. */
+  backend?: string;
   /**
    * v3 task-handle dispatch-time capture (docs/task-handle.md §5.2/§9.9
    * "dispatch 时捕获根消息文本"): the thread's ROOT message text, truncated
@@ -191,6 +193,8 @@ interface StoredRecord {
   createdTs: number;
   lastActiveTs: number;
   senderOpenId?: string;
+  workspacePath?: string;
+  backend?: string;
   rootText?: string;
   chatId?: string;
   chatType?: string;
@@ -453,6 +457,8 @@ export class SessionStore {
       createdTs: record.createdTs,
       lastActiveTs: record.lastActiveTs,
       ...(record.senderOpenId !== undefined ? { senderOpenId: record.senderOpenId } : {}),
+      ...(record.workspacePath !== undefined ? { workspacePath: record.workspacePath } : {}),
+      ...(record.backend !== undefined ? { backend: record.backend } : {}),
       ...(record.rootText !== undefined ? { rootText: record.rootText } : {}),
       ...(record.chatId !== undefined ? { chatId: record.chatId } : {}),
       ...(record.chatType !== undefined ? { chatType: record.chatType } : {}),
@@ -632,6 +638,8 @@ function isStoredRecord(value: unknown): value is StoredRecord {
     typeof v["createdTs"] === "number" &&
     typeof v["lastActiveTs"] === "number" &&
     (v["senderOpenId"] === undefined || typeof v["senderOpenId"] === "string") &&
+    (v["workspacePath"] === undefined || typeof v["workspacePath"] === "string") &&
+    (v["backend"] === undefined || typeof v["backend"] === "string") &&
     (v["rootText"] === undefined || typeof v["rootText"] === "string") &&
     (v["chatId"] === undefined || typeof v["chatId"] === "string") &&
     (v["chatType"] === undefined || typeof v["chatType"] === "string") &&

@@ -2,6 +2,8 @@
 
 > 批G/H P1 引入。一句话:**长期记忆的所有权单位从 per-agent 筒仓改为 host 级共享 git 库**;对话轮零整理义务,蒸馏由「保养轮」统一做,一切变更机械可见。
 
+> 当前这是显式开启的组织能力：bot 配置 `sharedKnowledge: true` 才初始化并注入共享库指针、提交共享变更及向这里归档。默认 Agent 沿用原生 workspace，回收档案留在 `agents/<id>/runtime/archive/`。以下组织协作规则由启用者维护，不是所有 Agent 的默认行为要求。参见 [原生 runtime 对齐](native-runtime.md)。
+
 ## 为什么(设计依据)
 
 真实部署审计发现:凡是「期待对话 agent 自觉维护」的记忆文件全是死管道(候选文件 6/6 从未被写过);而唯一活着的记忆全是**组织事实**(平台坑、协作纪律),却被复制进多个 agent 的私有目录,漂移出互相矛盾的副本。业界同结论:Letta 把记忆写权从对话 agent 拿走单设 sleep-time agent;Codex memories 是离线批处理管道。详见设计原则:机械优先于劝导;一处真相,机械投影。
@@ -9,7 +11,7 @@
 ## 结构
 
 ```
-<LARKWAY_HOME>/knowledge/          ← git repo(bridge 首次启动自动 init;可自行加 private remote 跨机同步)
+<LARKWAY_HOME>/knowledge/          ← git repo(显式开启共享后初始化;可自行加 private remote 跨机同步)
   README.md                        ← 写入契约(owner 可改;仅缺失时播种)
   MAINTENANCE.md                   ← 保养轮流程(同上)
   inbox/inbox.md                   ← 速记队列:对话轮唯一写入原语
@@ -29,7 +31,7 @@
 
 ## Prompt 侧(bridge 注入什么)
 
-- 全量 prompt 的 `<agent-workspace>` 块带:知识库路径指针、inbox 速记契约、取信优先级(owner L2 > topics/ > session summary)、`<org-knowledge-map>`(机械生成的清单:主题文件+首标题、inbox 待处理行数、原料量;硬帽 ~2.5k 字符)。
+- 全量 prompt 的 `<agent-workspace>` 块带知识库路径指针和 `<org-knowledge-map>`(机械生成的清单:主题文件+首标题、inbox 待处理行数、原料量;硬帽 ~2.5k 字符)。速记与取信政策留在知识库自己的文件中。
 - **正文永不注入**——agent 按需 `rg`/Read topics/(R5 注入纪律;防 prompt 膨胀与自激励回写)。
 - delta 续轮不带以上任何内容(批E 瘦身不回退)。
 
@@ -44,7 +46,7 @@
 
 - 流程全文在知识库自己的 `MAINTENANCE.md`(owner 可改),要点:增量水位、Mem0 式四选一裁决、supersede-not-delete、时间锚 `[rec:YYYY-MM-DD]`、来源可核、矛盾报告 owner。
 - **触发是外部真实消息**:owner 对任一 bot 说「执行记忆保养」;想定时,用飞书自带的定时消息每周日发到 bot 单聊(真实消息 = 天然合法回复锚点)。bridge 不起定时器(定时器产品化是 P2,须先证明保养轮有真产出)。
-- 护栏全机械:turn 前 snapshot commit(保养前状态永远可回退)、turn 后 diffstat 卡片(执行者自述只是注释)、grounding 由 MAINTENANCE.md 强制(核不到来源不进正文)。
+- 变更记录:turn 后 commit 和 diffstat 卡片(执行者自述只是注释)；bridge 不做 turn 前 snapshot commit，以免收编并发任务的中间写入。grounding 规则由启用者的 MAINTENANCE.md 定义。
 
 ## 合规度量(原则 6:新机制自带死亡检测)
 

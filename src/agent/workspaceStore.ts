@@ -31,6 +31,21 @@ export interface EnsureAgentWorkspaceInput {
   permissionRequests?: WorkspacePermissionItem[];
   permissionGrants?: WorkspacePermissionItem[];
   humanGates?: string[];
+  /** Previous saved definition, used only to safely adopt unmarked legacy sections. */
+  previousDefinition?: WorkspaceAgentDefinition;
+}
+
+export interface WorkspaceAgentDefinition {
+  name: string;
+  description: string;
+  taskDescription?: string;
+  agentMemory?: string;
+  repos?: WorkspaceRepoPointer[];
+}
+
+export interface WorkspaceProjectionResult {
+  /** Human-authored or ambiguous legacy sections left unchanged; surface this to the editor. */
+  preservedSections: string[];
 }
 
 export type WorkspacePermissionBot = Pick<
@@ -99,13 +114,9 @@ async function readTextIfExists(filePath: string): Promise<string | undefined> {
 
 function renderAgentsMd(input: EnsureAgentWorkspaceInput): string {
   return [
-    `# ${input.bot.name}`,
+    renderManagedBlock("identity", renderIdentity(input.bot)),
     "",
-    input.bot.description,
-    "",
-    "## Primary Task",
-    "",
-    input.taskDescription?.trim() || input.bot.description,
+    renderManagedBlock("primary-task", renderPrimaryTask(input)),
     "",
     "## Workspace Contract",
     "",
@@ -115,12 +126,6 @@ function renderAgentsMd(input: EnsureAgentWorkspaceInput): string {
     "- Larkway is a thin Feishu bridge. It passes scene/context pointers; you decide what to inspect and what work to do.",
     "- Each Feishu topic is one task session under `sessions/<thread_id>/`.",
     "- Keep durable notes, repo clones, session summaries, and permission decisions inside this workspace.",
-    "- Write the per-session state file path provided by the prompt before ending a turn so the Feishu card can finalize.",
-    "- Read `permissions-request.md` and `permissions-granted.md` before write/deploy/external-message work.",
-    // 批G G7 (P1): the DEFAULT non-owner knowledge policy. Deliberately a
-    // template line (owner-editable), NOT bridge code — the bridge only
-    // injects the `sender_is_owner` fact; what to do with it is policy.
-    "- 长期知识纪律:每轮 prompt 带有 `sender_is_owner` 事实。owner 的指示可进组织知识库 inbox;非 owner 提供的新知识只写进本 session 的 summary.md 并标注 `[未经 owner 确认]`,由保养轮决定是否晋升 —— 不直接写 AGENTS.md、L2 或知识库。",
     "",
     "## Role Notes",
     "",
@@ -130,25 +135,42 @@ function renderAgentsMd(input: EnsureAgentWorkspaceInput): string {
     // copies on every save).
     ROLE_NOTES_START,
     "",
-    input.agentMemory?.trim() || "No extra role notes have been configured yet.",
+    cleanManagedContent(input.agentMemory?.trim() || "No extra role notes have been configured yet."),
     "",
     ROLE_NOTES_END,
     "",
-    "## Repos",
-    "",
-    ...(input.repos && input.repos.length > 0
-      ? input.repos.map((repo) => {
-          const parts = [
-            `- ${repo.slug}`,
-            `suggested_path=${repo.suggestedPath}`,
-            `branch=${repo.branch ?? "master"}`,
-          ];
-          if (repo.url) parts.push(`url=${sanitizeRepoUrl(repo.url)}`);
-          return parts.join(" ");
-        })
-      : ["- No repo pointers have been configured yet."]),
+    renderManagedBlock("repos", renderRepos(input.repos)),
     "",
   ].join("\n");
+}
+
+/** Managed inputs cannot create or close a different ownership boundary. */
+function cleanManagedContent(content: string): string {
+  return content.split(/\r?\n/).filter((line) => !line.includes("<!-- larkway:")).join("\n");
+}
+
+function renderManagedBlock(section: string, body: string): string {
+  return `<!-- larkway:${section}:start -->\n${cleanManagedContent(body)}\n<!-- larkway:${section}:end -->`;
+}
+
+function renderIdentity(definition: Pick<WorkspaceAgentDefinition, "name" | "description">): string {
+  return `# ${definition.name}\n\n${definition.description}`;
+}
+
+function renderPrimaryTask(input: Pick<EnsureAgentWorkspaceInput, "bot" | "taskDescription">): string {
+  return `## Primary Task\n\n${input.taskDescription?.trim() || input.bot.description}`;
+}
+
+function renderRepos(repos?: WorkspaceRepoPointer[]): string {
+  return ["## Repos", "", ...(repos?.length ? repos.map((repo) => {
+    const parts = [
+      `- ${repo.slug}`,
+      `suggested_path=${repo.suggestedPath}`,
+      `branch=${repo.branch ?? "master"}`,
+    ];
+    if (repo.url) parts.push(`url=${sanitizeRepoUrl(repo.url)}`);
+    return parts.join(" ");
+  }) : ["- No repo pointers have been configured yet."])].join("\n");
 }
 
 function renderPermissionsRequest(input: EnsureAgentWorkspaceInput): string {
@@ -279,30 +301,84 @@ function extractCreationTaskDescription(text: string | undefined): string | unde
   return value || undefined;
 }
 
-/**
- * 批G G4: surgically project the bot's L2 memory into AGENTS.md's
- * `## Role Notes` section — replacing ONLY that section's body, never the
- * rest of the file (the previous full-template re-render wiped out anything
- * the agent had legitimately promoted into AGENTS.md per its own docs). This
- * is THE single projection path every L2 write route (CLI `larkway memory
- * set/edit`, Web PUT /api/memory/:id, onboarding) must converge on.
- *
- * Also performs a one-shot legacy migration in passing: drops the retired
- * "开场不可跳过:…先 Read `memory/index.md`…" ritual line if the file still
- * carries it (批E E4 removed its prompt twin; the template no longer emits it).
- *
- * Returns "projected" when AGENTS.md was updated, "skipped" when the file
- * doesn't exist (workspace never ensured — caller decides whether to run the
- * full ensureAgentWorkspace instead). Never throws on content issues; IO
- * errors propagate to the caller.
- */
+/** Compatibility edit source; the runtime reads the resulting AGENTS.md once. */
 export const ROLE_NOTES_START = "<!-- larkway:role-notes:start (bridge-projected from bots/<id>.memory.md — edit THAT file, not this section) -->";
 export const ROLE_NOTES_END = "<!-- larkway:role-notes:end -->";
+
+const RETIRED_CONTRACT_LINES = new Set([
+  "- Write the per-session state file path provided by the prompt before ending a turn so the Feishu card can finalize.",
+  "- Read `permissions-request.md` and `permissions-granted.md` before write/deploy/external-message work.",
+  "- 长期知识纪律:每轮 prompt 带有 `sender_is_owner` 事实。owner 的指示可进组织知识库 inbox;非 owner 提供的新知识只写进本 session 的 summary.md 并标注 `[未经 owner 确认]`,由保养轮决定是否晋升 —— 不直接写 AGENTS.md、L2 或知识库。",
+]);
+
+function removeRetiredContractLines(content: string): string {
+  return content.split(/\r?\n/).filter((line) =>
+    !RETIRED_CONTRACT_LINES.has(line) &&
+    !(line.includes("开场不可跳过") && line.includes("memory/index.md")),
+  ).join("\n");
+}
+
+interface SectionProjection {
+  content: string;
+  preserved: boolean;
+}
+
+/** Never consume text past an ambiguous/malformed ownership marker. */
+function replaceMarkedSection(content: string, section: string, replacement: string): SectionProjection | undefined {
+  const lines = content.split(/\r?\n/);
+  const starts = lines.flatMap((line, i) => line.trim().startsWith(`<!-- larkway:${section}:start`) ? [i] : []);
+  const ends = lines.flatMap((line, i) => line.trim() === `<!-- larkway:${section}:end -->` ? [i] : []);
+  if (starts.length === 0 && ends.length === 0) return undefined;
+  if (starts.length !== 1 || ends.length !== 1 || starts[0]! >= ends[0]!) {
+    return { content, preserved: true };
+  }
+  return {
+    content: [...lines.slice(0, starts[0]), replacement, ...lines.slice(ends[0]! + 1)].join("\n"),
+    preserved: false,
+  };
+}
+
+function projectRoleNotesContent(current: string, agentMemory: string | undefined, previousAgentMemory?: string): SectionProjection {
+  const body = cleanManagedContent(agentMemory?.trim() || "No extra role notes have been configured yet.");
+  const section = [ROLE_NOTES_START, "", body, "", ROLE_NOTES_END].join("\n");
+  const marked = replaceMarkedSection(current, "role-notes", section);
+  if (marked) return marked;
+
+  const lines = current.split(/\r?\n/);
+  const start = lines.findIndex((line) => line.trim() === "## Role Notes");
+  if (start === -1) {
+    return { content: `${current.trimEnd()}\n\n## Role Notes\n\n${section}\n`, preserved: false };
+  }
+  // Legacy L2 may contain headings itself. Only adopt the exact previously
+  // saved body; a missing Repos boundary or manual addition stays untouched.
+  let end = lines.findIndex((line, i) => i > start && line.trim() === "## Repos");
+  if (end === -1) end = lines.length;
+  const previous = previousAgentMemory === undefined
+    ? body
+    : previousAgentMemory.trim() || "No extra role notes have been configured yet.";
+  if (lines.slice(start + 1, end).join("\n").trim() !== previous) {
+    return { content: current, preserved: true };
+  }
+  return {
+    content: [...lines.slice(0, start + 1), "", section, "", ...lines.slice(end)].join("\n"),
+    preserved: false,
+  };
+}
+
+function warnPreservedSections(workspacePath: string, sections: string[]): void {
+  if (sections.length === 0) return;
+  console.warn(
+    `[workspace] ${path.join(workspacePath, "AGENTS.md")}: preserved unmarked or ambiguous sections ` +
+      `(${sections.join(", ")}); these definition changes were NOT synchronized. ` +
+      "Review the existing content and merge the saved definition manually.",
+  );
+}
 
 export async function projectRoleNotes(
   workspacePath: string,
   agentMemory: string | undefined,
-): Promise<"projected" | "skipped"> {
+  previousAgentMemory?: string,
+): Promise<"projected" | "skipped" | "preserved"> {
   const agentsPath = path.join(workspacePath, "AGENTS.md");
   let current: string;
   try {
@@ -311,48 +387,64 @@ export async function projectRoleNotes(
     return "skipped";
   }
 
-  const lines = current.split(/\r?\n/).filter(
-    (line) => !line.includes("开场不可跳过") || !line.includes("memory/index.md"),
-  );
-  // The body must never be able to smuggle in an END sentinel — the section
-  // boundary is a hard invariant, not a convention.
-  const body = (agentMemory?.trim() || "No extra role notes have been configured yet.")
-    .split(/\r?\n/)
-    .filter((line) => !line.includes("larkway:role-notes:"))
-    .join("\n");
-  const section = [ROLE_NOTES_START, "", body, "", ROLE_NOTES_END];
-
-  // Preferred path: sentinel-delimited replacement — immune to "## " headings
-  // inside the projected body (adversarial-review blocker: a heading-boundary
-  // scan turned every save into one more stale, contradictory copy).
-  const startIdx = lines.findIndex((line) => line.trim().startsWith("<!-- larkway:role-notes:start"));
-  const endIdx = lines.findIndex((line) => line.trim() === ROLE_NOTES_END);
-  let next: string[];
-  if (startIdx !== -1 && endIdx > startIdx) {
-    next = [...lines.slice(0, startIdx), ...section, ...lines.slice(endIdx + 1)];
-  } else {
-    // Legacy file without sentinels: replace from the Role Notes heading up
-    // to the next heading THE TEMPLATE ITSELF emits ("## Repos") — never an
-    // arbitrary "## " line, which may belong to the previously projected L2
-    // body — installing sentinels for every future save. EOF fallback covers
-    // files whose Repos section was removed by hand.
-    const heading = "## Role Notes";
-    const start = lines.findIndex((line) => line.trim() === heading);
-    if (start === -1) {
-      next = [...lines, "", heading, "", ...section, ""];
-    } else {
-      let end = lines.length;
-      for (let i = start + 1; i < lines.length; i++) {
-        if (lines[i]!.trim() === "## Repos") {
-          end = i;
-          break;
-        }
-      }
-      next = [...lines.slice(0, start + 1), "", ...section, "", ...lines.slice(end)];
-    }
+  const result = projectRoleNotesContent(removeRetiredContractLines(current), agentMemory, previousAgentMemory);
+  if (result.preserved) {
+    warnPreservedSections(workspacePath, ["role-notes"]);
+    return "preserved";
   }
-  await fs.writeFile(agentsPath, next.join("\n"), "utf8");
+  if (result.content !== current) await fs.writeFile(agentsPath, result.content, "utf8");
   return "projected";
+}
+
+function projectDefinitionSection(
+  content: string,
+  section: "identity" | "primary-task" | "repos",
+  body: string,
+  previousBody: string,
+): SectionProjection {
+  const replacement = renderManagedBlock(section, body);
+  const marked = replaceMarkedSection(content, section, replacement);
+  if (marked) return marked;
+  const lines = content.split(/\r?\n/);
+  const heading = section === "identity" ? undefined : section === "primary-task" ? "## Primary Task" : "## Repos";
+  const start = heading ? lines.findIndex((line) => line.trim() === heading) : 0;
+  if (start < 0) return { content, preserved: true };
+  let end = lines.findIndex((line, i) => i > start && line.startsWith("## "));
+  if (end === -1) end = lines.length;
+  // Without ownership markers, matching the old saved definition is the only
+  // evidence that we may replace this text. Preserve custom headings/notes.
+  if (lines.slice(start, end).join("\n").trim() !== previousBody.trim()) {
+    return { content, preserved: true };
+  }
+  return {
+    content: [...lines.slice(0, start), replacement, "", ...lines.slice(end)].join("\n"),
+    preserved: false,
+  };
+}
+
+function projectAgentDefinition(current: string, input: EnsureAgentWorkspaceInput): { content: string } & WorkspaceProjectionResult {
+  const previous = input.previousDefinition ?? {
+    name: input.bot.name, description: input.bot.description,
+    taskDescription: input.taskDescription, agentMemory: input.agentMemory, repos: input.repos,
+  };
+  let content = removeRetiredContractLines(current);
+  const preservedSections: string[] = [];
+  const role = projectRoleNotesContent(content, input.agentMemory, previous.agentMemory ?? "");
+  content = role.content;
+  if (role.preserved) preservedSections.push("role-notes");
+  // Adopt earlier unmarked sections before adding a marker at their next
+  // heading. Otherwise that new marker becomes part of the legacy body.
+  const sections = [
+    ["identity", renderIdentity(input.bot), renderIdentity(previous)],
+    ["primary-task", renderPrimaryTask(input), renderPrimaryTask({ bot: previous, taskDescription: previous.taskDescription })],
+    ["repos", renderRepos(input.repos), renderRepos(previous.repos)],
+  ] as const;
+  for (const [section, body, previousBody] of sections) {
+    const projected = projectDefinitionSection(content, section, body, previousBody);
+    content = projected.content;
+    if (projected.preserved) preservedSections.push(section);
+  }
+  return { content, preservedSections };
 }
 
 function extractMarkdownSectionText(text: string | undefined, heading: string): string | undefined {
@@ -362,7 +454,7 @@ function extractMarkdownSectionText(text: string | undefined, heading: string): 
   if (start === -1) return undefined;
   const collected: string[] = [];
   for (const line of lines.slice(start + 1)) {
-    if (line.startsWith("## ")) break;
+    if (line.startsWith("## ") || line.trim().startsWith("<!-- larkway:")) break;
     if (line.trim() === "") {
       if (collected.length === 0) continue;
       break;
@@ -561,7 +653,7 @@ export async function resetAgentWorkspacePermissions(input: {
 
 export async function ensureAgentWorkspace(
   input: EnsureAgentWorkspaceInput,
-): Promise<void> {
+): Promise<WorkspaceProjectionResult> {
   await fs.mkdir(input.workspacePath, { recursive: true });
   await fs.mkdir(input.reposPath, { recursive: true });
   if (input.sessionPath) {
@@ -569,13 +661,8 @@ export async function ensureAgentWorkspace(
   }
   const writeFacts = input.refreshFacts ? writeAlways : writeIfMissing;
 
-  // 批G G4 (adversarial-review fix): refreshFacts must NEVER full-rewrite an
-  // EXISTING AGENTS.md — that wiped every section the agent had legitimately
-  // promoted into it (the exact bug projectRoleNotes exists to fix, which
-  // the Web putBot path was still triggering). Existing file → surgical Role
-  // Notes projection only; the template render is reserved for first
-  // creation. Trade-off accepted: the informational Repos section can go
-  // stale after a config change (live repo pointers ride every prompt).
+  // Config saves update only explicitly owned sections. A pre-marker legacy
+  // section is adopted only when it matches the previous saved definition.
   const agentsPath = path.join(input.workspacePath, "AGENTS.md");
   let agentsMdExists = true;
   try {
@@ -583,8 +670,13 @@ export async function ensureAgentWorkspace(
   } catch {
     agentsMdExists = false;
   }
+  let preservedSections: string[] = [];
   if (agentsMdExists && input.refreshFacts) {
-    await projectRoleNotes(input.workspacePath, input.agentMemory);
+    const current = await fs.readFile(agentsPath, "utf8");
+    const projected = projectAgentDefinition(current, input);
+    preservedSections = projected.preservedSections;
+    if (projected.content !== current) await fs.writeFile(agentsPath, projected.content, "utf8");
+    warnPreservedSections(input.workspacePath, preservedSections);
   } else {
     await writeIfMissing(agentsPath, renderAgentsMd(input));
   }
@@ -599,6 +691,7 @@ export async function ensureAgentWorkspace(
   );
   await ensureMemoryScaffold(input.workspacePath);
   await ensureSkillsScaffold(input.workspacePath);
+  return { preservedSections };
 }
 
 /**
@@ -624,21 +717,16 @@ async function ensureSkillsScaffold(workspacePath: string): Promise<void> {
   await ensureRelativeSymlink(linkPath, path.join("..", ".agents", "skills"));
 }
 
-// 批G P1 (R1/R2): the six-category per-agent scaffold is retired for NEW
-// workspaces. The audit showed the categories were a dead pipeline (45 files,
-// 5 with content — all six drifting copies of ORGANIZATION facts), so shared
-// knowledge now lives in the host-level knowledge repo (src/knowledge/store.ts)
-// and per-agent memory keeps only identity/preferences. Existing workspaces
-// are untouched here (their stock is a one-time owner cleanup, G0); every
-// path below is writeIfMissing / mkdir-recursive, so re-running on an old
-// workspace changes nothing.
+// Memory belongs to the native workspace by default. Shared organization
+// knowledge is an explicit opt-in, not a policy embedded in every scaffold.
+// Existing memory files remain owner-managed: only create missing files.
 
 function renderMemoryReadme(): string {
   return [
-    "# 本 agent 的私有记忆(仅身份与偏好)",
+    "# 本 agent 的 workspace 私有记忆",
     "",
-    "- 跨 agent 复用的知识**不放这里** —— 组织知识库(`<LARKWAY_HOME>/knowledge/`,git 版本化)才是长期记忆的家;",
-    "  对话轮往 `knowledge/inbox/inbox.md` 追加一行速记即可,蒸馏/分类由保养轮统一做。",
+    "- 长期笔记与偏好默认保存在当前 workspace,由本 agent 的原生指南决定如何整理。",
+    "- 跨 Agent 共享须由维护者显式配置 `sharedKnowledge: true` 并说明共享范围;默认不写入组织知识库。",
     "- `preferences.md` — owner 对**这个 agent** 的长期偏好(汇报格式、默认语言、验证偏好等)。",
     "- `assets/` — 本 agent 长期图片/附件实体;`archive/` — 失效条目的留档。",
     "",
@@ -650,7 +738,7 @@ function renderPreferencesSkeleton(): string {
     "# Owner Preferences",
     "",
     "owner 对这个 agent 的长期偏好(汇报格式、默认语言、验证偏好等)。",
-    "写前先读本文件;有相同/相关条目就不重复写;组织级知识请走知识库 inbox,不写这里。",
+    "这些偏好默认属于当前 workspace。跨 Agent 共享须由维护者显式配置并说明共享范围。",
     "",
   ].join("\n");
 }

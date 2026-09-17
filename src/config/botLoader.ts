@@ -279,14 +279,9 @@ export const BotConfigSchema = z.object({
   lark_cli_profile: z.string().min(1).optional(),
 
   /**
-   * BL-50: per-bot lark-cli identity isolation. When true, every lark-cli
-   * invocation for this bot (agent subprocess, gap-fill, roster, health scan)
-   * runs with LARKSUITE_CLI_CONFIG_DIR pointed at ~/.larkway/<botId>/lark-cli/
-   * — a private config dir holding ONLY this bot's app profile. The
-   * maintainer's personal lark-cli login (calendar/mail/drive access) in the
-   * shared global dir becomes invisible to this bot's agent ("bot-only" by
-   * default; grant user identity by running `lark-cli auth login` with the
-   * same LARKSUITE_CLI_CONFIG_DIR). Default false = shared dir (pre-BL-50).
+   * Per-bot lark-cli profile directory. Effective default true; explicitly
+   * false preserves the legacy shared host directory. This scopes CLI
+   * credentials, not OS file access. Profiles contain this bot's app identity.
    */
   lark_cli_isolated: z.boolean().optional(),
 
@@ -309,13 +304,9 @@ export const BotConfigSchema = z.object({
   gitlab_token_env: z.string().min(1).optional(),  // compat alias (legacy)
 
   /**
-   * L2 Agent Memory (职能定义) — filename relative to the bots/ directory,
-   * pointing at this bot's `*.memory.md`. Loaded at startup and injected into
-   * the prompt as a `<agent-memory>` role preamble (V2 only). Defines WHO the
-   * agent is / whom to @ / its don'ts — NOT the project workflow (that lives in
-   * the business repo's agent docs / skills (AGENTS.md, CLAUDE.md,
-   * `.agents/skills`, `.claude/skills`).
-   * See docs/product-v2.md §Agent 两根支柱.
+   * Compatibility editing source, relative to bots/. Managed workspaces
+   * project it into AGENTS.md; only legacy runtime injects it into prompts.
+   * BYO workspaces own their native definition and do not load this file.
    */
   memory_file: z.string().min(1).optional(),
 
@@ -502,11 +493,14 @@ export const BotConfigSchema = z.object({
    * static block (state contract, L2 memory, workspace block, peers) that is
    * already in the resumed session history from the thread's first turn.
    * Measured on a real bot config: continuation prompt ~11.7k → ~2k chars.
-   * Omitted = "full" (byte-identical prompts to before this field existed).
+   * Omitted = "delta" for agent_workspace, "full" for legacy runtime.
    * `.optional()` (not `.default()`) deliberately — same strict-schema
    * backward-compat reasoning as `warmProcess` below.
    */
   promptMode: z.enum(["full", "delta"]).optional(),
+
+  /** Opt in to host-wide organization knowledge; ordinary agents use their native workspace. */
+  sharedKnowledge: z.boolean().optional(),
 
   /**
    * 批F (F1) — p2p sticky sessions. When true, every PURE top-level message
@@ -528,7 +522,7 @@ export const BotConfigSchema = z.object({
    * turns on one backend session, the next turn starts a FRESH backend
    * session seeded with summary.md + the transcript tail (session record and
    * directory continue in place) — bounding the "resume 无压缩,话题越滚越慢"
-   * growth. 0 disables. Omitted = 60 (handler DEFAULT_SESSION_RESEED_TURNS).
+   * growth. 0 disables. Omitted = 0: retain native session and its compaction policy.
    */
   sessionReseedTurns: z.number().int().nonnegative().optional(),
 
@@ -537,7 +531,7 @@ export const BotConfigSchema = z.object({
    * its next message (fresh backend session + seed; same mechanism as
    * sessionReseedTurns). Only sticky sessions have an idle trigger — topic
    * sessions resuming days later with full context is a feature. 0 disables.
-   * Omitted = 12h (handler DEFAULT_P2P_STICKY_IDLE_MS).
+   * Omitted = 0: idle time alone does not discard a native conversation.
    */
   p2pStickyIdleMs: z.number().int().nonnegative().optional(),
 
@@ -548,7 +542,7 @@ export const BotConfigSchema = z.object({
    * replayed history aren't counted). Fires the same seeded fresh start as
    * sessionReseedTurns; whichever trips first wins. A turn-count alone misses
    * the "few turns, huge tool outputs" session shape. 0 disables. Omitted =
-   * 300k (handler DEFAULT_SESSION_RESEED_CHARS).
+   * 0: this historical traffic estimate is not native context usage.
    */
   sessionReseedChars: z.number().int().nonnegative().optional(),
 
@@ -805,6 +799,8 @@ export async function loadBotsDetailed(botsDir: string): Promise<LoadBotsResult>
       );
     }
 
+    // BYO workspaces own their native definition; a legacy memory_file reference
+    // is retained for compatibility but never loaded or required in BYO mode.
     // L2 Agent Memory: load memory_file content (relative to botsDir) so the
     // bridge can inject it as the agent's role preamble. Missing file is fatal
     // — a memory_file pointing nowhere is a config error worth failing loud.
@@ -812,7 +808,7 @@ export async function loadBotsDetailed(botsDir: string): Promise<LoadBotsResult>
     // re-read the file per turn ("下一次全量渲染即新鲜") — editing L2 no
     // longer requires a bridge restart; this boot-time content remains the
     // fallback when a live read fails mid-flight.
-    if (bot.memory_file) {
+    if (bot.memory_file && !bot.workspace) {
       const memoryPath = path.join(botsDir, bot.memory_file);
       try {
         bot.agent_memory = await readFile(memoryPath, "utf-8");

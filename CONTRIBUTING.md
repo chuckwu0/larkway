@@ -27,6 +27,9 @@ readiness gate (`pnpm test:v0.3`) is also safe to run without live Feishu
 credentials; it combines local checks and synthetic smoke fixtures. Real Feishu
 E2E smoke testing is maintainer-only and requires a separately approved test
 environment; see [docs/phase0-readiness.md](docs/phase0-readiness.md).
+For real runtime comparisons and multi-turn checks, follow
+[docs/runtime-validation.md](docs/runtime-validation.md). These are opt-in
+validation runs, not additions to the automated unit-test command.
 
 ## Merging PRs (maintainers)
 
@@ -44,6 +47,14 @@ A PR needs two reviews before merge, and they answer different questions:
      each need a presentation, not one eternal button.
    - Operations with side effects on running work (restarts, updates, kills)
      must say so before the user confirms.
+   - Agent configuration changes must survive reload and reach the native
+     definition. Verify managed-file ownership warnings and BYO directories,
+     not just the HTTP response. A BYO configuration operation must not write
+     generated definitions or permission settings into the user's directory.
+   - Runtime changes need evidence at the layer they affect: a parser fixture
+     cannot prove Feishu delivery, and a short conversation cannot prove
+     long-context or approval behavior. Record unresolved differences rather
+     than treating them as native equivalence.
 
 Code review alone is not enough — a PR can be clean, secure, principled, and
 still not work as a product. When product intent is unclear, ask before
@@ -129,22 +140,42 @@ Key fields your runner will receive:
 
 | Field | Type | Notes |
 |---|---|---|
-| `prompt` | `string` | Full prompt text for this turn |
-| `resumeSessionId` | `string \| undefined` | Non-null on every turn after the first |
+| `prompt` | `string` | Submitted text for this turn: full contract or continuation delta |
+| `resumeSessionId` | `string \| undefined` | Native session to resume; omitted for a fresh or explicitly reset session |
 | `permissionMode` | `"acceptEdits" \| "ask" \| "bypassPermissions"` | How aggressively the agent may edit files |
 | `cwd` | `string \| undefined` | Working directory (pass to spawn as `cwd` option) |
 | `timeoutMs` | `number` | Hard wall-clock limit (default 15 min) |
 | `abortSignal` | `AbortSignal \| undefined` | Honour for early cancellation |
 | `botGitIdentity` | `{ name, email } \| undefined` | Set `GIT_AUTHOR_*` / `GIT_COMMITTER_*` env vars |
 | `gitlabToken` | `string \| undefined` | Inject as `GITLAB_TOKEN` into the subprocess |
+| `model` / `effort` | `string \| undefined` | Optional runtime overrides; omission preserves host defaults |
+| `larkCliConfigDir` | `string \| undefined` | Per-agent CLI credential directory; not an OS sandbox |
+| `pidFilePath` | `string \| null \| undefined` | Explicit PID hint path; `null` prevents cwd PID writes |
+
+`prompt` is the submitted text for this turn: managed workspaces normally use
+a full first-turn contract and a delta on continuation. It is not the native
+runtime's full context, system instructions, or token count. The complete type
+in `src/agent/runner.ts` is authoritative.
+
+Permission names are translated per backend. Codex maps both `acceptEdits` and
+`bypassPermissions` to `danger-full-access`; `acceptEdits` is not a tighter
+Codex sandbox. Its `ask` mapping is read-only with on-request approval, but the
+complete Feishu approval/user-input round trip is not implemented. Do not infer
+that capability from a configuration enum or a custom choice card.
 
 ### RunHandle
 
 ```ts
 export interface RunHandle {
   events: AsyncIterable<AgentStreamEvent>;
-  done: Promise<{ exitCode: number; sessionId?: string }>;
+  done: Promise<{
+    exitCode: number;
+    sessionId?: string;
+    pooled?: boolean;
+    resumeMode?: "same-process" | "cold";
+  }>;
   kill(): void;
+  pid?: number;
 }
 ```
 
@@ -152,10 +183,15 @@ export interface RunHandle {
   subprocess stdout. The bridge uses `system_init` to capture the session ID,
   treats raw backend prose as `internal_text`, and renders only the explicit
   answer channel (`answer_delta` / `answer_snapshot`).
-- `done` — resolves (or rejects on non-zero exit) once the subprocess has fully
-  finished. **Must always settle** — use a total-timeout fallback if the
-  subprocess may hold stdout open after exit.
-- `kill()` — SIGTERM the subprocess; SIGKILL after a grace period.
+- `done` — settles when this turn finishes, returning its exit status or
+  rejecting on a runner failure. **Must always settle**; pooled children may
+  remain alive. `pooled` alone does not prove a warm continuation: use
+  `resumeMode`, where a resumed session loaded into a new child is `cold`.
+- `kill()` — cancels this run. One-shot runners terminate their subprocess;
+  the Codex pool interrupts the selected turn without killing other threads
+  sharing its app-server process.
+- `pid` — optional process evidence; a PID hint is not a filesystem or
+  permission boundary.
 
 ### AgentStreamEvent union
 
@@ -167,6 +203,8 @@ export type AgentStreamEvent =
   | { type: "answer_snapshot"; text: string; raw: unknown; seq?: number }
   /** @deprecated Treat as internal; UI surfaces must not render it. */
   | { type: "text_delta"; text: string; raw: unknown }
+  | { type: "thinking_delta"; text: string; raw: unknown }
+  | { type: "thinking_snapshot"; text: string; raw: unknown }
   | { type: "tool_use"; toolName: string; toolInput: unknown; raw: unknown }
   | { type: "tool_result"; raw: unknown }
   | { type: "result"; stopReason: string; raw: unknown }
@@ -190,21 +228,29 @@ registerRunner("mybackend", () => new MyRunner());
 ```
 
 The string key is how users select the backend in their bot config
-(`agent_backend: mybackend`).
+(`backend: mybackend`).
 
 ### Existing implementations as reference
 
 | File | Backend | CLI spawned |
 |---|---|---|
 | `src/claude/runner.ts` | `"claude"` | `claude --output-format stream-json` |
-| `src/codex/runner.ts` | `"codex"` | `codex exec --json` |
+| `src/codex/runner.ts` | `"codex"` | `codex app-server --stdio` |
 
 `ClaudeRunner` is the canonical reference — it handles session resume,
 SIGTERM/SIGKILL cleanup, the `AbortController`-based readline drain, and the
 total-timeout fallback. Read it before writing a new runner.
 
-`CodexRunner` shows how to adapt a different NDJSON schema (Codex emits
-`thread.started` / `item.completed` / `turn.completed` instead of Claude's
-`system` / `assistant` / `result`) to the same `AgentStreamEvent` union. The
-`parseCodexLine()` function in that file is a good template for a new
-line-level parser.
+`CodexRunner` initializes a JSON-RPC app-server connection, starts or resumes a
+native thread, then submits each prompt through `turn/start`.
+`CodexAppServerLineParser` adapts notifications such as `thread/started`,
+`item/agentMessage/delta`, `item/completed` and `turn/completed` to the normalized
+events. Native `phase: final_answer` is the answer-channel authority; phase-less
+older messages retain marker compatibility. The legacy `parseCodexLine()` helper
+is not the live app-server path.
+
+When pooling is enabled, `src/claude/pool.ts` maintains Claude stream-json
+processes per thread; `src/codex/pool.ts` multiplexes native threads through a
+per-bot app-server. Read those implementations before changing resume,
+cancellation or telemetry. Current defaults and remaining interaction gaps are
+documented in [native runtime alignment](docs/native-runtime.md).

@@ -237,7 +237,19 @@ describe("ClaudeProcessPool — spawn-once/reuse per thread key", () => {
     child.stdout.write(resultLine("success") + "\n");
     await flush();
     const result = await handle.done;
-    expect(result.resumeMode).toBe("same-process");
+    expect(result.resumeMode).toBe("cold");
+
+    const next = pool.run({
+      prompt: "continue again",
+      cwd: "/wt/thread-1",
+      threadId: "thread-1",
+      resumeSessionId: "prior-session",
+    });
+    await flush();
+    expect(next.pid).toBe(child.pid);
+    expect(spawnedChildren).toHaveLength(1);
+    child.stdout.write(resultLine("success") + "\n");
+    expect((await next.done).resumeMode).toBe("same-process");
   });
 });
 
@@ -246,6 +258,64 @@ describe("ClaudeProcessPool — spawn-once/reuse per thread key", () => {
 // ---------------------------------------------------------------------------
 
 describe("ClaudeProcessPool — key drift", () => {
+  it.each([
+    { addDirs: ["/workspace/repos/new"] },
+    { permissionMode: "ask" as const },
+    { agentBinPath: "/custom/claude" },
+  ])("respawns for changed native spawn options: %j", async (changed) => {
+    const pool = new ClaudeProcessPool({ botId: "bot-a" });
+    const opts = { prompt: "first", cwd: "/workspace", threadId: "one", pidFilePath: null };
+    const first = pool.run(opts);
+    await flush();
+    const oldChild = spawnedChildren[0]!;
+    oldChild.stdout.write(resultLine("success") + "\n");
+    await first.done;
+    const second = pool.run({ ...opts, ...changed, resumeSessionId: "native-session" });
+    await flush();
+    expect(oldChild.killed).toBe(true);
+    expect(spawnedChildren).toHaveLength(2);
+    expect(spawnArgs[1]).toEqual(expect.arrayContaining(["--resume", "native-session"]));
+    spawnedChildren[1]!.stdout.write(resultLine("success") + "\n");
+    expect((await second.done).resumeMode).toBe("cold");
+  });
+
+  it("does not adopt a prewarm process missing a newly discovered repository", async () => {
+    const pool = new ClaudeProcessPool({ botId: "bot-a" });
+    const opts = { cwd: "/workspace", pidFilePath: null };
+    pool.prewarm(opts);
+    const blank = spawnedChildren[0]!;
+    const turn = pool.run({ ...opts, prompt: "hello", threadId: "new", addDirs: ["/workspace/repos/new"] });
+    await flush();
+    expect(turn.pid).not.toBe(blank.pid);
+    expect(spawnArgs[1]).toEqual(expect.arrayContaining(["--add-dir", "/workspace/repos/new"]));
+    spawnedChildren[1]!.stdout.write(resultLine("success") + "\n");
+    await turn.done;
+    const standby = spawnedChildren[2]!;
+    expect(blank.killed).toBe(true);
+    expect(spawnArgs[2]).toEqual(expect.arrayContaining(["--add-dir", "/workspace/repos/new"]));
+    const next = pool.run({ ...opts, prompt: "next", threadId: "next", addDirs: ["/workspace/repos/new"] });
+    await flush();
+    expect(next.pid).toBe(standby.pid);
+    standby.stdout.write(resultLine("success") + "\n");
+    await next.done;
+  });
+
+  it("keeps a BYO cwd untouched during prewarm and turn execution", async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), "claude-pool-byo-"));
+    try {
+      const pool = new ClaudeProcessPool({ botId: "bot-a", maxProcesses: 1 });
+      pool.prewarm({ cwd: dir, pidFilePath: null });
+      const turn = pool.run({ cwd: dir, pidFilePath: null, prompt: "hello", threadId: "new" });
+      await flush();
+      spawnedChildren[0]!.stdout.write(resultLine("success") + "\n");
+      await turn.done;
+      await flush();
+      await expect(readFile(path.join(dir, ".larkway", "runner.pid"), "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
   it("retires the old warm process and spawns a fresh one when cwd changes for the same thread", async () => {
     const pool = new ClaudeProcessPool({ botId: "bot-a" });
 
@@ -928,7 +998,7 @@ describe("ClaudeProcessPool — blank standby prewarm (批D)", () => {
     }
   });
 
-  it("a signature MISMATCH (different model) never adopts — fail-safe spawn, blank stays", async () => {
+  it("changed model retires the old blank and refreshes the next standby", async () => {
     const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
     try {
       const pool = new ClaudeProcessPool({ botId: "bot-a" });
@@ -937,11 +1007,13 @@ describe("ClaudeProcessPool — blank standby prewarm (批D)", () => {
 
       const handle = pool.run({ ...MATCHING_OPTS, model: "opus" });
       await flush();
-      expect(spawnedChildren).toHaveLength(2);
+      expect(spawnedChildren).toHaveLength(3);
+      expect(spawnedChildren[0]!.killed).toBe(true);
+      expect(spawnArgs[2]).toEqual(expect.arrayContaining(["--model", "opus"]));
       expect(handle.pid).toBe(spawnedChildren[1]!.pid);
       expect(pool.blankProcessCountForTesting).toBe(1);
       expect(
-        warnSpy.mock.calls.some((c) => String(c[0]).includes("spawn signature doesn't match")),
+        warnSpy.mock.calls.some((c) => String(c[0]).includes("standby spawn options changed")),
       ).toBe(true);
 
       const child = spawnedChildren[1]!;
