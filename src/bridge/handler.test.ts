@@ -17,6 +17,7 @@ import {
 import type { MemoryMetricEvent } from "./memoryMetrics.js";
 import { readPostFile, writePostFile } from "./postFile.js";
 import { reconcileOrphanedCards } from "./reconcile.js";
+import * as housekeeping from "../housekeeping/gc.js";
 import { buildPostContent } from "../lark/postContent.js";
 import { derivePostIdempotencyKey, digestPostContent } from "../lark/idempotency.js";
 import type { OutboundPostClient } from "../lark/outboundPostClient.js";
@@ -3358,6 +3359,10 @@ describe("handleOne — thin-channel finalize", () => {
     expect(calls).toHaveLength(0);
     expect(await readPostFile(wt)).toBeNull();
 
+    // Reconciliation checks each directory for live processes. This fixture
+    // has no real runner; avoid a host process scan (PowerShell CIM on Windows,
+    // which uses execFile and bypasses this suite's spawn-only mock).
+    const findPids = vi.spyOn(housekeeping, "findPidsByWorktree").mockResolvedValue([]);
     await reconcileOrphanedCards({
       worktreesDir: root,
       botId: "frontend",
@@ -3365,6 +3370,7 @@ describe("handleOne — thin-channel finalize", () => {
       cardRenderer: renderer as any,
       log: () => {},
     });
+    expect(findPids).toHaveBeenCalledWith(wt);
     expect(startArgs).toHaveLength(1);
     expect(await readPostFile(wt)).toBeNull();
   });

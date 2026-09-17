@@ -168,7 +168,15 @@ describe("ensureAgentWorkspace", () => {
     );
     const linkPath = path.join(workspacePath, ".claude", "skills");
     expect((await fs.lstat(linkPath)).isSymbolicLink()).toBe(true);
-    expect(await fs.readlink(linkPath)).toBe(path.join("..", ".agents", "skills"));
+    const target = await fs.readlink(linkPath);
+    // Windows junctions expose an absolute target (possibly with a trailing
+    // separator); compare the actual directory while retaining POSIX portability.
+    expect(await fs.realpath(path.resolve(path.dirname(linkPath), target))).toBe(
+      await fs.realpath(path.join(workspacePath, ".agents", "skills")),
+    );
+    if (process.platform !== "win32") {
+      expect(target).toBe(path.join("..", ".agents", "skills"));
+    }
     // A skill dropped in the canonical directory is visible through both paths.
     await fs.mkdir(path.join(workspacePath, ".agents", "skills", "demo"), { recursive: true });
     await fs.writeFile(path.join(workspacePath, ".agents", "skills", "demo", "SKILL.md"), "x");
