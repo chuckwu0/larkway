@@ -255,15 +255,20 @@ is not the live app-server path.
 `PiRunner` is the smallest adapter: pi's JSON mode is a flat JSONL event
 stream (`session` header → `system_init`; `message_update` text/thinking
 deltas; `tool_execution_start/end`; assistant `message_end` as the
-authoritative snapshot; `agent_end` → `result`), so `parsePiLine()` is a
+authoritative snapshot; `agent_settled` → `result`), so `parsePiLine()` is a
 straight mapping and the answer channel reuses the Claude marker contract.
-Three pi-specific facts are encoded there and must survive refactors: the
+Four pi-specific facts are encoded there and must survive refactors: the
 prompt goes over stdin (pi's argv parser treats a leading `@` as a file
-mention), `--approve` is mandatory in non-interactive mode (otherwise
-project-local `.agents/skills/` are silently skipped), and env is passed
+mention); `--approve` is mandatory in non-interactive mode (otherwise
+project-local `.agents/skills/` are silently skipped); env is passed
 through without key stripping (pi has no subscription login; provider keys
-are its auth). pi has no permission system, so `permissionMode` is accepted
-and ignored. There is no pi pool: a cold spawn costs ~1 s.
+are its auth); and `result` fires on `agent_settled`, not `agent_end`,
+because pi retries transient provider errors and continues after overflow
+compaction in-process, re-emitting `agent_start…agent_end` each time — the
+runner likewise keeps only the LAST assistant `message_end` outcome, so a
+recovered turn is not reported as a provider error. pi has no permission
+system, so `permissionMode` is accepted and ignored. There is no pi pool:
+spawn-to-first-output of a cold `pi -p` is well under a second on a laptop.
 
 When pooling is enabled, `src/claude/pool.ts` maintains Claude stream-json
 processes per thread; `src/codex/pool.ts` multiplexes native threads through a

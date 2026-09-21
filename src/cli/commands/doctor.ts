@@ -776,7 +776,7 @@ async function checkPi(ctx: CliContext): Promise<CheckResult[]> {
     results.push({
       id: `pi-auth:${model}`,
       label: `pi 模型凭据 ${model}`,
-      status: auth.ready === true ? "ok" : auth.ready === false ? "warn" : "warn",
+      status: auth.ready === true ? "ok" : "warn",
       message:
         auth.ready === true
           ? undefined

@@ -102,7 +102,7 @@ larkway start           # 长驻进程，后台运行，日志写入 ~/.larkway/
 | **Codex** | `codex` | `codex login` | 现有 Codex 订阅，不按 token 扣费 |
 | **pi** | `pi`（[pi coding agent](https://github.com/earendil-works/pi)） | `~/.pi/agent/models.json` 里的 provider API key（或 provider 对应环境变量） | 自带模型：pi 支持的任何 provider，含自定义 OpenAI 兼容端点 |
 
-**pi 底座**是订阅 token 用尽时的出口：bot yaml 写 `backend: pi` + `model: <provider>/<model>`，pi 就在同一个 workspace（`AGENTS.md`、`.agents/skills/`、已 clone 的仓库）上跑你在 pi 里配好的模型。Larkway 对 pi 子进程原样透传环境变量：自己仍不注入任何 key，但也不像 claude/codex 那样剥掉 provider key，因为对 pi 来说 key 就是登录态。`effort` 对应 pi 的 `--thinking` 档位。用 `pi auth check --model <provider>/<model>` 验证凭据；`larkway doctor` 会对每个 pi bot 跑这项检查。注意 pi 没有权限系统，所有权限模式在 pi 上都等于全量访问，`ask` 无效。
+**pi 底座**是订阅 token 用尽时的出口：bot yaml 写 `backend: pi` + `model: <provider>/<model>`，pi 就在同一个 workspace（`AGENTS.md`、`.agents/skills/`、已 clone 的仓库）上跑你在 pi 里配好的模型。Larkway 对 pi 子进程原样透传环境变量：自己仍不注入任何 key，但也不像 claude/codex 那样剥掉 provider key，因为对 pi 来说 key 就是登录态。`effort` 对应 pi 的 `--thinking` 档位（`models.json` 里该模型要声明 `reasoning: true`，否则 pi 只支持 `off`）。用 `pi auth check --model <provider>/<model>` 验证凭据；`larkway doctor` 会对 pi bot 配置的每个 model 跑这项检查。注意 pi 没有权限系统，所有权限模式在 pi 上都等于全量访问，`ask` 无效；larkway 以 `--approve`（项目信任）启动 pi，workspace 及其父目录里的 `.pi/extensions`、`.pi/settings.json` 也会被加载。
 
 Larkway 不注入 `ANTHROPIC_API_KEY` 或任何其他 API key。子进程继承你的本地登录态。如需切换到 API key 模式，需在 `src/claude/runner.ts` 显式开启。
 

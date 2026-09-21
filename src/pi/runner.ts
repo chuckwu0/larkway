@@ -120,8 +120,10 @@ export function buildPiEnv(
  * pi's own validation reports them, and botLoader already warned.
  *
  * Per-model support is pi's business: a model's `thinkingLevelMap` may mark
- * a level `null` (unsupported), in which case pi clamps to the nearest
- * supported level rather than failing the turn.
+ * a level `null` (unsupported), in which case pi clamps to a supported level
+ * (looking up first, then down) rather than failing the turn. A custom model
+ * entry without `reasoning: true` supports only `off`, so `effort` is then
+ * silently ignored — that is a models.json fact, not a larkway one.
  */
 export function piThinkingFromLarkway(effort: string): string {
   return effort;
@@ -207,11 +209,17 @@ function asRecord(value: unknown): JsonRecord | undefined {
  *       here — tool_execution_start is the single tool_use source, so the
  *       handler's toolsInFlight counter stays balanced.
  *
- *   {"type":"agent_end"}
+ *   {"type":"agent_settled"}
  *     → {type:"result", stopReason:"end_turn", raw}
+ *     NOT agent_end: pi retries transient provider errors (429/5xx, default
+ *     retry.maxRetries=3 with backoff) and continues after an overflow
+ *     compaction IN-PROCESS, and every such continuation re-emits
+ *     agent_start…agent_end. agent_settled is emitted exactly once per
+ *     prompt, in the session's finally block, after all of that.
  *
- *   Everything else (agent_start, turn_*, message_start, tool_execution_update,
- *   toolcall_* deltas, user/toolResult message_end, unknown) → {type:"raw"}.
+ *   Everything else (agent_start, agent_end, turn_*, message_start,
+ *   tool_execution_update, toolcall_* deltas, user/toolResult message_end,
+ *   unknown) → {type:"raw"}.
  */
 function* parsePiLine(
   line: string,
@@ -241,8 +249,8 @@ function* parsePiLine(
     return;
   }
 
-  // ── agent_end → result ──────────────────────────────────────────────────
-  if (topType === "agent_end") {
+  // ── agent_settled → result (see doc comment: agent_end may repeat) ──────
+  if (topType === "agent_settled") {
     yield { type: "result", stopReason: "end_turn", raw: obj };
     return;
   }
@@ -307,13 +315,16 @@ function* parsePiLine(
 }
 
 /**
- * Pull a provider/model error message out of an assistant `message_end`
- * whose stopReason is "error" — pi reports API failures (bad key, model not
- * found, upstream 5xx) this way and still exits 0, so the bridge would
- * otherwise see a silent turn with no answer. Returns undefined for any
- * other line.
+ * Outcome of an assistant `message_end`: `{ error }` when its stopReason is
+ * "error" (pi reports API failures — bad key, model not found, upstream 5xx
+ * — this way and still exits 0, spike-verified), `{}` for any other
+ * assistant message_end, and undefined for every other line.
+ *
+ * The runner keeps only the LAST outcome: pi retries transient errors and
+ * continues after overflow compaction in-process, so an error message_end
+ * followed by a successful one is a recovered turn, not a failed one.
  */
-export function piErrorFromLine(line: string): string | undefined {
+export function piAssistantOutcomeFromLine(line: string): { error?: string } | undefined {
   let obj: unknown;
   try {
     obj = JSON.parse(line);
@@ -323,9 +334,10 @@ export function piErrorFromLine(line: string): string | undefined {
   const record = asRecord(obj);
   if (record?.["type"] !== "message_end") return undefined;
   const message = asRecord(record["message"]);
-  if (message?.["role"] !== "assistant" || message["stopReason"] !== "error") return undefined;
+  if (message?.["role"] !== "assistant") return undefined;
+  if (message["stopReason"] !== "error") return {};
   const msg = message["errorMessage"];
-  return typeof msg === "string" && msg.trim() ? msg.trim() : "pi reported an assistant error";
+  return { error: typeof msg === "string" && msg.trim() ? msg.trim() : "pi reported an assistant error" };
 }
 
 // ---------------------------------------------------------------------------
@@ -373,7 +385,21 @@ export function runPi(opts: RunOptions, piBinPath = "pi"): RunHandle {
   }
 
   let discoveredSessionId: string | undefined;
+  /** Error of the LAST assistant message_end seen; cleared by a later success. */
   let assistantError: string | undefined;
+  /**
+   * The events generator is consumer-driven: lines (and with them the
+   * session id and assistantError above) are only processed as fast as the
+   * bridge iterates. On a normal 'close' we therefore let the generator drain
+   * what readline has buffered before deciding resolve-vs-reject, instead of
+   * settling on whatever had been iterated at the instant the pipe closed.
+   * Bounded by CLOSE_DRAIN_GRACE_MS so a consumer that stops iterating can
+   * never hang `done`.
+   */
+  let generatorState: "idle" | "running" | "finished" = "idle";
+  let deferredExitCode: number | undefined;
+  let closeDrainTimer: ReturnType<typeof setTimeout> | undefined;
+  const CLOSE_DRAIN_GRACE_MS = 5_000;
 
   // ── kill helper (SIGTERM → grace → SIGKILL) ───────────────────────────────
   let killScheduled = false;
@@ -403,7 +429,7 @@ export function runPi(opts: RunOptions, piBinPath = "pi"): RunHandle {
       grandchildGraceTimer = undefined;
       if (!child.killed && !killScheduled) {
         console.warn(
-          "[pi-runner] pi still running 30 s after agent_end — " +
+          "[pi-runner] pi still running 30 s after agent_settled — " +
             "likely blocked by a non-detached grandchild process (e.g. dev server). Sending SIGTERM.",
         );
         doKill();
@@ -416,6 +442,7 @@ export function runPi(opts: RunOptions, piBinPath = "pi"): RunHandle {
   const TOTAL_TIMEOUT_EXTRA_MS = SIGKILL_GRACE_MS + 2_000;
   let totalTimeoutFallbackHandle: ReturnType<typeof setTimeout> | undefined;
   let _forceFinalizeForTimeout: () => void = () => { /* bound below */ };
+  let _finalizeAfterDrain: () => void = () => { /* bound below */ };
 
   const timeoutHandle = setTimeout(() => {
     doKill();
@@ -453,6 +480,7 @@ export function runPi(opts: RunOptions, piBinPath = "pi"): RunHandle {
         clearTimeout(killTimer);
         clearTimeout(grandchildGraceTimer);
         clearTimeout(totalTimeoutFallbackHandle);
+        clearTimeout(closeDrainTimer);
         rlAbortController.abort();
         if (pidFilePath !== null) {
           void unlink(pidFilePath).catch(() => { /* may already be gone */ });
@@ -516,8 +544,30 @@ export function runPi(opts: RunOptions, piBinPath = "pi"): RunHandle {
       });
 
       child.on("close", (code: number | null) => {
+        if (settled) return;
+        if (generatorState === "running") {
+          // Normal path: stdout has ended, readline will deliver its buffered
+          // tail and end on its own; the generator's finally then finalizes.
+          deferredExitCode = code ?? 1;
+          closeDrainTimer = setTimeout(() => {
+            if (settled) return;
+            console.warn(
+              `[pi-runner] child pid=${child.pid} closed but the events consumer did not drain ` +
+                `within ${CLOSE_DRAIN_GRACE_MS / 1000}s — force-resolving done.`,
+            );
+            finalizeResolve(code ?? 1);
+          }, CLOSE_DRAIN_GRACE_MS);
+          closeDrainTimer.unref();
+          return;
+        }
         finalizeResolve(code ?? 1);
       });
+
+      // Called from the generator's finally: settle with the exit code that
+      // 'close' parked while the consumer was still draining.
+      _finalizeAfterDrain = () => {
+        if (deferredExitCode !== undefined) finalizeResolve(deferredExitCode);
+      };
 
       child.on("exit", (code: number | null) => {
         if (settled) return;
@@ -544,12 +594,13 @@ export function runPi(opts: RunOptions, piBinPath = "pi"): RunHandle {
       signal: rlAbortController.signal,
     });
     const answerExtractor = new AnswerChannelExtractor();
+    generatorState = "running";
 
     try {
       for await (const line of rl) {
         markPerf("first_line");
-        const err = piErrorFromLine(line);
-        if (err !== undefined) assistantError = err;
+        const outcome = piAssistantOutcomeFromLine(line);
+        if (outcome !== undefined) assistantError = outcome.error;
         for (const event of parsePiLine(line, answerExtractor)) {
           if (event.type === "system_init") {
             discoveredSessionId = event.sessionId;
@@ -568,6 +619,8 @@ export function runPi(opts: RunOptions, piBinPath = "pi"): RunHandle {
       console.debug("[pi-runner] readline aborted (child exited with stdout still open) — exiting generateEvents");
     } finally {
       rl.close();
+      generatorState = "finished";
+      _finalizeAfterDrain();
     }
   }
 

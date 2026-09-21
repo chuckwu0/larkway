@@ -94,14 +94,16 @@ describe("interpretProbe", () => {
 });
 
 describe("pi backend probes", () => {
-  it("probeSpecForBackend: model hint → pi auth check; provider-only hint → --provider; none → --version", () => {
+  it("probeSpecForBackend: any model hint → pi auth check --model (bare ids too); none → --version", () => {
     expect(probeSpecForBackend("pi", { model: "zhipu/glm-5.3-flashx" })).toEqual({
       bin: "pi",
       args: ["auth", "check", "--model", "zhipu/glm-5.3-flashx", "--json"],
     });
-    expect(probeSpecForBackend("pi", { model: "zhipu" })).toEqual({
+    // A bare model id must NOT become --provider: pi resolves the provider
+    // from the model, and --provider <model-id> reports provider_not_found.
+    expect(probeSpecForBackend("pi", { model: "glm-5.3-flashx" })).toEqual({
       bin: "pi",
-      args: ["auth", "check", "--provider", "zhipu", "--json"],
+      args: ["auth", "check", "--model", "glm-5.3-flashx", "--json"],
     });
     expect(probeSpecForBackend("pi")).toEqual({ bin: "pi", args: ["--version"] });
   });

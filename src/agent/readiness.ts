@@ -73,12 +73,14 @@ export function probeSpecForBackend(backend: string, hint: ProbeHint = {}): Prob
     case "codex":
       return { bin: "codex", args: ["login", "status"] };
     case "pi": {
-      // `pi auth check` needs --model (provider/id) or --provider; with no
-      // model configured we can still catch the "CLI missing from PATH"
-      // family by probing the binary itself.
+      // `pi auth check --model` takes exactly what the runner passes to
+      // `--model` (bare id, provider/id or pattern) and resolves the provider
+      // itself — never translate a bare id into --provider, that reports
+      // provider_not_found for a perfectly runnable model. With no model
+      // configured we can still catch the "CLI missing from PATH" family by
+      // probing the binary itself.
       if (!hint.model) return { bin: "pi", args: ["--version"] };
-      const flag = hint.model.includes("/") ? "--model" : "--provider";
-      return { bin: "pi", args: ["auth", "check", flag, hint.model, "--json"] };
+      return { bin: "pi", args: ["auth", "check", "--model", hint.model, "--json"] };
     }
     default:
       return undefined;

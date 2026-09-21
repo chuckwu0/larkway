@@ -2,9 +2,10 @@
  * Tests for src/pi/runner.ts.
  *
  * spawn() integration is not unit-tested against a real pi CLI; the pure
- * helpers are exercised directly and runPi() is driven through a mock spawn
- * that replays JSONL captured from a real `pi -p --mode json` run
- * (pi 0.86.0, 2026-09-21 spike).
+ * helpers are exercised directly and runPi() is driven through a mock spawn.
+ * The line shapes used below mirror JSONL captured from real
+ * `pi -p --mode json` runs (pi 0.86.0, 2026-09-21 spike): field names and
+ * nesting are the real ones, the text content is made up.
  */
 
 import { describe, it, expect, afterEach, vi } from "vitest";
@@ -14,7 +15,7 @@ import {
   buildPiCommand,
   buildPiEnv,
   piThinkingFromLarkway,
-  piErrorFromLine,
+  piAssistantOutcomeFromLine,
   _parsePiLine as parsePiLine,
 } from "./runner.js";
 
@@ -179,10 +180,13 @@ describe("parsePiLine", () => {
     expect(events).toEqual([expect.objectContaining({ type: "system_init", sessionId: "abc-123" })]);
   });
 
-  it("agent_end → result end_turn; lifecycle noise → raw", () => {
+  it("agent_settled → result end_turn; agent_end and other lifecycle noise → raw", () => {
     const ex = new AnswerChannelExtractor();
-    expect([...parsePiLine('{"type":"agent_end","messages":[]}', ex)][0]).toMatchObject({ type: "result", stopReason: "end_turn" });
-    for (const t of ["agent_start", "turn_start", "turn_end", "agent_settled", "tool_execution_update"]) {
+    expect([...parsePiLine('{"type":"agent_settled"}', ex)][0]).toMatchObject({ type: "result", stopReason: "end_turn" });
+    // pi re-emits agent_start…agent_end for every in-process retry /
+    // post-compaction continuation; only agent_settled is once-per-prompt.
+    expect([...parsePiLine('{"type":"agent_end","messages":[],"willRetry":true}', ex)][0]?.type).toBe("raw");
+    for (const t of ["agent_start", "turn_start", "turn_end", "tool_execution_update"]) {
       expect([...parsePiLine(JSON.stringify({ type: t }), ex)][0]?.type).toBe("raw");
     }
     expect([...parsePiLine("not json", ex)][0]?.type).toBe("raw");
@@ -243,14 +247,17 @@ describe("parsePiLine", () => {
   });
 });
 
-describe("piErrorFromLine", () => {
+describe("piAssistantOutcomeFromLine", () => {
   it("extracts errorMessage from an assistant message_end with stopReason error", () => {
     const line = JSON.stringify({ type: "message_end", message: { role: "assistant", content: [], stopReason: "error", errorMessage: "401 Unauthorized" } });
-    expect(piErrorFromLine(line)).toBe("401 Unauthorized");
+    expect(piAssistantOutcomeFromLine(line)).toEqual({ error: "401 Unauthorized" });
   });
-  it("ignores normal messages and garbage", () => {
-    expect(piErrorFromLine(assistantEnd([{ type: "text", text: "ok" }]))).toBeUndefined();
-    expect(piErrorFromLine("nope")).toBeUndefined();
+  it("a successful assistant message_end is an outcome without error (clears an earlier one)", () => {
+    expect(piAssistantOutcomeFromLine(assistantEnd([{ type: "text", text: "ok" }]))).toEqual({});
+  });
+  it("ignores non-assistant messages and garbage", () => {
+    expect(piAssistantOutcomeFromLine(JSON.stringify({ type: "message_end", message: { role: "toolResult", content: [] } }))).toBeUndefined();
+    expect(piAssistantOutcomeFromLine("nope")).toBeUndefined();
   });
 });
 
@@ -289,7 +296,8 @@ describe("runPi()", () => {
     await new Promise<void>((resolve) => setImmediate(() => {
       fake.stdout.write('{"type":"session","version":3,"id":"sess-pi","timestamp":"t","cwd":"/w"}\n');
       fake.stdout.write(textDelta("LARKWAY_ANSWER_BEGIN\nhello there this is a long enough answer\nLARKWAY_ANSWER_END") + "\n");
-      fake.stdout.write('{"type":"agent_end","messages":[]}\n');
+      fake.stdout.write('{"type":"agent_end","messages":[],"willRetry":false}\n');
+      fake.stdout.write('{"type":"agent_settled"}\n');
       void initSeen.then(() => { fake.triggerClose(0); resolve(); });
     }));
 
@@ -316,11 +324,63 @@ describe("runPi()", () => {
     await new Promise<void>((resolve) => setImmediate(() => {
       fake.stdout.write('{"type":"session","version":3,"id":"s","timestamp":"t","cwd":"/w"}\n');
       fake.stdout.write(JSON.stringify({ type: "message_end", message: { role: "assistant", content: [], stopReason: "error", errorMessage: "model not found: glm-9" } }) + "\n");
-      fake.stdout.write('{"type":"agent_end","messages":[]}\n');
+      fake.stdout.write('{"type":"agent_end","messages":[],"willRetry":false}\n');
+      fake.stdout.write('{"type":"agent_settled"}\n');
       setImmediate(() => { fake.triggerClose(0); resolve(); });
     }));
     await loop;
     await expect(handle.done).rejects.toThrow(/pi provider error: model not found: glm-9/);
+  });
+
+  it("an in-process retry that recovers (error message_end, agent_end willRetry, then success) resolves, with ONE result", async () => {
+    const fake = makeFakeChild();
+    __nextFakeChild = fake;
+    const { runPi } = await import("./runner.js");
+    const handle = runPi({ prompt: "x", agentBinPath: "/fake/pi", pidFilePath: null });
+    const types: string[] = [];
+    const loop = (async () => { for await (const ev of handle.events) types.push(ev.type); })();
+    await new Promise<void>((resolve) => setImmediate(() => {
+      fake.stdout.write('{"type":"session","version":3,"id":"s","timestamp":"t","cwd":"/w"}\n');
+      fake.stdout.write('{"type":"agent_start"}\n');
+      fake.stdout.write(JSON.stringify({ type: "message_end", message: { role: "assistant", content: [], stopReason: "error", errorMessage: "429 rate limited" } }) + "\n");
+      fake.stdout.write('{"type":"agent_end","messages":[],"willRetry":true}\n');
+      fake.stdout.write('{"type":"agent_start"}\n');
+      fake.stdout.write(textDelta("LARKWAY_ANSWER_BEGIN\nrecovered answer that is long enough to stream\nLARKWAY_ANSWER_END") + "\n");
+      fake.stdout.write(assistantEnd([{ type: "text", text: "LARKWAY_ANSWER_BEGIN\nrecovered answer that is long enough to stream\nLARKWAY_ANSWER_END" }]) + "\n");
+      fake.stdout.write('{"type":"agent_end","messages":[],"willRetry":false}\n');
+      fake.stdout.write('{"type":"agent_settled"}\n');
+      setImmediate(() => { fake.triggerClose(0); resolve(); });
+    }));
+    await loop;
+    await expect(handle.done).resolves.toMatchObject({ exitCode: 0, sessionId: "s" });
+    expect(types.filter((t) => t === "result")).toHaveLength(1);
+    expect(types).toContain("answer_delta");
+  });
+
+  it("a slow consumer still sees the provider error: close waits for the events drain", async () => {
+    const fake = makeFakeChild();
+    __nextFakeChild = fake;
+    const { runPi } = await import("./runner.js");
+    const handle = runPi({ prompt: "x", agentBinPath: "/fake/pi", pidFilePath: null });
+    const loop = (async () => {
+      for await (const _ of handle.events) {
+        await new Promise((r) => setTimeout(r, 15));
+      }
+    })();
+    // Write everything and close the pipe before the consumer has iterated
+    // past the first line — the reject must not be decided on that snapshot.
+    await new Promise<void>((resolve) => setImmediate(() => {
+      fake.stdout.write('{"type":"session","version":3,"id":"slow","timestamp":"t","cwd":"/w"}\n');
+      fake.stdout.write('{"type":"agent_start"}\n');
+      fake.stdout.write('{"type":"turn_start"}\n');
+      fake.stdout.write(JSON.stringify({ type: "message_end", message: { role: "assistant", content: [], stopReason: "error", errorMessage: "401 Unauthorized" } }) + "\n");
+      fake.stdout.write('{"type":"agent_end","messages":[],"willRetry":false}\n');
+      fake.stdout.write('{"type":"agent_settled"}\n');
+      fake.triggerClose(0);
+      resolve();
+    }));
+    await expect(handle.done).rejects.toThrow(/pi provider error: 401 Unauthorized/);
+    await loop;
   });
 
   it("non-zero exit rejects with stderr attached", async () => {

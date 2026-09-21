@@ -175,10 +175,11 @@ export interface PiAuthResult {
  */
 export async function detectPiAuth(model?: string): Promise<PiAuthResult> {
   if (!model) return { ready: null };
-  const flag = model.includes("/") ? "--model" : "--provider";
+  // Always --model: it accepts exactly what the runner passes (bare id,
+  // provider/id, pattern) and resolves the provider itself.
   let stdout = "";
   try {
-    ({ stdout } = await execFileAsync("pi", ["auth", "check", flag, model, "--json"]));
+    ({ stdout } = await execFileAsync("pi", ["auth", "check", "--model", model, "--json"]));
   } catch (err) {
     stdout = String((err as { stdout?: unknown })?.stdout ?? "");
     if (!stdout.trim()) return { ready: null };
