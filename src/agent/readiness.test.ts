@@ -92,3 +92,42 @@ describe("interpretProbe", () => {
     expect(r.diagnosis).toContain("could not be evaluated");
   });
 });
+
+describe("pi backend probes", () => {
+  it("probeSpecForBackend: any model hint → pi auth check --model (bare ids too); none → --version", () => {
+    expect(probeSpecForBackend("pi", { model: "zhipu/glm-5.3-flashx" })).toEqual({
+      bin: "pi",
+      args: ["auth", "check", "--model", "zhipu/glm-5.3-flashx", "--json"],
+    });
+    // A bare model id must NOT become --provider: pi resolves the provider
+    // from the model, and --provider <model-id> reports provider_not_found.
+    expect(probeSpecForBackend("pi", { model: "glm-5.3-flashx" })).toEqual({
+      bin: "pi",
+      args: ["auth", "check", "--model", "glm-5.3-flashx", "--json"],
+    });
+    expect(probeSpecForBackend("pi")).toEqual({ bin: "pi", args: ["--version"] });
+  });
+
+  it("interpretProbe: ready JSON → ok; not_ready → diagnosis names provider, reason and model", () => {
+    const hint = { model: "zhipu/glm-5.3-flashx" };
+    expect(
+      interpretProbe("pi", { exitCode: 0, stdout: '{"status":"ready","provider":"zhipu","authType":"api_key"}' }, "darwin", hint).ok,
+    ).toBe(true);
+    const bad = interpretProbe(
+      "pi",
+      { exitCode: 1, stdout: '{"status":"not_ready","provider":"zhipu","reason":"missing_api_key"}' },
+      "darwin",
+      hint,
+    );
+    expect(bad.ok).toBe(false);
+    expect(bad.diagnosis).toContain('"zhipu"');
+    expect(bad.diagnosis).toContain("missing_api_key");
+    expect(bad.diagnosis).toContain("pi auth check --model zhipu/glm-5.3-flashx");
+  });
+
+  it("interpretProbe: pi missing from PATH is the CLI-not-found family", () => {
+    const out = interpretProbe("pi", { errorCode: "ENOENT" }, "darwin", { model: "zhipu/glm-5.3-flashx" });
+    expect(out.ok).toBe(false);
+    expect(out.diagnosis).toMatch(/^pi CLI not found on PATH/);
+  });
+});

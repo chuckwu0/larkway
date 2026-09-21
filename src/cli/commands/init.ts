@@ -32,6 +32,7 @@ import {
   detectCodexBinary,
   detectCodexLogin,
   detectCodexRuntimeWritable,
+  detectPiBinary,
 } from "../backendHealth.js";
 import { ensureAgentWorkspace, resetAgentWorkspacePermissions } from "../../agent/workspaceStore.js";
 import { permissionItemsFromCapabilities } from "../../agent/permissionPlan.js";
@@ -144,6 +145,15 @@ async function runPreflightChecks(ctx: CliContext, backendHint: string): Promise
       );
       allOk = false;
     }
+  } else if (backendHint === "pi") {
+    const binary = await detectPiBinary();
+    if (binary.found) {
+      ui.success(`pi CLI 可用${binary.version ? `(${binary.version})` : ""}`);
+    } else {
+      ui.failure("未找到 `pi` binary。选择 backend=pi 前请先安装:npm i -g @earendil-works/pi-coding-agent");
+      allOk = false;
+    }
+    ui.print(ui.dim("pi 的模型凭据按 provider 配置(~/.pi/agent/models.json);bot 配好 model 后用 larkway doctor 验证。"));
   } else {
     ui.print(ui.dim(`backend=${backendHint}: 跳过 Claude 登录硬检查;请用 larkway doctor 检查对应 backend。`));
   }

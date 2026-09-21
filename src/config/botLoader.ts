@@ -24,11 +24,12 @@ import { ResponseSurfacePrototypeConfigSchema } from "../responseSurface.js";
 // ---------------------------------------------------------------------------
 
 /**
- * Larkway's canonical effort vocabulary — confirmed supported by both
+ * Larkway's canonical effort vocabulary — confirmed supported by all three
  * backends: the claude CLI's `--effort <value>` flag verbatim (see
- * src/claude/runner.ts), and codex's `turn/start.effort` via the
+ * src/claude/runner.ts), codex's `turn/start.effort` via the
  * codexEffortFromLarkway low/medium/high/max → low/medium/high/xhigh mapping
- * (see src/codex/runner.ts). Advisory only — `effort` itself stays an open
+ * (see src/codex/runner.ts), and pi's `--thinking <level>` verbatim (larkway's
+ * four values are a subset of pi's levels; see src/pi/runner.ts). Advisory only — `effort` itself stays an open
  * zod string so an unrecognized value never fails validation, it's just
  * flagged with a warn.
  */
@@ -376,10 +377,12 @@ export const BotConfigSchema = z.object({
   /**
    * Agent backend to use when spawning the AI subprocess for this bot.
    *
-   * Open string — not a 2-enum — so future backends (gemini, local-llm, …) can be
+   * Open string — not an enum — so future backends (gemini, local-llm, …) can be
    * added without a schema change. The bridge validates the value against the
    * registered runners at createRunner() time, which gives a clear error listing all
-   * known backends.
+   * known backends. Registered today: "claude", "codex", "pi" (the BYO-model
+   * backend — pi talks to whatever provider ~/.pi/agent/models.json defines,
+   * so `model` is effectively required for it; see src/pi/runner.ts).
    *
    * @default "claude"
    */
@@ -469,7 +472,8 @@ export const BotConfigSchema = z.object({
 
   /**
    * Per-bot model override (perf plan 批 C 旋钮). Passed through verbatim to
-   * the backend CLI as `--model <value>` (claude) / `turn/start.model`
+   * the backend CLI as `--model <value>` (claude, pi — pi also accepts the
+   * `provider/id` form, e.g. `zhipu/glm-5.3-flashx`) / `turn/start.model`
    * (codex) — larkway does not validate or allowlist model ids, same
    * precedent as `backend` above. Omitted = unchanged host/backend default
    * behavior (byte-identical to before this field existed).
@@ -751,7 +755,7 @@ export async function loadBotsDetailed(botsDir: string): Promise<LoadBotsResult>
       console.warn(
         `[botLoader] Bot "${bot.id}" effort "${bot.effort}" is not one of the known values ` +
           `(${[...KNOWN_EFFORT_VALUES].join(", ")}). Continuing — the value is still passed ` +
-          `through to the backend CLI verbatim (claude: --effort; codex: mapped through ` +
+          `through to the backend CLI verbatim (claude: --effort; pi: --thinking; codex: mapped through ` +
           `codexEffortFromLarkway), but a typo here will silently fail the bot's spawn every turn.`,
       );
     }

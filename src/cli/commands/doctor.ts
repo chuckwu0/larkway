@@ -37,6 +37,8 @@ import {
   detectCodexBinary,
   detectCodexLogin,
   detectCodexRuntimeWritable,
+  detectPiAuth,
+  detectPiBinary,
 } from "../backendHealth.js";
 
 const execFileAsync = promisify(execFile);
@@ -721,6 +723,73 @@ async function checkTaskHandle(ctx: CliContext, opts: { lint: boolean }): Promis
   return results;
 }
 
+/**
+ * 6b. pi CLI 可用性探测(backend: pi)
+ *
+ * - Any bot with backend: pi → required (error on missing binary; warn when
+ *   the provider behind a bot's model has no usable credentials).
+ * - Otherwise → optional/informational, same posture as checkCodex.
+ *
+ * pi has no global login: credentials are per provider, so the auth check
+ * is run once per distinct `model` configured on pi bots. Bots without a
+ * model get no auth check (pi would use its own default provider/model).
+ */
+async function checkPi(ctx: CliContext): Promise<CheckResult[]> {
+  const results: CheckResult[] = [];
+  const required = await backendRequired(ctx, "pi");
+
+  const binary = await detectPiBinary();
+  if (!binary.found) {
+    results.push({
+      id: "pi-binary",
+      label: `pi CLI${required ? "" : " (可选)"}`,
+      status: required ? "error" : "ok",
+      message: required
+        ? "未找到 `pi` binary。有 bot 配置了 backend: pi,请先安装:npm i -g @earendil-works/pi-coding-agent"
+        : "未安装 pi(当前无 bot 使用 pi backend,可忽略)。如需安装:npm i -g @earendil-works/pi-coding-agent",
+    });
+    return results;
+  }
+  results.push({
+    id: "pi-binary",
+    label: `pi CLI${required ? "" : " (可选)"}`,
+    status: "ok",
+    message: binary.version ? `pi ${binary.version}` : undefined,
+  });
+  if (!required) return results;
+
+  const models = new Set<string>();
+  try {
+    for (const id of await ctx.botsStore.listBots()) {
+      try {
+        const bot = await ctx.botsStore.readBot(id);
+        if ((bot.backend ?? "claude") === "pi" && bot.model) models.add(bot.model);
+      } catch {
+        /* schema errors are reported by check #3 */
+      }
+    }
+  } catch {
+    /* botsStore unavailable */
+  }
+  for (const model of models) {
+    const auth = await detectPiAuth(model);
+    results.push({
+      id: `pi-auth:${model}`,
+      label: `pi 模型凭据 ${model}`,
+      status: auth.ready === true ? "ok" : "warn",
+      message:
+        auth.ready === true
+          ? undefined
+          : auth.ready === false
+            ? `pi 报告 provider${auth.provider ? ` "${auth.provider}"` : ""} 未就绪` +
+              `${auth.reason ? `(${auth.reason})` : ""}。请在 ~/.pi/agent/models.json(或 provider 环境变量)配置 API key,` +
+              `然后运行 \`pi auth check --model ${model}\` 验证。`
+            : `无法评估 \`pi auth check --model ${model}\` 的结果;请手动运行确认。`,
+    });
+  }
+  return results;
+}
+
 // ---------------------------------------------------------------------------
 // Run all checks
 // ---------------------------------------------------------------------------
@@ -753,6 +822,10 @@ async function runAllChecks(ctx: CliContext, opts: { lint: boolean }): Promise<C
   // 6. Codex CLI availability (required only if a bot uses backend: codex)
   const codexChecks = await checkCodex(ctx);
   results.push(...codexChecks);
+
+  // 6b. pi CLI availability (required only if a bot uses backend: pi)
+  const piChecks = await checkPi(ctx);
+  results.push(...piChecks);
 
   // 7. Task-handle config status + scope probe (v3.4 discoverability)
   const taskHandleChecks = await checkTaskHandle(ctx, opts);

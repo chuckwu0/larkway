@@ -6,6 +6,7 @@
 - pnpm 9 (`npm i -g pnpm@9`)
 - `claude` CLI on PATH (for integration testing against a real agent backend)
 - `codex` CLI on PATH (optional — only needed to exercise the Codex backend)
+- `pi` CLI on PATH (optional — only needed to exercise the pi backend; `npm i -g @earendil-works/pi-coding-agent`)
 
 ## Setup
 
@@ -104,6 +105,7 @@ src/
   agent/        AgentRunner interface + backend registry (extension point)
   claude/       ClaudeRunner — spawns the `claude` CLI
   codex/        CodexRunner  — spawns the `codex` CLI
+  pi/           PiRunner     — spawns the `pi` CLI in headless JSON mode
   bridge/       Core message handler, card renderer, state files
   lark/         Feishu WebSocket channel client, card/message parsing
   config/       Bot loader, path helpers, config schema
@@ -236,6 +238,7 @@ The string key is how users select the backend in their bot config
 |---|---|---|
 | `src/claude/runner.ts` | `"claude"` | `claude --output-format stream-json` |
 | `src/codex/runner.ts` | `"codex"` | `codex app-server --stdio` |
+| `src/pi/runner.ts` | `"pi"` | `pi -p --mode json --approve` (prompt via stdin) |
 
 `ClaudeRunner` is the canonical reference — it handles session resume,
 SIGTERM/SIGKILL cleanup, the `AbortController`-based readline drain, and the
@@ -248,6 +251,24 @@ native thread, then submits each prompt through `turn/start`.
 events. Native `phase: final_answer` is the answer-channel authority; phase-less
 older messages retain marker compatibility. The legacy `parseCodexLine()` helper
 is not the live app-server path.
+
+`PiRunner` is the smallest adapter: pi's JSON mode is a flat JSONL event
+stream (`session` header → `system_init`; `message_update` text/thinking
+deltas; `tool_execution_start/end`; assistant `message_end` as the
+authoritative snapshot; `agent_settled` → `result`), so `parsePiLine()` is a
+straight mapping and the answer channel reuses the Claude marker contract.
+Four pi-specific facts are encoded there and must survive refactors: the
+prompt goes over stdin (pi's argv parser treats a leading `@` as a file
+mention); `--approve` is mandatory in non-interactive mode (otherwise
+project-local `.agents/skills/` are silently skipped); env is passed
+through without key stripping (pi has no subscription login; provider keys
+are its auth); and `result` fires on `agent_settled`, not `agent_end`,
+because pi retries transient provider errors and continues after overflow
+compaction in-process, re-emitting `agent_start…agent_end` each time — the
+runner likewise keeps only the LAST assistant `message_end` outcome, so a
+recovered turn is not reported as a provider error. pi has no permission
+system, so `permissionMode` is accepted and ignored. There is no pi pool:
+spawn-to-first-output of a cold `pi -p` is well under a second on a laptop.
 
 When pooling is enabled, `src/claude/pool.ts` maintains Claude stream-json
 processes per thread; `src/codex/pool.ts` multiplexes native threads through a

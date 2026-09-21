@@ -24,6 +24,8 @@ import {
   detectCodexBinary,
   detectCodexLogin,
   detectCodexRuntimeWritable,
+  detectPiAuth,
+  detectPiBinary,
 } from "../cli/backendHealth.js";
 import {
   defaultPermissionCapabilitiesForBot,
@@ -345,23 +347,26 @@ type HealthScanExecFile = (
 ) => Promise<{ stdout: string; stderr: string }>;
 let healthScanExecFile: HealthScanExecFile = execFileCompat as HealthScanExecFile;
 
-/** 底座登录态探针(生产=detectClaudeLogin / codex auth.json 文件探测)。 */
-let healthScanBackendLoginProbe: (backend: string) => Promise<boolean | null> =
+/** 底座登录态探针(生产=detectClaudeLogin / codex auth.json 文件探测 / pi auth check)。 */
+let healthScanBackendLoginProbe: (backend: string, model?: string) => Promise<boolean | null> =
   defaultBackendLoginProbe;
 
 export function _setHealthScanForTest(overrides?: {
   exec?: HealthScanExecFile;
-  backendLogin?: (backend: string) => Promise<boolean | null>;
+  backendLogin?: (backend: string, model?: string) => Promise<boolean | null>;
 }): void {
   healthScanExecFile = overrides?.exec ?? (execFileCompat as HealthScanExecFile);
   healthScanBackendLoginProbe = overrides?.backendLogin ?? defaultBackendLoginProbe;
   healthScanCache.clear();
 }
 
-async function defaultBackendLoginProbe(backend: string): Promise<boolean | null> {
+async function defaultBackendLoginProbe(backend: string, model?: string): Promise<boolean | null> {
   try {
     if (backend === "claude") return await detectClaudeLogin();
     if (backend === "codex") return await isCodexReady();
+    // pi: per-provider credentials — ask about the bot's own model; no model
+    // configured → binary presence is the only fact we can state.
+    if (backend === "pi") return await isPiReady(model);
     return null; // 未知底座:探测不了,如实 unknown
   } catch {
     return null;
@@ -403,21 +408,25 @@ interface HealthCredentialItem {
 }
 
 async function runHealthScan(
-  bot: { id: string; backend?: string; app_id: string; lark_cli_profile?: string; lark_cli_isolated?: boolean; repos?: unknown[]; git_token_env?: string; gitlab_token_env?: string },
+  bot: { id: string; backend?: string; model?: string; app_id: string; lark_cli_profile?: string; lark_cli_isolated?: boolean; repos?: unknown[]; git_token_env?: string; gitlab_token_env?: string },
   hostConfigStore: { readSecret(envName: string): Promise<string | null> },
 ): Promise<Record<string, unknown>> {
   const credentials: HealthCredentialItem[] = [];
   const backend = bot.backend || "claude";
 
   // ① 底座登录态(主机级,必需)
-  const login = await healthScanBackendLoginProbe(backend);
+  const login = await healthScanBackendLoginProbe(backend, bot.model);
+  const loginHint =
+    backend === "pi"
+      ? `pi 的凭据按 provider 配置:在 ~/.pi/agent/models.json(或 provider 对应环境变量)配好 API key,然后 \`pi auth check --model ${bot.model ?? "<provider/model>"}\` 验证`
+      : `终端运行 \`${backend === "claude" ? "claude" : "codex login"}\` 完成登录`;
   credentials.push({
     id: "backend-login",
-    label: backend === "claude" ? "Claude 登录" : backend === "codex" ? "Codex 登录" : `${backend} 登录`,
+    label: backend === "claude" ? "Claude 登录" : backend === "codex" ? "Codex 登录" : backend === "pi" ? "pi 模型凭据" : `${backend} 登录`,
     status: login === null ? "unknown" : login ? "ok" : "fail",
     severity: "required",
     global: true,
-    ...(login === false ? { hint: `终端运行 \`${backend === "claude" ? "claude" : "codex login"}\` 完成登录` } : {}),
+    ...(login === false ? { hint: loginHint } : {}),
   });
 
   // ② lark-cli profile bot 身份(agent 级,必需)—— auth status --json 一并
@@ -1884,10 +1893,11 @@ const getRuntimeRequirements: ApiHandler = async (req) => {
 const BACKEND_META: Record<string, { id: string; name: string; short: string; vendor: string; mono: string }> = {
   claude: { id: "claude", name: "Claude Code", short: "Claude", vendor: "Anthropic 订阅", mono: "CC" },
   codex:  { id: "codex",  name: "Codex",       short: "Codex",  vendor: "OpenAI 订阅",  mono: "CX" },
+  pi:     { id: "pi",     name: "pi",          short: "pi",     vendor: "自带模型 / API key", mono: "PI" },
 };
 
 /** Canonical display order (mirrors backendKit.jsx LK_BACKEND_ORDER, minus hypothetical gemini). */
-const BACKEND_ORDER = ["codex", "claude"];
+const BACKEND_ORDER = ["codex", "claude", "pi"];
 
 /**
  * Detect codex ready: binary in PATH AND local Codex CLI login auth.json.
@@ -1903,6 +1913,19 @@ async function isCodexReady(): Promise<boolean> {
   if (!binary.found) return false;
   if (!await detectCodexLogin()) return false;
   return (await detectCodexRuntimeWritable()).ok;
+}
+
+/**
+ * Detect pi ready: binary in PATH, and — when a model is known — the
+ * provider behind it has usable credentials (`pi auth check`). pi has no
+ * global login, so with no model hint "binary present" is all we can say
+ * (null = unknown, never a false "ready").
+ */
+async function isPiReady(model?: string): Promise<boolean | null> {
+  const binary = await detectPiBinary();
+  if (!binary.found) return false;
+  if (!model) return null;
+  return (await detectPiAuth(model)).ready;
 }
 
 /**
@@ -2000,9 +2023,13 @@ async function readBackendModelFacts(): Promise<{
  */
 const getBackends: ApiHandler = async (_req) => {
   const codexReady = await isCodexReady();
+  // pi: the registry has no model context, so "ready" here means the binary
+  // is installed; per-provider credentials are checked by the bot health scan.
+  const piReady = (await detectPiBinary()).found;
   const ready: Record<string, boolean> = {
     claude: true,   // claude is always assumed ready (checked separately by doctor)
     codex: codexReady,
+    pi: piReady,
   };
   const modelFacts = await readBackendModelFacts();
   const backends = BACKEND_ORDER.map((id) => ({

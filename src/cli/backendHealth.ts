@@ -140,3 +140,58 @@ export async function detectClaudeBinary(): Promise<{ found: boolean; version?: 
     return { found: false };
   }
 }
+
+/**
+ * Check whether the `pi` binary (npm `@earendil-works/pi-coding-agent`)
+ * exists on PATH. Never throws.
+ */
+export async function detectPiBinary(): Promise<{ found: boolean; version?: string }> {
+  try {
+    const { stdout } = await execFileAsync("pi", ["--version"]);
+    const version = stdout.trim().split("\n")[0];
+    return { found: true, version };
+  } catch {
+    return { found: false };
+  }
+}
+
+export interface PiAuthResult {
+  /** null = could not evaluate (no model/provider hint, or pi missing). */
+  ready: boolean | null;
+  provider?: string;
+  /** pi's own reason string when not ready (e.g. "provider_not_found", "missing_api_key"). */
+  reason?: string;
+}
+
+/**
+ * Ask pi whether the provider behind `model` (a `provider/id` pair, bare id
+ * or provider name) has usable credentials: `pi auth check --model <m> --json`
+ * → `{"status":"ready"|"not_ready","provider":...,"reason"?:...}` (exit 1
+ * when not ready). pi has no global login state — readiness is per provider,
+ * which is why a model hint is required; without one this returns
+ * `ready: null` rather than guessing.
+ *
+ * NEVER passes `--credentials`, so the key value is never printed or read.
+ */
+export async function detectPiAuth(model?: string): Promise<PiAuthResult> {
+  if (!model) return { ready: null };
+  // Always --model: it accepts exactly what the runner passes (bare id,
+  // provider/id, pattern) and resolves the provider itself.
+  let stdout = "";
+  try {
+    ({ stdout } = await execFileAsync("pi", ["auth", "check", "--model", model, "--json"]));
+  } catch (err) {
+    stdout = String((err as { stdout?: unknown })?.stdout ?? "");
+    if (!stdout.trim()) return { ready: null };
+  }
+  try {
+    const parsed = JSON.parse(stdout.trim()) as { status?: unknown; provider?: unknown; reason?: unknown };
+    return {
+      ready: parsed.status === "ready",
+      ...(typeof parsed.provider === "string" ? { provider: parsed.provider } : {}),
+      ...(typeof parsed.reason === "string" ? { reason: parsed.reason } : {}),
+    };
+  } catch {
+    return { ready: null };
+  }
+}
