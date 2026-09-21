@@ -20,6 +20,7 @@ src/
   agent/        AgentRunner interface + backend registry — the extension point
   claude/       ClaudeRunner: spawns `claude --output-format stream-json`
   codex/        CodexRunner: JSON-RPC over `codex app-server --stdio`
+  pi/           PiRunner: spawns `pi -p --mode json` (BYO-model backend)
   bridge/       Message handler, card renderer, session state files
   lark/         Feishu WS channel client, card/message parsing utilities
   config/       Bot YAML loader, path helpers, zod config schema
@@ -40,6 +41,7 @@ Key files:
 | `src/lark/card.ts` | Card rendering + throttled Feishu PATCH |
 | `src/claude/runner.ts` | Reference runner implementation |
 | `src/codex/runner.ts` | Codex app-server lifecycle and protocol adapter |
+| `src/pi/runner.ts` | pi headless JSON-mode adapter (provider keys pass through — see rule 3) |
 | `src/config/botLoader.ts` | Loads `bots/*.yaml` into typed `BotConfig` |
 
 Current behavior and boundaries: [native runtime alignment](docs/native-runtime.md),
@@ -73,6 +75,11 @@ Use the CLI's existing local subscription login. The Claude runner strips
 `ANTHROPIC_API_KEY`; the Codex runner strips both `OPENAI_API_KEY` and
 `ANTHROPIC_API_KEY`. Do not reintroduce billing-key overrides or copy account
 credentials into configuration or test evidence.
+The one deliberate exception is the **pi** backend (`src/pi/runner.ts`): pi is
+the bring-your-own-model runtime and has no subscription login — provider API
+keys (in `~/.pi/agent/models.json` or the provider's env var) *are* its auth,
+so the pi runner passes the bridge's environment through unchanged. It still
+injects nothing of its own.
 
 **4. Changes to workflow go in the agent's config/skills, not in Larkway.**
 If you want the agent to behave differently (new commit convention, extra test

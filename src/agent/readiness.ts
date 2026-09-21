@@ -56,13 +56,30 @@ export interface ProbeSpec {
   args: string[];
 }
 
+/**
+ * Hints a probe may need beyond the backend name. pi has no global login —
+ * credentials are per provider — so its probe needs a model/provider to ask
+ * about; main.ts passes the first bot's configured `model` on that backend.
+ */
+export interface ProbeHint {
+  model?: string;
+}
+
 /** Login-status probe command per backend; undefined = backend has no probe. */
-export function probeSpecForBackend(backend: string): ProbeSpec | undefined {
+export function probeSpecForBackend(backend: string, hint: ProbeHint = {}): ProbeSpec | undefined {
   switch (backend) {
     case "claude":
       return { bin: "claude", args: ["auth", "status"] };
     case "codex":
       return { bin: "codex", args: ["login", "status"] };
+    case "pi": {
+      // `pi auth check` needs --model (provider/id) or --provider; with no
+      // model configured we can still catch the "CLI missing from PATH"
+      // family by probing the binary itself.
+      if (!hint.model) return { bin: "pi", args: ["--version"] };
+      const flag = hint.model.includes("/") ? "--model" : "--provider";
+      return { bin: "pi", args: ["auth", "check", flag, hint.model, "--json"] };
+    }
     default:
       return undefined;
   }
@@ -90,8 +107,9 @@ export function interpretProbe(
     stderr?: string;
   },
   platform: NodeJS.Platform = process.platform,
+  hint: ProbeHint = {},
 ): ProbeOutcome {
-  const spec = probeSpecForBackend(backend);
+  const spec = probeSpecForBackend(backend, hint);
   if (!spec) return { ok: true };
 
   if (result.errorCode === "ENOENT") {
@@ -111,6 +129,23 @@ export function interpretProbe(
         `${spec.bin} ${spec.args.join(" ")} could not be evaluated ` +
         `(${result.timedOut ? "timed out" : `spawn error ${result.errorCode}`}). ` +
         `Backend "${backend}" may still work; investigate if bots on it do not respond.`,
+    };
+  }
+
+  // pi: `auth check --json` → {"status":"not_ready","provider":"…","reason":"…"}
+  // + exit 1 when the provider behind the bot's model has no usable
+  // credentials. Per-provider, not a global login — say which one.
+  if (backend === "pi" && ((result.exitCode ?? 1) !== 0 || /"status"\s*:\s*"not_ready"/.test(result.stdout ?? ""))) {
+    const reason = /"reason"\s*:\s*"([^"]+)"/.exec(result.stdout ?? "")?.[1];
+    const provider = /"provider"\s*:\s*"([^"]+)"/.exec(result.stdout ?? "")?.[1];
+    return {
+      ok: false,
+      diagnosis:
+        `pi reports provider ${provider ? `"${provider}" ` : ""}not ready` +
+        `${reason ? ` (${reason})` : ""} for model "${hint.model ?? "?"}" (exit ${result.exitCode}). ` +
+        `Bots on backend "pi" will spawn agents that immediately fail. ` +
+        `Fix: configure the provider + API key in ~/.pi/agent/models.json (or the provider's env var) ` +
+        `as the bridge's user, then verify with \`pi auth check --model ${hint.model ?? "<provider/model>"}\`.`,
     };
   }
 
@@ -137,9 +172,11 @@ export function interpretProbe(
 }
 
 /** Run the login probe for one backend (10 s cap). Never throws. */
-export async function probeBackendReadiness(backend: string): Promise<ProbeOutcome> {
-  const spec = probeSpecForBackend(backend);
+export async function probeBackendReadiness(backend: string, hint: ProbeHint = {}): Promise<ProbeOutcome> {
+  const spec = probeSpecForBackend(backend, hint);
   if (!spec) return { ok: true };
+  const interpret = (r: Parameters<typeof interpretProbe>[1]): ProbeOutcome =>
+    interpretProbe(backend, r, process.platform, hint);
   return new Promise<ProbeOutcome>((resolve) => {
     let settled = false;
     let timer: ReturnType<typeof setTimeout> | undefined;
@@ -154,7 +191,7 @@ export async function probeBackendReadiness(backend: string): Promise<ProbeOutco
       child = spawnProcess(spec.bin, spec.args, { stdio: ["ignore", "pipe", "pipe"] });
     } catch (err) {
       const code = (err as NodeJS.ErrnoException).code;
-      done(interpretProbe(backend, { errorCode: typeof code === "string" ? code : "unknown" }));
+      done(interpret({ errorCode: typeof code === "string" ? code : "unknown" }));
       return;
     }
     timer = setTimeout(() => {
@@ -163,25 +200,16 @@ export async function probeBackendReadiness(backend: string): Promise<ProbeOutco
       } catch {
         /* already gone */
       }
-      done(interpretProbe(backend, { timedOut: true }));
+      done(interpret({ timedOut: true }));
     }, 10_000);
     const out: Buffer[] = [];
     child.stdout?.on("data", (c: Buffer) => out.push(c));
     child.stderr?.on("data", (c: Buffer) => out.push(c));
     child.on("error", (err: NodeJS.ErrnoException) => {
-      done(
-        interpretProbe(backend, {
-          errorCode: typeof err.code === "string" ? err.code : "unknown",
-        }),
-      );
+      done(interpret({ errorCode: typeof err.code === "string" ? err.code : "unknown" }));
     });
     child.on("close", (code) => {
-      done(
-        interpretProbe(backend, {
-          exitCode: code,
-          stdout: Buffer.concat(out).toString("utf8"),
-        }),
-      );
+      done(interpret({ exitCode: code, stdout: Buffer.concat(out).toString("utf8") }));
     });
   });
 }

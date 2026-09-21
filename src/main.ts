@@ -38,6 +38,7 @@ import { ClaudeRunner } from "./claude/runner.js";
 import { ClaudeProcessPool, reapOrphanedWarmClaudeProcesses } from "./claude/pool.js";
 import { CodexRunner } from "./codex/runner.js";
 import { CodexProcessPool, reapOrphanedWarmProcess } from "./codex/pool.js";
+import { PiRunner } from "./pi/runner.js";
 import { ensureLarkCliProfile, deriveLarkCliProfile } from "./lark/profileBootstrap.js";
 import { isSyntheticSessionKey } from "./lark/message.js";
 import { createCachedRosterResolver } from "./lark/rosterResolver.js";
@@ -222,7 +223,10 @@ async function runV2Mode({
   // are detected here once per distinct backend and reported loudly, instead
   // of surfacing as dead cards debugged one SSH session at a time.
   for (const backend of new Set(healthyBots.map((b) => b.backend))) {
-    const readiness = await probeBackendReadiness(backend);
+    // pi's credentials are per provider, so its probe asks about the model
+    // the first bot on that backend configured (see readiness.ts ProbeHint).
+    const modelHint = healthyBots.find((b) => b.backend === backend && b.model)?.model;
+    const readiness = await probeBackendReadiness(backend, { model: modelHint });
     if (!readiness.ok) {
       const botsOnBackend = healthyBots.filter((b) => b.backend === backend).map((b) => b.id);
       console.warn(
@@ -1401,6 +1405,8 @@ async function runV2Mode({
 
 registerRunner("claude", () => new ClaudeRunner());
 registerRunner("codex", () => new CodexRunner());
+// pi (BYO-model backend, src/pi/runner.ts): cold spawn per turn, no warm pool.
+registerRunner("pi", () => new PiRunner());
 
 async function main(): Promise<void> {
   const dryRun = process.env["LARKWAY_DRY_RUN"] === "1";
