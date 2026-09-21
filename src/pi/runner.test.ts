@@ -357,6 +357,48 @@ describe("runPi()", () => {
     expect(types).toContain("answer_delta");
   });
 
+  it("the exit→close 5 s fallback does not pre-empt a parked close while the consumer is still draining", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      const fake = makeFakeChild();
+      __nextFakeChild = fake;
+      const { runPi } = await import("./runner.js");
+      const handle = runPi({ prompt: "x", agentBinPath: "/fake/pi", pidFilePath: null });
+      let release!: () => void;
+      const gate = new Promise<void>((r) => { release = r; });
+      const seen: string[] = [];
+      const loop = (async () => {
+        for await (const ev of handle.events) {
+          seen.push(ev.type);
+          if (ev.type === "system_init") await gate; // consumer stalls after the first line
+        }
+      })();
+      await new Promise<void>((r) => setImmediate(r));
+      fake.stdout.write('{"type":"session","version":3,"id":"parked","timestamp":"t","cwd":"/w"}\n');
+      fake.stdout.write(JSON.stringify({ type: "message_end", message: { role: "assistant", content: [], stopReason: "error", errorMessage: "401 Unauthorized" } }) + "\n");
+      fake.stdout.write('{"type":"agent_settled"}\n');
+      await new Promise<void>((r) => setImmediate(r));
+      // exit fires, then close 3 s later (close parks the exit code for the drain)
+      fake.child.emit("exit", 0);
+      vi.advanceTimersByTime(3_000);
+      fake.stdout.end();
+      fake.child.emit("close", 0);
+      // exit+5 s: the exit fallback fires — it must NOT settle done now
+      vi.advanceTimersByTime(2_500);
+      let settled = false;
+      void handle.done.then(() => { settled = true; }, () => { settled = true; });
+      await new Promise<void>((r) => setImmediate(r));
+      expect(settled).toBe(false);
+      // consumer resumes and drains the parked error
+      release();
+      await loop;
+      await expect(handle.done).rejects.toThrow(/pi provider error: 401 Unauthorized/);
+      expect(seen).toContain("result");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("a slow consumer still sees the provider error: close waits for the events drain", async () => {
     const fake = makeFakeChild();
     __nextFakeChild = fake;

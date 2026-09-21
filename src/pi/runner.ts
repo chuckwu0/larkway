@@ -573,7 +573,10 @@ export function runPi(opts: RunOptions, piBinPath = "pi"): RunHandle {
         if (settled) return;
         const EXIT_TO_CLOSE_GRACE_MS = 5_000;
         const exitFallback = setTimeout(() => {
-          if (settled) return;
+          // 'close' DID fire and parked its exit code for the events drain:
+          // this fallback exists only for the no-close (grandchild holding
+          // stdio) case, and closeDrainTimer already bounds the drain.
+          if (settled || deferredExitCode !== undefined) return;
           console.warn(
             `[pi-runner] child pid=${child.pid} exited (code=${code ?? "signal"}) ` +
               `but 'close' didn't fire within ${EXIT_TO_CLOSE_GRACE_MS / 1000}s — ` +
