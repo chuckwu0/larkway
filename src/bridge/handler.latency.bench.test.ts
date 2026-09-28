@@ -18,6 +18,11 @@
  * off the critical path must update them here, with the ordering assertions
  * still passing. A call the handler starts but does not wait on shows up in
  * `expectInFlight`, not in the serial count.
+ *
+ * WP-10: the scenarios with `mode` run under LARKWAY_MODEL_FIRST. Where the
+ * turn goes model-first, every fake round trip is held until run() (see
+ * LatencyTimeline.holdUntilRun), so "0 serial, all in flight" means the
+ * runner waited on no network call at all.
  */
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { appendFile, mkdir, mkdtemp, rm } from "node:fs/promises";
@@ -83,6 +88,13 @@ interface Scenario {
   expectCalls: number;
   /** Calls started before runner.run() but not waited on (still in flight at run()). */
   expectInFlight: number;
+  /** WP-10: LARKWAY_MODEL_FIRST for this scenario (unset = off). */
+  mode?: "continuation" | "all";
+}
+
+/** WP-10: does the scenario's turn start its runner before its surfaces? */
+function goesModelFirst(s: Scenario): boolean {
+  return s.mode === "all" || (s.mode === "continuation" && s.thread === "continuation");
 }
 
 // new topic:    [reaction.add ‖ roster] → card (reply+idConvert | failed reply
@@ -108,6 +120,25 @@ const SCENARIOS: Scenario[] = [
     thread: "continuation", roster: "warm", cardkit: "ok", cotThread: "untried",
     expectSerial: 6, expectCalls: 7, expectInFlight: 0,
   },
+  // WP-10 model-first: before run() only the calls fired at turn start — the
+  // root probe (not awaited: this bot has no task-claim hook), the roster and
+  // the ⏳ reaction — and none is waited on; the lane (COT → card → reaction
+  // removal → post-card bubble) starts once the reaction lands, after run().
+  { name: "mf-continuation:continuation/roster-cold/cardkit-ok", mode: "continuation", thread: "continuation", roster: "cold", cardkit: "ok", expectSerial: 0, expectCalls: 3, expectInFlight: 3 },
+  { name: "mf-continuation:continuation/roster-warm/cardkit-ok", mode: "continuation", thread: "continuation", roster: "warm", cardkit: "ok", expectSerial: 0, expectCalls: 2, expectInFlight: 2 },
+  { name: "mf-continuation:continuation/roster-cold/cardkit-fail", mode: "continuation", thread: "continuation", roster: "cold", cardkit: "fail", expectSerial: 0, expectCalls: 3, expectInFlight: 3 },
+  {
+    name: "mf-continuation:continuation/roster-warm/cardkit-ok/cot-thread-untried",
+    mode: "continuation", thread: "continuation", roster: "warm", cardkit: "ok", cotThread: "untried",
+    expectSerial: 0, expectCalls: 2, expectInFlight: 2,
+  },
+  // `continuation` keeps a new topic card-first: exactly the off numbers.
+  { name: "mf-continuation:new/roster-cold/cardkit-ok", mode: "continuation", thread: "new", roster: "cold", cardkit: "ok", expectSerial: 4, expectCalls: 6, expectInFlight: 1 },
+  { name: "mf-continuation:new/roster-warm/cardkit-fail", mode: "continuation", thread: "new", roster: "warm", cardkit: "fail", expectSerial: 4, expectCalls: 5, expectInFlight: 1 },
+  // `all`: a new topic too. Its full prompt does not wait on a cold roster.
+  { name: "mf-all:new/roster-cold/cardkit-ok", mode: "all", thread: "new", roster: "cold", cardkit: "ok", expectSerial: 0, expectCalls: 2, expectInFlight: 2 },
+  { name: "mf-all:new/roster-warm/cardkit-fail", mode: "all", thread: "new", roster: "warm", cardkit: "fail", expectSerial: 0, expectCalls: 1, expectInFlight: 1 },
+  { name: "mf-all:continuation/roster-cold/cardkit-ok", mode: "all", thread: "continuation", roster: "cold", cardkit: "ok", expectSerial: 0, expectCalls: 3, expectInFlight: 3 },
 ];
 
 const ROOT_ID = "om_bench_root";
@@ -140,7 +171,19 @@ interface RunResult {
 }
 
 async function runScenario(root: string, s: Scenario, rep: number): Promise<RunResult> {
-  const home = join(root, `${s.name.replace(/\//g, "_")}-${rep}`);
+  const priorMode = process.env["LARKWAY_MODEL_FIRST"];
+  if (s.mode) process.env["LARKWAY_MODEL_FIRST"] = s.mode;
+  else delete process.env["LARKWAY_MODEL_FIRST"];
+  try {
+    return await runScenarioIn(root, s, rep);
+  } finally {
+    if (priorMode === undefined) delete process.env["LARKWAY_MODEL_FIRST"];
+    else process.env["LARKWAY_MODEL_FIRST"] = priorMode;
+  }
+}
+
+async function runScenarioIn(root: string, s: Scenario, rep: number): Promise<RunResult> {
+  const home = join(root, `${s.name.replace(/[/:]/g, "_")}-${rep}`);
   const workspace = join(home, "workspace");
   await mkdir(join(workspace, "repos"), { recursive: true });
   const timeline = new LatencyTimeline();
@@ -167,6 +210,7 @@ async function runScenario(root: string, s: Scenario, rep: number): Promise<RunR
     expect(primed.channel).toBe("chat-after-thread");
     timeline.clear();
   }
+  timeline.holdUntilRun = goesModelFirst(s);
   const store = fakeSessionStore(
     s.thread === "continuation"
       ? [{
@@ -305,7 +349,8 @@ describe("handler latency bench (A1)", () => {
       expect(r.serial, `serial round trips before run(): ${r.calls.join(" → ")}`).toBe(s.expectSerial);
       expect(r.calls).toHaveLength(s.expectCalls);
       expect(r.inFlight, "started before run(), not waited on").toHaveLength(s.expectInFlight);
-      if (s.thread === "new") expect(r.inFlight).toEqual(["cot.create(chat)"]);
+      if (goesModelFirst(s)) expect(r.inFlight.sort()).toEqual([...r.calls].sort());
+      else if (s.thread === "new") expect(r.inFlight).toEqual(["cot.create(chat)"]);
 
       // Ordering: an existing topic's bubble lands BEFORE the card, a new
       // topic's AFTER it (the topic does not exist until the card creates it).
@@ -325,9 +370,14 @@ describe("handler latency bench (A1)", () => {
       expect(sample.handleStartAt).toBeLessThanOrEqual(sample.runnerRunAt!);
       expect(sample.preRunner?.rosterCache).toBe(s.roster === "warm" ? "hit" : "miss");
       expect(sample.preRunner?.cotChannel).toBe(s.cotThread === "untried" ? "chat-after-thread" : "chat");
-      // A delta turn never waits on the roster; a full prompt does (≈0 here).
-      if (s.thread === "continuation") expect(sample.preRunner?.rosterMs).toBeUndefined();
-      else expect(sample.preRunner?.rosterMs).toBeGreaterThanOrEqual(0);
+      // A delta turn never waits on the roster; a full prompt does (≈0 here),
+      // unless it went model-first on a cold lookup (WP-10).
+      if (s.thread === "continuation" || (goesModelFirst(s) && s.roster === "cold")) {
+        expect(sample.preRunner?.rosterMs).toBeUndefined();
+      } else {
+        expect(sample.preRunner?.rosterMs).toBeGreaterThanOrEqual(0);
+      }
+      expect(sample.preRunner?.modelFirst).toBe(goesModelFirst(s) ? true : undefined);
       expect(sample.preRunner?.cardReplyMs).toBeGreaterThanOrEqual(NET_MS - 5);
       expect(sample.preRunner?.reactionAddMs).toBeGreaterThanOrEqual(NET_MS - 5);
       expect(sample.preRunner?.reactionRemoveMs).toBeGreaterThanOrEqual(NET_MS - 5);

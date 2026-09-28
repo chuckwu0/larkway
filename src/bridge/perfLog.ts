@@ -57,6 +57,12 @@ export interface PreRunnerPerf {
   reactionRemoveMs?: number;
   /** Legacy visible card `start` — the non-CardKit surface or the CardKit-failure fallback. */
   legacyCardMs?: number;
+  /**
+   * WP-10: the turn ran model-first (LARKWAY_MODEL_FIRST). Its reaction, COT
+   * and card timings above then ran alongside the runner, not in front of it
+   * (absent: they were awaited before it).
+   */
+  modelFirst?: boolean;
 }
 
 /** WP-0: the post-runner tail, runner done → final card delivered. */

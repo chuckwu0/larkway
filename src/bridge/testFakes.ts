@@ -50,6 +50,14 @@ export class LatencyTimeline {
   runAt: number | undefined;
   /** Start order of the (first) run() call. */
   runSeq: number | undefined;
+  /**
+   * WP-10: hold every round trip's sleep until run() (1s cap), as
+   * fakeCotClient's createAfterRun does for one call — for a model-first turn,
+   * which must not wait on any of them before the runner: a call it did wait
+   * on completes before run() (one more serial group, after the cap) instead
+   * of hanging, and every call it did not stays in flight at run().
+   */
+  holdUntilRun = false;
   private nextSeq = 0;
   private resolveRunStarted!: () => void;
   private readonly runStarted = new Promise<void>((resolve) => {
@@ -64,7 +72,8 @@ export class LatencyTimeline {
   async net<T>(what: string, ms: number, result: () => T, opts: { notBefore?: Promise<unknown> } = {}): Promise<T> {
     const seq = this.nextSeq++;
     const start = Date.now();
-    if (opts.notBefore) await opts.notBefore;
+    const notBefore = opts.notBefore ?? (this.holdUntilRun ? this.runStartedOrAfter(1000) : undefined);
+    if (notBefore) await notBefore;
     await new Promise((resolve) => setTimeout(resolve, ms));
     this.entries.push({ what, kind: "net", seq, endSeq: this.nextSeq++, start, end: Date.now() });
     return result();

@@ -79,7 +79,7 @@ import {
   stateFilePathOf,
 } from "./stateFile.js";
 import { processHandoffs, type LocalHandoffRegistry } from "./localHandoff.js";
-import { createCotEventBuffer, type BufferedSink } from "./bufferedSink.js";
+import { BufferedSurface, createCotEventBuffer, type BufferedSink } from "./bufferedSink.js";
 import { writeCardFile, deleteCardFile } from "./cardFile.js";
 import { writeCotFile, deleteCotFileIfMatches } from "./cotFile.js";
 import {
@@ -375,6 +375,41 @@ function resolveStuckSessionResetAfter(): number {
   const n = Number.parseInt(raw, 10);
   return Number.isFinite(n) && n > 0 ? n : DEFAULT_STUCK_SESSION_RESET_AFTER;
 }
+
+/**
+ * WP-10 model-first surface lane, env LARKWAY_MODEL_FIRST:
+ *   - `off` (default; also unset or unrecognised): the reply surfaces (⏳
+ *     reaction, answer card, COT bubble) exist before the runner starts.
+ *   - `continuation`: a follow-up turn in a topic this bot already has a
+ *     session for starts the runner first; its surfaces open alongside it, in
+ *     their usual order, and its early events wait for the card. Every other
+ *     turn stays card-first: the card of a turn that opens a topic is what
+ *     creates the topic, and an agent that replied through lark-cli ahead of
+ *     it would land outside.
+ *   - `all`: every turn starts the runner first.
+ * Pure scheduling: the same calls happen either way, only what the runner
+ * waits for changes.
+ */
+export type ModelFirstMode = "off" | "continuation" | "all";
+
+let warnedModelFirstValue: string | undefined;
+
+export function resolveModelFirstMode(raw: string | undefined = process.env.LARKWAY_MODEL_FIRST): ModelFirstMode {
+  const value = raw?.trim().toLowerCase() ?? "";
+  if (value === "continuation" || value === "all") return value;
+  if (value !== "" && value !== "off" && warnedModelFirstValue !== value) {
+    warnedModelFirstValue = value;
+    console.warn(`[bridge.handler] LARKWAY_MODEL_FIRST=${raw}: expected off|continuation|all — using off`);
+  }
+  return "off";
+}
+
+/**
+ * WP-10: how long a model-first turn waits for the in-topic task-root probe
+ * (a message lookup, cached per root) before rendering without <task-root>.
+ * A turn of a bot with no task-claim hook does not wait for it at all.
+ */
+const MODEL_FIRST_ROOT_PROBE_BUDGET_MS = 1_000;
 
 function summarizeMentionPolicyRules(rules: string[]): string {
   const counts = new Map<string, number>();
@@ -1057,6 +1092,11 @@ export interface BridgeHandlerDeps {
    * the background. @default COT_BUBBLE_CREATE_BUDGET_MS (3s). Test seam.
    */
   cotBubbleCreateBudgetMs?: number;
+  /**
+   * WP-10: max ms a model-first turn waits for the in-topic task-root probe.
+   * @default MODEL_FIRST_ROOT_PROBE_BUDGET_MS (1s). Test seam.
+   */
+  modelFirstRootProbeBudgetMs?: number;
   /**
    * WP-0: max ms between runner done and the success-path perf sample write.
    * @default PERF_SAMPLE_TAIL_BUDGET_MS (60s). Test seam.
@@ -1762,6 +1802,20 @@ export class BridgeHandler {
     // so does the next turn's "received" hook (a thread's turns are serialized
     // on handleOne resolving). Never rejects.
     let taskSignalsSettled: Promise<void> | undefined;
+    // WP-10: the model-first surface lane (see resolveModelFirstMode) — the
+    // reply surfaces' steps, chained in their usual order, running alongside
+    // the runner. undefined when this turn awaits each step inline instead.
+    // Every exit that reads or finalizes a surface waits for it first. Never
+    // rejects: a failed step is logged and the next one still runs.
+    let surfaceReady: Promise<void> | undefined;
+    const chainSurface = (step: () => Promise<unknown>): void => {
+      surfaceReady = (surfaceReady ?? Promise.resolve()).then(step).then(
+        () => undefined,
+        (err: unknown) => {
+          console.warn("[bridge.handler] surface lane step failed (continuing):", err);
+        },
+      );
+    };
     const settle = (ok: boolean): void => {
       if (settled) return;
       settled = true;
@@ -2001,6 +2055,21 @@ export class BridgeHandler {
       turnPerf.preRunner.rosterCache = "skip";
     }
 
+    // WP-10: does this turn start its runner first? A "continuation" is a
+    // follow-up in a topic this bot already has a session for, whose reply
+    // does not open a topic (replyInThread below stays false: a thread reply
+    // not retargeted onto a task card). The session store is only peeked
+    // when the flag is on.
+    const modelFirstMode = resolveModelFirstMode();
+    const modelFirst =
+      modelFirstMode === "all" ||
+      (modelFirstMode === "continuation" &&
+        typeof parsed.raw.root_id === "string" &&
+        parsed.raw.root_id.length > 0 &&
+        !taskCardAnchorId &&
+        this.deps.sessionStore.get(threadId, botId) !== undefined);
+    if (modelFirst) turnPerf.preRunner.modelFirst = true;
+
     const triggerType =
       typeof parsed.raw.root_id === "string" && parsed.raw.root_id
         ? "thread_reply"
@@ -2022,7 +2091,10 @@ export class BridgeHandler {
     // WP-0: the ⏳ reaction round trips on the pre-runner path, timed for the
     // perf sample (the error-path removal further down is not pre-runner).
     if (this.deps.client.addProcessingReaction) {
-      await turnPerf.timed("reactionAddMs", this.deps.client.addProcessingReaction(messageId));
+      const reactionAdded = turnPerf.timed("reactionAddMs", this.deps.client.addProcessingReaction(messageId));
+      // WP-10: the model-first lane's first step (its removal must follow).
+      if (modelFirst) chainSurface(() => reactionAdded);
+      else await reactionAdded;
     }
     const removeProcessingReactionPreRunner = async (): Promise<void> => {
       if (!this.deps.client.removeProcessingReaction) return;
@@ -2175,41 +2247,47 @@ export class BridgeHandler {
     let legacyCardStartFailed = false;
     let legacyCardStartFailureReason: string | undefined;
     let startFailurePostFallbackSent = false;
-    if (!cardKitAvailable) {
-      try {
-        card = await turnPerf.timed(
-          "legacyCardMs",
-          this.deps.cardRenderer.start(replyAnchorId, { replyInThread, threadId }),
-        );
+    const startCardOrDefer = async (): Promise<void> => {
+      if (!cardKitAvailable) {
+        try {
+          card = await turnPerf.timed(
+            "legacyCardMs",
+            this.deps.cardRenderer.start(replyAnchorId, { replyInThread, threadId }),
+          );
+          await recordEvent({
+            status: "running",
+            startedAt: new Date().toISOString(),
+            appendPath: "已创建卡片",
+            reason: "已交给本地 Agent 处理。",
+          });
+        } catch (err) {
+          legacyCardStartFailed = true;
+          legacyCardStartFailureReason = String(err);
+          console.error("[bridge.handler] Failed to start card for thread", threadId, err);
+          await recordEvent({
+            status: "running",
+            startedAt: new Date().toISOString(),
+            appendPath: "卡片创建失败，继续执行",
+            reason: "卡片创建失败，但 bridge 会继续启动本地 Agent。",
+          });
+          // Without a card we can still run Claude, but operator won't see output.
+          // Proceed — sessionStore still needs updating.
+        } finally {
+          await removeProcessingReactionPreRunner();
+        }
+      } else {
         await recordEvent({
           status: "running",
           startedAt: new Date().toISOString(),
-          appendPath: "已创建卡片",
-          reason: "已交给本地 Agent 处理。",
+          appendPath: "延迟创建卡片",
+          reason: "CardKit response surface is available; legacy card is reserved for fallback.",
         });
-      } catch (err) {
-        legacyCardStartFailed = true;
-        legacyCardStartFailureReason = String(err);
-        console.error("[bridge.handler] Failed to start card for thread", threadId, err);
-        await recordEvent({
-          status: "running",
-          startedAt: new Date().toISOString(),
-          appendPath: "卡片创建失败，继续执行",
-          reason: "卡片创建失败，但 bridge 会继续启动本地 Agent。",
-        });
-        // Without a card we can still run Claude, but operator won't see output.
-        // Proceed — sessionStore still needs updating.
-      } finally {
-        await removeProcessingReactionPreRunner();
       }
-    } else {
-      await recordEvent({
-        status: "running",
-        startedAt: new Date().toISOString(),
-        appendPath: "延迟创建卡片",
-        reason: "CardKit response surface is available; legacy card is reserved for fallback.",
-      });
-    }
+    };
+    // WP-10: next in the model-first lane, still ahead of the setup below; a
+    // failure there then finds this card to finalize, as it would inline.
+    if (modelFirst) chainSurface(startCardOrDefer);
+    else await startCardOrDefer();
 
     try {
       // Step 4a: build conventions (per-thread worktreePath)
@@ -2378,7 +2456,8 @@ export class BridgeHandler {
       ): Promise<void> => {
         if (!(this.deps.cotClient && cotDetail !== "off" && cotSurface === "bubble")) return;
         if (bubbleCreate) return; // once per turn
-        const sink = createCotEventBuffer();
+        // A model-first turn made the sink before its runner started (WP-10).
+        const sink = cotSink ?? createCotEventBuffer();
         cotSink = sink;
         bubbleCreate = createCotProgressHandle({
           cotClient: this.deps.cotClient,
@@ -2483,7 +2562,9 @@ export class BridgeHandler {
       // the same treatment a brand-new topic already gets.
       const triggerIsRealMessage =
         typeof parsed.raw.message_id === "string" && parsed.raw.message_id.startsWith("om_");
-      if (!isNewThread && triggerIsRealMessage && (triggerInTopic || !taskCardAnchorId)) {
+      const preCardBubble = !isNewThread && triggerIsRealMessage && (triggerInTopic || !taskCardAnchorId);
+      // WP-10: a model-first turn makes it in its surface lane, ahead of the card.
+      if (preCardBubble && !modelFirst) {
         await createCotBubble(messageId, { awaitCreate: true });
       }
 
@@ -2621,9 +2702,10 @@ export class BridgeHandler {
         }
       };
 
-      if (isAgentWorkspace) {
+      if (isAgentWorkspace && !modelFirst) {
         // A1 early path: safe (see rationale above) — no bridge-managed
-        // worktree to race against.
+        // worktree to race against. (WP-10: a model-first turn creates it in
+        // its surface lane, started once this setup is done.)
         await createCardKitPlaceholder();
       }
 
@@ -2869,7 +2951,7 @@ export class BridgeHandler {
         console.warn("[bridge.handler] ensureStateFile failed (continuing):", err);
       }
 
-      if (!isAgentWorkspace) {
+      if (!isAgentWorkspace && !modelFirst) {
         // Legacy runtime: baseline ordering — the worktree definitely exists
         // (built above) before the card is created. See the A1 rationale at
         // the other call site for why legacy does NOT get the early-card path.
@@ -2880,20 +2962,23 @@ export class BridgeHandler {
       //   finalize this card if the bridge crashes before card.finalize().
       //   Gated on a live card handle. Best-effort: a write failure must not
       //   abort the turn.
-      if (card) {
-        try {
-          await writeCardFile(worktreePath, {
-            messageId: card.messageId,
-            chatId: parsed.chatId,
-            threadId,
-            botId: this.deps.botConfig?.id ?? "",
-            replyInThread,
-            createdAt: new Date().toISOString(),
-          });
-        } catch (err) {
-          console.warn("[bridge.handler] writeCardFile failed (continuing):", err);
+      const writeCardLedger = async (): Promise<void> => {
+        if (card) {
+          try {
+            await writeCardFile(worktreePath, {
+              messageId: card.messageId,
+              chatId: parsed.chatId,
+              threadId,
+              botId: this.deps.botConfig?.id ?? "",
+              replyInThread,
+              createdAt: new Date().toISOString(),
+            });
+          } catch (err) {
+            console.warn("[bridge.handler] writeCardFile failed (continuing):", err);
+          }
         }
-      }
+      };
+      if (!modelFirst) await writeCardLedger();
 
       // Step 4a-vi: pre-install node_modules in the worktree (best-effort).
       //   Without this the bot trips on `Cannot find module 'ts-node/register'`
@@ -3007,9 +3092,42 @@ export class BridgeHandler {
       // WP-2 (c): not awaited — the card is already out, so nothing visible
       // is ordered behind this bubble; the runner starts right away and the
       // handle is adopted (with any buffered events) when the create lands.
-      {
+      const createDeferredBubble = (): void => {
         const anchorMessageId = cardKitProgress?.messageId ?? card?.messageId ?? messageId;
         void createCotBubble(anchorMessageId, { awaitCreate: false });
+      };
+
+      // WP-10: what the stream loop and the idle notice feed instead of the
+      // card handles. Not model-first: attached now, so it passes straight
+      // through to whichever handle is live. Model-first: it holds the
+      // runner's early events (bounded, answer text coalesced, never dropped)
+      // until the lane below has the card, then replays them in order.
+      const surface = new BufferedSurface({
+        handle: (ev) => {
+          if (cardKitProgress) cardKitProgress.handle(ev);
+          else if (card) card.handle(ev);
+        },
+        markIdleWaiting: (silentMs, idleOpts) => cardKitProgress?.markIdleWaiting(silentMs, idleOpts),
+        clearIdleWaiting: () => cardKitProgress?.clearIdleWaiting(),
+      });
+      if (!modelFirst) {
+        surface.attach();
+        createDeferredBubble();
+      } else {
+        // The rest of the lane, in the inline order: the pre-card bubble of an
+        // existing session, the card (CardKit, else the legacy fallback tree,
+        // else a post), its ledger, the post-card bubble. Started only now, so
+        // a legacy worktree exists before anything writes into it.
+        if (this.deps.cotClient && cotDetail !== "off" && cotSurface === "bubble") {
+          cotSink = createCotEventBuffer(); // the runner may emit before the bubble exists
+        }
+        chainSurface(async () => {
+          if (preCardBubble) await createCotBubble(messageId, { awaitCreate: true });
+          await createCardKitPlaceholder();
+          await writeCardLedger();
+          createDeferredBubble();
+        });
+        chainSurface(async () => surface.attach());
       }
 
       // Step 4b–4f: spawn + stream + finalize, with one stale-session retry.
@@ -3019,6 +3137,9 @@ export class BridgeHandler {
 
       while (true) {
         attempt++;
+        // WP-10: only the first attempt runs ahead of the surfaces; a
+        // stale-session retry starts once they are up.
+        if (attempt > 1 && surfaceReady) await surfaceReady;
 
         // Step 4b: render prompt — isNewThread reflects current attempt's state.
         const backend = this.deps.botConfig?.backend ?? "claude";
@@ -3056,8 +3177,26 @@ export class BridgeHandler {
         // The topic already exists (we're inside it), so the deep link comes
         // straight from the event's own thread_id — no dependency on the
         // (possibly pre-topic, cached) probe result's threadId field.
-        if (deferredTaskRootProbe) {
-          const info = await turnPerf.timed("rootProbeMs", deferredTaskRootProbe);
+        // WP-10: a model-first turn waits for it within a budget, and not at
+        // all when this bot has no task-claim hook — then only the prompt's
+        // <task-root> facts would use it. A late answer still fills the lookup
+        // cache for the next turn.
+        const taskRootProbe = !modelFirst
+          ? deferredTaskRootProbe
+          : deferredTaskRootProbe && this.deps.taskHandleClaim && botId
+            ? Promise.race([
+                deferredTaskRootProbe,
+                new Promise<undefined>((resolve) => {
+                  const t = setTimeout(
+                    () => resolve(undefined),
+                    this.deps.modelFirstRootProbeBudgetMs ?? MODEL_FIRST_ROOT_PROBE_BUDGET_MS,
+                  );
+                  t.unref?.();
+                }),
+              ])
+            : undefined;
+        if (taskRootProbe) {
+          const info = await turnPerf.timed("rootProbeMs", taskRootProbe);
           if (info?.msgType === "todo" && info.content) {
             const todo = parseTodoShareContent(info.content);
             if (todo) {
@@ -3086,6 +3225,8 @@ export class BridgeHandler {
         // the fresh omt_* id so the <task-root> fact can carry the topic deep
         // link the agent pastes into its claim comment. Best-effort.
         if (taskRootInfo && !taskRootInfo.topicLink && replyAnchorId !== messageId && this.deps.messageLookup) {
+          // WP-10: that card is in the model-first lane — wait for it here.
+          if (surfaceReady) await surfaceReady;
           const refreshed = await this.deps.messageLookup.get(replyAnchorId, { refresh: true }).catch(() => undefined);
           const refreshedThreadId = realTopicThreadId(refreshed?.threadId);
           if (refreshedThreadId) {
@@ -3106,8 +3247,15 @@ export class BridgeHandler {
         // same-app-scope ids so a handoff @ actually wakes the peer. See
         // rosterTask (WP-2 (b)): started at turn start, awaited here only by a
         // full prompt; a delta turn renders without it.
+        // WP-10: model-first waits only for an answer served from the cache;
+        // a cold lookup keeps running (it fills the cache) while this prompt
+        // renders the static ids, and the handoff @ below still waits for it.
         let effectivePeers = this.deps.peers;
-        if (rosterTask && rendersFullPrompt) {
+        if (
+          rosterTask &&
+          rendersFullPrompt &&
+          (!modelFirst || rosterLookup.cache === "hit" || rosterLookup.cache === "stale")
+        ) {
           effectivePeers = await turnPerf.timed("rosterMs", rosterTask);
         }
         // WP-2 (f): the session's native history already holds the last
@@ -3468,7 +3616,7 @@ export class BridgeHandler {
               if (idleSuspected && silentMs - idleNoticeAtMs >= noticeRefreshMs) {
                 idleNoticeAtMs = silentMs;
                 try {
-                  cardKitProgress?.markIdleWaiting(silentMs, {
+                  surface.markIdleWaiting(silentMs, {
                     hasBubble: cotPublisher?.bubbleRef !== undefined,
                     toolInFlight: toolExemptsKill,
                   });
@@ -3489,7 +3637,7 @@ export class BridgeHandler {
                     (this.deps.botConfig?.id ? ` [bot ${this.deps.botConfig.id}]` : ""),
                 );
                 try {
-                  cardKitProgress?.markIdleWaiting(silentMs, {
+                  surface.markIdleWaiting(silentMs, {
                     hasBubble: cotPublisher?.bubbleRef !== undefined,
                     toolInFlight: toolExemptsKill,
                   });
@@ -3638,7 +3786,7 @@ export class BridgeHandler {
                   (this.deps.botConfig?.id ? ` [bot ${this.deps.botConfig.id}]` : ""),
               );
               try {
-                cardKitProgress?.clearIdleWaiting();
+                surface.clearIdleWaiting();
               } catch {
                 /* status notice is best-effort */
               }
@@ -3667,8 +3815,9 @@ export class BridgeHandler {
                 }
               }
             }
-            if (cardKitProgress) cardKitProgress.handle(ev);
-            else if (card) card.handle(ev);
+            // Through `surface` (WP-10): straight to the live card handle,
+            // or held until the model-first lane has the card.
+            surface.handle(ev);
             // COT is a parallel channel, not an either/or with the card: feed
             // it every event regardless of which primary surface is live
             // (through cotSink, which holds them until the handle is adopted).
@@ -3699,6 +3848,10 @@ export class BridgeHandler {
             idleWatchdog = undefined;
           }
           if (queueKey) this.activeTurnStops.delete(queueKey);
+          // WP-10: everything below reads or finalizes the surfaces — a
+          // model-first turn waits for its lane (the card, and the early events
+          // replayed into it) here, a /stop'd one included.
+          if (surfaceReady) await surfaceReady;
 
           // COT bubble teardown is deferred to just after `success` is known
           // (search cotTurnOutcome below). It used to run here and had to guess
@@ -4766,7 +4919,8 @@ export class BridgeHandler {
                     const outcomes = await processHandoffs({
                       handoffs: declaredHandoffs,
                       // WP-2 (b): a delta turn rendered without the live roster, so
-                      // settle it for the @ targets now (a full turn's is already in).
+                      // settle it for the @ targets now (a full turn's is already in,
+                      // unless it went model-first on a cold lookup, WP-10).
                       // A turn-start answer served "stale" came with a refresh; by now
                       // it has usually landed, so ask again (a lookup that finds
                       // nothing keeps the turn-start peers).
@@ -4996,6 +5150,11 @@ export class BridgeHandler {
       }
     } catch (err) {
       console.error("[bridge.handler] handleOne failed for thread", threadId, err);
+      // WP-10: a model-first turn can fail (run() throwing, the stream dying,
+      // a setup step) while its lane is still opening the card; the failure
+      // card below needs it, and nothing may outlive the turn as an orphan
+      // 努力回答中 card. Never rejects.
+      if (surfaceReady) await surfaceReady;
       // v4.2 round-2 fix: exception exits (spawn throw, pre-finalize throw)
       // bypass the success-path outcome write — without this, a STALE
       // "completed" from an earlier turn masks a peer whose post-mention turn
