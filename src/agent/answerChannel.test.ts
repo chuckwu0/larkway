@@ -5,6 +5,9 @@ import {
   ANSWER_END_MARKER,
   splitAnswerChannelText,
 } from "./answerChannel.js";
+import type { AgentStreamEvent } from "./runner.js";
+import { parseLinesMulti } from "../claude/runner.js";
+import { _parsePiLine as parsePiLine } from "../pi/runner.js";
 
 describe("splitAnswerChannelText", () => {
   it("treats unmarked backend prose as internal text", () => {
@@ -184,5 +187,218 @@ describe("AnswerChannelExtractor", () => {
 
     expect(deltaEvents.some((event) => event.type === "answer_delta")).toBe(true);
     expect(snapshotEvents.filter((event) => event.type === "answer_snapshot")).toHaveLength(0);
+  });
+});
+
+// WP-6: claude (--include-partial-messages) and pi stream text deltas and then
+// deliver the finished block as a snapshot — claude as one `assistant` line
+// per content block, pi as `message_end` carrying the message's blocks. These
+// replay both shapes through the real runner parsers.
+describe("AnswerChannelExtractor — block snapshot after streamed deltas (WP-6)", () => {
+  type Parse = (line: string, extractor: AnswerChannelExtractor) => Iterable<AgentStreamEvent>;
+  interface Backend {
+    name: string;
+    parse: Parse;
+    delta: (text: string) => string;
+    /** One line delivering these finished text blocks. */
+    blocks: (texts: string[]) => string;
+  }
+
+  const backends: Backend[] = [
+    {
+      name: "claude",
+      parse: (line, extractor) => parseLinesMulti(line, extractor),
+      delta: (text) =>
+        JSON.stringify({
+          type: "stream_event",
+          event: { type: "content_block_delta", index: 0, delta: { type: "text_delta", text } },
+        }),
+      blocks: (texts) =>
+        JSON.stringify({
+          type: "assistant",
+          message: { content: texts.map((text) => ({ type: "text", text })) },
+        }),
+    },
+    {
+      name: "pi",
+      parse: (line, extractor) => parsePiLine(line, extractor),
+      delta: (delta) =>
+        JSON.stringify({
+          type: "message_update",
+          assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta },
+        }),
+      blocks: (texts) =>
+        JSON.stringify({
+          type: "message_end",
+          message: { role: "assistant", content: texts.map((text) => ({ type: "text", text })) },
+        }),
+    },
+  ];
+
+  const chunks = (text: string): string[] => text.match(/.{1,8}/gs) ?? [];
+
+  function replay(
+    backend: Backend,
+    lines: string[],
+    extractor = new AnswerChannelExtractor(),
+  ): { events: AgentStreamEvent[]; answer: string; internals: string[] } {
+    const events = lines.flatMap((line) => [...backend.parse(line, extractor)]);
+    let answer = "";
+    for (const event of events) {
+      if (event.type === "answer_delta") answer += event.text;
+      else if (event.type === "answer_snapshot") answer = event.text;
+    }
+    const internals = events.flatMap((event) => (event.type === "internal_text" ? [event.text] : []));
+    return { events, answer, internals };
+  }
+
+  const answerTypes = (events: AgentStreamEvent[]): string[] =>
+    events
+      .filter((event) => event.type === "answer_delta" || event.type === "answer_snapshot")
+      .map((event) => event.type);
+
+  const body = "Hello world, this is a longer answer without an end marker.";
+
+  describe.each(backends)("$name", (backend) => {
+    it("no END marker: the block snapshot completes the answer once, without the BEGIN line", () => {
+      const block = `${ANSWER_BEGIN_MARKER}\n${body}`;
+      const { events, answer } = replay(backend, [...chunks(block).map(backend.delta), backend.blocks([block])]);
+
+      expect(answer).toBe(body);
+      expect(answer).not.toContain(ANSWER_BEGIN_MARKER);
+      expect(answerTypes(events).every((type) => type === "answer_delta")).toBe(true);
+    });
+
+    it("END marker: the block snapshot adds nothing to the answer channel", () => {
+      const block = `${ANSWER_BEGIN_MARKER}\n${body}\n${ANSWER_END_MARKER}`;
+      const extractor = new AnswerChannelExtractor();
+      const streamed = replay(backend, chunks(block).map(backend.delta), extractor);
+      const final = replay(backend, [backend.blocks([block])], extractor);
+
+      expect(streamed.answer).toBe(body);
+      expect(answerTypes(final.events)).toEqual([]);
+    });
+
+    it("no marker at all: nothing reaches the answer; the block surfaces once as internal_text", () => {
+      const block = "Plain reply with no markers at all, reasonably long text.";
+      const { answer, internals } = replay(backend, [...chunks(block).map(backend.delta), backend.blocks([block])]);
+
+      expect(answer).toBe("");
+      expect(internals).toEqual([block]);
+    });
+
+    it("deltas alone hold back only the possible END-marker tail; the block snapshot releases exactly that tail", () => {
+      const block = `${ANSWER_BEGIN_MARKER}\n${body}`;
+      const extractor = new AnswerChannelExtractor();
+      const streamed = replay(backend, chunks(block).map(backend.delta), extractor);
+      const final = replay(backend, [backend.blocks([block])], extractor);
+
+      expect(body.startsWith(streamed.answer)).toBe(true);
+      expect(streamed.answer.length).toBeLessThan(body.length);
+      expect(body.length - streamed.answer.length).toBeLessThanOrEqual(ANSWER_END_MARKER.length + 2);
+      expect(final.events.filter((event) => event.type === "answer_delta")).toEqual([
+        expect.objectContaining({ text: body.slice(streamed.answer.length) }),
+      ]);
+      expect(streamed.answer + final.answer).toBe(body);
+    });
+
+    it("a snapshot longer than the streamed deltas feeds only the unseen suffix", () => {
+      const block = `${ANSWER_BEGIN_MARKER}\n${body}`;
+      const streamedPart = block.slice(0, block.length - 12);
+      const { answer } = replay(backend, [...chunks(streamedPart).map(backend.delta), backend.blocks([block])]);
+
+      expect(answer).toBe(body);
+    });
+  });
+
+  describe("multiple text blocks", () => {
+    const [claude, pi] = backends as [Backend, Backend];
+    const preamble = "Let me check the code first.";
+    const answerBody = "The fix is in parser.ts line 12, see the diff.";
+    const answerBlock = `${ANSWER_BEGIN_MARKER}\n${answerBody}\n${ANSWER_END_MARKER}`;
+    const claudeToolUse = JSON.stringify({
+      type: "assistant",
+      message: { content: [{ type: "tool_use", id: "call_1", name: "Read", input: {} }] },
+    });
+
+    it("claude: an answer block that opens with BEGIN after a preamble block streams live, not only at its snapshot", () => {
+      const extractor = new AnswerChannelExtractor();
+      const beforeAnswerSnapshot = replay(
+        claude,
+        [
+          ...chunks(preamble).map(claude.delta),
+          claude.blocks([preamble]),
+          claudeToolUse,
+          ...chunks(answerBlock).map(claude.delta),
+        ],
+        extractor,
+      );
+      const final = replay(claude, [claude.blocks([answerBlock])], extractor);
+
+      expect(beforeAnswerSnapshot.answer).toBe(answerBody);
+      expect(beforeAnswerSnapshot.internals).toEqual([preamble]);
+      expect(answerTypes(final.events)).toEqual([]);
+    });
+
+    it("claude: an answer spanning two blocks is neither duplicated nor truncated", () => {
+      const first = `${ANSWER_BEGIN_MARKER}\nPart one of the answer, long enough to stream.`;
+      const second = `Part two.\n${ANSWER_END_MARKER}`;
+      const { answer } = replay(claude, [
+        ...chunks(first).map(claude.delta),
+        claude.blocks([first]),
+        claudeToolUse,
+        ...chunks(second).map(claude.delta),
+        claude.blocks([second]),
+      ]);
+
+      expect(answer).toBe("Part one of the answer, long enough to stream.Part two.");
+    });
+
+    it("pi: a BEGIN line glued to the previous block in the delta stream is recovered from the message_end blocks", () => {
+      const { answer, internals } = replay(pi, [
+        ...chunks(preamble).map(pi.delta),
+        ...chunks(answerBlock).map(pi.delta),
+        pi.blocks([preamble, answerBlock]),
+      ]);
+
+      expect(answer).toBe(answerBody);
+      expect(internals).toEqual([preamble]);
+    });
+
+    // pi retries a provider error in-process; the retried message streams a
+    // fresh BEGIN line while the extractor is already in answer mode.
+    const cut = `${ANSWER_BEGIN_MARKER}\nFirst attempt answer that was cut`;
+    const errorEnds: Array<[string, unknown[]]> = [
+      ["without text", []],
+      ["carrying the partial text", [{ type: "text", text: cut }]],
+    ];
+    it.each(errorEnds)(
+      "pi: after a failed attempt (error message_end %s) the retried message's block replaces the answer",
+      (_label, content) => {
+        const retried = `${ANSWER_BEGIN_MARKER}\nSecond attempt answer, complete this time.`;
+        const { answer } = replay(pi, [
+          ...chunks(cut).map(pi.delta),
+          JSON.stringify({ type: "message_end", message: { role: "assistant", content, stopReason: "error" } }),
+          ...chunks(retried).map(pi.delta),
+          pi.blocks([retried]),
+        ]);
+
+        expect(answer).toBe("Second attempt answer, complete this time.");
+      },
+    );
+  });
+
+  it("a text block the deltas never carried does not append to an answer in progress", () => {
+    const extractor = new AnswerChannelExtractor();
+    const block = `${ANSWER_BEGIN_MARKER}\n${body}`;
+    const streamed = [
+      ...extractor.ingestDelta(block, { id: 1 }),
+      ...extractor.ingestGrowingSnapshot(block, { id: 2 }),
+    ];
+    const unrelated = extractor.ingestGrowingSnapshot("Unrelated text block with no deltas.", { id: 3 });
+
+    const streamedAnswer = streamed.flatMap((event) => (event.type === "answer_delta" ? [event.text] : []));
+    expect(streamedAnswer.join("")).toBe(body);
+    expect(answerTypes(unrelated)).toEqual([]);
   });
 });

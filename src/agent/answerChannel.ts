@@ -56,11 +56,19 @@ export class AnswerChannelExtractor {
   private visibleText = "";
   private lastSnapshotText = "";
   private lastWaitingCatchUpText = "";
+  // Delta-streaming runtimes (claude with --include-partial-messages, pi):
+  // whether this turn has streamed any delta, the text streamed since the
+  // last block snapshot, and whether drain() entered answer mode since then.
+  // See ingestStreamedBlockSnapshot.
+  private sawDelta = false;
+  private blockDeltaText = "";
+  private answerBeganInBlock = false;
 
   ingestDelta(text: string, raw: unknown): AgentStreamEvent[] {
     if (!text || this.mode === "closed") return [];
-    this.buffer += text;
-    return this.drain(raw);
+    this.sawDelta = true;
+    this.blockDeltaText += text;
+    return this.feed(text, raw);
   }
 
   ingestSnapshot(text: string, raw: unknown): AgentStreamEvent[] {
@@ -83,20 +91,93 @@ export class AnswerChannelExtractor {
     return out;
   }
 
+  /**
+   * Text-block snapshot from a runtime that may also stream deltas.
+   *
+   * Once the turn has streamed deltas, each snapshot is the completed text
+   * block those deltas built (claude emits one `assistant` line per finished
+   * content block; pi's `message_end` carries the message's finished blocks)
+   * and goes to ingestStreamedBlockSnapshot. A turn without any delta
+   * (partial messages off, or codex's growing agent_message snapshots) keeps
+   * the growing-snapshot fallback below unchanged.
+   */
   ingestGrowingSnapshot(text: string, raw: unknown): AgentStreamEvent[] {
     if (!text || this.mode === "closed") return [];
+    if (this.sawDelta) return this.ingestStreamedBlockSnapshot(text, raw);
     if (this.lastSnapshotText && text.startsWith(this.lastSnapshotText)) {
       const delta = text.slice(this.lastSnapshotText.length);
       this.lastSnapshotText = text;
-      const events = delta ? this.ingestDelta(delta, raw) : [];
+      const events = delta ? this.feed(delta, raw) : [];
       return this.withWaitingCatchUp(events, text, raw);
     }
     if (this.lastSnapshotText === "") {
       this.lastSnapshotText = text;
-      return this.withWaitingCatchUp(this.ingestDelta(text, raw), text, raw);
+      return this.withWaitingCatchUp(this.feed(text, raw), text, raw);
     }
     this.lastSnapshotText = text;
     return this.ingestSnapshot(text, raw);
+  }
+
+  /**
+   * WP-6: a completed text block arriving after deltas.
+   *
+   * The deltas already fed this block through drain(), so the snapshot must
+   * not be fed again — re-feeding it whole (the old first-snapshot branch)
+   * duplicated the answer and leaked the LARKWAY_ANSWER_BEGIN line into it
+   * whenever the END marker was missing. Only a suffix the deltas never
+   * delivered is fed. The snapshot then marks the block's end: the text held
+   * back in case it was the start of an END marker (STREAM_HOLD_CHARS) is
+   * flushed, and a waiting buffer is dropped, because a marker line never
+   * spans two content blocks.
+   *
+   * A block with a BEGIN line is parsed on its own, as the plain snapshot
+   * path does, unless the deltas carried it and entered the answer while
+   * streaming it — i.e. unless the delta stream consumed that BEGIN line.
+   * The others are a block the deltas did not carry (none streamed for it,
+   * or the text diverged), a BEGIN glued to the previous block's last
+   * character in the delta stream (a later text block of the same pi
+   * message), and a BEGIN that re-opens an answer already in progress (a
+   * pi retry after a provider error), which drain() streamed as answer text.
+   */
+  private ingestStreamedBlockSnapshot(text: string, raw: unknown): AgentStreamEvent[] {
+    const streamed = this.blockDeltaText;
+    this.blockDeltaText = "";
+    const events: AgentStreamEvent[] = [];
+    let carried = false;
+    if (streamed && streamed.startsWith(text)) {
+      carried = true;
+    } else if (streamed && text.startsWith(streamed)) {
+      carried = true;
+      events.push(...this.feed(text.slice(streamed.length), raw));
+    }
+    const beganInBlock = this.answerBeganInBlock;
+    this.answerBeganInBlock = false;
+    const hasBegin = markerLineIndex(text, ANSWER_BEGIN_MARKER) !== null;
+    if (this.mode !== "closed" && hasBegin && !(carried && beganInBlock)) {
+      events.push(...this.adoptBlockSnapshot(text, raw));
+    } else {
+      events.push(...this.endBlock(raw));
+    }
+    return this.withWaitingCatchUp(events, text, raw);
+  }
+
+  private adoptBlockSnapshot(text: string, raw: unknown): AgentStreamEvent[] {
+    this.buffer = "";
+    const events = this.ingestSnapshot(text, raw);
+    // BEGIN without END: later blocks continue the answer, as on the delta path.
+    if (this.mode === "waiting") this.mode = "answer";
+    return events;
+  }
+
+  private endBlock(raw: unknown): AgentStreamEvent[] {
+    if (this.mode === "waiting") {
+      this.buffer = "";
+      return [];
+    }
+    if (this.mode !== "answer" || !hasUsefulText(this.buffer)) return [];
+    const heldTail = this.buffer;
+    this.buffer = "";
+    return [this.answerDelta(heldTail, raw)];
   }
 
   /**
@@ -136,6 +217,12 @@ export class AnswerChannelExtractor {
     return [...events, { type: "internal_text", text: bounded, raw }];
   }
 
+  private feed(text: string, raw: unknown): AgentStreamEvent[] {
+    if (!text || this.mode === "closed") return [];
+    this.buffer += text;
+    return this.drain(raw);
+  }
+
   private drain(raw: unknown): AgentStreamEvent[] {
     const events: AgentStreamEvent[] = [];
 
@@ -149,6 +236,7 @@ export class AnswerChannelExtractor {
       if (before.trim()) events.push({ type: "internal_text", text: before, raw });
       this.buffer = this.buffer.slice(begin.end);
       this.mode = "answer";
+      this.answerBeganInBlock = true;
     }
 
     if (this.mode !== "answer") return events;
