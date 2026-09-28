@@ -72,8 +72,8 @@ export interface RenderPromptInput {
   larkCliProfile?: string;
   runtimeWarnings?: RuntimeWarning[];
   /**
-   * WP-2 (f): false = the session already received this exact warning list
-   * (handler-computed). Absent behaves as today.
+   * Delta turns skip `<runtime-warnings>` only when the handler reports the
+   * set unchanged since the session last received it. Absent = changed.
    */
   runtimeWarningsChanged?: boolean;
   taskHandleTasklistGuid?: string;
@@ -134,12 +134,13 @@ function renderStateContract(input: RenderPromptInput, full: boolean): string[] 
   const backend = input.backend ?? "claude";
   if (!full) {
     // The full contract already sits in native history. One line keeps the
-    // marker habit alive; the state path stays because it is the only card
-    // pointer left once native compaction drops the first turn.
+    // marker habit alive; the state path stays because it is the only state
+    // pointer left once native compaction drops the first turn, so the line
+    // names every use of it (cards, task_handle, handoffs), not cards alone.
     return block("contract-anchor", [
       backend === "codex"
-        ? `仅结构化卡片需写 ${target}。`
-        : `正文放独立行 ${ANSWER_BEGIN_MARKER} / ${ANSWER_END_MARKER} 之间;仅结构化卡片需写 ${target}。`,
+        ? `卡片/任务/交接声明写 ${target}。`
+        : `正文放独立行 ${ANSWER_BEGIN_MARKER} / ${ANSWER_END_MARKER} 之间;卡片/任务/交接声明写 ${target}。`,
     ]);
   }
   return block("state-contract", [
@@ -200,14 +201,19 @@ export function compactCandidateDescription(description: string): { thread?: str
   return { thread, text: text.replace(/\s+/g, " ").trim() };
 }
 
-function renderCandidate(candidate: TaskCandidate, full: boolean): string {
+function renderCandidate(candidate: TaskCandidate, full: boolean, topicId: string | undefined): string {
   const { thread, text } = compactCandidateDescription(candidate.descriptionExcerpt ?? "");
+  // Candidates change between polls, so a delta turn may be the first to show
+  // one. A candidate pointing at this very topic keeps its description: it is
+  // the one a claim would act on, and only the description tells a task
+  // converted from this topic from one a peer bot created here ("由 X 创建").
+  const withText = full || (thread !== undefined && thread === topicId);
   return `- guid=${candidate.guid} | summary=${candidate.summary}` +
     (thread ? ` | thread=${thread}` : "") +
-    (full && text ? ` | description: ${text}` : "");
+    (withText && text ? ` | description: ${text}` : "");
 }
 
-function renderTaskContext(input: RenderPromptInput, full: boolean): string[] {
+function renderTaskContext(input: RenderPromptInput, full: boolean, topicId: string | undefined): string[] {
   const root = input.taskRoot;
   if (root) {
     return block("task-root", [
@@ -223,12 +229,14 @@ function renderTaskContext(input: RenderPromptInput, full: boolean): string[] {
   const candidates = input.taskHandleCandidates ?? [];
   if (!input.taskHandleClaimed && candidates.length === 0) return [];
   return block("task-handle", [
-    // The tasklist guid never changes within a session; delta leaves it to native history.
+    // Static within a session and not needed to claim (task_handle takes the
+    // task guid), so delta omits it; a block first shown on a delta turn
+    // never carries it.
     ...(full ? [`task_handle_tasklist_guid: ${input.taskHandleTasklistGuid}`] : []),
     `task_handle_claimed: ${input.taskHandleClaimed ? "yes" : "no"}`,
     ...(input.taskHandleClaimed
       ? ["已有关联任务,task_handle 可表达 note/due/blocked/done。"]
-      : candidates.map((c) => renderCandidate(c, full))),
+      : candidates.map((c) => renderCandidate(c, full, topicId))),
   ]);
 }
 
@@ -384,7 +392,7 @@ export async function renderPrompt(input: RenderPromptInput): Promise<string> {
       block("turn-taking", [`configured_turn_taking_limit: ${input.turn_taking_limit} (工作区协作策略参数)`]),
     ] : []),
     block("workspace-file-changes", input.mtimeFacts ?? []),
-    renderTaskContext(input, full),
+    renderTaskContext(input, full, trigger.feishuThreadId),
     renderReseed(input.sessionReseed),
     ...(!input.isNewThread && input.reseedWarning ? [
       block("session-notice", ["reseed_threshold_near: true;已配置的会话重开阈值临近。"]),

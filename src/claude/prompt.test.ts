@@ -67,7 +67,7 @@ describe("native prompt budget and optional work", () => {
       expect(prompt).not.toMatch(/必须.*建卡|≥ 2.*建卡|报告.*先.*导.*飞书文档/);
     }
     expect(first).toContain("纯文字回答不用写 state.json");
-    expect(between(resumed, "contract-anchor")).toContain(`仅结构化卡片需写 ${STATE}`);
+    expect(between(resumed, "contract-anchor")).toContain(`卡片/任务/交接声明写 ${STATE}`);
     expect(resumed).not.toContain("<state-contract>");
     expect(resumed).not.toContain("<agent-workspace>");
   });
@@ -105,7 +105,7 @@ describe("answer and optional card transport", () => {
     expect(first).toContain("旧版 runtime 可兼容");
     expect(first).not.toContain("marker 外为内部过程");
     const resumed = await renderPrompt(makeInput({ backend: "codex", isNewThread: false }));
-    expect(between(resumed, "contract-anchor").trim()).toBe(`仅结构化卡片需写 ${STATE}。`);
+    expect(between(resumed, "contract-anchor").trim()).toBe(`卡片/任务/交接声明写 ${STATE}。`);
     expect(resumed).not.toContain("LARKWAY_ANSWER_BEGIN");
   });
 
@@ -115,8 +115,16 @@ describe("answer and optional card transport", () => {
     expect(prompt).toContain("独立行");
     const resumed = await renderPrompt(makeInput({ backend, isNewThread: false }));
     expect(between(resumed, "contract-anchor").trim()).toBe(
-      `正文放独立行 LARKWAY_ANSWER_BEGIN / LARKWAY_ANSWER_END 之间;仅结构化卡片需写 ${STATE}。`,
+      `正文放独立行 LARKWAY_ANSWER_BEGIN / LARKWAY_ANSWER_END 之间;卡片/任务/交接声明写 ${STATE}。`,
     );
+  });
+
+  it.each(["claude", "pi", "codex"])("the %s continuation anchor names every state use, not cards alone", async (backend) => {
+    const anchor = between(await renderPrompt(makeInput({ backend, isNewThread: false })), "contract-anchor");
+    // Once compaction drops the full contract this line is the only state
+    // guidance left; task_handle (done/note) and handoffs are written there too.
+    for (const use of ["卡片", "任务", "交接"]) expect(anchor).toContain(use);
+    expect(anchor).not.toMatch(/仅.*卡片/);
   });
 
   it("documents rich output without requiring a state write for plain replies", async () => {
@@ -298,6 +306,28 @@ describe("optional collaboration and task facts", () => {
     expect(prompt).not.toContain("applink.feishu.cn");
     if (isNewThread) expect(prompt).toContain("thread=omt_test_topic | description: 话题：打开话题 由 Reviewer 创建");
     else expect(prompt).not.toContain("由 Reviewer 创建");
+  });
+
+  it("keeps the description of a candidate pointing at this topic on a continuation turn", async () => {
+    const link = (thread: string) => `https://applink.feishu.cn/client/thread/open?open_chat_id=oc_test_chat&open_thread_id=${thread}&thread_position=-1`;
+    const prompt = await renderPrompt(makeInput({
+      isNewThread: false,
+      parsed: makeParsed({ raw: { chat_type: "group", thread_id: "omt_test_here", root_id: "om_thread001" } as ParsedMessage["raw"] }),
+      taskHandleTasklistGuid: "list_one",
+      taskHandleCandidates: [
+        { guid: "task_here", summary: "Here", descriptionExcerpt: `话题：[点击进入工作话题](${link("omt_test_here")}) 由 Reviewer 创建` },
+        { guid: "task_there", summary: "There", descriptionExcerpt: `话题：[点击进入工作话题](${link("omt_test_there")}) 由 Planner 创建` },
+        candidate,
+      ],
+    }));
+    // A candidate first polled mid-session never had its description in native
+    // history; for the one a claim would act on, it names who created the task.
+    expect(prompt).toContain("- guid=task_here | summary=Here | thread=omt_test_here | description: 话题：点击进入工作话题 由 Reviewer 创建\n");
+    expect(prompt).toContain("- guid=task_there | summary=There | thread=omt_test_there\n");
+    expect(prompt).toContain("- guid=task_one | summary=Review API\n");
+    expect(prompt).not.toContain("由 Planner 创建");
+    expect(prompt).not.toContain("Check compatibility");
+    expect(prompt).not.toContain("task_handle_tasklist_guid");
   });
 
   it("an existing claim suppresses candidates", async () => {

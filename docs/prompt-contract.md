@@ -15,11 +15,11 @@ Larkway 传递飞书触发事实、可选资源指针和最小输出协议。任
 | `thread-context` | 当前消息、会话、资源和 owner 事实；delta 只列本条消息的事实和偏离常态的值（见下） | 每轮 |
 | `context-pointers` | 按需取消息/历史/文档的命令、profile、env 名、开发地址 | 完整 prompt |
 | `state-contract` | 输出通道和可选卡片字段概要 | 完整 prompt |
-| `contract-anchor` | 一行：答案 marker 提示（Codex 省略）及 state 路径 | delta 续轮 |
+| `contract-anchor` | 一行：答案 marker 提示（Codex 省略）及 state 路径（卡片、任务、交接声明都写在这里） | delta 续轮 |
 | `agent-workspace` / `workspace` | workspace/session/repo/知识库位置 | 完整 prompt |
 | `peer-bots` / `turn-taking` | peer 名册、配置的协作参数 | 完整 prompt，且有配置 |
 | `workspace-file-changes` | 工作区文件变化事实 | 有变化时，包括 delta |
-| `task-root` / `task-handle` | 任务分享入口或关联/候选任务事实 | 有相关任务时，包括 delta（候选只带 guid、summary、话题 id） |
+| `task-root` / `task-handle` | 任务分享入口或关联/候选任务事实 | 有相关任务时，包括 delta（候选只带 guid、summary、话题 id；指向本话题的候选另带描述） |
 | `session-reseed` | 明确重开会话的原因、摘要和转录摘录、完整转录路径 | 显式恢复时 |
 | `user-message` | 用户原文和按到达顺序合并的追加消息 | 每轮 |
 
@@ -91,7 +91,7 @@ Codex 使用原生 `final_answer` 通道：已知 final phase 的消息直接流
 | `handoffs` | 最多 3 个 `{to,text}`；bridge 发带真实 at 标签的 post 并直递本地 peer，`text` 自包含 |
 | `task_handle` | 按需声明 `{create:{summary,due?}}`、`guid`、`note`、`due`/`due_reason`、`blocked`、`done`；不因聊天轮数自动要求使用 |
 
-tasklist 候选行形如 `guid=… | summary=… | thread=omt_…`：`thread` 由 bridge 从描述里的 applink 机械提取（被摘录截断的 id 不提取；描述指向多个话题时不给出），是与本话题 `feishu_thread_id` 精确对照的信号；URL 本身不注入。完整 prompt 另附去掉 URL 的描述摘录和清单 guid；delta 续轮省略这两项。
+tasklist 候选行形如 `guid=… | summary=… | thread=omt_…`：`thread` 由 bridge 从描述里的 applink 机械提取（被摘录截断的 id 不提取；描述指向多个话题时不给出），是与本话题 `feishu_thread_id` 精确对照的信号；URL 本身不注入。完整 prompt 另附去掉 URL 的描述摘录和清单 guid。delta 续轮省略清单 guid（认领只需要任务 guid），描述摘录只留给 `thread` 等于本话题 `feishu_thread_id` 的候选：候选随轮询变化，续轮才出现的候选此前没有注入过描述，而指向本话题的那一条正是认领会作用的对象，描述里的「由 X 创建」是区分同话题其他 bot 自建任务的依据（摘录在 200 字符处截断，长链接之后的这一行可能看不到）。已知取舍：续轮才出现、描述里没有话题链接的候选只带 guid 和 summary，agent 只能按 summary 判断。
 
 任务分享入口的 `task-root` 块只暴露 guid、summary、回链、认领状态和刚认领事实。其评论模式由用户在任务中心确认完成；是否评论或声明交付由当前任务决定。该块替代 tasklist 候选块，避免提供冲突目标。
 
