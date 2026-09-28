@@ -7,6 +7,7 @@ import {
   ensureAgentWorkspace,
   migrateRetiredContractLines,
   resetAgentWorkspacePermissions,
+  retiredContractBackupPath,
   retiredContractMigrationPath,
 } from "./workspaceStore.js";
 
@@ -645,23 +646,70 @@ describe("migrateRetiredContractLines", () => {
   it("removes exactly the retired lines and leaves every other byte unchanged", async () => {
     const agentsPath = path.join(dir, "AGENTS.md");
     await fs.writeFile(agentsPath, LEGACY_LINES.join("\n"), "utf8");
-    expect(await migrateRetiredContractLines(dir)).toBe(4);
+    expect((await migrateRetiredContractLines(dir)).removed).toHaveLength(4);
     const expected = LEGACY_LINES.filter((line) => !RETIRED.has(line)).join("\n");
     expect(await fs.readFile(agentsPath, "utf8")).toBe(expected);
+  });
+
+  it("reports each removed line's label and original line number, in file order", async () => {
+    await fs.writeFile(path.join(dir, "AGENTS.md"), LEGACY_LINES.join("\n"), "utf8");
+    expect((await migrateRetiredContractLines(dir)).removed).toEqual([
+      { label: "memory-ritual", line: 9 },
+      { label: "state-each-turn", line: 11 },
+      { label: "perms-preread", line: 12 },
+      { label: "knowledge-discipline", line: 13 },
+    ]);
+  });
+
+  it("dry-run reports what would go and writes nothing", async () => {
+    const agentsPath = path.join(dir, "AGENTS.md");
+    const backupPath = path.join(dir, "backup.bak");
+    await fs.writeFile(agentsPath, LEGACY_LINES.join("\n"), "utf8");
+    await fs.utimes(agentsPath, OLD, OLD);
+    const result = await migrateRetiredContractLines(dir, { dryRun: true, backupPath });
+    expect(result.removed).toHaveLength(4);
+    expect(result.backupPath).toBeUndefined();
+    expect(await fs.readFile(agentsPath, "utf8")).toBe(LEGACY_LINES.join("\n"));
+    expect((await fs.stat(agentsPath)).mtimeMs).toBe(OLD.getTime());
+    expect((await fs.readdir(dir)).sort()).toEqual(["AGENTS.md"]);
+  });
+
+  it("copies the original before the first rewrite and keeps that earliest copy afterwards", async () => {
+    const agentsPath = path.join(dir, "AGENTS.md");
+    const backupPath = path.join(dir, "backup.bak");
+    const original = LEGACY_LINES.join("\n");
+    await fs.writeFile(agentsPath, original, "utf8");
+    expect((await migrateRetiredContractLines(dir, { backupPath })).backupPath).toBe(backupPath);
+    expect(await fs.readFile(backupPath, "utf8")).toBe(original);
+    // The owner re-adds a template line word for word: removed again, earliest copy untouched.
+    await fs.appendFile(agentsPath, `\n${STATE_LINE}\n`, "utf8");
+    const again = await migrateRetiredContractLines(dir, { backupPath });
+    expect(again.removed.map((r) => r.label)).toEqual(["state-each-turn"]);
+    expect(again.backupPath).toBeUndefined();
+    expect(await fs.readFile(backupPath, "utf8")).toBe(original);
+  });
+
+  it("a backup that cannot be written aborts the rewrite", async () => {
+    const agentsPath = path.join(dir, "AGENTS.md");
+    await fs.writeFile(agentsPath, LEGACY_LINES.join("\n"), "utf8");
+    await expect(
+      migrateRetiredContractLines(dir, { backupPath: path.join(dir, "missing-dir", "backup.bak") }),
+    ).rejects.toMatchObject({ code: "ENOENT" });
+    expect(await fs.readFile(agentsPath, "utf8")).toBe(LEGACY_LINES.join("\n"));
   });
 
   it("matches retired lines exactly, never by the projection path's ritual substring rule", async () => {
     const agentsPath = path.join(dir, "AGENTS.md");
     const content = ["## Custom Rules", "", OWNER_RITUAL_LIKE_LINE, RITUAL_LINE, ""].join("\n");
     await fs.writeFile(agentsPath, content, "utf8");
-    expect(await migrateRetiredContractLines(dir)).toBe(1);
+    expect((await migrateRetiredContractLines(dir)).removed).toHaveLength(1);
     expect(await fs.readFile(agentsPath, "utf8")).toBe(["## Custom Rules", "", OWNER_RITUAL_LIKE_LINE, ""].join("\n"));
   });
 
   it("keeps CRLF line endings of the surviving lines", async () => {
     const agentsPath = path.join(dir, "AGENTS.md");
     await fs.writeFile(agentsPath, `${LEGACY_LINES.join("\r\n")}\r\n`, "utf8");
-    expect(await migrateRetiredContractLines(dir)).toBe(4);
+    expect((await migrateRetiredContractLines(dir)).removed).toHaveLength(4);
     const expected = `${LEGACY_LINES.filter((line) => !RETIRED.has(line)).join("\r\n")}\r\n`;
     expect(await fs.readFile(agentsPath, "utf8")).toBe(expected);
   });
@@ -669,10 +717,10 @@ describe("migrateRetiredContractLines", () => {
   it("is idempotent and does not rewrite an already clean file", async () => {
     const agentsPath = path.join(dir, "AGENTS.md");
     await fs.writeFile(agentsPath, LEGACY_LINES.join("\n"), "utf8");
-    expect(await migrateRetiredContractLines(dir)).toBe(4);
+    expect((await migrateRetiredContractLines(dir)).removed).toHaveLength(4);
     const migrated = await fs.readFile(agentsPath, "utf8");
     await fs.utimes(agentsPath, OLD, OLD);
-    expect(await migrateRetiredContractLines(dir)).toBe(0);
+    expect((await migrateRetiredContractLines(dir)).removed).toHaveLength(0);
     expect(await fs.readFile(agentsPath, "utf8")).toBe(migrated);
     expect((await fs.stat(agentsPath)).mtimeMs).toBe(OLD.getTime());
     expect((await fs.readdir(dir)).sort()).toEqual(["AGENTS.md"]);
@@ -688,12 +736,12 @@ describe("migrateRetiredContractLines", () => {
     });
     const agentsPath = path.join(workspacePath, "AGENTS.md");
     await fs.utimes(agentsPath, OLD, OLD);
-    expect(await migrateRetiredContractLines(workspacePath)).toBe(0);
+    expect((await migrateRetiredContractLines(workspacePath)).removed).toHaveLength(0);
     expect((await fs.stat(agentsPath)).mtimeMs).toBe(OLD.getTime());
   });
 
   it("is a no-op without AGENTS.md", async () => {
-    expect(await migrateRetiredContractLines(dir)).toBe(0);
+    expect((await migrateRetiredContractLines(dir)).removed).toHaveLength(0);
     expect(await fs.readdir(dir)).toEqual([]);
   });
 
@@ -704,7 +752,7 @@ describe("migrateRetiredContractLines", () => {
     const workspacePath = path.join(dir, "workspace");
     await fs.mkdir(workspacePath);
     await fs.symlink(path.join("..", "shared-agents.md"), path.join(workspacePath, "AGENTS.md"));
-    expect(await migrateRetiredContractLines(workspacePath)).toBe(4);
+    expect((await migrateRetiredContractLines(workspacePath)).removed).toHaveLength(4);
     expect((await fs.lstat(path.join(workspacePath, "AGENTS.md"))).isSymbolicLink()).toBe(true);
     expect(await fs.readFile(realPath, "utf8")).toBe(LEGACY_LINES.filter((line) => !RETIRED.has(line)).join("\n"));
     expect((await fs.stat(realPath)).mode & 0o777).toBe(0o600);
@@ -745,5 +793,10 @@ describe("retiredContractMigrationPath", () => {
 
   it("skips a legacy-runtime bot", () => {
     expect(retiredContractMigrationPath({ id: "demo", runtime: "legacy" }, HOME)).toBeUndefined();
+  });
+
+  it("keeps the pre-migration copy beside the workspace, outside the agent's cwd", () => {
+    const workspace = retiredContractMigrationPath({ id: "demo", runtime: "agent_workspace" }, HOME)!;
+    expect(retiredContractBackupPath(workspace)).toBe(path.join(HOME, "agents", "demo", "AGENTS.md.pre-retired-lines.bak"));
   });
 });

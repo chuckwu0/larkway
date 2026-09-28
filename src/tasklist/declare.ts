@@ -17,7 +17,7 @@
  * makes no judgment calls — "should this be a task" was decided agent-side.
  */
 
-import type { TaskListClient, TaskMember } from "./client.js";
+import { isTaskNotFoundError, type TaskListClient, type TaskMember } from "./client.js";
 import type { TaskHandleStore } from "./store.js";
 import { formatLocalDateTime } from "./writeback.js";
 import type {
@@ -98,7 +98,25 @@ export async function applyTaskHandleDeclarations(
 
   // ── create (信号1) ────────────────────────────────────────────────────────
   if (patch.create) {
-    const existing = deps.store.get(patch.threadId);
+    let existing = deps.store.get(patch.threadId);
+    // A comment-mode claim is no longer re-read on every turn (writeback.ts,
+    // contract item 2), so a task deleted in Feishu keeps its claim until a
+    // poller notices — and a user who deleted the card and at once asked for
+    // a new one would find the create skipped. Check that claim here, only on
+    // a turn that declared create; a gone task drops the claim, as the
+    // writeback would have, and the create goes ahead.
+    if (existing?.mode === "comment") {
+      const claimed = existing;
+      const gone = await deps.client.getTask(claimed.taskGuid).then(
+        (task) => task === null,
+        (err: unknown) => isTaskNotFoundError(err),
+      );
+      if (gone) {
+        await deps.store.delete(patch.threadId);
+        outcomes.push(`已认领任务 ${claimed.taskGuid} 已不存在，解除认领后新建`);
+        existing = undefined;
+      }
+    }
     if (existing) {
       outcomes.push(`create 跳过：话题已认领任务 ${existing.taskGuid}`);
     } else {

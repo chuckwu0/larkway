@@ -25,6 +25,13 @@ const DEFAULT_PATCH_INTERVAL_MS = 250;
  * turn doesn't hammer Feishu at the normal cadence forever.
  */
 const DEFAULT_MAX_PROGRESS_UPDATES = 240;
+/**
+ * How long a failed finalize may spend patching up the card it could not
+ * rebuild before it rejects (the caller then posts a fallback card).
+ */
+const FINAL_FAILURE_SALVAGE_BUDGET_MS = 5_000;
+/** Footer left on a card whose final rebuild failed (see salvageAfterFinalFailure). */
+export const CARDKIT_FINAL_FAILURE_FOOTER = "⚠️ 本卡未能正常收尾;如下方另有回复卡片,以那张为准。";
 /** A6: patch-interval backoff ladder once the soft budget is exceeded, capped at the last entry. */
 const BACKOFF_LADDER_MS = [250, 1_000, 2_000, 5_000];
 
@@ -411,13 +418,19 @@ class LiveCardKitProgressHandle implements CardKitProgressHandle {
     // first, even when it differs from what streamed — the rebuilt card already
     // holds it in final_md. The cost is the typing animation for that final
     // replacement.
-    await this.next((sequence) =>
-      this.cardKitClient.updateCardEntity(this.cardId, buildCardKitFinalCard(finalOpts), {
-        sequence,
-        uuid: sequenceUuid(this.cardId, "final-card", sequence),
-      }),
-    );
-    this.answerBuffer = buildCardKitFinalMarkdown(opts);
+    const finalMarkdown = buildCardKitFinalMarkdown(opts);
+    try {
+      await this.next((sequence) =>
+        this.cardKitClient.updateCardEntity(this.cardId, buildCardKitFinalCard(finalOpts), {
+          sequence,
+          uuid: sequenceUuid(this.cardId, "final-card", sequence),
+        }),
+      );
+    } catch (err) {
+      await this.salvageAfterFinalFailure(finalMarkdown, opts.finalText);
+      throw err;
+    }
+    this.answerBuffer = finalMarkdown;
     await this.next((sequence) =>
       this.cardKitClient.updateCardSettings(
         this.cardId,
@@ -433,6 +446,71 @@ class LiveCardKitProgressHandle implements CardKitProgressHandle {
         },
       ),
     );
+  }
+
+  /**
+   * The final rebuild failed, and the caller will post a fallback card. The
+   * card left behind would otherwise keep 「努力回答中...」 and only the text
+   * that last streamed (WP-4 no longer streams the final text ahead of the
+   * rebuild; nothing ever reconciles a card whose turn got a visible fallback).
+   * Best effort, bounded by FINAL_FAILURE_SALVAGE_BUDGET_MS, each step on its
+   * own: stream the final text into it (the pre-WP-4 order, on this path
+   * only), point its footer at the fallback, and stop its streaming state.
+   * Calls still running when the budget ends finish in the background.
+   */
+  private async salvageAfterFinalFailure(finalMarkdown: string, finalText: string): Promise<void> {
+    const step = async (label: string, run: () => Promise<void>): Promise<void> => {
+      try {
+        await run();
+      } catch (err) {
+        console.warn(`[cardkit_progress] final-failure salvage: ${label} failed (continuing):`, err);
+      }
+    };
+    const salvage = (async (): Promise<void> => {
+      if (finalMarkdown && finalMarkdown !== this.lastCommittedAnswer) {
+        await step("final text", async () => {
+          if (!this.answerElementCreated) {
+            await this.withAnswerElement(finalMarkdown);
+          } else {
+            await this.next((sequence) =>
+              this.cardKitClient.streamElementContent(this.cardId, CARDKIT_FINAL_ELEMENT_ID, finalMarkdown, {
+                sequence,
+                uuid: sequenceUuid(this.cardId, "final-content", sequence),
+              }),
+            );
+          }
+          this.lastCommittedAnswer = finalMarkdown;
+        });
+      }
+      await step("footer", () =>
+        this.next((sequence) =>
+          this.cardKitClient.updateElement(
+            this.cardId,
+            CARDKIT_FOOTER_ELEMENT_ID,
+            { tag: "markdown", content: CARDKIT_FINAL_FAILURE_FOOTER, element_id: CARDKIT_FOOTER_ELEMENT_ID },
+            { sequence, uuid: sequenceUuid(this.cardId, "status", sequence) },
+          ),
+        ),
+      );
+      await step("settings", () =>
+        this.next((sequence) =>
+          this.cardKitClient.updateCardSettings(
+            this.cardId,
+            { config: { streaming_mode: false, summary: { content: finalText.replace(/\s+/g, " ").trim().slice(0, 50) } } },
+            { sequence, uuid: sequenceUuid(this.cardId, "settings", sequence) },
+          ),
+        ),
+      );
+    })();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    await Promise.race([
+      salvage,
+      new Promise<void>((resolve) => {
+        timer = setTimeout(resolve, FINAL_FAILURE_SALVAGE_BUDGET_MS);
+        timer.unref?.();
+      }),
+    ]);
+    if (timer) clearTimeout(timer);
   }
 
   close(): void {

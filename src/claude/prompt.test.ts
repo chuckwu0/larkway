@@ -500,6 +500,71 @@ describe("delta thread facts", () => {
   });
 });
 
+// The parsed text drops every @ and never shows a quoted message, so these
+// facts are the only trace of either (product review of the delta prompt).
+describe("mentions and quotes the parsed text drops", () => {
+  const resumed = (overrides: Partial<RenderPromptInput> = {}) =>
+    renderPrompt(makeInput({ isNewThread: false, larkCliProfile: "test-profile", ...overrides }));
+  const RAW_POINTER = "raw_pointer:      lark-cli api GET /open-apis/im/v1/messages/om_msg001 --profile test-profile --as bot";
+  const bot = { key: "@_user_1", id: { open_id: "ou_test_bot" }, name: "TestBot" };
+  const colleague = { key: "@_user_2", id: { open_id: "ou_test_colleague" }, name: "Colleague" };
+  const withRaw = (raw: Record<string, unknown>, text = "这个问题你和 对一下") =>
+    makeParsed({ text, raw: { chat_type: "group", root_id: "om_root", thread_id: "omt_topic", ...raw } as ParsedMessage["raw"] });
+
+  it("names a colleague @-mentioned beside the bot, on delta and full prompts", async () => {
+    const parsed = withRaw({ mentions: [bot, colleague] });
+    for (const prompt of [await resumed({ parsed, botOpenId: "ou_test_bot" }), await renderPrompt(makeInput({ parsed, botOpenId: "ou_test_bot" }))]) {
+      const facts = between(prompt, "thread-context");
+      expect(facts).toContain("mentioned_others: Colleague (ou_test_colleague)");
+      expect(facts).not.toContain("TestBot");
+    }
+    expect(between(await resumed({ parsed, botOpenId: "ou_test_bot" }), "thread-context")).toContain(RAW_POINTER);
+  });
+
+  it("says nothing extra when the bot is the only one @-mentioned", async () => {
+    for (const botOpenId of ["ou_test_bot", undefined]) {
+      const facts = between(await resumed({ parsed: withRaw({ mentions: [bot] }), botOpenId }), "thread-context");
+      expect(facts).not.toContain("mentioned_others");
+      expect(facts).not.toContain("raw_pointer");
+    }
+  });
+
+  it("without the bot's own open_id, lists every mention once there are two or more", async () => {
+    const facts = between(await resumed({ parsed: withRaw({ mentions: [bot, colleague] }) }), "thread-context");
+    expect(facts).toContain("mentioned_others: TestBot (ou_test_bot), Colleague (ou_test_colleague)");
+  });
+
+  it("leaves @all to mention_type", async () => {
+    const facts = between(
+      await resumed({ parsed: withRaw({ mentions: [bot, { key: "@_all", name: "所有人" }] }), botOpenId: "ou_test_bot" }),
+      "thread-context",
+    );
+    expect(facts).toContain("mention_type:     all_mention");
+    expect(facts).not.toContain("mentioned_others");
+  });
+
+  it("points at the quoted message of an in-topic quote-reply", async () => {
+    const line = "quoted_message:   lark-cli api GET /open-apis/im/v1/messages/om_earlier_card --profile test-profile --as bot";
+    // A live quote-reply push may carry no root_id at all.
+    for (const raw of [{ parent_id: "om_earlier_card" }, { parent_id: "om_earlier_card", root_id: undefined }]) {
+      const parsed = withRaw({ ...raw, mentions: [bot] }, "这里第二条改一下");
+      const facts = between(await resumed({ parsed, botOpenId: "ou_test_bot" }), "thread-context");
+      expect(facts).toContain(line);
+      expect(facts).toContain(RAW_POINTER);
+      const full = await renderPrompt(makeInput({ parsed, botOpenId: "ou_test_bot", larkCliProfile: "test-profile" }));
+      expect(between(full, "thread-context")).toContain(line);
+    }
+  });
+
+  it("an ordinary in-topic reply (parent = topic root) quotes nothing", async () => {
+    for (const parent of ["om_root", "om_thread001"]) {
+      const facts = between(await resumed({ parsed: withRaw({ parent_id: parent, mentions: [bot] }), botOpenId: "ou_test_bot" }), "thread-context");
+      expect(facts).not.toContain("quoted_message");
+      expect(facts).not.toContain("raw_pointer");
+    }
+  });
+});
+
 describe("runtime warnings on continuation", () => {
   const runtimeWarnings = [{ label: "git", reason: "unavailable" }];
 
@@ -510,6 +575,25 @@ describe("runtime warnings on continuation", () => {
   ] as const)("delta renders warnings when runtimeWarningsChanged=%s: %s", async (runtimeWarningsChanged, shown) => {
     const prompt = await renderPrompt(makeInput({ isNewThread: false, runtimeWarnings, runtimeWarningsChanged }));
     expect(prompt.includes("<runtime-warnings>")).toBe(shown);
+  });
+
+  it("a delta block says the list is complete, so an item it no longer lists reads as resolved", async () => {
+    const delta = between(await renderPrompt(makeInput({ isNewThread: false, runtimeWarnings })), "runtime-warnings");
+    expect(delta).toContain("git: unavailable");
+    expect(delta).toContain("此前提示过、这里未列出的已恢复");
+    expect(between(await renderPrompt(makeInput({ runtimeWarnings })), "runtime-warnings")).not.toContain("已恢复");
+  });
+
+  it("an emptied list is stated once on a delta turn, never on a full one", async () => {
+    const cleared = await renderPrompt(makeInput({ isNewThread: false, runtimeWarnings: [], runtimeWarningsCleared: true }));
+    expect(between(cleared, "runtime-warnings").trim()).toBe("当前未检测到本机能力缺失(此前如有提示,均已恢复)。");
+    for (const input of [
+      makeInput({ isNewThread: false, runtimeWarnings: [] }),
+      makeInput({ isNewThread: false, runtimeWarnings: [], runtimeWarningsCleared: true, runtimeWarningsChanged: false }),
+      makeInput({ runtimeWarnings: [], runtimeWarningsCleared: true }),
+    ]) {
+      expect(await renderPrompt(input)).not.toContain("<runtime-warnings>");
+    }
   });
 
   it("full prompts always carry warnings", async () => {

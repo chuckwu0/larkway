@@ -332,6 +332,19 @@ export function resolveInboundBatchDelayMs(): number | undefined {
   return parsed > 0 ? parsed : 0;
 }
 
+/**
+ * The boot line naming the inbound debounce in effect and how to change it —
+ * the default moved from the SDK's timing to 0, so a bare number would not
+ * tell an operator whether it is the default or how to get the old one back.
+ */
+export function inboundBatchDelayLogLine(delayMs: number | undefined, env: string | undefined): string {
+  if (delayMs === undefined) {
+    return "inbound debounce: SDK default 600ms / 2000ms after 1000 chars (LARKWAY_INBOUND_BATCH_DELAY_MS=sdk)";
+  }
+  const source = env?.trim() ? "LARKWAY_INBOUND_BATCH_DELAY_MS" : "default";
+  return `inbound debounce ${delayMs}ms (${source}; LARKWAY_INBOUND_BATCH_DELAY_MS=sdk restores the SDK's 600ms / 2000ms)`;
+}
+
 /** How often a channel cache drops its expired entries (checked on write). */
 export const CHANNEL_CACHE_SWEEP_MS = 5 * 60_000;
 
@@ -1206,9 +1219,7 @@ export class ChannelClient {
       policy.groupAllowlist = [...this.opts.allowedChatIds];
     }
     const inboundBatchDelayMs = resolveInboundBatchDelayMs();
-    if (inboundBatchDelayMs !== undefined) {
-      log(`inbound text batch delay ${inboundBatchDelayMs}ms (LARKWAY_INBOUND_BATCH_DELAY_MS)`);
-    }
+    log(inboundBatchDelayLogLine(inboundBatchDelayMs, process.env["LARKWAY_INBOUND_BATCH_DELAY_MS"]));
     const channel = createLarkChannel({
       appId: this.opts.appId,
       appSecret: this.opts.appSecret,

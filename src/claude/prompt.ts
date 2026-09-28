@@ -6,6 +6,8 @@ import {
   DEFAULT_MENTION_TYPES,
   deriveTriggerFacts,
   hasContentBeyondText,
+  mentionedOthers,
+  quotedMessageId,
 } from "../agent/triggerFacts.js";
 import { ANSWER_BEGIN_MARKER, ANSWER_END_MARKER } from "../agent/answerChannel.js";
 import type { TaskCandidate } from "../tasklist/types.js";
@@ -64,6 +66,11 @@ export interface RenderPromptInput {
   peers?: PeerBot[];
   turn_taking_limit?: number;
   botName?: string;
+  /**
+   * This bot's open_id in its own app scope. Keeps the bot itself out of the
+   * `mentioned_others` fact; absent, a lone mention is taken to be the bot.
+   */
+  botOpenId?: string;
   /** Codex uses its native final-answer channel; other adapters use markers. */
   backend?: string;
   /** Legacy identity only. Agent workspaces use their native AGENTS.md. */
@@ -85,6 +92,14 @@ export interface RenderPromptInput {
    * set unchanged since the session last received it. Absent = changed.
    */
   runtimeWarningsChanged?: boolean;
+  /**
+   * Delta turns only: the list is empty and the session may still hold an
+   * earlier warning in its native history (the list emptied since it last
+   * received one, or this process never delivered it — a restart). On a delta
+   * turn a missing block is the steady state, so without this line the agent
+   * could not tell "unchanged" from "resolved".
+   */
+  runtimeWarningsCleared?: boolean;
   taskHandleTasklistGuid?: string;
   taskHandleClaimed?: boolean;
   taskHandleCandidates?: readonly TaskCandidate[];
@@ -249,13 +264,17 @@ function renderTaskContext(input: RenderPromptInput, full: boolean, topicId: str
   ]);
 }
 
-function renderWarnings(warnings: RuntimeWarning[] | undefined): string[] {
-  if (!warnings?.length) return [];
+function renderWarnings(warnings: RuntimeWarning[] | undefined, delta: boolean, cleared: boolean): string[] {
+  if (!warnings?.length) {
+    return delta && cleared ? block("runtime-warnings", ["当前未检测到本机能力缺失(此前如有提示,均已恢复)。"]) : [];
+  }
   return block("runtime-warnings", [
     "以下是本机能力事实,是否影响当前任务由你判断:",
     ...warnings.map((w) =>
       `- ${w.label}${w.command ? ` (${w.command})` : ""}` +
       `${w.reason ? `: ${w.reason}` : ""}${w.installHint ? `; ${w.installHint}` : ""}`),
+    // A delta turn repeats the block only when the list changed.
+    ...(delta ? ["以上为当前全部缺失项;此前提示过、这里未列出的已恢复。"] : []),
   ]);
 }
 
@@ -304,6 +323,11 @@ function renderReseed(reseed: RenderPromptInput["sessionReseed"]): string[] {
   ]);
 }
 
+function renderMentioned(person: { name?: string; openId?: string }): string {
+  if (person.name && person.openId) return `${person.name} (${person.openId})`;
+  return person.name ?? person.openId ?? "";
+}
+
 function sceneFacts(parsed: ParsedMessage, isNewThread: boolean): string {
   if (parsed.raw.chat_type === "p2p") return "p2p_direct_message";
   return !parsed.raw.root_id && isNewThread ? "group_mention_opens_topic" : "topic_continuation";
@@ -319,6 +343,14 @@ export async function renderPrompt(input: RenderPromptInput): Promise<string> {
   const attachments = parsed.attachments.map((a) => a.fileKey);
   const images = parsed.attachments.filter((a) => a.fileType === "image").map((a) => a.fileKey);
   const owner = input.senderIsOwner ?? "unknown";
+  // Both are gone from the parsed text: every @ is stripped, and a quote-reply
+  // carries only the new text. Stated on every turn that has them.
+  const others = mentionedOthers(parsed, input.botOpenId);
+  const quoted = quotedMessageId(parsed);
+  const messageRefs = [
+    ...(others.length > 0 ? [`mentioned_others: ${others.map(renderMentioned).join(", ")}`] : []),
+    ...(quoted ? [`quoted_message:   lark-cli api GET /open-apis/im/v1/messages/${quoted}${profile} --as bot`] : []),
+  ];
   const threadFacts = input.threadTurnCount !== undefined ? [
     `thread_turn_count:   ${input.threadTurnCount}`,
     `thread_has_task_card: ${input.threadHasTaskCard ? "yes" : "no"}`,
@@ -338,6 +370,7 @@ export async function renderPrompt(input: RenderPromptInput): Promise<string> {
     `feishu_thread_id: ${trigger.feishuThreadId ?? "none"}`,
     `feishu_root_id:   ${trigger.feishuRootId ?? "none"}`,
     `raw_pointer:      ${trigger.rawMessagePointer}`,
+    ...messageRefs,
     `attachments:      ${csv(attachments)}`,
     `feishu_doc_links: ${csv(parsed.feishuDocLinks)}`,
     `images:           ${csv(images)}`,
@@ -353,8 +386,10 @@ export async function renderPrompt(input: RenderPromptInput): Promise<string> {
     ...(trigger.triggerType !== DEFAULT_CONTINUATION_TRIGGER_TYPE ? [`trigger_type:     ${trigger.triggerType}`] : []),
     ...(!DEFAULT_MENTION_TYPES.has(trigger.mentionType) ? [`mention_type:     ${trigger.mentionType}`] : []),
     ...(trigger.feishuThreadId?.startsWith("omt_") ? [`feishu_thread_id: ${trigger.feishuThreadId}`] : []),
-    // Also for a resource that arrived as a text marker, or a card/sticker with no readable text.
-    ...(hasContentBeyondText(parsed) ? [`raw_pointer:      ${trigger.rawMessagePointer}`] : []),
+    // Also for a resource that arrived as a text marker, a card/sticker with no
+    // readable text, or an @ / quote the parsed text dropped.
+    ...(hasContentBeyondText(parsed) || messageRefs.length > 0 ? [`raw_pointer:      ${trigger.rawMessagePointer}`] : []),
+    ...messageRefs,
     ...(attachments.length > 0 ? [`attachments:      ${csv(attachments)}`] : []),
     ...(parsed.feishuDocLinks.length > 0 ? [`feishu_doc_links: ${csv(parsed.feishuDocLinks)}`] : []),
     ...(images.length > 0 ? [`images:           ${csv(images)}`] : []),
@@ -393,7 +428,9 @@ export async function renderPrompt(input: RenderPromptInput): Promise<string> {
   ];
   const sections = [
     identity,
-    ...(full || input.runtimeWarningsChanged !== false ? [renderWarnings(input.runtimeWarnings)] : []),
+    ...(full || input.runtimeWarningsChanged !== false
+      ? [renderWarnings(input.runtimeWarnings, !full, input.runtimeWarningsCleared === true)]
+      : []),
     block("thread-context", facts),
     ...(full ? [block("context-pointers", pointers)] : []),
     renderStateContract(input, full),

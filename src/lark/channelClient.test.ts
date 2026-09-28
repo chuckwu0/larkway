@@ -25,6 +25,7 @@ import {
   CHANNEL_CACHE_SWEEP_MS,
   ExpiringChannelCache,
   channelMsgToLarkEvent,
+  inboundBatchDelayLogLine,
   resolveInboundBatchDelayMs,
   resolveOpenChatDiscoveryMs,
   resolveRecoveredThreadId,
@@ -1303,6 +1304,15 @@ describe("ChannelClient — inbound safety options (WP-3)", () => {
     expect(resolveInboundBatchDelayMs()).toBe(0);
     process.env[ENV_KEY] = "250";
     expect(resolveInboundBatchDelayMs()).toBe(250);
+  });
+
+  it("the boot line says whether the delay is the default and how to get the SDK timing back", () => {
+    expect(inboundBatchDelayLogLine(0, undefined)).toBe(
+      "inbound debounce 0ms (default; LARKWAY_INBOUND_BATCH_DELAY_MS=sdk restores the SDK's 600ms / 2000ms)",
+    );
+    expect(inboundBatchDelayLogLine(0, "abc")).toContain("(LARKWAY_INBOUND_BATCH_DELAY_MS;");
+    expect(inboundBatchDelayLogLine(250, "250")).toMatch(/^inbound debounce 250ms \(LARKWAY_INBOUND_BATCH_DELAY_MS;/);
+    expect(inboundBatchDelayLogLine(undefined, "sdk")).toContain("SDK default 600ms / 2000ms");
   });
 
   it("gives every bot its own cache instance and defaults the debounce to 0 when the env is unset", async () => {

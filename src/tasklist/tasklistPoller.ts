@@ -62,8 +62,13 @@ const DEFAULT_INTERVAL_MS = 60_000;
 const DEFAULT_JITTER_MS = 10_000;
 /** v3.3 候选黑洞提示 (docs/task-handle.md §14) — how long a candidate can stay continuously unclaimed before this poller posts a one-time mechanical alert comment on it. */
 const DEFAULT_CANDIDATE_UNBOUND_ALERT_MS = 60 * 60_000;
-/** Description excerpt cap for prompt injection — keep the block cheap. */
+/**
+ * Description excerpt cap for prompt injection — keep the block cheap. URLs
+ * do not count toward it (see excerpt()).
+ */
 const DESCRIPTION_EXCERPT_MAX_LEN = 200;
+/** A bare URL run, with the same character class the prompt renderer strips (compactCandidateDescription). */
+const EXCERPT_URL = /https?:\/\/[\x21-\x28\x2A-\x7E]+/g;
 /** Bound both the per-cycle candidate count and the pages fetched to reach it — a large tasklist must never make one poll cycle unbounded. */
 const MAX_CANDIDATES = 30;
 const MAX_PAGES_PER_CYCLE = 5;
@@ -203,13 +208,30 @@ function isBridgeTouched(description: string | undefined): boolean {
   return typeof description === "string" && description.includes(STATUS_SNAPSHOT_MARKER);
 }
 
+/**
+ * The prompt renderer drops every URL of the excerpt and keeps only a topic
+ * id out of it, so URLs are kept whole and only the text around them counts
+ * toward the cap. A bridge-created description is a ~230-character applink
+ * followed by 「由 X 创建」; with the link counted, that line was always cut,
+ * and the creator — what tells a peer bot's task in the same topic from this
+ * bot's own — never reached the agent.
+ */
 function excerpt(description: string | undefined): string | undefined {
   if (!description) return undefined;
   const clean = description.replace(/\s+/g, " ").trim();
   if (clean.length === 0) return undefined;
-  return clean.length > DESCRIPTION_EXCERPT_MAX_LEN
-    ? `${clean.slice(0, DESCRIPTION_EXCERPT_MAX_LEN)}…`
-    : clean;
+  let budget = DESCRIPTION_EXCERPT_MAX_LEN;
+  let kept = "";
+  let from = 0;
+  for (const url of clean.matchAll(EXCERPT_URL)) {
+    const text = clean.slice(from, url.index);
+    if (text.length > budget) return `${kept}${text.slice(0, budget)}…`;
+    budget -= text.length;
+    kept += text + url[0];
+    from = url.index + url[0].length;
+  }
+  const rest = clean.slice(from);
+  return rest.length > budget ? `${kept}${rest.slice(0, budget)}…` : clean;
 }
 
 export class TasklistPoller {

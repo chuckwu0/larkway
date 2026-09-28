@@ -692,6 +692,28 @@ describe("WP-2 (f): runtime-warnings send-on-change", () => {
     expect(changedFlags()).toEqual([true, true, false]);
   });
 
+  it("a warning fixed across a restart is reported as resolved once, then no longer", async () => {
+    registerScriptedRunner([{}]);
+    const store = fakeSessionStore([existingSession()]);
+    const before = makeHandler({
+      client: sequentialClient([continuationEvent("om_test_t1")]).client,
+      store,
+      deps: { runtimeRequirements: REQUIREMENTS },
+    });
+    await runAll(before.handler);
+    // The operator installs the CLI and restarts: detection now finds nothing missing.
+    const { captured } = registerScriptedRunner([{}, {}]);
+    const after = makeHandler({
+      client: sequentialClient([continuationEvent("om_test_t2"), continuationEvent("om_test_t3")]).client,
+      store,
+      deps: { runtimeRequirements: [{ ...REQUIREMENTS![0]!, ok: true }] },
+    });
+    await runAll(after.handler);
+    expect(vi.mocked(renderPrompt).mock.calls.map(([input]) => input.runtimeWarningsCleared)).toEqual([false, true, false]);
+    expect(captured[0]?.prompt).toContain("当前未检测到本机能力缺失");
+    expect(captured[1]?.prompt).not.toContain("<runtime-warnings>");
+  });
+
   it("a full prompt always counts as changed", async () => {
     registerScriptedRunner([{}]);
     const { handler } = makeHandler({
@@ -701,6 +723,31 @@ describe("WP-2 (f): runtime-warnings send-on-change", () => {
     await runAll(handler);
     expect(changedFlags()).toEqual([true]);
     expect(vi.mocked(renderPrompt).mock.calls[0]?.[0].isNewThread).toBe(true);
+  });
+});
+
+describe("delta turn: an @ or a quote the parsed text dropped", () => {
+  it("names the colleague @-mentioned beside this bot (not the bot) and points at the quoted message", async () => {
+    const { captured } = registerScriptedRunner([{}]);
+    const event: LarkMessageEvent = {
+      ...continuationEvent("om_test_reply"),
+      parent_id: "om_test_earlier_card",
+      content: JSON.stringify({ text: "@_user_1 这里你和 @_user_2 对一下" }),
+      mentions: [
+        { key: "@_user_1", id: { open_id: "ou_test_self" }, name: "Test" },
+        { key: "@_user_2", id: { open_id: "ou_test_colleague" }, name: "Colleague" },
+      ],
+    };
+    const { client, outcomes } = sequentialClient([event]);
+    const { handler } = makeHandler({ client, store: fakeSessionStore([existingSession()]), bot: { bot_open_id: "ou_test_self" } });
+    await runAll(handler);
+    expect(outcomes).toEqual(["handled:om_test_reply"]);
+    const prompt = captured[0]?.prompt ?? "";
+    expect(vi.mocked(renderPrompt).mock.calls[0]?.[0].promptMode).toBe("delta");
+    expect(prompt).toContain("mentioned_others: Colleague (ou_test_colleague)");
+    expect(prompt).not.toContain("ou_test_self");
+    expect(prompt).toContain("quoted_message:   lark-cli api GET /open-apis/im/v1/messages/om_test_earlier_card");
+    expect(prompt).toContain("raw_pointer:");
   });
 });
 

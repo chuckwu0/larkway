@@ -1191,6 +1191,8 @@ export interface BridgeHandlerDeps {
     p2pStickyIdleMs?: number;
     /** 批G (G7) owner's open_id in THIS bot's app scope — see BotConfig.owner_open_id. */
     owner_open_id?: string;
+    /** This bot's own open_id — keeps it out of the prompt's `mentioned_others`. */
+    bot_open_id?: string;
     /**
      * COT (思维链) 气泡档位。"off" = 不推;"brief"/"detailed" 见 BotConfig.cot。
      * 缺省视为 "brief"。仅在非 "off" 时 main.ts 才注入 cotClient。
@@ -1422,7 +1424,8 @@ export class BridgeHandler {
    * the session's native history last received (recorded when a turn that
    * carried it succeeds). A delta prompt repeats the block only when the list
    * differs. In-memory like threadReceivedAt: empty after a restart, so each
-   * session gets the block once more.
+   * session gets the block once more (an empty list: one "none missing" line,
+   * see runtimeWarningsCleared).
    */
   private readonly runtimeWarningsSent = new Map<string, string>();
 
@@ -3308,6 +3311,11 @@ export class BridgeHandler {
         const runtimeWarningsKey = BridgeHandler.runtimeWarningsFingerprint(runtimeWarnings);
         const runtimeWarningsChanged =
           rendersFullPrompt || this.runtimeWarningsSent.get(threadId) !== runtimeWarningsKey;
+        // A delta prompt without the block is the steady state, so an absent
+        // block cannot tell the agent that a warning still in its history was
+        // resolved. Say so once when the list is empty and changed — which
+        // after a restart (the map starts empty) is every session's first turn.
+        const runtimeWarningsCleared = !rendersFullPrompt && runtimeWarnings.length === 0 && runtimeWarningsChanged;
         let knowledgeMap: string | undefined;
         if (knowledgeDir && rendersFullPrompt) {
           try {
@@ -3351,6 +3359,7 @@ export class BridgeHandler {
           peers: effectivePeers,
           turn_taking_limit: this.deps.botConfig?.turn_taking_limit,
           botName: this.deps.botConfig?.name,
+          botOpenId: this.deps.botConfig?.bot_open_id,
           backend: this.deps.botConfig?.backend,
           promptMode,
           // 批G G1 (P1): pre-reseed handover warning (one line, bounded
@@ -3386,6 +3395,7 @@ export class BridgeHandler {
           larkCliSharedConfig: !(this.deps.botConfig?.id && this.deps.botConfig.lark_cli_isolated !== false),
           runtimeWarnings,
           runtimeWarningsChanged,
+          runtimeWarningsCleared,
           taskHandleTasklistGuid: this.deps.botConfig?.taskHandle?.tasklistGuid,
           taskHandleClaimed: this.deps.taskHandleClaimedLookup?.(threadId) ?? false,
           // BL-49: mechanical 建卡 判据 facts. Counts THIS turn (a brand-new

@@ -104,7 +104,7 @@ larkway start           # long-running; runs in background, logs to ~/.larkway/l
 
 Larkway never injects `ANTHROPIC_API_KEY` or any other API key. The subprocess inherits your local login state. If you switch to API-key mode, that is a deliberate opt-in in `src/claude/runner.ts`.
 
-The **pi backend** is the escape hatch when a subscription's token budget runs out: set `backend: pi` and `model: <provider>/<model>` in the bot yaml, and pi runs the same workspace (`AGENTS.md`, `.agents/skills/`, cloned repos) against the model you configured in pi. Larkway passes the bridge's environment through unchanged — it still adds no key of its own, but it does not strip provider keys either, because for pi they *are* the login. `effort` maps to pi's `--thinking` level (the model's entry in `models.json` needs `reasoning: true`, otherwise pi supports only `off`). Verify a bot's provider with `pi auth check --model <provider>/<model>`; `larkway doctor` runs that check for each model configured on a pi bot.
+The **pi backend** is the escape hatch when a subscription's token budget runs out: set `backend: pi` and `model: <provider>/<model>` in the bot yaml, and pi runs the same workspace (`AGENTS.md`, `.agents/skills/`, cloned repos) against the model you configured in pi. Larkway passes the bridge's environment through unchanged — it still adds no key of its own, but it does not strip provider keys either, because for pi they *are* the login. `effort` maps to pi's `--thinking` level (the model's entry in `models.json` needs `reasoning: true`, otherwise pi supports only `off`). Verify a bot's provider with `pi auth check --model <provider>/<model>`; `larkway doctor` runs that check for each model configured on a pi bot. pi starts cold every turn by default; `warmProcess: true` in the bot yaml keeps one `pi --mode rpc` process per active topic instead (opt-in — see [native runtime alignment](docs/native-runtime.md) for its limits, memory use, and how it differs from the cold path).
 
 ---
 
@@ -133,7 +133,10 @@ so `ask` cannot be honoured there. Larkway also runs pi with `--approve`
 (project trust), so `.pi/extensions` and `.pi/settings.json` found in the
 workspace or its parent directories are loaded too — an agent that can write
 its own cwd can therefore install code that runs in its next turn, which is
-no wider than the shell access it already has, but worth knowing.**
+no wider than the shell access it already has, but worth knowing. With the pi
+warm pool on, pi runs in RPC mode, where MCP servers are also offered
+sampling/elicitation (Larkway answers every such request with a cancel) — see
+[native runtime alignment](docs/native-runtime.md).**
 
 **Prompt injection is real.** Everything in the triggering message — and
 thread history / attachments the agent chooses to read — becomes agent input.

@@ -11,7 +11,7 @@ Larkway 传递飞书触发事实、可选资源指针和最小输出协议。任
 | 块 | 内容 | 条件 |
 |---|---|---|
 | `agent-memory` | legacy bot 的身份文本，最多 4,000 字符 | 仅 legacy runtime；不注入 agent workspace |
-| `runtime-warnings` | 本机缺失能力、诊断、安装提示 | 有检测结果时；delta 续轮仅在结果变化时（handler 未声明“未变化”即照发） |
+| `runtime-warnings` | 本机缺失能力、诊断、安装提示 | 有检测结果时；delta 续轮仅在结果变化时（handler 未声明“未变化”即照发），并注明列表完整、未列出的此前缺失项已恢复；列表变空（含 bridge 重启后该 session 的第一轮）时 delta 发一行“当前未检测到缺失”，只发一次 |
 | `thread-context` | 当前消息、会话、资源和 owner 事实；delta 只列本条消息的事实和偏离常态的值（见下） | 每轮 |
 | `context-pointers` | 按需取消息/历史/文档的命令、profile、env 名、开发地址 | 完整 prompt |
 | `state-contract` | 输出通道和可选卡片字段概要 | 完整 prompt |
@@ -36,13 +36,14 @@ Larkway 传递飞书触发事实、可选资源指针和最小输出协议。任
 - `is_new_thread`、`trigger_type`、`mention_type`、`scene_type`、`chat_type`。
 - `feishu_thread_id`、`feishu_root_id`：平台实际话题和首楼标识。
 - `raw_pointer`：读取当前原始消息的命令。
+- `mentioned_others`：消息里本 bot 以外被 @ 的人（`姓名 (open_id)`，不含 @所有人）；`quoted_message`：话题内引用回复某条消息（被引用的不是话题首楼）时，读取被引用消息的命令。解析文本会去掉所有 @，引用回复的正文也不含被引用内容，这两行是唯一线索；有值时首轮和续轮都给。
 - `attachments`、`images`、`feishu_doc_links`：资源指针。
 - 可选 `thread_turn_count`、`thread_has_task_card`：观察事实，不触发建卡规则。
 
 delta 续轮的 `thread-context` 只列会变化的事实，会话常量已在原生历史中：
 
 - 每轮：`message_id`、`chat_id`，以及 `thread_turn_count`、`thread_has_task_card`（如有）。`chat_id` 在原生压缩后仍是回帖和取历史的锚点。
-- 有值时：真实 `omt_` 话题的 `feishu_thread_id`；bot 使用宿主共享 lark-cli 配置（`lark_cli_isolated: false`）时的 `lark_cli_profile`（共享配置里靠 profile 选定本 bot 身份，原生压缩后首轮指针可能不在上下文中；独立配置目录只有本 bot 的 profile，不重复）；配置了 owner 时的 `sender_is_owner`；非空的 `attachments`、`images`、`feishu_doc_links`；原始消息含解析文本之外的内容时附 `raw_pointer`（有附件、正文里有资源标记如 `![image](…)` / `<file key=…/>`，或没有可读文本）。
+- 有值时：真实 `omt_` 话题的 `feishu_thread_id`；bot 使用宿主共享 lark-cli 配置（`lark_cli_isolated: false`）时的 `lark_cli_profile`（共享配置里靠 profile 选定本 bot 身份，原生压缩后首轮指针可能不在上下文中；独立配置目录只有本 bot 的 profile，不重复）；配置了 owner 时的 `sender_is_owner`；非空的 `attachments`、`images`、`feishu_doc_links`；`mentioned_others`、`quoted_message`；原始消息含解析文本之外的内容时附 `raw_pointer`（有附件、正文里有资源标记如 `![image](…)` / `<file key=…/>`、没有可读文本，或有上述 @ / 引用）。
 - 偏离常态时：`trigger_type`（常态为 `topic_continuation`）、`mention_type`（`bot_or_user_mention` 与 `no_mention_metadata` 都算常态：是否带 mention 元数据取决于送达路径，不反映用户行为）。
 - 只在完整 prompt 出现：`thread_id`、`session_key`、`is_new_thread`、`scene_type`、`chat_type`、`feishu_root_id`。
 
@@ -91,13 +92,13 @@ Codex 使用原生 `final_answer` 通道：已知 final phase 的消息直接流
 | `handoffs` | 最多 3 个 `{to,text}`；bridge 发带真实 at 标签的 post 并直递本地 peer，`text` 自包含 |
 | `task_handle` | 按需声明 `{create:{summary,due?}}`、`guid`、`note`、`due`/`due_reason`、`blocked`、`done`；不因聊天轮数自动要求使用 |
 
-tasklist 候选行形如 `guid=… | summary=… | thread=omt_…`：`thread` 由 bridge 从描述里的 applink 机械提取（被摘录截断的 id 不提取；描述指向多个话题时不给出），是与本话题 `feishu_thread_id` 精确对照的信号；URL 本身不注入。完整 prompt 另附去掉 URL 的描述摘录和清单 guid。delta 续轮省略清单 guid（认领只需要任务 guid），描述摘录只留给 `thread` 等于本话题 `feishu_thread_id` 的候选：候选随轮询变化，续轮才出现的候选此前没有注入过描述，而指向本话题的那一条正是认领会作用的对象，描述里的「由 X 创建」是区分同话题其他 bot 自建任务的依据（摘录在 200 字符处截断，长链接之后的这一行可能看不到）。已知取舍：续轮才出现、描述里没有话题链接的候选只带 guid 和 summary，agent 只能按 summary 判断。
+tasklist 候选行形如 `guid=… | summary=… | thread=omt_…`：`thread` 由 bridge 从描述里的 applink 机械提取（被摘录截断的 id 不提取；描述指向多个话题时不给出），是与本话题 `feishu_thread_id` 精确对照的信号；URL 本身不注入。完整 prompt 另附去掉 URL 的描述摘录和清单 guid。delta 续轮省略清单 guid（认领只需要任务 guid），描述摘录只留给 `thread` 等于本话题 `feishu_thread_id` 的候选：候选随轮询变化，续轮才出现的候选此前没有注入过描述，而指向本话题的那一条正是认领会作用的对象，描述里的「由 X 创建」是区分同话题其他 bot 自建任务的依据（摘录的 200 字符上限只计链接以外的文字，链接保持完整、渲染时再去掉，所以 bridge 自建任务在长链接之后的这一行能看到）。已知取舍：续轮才出现、描述里没有话题链接的候选只带 guid 和 summary，agent 只能按 summary 判断。
 
 任务分享入口的 `task-root` 块只暴露 guid、summary、回链、认领状态和刚认领事实。其评论模式由用户在任务中心确认完成；是否评论或声明交付由当前任务决定。该块替代 tasklist 候选块，避免提供冲突目标。
 
 peer 卡片正文并非可靠的 peer 输入通道。需要交接时使用自包含的 `handoffs` 文本或真实 post + at 标签；不强制增加 ack、台账或 deadline 流程。
 
-bridge 发本轮终卡的同时发出 `handoffs` 镜像 post：另一个 bridge 进程里的 peer 可能在本轮卡片定稿之前被唤醒（CardKit 定稿失败时，也可能早于兜底卡出现）；同一进程内的 peer 等终卡投递结束、本轮任务认领落地之后才收到。终卡投递失败时，已声明的 handoff 照常发出，本轮随后记为失败；用户重新 @ 后重跑的一轮如果再次声明 handoff，peer 会再收到一次。
+bridge 发本轮终卡的同时发出 `handoffs` 镜像 post：另一个 bridge 进程里的 peer 可能在本轮卡片定稿之前被唤醒（CardKit 定稿失败时，也可能早于兜底卡出现）；同一进程内的 peer 等终卡投递结束、本轮任务认领落地之后才收到。终卡投递失败时，已声明的 handoff 照常发出，本轮随后记为失败，失败卡不提交接已发出；用户重新 @ 后重跑的一轮，或断线重连补抓（gap-fill）把这条消息重新投递后重跑的一轮，如果再次声明 handoff，peer 会再收到一次（agent 已跑完的轮次不走稳态自动重投）。
 
 ## 连续性与预算
 

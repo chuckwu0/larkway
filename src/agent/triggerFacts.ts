@@ -39,16 +39,66 @@ function stringField(value: unknown): string | undefined {
   return typeof value === "string" && value.length > 0 ? value : undefined;
 }
 
+/** Someone besides this bot that the message @-mentions. */
+export interface MentionedOther {
+  name?: string;
+  openId?: string;
+}
+
+function isAllMention(record: Record<string, unknown>): boolean {
+  return record["key"] === "@_all" || record["mentioned_type"] === "all";
+}
+
+function mentionOpenId(record: Record<string, unknown>): string | undefined {
+  const id = record["id"];
+  if (typeof id === "string") return stringField(id);
+  if (typeof id === "object" && id !== null) return stringField((id as Record<string, unknown>)["open_id"]);
+  return undefined;
+}
+
+/**
+ * Who else the message @-mentions. The parsed text drops every @ (the live
+ * path's `<at>` markup and the replayed `@_user_N` placeholders alike), so
+ * without this "你和 @同事 对一下" reaches the agent as "你和 对一下".
+ * Excludes this bot (its own open_id) and @all (`mention_type` states that).
+ * Without a known own open_id, a lone mention is taken to be this bot — a
+ * group message reaches a bot only when it @-mentions it — and two or more
+ * are all listed, this bot included.
+ */
+export function mentionedOthers(parsed: ParsedMessage, selfOpenId?: string): MentionedOther[] {
+  const mentions = (parsed.raw as Record<string, unknown>)["mentions"];
+  if (!Array.isArray(mentions)) return [];
+  const people = mentions.flatMap((mention): MentionedOther[] => {
+    if (typeof mention !== "object" || mention === null) return [];
+    const record = mention as Record<string, unknown>;
+    if (isAllMention(record)) return [];
+    const name = stringField(record["name"]);
+    const openId = mentionOpenId(record);
+    return name || openId ? [{ ...(name ? { name } : {}), ...(openId ? { openId } : {}) }] : [];
+  });
+  if (selfOpenId) return people.filter((person) => person.openId !== selfOpenId);
+  return people.length > 1 ? people : [];
+}
+
+/**
+ * The message a reply quotes when that is not the topic root: an in-topic
+ * quote-reply to one specific earlier message (a live quote-reply push may
+ * omit `root_id` altogether). The parsed text never shows the quoted content.
+ */
+export function quotedMessageId(parsed: ParsedMessage): string | undefined {
+  const raw = parsed.raw as Record<string, unknown>;
+  const parentId = stringField(raw["parent_id"]);
+  if (!parentId || parentId === stringField(raw["root_id"]) || parentId === parsed.threadId) return undefined;
+  return parentId;
+}
+
 function mentionType(raw: Record<string, unknown>): TriggerFacts["mentionType"] {
   if (raw["larkway_trigger_type"] === "card_action") return "card_choice";
   const mentions = raw["mentions"];
   if (!Array.isArray(mentions) || mentions.length === 0) return "no_mention_metadata";
   if (
-    mentions.some((mention) => {
-      if (typeof mention !== "object" || mention === null) return false;
-      const record = mention as Record<string, unknown>;
-      return record["key"] === "@_all" || record["mentioned_type"] === "all";
-    })
+    mentions.some((mention) =>
+      typeof mention === "object" && mention !== null && isAllMention(mention as Record<string, unknown>))
   ) {
     return "all_mention";
   }

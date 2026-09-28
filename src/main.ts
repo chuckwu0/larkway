@@ -44,7 +44,11 @@ import { ensureLarkCliProfile, deriveLarkCliProfile } from "./lark/profileBootst
 import { isSyntheticSessionKey } from "./lark/message.js";
 import { createCachedRosterResolver } from "./lark/rosterResolver.js";
 import { checkWorkspacePermissionGrant } from "./agent/permissionGate.js";
-import { migrateRetiredContractLines, retiredContractMigrationPath } from "./agent/workspaceStore.js";
+import {
+  migrateRetiredContractLines,
+  retiredContractBackupPath,
+  retiredContractMigrationPath,
+} from "./agent/workspaceStore.js";
 import { ensureLocalBinOnPath, probeBackendReadiness } from "./agent/readiness.js";
 import { runtimeRequirementsForBots } from "./runtimeRequirements.js";
 import { registerCrashGuard } from "./crashGuard.js";
@@ -204,14 +208,23 @@ async function runV2Mode({
         // dropped only by a config save. Strip them once per boot — never on the
         // per-turn path, where agent self-edits and web saves could race it.
         // retiredContractMigrationPath returns undefined for BYO workspaces.
+        // Dry-run only reports what a real start would remove.
         const migrationPath = retiredContractMigrationPath(bot, larkwayHome());
-        if (migrationPath && !dryRun) {
+        if (migrationPath) {
           try {
-            const removed = await migrateRetiredContractLines(migrationPath);
-            if (removed > 0) {
+            const { removed, backupPath } = await migrateRetiredContractLines(migrationPath, {
+              dryRun,
+              backupPath: retiredContractBackupPath(migrationPath),
+            });
+            if (removed.length > 0) {
+              const lines = removed.map((r) => `${r.label} (line ${r.line})`).join(", ");
               console.log(
-                `[larkway] bot "${bot.id}": removed ${removed} retired contract line(s) from workspace AGENTS.md ` +
-                  "(takes effect for new sessions).",
+                `[larkway] bot "${bot.id}": ${dryRun ? "would remove" : "removed"} ${removed.length} retired ` +
+                  `contract line(s) from workspace AGENTS.md: ${lines}` +
+                  (dryRun
+                    ? "."
+                    : `${backupPath ? `; original saved to ${backupPath}` : ""} (takes effect for new sessions; ` +
+                      "a line re-added word for word is removed again — reword it to keep it; see docs/native-runtime.md)."),
               );
             }
           } catch (err) {
@@ -1029,6 +1042,7 @@ async function runV2Mode({
         sessionReseedChars: bot.sessionReseedChars,
         p2pStickyIdleMs: bot.p2pStickyIdleMs,
         owner_open_id: bot.owner_open_id,
+        bot_open_id: bot.bot_open_id,
         cot: bot.cot,
         cotSurface: bot.cotSurface,
         lark_cli_isolated: bot.lark_cli_isolated,
@@ -1453,7 +1467,8 @@ async function runV2Mode({
 
 registerRunner("claude", () => new ClaudeRunner());
 registerRunner("codex", () => new CodexRunner());
-// pi (BYO-model backend, src/pi/runner.ts): cold spawn per turn, no warm pool.
+// pi (BYO-model backend, src/pi/runner.ts): cold spawn per turn. A bot with
+// `warmProcess: true` gets its own PiProcessPool, registered as `pi-pool:<id>` when the bot starts.
 registerRunner("pi", () => new PiRunner());
 
 async function main(): Promise<void> {

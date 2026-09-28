@@ -940,3 +940,92 @@ describe("CardKitProgressHandle — WP-4 tail slimming", () => {
     expect(held.calls.slice(2).map((c) => c.name)).toEqual(["createElements"]);
   });
 });
+
+// Product review of WP-4: a final rebuild that fails leaves the card behind
+// for good (its turn gets a fallback card, which reconcile never revisits).
+describe("CardKit finalize failure: the card left behind", () => {
+  const facts = { botId: "bot", threadId: "thread", triggerMessageId: "trigger_message" };
+  const failingFinal = () => {
+    const fake = fakeCardKitClient();
+    const client: OutboundCardKitClient = {
+      ...fake.client,
+      async updateCardEntity() {
+        fake.calls.push({ name: "updateCardEntity:FAIL", args: [] });
+        throw new Error("fake finalize failed");
+      },
+    };
+    return { client, calls: fake.calls };
+  };
+
+  it("gets the final text streamed in, a footer pointing at the fallback, and streaming off — then finalize still rejects", async () => {
+    const { client, calls } = failingFinal();
+    const handle = await createCardKitProgressHandle({
+      cardKitClient: client, replyToMessageId: "trigger_message", replyInThread: true, facts, patchIntervalMs: 0,
+    });
+    handle.handle({ type: "answer_snapshot", text: "第一段答案。", raw: {} });
+    await handle.drain();
+    const before = calls.length;
+    await expect(handle.finalize({ finalText: "第一段答案。第二段答案,结束。" })).rejects.toThrow("fake finalize failed");
+    const after = calls.slice(before);
+    expect(after.map((c) => c.name)).toEqual([
+      "updateCardEntity:FAIL",
+      "streamElementContent",
+      "updateElement",
+      "updateCardSettings",
+    ]);
+    expect(after[1]!.args[2]).toBe("第一段答案。第二段答案,结束。");
+    expect((after[2]!.args[2] as { content: string }).content).toContain("本卡未能正常收尾");
+    expect((after[3]!.args[1] as { config: { streaming_mode: boolean } }).config.streaming_mode).toBe(false);
+    // Sequences stay strictly increasing across the failed call and the salvage.
+    const seqs = after.slice(1).map((c) => (c.args.at(-1) as { sequence: number }).sequence);
+    expect(seqs).toEqual([...seqs].sort((a, b) => a - b));
+    expect(new Set(seqs).size).toBe(seqs.length);
+  });
+
+  it("creates the answer element when nothing streamed (e.g. the answer came only from state.json)", async () => {
+    const { client, calls } = failingFinal();
+    const handle = await createCardKitProgressHandle({
+      cardKitClient: client, replyToMessageId: "trigger_message", replyInThread: true, facts, patchIntervalMs: 0,
+    });
+    const before = calls.length;
+    await expect(handle.finalize({ finalText: "只来自 state.json 的正文" })).rejects.toThrow("fake finalize failed");
+    const after = calls.slice(before);
+    expect(after.map((c) => c.name)).toEqual(["updateCardEntity:FAIL", "createElements", "updateElement", "updateCardSettings"]);
+    expect(JSON.stringify(after[1]!.args[1])).toContain("只来自 state.json 的正文");
+  });
+
+  it("does not re-stream text the card already shows; a salvage step that fails does not stop the others", async () => {
+    const { client, calls } = failingFinal();
+    const handle = await createCardKitProgressHandle({
+      cardKitClient: { ...client, async updateElement() { throw new Error("footer update failed"); } },
+      replyToMessageId: "trigger_message", replyInThread: true, facts, patchIntervalMs: 0,
+    });
+    handle.handle({ type: "answer_snapshot", text: "完整答案", raw: {} });
+    await handle.drain();
+    const before = calls.length;
+    await expect(handle.finalize({ finalText: "完整答案" })).rejects.toThrow("fake finalize failed");
+    expect(calls.slice(before).map((c) => c.name)).toEqual(["updateCardEntity:FAIL", "updateCardSettings"]);
+  });
+
+  it("a hung salvage call does not hold the fallback past its budget", async () => {
+    vi.useFakeTimers();
+    try {
+      const { client } = failingFinal();
+      const handle = await createCardKitProgressHandle({
+        cardKitClient: { ...client, streamElementContent: () => new Promise<void>(() => {}), createElements: () => new Promise<void>(() => {}) },
+        replyToMessageId: "trigger_message", replyInThread: true, facts, patchIntervalMs: 0,
+      });
+      let rejected = false;
+      const finalizing = handle.finalize({ finalText: "final" }).catch(() => {
+        rejected = true;
+      });
+      await vi.advanceTimersByTimeAsync(4_999);
+      expect(rejected).toBe(false);
+      await vi.advanceTimersByTimeAsync(2);
+      await finalizing;
+      expect(rejected).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});

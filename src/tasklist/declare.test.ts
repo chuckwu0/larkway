@@ -123,6 +123,62 @@ describe("applyTaskHandleDeclarations — create (信号1)", () => {
     expect(result.outcomes[0]).toContain("已认领");
   });
 
+  // A comment-mode claim is not re-read on every turn (writeback.ts), so a
+  // task deleted in Feishu can still hold its claim when the agent is asked
+  // for a new card.
+  describe("a comment-mode claim whose task may be gone", () => {
+    function requesterWithTask(get: "exists" | "missing" | "forbidden") {
+      const calls: LarkTaskRequestConfig[] = [];
+      const request = vi.fn(async (config: LarkTaskRequestConfig) => {
+        calls.push(config);
+        if (config.method === "POST" && config.url.endsWith("/tasks")) return { data: { task: { guid: "guid-new" } } };
+        if (config.method === "GET" && config.url.endsWith("/tasks/guid-old")) {
+          if (get === "exists") return { data: { task: { guid: "guid-old", summary: "旧卡" } } };
+          throw { response: { status: get === "missing" ? 404 : 403, data: { code: 1, msg: get === "missing" ? "not found" : "forbidden" } } };
+        }
+        return { data: {} };
+      });
+      return { requester: { request: request as unknown as LarkTaskRequester["request"] }, calls };
+    }
+    async function claimedStore() {
+      const store = await TaskHandleStore.load(join(dir, "task-handles.json"));
+      await store.claim({ threadId: "om_thread_1", chatId: "oc_chat_1", taskGuid: "guid-old", mode: "comment" });
+      return store;
+    }
+    const creates = (calls: LarkTaskRequestConfig[]) => calls.filter((c) => c.method === "POST" && c.url.endsWith("/tasks"));
+
+    it("deleted upstream: the claim is dropped and the new task is created", async () => {
+      const store = await claimedStore();
+      const { requester, calls } = requesterWithTask("missing");
+      const result = await applyTaskHandleDeclarations(basePatch({ create: { summary: "重新建卡" } }), {
+        store, client: new TaskListClient(requester),
+      });
+      expect(result.createdGuid).toBe("guid-new");
+      expect(creates(calls)).toHaveLength(1);
+      expect(store.get("om_thread_1")).toBeUndefined();
+      expect(result.outcomes[0]).toContain("guid-old 已不存在");
+    });
+
+    it.each(["exists", "forbidden"] as const)("task %s: the create is skipped as before", async (get) => {
+      const store = await claimedStore();
+      const { requester, calls } = requesterWithTask(get);
+      const result = await applyTaskHandleDeclarations(basePatch({ create: { summary: "重复建卡" } }), {
+        store, client: new TaskListClient(requester),
+      });
+      expect(result.createdGuid).toBeUndefined();
+      expect(creates(calls)).toHaveLength(0);
+      expect(store.get("om_thread_1")?.taskGuid).toBe("guid-old");
+      expect(result.outcomes[0]).toContain("已认领");
+    });
+
+    it("a turn that declares no create never reads the claimed task", async () => {
+      const store = await claimedStore();
+      const { requester, calls } = requesterWithTask("missing");
+      await applyTaskHandleDeclarations(basePatch({ blocked: "等设计稿" }), { store, client: new TaskListClient(requester) });
+      expect(calls.filter((c) => c.method === "GET")).toHaveLength(0);
+    });
+  });
+
   it("degrades to an outcome line when the create API fails (never throws)", async () => {
     const store = await TaskHandleStore.load(join(dir, "task-handles.json"));
     const { requester } = makeFakeRequester({ failCreate: true });

@@ -40,6 +40,8 @@ import {
   detectPiAuth,
   detectPiBinary,
 } from "../backendHealth.js";
+import { effectiveWarmProcess } from "../../config/botLoader.js";
+import { DEFAULT_MAX_PROCESSES as PI_DEFAULT_MAX_PROCESSES } from "../../pi/pool.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -790,6 +792,43 @@ async function checkPi(ctx: CliContext): Promise<CheckResult[]> {
   return results;
 }
 
+/**
+ * 6c. pi 热进程池提示(informational, never a warn/error)
+ *
+ * A pi bot's `warmProcess: true` turns its pool on; releases before the pool
+ * existed ignored the key, so it can sit in a yaml from an earlier backend
+ * (the Web UI keeps unrelated keys when switching backend). Surfaced here,
+ * status ok, so an operator sees it before or after an upgrade without the
+ * lint gate changing.
+ */
+export async function checkPiWarmPool(ctx: CliContext): Promise<CheckResult[]> {
+  const pooled: Array<{ id: string; maxProcesses: number }> = [];
+  try {
+    for (const id of await ctx.botsStore.listBots()) {
+      try {
+        const bot = await ctx.botsStore.readBot(id);
+        if (bot.backend === "pi" && effectiveWarmProcess(bot)) {
+          pooled.push({ id, maxProcesses: bot.warmProcessMaxProcesses ?? PI_DEFAULT_MAX_PROCESSES });
+        }
+      } catch {
+        /* schema errors are reported by check #3 */
+      }
+    }
+  } catch {
+    /* botsStore unavailable */
+  }
+  if (pooled.length === 0) return [];
+  return [{
+    id: "pi-warm-pool",
+    label: `pi 热进程池已开启: ${pooled.map((b) => `${b.id} (最多 ${b.maxProcesses} 个进程)`).join(", ")}`,
+    status: "ok",
+    message:
+      "这些 pi bot 的 yaml 写了 warmProcess: true:每个活跃话题常驻一个 `pi --mode rpc`,空闲后回收;" +
+      "单进程实测约 130–150 MB(只含 pi 本体,不含它拉起的 MCP 子进程)。更早的版本对 pi 忽略这一项," +
+      "如果它是切换底座前留下的,删掉这一行并重启即恢复每轮冷启动。见 docs/native-runtime.md。",
+  }];
+}
+
 // ---------------------------------------------------------------------------
 // Run all checks
 // ---------------------------------------------------------------------------
@@ -826,6 +865,7 @@ async function runAllChecks(ctx: CliContext, opts: { lint: boolean }): Promise<C
   // 6b. pi CLI availability (required only if a bot uses backend: pi)
   const piChecks = await checkPi(ctx);
   results.push(...piChecks);
+  results.push(...(await checkPiWarmPool(ctx)));
 
   // 7. Task-handle config status + scope probe (v3.4 discoverability)
   const taskHandleChecks = await checkTaskHandle(ctx, opts);
