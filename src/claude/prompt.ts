@@ -5,6 +5,7 @@ import {
   DEFAULT_CONTINUATION_TRIGGER_TYPE,
   DEFAULT_MENTION_TYPES,
   deriveTriggerFacts,
+  hasContentBeyondText,
 } from "../agent/triggerFacts.js";
 import { ANSWER_BEGIN_MARKER, ANSWER_END_MARKER } from "../agent/answerChannel.js";
 import type { TaskCandidate } from "../tasklist/types.js";
@@ -71,8 +72,8 @@ export interface RenderPromptInput {
   larkCliProfile?: string;
   runtimeWarnings?: RuntimeWarning[];
   /**
-   * Delta turns skip `<runtime-warnings>` only when the handler reports the
-   * set unchanged since the session last received it. Absent = changed.
+   * WP-2 (f): false = the session already received this exact warning list
+   * (handler-computed). Absent behaves as today.
    */
   runtimeWarningsChanged?: boolean;
   taskHandleTasklistGuid?: string;
@@ -161,11 +162,12 @@ function renderPeers(peers: PeerBot[] | undefined): string[] {
 }
 
 // A markdown link (its URL may be cut by the poller's excerpt truncation, so
-// the closing paren is optional) or a bare URL.
-const DESCRIPTION_URL = /\[([^\]]*)\]\((https?:\/\/[^\s)]*)\)?|https?:\/\/[^\s)]+/g;
-// Only a complete id counts: a truncated excerpt ends mid-URL with "…", and a
-// cut-off `omt_` prefix must never reach the agent as a topic to match.
-const TOPIC_ID_PARAM = /[?&](?:open_thread_id|openthreadid)=(omt_[A-Za-z0-9_-]+)(?=[&#]|$)/;
+// the closing paren is optional) or a bare URL. URL characters are visible
+// ASCII except ")": Chinese text often runs straight on after a link, and the
+// poller's cut mark must stay outside the URL.
+const DESCRIPTION_URL = /\[([^\]]*)\]\((https?:\/\/[\x21-\x28\x2A-\x7E]*)\)?|https?:\/\/[\x21-\x28\x2A-\x7E]+/g;
+const TOPIC_ID_PARAM = /[?&](?:open_thread_id|openthreadid)=(omt_[A-Za-z0-9_-]+)/g;
+const EXCERPT_CUT_MARK = "…";
 
 /**
  * Mechanical candidate-description compaction. Bridge-created task
@@ -174,11 +176,27 @@ const TOPIC_ID_PARAM = /[?&](?:open_thread_id|openthreadid)=(omt_[A-Za-z0-9_-]+)
  * and a link keeps its label.
  */
 export function compactCandidateDescription(description: string): { thread?: string; text: string } {
-  let thread: string | undefined;
-  const text = description.replace(DESCRIPTION_URL, (match, label: string | undefined, linkUrl: string | undefined) => {
-    thread ??= TOPIC_ID_PARAM.exec(linkUrl ?? match)?.[1];
-    return label ?? "";
-  });
+  const complete = new Set<string>();
+  const cutShort: string[] = [];
+  const text = description.replace(
+    DESCRIPTION_URL,
+    (match: string, label: string | undefined, linkUrl: string | undefined, offset: number) => {
+      const url = linkUrl ?? match;
+      // Where the URL stops in the description: before a markdown link's ")".
+      const urlEnd = offset + match.length - (match.endsWith(")") ? 1 : 0);
+      for (const param of url.matchAll(TOPIC_ID_PARAM)) {
+        // An id that runs into the excerpt's cut mark may be missing characters.
+        const cut = param.index + param[0].length === url.length && description[urlEnd] === EXCERPT_CUT_MARK;
+        if (cut) cutShort.push(param[1]!);
+        else complete.add(param[1]!);
+      }
+      return label ?? "";
+    },
+  );
+  // Only an unambiguous id is a match signal: two topics (a reference link
+  // beside the work topic, say) or a cut-off id of another topic yield none.
+  const [only, ...others] = complete;
+  const thread = only && others.length === 0 && cutShort.every((id) => only.startsWith(id)) ? only : undefined;
   return { thread, text: text.replace(/\s+/g, " ").trim() };
 }
 
@@ -317,10 +335,9 @@ export async function renderPrompt(input: RenderPromptInput): Promise<string> {
     ...(trigger.triggerType !== DEFAULT_CONTINUATION_TRIGGER_TYPE ? [`trigger_type:     ${trigger.triggerType}`] : []),
     ...(!DEFAULT_MENTION_TYPES.has(trigger.mentionType) ? [`mention_type:     ${trigger.mentionType}`] : []),
     ...(trigger.feishuThreadId?.startsWith("omt_") ? [`feishu_thread_id: ${trigger.feishuThreadId}`] : []),
-    ...(attachments.length > 0 ? [
-      `raw_pointer:      ${trigger.rawMessagePointer}`,
-      `attachments:      ${csv(attachments)}`,
-    ] : []),
+    // Also for a resource that arrived as a text marker, or a card/sticker with no readable text.
+    ...(hasContentBeyondText(parsed) ? [`raw_pointer:      ${trigger.rawMessagePointer}`] : []),
+    ...(attachments.length > 0 ? [`attachments:      ${csv(attachments)}`] : []),
     ...(parsed.feishuDocLinks.length > 0 ? [`feishu_doc_links: ${csv(parsed.feishuDocLinks)}`] : []),
     ...(images.length > 0 ? [`images:           ${csv(images)}`] : []),
     ...threadFacts,

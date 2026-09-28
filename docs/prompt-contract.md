@@ -42,8 +42,8 @@ Larkway 传递飞书触发事实、可选资源指针和最小输出协议。任
 delta 续轮的 `thread-context` 只列会变化的事实，会话常量已在原生历史中：
 
 - 每轮：`message_id`、`chat_id`，以及 `thread_turn_count`、`thread_has_task_card`（如有）。`chat_id` 在原生压缩后仍是回帖和取历史的锚点。
-- 有值时：真实 `omt_` 话题的 `feishu_thread_id`；配置了 owner 时的 `sender_is_owner`；非空的 `attachments`、`images`、`feishu_doc_links`，有附件时附 `raw_pointer`。
-- 偏离常态时：`trigger_type`（常态为 `topic_continuation`）、`mention_type`（`bot_or_user_mention` 与 `no_mention_metadata` 都算常态：实时推送不带 mention 元数据，补抓重放带，差别来自送达路径）。
+- 有值时：真实 `omt_` 话题的 `feishu_thread_id`；配置了 owner 时的 `sender_is_owner`；非空的 `attachments`、`images`、`feishu_doc_links`；原始消息含解析文本之外的内容时附 `raw_pointer`（有附件、正文里有资源标记如 `![image](…)` / `<file key=…/>`，或没有可读文本）。
+- 偏离常态时：`trigger_type`（常态为 `topic_continuation`）、`mention_type`（`bot_or_user_mention` 与 `no_mention_metadata` 都算常态：是否带 mention 元数据取决于送达路径，不反映用户行为）。
 - 只在完整 prompt 出现：`thread_id`、`session_key`、`is_new_thread`、`scene_type`、`chat_type`、`feishu_root_id`。
 
 所有命令只是可选指针。当前用户消息和原生会话历史足够时，可以直接回答，不要求任何工具调用。
@@ -91,7 +91,7 @@ Codex 使用原生 `final_answer` 通道：已知 final phase 的消息直接流
 | `handoffs` | 最多 3 个 `{to,text}`；bridge 发带真实 at 标签的 post 并直递本地 peer，`text` 自包含 |
 | `task_handle` | 按需声明 `{create:{summary,due?}}`、`guid`、`note`、`due`/`due_reason`、`blocked`、`done`；不因聊天轮数自动要求使用 |
 
-tasklist 候选行形如 `guid=… | summary=… | thread=omt_…`：`thread` 由 bridge 从描述里的 applink 机械提取（被摘录截断的 id 不提取），是与本话题 `feishu_thread_id` 精确对照的信号；URL 本身不注入。完整 prompt 另附去掉 URL 的描述摘录和清单 guid；delta 续轮省略这两项。
+tasklist 候选行形如 `guid=… | summary=… | thread=omt_…`：`thread` 由 bridge 从描述里的 applink 机械提取（被摘录截断的 id 不提取；描述指向多个话题时不给出），是与本话题 `feishu_thread_id` 精确对照的信号；URL 本身不注入。完整 prompt 另附去掉 URL 的描述摘录和清单 guid；delta 续轮省略这两项。
 
 任务分享入口的 `task-root` 块只暴露 guid、summary、回链、认领状态和刚认领事实。其评论模式由用户在任务中心确认完成；是否评论或声明交付由当前任务决定。该块替代 tasklist 候选块，避免提供冲突目标。
 

@@ -435,6 +435,22 @@ describe("delta thread facts", () => {
     expect(image).toContain("raw_pointer:");
     expect(image).toContain("images:           file_image");
   });
+
+  // A delivery carrying the SDK's normalized text reports resources as markers
+  // in the text, with `attachments` empty; unreadable content leaves no text.
+  it.each([
+    ["an image marker", "看下这张 ![image](img_test_key)", true],
+    ["a file marker", '<file key="file_test_key" name="test.log"/>', true],
+    ["a sticker marker", '<sticker key="file_test_sticker"/>', true],
+    ["forwarded messages", "<forwarded_messages>\nou_test_a: 旧消息\n</forwarded_messages>", true],
+    ["no readable text", "", true],
+    ["plain text with a markdown link", "按 [文档](https://example.com/spec) 改一下图片说明", false],
+  ])("points at the raw message for %s: %s", async (_label, text, shown) => {
+    const facts = between(await resumed({ larkCliProfile: "test-profile", parsed: makeParsed({ text }) }), "thread-context");
+    if (shown) expect(facts).toContain("raw_pointer:      lark-cli api GET /open-apis/im/v1/messages/om_msg001 --profile test-profile --as bot");
+    else expect(facts).not.toContain("raw_pointer");
+    expect(facts).not.toMatch(/^(attachments|images):/m);
+  });
 });
 
 describe("runtime warnings on continuation", () => {
@@ -469,7 +485,8 @@ describe("candidate description compaction", () => {
 
   it("reads a complete id from a link the excerpt truncated later on", () => {
     const cut = `话题：[点击进入工作话题](${topicLink("omt_test_one").slice(0, 110)}…`;
-    expect(compactCandidateDescription(cut)).toEqual({ thread: "omt_test_one", text: "话题：点击进入工作话题" });
+    // The cut mark stays in the text: the agent sees the excerpt was shortened.
+    expect(compactCandidateDescription(cut)).toEqual({ thread: "omt_test_one", text: "话题：点击进入工作话题…" });
   });
 
   it("never reports an id the truncation cut short", () => {
@@ -492,6 +509,37 @@ describe("candidate description compaction", () => {
   it("leaves text without URLs alone and yields no topic id", () => {
     expect(compactCandidateDescription("Check  compatibility omt_not_a_link")).toEqual({ thread: undefined, text: "Check compatibility omt_not_a_link" });
     expect(compactCandidateDescription("[打开群聊](https://applink.feishu.cn/client/chat/open?openChatId=oc_test_chat)")).toEqual({ thread: undefined, text: "打开群聊" });
+  });
+
+  it("ends a bare URL where Chinese text runs straight on", () => {
+    expect(compactCandidateDescription("需求见 https://example.feishu.cn/docx/test，请按文档改接口并补测试")).toEqual({
+      thread: undefined,
+      text: "需求见 ，请按文档改接口并补测试",
+    });
+    expect(compactCandidateDescription(`关联话题${topicLink("omt_test_cjk")}，请今天跟进登录失败`)).toEqual({
+      thread: "omt_test_cjk",
+      text: "关联话题，请今天跟进登录失败",
+    });
+    expect(compactCandidateDescription("话题 https://applink.feishu.cn/client/thread/open?open_thread_id=omt_test_end。由我创建").thread).toBe("omt_test_end");
+    expect(compactCandidateDescription("话题 https://applink.feishu.cn/client/thread/open?open_thread_id=omt_test_dot. 由我创建").thread).toBe("omt_test_dot");
+  });
+
+  it("never reports an id a bare URL lost to the truncation", () => {
+    const link = topicLink("omt_test_one");
+    const compacted = compactCandidateDescription(`话题 ${link.slice(0, link.indexOf("omt_test_one") + 8)}…`);
+    expect(compacted).toEqual({ thread: undefined, text: "话题 …" });
+  });
+
+  it("reports a topic only when the description names exactly one", () => {
+    const both = `参考[旧话题](${topicLink("omt_test_old")})，工作[新话题](${topicLink("omt_test_new")})`;
+    expect(compactCandidateDescription(both)).toEqual({ thread: undefined, text: "参考旧话题，工作新话题" });
+    // The same topic linked twice is still one topic.
+    expect(compactCandidateDescription(`[话题](${topicLink("omt_test_one")}) 或 ${topicLink("omt_test_one")}`).thread).toBe("omt_test_one");
+    // A cut-off id is ambiguous unless it is a prefix of the complete one.
+    const link = topicLink("omt_test_one");
+    expect(compactCandidateDescription(`[话题](${link.slice(0, link.lastIndexOf("omt_test_one") + 6)}…`).thread).toBe("omt_test_one");
+    const other = topicLink("omt_test_two");
+    expect(compactCandidateDescription(`[话题](${link}) 参考 ${other.slice(0, other.indexOf("omt_test_two") + 10)}…`).thread).toBeUndefined();
   });
 });
 
