@@ -9,6 +9,7 @@
  */
 
 import { describe, it, expect, afterEach, vi } from "vitest";
+import { join } from "node:path";
 import { EventEmitter, PassThrough } from "node:stream";
 import { AnswerChannelExtractor } from "../agent/answerChannel.js";
 import {
@@ -140,13 +141,16 @@ describe("buildPiCommand", () => {
   });
 
   it("addDirs become --skill <dir>/.agents/skills only where that directory exists", () => {
+    // buildPiCommand joins with node:path, so the skill dir uses the native
+    // separator (`\ws\repos\a\.agents\skills` on Windows).
+    const repoA = join("/ws/repos/a");
     const [, args] = buildPiCommand(
       { prompt: "x", addDirs: ["/ws/repos/a", "/ws/repos/b"] },
       "pi",
-      (dir) => dir.startsWith("/ws/repos/a"),
+      (dir) => dir.startsWith(repoA),
     );
     expect(args.filter((a) => a === "--skill")).toHaveLength(1);
-    expect(args[args.indexOf("--skill") + 1]).toBe("/ws/repos/a/.agents/skills");
+    expect(args[args.indexOf("--skill") + 1]).toBe(join(repoA, ".agents", "skills"));
   });
 
   it("agentBinPath overrides the binary", () => {
