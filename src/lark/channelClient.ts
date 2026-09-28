@@ -238,12 +238,15 @@ interface ChannelNormalizedMessage {
   threadId?: string;
   rootId?: string;
   createTime?: number;
-  /** Normalized text (markdown + XML-style tags). Used to synthesize lark
-   *  content when the raw lark content JSON isn't available. */
+  /** Normalized text (markdown + XML-style tags) — the event's text whenever
+   *  present (see {@link liveContent}). */
   content?: string;
   rawContentType?: string;
+  /** Attachments the SDK found (for a debounce-merged burst: across all of it). */
+  resources?: Array<{ type?: string; fileKey?: string }>;
   mentions?: unknown;
-  /** Raw im.message.receive_v1 event body (present when includeRawInMessage). */
+  /** Raw im.message.receive_v1 event body (present when includeRawEvent) —
+   *  see {@link receiveBodyOf} for the shapes it arrives in. */
   raw?: unknown;
 }
 
@@ -304,17 +307,20 @@ export function resolveOpenChatDiscoveryMs(ctorValue: number | undefined): numbe
 }
 
 /**
- * Opt-in override for the Channel SDK's inbound text batching, from env
+ * Opt-in override for the Channel SDK's inbound debounce window, from env
  * LARKWAY_INBOUND_BATCH_DELAY_MS. The SDK holds every inbound message for a
- * per-chat debounce window before dispatching it — 600ms, or 2000ms once the
- * buffered text reaches 1000 chars (node-sdk 1.67.0 DEFAULT_BATCH) — and merges
- * same-chat messages that land inside the window into one turn carrying the
- * LATEST message's id and sender. That wait happens before our `wsAt` stamp.
+ * per-chat window before dispatching it — 600ms, or 2000ms once the buffered
+ * text reaches 1000 chars, restarted by each new message in the chat (node-sdk
+ * 1.67.0 DEFAULT_BATCH) — and folds what landed inside it into one dispatch.
+ * {@link installInboundBatchSplit} splits every such flush back into one
+ * dispatch per message, so the window does not decide how messages become
+ * turns; it only delays them. That wait happens before our `wsAt` stamp.
  *
  * Unset, empty or non-numeric → `undefined`: keep the SDK default (today's
- * deployed behaviour). `0` (negatives clamp to 0) → the SDK's pure-serial
- * mode: dispatch at once, no merging — the long-message delay is skipped too.
- * A positive value replaces only the short-message window.
+ * deployed timing). `0` (negatives clamp to 0) → the SDK's pure-serial mode:
+ * dispatch at once, the long-message delay skipped too. A positive value
+ * replaces only the short-message window. Whatever the value, each message is
+ * dispatched on its own, in arrival order.
  */
 export function resolveInboundBatchDelayMs(): number | undefined {
   const env = process.env["LARKWAY_INBOUND_BATCH_DELAY_MS"];
@@ -562,11 +568,105 @@ export function synthesizeCardActionEvent(
 // Raw event → LarkMessageEvent (lark-cli-identical shape)
 // ---------------------------------------------------------------------------
 
+/** The im.message.receive_v1 body: the part of the event we read. */
+interface RawReceiveBody {
+  message?: Record<string, unknown>;
+  sender?: { sender_id?: { open_id?: string } };
+}
+
+/**
+ * Locate the im.message.receive_v1 body inside `msg.raw`. It comes in two shapes:
+ *  - FLAT — every live delivery. The SDK's EventDispatcher spreads the v2
+ *    envelope before normalizing (node-sdk 1.67.0 `RequestHandle.parse`:
+ *    `{...rest, ...header, ...event}`), so raw is `{ schema, event_id,
+ *    event_type, app_id, tenant_key, create_time, sender, message }` with NO
+ *    `event` key — the SDK's own `RawMessageEvent` type is `{ sender, message }`.
+ *  - NESTED `{ event: { sender, message } }` — the unflattened envelope, which
+ *    gap-fill builds around a recovered list item.
+ * Reading only the nested form found nothing on live traffic: mentions were
+ * always dropped, and image/file/post-image/task-share messages reached
+ * message.ts as the SDK's text alone, with no attachment key or task guid.
+ */
+function receiveBodyOf(raw: unknown): RawReceiveBody | undefined {
+  if (!raw || typeof raw !== "object") return undefined;
+  const r = raw as { message?: unknown; event?: unknown };
+  if (r.message && typeof r.message === "object") return r as RawReceiveBody;
+  if (r.event && typeof r.event === "object") return r.event as RawReceiveBody;
+  return undefined;
+}
+
+/**
+ * Message types whose SDK text is only a tag (`![image](key)`, `<file key=…
+ * name=…/>`, a `<todo>` block without the task guid) while their raw content
+ * holds what message.ts extracts: the attachment key (+ file name) or the task
+ * share's guid.
+ */
+const RAW_KEYS_MESSAGE_TYPES = new Set(["image", "file", "audio", "media", "video", "todo"]);
+
+/**
+ * Lark content JSON for a message the SDK normalized (message.ts reads the text
+ * AND the attachment keys from it).
+ *
+ * The text is always the SDK's: markdown with its paragraphs, links, code
+ * blocks and @names intact — message.ts's own post parsing joins rows into one
+ * line and strips every @placeholder — and, for a debounce-merged burst (the
+ * SDK folds same-chat messages landing within ~600ms into one, keeping only the
+ * LAST one's raw; {@link installInboundBatchSplit} splits such bursts back
+ * apart, so one arrives merged only when it can't), every message's text.
+ * Alongside it go the keys message.ts extracts: an attachment / task-share
+ * message's own raw keys (its SDK text is only a tag), and every image the SDK
+ * found — inline in a post, or anywhere in a burst — as post `img` rows.
+ *
+ * A task share is the one type message.ts renders from its raw keys alone
+ * (`[飞书任务] <title> (task_guid=…)`, ignoring `text`). That suits a lone
+ * share, whose SDK text is just its `<todo>` block; a burst ENDING in one keeps
+ * the SDK text instead, with the guid appended, so its earlier messages stay.
+ */
+function liveContent(
+  msg: ChannelNormalizedMessage,
+  rawContent: string | undefined,
+  messageType: string | undefined,
+): string {
+  let keys: Record<string, unknown> = {};
+  if (rawContent !== undefined && RAW_KEYS_MESSAGE_TYPES.has(messageType ?? "")) {
+    try {
+      const parsed = JSON.parse(rawContent) as unknown;
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        keys = parsed as Record<string, unknown>;
+      }
+    } catch {
+      // unparseable raw: the SDK text alone, as for any other type
+    }
+  }
+  let text = stripAtMarkup(msg.content ?? "");
+  const taskGuid = keys["task_id"];
+  const loneTodoBlock =
+    text.startsWith("<todo>") && text.endsWith("</todo>") && text.lastIndexOf("<todo>") === 0;
+  if (typeof taskGuid === "string" && !loneTodoBlock) {
+    text = `${text} (task_guid=${taskGuid})`;
+    keys = {};
+  }
+  const imageKeys = [
+    ...new Set(
+      (msg.resources ?? [])
+        .filter((r) => r?.type === "image" && typeof r.fileKey === "string" && r.fileKey.length > 0)
+        .map((r) => r.fileKey as string),
+    ),
+  ].filter((key) => key !== keys["image_key"]);
+  return JSON.stringify({
+    ...keys,
+    text,
+    ...(imageKeys.length > 0
+      ? { content: imageKeys.map((image_key) => [{ tag: "img", image_key }]) }
+      : {}),
+  });
+}
+
 /**
  * Reconstruct the lark-cli-compatible LarkMessageEvent from the SDK's raw
  * im.message.receive_v1 body, falling back to the SDK's normalized fields.
- * The RAW `message.content` (text/post JSON string) + `mentions` are preserved
- * verbatim so lark/message.ts parses attachments / post text / @ exactly as before.
+ * Routing fields and `mentions` come from raw verbatim; for content see the
+ * comment at its selection below.
  */
 export function channelMsgToLarkEvent(
   msg: ChannelNormalizedMessage,
@@ -580,11 +680,9 @@ export function channelMsgToLarkEvent(
    */
   fallbackChatType?: string,
 ): LarkMessageEvent | null {
-  const raw = msg.raw as
-    | { event?: { message?: Record<string, unknown>; sender?: { sender_id?: { open_id?: string } } } }
-    | undefined;
-  const m = raw?.event?.message;
-  const senderOpenId = raw?.event?.sender?.sender_id?.open_id ?? msg.senderId;
+  const body = receiveBodyOf(msg.raw);
+  const m = body?.message;
+  const senderOpenId = body?.sender?.sender_id?.open_id ?? msg.senderId;
 
   const message_id = (m?.["message_id"] as string) ?? msg.messageId;
   const chat_id = (m?.["chat_id"] as string) ?? msg.chatId;
@@ -620,14 +718,16 @@ export function channelMsgToLarkEvent(
     (msg as { replyToMessageId?: string }).replyToMessageId ??
     undefined;
 
-  // Content: prefer the RAW lark content JSON (message.ts parses text/post/
-  // image_key with full fidelity). When raw isn't in the expected shape, fall
-  // back to synthesizing a lark TEXT content from the SDK's normalized `content`
-  // (markdown+tags) so the agent still gets the message text. Without this
-  // fallback the agent received an EMPTY user-message (E2E 2026-05-29).
+  // Content: a live message (the SDK normalized it) → the SDK's text plus the
+  // raw keys message.ts extracts ({@link liveContent}); no SDK text (a gap-fill
+  // replay) → the raw content JSON, verbatim; neither → an empty text, never
+  // a missing one (the agent once received an EMPTY user-message, E2E 2026-05-29).
   const rawContent = typeof m?.["content"] === "string" ? (m["content"] as string) : undefined;
+  const messageType = (m?.["message_type"] as string | undefined) ?? msg.rawContentType;
   const content =
-    rawContent ?? JSON.stringify({ text: stripAtMarkup(msg.content ?? "") });
+    typeof msg.content === "string"
+      ? liveContent(msg, rawContent, messageType)
+      : rawContent ?? JSON.stringify({ text: "" });
 
   return {
     message_id,
@@ -641,6 +741,98 @@ export function channelMsgToLarkEvent(
     content,
     create_time: (m?.["create_time"] as string) ?? String(msg.createTime ?? Date.now()),
   };
+}
+
+// ---------------------------------------------------------------------------
+// SDK inbound batching → one dispatch per message
+// ---------------------------------------------------------------------------
+
+/** One flush of the SDK's inbound batcher: the message it dispatches + the ids folded into it. */
+interface SdkInboundBatch {
+  message: ChannelNormalizedMessage;
+  sourceIds: string[];
+}
+
+/** node-sdk's private per-chat batcher, reached as `channel.safety.manager`. */
+interface SdkChatPipelineManager {
+  push(
+    scope: string,
+    msg: ChannelNormalizedMessage,
+    handler: (batch: SdkInboundBatch) => Promise<void>,
+  ): void;
+}
+
+/**
+ * Stop the Channel SDK's inbound debounce from merging messages into one turn.
+ *
+ * node-sdk's SafetyPipeline (1.67.0; unchanged through 1.74.0) batches
+ * inbound messages PER CHAT — `manager.push(msg.chatId, …)`, with no thread
+ * or sender in the key and no option to change it — for a debounce window
+ * (600ms, 2000ms once the buffer reaches 1000 chars; forced flush at 8
+ * messages / 4000 chars). It then dispatches ONE message from `mergeBatch`:
+ * the LAST message's id, sender, root/thread id and `raw`, with every
+ * message's text joined into `content`. The event channelMsgToLarkEvent
+ * builds from it is routed to the last message's topic and sender. So two @s
+ * in different topics of one group inside the window became a single turn in
+ * the later topic, and the earlier @ either rode along in the joined text,
+ * under the wrong topic and sender, or was dropped, when content came from
+ * the last message's `raw`. The SDK marks every folded id seen, so a Feishu
+ * re-delivery of the earlier @ is dropped too.
+ *
+ * This wraps the batcher's push. It remembers each buffered message and,
+ * when a flush carries more than one, dispatches every one of them, in
+ * arrival order, each with its own id, sender and raw body. Debounce timing
+ * is unchanged: a lone message still waits out the SDK window. A burst in
+ * one topic is therefore no longer one turn: its first message starts a turn
+ * and the rest queue behind it, where the handler's canCoalesceFollowup folds
+ * same-session plain-text follow-ups into the next turn together.
+ *
+ * The hook depends on SDK internals: `channel.safety.manager.push` and the
+ * `{ message, sourceIds }` flush shape. The exact package pin keeps them
+ * fixed, and channelClient.batchSplit.test.ts drives the real SDK, so a bump
+ * that moves them fails there. Returns false, changing nothing, when they
+ * are missing.
+ */
+export function installInboundBatchSplit(
+  channel: unknown,
+  log: (s: string) => void = () => {},
+): boolean {
+  const manager = (channel as { safety?: { manager?: Partial<SdkChatPipelineManager> } } | null)
+    ?.safety?.manager;
+  if (!manager || typeof manager.push !== "function") return false;
+  const push = manager.push.bind(manager);
+  // messageId → the message as it entered the batcher; dropped at its flush.
+  const buffered = new Map<string, ChannelNormalizedMessage>();
+  manager.push = (scope, msg, handler) => {
+    if (msg.messageId) buffered.set(msg.messageId, msg);
+    push(scope, msg, async (batch) => {
+      // A flush without an id list means the SDK's shape moved: hand it on
+      // untouched (the SDK's own behavior) rather than throw inside its queue,
+      // which would swallow the error and never dispatch the batch. Nothing
+      // buffered can be matched to a flush any more, so drop it all.
+      if (!Array.isArray(batch?.sourceIds)) {
+        buffered.clear();
+        return handler(batch);
+      }
+      const originals = batch.sourceIds.flatMap((id) => {
+        const m = buffered.get(id);
+        buffered.delete(id);
+        return m ? [{ id, m }] : [];
+      });
+      // A lone message is dispatched as-is. A batch holding an id this hook
+      // never saw can't be rebuilt, so it too goes through unchanged.
+      if (batch.sourceIds.length < 2 || originals.length !== batch.sourceIds.length) {
+        return handler(batch);
+      }
+      log(`split SDK-merged inbound batch: chat=${scope} message_ids=${batch.sourceIds.join(",")}`);
+      // One at a time: the SDK handler awaits our listener, so a listener that
+      // finishes asynchronously still hands the chat's messages over in
+      // arrival order. Each call marks its own source id seen and releases
+      // its lock, so that bookkeeping stays per message.
+      for (const { id, m } of originals) await handler({ message: m, sourceIds: [id] });
+    });
+  };
+  return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -1089,6 +1281,14 @@ export class ChannelClient {
       // orthogonal and SAFE precisely because this net still triggers reconnect.
       wsConfig: { pingTimeout: 60 },
     } as Parameters<typeof createLarkChannel>[0]) as unknown as LarkChannel;
+    // With the window at 0 the SDK flushes every message alone and never
+    // merges, so a missing batcher hook changes nothing there.
+    if (!installInboundBatchSplit(channel, log) && inboundBatchDelayMs !== 0) {
+      console.warn(
+        "[channel.client] WARN: node-sdk inbound batcher not found (channel.safety.manager.push); " +
+          "messages in one chat inside the SDK debounce window may be merged into a single turn",
+      );
+    }
 
     channel.on("message", (msg) => {
       if (this.closed) return;

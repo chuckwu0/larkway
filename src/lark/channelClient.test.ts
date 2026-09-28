@@ -3,7 +3,7 @@
  *
  * The fidelity guarantee: the SDK's raw im.message.receive_v1 body must be
  * reconstructed into a lark-cli-identical LarkMessageEvent so lark/message.ts
- * parses content/mentions/attachments exactly as before.
+ * gets the routing fields, mentions, text and attachment keys it parses.
  */
 import { mkdtemp, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -12,8 +12,15 @@ import { describe, it, expect, vi, afterEach } from "vitest";
 // The REAL SDK module (no hoisted vi.mock of it in this file). Every vi.doMock
 // of the SDK below passes DefaultCache through, since connect() builds one
 // cache per channel (a mock without it would throw); realCreateLarkChannel
-// backs the WP-3 tests that drive the SDK's own inbound pipeline.
-import { DefaultCache, createLarkChannel as realCreateLarkChannel } from "@larksuiteoapi/node-sdk";
+// backs the WP-3 tests that drive the SDK's own inbound pipeline, and
+// EventDispatcher + normalize pin the live raw shape.
+import {
+  DefaultCache,
+  EventDispatcher,
+  LoggerLevel,
+  createLarkChannel as realCreateLarkChannel,
+  normalize,
+} from "@larksuiteoapi/node-sdk";
 import {
   CHANNEL_CACHE_SWEEP_MS,
   ExpiringChannelCache,
@@ -25,12 +32,94 @@ import {
   type ChannelCardAction,
 } from "./channelClient.js";
 import { silentSdkLogger } from "./sdkLogger.js";
+import type { LarkMessageEvent } from "./transport.js";
 
+/**
+ * A message whose raw has the LIVE delivery's shape: the SDK's EventDispatcher
+ * flattens the v2 envelope, so `sender` / `message` sit at the top of raw —
+ * there is no `event` wrapper. (The old nested fixture here is what hid the
+ * live raw path never matching.) It carries no SDK text, so its content is
+ * the raw JSON verbatim; for a full live message use `liveSdkMessage`, which
+ * pins the shape to the real SDK.
+ */
 function rawEvent(message: Record<string, unknown>, openId = "ou_sender") {
+  return {
+    raw: {
+      schema: "2.0",
+      event_id: "ev_test",
+      event_type: "im.message.receive_v1",
+      sender: { sender_id: { open_id: openId }, sender_type: "user" },
+      message,
+    },
+  };
+}
+
+/** The unflattened envelope form — what gap-fill builds around a list item. */
+function nestedRawEvent(message: Record<string, unknown>, openId = "ou_sender") {
   return {
     raw: { event: { message, sender: { sender_id: { open_id: openId } } } },
   };
 }
+
+const TEST_BOT = { openId: "ou_bot", name: "bot" };
+
+/**
+ * What createLarkChannel hands its "message" handler for a single (un-merged)
+ * message: the v2 WS envelope run through the SDK's own EventDispatcher (which
+ * flattens it) and normalize (with the raw kept, as includeRawEvent does).
+ */
+async function liveSdkMessage(message: Record<string, unknown>, openId = "ou_sender") {
+  const envelope = {
+    schema: "2.0",
+    header: {
+      event_id: `ev_${String(message["message_id"])}`,
+      event_type: "im.message.receive_v1",
+      app_id: "cli_test",
+      tenant_key: "tenant_test",
+      create_time: "1780000000000",
+    },
+    event: { sender: { sender_id: { open_id: openId }, sender_type: "user" }, message },
+  };
+  let raw: unknown;
+  const dispatcher = new EventDispatcher({ loggerLevel: LoggerLevel.error }).register({
+    "im.message.receive_v1": async (data: unknown) => {
+      raw = data;
+    },
+  } as Parameters<EventDispatcher["register"]>[0]);
+  await dispatcher.invoke(envelope, { needCheck: false });
+  return normalize(raw as Parameters<typeof normalize>[0], {
+    botIdentity: TEST_BOT,
+    stripBotMentions: true,
+    includeRaw: true,
+  });
+}
+
+/**
+ * node-sdk 1.67.0 mergeBatch: the LAST message's fields (ids, raw), texts
+ * joined by a blank line, resources unioned by file key.
+ */
+function sdkMerged<T extends { content: string; resources: Array<{ fileKey: string }> }>(...batch: T[]): T {
+  const last = batch[batch.length - 1]!;
+  const resources = batch
+    .flatMap((m) => m.resources)
+    .filter((r, i, all) => all.findIndex((o) => o.fileKey === r.fileKey) === i);
+  return { ...last, content: batch.map((m) => m.content).filter(Boolean).join("\n\n"), resources };
+}
+
+const POST_WITH_IMAGE = JSON.stringify({
+  title: "",
+  content: [
+    [{ tag: "at", user_id: "@_user_1" }, { tag: "text", text: " see the screenshot" }],
+    [{ tag: "text", text: "then ask " }, { tag: "at", user_id: "@_user_2" }],
+    [{ tag: "code_block", language: "ts", text: "const a = 1;\nconst b = 2;" }],
+    [{ tag: "img", image_key: "img_test_1" }],
+  ],
+});
+const BOT_MENTION = [{ key: "@_user_1", id: { open_id: "ou_bot" }, name: "bot" }];
+const BOT_AND_PEER_MENTIONS = [
+  ...BOT_MENTION,
+  { key: "@_user_2", id: { open_id: "ou_peer" }, name: "Reviewer" },
+];
 
 // Round-2 adversarial review fix: exported so main.ts's v3.2 handoff-
 // threshold floor warning checks against the REAL resolved discovery
@@ -66,7 +155,7 @@ describe("resolveOpenChatDiscoveryMs", () => {
 });
 
 describe("channelMsgToLarkEvent", () => {
-  it("reconstructs a lark-cli-shaped event from the raw body (post + mentions preserved)", () => {
+  it("reconstructs a lark-cli-shaped event from the raw body (no SDK text: post + mentions verbatim)", () => {
     const content = JSON.stringify({ title: "", content: [[{ tag: "at", user_id: "ou_bot" }, { tag: "text", text: " hi" }]] });
     const ev = channelMsgToLarkEvent(
       rawEvent({
@@ -131,7 +220,224 @@ describe("channelMsgToLarkEvent", () => {
   });
 
   it("returns null when routing essentials are missing (no message_id/chat/sender)", () => {
+    expect(channelMsgToLarkEvent({ raw: { message: {} } })).toBeNull();
     expect(channelMsgToLarkEvent({ raw: { event: { message: {} } } })).toBeNull();
+  });
+
+  it("still reads the nested { event: { message, sender } } shape gap-fill builds", () => {
+    const content = JSON.stringify({ text: "@_user_1 recovered" });
+    const ev = channelMsgToLarkEvent(
+      nestedRawEvent(
+        { message_id: "om_gap", chat_id: "oc_1", chat_type: "group", content, root_id: "om_root" },
+        "ou_gap_sender",
+      ),
+    );
+    expect(ev!.content).toBe(content);
+    expect(ev!.sender_id).toBe("ou_gap_sender");
+    expect(ev!.root_id).toBe("om_root");
+  });
+
+  it("reads the FLAT raw the live SDK delivers (no `event` key): routing + mentions from raw", async () => {
+    const msg = await liveSdkMessage({
+      message_id: "om_live",
+      root_id: "om_root",
+      parent_id: "om_parent",
+      thread_id: "omt_1",
+      chat_id: "oc_1",
+      chat_type: "group",
+      message_type: "text",
+      content: JSON.stringify({ text: "@_user_1 hi" }),
+      create_time: "1780000000000",
+      mentions: BOT_MENTION,
+    });
+    // The shape contract this module depends on — pinned to the real SDK.
+    expect(msg.raw).toMatchObject({ event_type: "im.message.receive_v1", message: { message_id: "om_live" } });
+    expect((msg.raw as Record<string, unknown>)["event"]).toBeUndefined();
+
+    const ev = channelMsgToLarkEvent(msg);
+    expect(ev!.mentions?.[0]?.id.open_id).toBe("ou_bot"); // was always undefined on live traffic
+    expect(ev!.sender_id).toBe("ou_sender");
+    expect(ev!.root_id).toBe("om_root");
+    expect(ev!.parent_id).toBe("om_parent");
+    expect(ev!.thread_id).toBe("omt_1");
+    expect(ev!.create_time).toBe("1780000000000");
+  });
+
+  it("a live text message keeps the SDK text, which keeps a peer's @name (raw text would lose it)", async () => {
+    const msg = await liveSdkMessage({
+      message_id: "om_text",
+      chat_id: "oc_1",
+      chat_type: "group",
+      message_type: "text",
+      content: JSON.stringify({ text: "@_user_1 ask @_user_2 about it" }),
+      mentions: BOT_AND_PEER_MENTIONS,
+    });
+    const { parseMessage } = await import("./message.js");
+    expect(parseMessage(channelMsgToLarkEvent(msg)!).text).toBe("ask @Reviewer about it");
+  });
+
+  it("a live post keeps the SDK's markdown text AND attaches its inline images", async () => {
+    const msg = await liveSdkMessage({
+      message_id: "om_post",
+      chat_id: "oc_1",
+      chat_type: "group",
+      message_type: "post",
+      content: POST_WITH_IMAGE,
+      mentions: BOT_AND_PEER_MENTIONS,
+    });
+    const { parseMessage } = await import("./message.js");
+    const parsed = parseMessage(channelMsgToLarkEvent(msg)!);
+    expect(parsed.attachments).toEqual([{ fileKey: "img_test_1", fileType: "image" }]);
+    // Paragraphs, the code block's lines and the peer's @name survive — the raw
+    // post through message.ts would be one space-joined line without "Reviewer".
+    // (node-sdk 1.67.0 renders a post `at` node holding an `@_user_N`
+    // placeholder as "@" + placeholder, hence "@@Reviewer"; not pinned here.)
+    expect(parsed.text).toMatch(/see the screenshot\nthen ask @+Reviewer/);
+    expect(parsed.text).toContain("const a = 1;\nconst b = 2;");
+  });
+
+  it("a live image message keeps its image_key (was synthesized as markdown text)", async () => {
+    const msg = await liveSdkMessage({
+      message_id: "om_live_img",
+      chat_id: "oc_1",
+      chat_type: "p2p",
+      message_type: "image",
+      content: JSON.stringify({ image_key: "img_test_2" }),
+      create_time: "1780000000000",
+    });
+    const ev = channelMsgToLarkEvent(msg);
+    expect(ev!.chat_type).toBe("p2p");
+
+    const { parseMessage } = await import("./message.js");
+    const parsed = parseMessage(ev!);
+    expect(parsed.attachments).toEqual([{ fileKey: "img_test_2", fileType: "image" }]);
+    expect(parsed.text).toBe("![image](img_test_2)"); // the SDK tag, as before
+  });
+
+  it("a live file message is attached AND keeps the SDK tag with its file name as text", async () => {
+    const msg = await liveSdkMessage({
+      message_id: "om_live_file",
+      chat_id: "oc_1",
+      chat_type: "p2p",
+      message_type: "file",
+      content: JSON.stringify({ file_key: "file_test_1", file_name: "report.pdf" }),
+    });
+    const { parseMessage } = await import("./message.js");
+    const parsed = parseMessage(channelMsgToLarkEvent(msg)!);
+    expect(parsed.attachments).toEqual([{ fileKey: "file_test_1", fileType: "file", fileName: "report.pdf" }]);
+    expect(parsed.text).toBe('<file key="file_test_1" name="report.pdf"/>');
+  });
+
+  it("a live task share keeps its raw keys, so the task guid reaches the agent", async () => {
+    const content = JSON.stringify({
+      task_id: "task-guid-test",
+      summary: { title: "", content: [[{ tag: "text", text: "Ship the fix" }]] },
+      due_time: "0000",
+    });
+    const msg = await liveSdkMessage({
+      message_id: "om_todo",
+      chat_id: "oc_1",
+      chat_type: "p2p",
+      message_type: "todo",
+      content,
+    });
+    const ev = channelMsgToLarkEvent(msg);
+    expect(JSON.parse(ev!.content)).toMatchObject(JSON.parse(content) as object);
+
+    const { parseMessage } = await import("./message.js");
+    expect(parseMessage(ev!).text).toBe("[飞书任务] Ship the fix (task_guid=task-guid-test)");
+  });
+
+  it("a debounce-merged burst keeps every message's text and attaches every image in it", async () => {
+    // The SDK folds a same-chat burst into ONE message whose raw is only the
+    // LAST message's — here the second image. Raw content alone would drop
+    // the first image and the question.
+    const burst = sdkMerged(
+      await liveSdkMessage({
+        message_id: "om_b1",
+        chat_id: "oc_1",
+        chat_type: "p2p",
+        message_type: "image",
+        content: JSON.stringify({ image_key: "img_burst_1" }),
+      }),
+      await liveSdkMessage({
+        message_id: "om_b2",
+        chat_id: "oc_1",
+        chat_type: "p2p",
+        message_type: "text",
+        content: JSON.stringify({ text: "what changed between these two?" }),
+      }),
+      await liveSdkMessage({
+        message_id: "om_b3",
+        chat_id: "oc_1",
+        chat_type: "p2p",
+        message_type: "image",
+        content: JSON.stringify({ image_key: "img_burst_2" }),
+      }),
+    );
+    const ev = channelMsgToLarkEvent(burst);
+    expect(ev!.message_id).toBe("om_b3"); // the SDK reports the burst under its last message
+
+    const { parseMessage } = await import("./message.js");
+    const parsed = parseMessage(ev!);
+    expect(parsed.text).toBe(
+      "![image](img_burst_1)\n\nwhat changed between these two?\n\n![image](img_burst_2)",
+    );
+    expect(parsed.attachments).toEqual([
+      { fileKey: "img_burst_2", fileType: "image" },
+      { fileKey: "img_burst_1", fileType: "image" },
+    ]);
+  });
+
+  it("a burst ending in a file keeps the earlier text and still attaches the file", async () => {
+    const burst = sdkMerged(
+      await liveSdkMessage({
+        message_id: "om_f1",
+        chat_id: "oc_1",
+        chat_type: "p2p",
+        message_type: "text",
+        content: JSON.stringify({ text: "summarize this" }),
+      }),
+      await liveSdkMessage({
+        message_id: "om_f2",
+        chat_id: "oc_1",
+        chat_type: "p2p",
+        message_type: "file",
+        content: JSON.stringify({ file_key: "file_burst", file_name: "notes.txt" }),
+      }),
+    );
+    const { parseMessage } = await import("./message.js");
+    const parsed = parseMessage(channelMsgToLarkEvent(burst)!);
+    expect(parsed.text).toBe('summarize this\n\n<file key="file_burst" name="notes.txt"/>');
+    expect(parsed.attachments).toEqual([{ fileKey: "file_burst", fileType: "file", fileName: "notes.txt" }]);
+  });
+
+  it("a burst ending in a task share keeps the earlier text and still carries the guid", async () => {
+    const burst = sdkMerged(
+      await liveSdkMessage({
+        message_id: "om_t1",
+        chat_id: "oc_1",
+        chat_type: "p2p",
+        message_type: "text",
+        content: JSON.stringify({ text: "please take this one" }),
+      }),
+      await liveSdkMessage({
+        message_id: "om_t2",
+        chat_id: "oc_1",
+        chat_type: "p2p",
+        message_type: "todo",
+        content: JSON.stringify({
+          task_id: "task-guid-burst",
+          summary: { title: "", content: [[{ tag: "text", text: "Fix login" }]] },
+          due_time: "0000",
+        }),
+      }),
+    );
+    const { parseMessage } = await import("./message.js");
+    const text = parseMessage(channelMsgToLarkEvent(burst)!).text;
+    expect(text).toContain("please take this one");
+    expect(text).toContain("Fix login");
+    expect(text).toContain("task_guid=task-guid-burst");
   });
 
   it("falls back to normalized fields when raw is absent + synthesizes text content", () => {
@@ -150,6 +456,86 @@ describe("channelMsgToLarkEvent", () => {
     // JSON.parses it and extracts the text (the bug was empty content here).
     const parsed = JSON.parse(ev!.content) as { text: string };
     expect(parsed.text).toBe("帮我 review MR 4025");
+  });
+});
+
+describe("ChannelClient live message → inbound queue (SDK raw shape)", () => {
+  afterEach(() => {
+    vi.doUnmock("@larksuiteoapi/node-sdk");
+    vi.doUnmock("node:child_process");
+    vi.resetModules();
+  });
+
+  it("queues a live flat-raw image with its key, and a burst ending in one with every message's text", async () => {
+    const lone = await liveSdkMessage({
+      message_id: "om_lone",
+      chat_id: "oc_a",
+      chat_type: "p2p",
+      message_type: "image",
+      content: JSON.stringify({ image_key: "img_lone" }),
+    });
+    const burst = sdkMerged(
+      await liveSdkMessage({
+        message_id: "om_burst_1",
+        chat_id: "oc_b",
+        chat_type: "p2p",
+        message_type: "text",
+        content: JSON.stringify({ text: "@_user_1 first question" }),
+        mentions: BOT_MENTION,
+      }),
+      // Last in the burst is an image: its raw is all the SDK keeps.
+      await liveSdkMessage({
+        message_id: "om_burst_2",
+        chat_id: "oc_b",
+        chat_type: "p2p",
+        message_type: "image",
+        content: JSON.stringify({ image_key: "img_burst" }),
+      }),
+    );
+
+    const handlers: Record<string, ((arg: unknown) => unknown) | undefined> = {};
+    const ch = {
+      botIdentity: TEST_BOT,
+      on(event: string, handler: (arg: unknown) => unknown) {
+        handlers[event] = handler;
+      },
+      async connect() {},
+      async disconnect() {},
+    };
+    vi.resetModules();
+    vi.doMock("node:child_process", () => ({
+      execFile: (_cmd: string, _args: string[], cb: (err: null, r: { stdout: string; stderr: string }) => void) =>
+        cb(null, { stdout: "[]", stderr: "" }),
+    }));
+    vi.doMock("@larksuiteoapi/node-sdk", () => ({ DefaultCache, createLarkChannel: () => ch }));
+    const { ChannelClient } = await import("./channelClient.js");
+    const client = new ChannelClient({
+      allowedChatIds: new Set(),
+      botOpenId: "ou_bot",
+      appId: "cli_x",
+      appSecret: "secret",
+      connectGraceMs: 0,
+      channelStaleMs: 0,
+      openChatDiscoveryMs: 0,
+    });
+    const queued: LarkMessageEvent[] = [];
+    void (async () => {
+      for await (const ev of client.events()) queued.push(ev);
+    })();
+    for (let i = 0; i < 100 && !handlers["message"]; i++) await new Promise((r) => setTimeout(r, 10));
+
+    handlers["message"]!(lone);
+    handlers["message"]!(burst);
+    for (let i = 0; i < 50 && queued.length < 2; i++) await new Promise((r) => setTimeout(r, 10));
+
+    expect(queued.map((e) => e.message_id)).toEqual(["om_lone", "om_burst_2"]);
+    const { parseMessage } = await import("./message.js");
+    expect(parseMessage(queued[0]!).attachments).toEqual([{ fileKey: "img_lone", fileType: "image" }]);
+    const burstParsed = parseMessage(queued[1]!);
+    expect(burstParsed.text).toBe("first question\n\n![image](img_burst)");
+    expect(burstParsed.attachments).toEqual([{ fileKey: "img_burst", fileType: "image" }]);
+
+    await client.close();
   });
 });
 
