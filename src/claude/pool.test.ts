@@ -24,6 +24,7 @@
 import { describe, it, expect, afterEach, vi } from "vitest";
 import { EventEmitter, PassThrough } from "node:stream";
 import { chmod, mkdir, mkdtemp, readFile, rm, symlink, unlink, utimes, writeFile } from "node:fs/promises";
+import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import {
@@ -102,6 +103,8 @@ function makeFakeChild(): FakeChild {
 
 let spawnedChildren: FakeChild[] = [];
 let spawnArgs: string[][] = [];
+/** Runs synchronously inside the mocked spawn() — i.e. between a pool's argv build and whatever it records after. */
+let __onSpawn: (() => void) | undefined;
 
 vi.mock("node:child_process", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:child_process")>();
@@ -109,6 +112,7 @@ vi.mock("node:child_process", async (importOriginal) => {
     ...actual,
     spawn: (_bin: string, args: string[]) => {
       spawnArgs.push(args);
+      __onSpawn?.();
       const child = makeFakeChild();
       spawnedChildren.push(child);
       return child;
@@ -129,6 +133,7 @@ vi.mock("node:child_process", async (importOriginal) => {
 afterEach(() => {
   spawnedChildren = [];
   spawnArgs = [];
+  __onSpawn = undefined;
   __fakeIsPidAlive = () => false;
   __fakeCommandLine = "";
   __fakeStartTimeIso = "";
@@ -406,6 +411,74 @@ describe("ClaudeProcessPool — key drift", () => {
     } finally {
       warnSpy.mockRestore();
     }
+  });
+
+  it("WP-7: a skill landing while the blank spawns is not recorded in its signature — the blank is never adopted without it", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      reposRoot = await mkdtemp(path.join(tmpdir(), "claude-pool-repos-"));
+      const repo = await makeRepo(reposRoot, "repo");
+      const pool = new ClaudeProcessPool({ botId: "bot-a" });
+      const opts = { cwd: "/workspace", pidFilePath: null, addDirs: [repo] };
+      // Another thread's clone/checkout lands the skill mid-spawn: after the
+      // blank's argv was built, before the pool records what it spawned.
+      __onSpawn = () => {
+        __onSpawn = undefined;
+        mkdirSync(path.join(repo, ".claude", "skills", "deploy"), { recursive: true });
+        writeFileSync(path.join(repo, ".claude", "skills", "deploy", "SKILL.md"), "---\nname: deploy\n---\n");
+      };
+      pool.prewarm(opts);
+      const blank = spawnedChildren[0]!;
+      expect(spawnArgs[0]).not.toContain("--add-dir");
+
+      const turn = pool.run({ ...opts, prompt: "hello", threadId: "new" });
+      await flush();
+      expect(turn.pid).not.toBe(blank.pid);
+      expect(blank.killed).toBe(true);
+      const served = spawnedChildren.findIndex((c) => c.pid === turn.pid);
+      expect(spawnArgs[served]).toEqual(expect.arrayContaining(["--add-dir", repo]));
+      spawnedChildren[served]!.stdout.write(resultLine("success") + "\n");
+      await turn.done;
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+
+  it("WP-7: a thread's key and argv come from one skills read — a skill flickering mid-run never leaves a warm process keyed for skills it lacks", async () => {
+    reposRoot = await mkdtemp(path.join(tmpdir(), "claude-pool-repos-"));
+    const repo = await makeRepo(reposRoot, "repo", { skill: true });
+    const skillFile = path.join(repo, ".claude", "skills", "deploy", "SKILL.md");
+    const pool = new ClaudeProcessPool({ botId: "bot-a" });
+    const opts = { prompt: "turn", cwd: "/workspace", threadId: "one", pidFilePath: null, addDirs: [repo] };
+
+    const first = pool.run(opts);
+    await flush();
+    const oldChild = spawnedChildren[0]!;
+    oldChild.stdout.write(resultLine("success") + "\n");
+    await first.done;
+
+    // Key drift retires the old child between run()'s key and #spawnEntry's
+    // argv; a branch switch drops the skill exactly then, and it comes back.
+    const originalKill = oldChild.kill;
+    oldChild.kill = (sig?: string) => {
+      rmSync(skillFile);
+      originalKill(sig);
+    };
+    const second = pool.run({ ...opts, permissionMode: "ask", resumeSessionId: "native-session" });
+    await flush();
+    expect(oldChild.killed).toBe(true);
+    writeFileSync(skillFile, "---\nname: deploy\n---\n");
+    const child = spawnedChildren[1]!;
+    child.stdout.write(resultLine("success") + "\n");
+    await second.done;
+
+    // Same key as turn two: served by that child, which must carry the repo.
+    const third = pool.run({ ...opts, permissionMode: "ask", resumeSessionId: "native-session" });
+    await flush();
+    expect(third.pid).toBe(child.pid);
+    expect(spawnArgs[1]).toEqual(expect.arrayContaining(["--add-dir", repo]));
+    child.stdout.write(resultLine("success") + "\n");
+    await third.done;
   });
 
   it("keeps a BYO cwd untouched during prewarm and turn execution", async () => {

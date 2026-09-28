@@ -118,11 +118,14 @@ export interface RunOptions {
   cwd?: string;
   /**
    * Additional working directories for backends that support them. The claude
-   * runner maps each entry to a repeated `--add-dir` flag — which (besides
-   * file access) makes that directory's `.claude/skills/` discoverable, the
-   * mechanism that surfaces skills shipped inside a repo the agent cloned
-   * under the workspace. Backends without an equivalent (codex: `--add-dir`
-   * is sandbox-write-only, no config discovery) ignore this — multica-style
+   * runner maps each entry that ships a Claude skill (a non-empty
+   * `.claude/skills/<name>/SKILL.md`) to a repeated `--add-dir` flag — which
+   * makes that directory's skills discoverable, the mechanism that surfaces
+   * skills shipped inside a repo the agent cloned under the workspace. Other
+   * entries are dropped, so they never reach its argv or warm-pool signature.
+   * pi instead passes each entry's `.agents/skills` (when present) as
+   * `--skill`. Backends without an equivalent (codex: `--add-dir` is
+   * sandbox-write-only, no config discovery) ignore this — multica-style
    * wide-options contract: consume what you support, ignore the rest.
    */
   addDirs?: string[];

@@ -86,6 +86,7 @@ import {
   buildWarmCommand,
   newClaudeTurnUsageState,
   parseLinesMulti,
+  repoShipsClaudeSkills,
   runClaude,
 } from "./runner.js";
 
@@ -240,6 +241,26 @@ function resolveBinRealpath(bin: string): string | undefined {
   } catch {
     return undefined;
   }
+}
+
+/**
+ * WP-7: which repos ship Claude skills, read once per repo and then fixed for
+ * one pool operation — run()'s key and adoption match, #spawnEntry's argv and
+ * its recorded signature. Each builder call used to rescan the filesystem, so
+ * a skill landing mid-spawn (another thread's clone or checkout) could record
+ * a signature the child was never started with, and a blank with the repo
+ * missing from --add-dir would be adopted as if it had it.
+ */
+function snapshotSkillProbe(): (dir: string) => boolean {
+  const seen = new Map<string, boolean>();
+  return (dir) => {
+    let ships = seen.get(dir);
+    if (ships === undefined) {
+      ships = repoShipsClaudeSkills(dir);
+      seen.set(dir, ships);
+    }
+    return ships;
+  };
 }
 
 export interface ClaudeProcessPoolOptions {
@@ -414,7 +435,8 @@ export class ClaudeProcessPool implements AgentRunner {
     // that degrades to "every turn gets its own process" rather than
     // accidentally aliasing unrelated callers onto the same warm child.
     const threadId = opts.threadId ?? `__unkeyed-${this.#nextUnkeyedId++}__`;
-    const key = this.#computeKey(threadId, opts);
+    const shipsSkills = snapshotSkillProbe();
+    const key = this.#computeKey(threadId, opts, shipsSkills);
 
     // A workspace can gain repo directories after boot. Refresh the standby
     // prototype for that same cwd, otherwise every later new topic cold-starts
@@ -425,11 +447,11 @@ export class ClaudeProcessPool implements AgentRunner {
     // proto's recomputed signature and the turn's together — only the
     // blank's recorded one stays behind. Compare against that too, or the
     // stale blank would never be replaced.
-    const wantedSignature = this.#spawnSignatureOf(opts);
+    const wantedSignature = this.#spawnSignatureOf(opts, shipsSkills);
     const staleBlank = (e: PoolEntry): boolean =>
       e.blank && e.current == null && e.spawnSignature !== wantedSignature;
     if (this.#prewarmProto && this.#prewarmProto.cwd === opts.cwd &&
-        (this.#spawnSignatureOf(this.#prewarmProto) !== wantedSignature ||
+        (this.#spawnSignatureOf(this.#prewarmProto, shipsSkills) !== wantedSignature ||
           [...this.#entries.values()].some(staleBlank))) {
       this.#prewarmProto = {
         cwd: opts.cwd, addDirs: opts.addDirs, pidFilePath: opts.pidFilePath,
@@ -474,7 +496,7 @@ export class ClaudeProcessPool implements AgentRunner {
       // child is already booted (hooks/MCP init done), so this turn's first
       // stdin write hits a fully warm process. Resume turns can never adopt
       // (--resume is a spawn-time flag the blank wasn't given).
-      entry = this.#adoptBlankEntry(key, threadId, opts);
+      entry = this.#adoptBlankEntry(key, threadId, opts, shipsSkills);
     }
     if (entry == null) {
       if (this.#entries.size >= this.#maxProcesses) {
@@ -494,7 +516,7 @@ export class ClaudeProcessPool implements AgentRunner {
           return { events: queue, done, kill, pid: undefined };
         }
       }
-      entry = this.#spawnEntry(key, threadId, opts);
+      entry = this.#spawnEntry(key, threadId, opts, shipsSkills);
     }
 
     state.entry = entry;
@@ -572,8 +594,8 @@ export class ClaudeProcessPool implements AgentRunner {
    * CodexProcessPool) — included anyway for unambiguous log lines and so the
    * key formula matches the design literally, not just in effect.
    */
-  #computeKey(threadId: string, opts: RunOptions): string {
-    return JSON.stringify([this.#botId, threadId, this.#spawnSignatureOf(opts)]);
+  #computeKey(threadId: string, opts: RunOptions, shipsSkills: (dir: string) => boolean): string {
+    return JSON.stringify([this.#botId, threadId, this.#spawnSignatureOf(opts, shipsSkills)]);
   }
 
   #pickLruIdleVictim(): PoolEntry | undefined {
@@ -790,9 +812,10 @@ export class ClaudeProcessPool implements AgentRunner {
    * adoption match is by construction a spawn-arg-identical process.
    * `resumeSessionId` is deliberately dropped: adoption is only ever
    * attempted for turns with no resume (run() guards), and the blank itself
-   * is spawned without one.
+   * is spawned without one. `shipsSkills` must be the snapshot the same
+   * operation spawns with (see snapshotSkillProbe).
    */
-  #spawnSignatureOf(opts: ClaudePrewarmOptions): string {
+  #spawnSignatureOf(opts: ClaudePrewarmOptions, shipsSkills: (dir: string) => boolean): string {
     const [bin, args] = buildWarmCommand({
       prompt: "",
       cwd: opts.cwd,
@@ -801,7 +824,7 @@ export class ClaudeProcessPool implements AgentRunner {
       effort: opts.effort,
       permissionMode: opts.permissionMode,
       agentBinPath: opts.agentBinPath,
-    } as RunOptions);
+    } as RunOptions, shipsSkills);
     return JSON.stringify([bin, args, opts.cwd ?? null, opts.pidFilePath === null ? null : opts.pidFilePath ?? "cwd-default"]);
   }
 
@@ -811,7 +834,12 @@ export class ClaudeProcessPool implements AgentRunner {
    * blank matches — the caller falls through to a normal spawn. Schedules a
    * replacement blank on success.
    */
-  #adoptBlankEntry(key: string, threadId: string, opts: RunOptions): PoolEntry | undefined {
+  #adoptBlankEntry(
+    key: string,
+    threadId: string,
+    opts: RunOptions,
+    shipsSkills: (dir: string) => boolean,
+  ): PoolEntry | undefined {
     let blank: PoolEntry | undefined;
     for (const e of this.#entries.values()) {
       if (e.blank && !e.destroyed && e.current == null) {
@@ -821,7 +849,7 @@ export class ClaudeProcessPool implements AgentRunner {
     }
     if (blank == null) return undefined;
 
-    const wanted = this.#spawnSignatureOf(opts);
+    const wanted = this.#spawnSignatureOf(opts, shipsSkills);
     if (blank.spawnSignature !== wanted) {
       // Fail-safe mismatch (see spawnSignature's doc): log once per attempt so
       // proto/turn drift is visible instead of silently wasting the standby.
@@ -876,15 +904,21 @@ export class ClaudeProcessPool implements AgentRunner {
       permissionMode: proto.permissionMode,
       agentBinPath: proto.agentBinPath,
     } as RunOptions;
-    const entry = this.#spawnEntry(key, key, opts, { blank: true });
+    const entry = this.#spawnEntry(key, key, opts, snapshotSkillProbe(), { blank: true });
     console.warn(
       `[claude-pool] pre-warmed blank standby pid=${entry.child.pid ?? "?"} for bot=${this.#botId} ` +
         `(signature=${entry.spawnSignature.slice(0, 120)}…)`,
     );
   }
 
-  #spawnEntry(key: string, threadId: string, opts: RunOptions, flags?: { blank?: boolean }): PoolEntry {
-    const [bin, args] = buildWarmCommand(opts);
+  #spawnEntry(
+    key: string,
+    threadId: string,
+    opts: RunOptions,
+    shipsSkills: (dir: string) => boolean,
+    flags?: { blank?: boolean },
+  ): PoolEntry {
+    const [bin, args] = buildWarmCommand(opts, shipsSkills);
     // Resolved BEFORE the spawn: an upgrade landing in between then reads as
     // a (harmless, one-off) change at the next sweep rather than going unseen.
     const binRealpath = flags?.blank === true ? resolveBinRealpath(bin) : undefined;
@@ -901,7 +935,7 @@ export class ClaudeProcessPool implements AgentRunner {
       pidFilePath: opts.pidFilePath !== undefined ? opts.pidFilePath :
         opts.cwd != null ? path.join(opts.cwd, ".larkway", "runner.pid") : null,
       blank: flags?.blank === true,
-      spawnSignature: this.#spawnSignatureOf(opts),
+      spawnSignature: this.#spawnSignatureOf(opts, shipsSkills),
       bin,
       binRealpath,
       child,

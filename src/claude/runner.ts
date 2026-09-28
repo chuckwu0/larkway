@@ -249,10 +249,12 @@ export function buildWarmCommand(
   if (opts.effort) {
     args.push("--effort", opts.effort);
   }
-  // Spawn-time-only, like model/effort. The filter is re-evaluated on every
-  // call, so a repo that starts or stops shipping skills after this warm
-  // child started (clone, removal, branch switch, a skill added) changes the
-  // pool's signature and the next turn respawns with the new set.
+  // Spawn-time-only, like model/effort. The pool takes a fresh skills
+  // snapshot for each run(), so a repo that starts or stops shipping skills
+  // after this warm child started (clone, removal, branch switch, a skill
+  // added) changes the pool's signature and the next turn respawns with the
+  // new set. Within one operation the pool reuses that snapshot, so the argv
+  // and the signature it records agree.
   for (const dir of claudeSkillAddDirs(opts, shipsSkills)) {
     args.push("--add-dir", dir);
   }
