@@ -13,8 +13,9 @@
 
 import { spawn } from "node:child_process";
 import { spawnPipedOutput } from "../platform/spawn.js";
+import { readdirSync, realpathSync, statSync } from "node:fs";
 import { writeFile, unlink, mkdir } from "node:fs/promises";
-import { dirname, join } from "node:path";
+import { dirname, isAbsolute, join, relative, sep } from "node:path";
 import { createInterface } from "node:readline";
 import type { AgentRunner } from "../agent/runner.js";
 import {
@@ -46,12 +47,39 @@ export type { RunOptions, RunHandle };
 const SIGKILL_GRACE_MS = 5_000;
 
 /**
+ * WP-7: session-identity variables a Claude Code session exports to the
+ * processes it launches. A bridge started from inside one (a terminal opened
+ * by the desktop app, an agent running `larkway start`) would otherwise pass
+ * them on to every agent turn, and the child CLI keys host-surface behaviour
+ * off them — e.g. a desktop entrypoint or `ENVIRONMENT_KIND=bridge` turns on
+ * a per-turn summary classifier — instead of running as a plain headless
+ * print session. Explicit names only, never a `CLAUDE_CODE_` wildcard:
+ * `CLAUDE_CODE_USE_BEDROCK`, `CLAUDE_CODE_MAX_OUTPUT_TOKENS` and friends are
+ * operator configuration, and auth variables (ANTHROPIC_BASE_URL, …) must
+ * pass through as well. Bridges started by launchd/systemd carry none of
+ * these, so this is a no-op there.
+ */
+const INHERITED_SESSION_ENV = [
+  "CLAUDECODE",
+  "CLAUDE_CODE_ENTRYPOINT",
+  "CLAUDE_CODE_ENVIRONMENT_KIND",
+  "CLAUDE_CODE_SESSION_ID",
+  "CLAUDE_CODE_CHILD_SESSION",
+  "CLAUDE_CODE_HOST_SESSION_ID",
+] as const;
+/** The host session's messaging channel (`_SOCKET`, `_TOKEN`, …) — never the child's to use. */
+const INHERITED_SESSION_ENV_PREFIX = "CLAUDE_CODE_MESSAGING_";
+
+/**
  * Build env for the child process:
  *  - inherit everything from process.env, including the host's normal Git auth
  *    surface (SSH agent, credential helper, GITLAB_TOKEN/GITHUB_TOKEN, etc.)
  *  - strip ANTHROPIC_API_KEY (subscription account, API key would switch billing)
+ *  - strip a parent Claude Code session's identity (see INHERITED_SESSION_ENV)
  *  - only override git author/committer identity when the bot explicitly
  *    configures `git_identity`; otherwise git uses the host repo/global config.
+ *
+ * Shared by the cold runner and every warm pool child (src/claude/pool.ts).
  *
  * @param botGitIdentity  Optional override from bots/*.yaml `git_identity` field.
  *                        If absent, uses the V1 default "larkway-bot" identity.
@@ -63,6 +91,10 @@ function buildEnv(
 ): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...process.env };
   delete env["ANTHROPIC_API_KEY"];
+  for (const key of INHERITED_SESSION_ENV) delete env[key];
+  for (const key of Object.keys(env)) {
+    if (key.startsWith(INHERITED_SESSION_ENV_PREFIX)) delete env[key];
+  }
 
   // BL-50: point this bot's lark-cli at its private config dir.
   if (larkCliConfigDir !== undefined) {
@@ -86,10 +118,80 @@ function buildEnv(
 }
 
 /**
+ * WP-7: does `dir` ship at least one Claude skill — a non-empty
+ * `.claude/skills/<name>/SKILL.md` (both the skills dir and each skill entry
+ * may be symlinks; stat follows them)?
+ */
+export function repoShipsClaudeSkills(dir: string): boolean {
+  const skillsDir = join(dir, ".claude", "skills");
+  let names: string[];
+  try {
+    names = readdirSync(skillsDir);
+  } catch {
+    return false;
+  }
+  return names.some((name) => {
+    try {
+      const st = statSync(join(skillsDir, name, "SKILL.md"));
+      return st.isFile() && st.size > 0;
+    } catch {
+      return false;
+    }
+  });
+}
+
+/**
+ * WP-7: does `dir` resolve — symlinks followed — outside `cwd` (the child's
+ * cwd; the bridge's own when unset, which the child then inherits)? false
+ * when either path cannot be resolved: a missing dir has nothing to grant,
+ * and a missing cwd fails the spawn anyway.
+ */
+function resolvesOutsideCwd(dir: string, cwd: string | undefined): boolean {
+  let rel: string;
+  try {
+    rel = relative(realpathSync(cwd ?? process.cwd()), realpathSync(dir));
+  } catch {
+    return false;
+  }
+  return rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel);
+}
+
+/**
+ * WP-7: does an `opts.addDirs` entry need claude's `--add-dir`? Only when
+ * the flag buys it something: skill discovery (it ships Claude skills), or
+ * the working-directory grant — discoverWorkspaceRepoDirs accepts symlinked
+ * repos, and a BYO workspace may link one in from outside the cwd. Such a
+ * repo keeps the flag it always had, so a permission mode other than
+ * bypassPermissions never depends on how claude resolves the link. A repo
+ * under the cwd without skills needs neither and is dropped.
+ */
+export function claudeNeedsAddDir(dir: string, cwd: string | undefined): boolean {
+  return repoShipsClaudeSkills(dir) || resolvesOutsideCwd(dir, cwd);
+}
+
+/** Which `opts.addDirs` entries reach `--add-dir`; the warm pool passes a per-operation snapshot. */
+export type ClaudeAddDirProbe = (dir: string, cwd: string | undefined) => boolean;
+
+/**
+ * The `--add-dir` subset of `opts.addDirs` (see claudeNeedsAddDir). Dropping
+ * the rest keeps a clone/removal of an ordinary in-workspace repo out of the
+ * warm pool's spawn signature (src/claude/pool.ts), which would otherwise
+ * cold-start every hot thread's next turn. Both builders below go through
+ * this, so prewarm and per-turn signatures agree by construction. Not
+ * applied in discoverWorkspaceRepoDirs: pi looks for `.agents/skills`.
+ */
+function claudeAddDirs(opts: RunOptions, needsAddDir: ClaudeAddDirProbe): string[] {
+  return (opts.addDirs ?? []).filter((dir) => needsAddDir(dir, opts.cwd));
+}
+
+/**
  * Build CLI args from RunOptions.
  * Returns [bin, ...args].
  */
-function buildCommand(opts: RunOptions): [string, string[]] {
+function buildCommand(
+  opts: RunOptions,
+  needsAddDir: ClaudeAddDirProbe = claudeNeedsAddDir,
+): [string, string[]] {
   const bin = opts.agentBinPath ?? "claude";
   const mode = opts.permissionMode ?? "acceptEdits";
 
@@ -118,7 +220,7 @@ function buildCommand(opts: RunOptions): [string, string[]] {
   if (opts.effort) {
     args.push("--effort", opts.effort);
   }
-  for (const dir of opts.addDirs ?? []) {
+  for (const dir of claudeAddDirs(opts, needsAddDir)) {
     args.push("--add-dir", dir);
   }
 
@@ -147,7 +249,10 @@ function buildCommand(opts: RunOptions): [string, string[]] {
  * any of them means a new key in ClaudeProcessPool's process map, i.e. a
  * brand-new child, never an in-place mutation of this one.
  */
-export function buildWarmCommand(opts: RunOptions): [string, string[]] {
+export function buildWarmCommand(
+  opts: RunOptions,
+  needsAddDir: ClaudeAddDirProbe = claudeNeedsAddDir,
+): [string, string[]] {
   const bin = opts.agentBinPath ?? "claude";
   const mode = opts.permissionMode ?? "acceptEdits";
 
@@ -172,9 +277,13 @@ export function buildWarmCommand(opts: RunOptions): [string, string[]] {
   if (opts.effort) {
     args.push("--effort", opts.effort);
   }
-  // Spawn-time-only, like model/effort: a repo cloned AFTER this warm child
-  // started becomes discoverable on the next cold spawn / pool respawn.
-  for (const dir of opts.addDirs ?? []) {
+  // Spawn-time-only, like model/effort. The pool takes a fresh --add-dir
+  // snapshot for each run(), so a repo that starts or stops needing the flag
+  // after this warm child started (clone, removal, branch switch, a skill
+  // added, a symlink retargeted) changes the pool's signature and the next
+  // turn respawns with the new set. Within one operation the pool reuses
+  // that snapshot, so the argv and the signature it records agree.
+  for (const dir of claudeAddDirs(opts, needsAddDir)) {
     args.push("--add-dir", dir);
   }
 

@@ -148,6 +148,40 @@ function codexApprovalPolicy(mode: NonNullable<RunOptions["permissionMode"]>): s
   return mode === "ask" ? "on-request" : "never";
 }
 
+/**
+ * [method, params] of the request that opens a turn's native thread:
+ * `thread/resume` when there is a session to continue, else `thread/start`.
+ * Shared by the cold runner and the warm pool (src/codex/pool.ts).
+ *
+ * WP-7: a resume sets `excludeTurns`. Larkway reads nothing but `thread.id`
+ * off the response, while the default one hydrates the thread's entire turn
+ * history — larger with every turn, and deprecated by the app-server itself
+ * for paginated threads. Callers pass `excludeTurns: false` only to retry an
+ * app-server too old to know the field (see isExcludeTurnsRejection).
+ * `thread/start` has no such field and never gets it.
+ */
+function codexThreadRequest(opts: RunOptions, excludeTurns = true): [string, JsonRecord] {
+  const mode = opts.permissionMode ?? "acceptEdits";
+  const resume = opts.resumeSessionId != null;
+  const params: JsonRecord = resume
+    ? { threadId: opts.resumeSessionId, ...(excludeTurns ? { excludeTurns: true } : {}) }
+    : { ephemeral: false, sessionStartSource: "startup" };
+  if (opts.cwd != null) params["cwd"] = opts.cwd;
+  params["approvalPolicy"] = codexApprovalPolicy(mode);
+  params["sandbox"] = codexThreadSandboxMode(mode);
+  return [resume ? "thread/resume" : "thread/start", params];
+}
+
+/**
+ * WP-7: did the app-server reject the request over `excludeTurns` itself — a
+ * build whose ThreadResumeParams predates the field (serde reports "unknown
+ * field `excludeTurns`, expected one of …")? Worth exactly one retry without
+ * the field; any other error is the turn's real failure.
+ */
+function isExcludeTurnsRejection(message: string): boolean {
+  return /excludeTurns|unknown field/i.test(message);
+}
+
 // ---------------------------------------------------------------------------
 // codexEffortFromLarkway — larkway effort vocab → codex ReasoningEffort
 // ---------------------------------------------------------------------------
@@ -843,6 +877,8 @@ export function runCodex(opts: RunOptions, codexBinPath = "codex"): RunHandle {
   const mode = opts.permissionMode ?? "acceptEdits";
   const requestById = new Map<number, string>();
   let nextRequestId = 1;
+  /** WP-7: id of the thread/resume that carried excludeTurns, until answered — see isExcludeTurnsRejection. */
+  let excludeTurnsRequestId: number | undefined;
 
   // A0 (perf plan): dedup'd marker sink — see createPerfMarker/markPerfForEventType.
   const markPerf = createPerfMarker(opts.onPerfMarker);
@@ -1090,25 +1126,31 @@ export function runCodex(opts: RunOptions, codexBinPath = "codex"): RunHandle {
           const method = requestById.get(id);
           requestById.delete(id);
 
+          const carriedExcludeTurns = id === excludeTurnsRequestId;
+          if (carriedExcludeTurns) excludeTurnsRequestId = undefined;
+
           const error = asRecord(response["error"]);
           if (error) {
             const message = typeof error["message"] === "string"
               ? error["message"]
               : JSON.stringify(error);
+            if (carriedExcludeTurns && isExcludeTurnsRejection(message)) {
+              console.warn(
+                `[codex-runner] app-server rejected thread/resume excludeTurns (${message}) — retrying once without it.`,
+              );
+              const [threadMethod, threadParams] = codexThreadRequest(opts, false);
+              sendRequest(threadMethod, threadParams);
+              continue;
+            }
             failAppServerTurn?.(new Error(`codex app-server ${method ?? "request"} failed: ${message}`));
             stopAppServerAfterTurn();
             return;
           }
 
           if (method === "initialize") {
-            const threadMethod = opts.resumeSessionId != null ? "thread/resume" : "thread/start";
-            const threadParams: JsonRecord = opts.resumeSessionId != null
-              ? { threadId: opts.resumeSessionId }
-              : { ephemeral: false, sessionStartSource: "startup" };
-            if (opts.cwd != null) threadParams["cwd"] = opts.cwd;
-            threadParams["approvalPolicy"] = codexApprovalPolicy(mode);
-            threadParams["sandbox"] = codexThreadSandboxMode(mode);
-            sendRequest(threadMethod, threadParams);
+            const [threadMethod, threadParams] = codexThreadRequest(opts);
+            const threadRequestId = sendRequest(threadMethod, threadParams);
+            if (threadParams["excludeTurns"] === true) excludeTurnsRequestId = threadRequestId;
             continue;
           }
 
@@ -1208,8 +1250,10 @@ export {
 // must not fork a second copy of these small pure helpers (DRY).
 export {
   codexApprovalPolicy,
+  codexThreadRequest,
   codexThreadSandboxMode,
   codexTurnSandboxPolicy,
+  isExcludeTurnsRejection,
   asRecord,
   extractThreadIdFromThreadResponse,
   CodexAppServerLineParser,
