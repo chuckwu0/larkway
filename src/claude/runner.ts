@@ -13,6 +13,7 @@
 
 import { spawn } from "node:child_process";
 import { spawnPipedOutput } from "../platform/spawn.js";
+import { readdirSync, statSync } from "node:fs";
 import { writeFile, unlink, mkdir } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { createInterface } from "node:readline";
@@ -46,12 +47,39 @@ export type { RunOptions, RunHandle };
 const SIGKILL_GRACE_MS = 5_000;
 
 /**
+ * WP-7: session-identity variables a Claude Code session exports to the
+ * processes it launches. A bridge started from inside one (a terminal opened
+ * by the desktop app, an agent running `larkway start`) would otherwise pass
+ * them on to every agent turn, and the child CLI keys host-surface behaviour
+ * off them — e.g. a desktop entrypoint or `ENVIRONMENT_KIND=bridge` turns on
+ * a per-turn summary classifier — instead of running as a plain headless
+ * print session. Explicit names only, never a `CLAUDE_CODE_` wildcard:
+ * `CLAUDE_CODE_USE_BEDROCK`, `CLAUDE_CODE_MAX_OUTPUT_TOKENS` and friends are
+ * operator configuration, and auth variables (ANTHROPIC_BASE_URL, …) must
+ * pass through as well. Bridges started by launchd/systemd carry none of
+ * these, so this is a no-op there.
+ */
+const INHERITED_SESSION_ENV = [
+  "CLAUDECODE",
+  "CLAUDE_CODE_ENTRYPOINT",
+  "CLAUDE_CODE_ENVIRONMENT_KIND",
+  "CLAUDE_CODE_SESSION_ID",
+  "CLAUDE_CODE_CHILD_SESSION",
+  "CLAUDE_CODE_HOST_SESSION_ID",
+] as const;
+/** The host session's messaging channel (`_SOCKET`, `_TOKEN`, …) — never the child's to use. */
+const INHERITED_SESSION_ENV_PREFIX = "CLAUDE_CODE_MESSAGING_";
+
+/**
  * Build env for the child process:
  *  - inherit everything from process.env, including the host's normal Git auth
  *    surface (SSH agent, credential helper, GITLAB_TOKEN/GITHUB_TOKEN, etc.)
  *  - strip ANTHROPIC_API_KEY (subscription account, API key would switch billing)
+ *  - strip a parent Claude Code session's identity (see INHERITED_SESSION_ENV)
  *  - only override git author/committer identity when the bot explicitly
  *    configures `git_identity`; otherwise git uses the host repo/global config.
+ *
+ * Shared by the cold runner and every warm pool child (src/claude/pool.ts).
  *
  * @param botGitIdentity  Optional override from bots/*.yaml `git_identity` field.
  *                        If absent, uses the V1 default "larkway-bot" identity.
@@ -63,6 +91,10 @@ function buildEnv(
 ): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...process.env };
   delete env["ANTHROPIC_API_KEY"];
+  for (const key of INHERITED_SESSION_ENV) delete env[key];
+  for (const key of Object.keys(env)) {
+    if (key.startsWith(INHERITED_SESSION_ENV_PREFIX)) delete env[key];
+  }
 
   // BL-50: point this bot's lark-cli at its private config dir.
   if (larkCliConfigDir !== undefined) {
@@ -86,10 +118,52 @@ function buildEnv(
 }
 
 /**
+ * WP-7: does `dir` ship at least one Claude skill — a non-empty
+ * `.claude/skills/<name>/SKILL.md` (both the skills dir and each skill entry
+ * may be symlinks; stat follows them)?
+ */
+export function repoShipsClaudeSkills(dir: string): boolean {
+  const skillsDir = join(dir, ".claude", "skills");
+  let names: string[];
+  try {
+    names = readdirSync(skillsDir);
+  } catch {
+    return false;
+  }
+  return names.some((name) => {
+    try {
+      const st = statSync(join(skillsDir, name, "SKILL.md"));
+      return st.isFile() && st.size > 0;
+    } catch {
+      return false;
+    }
+  });
+}
+
+/**
+ * The `--add-dir` subset of `opts.addDirs`. Workspace repos sit under the
+ * workspace cwd, so the flag buys them nothing but skill discovery; a repo
+ * without skills is dropped. That keeps a clone/removal of an ordinary repo
+ * out of the warm pool's spawn signature (src/claude/pool.ts), which would
+ * otherwise cold-start every hot thread's next turn. Both builders below go
+ * through this, so prewarm and per-turn signatures agree by construction.
+ * Not applied in discoverWorkspaceRepoDirs: pi looks for `.agents/skills`.
+ */
+function claudeSkillAddDirs(
+  opts: RunOptions,
+  shipsSkills: (dir: string) => boolean,
+): string[] {
+  return (opts.addDirs ?? []).filter((dir) => shipsSkills(dir));
+}
+
+/**
  * Build CLI args from RunOptions.
  * Returns [bin, ...args].
  */
-function buildCommand(opts: RunOptions): [string, string[]] {
+function buildCommand(
+  opts: RunOptions,
+  shipsSkills: (dir: string) => boolean = repoShipsClaudeSkills,
+): [string, string[]] {
   const bin = opts.agentBinPath ?? "claude";
   const mode = opts.permissionMode ?? "acceptEdits";
 
@@ -118,7 +192,7 @@ function buildCommand(opts: RunOptions): [string, string[]] {
   if (opts.effort) {
     args.push("--effort", opts.effort);
   }
-  for (const dir of opts.addDirs ?? []) {
+  for (const dir of claudeSkillAddDirs(opts, shipsSkills)) {
     args.push("--add-dir", dir);
   }
 
@@ -147,7 +221,10 @@ function buildCommand(opts: RunOptions): [string, string[]] {
  * any of them means a new key in ClaudeProcessPool's process map, i.e. a
  * brand-new child, never an in-place mutation of this one.
  */
-export function buildWarmCommand(opts: RunOptions): [string, string[]] {
+export function buildWarmCommand(
+  opts: RunOptions,
+  shipsSkills: (dir: string) => boolean = repoShipsClaudeSkills,
+): [string, string[]] {
   const bin = opts.agentBinPath ?? "claude";
   const mode = opts.permissionMode ?? "acceptEdits";
 
@@ -172,9 +249,11 @@ export function buildWarmCommand(opts: RunOptions): [string, string[]] {
   if (opts.effort) {
     args.push("--effort", opts.effort);
   }
-  // Spawn-time-only, like model/effort: a repo cloned AFTER this warm child
-  // started becomes discoverable on the next cold spawn / pool respawn.
-  for (const dir of opts.addDirs ?? []) {
+  // Spawn-time-only, like model/effort. The filter is re-evaluated on every
+  // call, so a repo that starts or stops shipping skills after this warm
+  // child started (clone, removal, branch switch, a skill added) changes the
+  // pool's signature and the next turn respawns with the new set.
+  for (const dir of claudeSkillAddDirs(opts, shipsSkills)) {
     args.push("--add-dir", dir);
   }
 

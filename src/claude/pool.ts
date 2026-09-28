@@ -63,7 +63,8 @@
  */
 
 import { execFile, spawn, type ChildProcess } from "node:child_process";
-import { spawnPiped } from "../platform/spawn.js";
+import { findOnPath, spawnPiped } from "../platform/spawn.js";
+import { realpathSync } from "node:fs";
 import { mkdir, readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { createInterface } from "node:readline";
@@ -169,6 +170,13 @@ interface PoolEntry {
    * blank simply never matches and the turn spawns its own child.
    */
   readonly spawnSignature: string;
+  /** The executable argv[0] this entry was spawned with (e.g. "claude" or an absolute agentBinPath). */
+  readonly bin: string;
+  /**
+   * WP-7: for a blank only — where `bin` resolved to (PATH lookup + symlinks)
+   * when it was spawned; undefined when unresolvable. See #armIdleSweep.
+   */
+  readonly binRealpath: string | undefined;
   readonly child: ChildProcess;
   readonly spawnedAt: number;
   /** Bumped whenever a turn starts or ends on this entry — LRU eviction picks the smallest among idle entries. */
@@ -211,6 +219,28 @@ export interface ClaudePrewarmOptions {
 const MAX_PREWARM_FAILURES = 3;
 /** Base delay before respawning a blank after an unprompted death (doubles per consecutive failure). */
 const PREWARM_RESPAWN_BACKOFF_MS = 10_000;
+/**
+ * WP-7: a blank that stayed up this long before dying unprompted is not
+ * counted toward MAX_PREWARM_FAILURES — see #onEntryExit.
+ */
+const LONG_LIVED_BLANK_MS = 6 * 60 * 60 * 1000;
+
+/**
+ * WP-7: where `bin` actually lives right now — PATH lookup, then symlinks
+ * resolved. The native claude installer repoints its launcher symlink at a
+ * new `versions/<x>` file on each self-update, so this changes exactly when
+ * the CLI a fresh spawn would run changes. undefined when unresolvable; the
+ * caller never treats that as a change.
+ */
+function resolveBinRealpath(bin: string): string | undefined {
+  const found = findOnPath(bin);
+  if (found == null) return undefined;
+  try {
+    return realpathSync(found);
+  } catch {
+    return undefined;
+  }
+}
 
 export interface ClaudeProcessPoolOptions {
   /** Used only to build each process's cache key and log lines — see #computeKey. */
@@ -389,15 +419,25 @@ export class ClaudeProcessPool implements AgentRunner {
     // A workspace can gain repo directories after boot. Refresh the standby
     // prototype for that same cwd, otherwise every later new topic cold-starts
     // while an unusable blank occupies a slot indefinitely.
+    //
+    // WP-7: signatures read the filesystem (only skill-shipping repos reach
+    // --add-dir), so a repo listed at boot that LATER gains skills moves the
+    // proto's recomputed signature and the turn's together — only the
+    // blank's recorded one stays behind. Compare against that too, or the
+    // stale blank would never be replaced.
+    const wantedSignature = this.#spawnSignatureOf(opts);
+    const staleBlank = (e: PoolEntry): boolean =>
+      e.blank && e.current == null && e.spawnSignature !== wantedSignature;
     if (this.#prewarmProto && this.#prewarmProto.cwd === opts.cwd &&
-        this.#spawnSignatureOf(this.#prewarmProto) !== this.#spawnSignatureOf(opts)) {
+        (this.#spawnSignatureOf(this.#prewarmProto) !== wantedSignature ||
+          [...this.#entries.values()].some(staleBlank))) {
       this.#prewarmProto = {
         cwd: opts.cwd, addDirs: opts.addDirs, pidFilePath: opts.pidFilePath,
         model: opts.model, effort: opts.effort,
         permissionMode: opts.permissionMode, agentBinPath: opts.agentBinPath,
       };
-      for (const blank of this.#entries.values()) {
-        if (blank.blank && blank.current == null) this.#destroyEntry(blank, "standby spawn options changed");
+      for (const blank of [...this.#entries.values()]) {
+        if (staleBlank(blank)) this.#destroyEntry(blank, "standby spawn options changed");
       }
       // Reserve the real turn's slot first; replenish only spare capacity.
       queueMicrotask(() => this.#maybeSpawnBlank());
@@ -845,6 +885,9 @@ export class ClaudeProcessPool implements AgentRunner {
 
   #spawnEntry(key: string, threadId: string, opts: RunOptions, flags?: { blank?: boolean }): PoolEntry {
     const [bin, args] = buildWarmCommand(opts);
+    // Resolved BEFORE the spawn: an upgrade landing in between then reads as
+    // a (harmless, one-off) change at the next sweep rather than going unseen.
+    const binRealpath = flags?.blank === true ? resolveBinRealpath(bin) : undefined;
     const env = buildEnv(this.#botGitIdentity, this.#gitlabToken, this.#larkCliConfigDir);
     const child = spawnPiped(bin, args, {
       env,
@@ -859,6 +902,8 @@ export class ClaudeProcessPool implements AgentRunner {
         opts.cwd != null ? path.join(opts.cwd, ".larkway", "runner.pid") : null,
       blank: flags?.blank === true,
       spawnSignature: this.#spawnSignatureOf(opts),
+      bin,
+      binRealpath,
       child,
       spawnedAt: Date.now(),
       lastUsedAt: Date.now(),
@@ -951,7 +996,8 @@ export class ClaudeProcessPool implements AgentRunner {
 
     // 批D blank lifecycle accounting. ANY unprompted death of a still-blank
     // standby (not one we tore down ourselves — those set `destroyed` first)
-    // is anomalous regardless of its age: blanks are idle-sweep-exempt, so
+    // is anomalous whatever its age (short of the WP-7 exception below):
+    // blanks are idle-sweep-exempt, so
     // nothing legitimate ends one except adoption, eviction, or shutdown.
     // Every such death counts toward the circuit breaker and pays a backoff
     // before the respawn, so a broken environment can't turn the standby
@@ -960,9 +1006,25 @@ export class ClaudeProcessPool implements AgentRunner {
     // Workflow adversarial review caught that an "early deaths only" gate
     // here left the ≥30s case as an unbounded immediate-respawn loop).
     // An ADOPTED entry's exit just frees a slot: replenish straight away.
+    //
+    // WP-7 exception: a blank that stayed up for LONG_LIVED_BLANK_MS already
+    // proved this environment can boot and hold one, so its eventual death,
+    // whatever the cause, is not the broken-flag/auth signature the breaker
+    // exists for. Counting such deaths let a few of them, days apart, trip
+    // the breaker and cost every new topic a cold start until restart. It is
+    // replenished at once and leaves the count untouched; no loop is
+    // possible, since each lap takes hours.
     if (this.#prewarmProto != null && !this.#shuttingDown && !this.#prewarmDisabled) {
       const unpromptedBlankDeath = entry.blank && !wasAlreadyMarkedDestroyed;
-      if (unpromptedBlankDeath) {
+      const livedMs = Date.now() - entry.spawnedAt;
+      if (unpromptedBlankDeath && livedMs >= LONG_LIVED_BLANK_MS) {
+        console.warn(
+          `[claude-pool] blank standby pid=${entry.child.pid ?? "?"} died unprompted after ` +
+            `${Math.round(livedMs / 1000)}s — outlived ${LONG_LIVED_BLANK_MS / 3_600_000}h, not counted toward ` +
+            `the prewarm circuit breaker (${this.#prewarmFailures}/${MAX_PREWARM_FAILURES}); replenishing now.`,
+        );
+        queueMicrotask(() => this.#maybeSpawnBlank());
+      } else if (unpromptedBlankDeath) {
         this.#prewarmFailures += 1;
         if (this.#prewarmFailures >= MAX_PREWARM_FAILURES) {
           this.#prewarmDisabled = true;
@@ -1057,7 +1119,21 @@ export class ClaudeProcessPool implements AgentRunner {
       const now = Date.now();
       for (const entry of [...this.#entries.values()]) {
         if (entry.current != null) continue;
-        if (entry.blank) continue; // 批D: the standby's whole point is to outlive idle periods
+        if (entry.blank) {
+          // 批D: the standby's whole point is to outlive idle periods — but
+          // not a CLI upgrade. WP-7: a blank that idles for days keeps
+          // running the build it booted with while every other spawn gets
+          // the new one; swap it for a fresh standby. A deliberate teardown
+          // (#destroyEntry marks it first), so the breaker never sees it.
+          if (entry.binRealpath !== undefined) {
+            const current = resolveBinRealpath(entry.bin);
+            if (current !== undefined && current !== entry.binRealpath) {
+              this.#destroyEntry(entry, `claude binary changed (${entry.binRealpath} → ${current})`);
+              this.#maybeSpawnBlank();
+            }
+          }
+          continue;
+        }
         if (now - entry.lastUsedAt >= this.#idleMs) {
           this.#destroyEntry(entry, "idle timeout");
         }

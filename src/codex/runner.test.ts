@@ -1343,6 +1343,109 @@ describe("runCodex() — spawn-level integration", () => {
     expect(stdinText).toContain('"threadId":"019eabc123def456"');
   });
 
+  describe("WP-7: thread/resume excludeTurns", () => {
+    function outboundRequests(fake: ReturnType<typeof makeFakeCodexChild>) {
+      const text: string = fake.child.stdin.read()?.toString("utf8") ?? "";
+      return text
+        .trim()
+        .split("\n")
+        .filter(Boolean)
+        .map((line: string) => JSON.parse(line) as { id?: number; method?: string; params?: Record<string, unknown> });
+    }
+
+    function threadResponse(id: number) {
+      return JSON.stringify({ id, result: { thread: { id: APP_THREAD_ID, sessionId: APP_THREAD_ID, cwd: "/wt" } } });
+    }
+
+    function turnResponse(id: number) {
+      return JSON.stringify({ id, result: { turn: { id: "turn-1", items: [], itemsView: "notLoaded", status: "inProgress" } } });
+    }
+
+    it("a resume asks for excludeTurns; a new thread's thread/start never carries it", async () => {
+      const { runCodex } = await import("./runner.js");
+      for (const resumeSessionId of [APP_THREAD_ID, undefined]) {
+        const fake = makeFakeCodexChild();
+        __nextFakeCodexChild = fake;
+        const handle = runCodex({ prompt: "go", cwd: "/wt", resumeSessionId });
+        const eventsPromise = collectEvents(handle.events);
+        await new Promise<void>((res) => setImmediate(() => {
+          fake.stdout.write(APP_INIT_RESPONSE + "\n");
+          fake.stdout.write(APP_THREAD_RESPONSE + "\n");
+          fake.stdout.write(APP_TURN_RESPONSE + "\n");
+          fake.stdout.write(APP_TURN_COMPLETED + "\n");
+          res();
+        }));
+        await eventsPromise;
+        await expect(handle.done).resolves.toMatchObject({ exitCode: 0 });
+
+        const thread = outboundRequests(fake).find((r) => r.method === "thread/resume" || r.method === "thread/start");
+        if (resumeSessionId) {
+          expect(thread?.method).toBe("thread/resume");
+          expect(thread?.params).toEqual({
+            threadId: APP_THREAD_ID,
+            excludeTurns: true,
+            cwd: "/wt",
+            approvalPolicy: "never",
+            sandbox: "danger-full-access",
+          });
+        } else {
+          expect(thread?.method).toBe("thread/start");
+          expect(thread?.params).not.toHaveProperty("excludeTurns");
+        }
+      }
+    });
+
+    it("an app-server that rejects the field gets exactly one retry without it, then the turn runs", async () => {
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+      try {
+        const fake = makeFakeCodexChild();
+        __nextFakeCodexChild = fake;
+        const { runCodex } = await import("./runner.js");
+        const handle = runCodex({ prompt: "go", resumeSessionId: APP_THREAD_ID });
+        const eventsPromise = collectEvents(handle.events);
+        await new Promise<void>((res) => setImmediate(() => {
+          fake.stdout.write(APP_INIT_RESPONSE + "\n");
+          fake.stdout.write(JSON.stringify({
+            id: 2,
+            error: { code: -32600, message: "Invalid request: unknown field `excludeTurns`, expected one of `threadId`" },
+          }) + "\n");
+          fake.stdout.write(threadResponse(3) + "\n");
+          fake.stdout.write(turnResponse(4) + "\n");
+          fake.stdout.write(APP_TURN_COMPLETED + "\n");
+          res();
+        }));
+        const events = await eventsPromise;
+        await expect(handle.done).resolves.toMatchObject({ exitCode: 0, sessionId: APP_THREAD_ID });
+        expect(events.some((e) => e.type === "system_init")).toBe(true);
+
+        const requests = outboundRequests(fake);
+        expect(
+          requests.filter((r) => r.method === "thread/resume").map((r) => [r.id, r.params?.["excludeTurns"]]),
+        ).toEqual([[2, true], [3, undefined]]);
+        expect(requests.find((r) => r.method === "turn/start")?.id).toBe(4);
+      } finally {
+        warnSpy.mockRestore();
+      }
+    });
+
+    it("any other thread/resume error still fails the turn — no retry", async () => {
+      const fake = makeFakeCodexChild();
+      __nextFakeCodexChild = fake;
+      const { runCodex } = await import("./runner.js");
+      const handle = runCodex({ prompt: "go", resumeSessionId: APP_THREAD_ID });
+      const doneOutcome = handle.done.then(() => "resolved", (err: Error) => err.message);
+      const eventsPromise = collectEvents(handle.events);
+      await new Promise<void>((res) => setImmediate(() => {
+        fake.stdout.write(APP_INIT_RESPONSE + "\n");
+        fake.stdout.write(JSON.stringify({ id: 2, error: { code: -32600, message: "thread not found" } }) + "\n");
+        res();
+      }));
+      await eventsPromise;
+      expect(await doneOutcome).toContain("thread/resume failed: thread not found");
+      expect(outboundRequests(fake).filter((r) => r.method === "thread/resume")).toHaveLength(1);
+    });
+  });
+
   it("done resolves even when child exits with code 1 (killed path)", async () => {
     const fake = makeFakeCodexChild();
     __nextFakeCodexChild = fake;

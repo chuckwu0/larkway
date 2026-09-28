@@ -12,6 +12,9 @@
 
 import { describe, it, expect, afterEach, vi } from "vitest";
 import { EventEmitter, PassThrough } from "node:stream";
+import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import {
   AnswerChannelExtractor,
   ANSWER_BEGIN_MARKER,
@@ -21,7 +24,9 @@ import {
   _buildCommand as buildCommand,
   _buildEnv as buildEnv,
   _parseLinesMulti as parseLinesMulti,
+  buildWarmCommand,
   newClaudeTurnUsageState,
+  repoShipsClaudeSkills,
 } from "./runner.js";
 
 // ---------------------------------------------------------------------------
@@ -81,12 +86,59 @@ describe("buildEnv", () => {
   const SCRATCH_VARS = [
     "ANTHROPIC_API_KEY",
     "LARKWAY_TEST_VAR",
+    "CLAUDECODE",
+    "CLAUDE_CODE_ENTRYPOINT",
+    "CLAUDE_CODE_ENVIRONMENT_KIND",
+    "CLAUDE_CODE_SESSION_ID",
+    "CLAUDE_CODE_CHILD_SESSION",
+    "CLAUDE_CODE_HOST_SESSION_ID",
+    "CLAUDE_CODE_MESSAGING_SOCKET",
+    "CLAUDE_CODE_MESSAGING_TOKEN",
+    "CLAUDE_CODE_USE_BEDROCK",
+    "CLAUDE_CODE_MAX_OUTPUT_TOKENS",
+    "ANTHROPIC_BASE_URL",
   ] as const;
+  const saved = new Map<string, string | undefined>(SCRATCH_VARS.map((key) => [key, process.env[key]]));
 
   afterEach(() => {
+    // Restore rather than delete: this suite may itself run under a Claude
+    // Code session that exports some of these.
     for (const key of SCRATCH_VARS) {
-      delete process.env[key];
+      const value = saved.get(key);
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
     }
+  });
+
+  it("WP-7: strips a parent Claude Code session's identity (explicit list + CLAUDE_CODE_MESSAGING_*)", () => {
+    const stripped = [
+      "CLAUDECODE",
+      "CLAUDE_CODE_ENTRYPOINT",
+      "CLAUDE_CODE_ENVIRONMENT_KIND",
+      "CLAUDE_CODE_SESSION_ID",
+      "CLAUDE_CODE_CHILD_SESSION",
+      "CLAUDE_CODE_HOST_SESSION_ID",
+      "CLAUDE_CODE_MESSAGING_SOCKET",
+      "CLAUDE_CODE_MESSAGING_TOKEN",
+    ];
+    for (const key of stripped) process.env[key] = `test-${key.toLowerCase()}`;
+    const env = buildEnv();
+    expect(stripped.filter((key) => key in env)).toEqual([]);
+    expect(Object.keys(env).filter((key) => key.startsWith("CLAUDE_CODE_MESSAGING_"))).toEqual([]);
+  });
+
+  it("WP-7: keeps operator CLAUDE_CODE_* configuration and auth variables — no prefix wildcard", () => {
+    process.env["CLAUDE_CODE_USE_BEDROCK"] = "1";
+    process.env["CLAUDE_CODE_MAX_OUTPUT_TOKENS"] = "32000";
+    process.env["ANTHROPIC_BASE_URL"] = "https://gateway.example.test";
+    process.env["CLAUDE_CODE_ENTRYPOINT"] = "claude-desktop";
+    const env = buildEnv();
+    expect(env["CLAUDE_CODE_USE_BEDROCK"]).toBe("1");
+    expect(env["CLAUDE_CODE_MAX_OUTPUT_TOKENS"]).toBe("32000");
+    expect(env["ANTHROPIC_BASE_URL"]).toBe("https://gateway.example.test");
+    expect(env["CLAUDE_CODE_ENTRYPOINT"]).toBeUndefined();
+    // Only the child's copy is filtered — the bridge's own env is untouched.
+    expect(process.env["CLAUDE_CODE_ENTRYPOINT"]).toBe("claude-desktop");
   });
 
   it("BL-50: sets LARKSUITE_CLI_CONFIG_DIR only when larkCliConfigDir is given", () => {
@@ -179,10 +231,13 @@ describe("buildCommand", () => {
   });
 
   it("addDirs map to repeated --add-dir flags (repo-skills discovery)", () => {
-    const [, args] = buildCommand({
-      prompt: "go",
-      addDirs: ["/ws/repos/alpha", "/ws/repos/beta"],
-    });
+    const [, args] = buildCommand(
+      {
+        prompt: "go",
+        addDirs: ["/ws/repos/alpha", "/ws/repos/beta"],
+      },
+      () => true,
+    );
 
     const flagIdxs = args.flatMap((a, i) => (a === "--add-dir" ? [i] : []));
     expect(flagIdxs).toHaveLength(2);
@@ -191,6 +246,20 @@ describe("buildCommand", () => {
     // Omitted → no flag at all (byte-identical legacy args).
     const [, bare] = buildCommand({ prompt: "go" });
     expect(bare).not.toContain("--add-dir");
+  });
+
+  it("WP-7: only repos that ship a Claude skill reach --add-dir — cold and warm builders alike", () => {
+    const shipsSkills = (dir: string) => dir.endsWith("/with-skills");
+    const opts = {
+      prompt: "go",
+      addDirs: ["/ws/repos/plain", "/ws/repos/with-skills", "/ws/repos/other"],
+    };
+    const addDirArgs = (args: string[]) => args.flatMap((a, i) => (a === "--add-dir" ? [args[i + 1]] : []));
+
+    expect(addDirArgs(buildCommand(opts, shipsSkills)[1])).toEqual(["/ws/repos/with-skills"]);
+    expect(addDirArgs(buildWarmCommand(opts, shipsSkills)[1])).toEqual(["/ws/repos/with-skills"]);
+    // No repo ships skills → no flag at all, same argv as addDirs omitted.
+    expect(buildWarmCommand(opts, () => false)).toEqual(buildWarmCommand({ prompt: "go" }));
   });
 
   it("legacy callers can still opt into bypassPermissions explicitly", () => {
@@ -219,6 +288,59 @@ describe("buildCommand", () => {
     expect(args).not.toContain("--model");
     expect(args).not.toContain("--effort");
   });
+});
+
+describe("repoShipsClaudeSkills (WP-7)", () => {
+  let root: string;
+
+  afterEach(async () => {
+    if (root) await rm(root, { recursive: true, force: true });
+  });
+
+  async function skill(repo: string, name: string, body: string): Promise<void> {
+    await mkdir(path.join(repo, ".claude", "skills", name), { recursive: true });
+    await writeFile(path.join(repo, ".claude", "skills", name, "SKILL.md"), body);
+  }
+
+  it("is true only for a non-empty .claude/skills/<name>/SKILL.md", async () => {
+    root = await mkdtemp(path.join(tmpdir(), "larkway-claude-skills-"));
+    const withSkill = path.join(root, "with-skill");
+    await skill(withSkill, "deploy", "---\nname: deploy\n---\n");
+    const emptySkill = path.join(root, "empty-skill");
+    await skill(emptySkill, "stub", "");
+    const noSkillMd = path.join(root, "no-skill-md");
+    await mkdir(path.join(noSkillMd, ".claude", "skills", "notes"), { recursive: true });
+    await writeFile(path.join(noSkillMd, ".claude", "skills", "README.md"), "not a skill");
+    const agentsOnly = path.join(root, "agents-only");
+    await mkdir(path.join(agentsOnly, ".agents", "skills", "deploy"), { recursive: true });
+    await writeFile(path.join(agentsOnly, ".agents", "skills", "deploy", "SKILL.md"), "pi only");
+    const plain = path.join(root, "plain");
+    await mkdir(plain);
+
+    expect(repoShipsClaudeSkills(withSkill)).toBe(true);
+    expect(repoShipsClaudeSkills(emptySkill)).toBe(false);
+    expect(repoShipsClaudeSkills(noSkillMd)).toBe(false);
+    expect(repoShipsClaudeSkills(agentsOnly)).toBe(false);
+    expect(repoShipsClaudeSkills(plain)).toBe(false);
+    expect(repoShipsClaudeSkills(path.join(root, "missing"))).toBe(false);
+
+    // Default predicate in the builder: same answer, no injection needed.
+    const [, args] = buildCommand({ prompt: "go", addDirs: [plain, withSkill, emptySkill] });
+    expect(args.flatMap((a, i) => (a === "--add-dir" ? [args[i + 1]] : []))).toEqual([withSkill]);
+  });
+
+  it.skipIf(process.platform === "win32")(
+    "follows a symlinked .claude/skills (the cross-backend scaffold's layout)",
+    async () => {
+      root = await mkdtemp(path.join(tmpdir(), "larkway-claude-skills-"));
+      const repo = path.join(root, "repo");
+      await mkdir(path.join(repo, ".agents", "skills", "deploy"), { recursive: true });
+      await writeFile(path.join(repo, ".agents", "skills", "deploy", "SKILL.md"), "---\nname: deploy\n---\n");
+      await mkdir(path.join(repo, ".claude"));
+      await symlink(path.join(repo, ".agents", "skills"), path.join(repo, ".claude", "skills"));
+      expect(repoShipsClaudeSkills(repo)).toBe(true);
+    },
+  );
 });
 
 describe("parseLinesMulti", () => {
