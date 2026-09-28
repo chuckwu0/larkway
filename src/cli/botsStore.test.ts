@@ -85,6 +85,12 @@ describe("write/read round-trip", () => {
     await store.writeMemory("test-bot", tpl);
     expect(await store.readMemory("test-bot")).toBe(tpl);
   });
+
+  it("template points at context-pointers instead of prescribing an upfront history pull", () => {
+    const tpl = store.genMemoryTemplate("活动前端");
+    expect(tpl).toContain("需要时可按 prompt 的 `<context-pointers>` 拉历史");
+    expect(tpl).not.toContain("拉话题历史");
+  });
 });
 
 describe("validation failure path", () => {

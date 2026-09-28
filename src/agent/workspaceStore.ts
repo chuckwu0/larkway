@@ -311,11 +311,48 @@ const RETIRED_CONTRACT_LINES = new Set([
   "- 长期知识纪律:每轮 prompt 带有 `sender_is_owner` 事实。owner 的指示可进组织知识库 inbox;非 owner 提供的新知识只写进本 session 的 summary.md 并标注 `[未经 owner 确认]`,由保养轮决定是否晋升 —— 不直接写 AGENTS.md、L2 或知识库。",
 ]);
 
+function isRetiredContractLine(line: string): boolean {
+  return RETIRED_CONTRACT_LINES.has(line) ||
+    (line.includes("开场不可跳过") && line.includes("memory/index.md"));
+}
+
 function removeRetiredContractLines(content: string): string {
-  return content.split(/\r?\n/).filter((line) =>
-    !RETIRED_CONTRACT_LINES.has(line) &&
-    !(line.includes("开场不可跳过") && line.includes("memory/index.md")),
-  ).join("\n");
+  return content.split(/\r?\n/).filter((line) => !isRetiredContractLine(line)).join("\n");
+}
+
+/** tmp + rename next to the real file, so a symlinked AGENTS.md keeps its link and mode. */
+async function replaceFileAtomic(filePath: string, content: string): Promise<void> {
+  const target = await fs.realpath(filePath);
+  const { mode } = await fs.stat(target);
+  const tmp = `${target}.${process.pid}.${Date.now()}.tmp`;
+  try {
+    await fs.writeFile(tmp, content, "utf8");
+    await fs.chmod(tmp, mode & 0o7777);
+    await fs.rename(tmp, target);
+  } catch (err) {
+    await fs.rm(tmp, { force: true });
+    throw err;
+  }
+}
+
+/**
+ * Bridge-startup migration for an existing managed AGENTS.md. The per-turn
+ * ensure only creates a missing file and only a config save re-projects it,
+ * so retired contract lines (e.g. "write the state file before ending a
+ * turn") would otherwise keep steering every new native session. Removes
+ * only those lines; every other byte, line endings included, stays as the
+ * owner left it. Returns the number of removed lines (0 = missing or already
+ * clean; nothing is written).
+ */
+export async function migrateRetiredContractLines(workspacePath: string): Promise<number> {
+  const agentsPath = path.join(workspacePath, "AGENTS.md");
+  const current = await readTextIfExists(agentsPath);
+  if (current === undefined) return 0;
+  const lines = current.split(/(?<=\n)/);
+  const kept = lines.filter((line) => !isRetiredContractLine(line.replace(/\r?\n$/, "")));
+  if (kept.length === lines.length) return 0;
+  await replaceFileAtomic(agentsPath, kept.join(""));
+  return lines.length - kept.length;
 }
 
 interface SectionProjection {

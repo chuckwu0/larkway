@@ -43,6 +43,7 @@ import { ensureLarkCliProfile, deriveLarkCliProfile } from "./lark/profileBootst
 import { isSyntheticSessionKey } from "./lark/message.js";
 import { createCachedRosterResolver } from "./lark/rosterResolver.js";
 import { checkWorkspacePermissionGrant } from "./agent/permissionGate.js";
+import { migrateRetiredContractLines } from "./agent/workspaceStore.js";
 import { ensureLocalBinOnPath, probeBackendReadiness } from "./agent/readiness.js";
 import { runtimeRequirementsForBots } from "./runtimeRequirements.js";
 import { registerCrashGuard } from "./crashGuard.js";
@@ -197,6 +198,22 @@ async function runV2Mode({
               `(${permissionGate.reason}; ${permissionGate.filePath}). ` +
               `Use \`larkway perms ${bot.id} --grant-from-request --grant-note "confirmed by <host>"\` only for audit notes.`,
           );
+        }
+        // Retired contract lines in an existing managed AGENTS.md are otherwise
+        // dropped only by a config save. Strip them once per boot — never on the
+        // per-turn path, where agent self-edits and web saves could race it.
+        if (!dryRun) {
+          try {
+            const removed = await migrateRetiredContractLines(resolveAgentWorkspacePath(bot.id));
+            if (removed > 0) {
+              console.log(
+                `[larkway] bot "${bot.id}": removed ${removed} retired contract line(s) from workspace AGENTS.md ` +
+                  "(takes effect for new sessions).",
+              );
+            }
+          } catch (err) {
+            console.warn(`[larkway] bot "${bot.id}": retired contract line migration failed (continuing):`, err);
+          }
         }
       }
     }
