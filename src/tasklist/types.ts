@@ -140,6 +140,13 @@ export interface TaskHandleClaimPatch {
   onlyIfThreadUnclaimed?: boolean;
   /** v4.2 round-2: record that the user-facing claim comment (task→topic backlink) is still owed — cleared by writeback on the first successfully completed turn. */
   claimCommentPending?: boolean;
+  /**
+   * Guid the bridge itself got back from `createTask` this turn (declare.ts's
+   * `createdGuid`). When it equals `taskGuid`, applyVerifiedClaim skips its
+   * getTask check — the create response already proved the task exists. Only
+   * ever set from that bridge-side result, never from agent-declared input.
+   */
+  trustedGuid?: string;
 }
 
 /**
