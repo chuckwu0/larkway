@@ -11,15 +11,15 @@ Larkway 传递飞书触发事实、可选资源指针和最小输出协议。任
 | 块 | 内容 | 条件 |
 |---|---|---|
 | `agent-memory` | legacy bot 的身份文本，最多 4,000 字符 | 仅 legacy runtime；不注入 agent workspace |
-| `runtime-warnings` | 本机缺失能力、诊断、安装提示 | 有检测结果时 |
-| `thread-context` | 当前消息、发送者、会话、资源和 owner 事实 | 每轮 |
+| `runtime-warnings` | 本机缺失能力、诊断、安装提示 | 有检测结果时；delta 续轮仅在结果变化时（handler 未声明“未变化”即照发） |
+| `thread-context` | 当前消息、会话、资源和 owner 事实；delta 只列本条消息的事实和偏离常态的值（见下） | 每轮 |
 | `context-pointers` | 按需取消息/历史/文档的命令、profile、env 名、开发地址 | 完整 prompt |
 | `state-contract` | 输出通道和可选卡片字段概要 | 完整 prompt |
-| `contract-anchor` | 输出通道及 state 路径 | delta 续轮 |
+| `contract-anchor` | 一行：答案 marker 提示（Codex 省略）及 state 路径 | delta 续轮 |
 | `agent-workspace` / `workspace` | workspace/session/repo/知识库位置 | 完整 prompt |
 | `peer-bots` / `turn-taking` | peer 名册、配置的协作参数 | 完整 prompt，且有配置 |
 | `workspace-file-changes` | 工作区文件变化事实 | 有变化时，包括 delta |
-| `task-root` / `task-handle` | 任务分享入口或关联/候选任务事实 | 有相关任务时，包括 delta |
+| `task-root` / `task-handle` | 任务分享入口或关联/候选任务事实 | 有相关任务时，包括 delta（候选只带 guid、summary、话题 id） |
 | `session-reseed` | 明确重开会话的原因、摘要和转录摘录、完整转录路径 | 显式恢复时 |
 | `user-message` | 用户原文和按到达顺序合并的追加消息 | 每轮 |
 
@@ -32,12 +32,19 @@ Larkway 传递飞书触发事实、可选资源指针和最小输出协议。任
 `thread-context` 提供：
 
 - `thread_id`：Larkway 话题锚点；sticky 单聊另带 `session_key`。
-- `message_id`、`chat_id`、`sender`、`sender_is_owner`。
+- `message_id`、`chat_id`、`sender_is_owner`；发送者即 `user-message` 每行的 `ou_…:` 前缀，不另列。
 - `is_new_thread`、`trigger_type`、`mention_type`、`scene_type`、`chat_type`。
 - `feishu_thread_id`、`feishu_root_id`：平台实际话题和首楼标识。
 - `raw_pointer`：读取当前原始消息的命令。
 - `attachments`、`images`、`feishu_doc_links`：资源指针。
 - 可选 `thread_turn_count`、`thread_has_task_card`：观察事实，不触发建卡规则。
+
+delta 续轮的 `thread-context` 只列会变化的事实，会话常量已在原生历史中：
+
+- 每轮：`message_id`、`chat_id`，以及 `thread_turn_count`、`thread_has_task_card`（如有）。`chat_id` 在原生压缩后仍是回帖和取历史的锚点。
+- 有值时：真实 `omt_` 话题的 `feishu_thread_id`；配置了 owner 时的 `sender_is_owner`；非空的 `attachments`、`images`、`feishu_doc_links`，有附件时附 `raw_pointer`。
+- 偏离常态时：`trigger_type`（常态为 `topic_continuation`）、`mention_type`（`bot_or_user_mention` 与 `no_mention_metadata` 都算常态：实时推送不带 mention 元数据，补抓重放带，差别来自送达路径）。
+- 只在完整 prompt 出现：`thread_id`、`session_key`、`is_new_thread`、`scene_type`、`chat_type`、`feishu_root_id`。
 
 所有命令只是可选指针。当前用户消息和原生会话历史足够时，可以直接回答，不要求任何工具调用。
 
@@ -84,6 +91,8 @@ Codex 使用原生 `final_answer` 通道：已知 final phase 的消息直接流
 | `handoffs` | 最多 3 个 `{to,text}`；bridge 发带真实 at 标签的 post 并直递本地 peer，`text` 自包含 |
 | `task_handle` | 按需声明 `{create:{summary,due?}}`、`guid`、`note`、`due`/`due_reason`、`blocked`、`done`；不因聊天轮数自动要求使用 |
 
+tasklist 候选行形如 `guid=… | summary=… | thread=omt_…`：`thread` 由 bridge 从描述里的 applink 机械提取（被摘录截断的 id 不提取），是与本话题 `feishu_thread_id` 精确对照的信号；URL 本身不注入。完整 prompt 另附去掉 URL 的描述摘录和清单 guid；delta 续轮省略这两项。
+
 任务分享入口的 `task-root` 块只暴露 guid、summary、回链、认领状态和刚认领事实。其评论模式由用户在任务中心确认完成；是否评论或声明交付由当前任务决定。该块替代 tasklist 候选块，避免提供冲突目标。
 
 peer 卡片正文并非可靠的 peer 输入通道。需要交接时使用自包含的 `handoffs` 文本或真实 post + at 标签；不强制增加 ack、台账或 deadline 流程。
@@ -92,6 +101,6 @@ peer 卡片正文并非可靠的 peer 输入通道。需要交接时使用自包
 
 原生 runtime 管理会话历史与压缩。桥接 prompt 不假定 “resume 无压缩”，不把累积字符数解释为原生当前 context 用量。确需重开会话时，`session-reseed` 明确说明此前原生对话不在上下文中，并提供可用的摘要、转录摘录与文件指针；摘录可能不完整，不被视为事实完备的替代上下文。
 
-renderer 为纯函数式转换：不读文件、不取飞书历史、不调用模型。行为测试约束最小 agent-workspace 问答：完整 prompt 少于 2,600 字符，delta 少于 1,100 字符。该预算不包含用户额外材料、peer 名册、repo 指针和知识地图；它是字符预算，不冒充 tokenizer 统计或耗时测量。
+renderer 为纯函数式转换：不读文件、不取飞书历史、不调用模型。行为测试约束最小 agent-workspace 问答：完整 prompt 少于 2,600 字符，delta 少于 410 字符。该预算不包含用户额外材料、peer 名册、repo 指针和知识地图。另有生产形态固定场景（3 个 peer、repo、4 条带 applink 描述的候选、已配置 owner，另含 sticky 单聊变体）按 backend 约束包装码点数（总长减去用户原文）：无候选 delta 不超过 550（Codex 532），每条候选行 delta 不超过 121、完整不超过 140。这些是字符预算，不冒充 tokenizer 统计或耗时测量。
 
 新增 prompt 内容前先检查：它是必需通道协议、当前触发事实，还是 Agent 可以按任务自行决定的流程？后者应放在工作区指南或 skill，避免所有任务持续支付无关提示和工具成本。
