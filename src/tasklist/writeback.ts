@@ -13,6 +13,12 @@
  *   1. Best-effort, never throws back to the caller (applyTaskHandleWriteback
  *      swallows everything and just warns).
  *   2. Task/tasklist deleted upstream → drop the mapping, log, do NOT recreate.
+ *      Here that only happens on the patches that still read the task (every
+ *      full-mode patch, comment-mode "failed"). A comment-mode claim's
+ *      received/completed patches skip the read, so its deletion is found by
+ *      CommentPoller (next cycle, about one 60s interval by default) or by
+ *      StallDetector when it is about to nudge — until then the thread still
+ *      counts as claimed (e.g. a v5 `create` in that thread is skipped).
  *   3. No claim for this thread → silent no-op (feature/claim absent = same
  *      as feature disabled).
  *   5. Never touch a title or anything a human wrote outside the bridge's own
@@ -314,8 +320,9 @@ export async function applyTaskHandleWriteback(
     // pure critical-path latency on every claimed turn. A task deleted
     // upstream still loses its claim, just off the turn path: CommentPoller
     // drops it on a not-found listComments, StallDetector on a null getTask
-    // before it nudges. Only "failed" keeps the lookup: it is about to post
-    // a comment, and a gone task should drop the claim, not fail the post.
+    // before it nudges (the lag and what it costs: module header, contract
+    // item 2). Only "failed" keeps the lookup: it is about to post a
+    // comment, and a gone task should drop the claim, not fail the post.
     if (record.mode === "comment") {
       switch (patch.status) {
         case "received": {
