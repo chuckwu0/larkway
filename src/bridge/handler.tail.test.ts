@@ -4,7 +4,11 @@
  * mirror posts concurrently, and keeps the orderings that matter:
  *   - the claim lands before the lifecycle writeback, the terminal event and
  *     the message settle (the next turn's "received" hook reads it);
- *   - a local handoff dispatch waits for the final card (and the claim);
+ *   - a handoff to a peer hosted in this process (mirror post + local
+ *     dispatch) waits for the final card and the claim; one to a peer in
+ *     another process posts its mirror while the card is finalized;
+ *   - a final card that fails still lets the handoffs through, and the turn's
+ *     failure is recorded after them;
  *   - a bridge-created guid is handed to the claim as trustedGuid.
  * Drives the REAL handler with the latency bench's fakes (./testFakes.ts);
  * no Feishu, no model, no subprocess.
@@ -210,7 +214,9 @@ function taskHooks(log: string[], holdClaim?: Promise<void>) {
 
 function makeHandler(opts: {
   client: InboundClient;
-  cardKitClient: OutboundCardKitClient;
+  /** Omitted → the legacy visible card path (cardRenderer). */
+  cardKitClient?: OutboundCardKitClient;
+  cardRenderer?: ReturnType<typeof fakeCardRenderer>;
   log: string[];
   store?: ReturnType<typeof fakeSessionStore>;
   deps?: Partial<BridgeHandlerDeps>;
@@ -219,7 +225,7 @@ function makeHandler(opts: {
   const handler = new BridgeHandler({
     client: opts.client,
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    cardRenderer: fakeCardRenderer(new LatencyTimeline(), 1) as any,
+    cardRenderer: (opts.cardRenderer ?? fakeCardRenderer(new LatencyTimeline(), 1)) as any,
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     sessionStore: (opts.store ?? fakeSessionStore()) as any,
     conventions: {
@@ -388,7 +394,8 @@ describe("WP-8: declare → claim runs alongside the final card", () => {
 });
 
 describe("WP-8: handoff mirror posts run alongside the final card", () => {
-  function handoffDeps(log: string[]) {
+  /** `inProcess`: the peer is registered as hosted in this bridge process. */
+  function handoffDeps(log: string[], inProcess = true) {
     const postClient: OutboundPostClient = {
       async createPostReply() {
         log.push("mirror");
@@ -402,15 +409,17 @@ describe("WP-8: handoff mirror posts run alongside the final card", () => {
       },
     };
     const registry = new LocalHandoffRegistry();
-    registry.register(
-      { botId: "peer-bot", name: "Peer", botOpenId: "ou_test_peer_own" },
-      {
-        ingestLocalEvent: (ev) => {
-          log.push(`dispatch:${ev.message_id}`);
-          return true;
+    if (inProcess) {
+      registry.register(
+        { botId: "peer-bot", name: "Peer", botOpenId: "ou_test_peer_own" },
+        {
+          ingestLocalEvent: (ev) => {
+            log.push(`dispatch:${ev.message_id}`);
+            return true;
+          },
         },
-      },
-    );
+      );
+    }
     const deps: Partial<BridgeHandlerDeps> = {
       peers: PEERS,
       postClient,
@@ -420,14 +429,16 @@ describe("WP-8: handoff mirror posts run alongside the final card", () => {
     return deps;
   }
 
-  it("posts the mirror during finalize; the local dispatch waits for the final card", async () => {
+  const HANDOFF_STATE = {
+    status: "ready",
+    last_message: "handing over",
+    handoffs: [{ to: "Peer", text: "please continue" }],
+  };
+
+  it("a peer in this process gets neither the mirror nor the local dispatch before the final card", async () => {
     const log: string[] = [];
     const holdCard = deferred();
-    registerStateRunner({
-      status: "ready",
-      last_message: "handing over",
-      handoffs: [{ to: "Peer", text: "please continue" }],
-    });
+    registerStateRunner(HANDOFF_STATE);
     const { client, outcomes } = singleEventClient(newTopicEvent(), log);
     const { handler, events } = makeHandler({
       client,
@@ -438,31 +449,55 @@ describe("WP-8: handoff mirror posts run alongside the final card", () => {
 
     const running = runAll(handler);
     await vi.waitFor(() => expect(log).toContain("updateCardEntity:start"), CI_WAIT);
-    await vi.waitFor(() => expect(log).toContain("mirror"), CI_WAIT);
     await new Promise((resolve) => setTimeout(resolve, 20));
+    // The mirror's WS copy would wake the in-process peer as well.
+    expect(log).not.toContain("mirror");
     expect(log).not.toContain("dispatch:om_test_mirror");
 
     holdCard.resolve();
     await running;
 
     expect(outcomes).toEqual(["handled:om_test_new"]);
-    expectBefore(log, "updateCardEntity:end", "dispatch:om_test_mirror");
-    expectBefore(log, "updateCardSettings:end", "dispatch:om_test_mirror");
+    expectBefore(log, "updateCardEntity:end", "mirror");
+    expectBefore(log, "updateCardSettings:end", "mirror");
+    expectBefore(log, "mirror", "dispatch:om_test_mirror");
     expectBefore(log, "dispatch:om_test_mirror", "event:completed");
     const handoffAt = events.findIndex((e) => e.appendPath === "peer handoff");
     expect(handoffAt).toBeGreaterThan(-1);
     expect(handoffAt).toBeLessThan(events.findIndex((e) => e.status === "completed"));
   });
 
-  it("the local dispatch also waits for the claim of the same turn", async () => {
+  it("a peer in another process gets its mirror while the final card is finalized", async () => {
+    const log: string[] = [];
+    const holdCard = deferred();
+    registerStateRunner(HANDOFF_STATE);
+    const { client, outcomes } = singleEventClient(newTopicEvent(), log);
+    const { handler, events } = makeHandler({
+      client,
+      cardKitClient: loggingCardKitClient(log, holdCard.promise),
+      log,
+      deps: handoffDeps(log, false),
+    });
+
+    const running = runAll(handler);
+    await vi.waitFor(() => expect(log).toContain("updateCardEntity:start"), CI_WAIT);
+    await vi.waitFor(() => expect(log).toContain("mirror"), CI_WAIT);
+    expect(log).not.toContain("updateCardEntity:end");
+
+    holdCard.resolve();
+    await running;
+
+    expect(outcomes).toEqual(["handled:om_test_new"]);
+    expect(log.some((l) => l.startsWith("dispatch:"))).toBe(false);
+    const handoff = events.find((e) => e.appendPath === "peer handoff");
+    expect(handoff?.reason).toContain("目标不在本 bridge 进程内");
+    expect(events.indexOf(handoff!)).toBeLessThan(events.findIndex((e) => e.status === "completed"));
+  });
+
+  it("a peer in this process also waits for the claim of the same turn", async () => {
     const log: string[] = [];
     const holdClaim = deferred();
-    registerStateRunner({
-      status: "ready",
-      last_message: "handing over",
-      task_handle: { create: { summary: "follow-up" } },
-      handoffs: [{ to: "Peer", text: "please continue" }],
-    });
+    registerStateRunner({ ...HANDOFF_STATE, task_handle: { create: { summary: "follow-up" } } });
     const { client } = singleEventClient(newTopicEvent(), log);
     const { deps } = taskHooks(log, holdClaim.promise);
     const { handler } = makeHandler({
@@ -474,13 +509,59 @@ describe("WP-8: handoff mirror posts run alongside the final card", () => {
 
     const running = runAll(handler);
     await vi.waitFor(() => expect(log).toContain("updateCardSettings:end"), CI_WAIT);
-    await vi.waitFor(() => expect(log).toContain("mirror"), CI_WAIT);
     await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(log).not.toContain("mirror");
     expect(log).not.toContain("dispatch:om_test_mirror");
 
     holdClaim.resolve();
     await running;
 
-    expectBefore(log, "claim:end", "dispatch:om_test_mirror");
+    expectBefore(log, "claim:end", "mirror");
+    expectBefore(log, "mirror", "dispatch:om_test_mirror");
+  });
+
+  it("a final card that fails still hands off; the turn's failure is recorded after the dispatch", async () => {
+    const log: string[] = [];
+    registerStateRunner(HANDOFF_STATE);
+    const { client, outcomes } = singleEventClient(newTopicEvent(), log);
+    const { deps } = taskHooks(log);
+    // Legacy visible card (no CardKit client) whose delivery finalize rejects;
+    // the catch's best-effort failure card (success: false) goes through.
+    const legacy = fakeCardRenderer(new LatencyTimeline(), 1);
+    const failingDelivery = (messageId: string) => ({
+      ...legacy.handleFor(messageId),
+      finalize: async (payload: { success?: boolean }) => {
+        if (payload.success === false) {
+          log.push("failureCard");
+          return;
+        }
+        log.push("legacyCard.finalize:rejected");
+        throw new Error("legacy card: finalize failed");
+      },
+    });
+    const cardRenderer = {
+      start: async () => failingDelivery("om_test_legacy_card"),
+      handleFor: failingDelivery,
+    } as unknown as ReturnType<typeof fakeCardRenderer>;
+    const { handler, events } = makeHandler({
+      client,
+      cardRenderer,
+      log,
+      deps: { ...deps, ...handoffDeps(log) },
+    });
+
+    await runAll(handler);
+
+    expect(outcomes).toEqual(["unhandled:om_test_new"]);
+    expectBefore(log, "legacyCard.finalize:rejected", "mirror");
+    expectBefore(log, "mirror", "dispatch:om_test_mirror");
+    expectBefore(log, "dispatch:om_test_mirror", "event:failed");
+    expectBefore(log, "dispatch:om_test_mirror", "lifecycle:failed");
+    expectBefore(log, "event:failed", "failureCard");
+    expect(log).not.toContain("event:completed");
+    expect(log).not.toContain("lifecycle:completed");
+    const handoffAt = events.findIndex((e) => e.appendPath === "peer handoff");
+    expect(handoffAt).toBeGreaterThan(-1);
+    expect(handoffAt).toBeLessThan(events.findIndex((e) => e.status === "failed"));
   });
 });

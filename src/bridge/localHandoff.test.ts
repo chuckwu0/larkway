@@ -8,6 +8,8 @@
  *   - the locally dispatched event carries the mirror post's REAL message_id
  *     (that id is what dedupes the later WS copy)
  *   - kill switch (localDispatchEnabled=false) keeps the mirror, skips dispatch
+ *   - inProcessHandoffAfter holds an in-process peer's mirror (and so its
+ *     dispatch); a peer in another process never waits on it
  */
 import { describe, it, expect, vi } from "vitest";
 import {
@@ -180,42 +182,89 @@ describe("processHandoffs — mirror + local dispatch", () => {
     expect(outcomes[0]!.detail).toContain("postClient");
   });
 
-  it("localDispatchAfter holds the local dispatch, not the mirror post", async () => {
-    const postClient = makePostClient();
-    const inbound = makeInbound();
+  function inProcessRegistry(inbound: ReturnType<typeof makeInbound>) {
     const registry = new LocalHandoffRegistry();
     registry.register(
       { botId: "review-bot", name: "ReviewBot", botOpenId: "ou_review_own_scope" },
       inbound.client,
     );
+    return registry;
+  }
+
+  function pendingGate() {
     let release!: () => void;
     const gate = new Promise<void>((resolve) => {
       release = resolve;
     });
+    return { gate, release };
+  }
 
-    const running = processHandoffs(baseCtx({ postClient, registry, localDispatchAfter: gate }));
-    await vi.waitFor(() => expect(postClient.createPostReply).toHaveBeenCalledTimes(1));
+  it("inProcessHandoffAfter holds an in-process peer's mirror post, and so its local dispatch", async () => {
+    const postClient = makePostClient();
+    const inbound = makeInbound();
+    const { gate, release } = pendingGate();
+
+    const running = processHandoffs(
+      baseCtx({ postClient, registry: inProcessRegistry(inbound), inProcessHandoffAfter: gate }),
+    );
     await new Promise((resolve) => setTimeout(resolve, 10));
+    // The mirror's WS copy would wake the in-process peer too — nothing goes out yet.
+    expect(postClient.createPostReply).not.toHaveBeenCalled();
     expect(inbound.client.ingestLocalEvent).not.toHaveBeenCalled();
 
     release();
     const outcomes = await running;
+    expect(postClient.createPostReply).toHaveBeenCalledTimes(1);
     expect(outcomes[0]!.localDispatched).toBe(true);
     expect(inbound.events[0]!.message_id).toBe("om_mirror_1");
   });
 
-  it("a rejected localDispatchAfter still dispatches (the mirror is already on record)", async () => {
+  it("with the kill switch on, an in-process peer's mirror still waits (its WS copy is what wakes the peer)", async () => {
     const postClient = makePostClient();
     const inbound = makeInbound();
-    const registry = new LocalHandoffRegistry();
-    registry.register(
-      { botId: "review-bot", name: "ReviewBot", botOpenId: "ou_review_own_scope" },
-      inbound.client,
+    const { gate, release } = pendingGate();
+
+    const running = processHandoffs(
+      baseCtx({
+        postClient,
+        registry: inProcessRegistry(inbound),
+        localDispatchEnabled: false,
+        inProcessHandoffAfter: gate,
+      }),
     );
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(postClient.createPostReply).not.toHaveBeenCalled();
+
+    release();
+    const outcomes = await running;
+    expect(outcomes[0]!.posted).toBe(true);
+    expect(outcomes[0]!.localDispatched).toBe(false);
+    expect(inbound.client.ingestLocalEvent).not.toHaveBeenCalled();
+  });
+
+  it("a peer in another process does not wait on inProcessHandoffAfter", async () => {
+    const postClient = makePostClient();
+    const never = new Promise<void>(() => {});
+
+    const outcomes = await processHandoffs(
+      baseCtx({ postClient, registry: new LocalHandoffRegistry(), inProcessHandoffAfter: never }),
+    );
+
+    expect(postClient.createPostReply).toHaveBeenCalledTimes(1);
+    expect(outcomes[0]!.posted).toBe(true);
+    expect(outcomes[0]!.localDispatched).toBe(false);
+    expect(outcomes[0]!.detail).toContain("目标不在本 bridge 进程内");
+  });
+
+  it("a rejected inProcessHandoffAfter still posts and dispatches (the agent's handoff stands)", async () => {
+    const postClient = makePostClient();
+    const inbound = makeInbound();
     const gate = Promise.reject(new Error("final card failed"));
     gate.catch(() => {});
 
-    const outcomes = await processHandoffs(baseCtx({ postClient, registry, localDispatchAfter: gate }));
+    const outcomes = await processHandoffs(
+      baseCtx({ postClient, registry: inProcessRegistry(inbound), inProcessHandoffAfter: gate }),
+    );
 
     expect(outcomes[0]!.posted).toBe(true);
     expect(outcomes[0]!.localDispatched).toBe(true);

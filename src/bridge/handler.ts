@@ -4744,12 +4744,19 @@ export class BridgeHandler {
           // never fail an otherwise-successful turn (each entry degrades to a
           // recorded diagnostic; WS delivery remains the fallback whenever local
           // dispatch doesn't apply).
-          // WP-8: runs alongside the final card instead of after it. The mirror
-          // post goes out right away; the LOCAL dispatch waits for the card
-          // (a peer woken in-process must not read this card mid-stream) and
-          // for the task-signal chain (so its claim still lands before that
-          // peer's turn starts, as when both preceded the handoff).
-          const localDispatchAfter = Promise.allSettled([cardDelivered, taskSignalsSettled]);
+          // WP-8: runs alongside the final card instead of after it.
+          //   - Peer in ANOTHER process: its mirror post goes out right away.
+          //     The mirror's WS copy is that peer's only path, so it can wake
+          //     before this card is final or this turn's claim has landed.
+          //   - Peer hosted in THIS process: the mirror and the local dispatch
+          //     both wait for the card (it must not read this card mid-stream)
+          //     and for the task-signal chain (this turn's claim lands before
+          //     that peer's turn starts; its pre-runner claim check reads this
+          //     bot's store). Both, because the mirror's WS copy wakes that
+          //     peer just as the local dispatch does.
+          // A rejected card still lets the handoffs through (allSettled): the
+          // agent's handoff stands, and the turn then fails as before.
+          const inProcessHandoffAfter = Promise.allSettled([cardDelivered, taskSignalsSettled]);
           const declaredHandoffs = reportedState?.handoffs;
           const handoffsSettled =
             declaredHandoffs && declaredHandoffs.length > 0
@@ -4778,7 +4785,7 @@ export class BridgeHandler {
                       threadId,
                       triggerMessageId: messageId,
                       localDispatchEnabled: process.env["LARKWAY_LOCAL_HANDOFF"] !== "off",
-                      localDispatchAfter,
+                      inProcessHandoffAfter,
                     });
                     for (const o of outcomes) {
                       await recordEvent({

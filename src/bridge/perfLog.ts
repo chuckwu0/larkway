@@ -70,7 +70,7 @@ export interface PostRunnerPerf {
   declareMs?: number;
   /**
    * processHandoffs (only when the agent declared handoffs); overlaps finalize
-   * since WP-8, and includes a local dispatch's wait for the final card.
+   * since WP-8, and includes an in-process peer's wait for the final card.
    */
   handoffMs?: number;
 }
