@@ -66,6 +66,11 @@ export interface RenderPromptInput {
   extraRepoPaths?: RepoRef[];
   larkCliProfile?: string;
   runtimeWarnings?: RuntimeWarning[];
+  /**
+   * WP-2 (f): false = the session already received this exact warning list
+   * (handler-computed). Absent behaves as today.
+   */
+  runtimeWarningsChanged?: boolean;
   taskHandleTasklistGuid?: string;
   taskHandleClaimed?: boolean;
   taskHandleCandidates?: readonly TaskCandidate[];

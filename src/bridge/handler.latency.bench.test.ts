@@ -16,13 +16,15 @@
  *
  * The expected serial counts pin TODAY's handler: a change that moves a call
  * off the critical path must update them here, with the ordering assertions
- * still passing.
+ * still passing. A call the handler starts but does not wait on shows up in
+ * `expectInFlight`, not in the serial count.
  */
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { appendFile, mkdir, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { BridgeHandler } from "./handler.js";
+import { createCotProgressHandle } from "./cotProgress.js";
 import type { PerfSample } from "./perfLog.js";
 import type { BotConfig } from "../config/botLoader.js";
 import type { LarkMessageEvent } from "../lark/transport.js";
@@ -69,25 +71,43 @@ interface Scenario {
   thread: "new" | "continuation";
   roster: "warm" | "cold";
   cardkit: "ok" | "fail";
-  /** Serial network round trips before runner.run() in today's handler. */
+  /**
+   * Continuation only: whether this chat already learned that the COT thread
+   * channel rejects (code=10002) — the steady state after the first in-topic
+   * turn since boot ("untried").
+   */
+  cotThread?: "known-rejected" | "untried";
+  /** Serial network round trips completed before runner.run() in today's handler. */
   expectSerial: number;
   /** Total network calls started before runner.run(). */
   expectCalls: number;
+  /** Calls started before runner.run() but not waited on (still in flight at run()). */
+  expectInFlight: number;
 }
 
-// new topic:   reaction.add → card (reply+idConvert | failed reply → legacy card)
-//              → reaction.delete → COT bubble on the card → [roster]
-// continuation: [root probe ‖ reaction.add] → COT thread (rejected) → COT chat
-//              → card → reaction.delete → [roster]
+// new topic:    [reaction.add ‖ roster] → card (reply+idConvert | failed reply
+//               → legacy card) → reaction.delete; the COT bubble create on the
+//               card is started, not awaited (in flight at run()).
+// continuation: [root probe ‖ reaction.add ‖ roster] → COT (chat; + a rejected
+//               thread attempt first when untried) → card → reaction.delete.
+// The delta prompt does not wait on the roster; the full (new-topic) prompt
+// does, by which time it has long completed alongside the reaction.
+// The reaction round trips are still awaited by these fakes (see
+// fakeInboundClient); WP-3 takes them off the path in the channel client.
 const SCENARIOS: Scenario[] = [
-  { name: "new/roster-cold/cardkit-ok", thread: "new", roster: "cold", cardkit: "ok", expectSerial: 6, expectCalls: 6 },
-  { name: "new/roster-warm/cardkit-ok", thread: "new", roster: "warm", cardkit: "ok", expectSerial: 5, expectCalls: 5 },
-  { name: "new/roster-cold/cardkit-fail", thread: "new", roster: "cold", cardkit: "fail", expectSerial: 6, expectCalls: 6 },
-  { name: "new/roster-warm/cardkit-fail", thread: "new", roster: "warm", cardkit: "fail", expectSerial: 5, expectCalls: 5 },
-  { name: "continuation/roster-cold/cardkit-ok", thread: "continuation", roster: "cold", cardkit: "ok", expectSerial: 7, expectCalls: 8 },
-  { name: "continuation/roster-warm/cardkit-ok", thread: "continuation", roster: "warm", cardkit: "ok", expectSerial: 6, expectCalls: 7 },
-  { name: "continuation/roster-cold/cardkit-fail", thread: "continuation", roster: "cold", cardkit: "fail", expectSerial: 7, expectCalls: 8 },
-  { name: "continuation/roster-warm/cardkit-fail", thread: "continuation", roster: "warm", cardkit: "fail", expectSerial: 6, expectCalls: 7 },
+  { name: "new/roster-cold/cardkit-ok", thread: "new", roster: "cold", cardkit: "ok", expectSerial: 4, expectCalls: 6, expectInFlight: 1 },
+  { name: "new/roster-warm/cardkit-ok", thread: "new", roster: "warm", cardkit: "ok", expectSerial: 4, expectCalls: 5, expectInFlight: 1 },
+  { name: "new/roster-cold/cardkit-fail", thread: "new", roster: "cold", cardkit: "fail", expectSerial: 4, expectCalls: 6, expectInFlight: 1 },
+  { name: "new/roster-warm/cardkit-fail", thread: "new", roster: "warm", cardkit: "fail", expectSerial: 4, expectCalls: 5, expectInFlight: 1 },
+  { name: "continuation/roster-cold/cardkit-ok", thread: "continuation", roster: "cold", cardkit: "ok", expectSerial: 5, expectCalls: 7, expectInFlight: 0 },
+  { name: "continuation/roster-warm/cardkit-ok", thread: "continuation", roster: "warm", cardkit: "ok", expectSerial: 5, expectCalls: 6, expectInFlight: 0 },
+  { name: "continuation/roster-cold/cardkit-fail", thread: "continuation", roster: "cold", cardkit: "fail", expectSerial: 5, expectCalls: 7, expectInFlight: 0 },
+  { name: "continuation/roster-warm/cardkit-fail", thread: "continuation", roster: "warm", cardkit: "fail", expectSerial: 5, expectCalls: 6, expectInFlight: 0 },
+  {
+    name: "continuation/roster-warm/cardkit-ok/cot-thread-untried",
+    thread: "continuation", roster: "warm", cardkit: "ok", cotThread: "untried",
+    expectSerial: 6, expectCalls: 7, expectInFlight: 0,
+  },
 ];
 
 const ROOT_ID = "om_bench_root";
@@ -114,6 +134,7 @@ function eventFor(s: Scenario): LarkMessageEvent {
 interface RunResult {
   serial: number;
   calls: string[];
+  inFlight: string[];
   sample: PerfSample;
   timeline: LatencyTimeline;
 }
@@ -124,8 +145,28 @@ async function runScenario(root: string, s: Scenario, rep: number): Promise<RunR
   await mkdir(join(workspace, "repos"), { recursive: true });
   const timeline = new LatencyTimeline();
   registerFakeRunner(RUNNER_KEY, timeline, {
+    // Outlasts one fake round trip, so a not-awaited bubble create lands
+    // (and reports its channel) before the turn's sample is written.
+    runMs: Math.max(20, 2 * NET_MS),
     usage: { inputTokens: 10, cacheCreationTokens: 100, cacheReadTokens: 1000, outputTokens: 5 },
   });
+  const cotClient = fakeCotClient(timeline, NET_MS, { createAfterRun: s.thread === "new" });
+  if (s.thread === "continuation" && s.cotThread !== "untried") {
+    // Prime through the real code path: an earlier in-topic turn in this chat
+    // saw the thread channel rejected and chat_id succeed.
+    const primed = await createCotProgressHandle({
+      cotClient,
+      target: { chatId: "oc_bench_chat", threadId: "omt_bench_topic", originMessageId: "om_bench_earlier" },
+      detail: "brief",
+      runId: "bench-prime",
+      scope: ROOT_ID,
+      inputPreview: "",
+      throttleMs: 60_000,
+    });
+    primed.close();
+    expect(primed.channel).toBe("chat-after-thread");
+    timeline.clear();
+  }
   const store = fakeSessionStore(
     s.thread === "continuation"
       ? [{
@@ -182,7 +223,7 @@ async function runScenario(root: string, s: Scenario, rep: number): Promise<RunR
       },
     } as unknown as BotConfig,
     cardKitClient: fakeCardKitClient(timeline, NET_MS, { failCreate: s.cardkit === "fail" }),
-    cotClient: fakeCotClient(timeline, NET_MS),
+    cotClient,
     messageLookup: fakeMessageLookup(timeline, NET_MS),
     peers: [{ id: "ou_bench_peer", name: "Peer", description: "bench peer" }],
     resolveLiveRoster: fakeRosterResolver(timeline, NET_MS, s.roster === "warm"),
@@ -196,8 +237,14 @@ async function runScenario(root: string, s: Scenario, rep: number): Promise<RunR
   expect(samples).toHaveLength(1);
   expect(timeline.runAt).toBeDefined();
   expect(spawned, "no real subprocess").toEqual([]);
-  const { calls, groups } = timeline.serialGroupsBeforeRun();
-  return { serial: groups, calls: calls.map((c) => c.what), sample: samples[0]!, timeline };
+  const { calls, inFlight, groups } = timeline.serialGroupsBeforeRun();
+  return {
+    serial: groups,
+    calls: calls.map((c) => c.what),
+    inFlight: inFlight.map((c) => c.what),
+    sample: samples[0]!,
+    timeline,
+  };
 }
 
 function pct(values: number[], p: number): number {
@@ -233,6 +280,8 @@ describe("handler latency bench (A1)", () => {
       // Critical-path shape.
       expect(r.serial, `serial round trips before run(): ${r.calls.join(" → ")}`).toBe(s.expectSerial);
       expect(r.calls).toHaveLength(s.expectCalls);
+      expect(r.inFlight, "started before run(), not waited on").toHaveLength(s.expectInFlight);
+      if (s.thread === "new") expect(r.inFlight).toEqual(["cot.create(chat)"]);
 
       // Ordering: an existing topic's bubble lands BEFORE the card, a new
       // topic's AFTER it (the topic does not exist until the card creates it).
@@ -251,7 +300,10 @@ describe("handler latency bench (A1)", () => {
       // WP-0 fields land in the sample.
       expect(sample.handleStartAt).toBeLessThanOrEqual(sample.runnerRunAt!);
       expect(sample.preRunner?.rosterCache).toBe(s.roster === "warm" ? "hit" : "miss");
-      expect(sample.preRunner?.cotChannel).toBe(s.thread === "continuation" ? "chat-after-thread" : "chat");
+      expect(sample.preRunner?.cotChannel).toBe(s.cotThread === "untried" ? "chat-after-thread" : "chat");
+      // A delta turn never waits on the roster; a full prompt does (≈0 here).
+      if (s.thread === "continuation") expect(sample.preRunner?.rosterMs).toBeUndefined();
+      else expect(sample.preRunner?.rosterMs).toBeGreaterThanOrEqual(0);
       expect(sample.preRunner?.cardReplyMs).toBeGreaterThanOrEqual(NET_MS - 5);
       expect(sample.preRunner?.reactionAddMs).toBeGreaterThanOrEqual(NET_MS - 5);
       expect(sample.preRunner?.reactionRemoveMs).toBeGreaterThanOrEqual(NET_MS - 5);
@@ -273,6 +325,7 @@ describe("handler latency bench (A1)", () => {
       reps: REPS,
       serialBeforeRun: last!.serial,
       callsBeforeRun: last!.calls,
+      inFlightAtRun: last!.inFlight,
       preRunnerMsP50: pct(preRunnerMs, 0.5),
       preRunnerMsP90: pct(preRunnerMs, 0.9),
       tailMsP50: pct(tailMs, 0.5),

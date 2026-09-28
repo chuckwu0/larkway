@@ -78,6 +78,7 @@ import {
   stateFilePathOf,
 } from "./stateFile.js";
 import { processHandoffs, type LocalHandoffRegistry } from "./localHandoff.js";
+import { createCotEventBuffer, type BufferedSink } from "./bufferedSink.js";
 import { writeCardFile, deleteCardFile } from "./cardFile.js";
 import { writeCotFile, deleteCotFileIfMatches } from "./cotFile.js";
 import {
@@ -1140,7 +1141,7 @@ export interface BridgeHandlerDeps {
      * 缺省视为 "brief"。仅在非 "off" 时 main.ts 才注入 cotClient。
      */
     cot?: "off" | "brief" | "detailed";
-    /** COT 展示形态(方案 B):"card"(默认,折叠进卡片)| "bubble"(实验,message_cot 气泡)。 */
+    /** COT 展示形态(方案 B):"bubble"(默认,message_cot 气泡)| "card"(实验,折叠进卡片)。 */
     cotSurface?: "card" | "bubble";
   };
   /**
@@ -1361,6 +1362,14 @@ export class BridgeHandler {
   private readonly threadLastOutcome = new Map<string, "completed" | "failed">();
   /** WP-0 perf: when run() pulled each event off the inbound queue (perf `enqueueAt`). */
   private readonly perfEnqueueAt = new WeakMap<object, number>();
+  /**
+   * WP-2 (f): per session key, the fingerprint of the <runtime-warnings> list
+   * the session's native history last received (recorded once the runner's
+   * first event proves the prompt was delivered). A delta prompt repeats the
+   * block only when the list differs. In-memory like threadReceivedAt: empty
+   * after a restart, so each session gets the block once more.
+   */
+  private readonly runtimeWarningsSent = new Map<string, string>();
 
   constructor(deps: BridgeHandlerDeps) {
     this.deps = deps;
@@ -1416,6 +1425,11 @@ export class BridgeHandler {
     return (this.deps.runtimeRequirements ?? []).filter((req) =>
       !req.ok && (req.severity === "required" || req.kind === "secret")
     );
+  }
+
+  /** WP-2 (f): identity of the rendered warning lines — see runtimeWarningsSent. */
+  private static runtimeWarningsFingerprint(warnings: readonly RuntimeRequirement[]): string {
+    return JSON.stringify(warnings.map((w) => [w.label, w.command, w.reason, w.installHint]));
   }
 
   /**
@@ -1701,6 +1715,10 @@ export class BridgeHandler {
     // inside the try, fed every event, finalized on success/error. Always
     // best-effort; a disabled handle is a no-op (see src/bridge/cotProgress.ts).
     let cotPublisher: CotProgressHandle | undefined;
+    // WP-2 (c): what the stream loop feeds instead of cotPublisher — buffers
+    // the events that arrive before a background-adopted handle exists and
+    // replays them into it on adoption (see createCotBubble).
+    let cotSink: BufferedSink<AgentStreamEvent> | undefined;
     // The bubble-create promise itself (see the ordering block below). Held at
     // function scope so the finally can guarantee a late-resolving handle —
     // adopted in the BACKGROUND after the 3s budget — still gets finalized:
@@ -1888,6 +1906,60 @@ export class BridgeHandler {
         console.warn("[bridge.handler] recordPerfSample failed (continuing):", err);
       }
     };
+    // Set right before this turn's terminal event record (completed / failed),
+    // so a late side-lane write (the roster diagnostic below) can't reopen it.
+    let turnTerminalRecorded = false;
+
+    // PRB-6/§11.3 live roster: peer @ targets resolved to their same-app-scope
+    // open_id (the static config id may be cross-scope). WP-2 (b): the lookup
+    // starts here and runs alongside the reaction + card round trips instead
+    // of in front of the prompt. Only a FULL prompt renders <peer-bots>, so a
+    // full turn awaits it just before rendering; a delta turn never waits on
+    // it before the runner — the handoff @ targets settle it after the run.
+    // Best-effort as before: any failure keeps the static config ids.
+    const staticPeers = this.deps.peers;
+    let rosterTask: Promise<PeerBot[]> | undefined;
+    if (staticPeers?.length && this.deps.resolveLiveRoster) {
+      const rosterLookup: RosterLookupInfo = {};
+      const recordRosterDiagnostic = async (reason: string): Promise<void> => {
+        if (turnTerminalRecorded) {
+          console.info(`[bridge.handler] peer roster resolved after turn end: ${reason}`);
+          return;
+        }
+        await recordEvent({ status: "running", appendPath: "peer roster", reason });
+      };
+      rosterTask = this.deps
+        .resolveLiveRoster(parsed.chatId, rosterLookup)
+        .then(async (liveRoster) => {
+          turnPerf.preRunner.rosterCache = rosterLookup.cache;
+          if (!liveRoster) {
+            await recordRosterDiagnostic(
+              "live-roster resolve returned nothing; kept static <peer-bots> open_ids " +
+                "(may be cross-app-scope / undeliverable).",
+            );
+            return staticPeers;
+          }
+          const { peers: remappedPeers, remapped, unresolved } = remapPeersToLiveRoster(
+            staticPeers,
+            liveRoster,
+          );
+          if (remapped.length > 0 || unresolved.length > 0) {
+            await recordRosterDiagnostic(
+              `live-roster resolve: remapped [${remapped.join(", ") || "none"}] to ` +
+                `same-app-scope open_id; unresolved (kept static config id, may not be ` +
+                `deliverable) [${unresolved.join(", ") || "none"}].`,
+            );
+          }
+          return remappedPeers;
+        })
+        .catch((err: unknown) => {
+          console.warn("[bridge.handler] live-roster resolve failed (using static peers):", err);
+          return staticPeers;
+        });
+    } else {
+      turnPerf.preRunner.rosterCache = "skip";
+    }
+
     const triggerType =
       typeof parsed.raw.root_id === "string" && parsed.raw.root_id
         ? "thread_reply"
@@ -2221,9 +2293,9 @@ export class BridgeHandler {
       };
 
       // COT (方案 B) surface resolution — shared by the CardKit panel (below)
-      // and the experimental bubble (further down). "card" (default) folds
-      // reasoning into the answer card's collapsible panel; "bubble" uses the
-      // message_cot side channel.
+      // and the bubble (further down). "bubble" (default) uses the message_cot
+      // side channel; "card" (experimental) folds reasoning into the answer
+      // card's collapsible panel.
       const cotDetail = this.deps.botConfig?.cot ?? "brief";
       const cotSurface = this.deps.botConfig?.cotSurface ?? "bubble";
       const cotCardOption =
@@ -2231,8 +2303,8 @@ export class BridgeHandler {
           ? { detail: cotDetail as "brief" | "detailed" }
           : undefined;
 
-      // COT (思维链) bubble — 方案 B experimental surface (cotSurface="bubble";
-      // the default "card" folds reasoning into the panel via `cot` above).
+      // COT (思维链) bubble — 方案 B default surface (cotSurface="bubble"; the
+      // experimental "card" folds reasoning into the panel via `cot` above).
       // Extracted to a closure because its position relative to the answer card
       // depends on whether this is the FIRST turn of a NEW topic:
       //   - existing topic (later turns): create the bubble BEFORE the card so
@@ -2245,21 +2317,28 @@ export class BridgeHandler {
       //     every later turn. A first-turn bubble slightly below the card is the
       //     correct trade here (users want "bubble inside the topic" over "on top").
       // Created ONCE per turn (before the retry loop). Bypass rule preserved:
-      // createCotProgressHandle never throws. To keep a SLOW create off the
-      // card's critical path (worst case = hung GET + two-tier create, each
-      // 8s-bounded), race a 3s budget — past it, proceed and adopt the handle in
-      // the background (the finally's anti-orphan finalize completes a late
-      // handle). This holds for BOTH orderings (a first-turn, post-card create
-      // can be slow/fail too).
+      // createCotProgressHandle never throws. The pre-card create is awaited
+      // (the bubble must land before the card) but raced against a 3s budget
+      // (worst case = hung GET + two-tier create, each 8s-bounded) — past it,
+      // proceed and adopt the handle in the background. WP-2 (c): the post-card
+      // create is never awaited at all — nothing visible depends on it, so it
+      // stays off the runner's critical path. Either way a background-adopted
+      // handle gets the events that arrived before it (cotSink replays them)
+      // and the finally's anti-orphan finalize completes a late handle.
       // `originMessageId` is the message_cot anchor. Its POSITION in the topic
       // decides where the bubble lands (control-var experiment, cot-write-probe
       // §F/F2): origin = the topic ROOT (首楼, pos=-1) → the bubble quote-replies
       // at the GROUP top level (thread_id=None); origin = an IN-topic message
       // (pos≥0) → the bubble inherits its thread and lands INSIDE the topic. So
       // callers pass an in-topic message id whenever they have one.
-      const createCotBubble = async (originMessageId: string): Promise<void> => {
+      const createCotBubble = async (
+        originMessageId: string,
+        opts: { awaitCreate: boolean },
+      ): Promise<void> => {
         if (!(this.deps.cotClient && cotDetail !== "off" && cotSurface === "bubble")) return;
         if (bubbleCreate) return; // once per turn
+        const sink = createCotEventBuffer();
+        cotSink = sink;
         bubbleCreate = createCotProgressHandle({
           cotClient: this.deps.cotClient,
           detail: cotDetail,
@@ -2296,6 +2375,25 @@ export class BridgeHandler {
           }
         };
 
+        const adopt = (handle: CotProgressHandle): Promise<void> => {
+          cotPublisher = handle;
+          turnPerf.preRunner.cotChannel = handle.channel;
+          // Replays, in order, whatever the runner emitted before the handle
+          // existed; from here on events pass straight through.
+          sink.attach(handle);
+          return persistBubbleRef(handle);
+        };
+        // Captured (not fire-and-forget): the finally's finalize+delete chain
+        // waits on it, so on the slow-create path the ledger write can no longer
+        // land AFTER its own delete and strand an orphan pointing at a bubble
+        // that was already completed (independent review 2026-07-28).
+        if (!opts.awaitCreate) {
+          // Adopt in the background once it resolves (never throws; the
+          // finally guarantees it's finalized).
+          cotPersistSettled = bubbleCreate.then(adopt);
+          return;
+        }
+
         const cotStartedAt = Date.now();
         const raced = await Promise.race([
           bubbleCreate.then((handle) => ({ ready: true as const, handle })),
@@ -2308,23 +2406,8 @@ export class BridgeHandler {
           }),
         ]);
         turnPerf.addMs("cotMs", Date.now() - cotStartedAt);
-        if (raced.ready) {
-          cotPublisher = raced.handle;
-          turnPerf.preRunner.cotChannel = raced.handle.channel;
-          // Captured (not fire-and-forget): the finally's finalize+delete chain
-          // waits on it, so on the slow-create path the ledger write can no longer
-          // land AFTER its own delete and strand an orphan pointing at a bubble
-          // that was already completed (independent review 2026-07-28).
-          cotPersistSettled = persistBubbleRef(raced.handle);
-        } else {
-          // Slow create — proceed now; adopt the handle in the background once
-          // it resolves (never throws; the finally guarantees it's finalized).
-          cotPersistSettled = bubbleCreate.then((handle) => {
-            cotPublisher = handle;
-            turnPerf.preRunner.cotChannel = handle.channel;
-            return persistBubbleRef(handle);
-          });
-        }
+        // Slow create — proceed now and adopt in the background.
+        cotPersistSettled = raced.ready ? adopt(raced.handle) : bubbleCreate.then(adopt);
       };
 
       // Existing session → bubble BEFORE the card, anchored on the TRIGGER
@@ -2360,7 +2443,7 @@ export class BridgeHandler {
       const triggerIsRealMessage =
         typeof parsed.raw.message_id === "string" && parsed.raw.message_id.startsWith("om_");
       if (!isNewThread && triggerIsRealMessage && (triggerInTopic || !taskCardAnchorId)) {
-        await createCotBubble(messageId);
+        await createCotBubble(messageId, { awaitCreate: true });
       }
 
       // CardKit response surface: default main surface when the transport and
@@ -2880,9 +2963,12 @@ export class BridgeHandler {
       // card id is available (both surfaces failed) — origin=首楼 lands at the
       // top level but is still usable; never block the turn. createCotBubble's
       // once-per-turn guard makes this a no-op when the early site already ran.
+      // WP-2 (c): not awaited — the card is already out, so nothing visible
+      // is ordered behind this bubble; the runner starts right away and the
+      // handle is adopted (with any buffered events) when the create lands.
       {
         const anchorMessageId = cardKitProgress?.messageId ?? card?.messageId ?? messageId;
-        await createCotBubble(anchorMessageId);
+        void createCotBubble(anchorMessageId, { awaitCreate: false });
       }
 
       // Step 4b–4f: spawn + stream + finalize, with one stale-session retry.
@@ -2923,50 +3009,6 @@ export class BridgeHandler {
         // and artifacts are retained.
         const currentIsNewThread = !currentExisting?.sessionId || incompatibleSession;
         const promptMode = this.deps.botConfig?.promptMode ?? (isAgentWorkspace ? "delta" : "full");
-        // PRB-6/§11.3: resolve peer @ targets to their same-app-scope open_id
-        // from the LIVE chat roster before building the prompt, so a handoff @
-        // actually wakes the peer (the static config id may be cross-scope).
-        // Best-effort: any failure keeps the static ids and never blocks the turn.
-        let effectivePeers = this.deps.peers;
-        if (effectivePeers?.length && this.deps.resolveLiveRoster) {
-          try {
-            const rosterLookup: RosterLookupInfo = {};
-            const liveRoster = await turnPerf.timed(
-              "rosterMs",
-              this.deps.resolveLiveRoster(parsed.chatId, rosterLookup),
-            );
-            turnPerf.preRunner.rosterCache = rosterLookup.cache;
-            if (liveRoster) {
-              const { peers: remappedPeers, remapped, unresolved } = remapPeersToLiveRoster(
-                effectivePeers,
-                liveRoster,
-              );
-              effectivePeers = remappedPeers;
-              if (remapped.length > 0 || unresolved.length > 0) {
-                await recordEvent({
-                  status: "running",
-                  appendPath: "peer roster",
-                  reason:
-                    `live-roster resolve: remapped [${remapped.join(", ") || "none"}] to ` +
-                    `same-app-scope open_id; unresolved (kept static config id, may not be ` +
-                    `deliverable) [${unresolved.join(", ") || "none"}].`,
-                });
-              }
-            } else {
-              await recordEvent({
-                status: "running",
-                appendPath: "peer roster",
-                reason:
-                  "live-roster resolve returned nothing; kept static <peer-bots> open_ids " +
-                  "(may be cross-app-scope / undeliverable).",
-              });
-            }
-          } catch (err) {
-            console.warn("[bridge.handler] live-roster resolve failed (using static peers):", err);
-          }
-        } else {
-          turnPerf.preRunner.rosterCache = "skip";
-        }
 
         // v4 任务派单 — deferred in-thread probe (see the dispatch-site
         // comment): resolve it here, where the <task-root> facts are consumed.
@@ -3019,6 +3061,21 @@ export class BridgeHandler {
           currentIsNewThread ||
           forceFreshSession ||
           promptMode !== "delta";
+        // PRB-6/§11.3: <peer-bots> (full prompts only) carries the live
+        // same-app-scope ids so a handoff @ actually wakes the peer. See
+        // rosterTask (WP-2 (b)): started at turn start, awaited here only by a
+        // full prompt; a delta turn renders without it.
+        let effectivePeers = this.deps.peers;
+        if (rosterTask && rendersFullPrompt) {
+          effectivePeers = await turnPerf.timed("rosterMs", rosterTask);
+        }
+        // WP-2 (f): the session's native history already holds the last
+        // <runtime-warnings> block it was sent; a delta prompt repeats it only
+        // when the list changed since (or this process never delivered it).
+        const runtimeWarnings = this.runtimeWarnings();
+        const runtimeWarningsKey = BridgeHandler.runtimeWarningsFingerprint(runtimeWarnings);
+        const runtimeWarningsChanged =
+          rendersFullPrompt || this.runtimeWarningsSent.get(threadId) !== runtimeWarningsKey;
         let knowledgeMap: string | undefined;
         if (knowledgeDir && rendersFullPrompt) {
           try {
@@ -3093,7 +3150,8 @@ export class BridgeHandler {
           knowledgeMap,
           agentMemory,
           larkCliProfile: this.deps.larkCliProfile,
-          runtimeWarnings: this.runtimeWarnings(),
+          runtimeWarnings,
+          runtimeWarningsChanged,
           taskHandleTasklistGuid: this.deps.botConfig?.taskHandle?.tasklistGuid,
           taskHandleClaimed: this.deps.taskHandleClaimedLookup?.(threadId) ?? false,
           // BL-49: mechanical 建卡 判据 facts. Counts THIS turn (a brand-new
@@ -3151,8 +3209,10 @@ export class BridgeHandler {
         const perfMarkers: Partial<Record<PerfMarkerName, number>> = {};
 
         // Share the exact discovery inputs with prewarm. Changes in repo
-        // directories invalidate the warm child's spawn signature.
-        const addDirs = isAgentWorkspace && conventions.workspaceReposPath
+        // directories invalidate the warm child's spawn signature. WP-2 (e):
+        // codex has no add-dir input (its command and pool ignore addDirs), so
+        // it skips the scan.
+        const addDirs = isAgentWorkspace && conventions.workspaceReposPath && backend !== "codex"
           ? await discoverWorkspaceRepoDirs(conventions.workspaceReposPath) : [];
 
         // Workspace-move resume gate: agent CLI sessions encode the cwd they
@@ -3511,8 +3571,15 @@ export class BridgeHandler {
         let turnToolResultChars = 0;
         let lastCountedToolResultRaw: unknown;
 
+        // WP-2 (f): the first runner event proves the prompt reached the session.
+        let promptDelivered = false;
+
         try {
           for await (const ev of handle.events) {
+            if (!promptDelivered) {
+              promptDelivered = true;
+              this.runtimeWarningsSent.set(threadId, runtimeWarningsKey);
+            }
             // PRB-9: any runner event = activity; resets the idle watchdog.
             // Measure the gap BEFORE resetting — this is the only place the real
             // silence of a recovered turn can still be read.
@@ -3569,8 +3636,9 @@ export class BridgeHandler {
             if (cardKitProgress) cardKitProgress.handle(ev);
             else if (card) card.handle(ev);
             // COT is a parallel channel, not an either/or with the card: feed
-            // it every event regardless of which primary surface is live.
-            if (cotPublisher) cotPublisher.handle(ev);
+            // it every event regardless of which primary surface is live
+            // (through cotSink, which holds them until the handle is adopted).
+            if (cotSink) cotSink.handle(ev);
             if (ev.type === "system_init") {
               sessionId = ev.sessionId;
             }
@@ -4644,7 +4712,9 @@ export class BridgeHandler {
             try {
               const outcomes = await processHandoffs({
                 handoffs: declaredHandoffs,
-                peers: effectivePeers ?? [],
+                // WP-2 (b): a delta turn rendered without the live roster, so
+                // settle it for the @ targets now (a full turn's is already in).
+                peers: (rosterTask ? await rosterTask : effectivePeers) ?? [],
                 roster: this.deps.taskHandleMentionRoster ?? [],
                 selfBotId: this.deps.botConfig?.id ?? "v1-default",
                 postClient: this.deps.postClient,
@@ -4677,6 +4747,7 @@ export class BridgeHandler {
           // this process or post-restart). This is the single terminal call on
           // the success path (Fix B / Bug #10 + self-heal in-flight tracking).
           settle(true);
+          turnTerminalRecorded = true;
           await recordEvent({
             status: "completed",
             finishedAt: new Date().toISOString(),
@@ -4865,6 +4936,7 @@ export class BridgeHandler {
         });
       }
       await this.deps.client.removeProcessingReaction?.(messageId);
+      turnTerminalRecorded = true;
       await recordEvent({
         status: "failed",
         finishedAt: new Date().toISOString(),
@@ -4962,18 +5034,20 @@ export class BridgeHandler {
       }
     }
     } finally {
-      // COT safety net: cancel any pending flush on every exit path. If a
-      // finalize already ran (success/error site), this is a no-op; if the
-      // turn escaped both (e.g. threw before finalize), close() at least stops
-      // a dangling throttle timer. Never completes the bubble on its own.
-      cotPublisher?.close();
+      // COT safety net. There is deliberately no close() here any more (WP-2):
+      // every bubble this turn created goes through the idempotent finalize
+      // chained below, which also clears its throttle timer. A close() here
+      // raced background adoption — a handle adopted AFTER the success/error
+      // finalize site had passed (routine once the post-card create stopped
+      // being awaited) was closed first, which turned the chained finalize
+      // into a no-op and left the bubble spinning `Working`.
       // Anti-orphan for the background-adopted bubble: a create slower than the
-      // 3s budget resolves AFTER the turn ended, so cotPublisher was still
-      // undefined at both finalize sites (and above) — the bubble would be
-      // created (RUN_STARTED sent) but never completed. Attach an idempotent
-      // finalize to the create promise itself: an already-finalized (early-
-      // adopted) handle no-ops via its closed guard; a late one gets completed
-      // when it resolves. Never throws.
+      // 3s budget (or any post-card create, WP-2) can resolve after the turn's
+      // finalize site, so cotPublisher was still undefined there — the bubble
+      // would be created (RUN_STARTED sent) but never completed. Attach an
+      // idempotent finalize to the create promise itself: an already-finalized
+      // (early-adopted) handle no-ops via its closed guard; a late one gets
+      // completed when it resolves. Never throws.
       if (bubbleCreate) {
         void Promise.resolve(bubbleCreate!)
           .then((handle) =>

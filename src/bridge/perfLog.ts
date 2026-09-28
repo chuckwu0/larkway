@@ -29,7 +29,10 @@ import type { CotChannel } from "./cotProgress.js";
  * stale-session retry re-runs some steps; their time accumulates.
  */
 export interface PreRunnerPerf {
-  /** COT bubble create (target resolve + a rejected thread attempt + chat), both call sites. */
+  /**
+   * The awaited pre-card COT bubble create (target resolve + a rejected thread
+   * attempt + chat). The post-card create is not awaited (WP-2) and adds none.
+   */
   cotMs?: number;
   cotChannel?: CotChannel;
   /**
@@ -39,6 +42,7 @@ export interface PreRunnerPerf {
   cardReplyMs?: number;
   /** CardKit `card.idConvert` of the placeholder reply. */
   cardIdConvertMs?: number;
+  /** Wait on the live-roster lookup before a full prompt (a delta turn does not wait on it, WP-2). */
   rosterMs?: number;
   /** How the live-roster lookup was served; "skip" = no peers / no resolver, no lookup. */
   rosterCache?: NonNullable<RosterLookupInfo["cache"]> | "skip";

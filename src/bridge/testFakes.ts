@@ -37,6 +37,8 @@ export interface TimelineEntry {
   kind: "net" | "runner";
   /** Exact start order across all entries (ms timestamps can tie). */
   seq: number;
+  /** Exact completion order, on the same counter as `seq`. */
+  endSeq: number;
   /** Epoch ms (Date.now()) — same clock as the perf sample's timeline. */
   start: number;
   end: number;
@@ -49,13 +51,22 @@ export class LatencyTimeline {
   /** Start order of the (first) run() call. */
   runSeq: number | undefined;
   private nextSeq = 0;
+  private resolveRunStarted!: () => void;
+  private readonly runStarted = new Promise<void>((resolve) => {
+    this.resolveRunStarted = resolve;
+  });
 
-  /** One fake network round trip: sleep `ms`, record it, then return / throw. */
-  async net<T>(what: string, ms: number, result: () => T): Promise<T> {
+  /**
+   * One fake network round trip: sleep `ms`, record it, then return / throw.
+   * `notBefore` holds the round trip's start of sleep until it settles — the
+   * call still counts as issued when net() was called.
+   */
+  async net<T>(what: string, ms: number, result: () => T, opts: { notBefore?: Promise<unknown> } = {}): Promise<T> {
     const seq = this.nextSeq++;
     const start = Date.now();
+    if (opts.notBefore) await opts.notBefore;
     await new Promise((resolve) => setTimeout(resolve, ms));
-    this.entries.push({ what, kind: "net", seq, start, end: Date.now() });
+    this.entries.push({ what, kind: "net", seq, endSeq: this.nextSeq++, start, end: Date.now() });
     return result();
   }
 
@@ -63,7 +74,21 @@ export class LatencyTimeline {
     const seq = this.nextSeq++;
     this.runAt ??= Date.now();
     this.runSeq ??= seq;
-    this.entries.push({ what: "runner.run()", kind: "runner", seq, start: Date.now(), end: Date.now() });
+    this.entries.push({ what: "runner.run()", kind: "runner", seq, endSeq: seq, start: Date.now(), end: Date.now() });
+    this.resolveRunStarted();
+  }
+
+  /** Resolves once run() was called, or after `capMs` — whichever is first. */
+  runStartedOrAfter(capMs: number): Promise<void> {
+    return Promise.race([
+      this.runStarted,
+      new Promise<void>((resolve) => setTimeout(resolve, capMs).unref?.()),
+    ]);
+  }
+
+  /** Forget recorded calls (e.g. after priming a fake's state through the real code path). */
+  clear(): void {
+    this.entries.length = 0;
   }
 
   netEntries(): TimelineEntry[] {
@@ -71,16 +96,20 @@ export class LatencyTimeline {
   }
 
   /**
-   * Network calls started before the first run() call, and how many SERIAL
-   * groups they form: calls whose intervals overlap ran in parallel and count
-   * once. N groups ≈ N back-to-back round trips on the critical path.
+   * Network calls started before the first run() call (`calls`), and how many
+   * SERIAL groups the ones that also COMPLETED before it form: calls whose
+   * intervals overlap ran in parallel and count once. N groups ≈ N
+   * back-to-back round trips the runner could have been waiting on. Calls
+   * still in flight at run() (`inFlight`) were not waited on.
    */
-  serialGroupsBeforeRun(): { calls: TimelineEntry[]; groups: number } {
+  serialGroupsBeforeRun(): { calls: TimelineEntry[]; inFlight: TimelineEntry[]; groups: number } {
     const runSeq = this.runSeq ?? Infinity;
     const calls = this.netEntries().filter((e) => e.seq < runSeq);
+    const inFlight = calls.filter((e) => e.endSeq > runSeq);
     let groups = 0;
     let groupEnd = -Infinity;
     for (const call of calls) {
+      if (call.endSeq > runSeq) continue;
       if (call.start < groupEnd) {
         groupEnd = Math.max(groupEnd, call.end);
       } else {
@@ -88,7 +117,7 @@ export class LatencyTimeline {
         groupEnd = call.end;
       }
     }
-    return { calls, groups };
+    return { calls, inFlight, groups };
   }
 
   firstStart(what: string): number | undefined {
@@ -164,20 +193,32 @@ export function fakeCardRenderer(timeline: LatencyTimeline, netMs: number) {
   } satisfies Pick<CardRenderer, keyof CardRenderer>;
 }
 
-/** COT client whose thread channel is rejected like the production tenant (code=10002). */
+/**
+ * COT client whose thread channel is rejected like the production tenant
+ * (code=10002). `createAfterRun`: a create completes only once run() was called
+ * (capped at 1s) — for a create the handler must NOT wait on, this makes "still
+ * in flight at run()" deterministic, and a regression that awaits it again
+ * shows up as one more serial round trip after the cap instead of a hang.
+ */
 export function fakeCotClient(
   timeline: LatencyTimeline,
   netMs: number,
-  opts: { rejectThread?: boolean } = { rejectThread: true },
+  opts: { rejectThread?: boolean; createAfterRun?: boolean } = {},
 ): Required<OutboundCotClient> {
+  const rejectThread = opts.rejectThread ?? true;
   return {
     create: (target: CotTarget) =>
-      timeline.net(`cot.create(${target.threadId ? "thread" : "chat"})`, netMs, () => {
-        if (target.threadId && opts.rejectThread) {
-          throw new Error("COT API failed: code=10002 Bot/User can NOT be out of the chat");
-        }
-        return { cotId: "cot_bench", messageId: "om_bench_cot" };
-      }),
+      timeline.net(
+        `cot.create(${target.threadId ? "thread" : "chat"})`,
+        netMs,
+        () => {
+          if (target.threadId && rejectThread) {
+            throw new Error("COT API failed: code=10002 Bot/User can NOT be out of the chat");
+          }
+          return { cotId: "cot_bench", messageId: "om_bench_cot" };
+        },
+        opts.createAfterRun ? { notBefore: timeline.runStartedOrAfter(1000) } : {},
+      ),
     resolveThreadId: () => timeline.net("cot.resolveThreadId", netMs, () => undefined),
     async update() {},
     async complete() {},
