@@ -106,6 +106,51 @@ describe("applyVerifiedClaim", () => {
     expect(store.get("om_thread")?.taskGuid).toBe("g-two");
   });
 
+  // v5 `create`: the bridge's own createTask just returned this guid — the
+  // lookup would only re-confirm what the create response already proved.
+  it("skips the lookup for a guid the bridge just created (trustedGuid)", async () => {
+    const store = await TaskHandleStore.load(join(dir, "task-handles.json"));
+    // Deliberately unknown to getTask: were the lookup made, the claim would be refused.
+    const { client: c, calls } = client([]);
+
+    const out = await applyVerifiedClaim(
+      { ...patch("g-created"), mode: "comment", trustedGuid: "g-created" },
+      { store, client: c, botId: "bot-1", warn: () => {} },
+    );
+
+    expect(out).toEqual({ recorded: true, verified: false });
+    expect(calls).toEqual([]);
+    expect(store.get("om_thread")).toMatchObject({ taskGuid: "g-created", mode: "comment" });
+  });
+
+  it("still verifies an agent-declared guid that differs from trustedGuid", async () => {
+    const store = await TaskHandleStore.load(join(dir, "task-handles.json"));
+    const { client: c, calls } = client(["g-created"]);
+
+    const out = await applyVerifiedClaim(
+      { ...patch("tasklist-guid"), trustedGuid: "g-created" },
+      { store, client: c, botId: "bot-1", warn: () => {} },
+    );
+
+    expect(out).toEqual({ recorded: false, reason: "unresolvable_guid" });
+    expect(calls).toEqual(["tasklist-guid"]);
+    expect(store.get("om_thread")).toBeUndefined();
+  });
+
+  it("a trusted guid still goes through the store's cross-thread guard", async () => {
+    const store = await TaskHandleStore.load(join(dir, "task-handles.json"));
+    const { client: c } = client([]);
+    await store.claim({ threadId: "om_other", chatId: "oc_chat", taskGuid: "g-created" });
+
+    const out = await applyVerifiedClaim(
+      { ...patch("g-created"), trustedGuid: "g-created" },
+      { store, client: c, botId: "bot-1", warn: () => {} },
+    );
+
+    expect(out).toMatchObject({ recorded: false, reason: "store_rejected" });
+    expect(store.get("om_thread")).toBeUndefined();
+  });
+
   it("reports a store-level rejection without pretending the claim landed", async () => {
     const store = await TaskHandleStore.load(join(dir, "task-handles.json"));
     const { client: c } = client(["g-real"]);

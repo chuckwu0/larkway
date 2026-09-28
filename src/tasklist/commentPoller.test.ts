@@ -257,6 +257,59 @@ describe("CommentPoller", () => {
     });
   });
 
+  // §6.2: for a comment-mode claim this poller is the main place a task
+  // deleted upstream loses its claim — writeback's received/completed hooks no
+  // longer read the task (WP-8). A missed drop can leave the thread "claimed"
+  // indefinitely (v5 `create` skipped; StallDetector skips doneDeclared
+  // claims), so pin both not-found shapes the client classifies: a 404
+  // status, and a not-found message on another status.
+  describe("task-not-found handling (§6.2)", () => {
+    function makeNotFoundRequester(response: Record<string, unknown>): LarkTaskRequester {
+      const request = vi.fn(async () => {
+        throw { response };
+      });
+      return { request: request as unknown as LarkTaskRequester["request"] };
+    }
+
+    it("drops the claim mapping when listComments answers 404, and stops polling that task", async () => {
+      const store = await TaskHandleStore.load(join(dir, "task-handles.json"));
+      await store.put({ threadId: "t1", taskGuid: "guid-1", chatId: "oc_1", claimedTs: 1, mode: "comment" });
+      const requester = makeNotFoundRequester({ status: 404 });
+      const client = new TaskListClient(requester);
+      const enqueueSyntheticTurn = vi.fn();
+      const poller = new CommentPoller({ store, client, enqueueSyntheticTurn });
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+      try {
+        await poller.pollOnceForTest();
+        await poller.pollOnceForTest();
+      } finally {
+        warnSpy.mockRestore();
+      }
+
+      expect(store.get("t1")).toBeUndefined();
+      expect(enqueueSyntheticTurn).not.toHaveBeenCalled();
+      // the second cycle has nothing left to poll — the drop is final, not a retry loop
+      expect((requester.request as ReturnType<typeof vi.fn>).mock.calls.length).toBe(1);
+    });
+
+    it("drops the claim mapping on a not-found message carried by a non-404 status", async () => {
+      const store = await TaskHandleStore.load(join(dir, "task-handles.json"));
+      await store.put({ threadId: "t1", taskGuid: "guid-1", chatId: "oc_1", claimedTs: 1, mode: "comment" });
+      const client = new TaskListClient(makeNotFoundRequester({ status: 400, data: { msg: "task not found" } }));
+      const poller = new CommentPoller({ store, client, enqueueSyntheticTurn: vi.fn() });
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+      try {
+        await poller.pollOnceForTest();
+      } finally {
+        warnSpy.mockRestore();
+      }
+
+      expect(store.get("t1")).toBeUndefined();
+    });
+  });
+
   // D: a missing task:comment scope used to be conflated with "task not
   // found" (dropping the claim) and, since every poll cycle re-attempted and
   // re-warned, spammed hundreds of warn lines/minute (mini dogfood). Both

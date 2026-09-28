@@ -578,24 +578,24 @@ describe("applyTaskHandleWriteback — comment-mode claims (v4 任务派单)", (
       { store, client },
     );
 
-    // the only network call is the leading getTask (deleted-task contract)
-    expect(calls.filter((c) => c.config.method !== "GET").length).toBe(0);
+    // local bookkeeping only — not even a getTask (WP-8: the snapshot was never read)
+    expect(calls.length).toBe(0);
     expect(store.get("t1")?.doneDeclared).toBe(true);
     expect(store.get("t1")?.lastTurnOutcome).toBe("completed");
   });
 
-  it("completed without done: no writes, doneDeclared stays unset", async () => {
+  it("completed without done: no network calls, doneDeclared stays unset", async () => {
     const store = await makeCommentModeStore();
     const { requester, calls } = makeFakeRequester({ task: {} });
     const client = new TaskListClient(requester);
 
     await applyTaskHandleWriteback({ botId: "b1", threadId: "t1", status: "completed" }, { store, client });
 
-    expect(calls.filter((c) => c.config.method !== "GET").length).toBe(0);
+    expect(calls.length).toBe(0);
     expect(store.get("t1")?.doneDeclared).toBeUndefined();
   });
 
-  it("failed: posts exactly one failure COMMENT (comments push; descriptions don't), never patches", async () => {
+  it("failed: reads the task, then posts exactly one failure COMMENT (comments push; descriptions don't), never patches", async () => {
     const store = await makeCommentModeStore();
     const { requester, calls } = makeFakeRequester({ task: {} });
     const client = new TaskListClient(requester);
@@ -605,13 +605,14 @@ describe("applyTaskHandleWriteback — comment-mode claims (v4 任务派单)", (
       { store, client },
     );
 
+    expect(calls.filter((c) => c.config.method === "GET").length).toBe(1);
     const nonGet = calls.filter((c) => c.config.method !== "GET");
     expect(nonGet.length).toBe(1);
     expect(nonGet[0]!.config.url).toContain("/comments");
     expect(store.get("t1")?.lastTurnOutcome).toBe("failed");
   });
 
-  it("received clears doneDeclared (re-engagement resumes stall patrol) and never reopens", async () => {
+  it("received clears doneDeclared (re-engagement resumes stall patrol), never reopens, never reads the task", async () => {
     const store = await makeCommentModeStore();
     await store.update("t1", (r) => (r ? { ...r, doneDeclared: true } : r));
     // task independently ticked complete by the human — full-mode would reopen here
@@ -621,7 +622,39 @@ describe("applyTaskHandleWriteback — comment-mode claims (v4 任务派单)", (
     await applyTaskHandleWriteback({ botId: "b1", threadId: "t1", status: "received" }, { store, client });
 
     expect(store.get("t1")?.doneDeclared).toBeUndefined();
-    expect(calls.some((c) => c.config.method === "PATCH")).toBe(false);
+    // "received" is awaited before the runner spawns — zero calls keeps it off the critical path
+    expect(calls.length).toBe(0);
+  });
+
+  // The deleted-task contract (§6.2) still holds, it just moved off the turn
+  // path for these two branches: CommentPoller/StallDetector drop the claim.
+  it("received/completed leave a deleted task's claim for the pollers to drop", async () => {
+    const store = await makeCommentModeStore();
+    const { requester, calls } = makeFakeRequester({ task: null });
+    const client = new TaskListClient(requester);
+
+    await applyTaskHandleWriteback({ botId: "b1", threadId: "t1", status: "received" }, { store, client });
+    await applyTaskHandleWriteback({ botId: "b1", threadId: "t1", status: "completed" }, { store, client });
+
+    expect(calls.length).toBe(0);
+    expect(store.get("t1")).toBeDefined();
+    expect(store.get("t1")?.lastTurnOutcome).toBe("completed");
+  });
+
+  it("failed on a deleted task drops the claim and posts no comment", async () => {
+    const store = await makeCommentModeStore();
+    const { requester, calls } = makeFakeRequester({ task: null });
+    const client = new TaskListClient(requester);
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    await applyTaskHandleWriteback(
+      { botId: "b1", threadId: "t1", status: "failed", failureReason: "进程崩溃" },
+      { store, client },
+    );
+
+    expect(store.get("t1")).toBeUndefined();
+    expect(calls.filter((c) => c.config.method !== "GET").length).toBe(0);
+    warnSpy.mockRestore();
   });
 
   it("full-mode claims (no mode field) keep the v1–v3 behavior untouched", async () => {
@@ -635,8 +668,21 @@ describe("applyTaskHandleWriteback — comment-mode claims (v4 任务派单)", (
       { store, client },
     );
 
+    // leading getTask (description merge + reopen decision need it), then
     // description patch + completed_at patch, exactly as before
+    expect(calls.filter((c) => c.config.method === "GET").length).toBe(1);
     expect(calls.filter((c) => c.config.method === "PATCH").length).toBe(2);
+  });
+
+  it("full-mode received still reads the task (reopen depends on completed_at)", async () => {
+    const store = await TaskHandleStore.load(join(dir, "task-handles.json"));
+    await store.put({ threadId: "t1", taskGuid: "guid-1", chatId: "oc_1", claimedTs: 1 });
+    const { requester, calls } = makeFakeRequester({ task: {} });
+    const client = new TaskListClient(requester);
+
+    await applyTaskHandleWriteback({ botId: "b1", threadId: "t1", status: "received" }, { store, client });
+
+    expect(calls.map((c) => c.config.method)).toEqual(["GET"]);
   });
 });
 
