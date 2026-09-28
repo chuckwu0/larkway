@@ -30,7 +30,7 @@ BYO 使用已有的绝对目录和该目录的原生配置。bridge 不向该目
 
 ## 效率验证
 
-prompt 单元测试使用相同的最小消息固定场景，限制首轮少于 2,600、续轮少于 1,100 个 Unicode 码点（`Array.from(text).length`）；同时验证必要场景指针、答案协议和可选卡片能力没有丢失。这是固定场景的注入量回归测试，不是所有真实任务的长度上限，不能换算为 token 或完成速度。
+prompt 单元测试使用相同的最小消息固定场景，限制首轮少于 2,600、续轮少于 410 个 Unicode 码点（`Array.from(text).length`）；另用生产形态固定场景（peer、repo、清单候选、owner、sticky 单聊）按 backend 限制续轮包装（总长减去用户原文），无候选时不超过 550 码点。同时验证必要场景指针、答案协议和可选卡片能力没有丢失。续轮只带本条消息的事实和一行输出提示，会话常量留在原生历史中，见 [prompt 契约](prompt-contract.md)。这是固定场景的注入量回归测试，不是所有真实任务的长度上限，不能换算为 token 或完成速度。
 
 每轮 `perf.jsonl` 记录 `promptChars`（JavaScript `text.length`，即 UTF-16 code units）、实际 `promptMode`、首个可信答案延迟、工具调用数、总耗时、进程复用方式和 runner 退出结果。流式执行失败也记录 `runnerError`。启动前准备失败及同步 runner 创建异常仍通过运行事件日志观察，不算作完成的性能样本。`pooled: true` 包含热池中新进程的首轮；判断续轮是否复用原进程，还需看 `resumeMode`。
 

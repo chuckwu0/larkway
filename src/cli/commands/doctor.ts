@@ -327,7 +327,7 @@ async function checkBotYaml(ctx: CliContext): Promise<CheckResult[]> {
           status: "ok",
         });
       }
-      // 批G G7 (P1): owner 事实未配置 → 每轮注入 sender_is_owner: unknown,
+      // 批G G7 (P1): owner 事实未配置 → 完整 prompt 注入 sender_is_owner: unknown(续轮省略),
       // 非 owner 政策(脚手架文本)无法生效。open_id 是 app 作用域的,必须
       // per-bot 配,不能从别的 bot 抄。status 保持 "ok"(带提示):doctor 是
       // CI 闸门(warn → exit 1),可选配置缺失不该让存量部署全体翻闸。

@@ -1,7 +1,12 @@
 /** Feishu facts + minimal output transport contract for a native agent runtime. */
 import type { ParsedMessage } from "../lark/message.js";
 import { isSyntheticSessionKey } from "../lark/message.js";
-import { deriveTriggerFacts } from "../agent/triggerFacts.js";
+import {
+  DEFAULT_CONTINUATION_TRIGGER_TYPE,
+  DEFAULT_MENTION_TYPES,
+  deriveTriggerFacts,
+  hasContentBeyondText,
+} from "../agent/triggerFacts.js";
 import { ANSWER_BEGIN_MARKER, ANSWER_END_MARKER } from "../agent/answerChannel.js";
 import type { TaskCandidate } from "../tasklist/types.js";
 
@@ -66,6 +71,11 @@ export interface RenderPromptInput {
   extraRepoPaths?: RepoRef[];
   larkCliProfile?: string;
   runtimeWarnings?: RuntimeWarning[];
+  /**
+   * Delta turns skip `<runtime-warnings>` only when the handler reports the
+   * set unchanged since the session last received it. Absent = changed.
+   */
+  runtimeWarningsChanged?: boolean;
   taskHandleTasklistGuid?: string;
   taskHandleClaimed?: boolean;
   taskHandleCandidates?: readonly TaskCandidate[];
@@ -121,20 +131,27 @@ function answerContract(backend: string): string {
 /** Output transport only. Choosing a task, workflow, or presentation is the agent's job. */
 function renderStateContract(input: RenderPromptInput, full: boolean): string[] {
   const target = input.conventions.stateFilePath ?? `${input.conventions.worktreePath}/.larkway/state.json`;
-  const lines = [
-    answerContract(input.backend ?? "claude"),
-    `纯文字回答不用写 state.json。需要结构化卡片时可写 ${target}。`,
-  ];
-  if (full) {
-    lines.push(
-      "state.json: {status:\"ready\"|\"in_progress\"|\"failed\", last_message?:正文, error?:错误, updated_at?:当前ISO时间};原子替换,显式时间勿沿用旧值。status 描述任务结果,单次工具错误不等于任务失败。",
-      "可选字段: choices:[{label,value}](最多5个,单选按钮,value逐字回传;多项信息可直接文字提问),choice_prompt;content_blocks:[{type:\"markdown\",content}|{type:\"image\",img_key,alt?}](最多12块/4图,非空时覆盖正文,img_key须已上传)。",
-      "可选交互: response_surface:{post:{mentions:[{user_id}]}} 仅视觉@;handoffs:[{to,text}](最多3条,to为peer名,text自包含)由bridge发真实post并直递本地peer。",
-      "可选任务投影: task_handle:{create?:{summary,due?},guid?,note?,due?,due_reason?,blocked?,done?};只在任务需要追踪时声明,轮数不构成建卡要求。done 表示交付,非本轮结束。",
-      "bridge 管理卡片更新,不要自行 PATCH/PUT。业务链接直接放正文;无需固定格式、任务卡或文档导出。",
-    );
+  const backend = input.backend ?? "claude";
+  if (!full) {
+    // The full contract already sits in native history. One line keeps the
+    // marker habit alive; the state path stays because it is the only state
+    // pointer left once native compaction drops the first turn, so the line
+    // names every use of it (cards, task_handle, handoffs), not cards alone.
+    return block("contract-anchor", [
+      backend === "codex"
+        ? `卡片/任务/交接声明写 ${target}。`
+        : `正文放独立行 ${ANSWER_BEGIN_MARKER} / ${ANSWER_END_MARKER} 之间;卡片/任务/交接声明写 ${target}。`,
+    ]);
   }
-  return block(full ? "state-contract" : "contract-anchor", lines);
+  return block("state-contract", [
+    answerContract(backend),
+    `纯文字回答不用写 state.json。需要结构化卡片时可写 ${target}。`,
+    "state.json: {status:\"ready\"|\"in_progress\"|\"failed\", last_message?:正文, error?:错误, updated_at?:当前ISO时间};原子替换,显式时间勿沿用旧值。status 描述任务结果,单次工具错误不等于任务失败。",
+    "可选字段: choices:[{label,value}](最多5个,单选按钮,value逐字回传;多项信息可直接文字提问),choice_prompt;content_blocks:[{type:\"markdown\",content}|{type:\"image\",img_key,alt?}](最多12块/4图,非空时覆盖正文,img_key须已上传)。",
+    "可选交互: response_surface:{post:{mentions:[{user_id}]}} 仅视觉@;handoffs:[{to,text}](最多3条,to为peer名,text自包含)由bridge发真实post并直递本地peer。",
+    "可选任务投影: task_handle:{create?:{summary,due?},guid?,note?,due?,due_reason?,blocked?,done?};只在任务需要追踪时声明,轮数不构成建卡要求。done 表示交付,非本轮结束。",
+    "bridge 管理卡片更新,不要自行 PATCH/PUT。业务链接直接放正文;无需固定格式、任务卡或文档导出。",
+  ]);
 }
 
 function renderPeers(peers: PeerBot[] | undefined): string[] {
@@ -145,7 +162,58 @@ function renderPeers(peers: PeerBot[] | undefined): string[] {
   ]);
 }
 
-function renderTaskContext(input: RenderPromptInput): string[] {
+// A markdown link (its URL may be cut by the poller's excerpt truncation, so
+// the closing paren is optional) or a bare URL. URL characters are visible
+// ASCII except ")": Chinese text often runs straight on after a link, and the
+// poller's cut mark must stay outside the URL.
+const DESCRIPTION_URL = /\[([^\]]*)\]\((https?:\/\/[\x21-\x28\x2A-\x7E]*)\)?|https?:\/\/[\x21-\x28\x2A-\x7E]+/g;
+const TOPIC_ID_PARAM = /[?&](?:open_thread_id|openthreadid)=(omt_[A-Za-z0-9_-]+)/g;
+const EXCERPT_CUT_MARK = "…";
+
+/**
+ * Mechanical candidate-description compaction. Bridge-created task
+ * descriptions are dominated by an applink whose only useful part is the
+ * topic id, the agent's exact-match signal; the rest of every URL is dropped
+ * and a link keeps its label.
+ */
+export function compactCandidateDescription(description: string): { thread?: string; text: string } {
+  const complete = new Set<string>();
+  const cutShort: string[] = [];
+  const text = description.replace(
+    DESCRIPTION_URL,
+    (match: string, label: string | undefined, linkUrl: string | undefined, offset: number) => {
+      const url = linkUrl ?? match;
+      // Where the URL stops in the description: before a markdown link's ")".
+      const urlEnd = offset + match.length - (match.endsWith(")") ? 1 : 0);
+      for (const param of url.matchAll(TOPIC_ID_PARAM)) {
+        // An id that runs into the excerpt's cut mark may be missing characters.
+        const cut = param.index + param[0].length === url.length && description[urlEnd] === EXCERPT_CUT_MARK;
+        if (cut) cutShort.push(param[1]!);
+        else complete.add(param[1]!);
+      }
+      return label ?? "";
+    },
+  );
+  // Only an unambiguous id is a match signal: two topics (a reference link
+  // beside the work topic, say) or a cut-off id of another topic yield none.
+  const [only, ...others] = complete;
+  const thread = only && others.length === 0 && cutShort.every((id) => only.startsWith(id)) ? only : undefined;
+  return { thread, text: text.replace(/\s+/g, " ").trim() };
+}
+
+function renderCandidate(candidate: TaskCandidate, full: boolean, topicId: string | undefined): string {
+  const { thread, text } = compactCandidateDescription(candidate.descriptionExcerpt ?? "");
+  // Candidates change between polls, so a delta turn may be the first to show
+  // one. A candidate pointing at this very topic keeps its description: it is
+  // the one a claim would act on, and only the description tells a task
+  // converted from this topic from one a peer bot created here ("由 X 创建").
+  const withText = full || (thread !== undefined && thread === topicId);
+  return `- guid=${candidate.guid} | summary=${candidate.summary}` +
+    (thread ? ` | thread=${thread}` : "") +
+    (withText && text ? ` | description: ${text}` : "");
+}
+
+function renderTaskContext(input: RenderPromptInput, full: boolean, topicId: string | undefined): string[] {
   const root = input.taskRoot;
   if (root) {
     return block("task-root", [
@@ -161,13 +229,14 @@ function renderTaskContext(input: RenderPromptInput): string[] {
   const candidates = input.taskHandleCandidates ?? [];
   if (!input.taskHandleClaimed && candidates.length === 0) return [];
   return block("task-handle", [
-    `task_handle_tasklist_guid: ${input.taskHandleTasklistGuid}`,
+    // Static within a session and not needed to claim (task_handle takes the
+    // task guid), so delta omits it; a block first shown on a delta turn
+    // never carries it.
+    ...(full ? [`task_handle_tasklist_guid: ${input.taskHandleTasklistGuid}`] : []),
     `task_handle_claimed: ${input.taskHandleClaimed ? "yes" : "no"}`,
     ...(input.taskHandleClaimed
       ? ["已有关联任务,task_handle 可表达 note/due/blocked/done。"]
-      : candidates.map((c) =>
-          `- guid=${c.guid} | summary=${c.summary}` +
-          (c.descriptionExcerpt ? ` | description: ${c.descriptionExcerpt}` : ""))),
+      : candidates.map((c) => renderCandidate(c, full, topicId))),
   ]);
 }
 
@@ -238,13 +307,20 @@ export async function renderPrompt(input: RenderPromptInput): Promise<string> {
   const full = input.isNewThread || !!input.sessionReseed || (input.promptMode ?? "delta") === "full";
   const trigger = deriveTriggerFacts(parsed, input.isNewThread, input.larkCliProfile);
   const profile = input.larkCliProfile ? ` --profile ${input.larkCliProfile}` : "";
-  const facts = [
+  const attachments = parsed.attachments.map((a) => a.fileKey);
+  const images = parsed.attachments.filter((a) => a.fileType === "image").map((a) => a.fileKey);
+  const owner = input.senderIsOwner ?? "unknown";
+  const threadFacts = input.threadTurnCount !== undefined ? [
+    `thread_turn_count:   ${input.threadTurnCount}`,
+    `thread_has_task_card: ${input.threadHasTaskCard ? "yes" : "no"}`,
+  ] : [];
+  // The sender is the `ou_…:` prefix of every user-message line, never a separate fact.
+  const facts = full ? [
     `thread_id:        ${parsed.threadId}`,
     ...(input.stickySessionKey ? [`session_key:      ${input.stickySessionKey}`] : []),
     `message_id:       ${parsed.messageId}`,
     `chat_id:          ${parsed.chatId}`,
-    `sender:           ${parsed.senderOpenId}`,
-    `sender_is_owner:  ${input.senderIsOwner ?? "unknown"}`,
+    `sender_is_owner:  ${owner}`,
     `is_new_thread:    ${input.isNewThread}`,
     `trigger_type:     ${trigger.triggerType}`,
     `mention_type:     ${trigger.mentionType}`,
@@ -253,13 +329,26 @@ export async function renderPrompt(input: RenderPromptInput): Promise<string> {
     `feishu_thread_id: ${trigger.feishuThreadId ?? "none"}`,
     `feishu_root_id:   ${trigger.feishuRootId ?? "none"}`,
     `raw_pointer:      ${trigger.rawMessagePointer}`,
-    `attachments:      ${csv(parsed.attachments.map((a) => a.fileKey))}`,
+    `attachments:      ${csv(attachments)}`,
     `feishu_doc_links: ${csv(parsed.feishuDocLinks)}`,
-    `images:           ${csv(parsed.attachments.filter((a) => a.fileType === "image").map((a) => a.fileKey))}`,
-    ...(input.threadTurnCount !== undefined ? [
-      `thread_turn_count:   ${input.threadTurnCount}`,
-      `thread_has_task_card: ${input.threadHasTaskCard ? "yes" : "no"}`,
-    ] : []),
+    `images:           ${csv(images)}`,
+    ...threadFacts,
+  ] : [
+    // Delta: session constants already sit in native history, so only this
+    // message's facts and deviations from an ordinary continuation. chat_id
+    // and a real topic id survive native compaction as reply/history anchors.
+    `message_id:       ${parsed.messageId}`,
+    `chat_id:          ${parsed.chatId}`,
+    ...(owner !== "unknown" ? [`sender_is_owner:  ${owner}`] : []),
+    ...(trigger.triggerType !== DEFAULT_CONTINUATION_TRIGGER_TYPE ? [`trigger_type:     ${trigger.triggerType}`] : []),
+    ...(!DEFAULT_MENTION_TYPES.has(trigger.mentionType) ? [`mention_type:     ${trigger.mentionType}`] : []),
+    ...(trigger.feishuThreadId?.startsWith("omt_") ? [`feishu_thread_id: ${trigger.feishuThreadId}`] : []),
+    // Also for a resource that arrived as a text marker, or a card/sticker with no readable text.
+    ...(hasContentBeyondText(parsed) ? [`raw_pointer:      ${trigger.rawMessagePointer}`] : []),
+    ...(attachments.length > 0 ? [`attachments:      ${csv(attachments)}`] : []),
+    ...(parsed.feishuDocLinks.length > 0 ? [`feishu_doc_links: ${csv(parsed.feishuDocLinks)}`] : []),
+    ...(images.length > 0 ? [`images:           ${csv(images)}`] : []),
+    ...threadFacts,
   ];
   const pointers = [
     "以下上下文按需获取;当前消息足够时可直接回答。",
@@ -294,7 +383,7 @@ export async function renderPrompt(input: RenderPromptInput): Promise<string> {
   ];
   const sections = [
     identity,
-    renderWarnings(input.runtimeWarnings),
+    ...(full || input.runtimeWarningsChanged !== false ? [renderWarnings(input.runtimeWarnings)] : []),
     block("thread-context", facts),
     ...(full ? [block("context-pointers", pointers)] : []),
     renderStateContract(input, full),
@@ -303,7 +392,7 @@ export async function renderPrompt(input: RenderPromptInput): Promise<string> {
       block("turn-taking", [`configured_turn_taking_limit: ${input.turn_taking_limit} (工作区协作策略参数)`]),
     ] : []),
     block("workspace-file-changes", input.mtimeFacts ?? []),
-    renderTaskContext(input),
+    renderTaskContext(input, full, trigger.feishuThreadId),
     renderReseed(input.sessionReseed),
     ...(!input.isNewThread && input.reseedWarning ? [
       block("session-notice", ["reseed_threshold_near: true;已配置的会话重开阈值临近。"]),

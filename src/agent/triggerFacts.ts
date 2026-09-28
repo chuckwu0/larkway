@@ -10,6 +10,31 @@ export interface TriggerFacts {
   rawMessagePointer: string;
 }
 
+/** What an ordinary continuation turn carries; delta prompts only state deviations. */
+export const DEFAULT_CONTINUATION_TRIGGER_TYPE: TriggerFacts["triggerType"] = "topic_continuation";
+/**
+ * Both count as ordinary: whether mention metadata reaches the parser depends
+ * on the delivery path (see channelMsgToLarkEvent), not on anything the user did.
+ */
+export const DEFAULT_MENTION_TYPES: ReadonlySet<TriggerFacts["mentionType"]> = new Set([
+  "bot_or_user_mention",
+  "no_mention_metadata",
+]);
+
+// A delivery that carries the SDK's normalized text instead of the raw content
+// shows resources as these markers in the text rather than in `attachments`.
+const NORMALIZED_RESOURCE_MARKER = /!\[image\]\(|<(?:file|audio|video|sticker|folder) key="|<forwarded_messages\b/;
+
+/**
+ * Whether the raw message holds something the parsed text does not show: an
+ * attachment in either form, or no readable text at all.
+ */
+export function hasContentBeyondText(parsed: ParsedMessage): boolean {
+  return parsed.attachments.length > 0 ||
+    parsed.text.trim().length === 0 ||
+    NORMALIZED_RESOURCE_MARKER.test(parsed.text);
+}
+
 function stringField(value: unknown): string | undefined {
   return typeof value === "string" && value.length > 0 ? value : undefined;
 }

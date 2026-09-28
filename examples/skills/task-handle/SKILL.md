@@ -59,14 +59,16 @@ description: 话题 ↔ 飞书任务句柄 —— 主路径:用户建任务发�
 
 每轮 prompt 事实里如果有 `<task-handle>` 块,说明这个 bot 已经有一个可用的
 「Agent Team」共享清单(owner 的一整组 bot 共用同一个,不管来自哪个群、哪个 bot 被 @)。
-块有两种形态,取决于本话题是否已经认领:
+块有两种形态,取决于本话题是否已经认领(`task_handle_tasklist_guid` 行和候选的 `description` 只在完整 prompt
+——新话题首轮或会话重开——里出现,续轮省略;候选随轮询变化,续轮才出现的候选从没带过描述。例外:`thread=`
+等于本话题 `feishu_thread_id` 的候选在续轮也带 `description`。认领只需要候选 guid):
 
 **已认领**(维护态,不需要你再做匹配):
 
 ```
 task_handle_tasklist_guid: <guid>
 task_handle_claimed: yes
-本话题已认领任务句柄;bridge 已自动维护完成/失败/reopen,按 task-handle skill 处理里程碑评论与 done 声明即可。
+已有关联任务,task_handle 可表达 note/due/blocked/done。
 ```
 
 **未认领,且清单里有候选**(v3:bridge 已经帮你把候选筛好,直接看这里,不用你再去查):
@@ -74,12 +76,12 @@ task_handle_claimed: yes
 ```
 task_handle_tasklist_guid: <guid>
 task_handle_claimed: no
-以下是该共享清单里当前未被任何 agent 认领的候选任务(bridge 只做结构性筛选,不做匹配判断):
-- guid=<guid1> | summary=<标题1>
-- guid=<guid2> | summary=<标题2> | description: <描述摘要>
-仅当其中一个候选与本话题高置信对应……才静默把该 guid 写入 state.json 的 task_handle.guid;歧义就什么都不做,
-不要为了消歧义去调用 lark-cli 列清单——候选已经在这里,判断不到就是这一轮没有匹配。
+- guid=<guid1> | summary=<标题1> | thread=<omt_…>
+- guid=<guid2> | summary=<标题2> | description: <去掉 URL 的描述摘要>
 ```
+
+`thread=` 是 bridge 从任务描述里的话题链接机械提取的话题 id(描述指向多个话题、或 id 被摘录截断时不给出),
+与本话题 `<thread-context>` 里的 `feishu_thread_id` 直接对照,见 §2 第 3 步。
 
 **没有这个块** = 以下两种情况之一,处理方式相同(跳过本 SKILL 全部内容,不用区分):
 - 这个 bot 暂时没有可用的清单(owner 还没授权 task scope、或清单尚未 provision);
@@ -110,10 +112,15 @@ task_handle_claimed: no
 
 1. **确认这是你自己的话题、且是 owner 转的任务**:只认领"源话题确实是当前 session"的任务(用你自己的根消息原文去匹配,不要跨话题认领)。这个共享清单本来就只对 owner 私有(§5.3),所以清单里出现的任务默认都是 owner 转的;如果候选任务的发起人明显不是当前话题的 owner,跳过、不认领(不用告诉用户)。
 
-2. **从 prompt 注入的候选里挑,不要自己去查**:候选列表(guid + summary + 可选的 description 摘要)已经在 `<task-handle>` 块里,是 bridge 的 TasklistPoller 提前筛好、结构性过滤过(未完成、未被任何 bot 认领、bridge 从未写回过)的结果。**不要**调用 `lark-cli task tasklists tasks` 或任何等价命令去自己列清单确认——那是旧版(v2 及以前)的做法,已经被 bridge 侧的候选注入取代,自己再查一次只是白费一次 API 调用 + 判断,不会拿到更多信息。
+2. **从 prompt 注入的候选里挑,不要自己去查**:候选列表(guid + summary + 可选的 thread / description 摘要)已经在 `<task-handle>` 块里,是 bridge 的 TasklistPoller 提前筛好、结构性过滤过(未完成、未被任何 bot 认领、bridge 从未写回过)的结果。**不要**调用 `lark-cli task tasklists tasks` 或任何等价命令去自己列清单确认——那是旧版(v2 及以前)的做法,已经被 bridge 侧的候选注入取代,自己再查一次只是白费一次 API 调用 + 判断,不会拿到更多信息。
 
 3. **只在高置信时认领,歧义就跳过**(这是自动化流程,没有人在旁边消解歧义,所以门槛要高):
-   - **恰好一个候选,且 summary == 或强前缀匹配本话题根消息原文** → 直接认领(进入第 4 步)。
+   - **恰好一个候选的 `thread=` 等于本话题的 `feishu_thread_id`** → 它指向本话题。`thread=` 只证明话题对得上,不证明任务归你:多 bot 话题里它也可能是同话题另一个 bot 自建的任务(描述写着「由 <那个 bot> 创建」;别的 bridge 上的认领本 bridge 看不到,所以它仍会作为候选出现)。
+     - 描述显示由别的 bot 创建 → 跳过。
+     - 描述显示由你创建,或本话题只有你一个 bot 在工作 → 认领(进入第 4 步),不必再比 summary(话题改过标题、根消息原文已不在上下文里时也成立)。
+     - 看不出创建者(描述被截断或没有),且本话题还有别的 bot 参与 → 按下面「没有 `thread=` 可比时」的 summary 规则保守处理。
+   - `thread=` 指向别的话题的候选不是本话题的任务,跳过。
+   - **没有 `thread=` 可比时:恰好一个候选,且 summary == 或强前缀匹配本话题根消息原文** → 直接认领(进入第 4 步)。
    - 零个候选对得上,或多个候选都像,或最佳候选与根消息只是弱相关 → **不认领、不声张、不问用户**,静默跳过,下一轮同样条件再检查一次(候选列表会跟着 bridge 的轮询周期刷新,可能用户随后又转了一次、或清单刚同步好)。
    - 这一步**不产出任何用户可见的输出**——不出 choices、不说"没找到匹配任务"。
 

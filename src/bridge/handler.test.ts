@@ -4907,7 +4907,9 @@ describe("handleOne — provisioning decision tree (unified model)", () => {
     expect(runOpts[1]?.prompt).not.toContain("<agent-workspace>");
     expect(runOpts[1]?.prompt).toContain("<contract-anchor>");
     expect(runOpts[1]?.prompt).toContain(stateFileMod.stateFilePathOf(sessionPath));
-    expect(runOpts[1]?.prompt).toContain("is_new_thread:    false");
+    // Delta carries this message's facts; session constants stay in native history.
+    expect(runOpts[1]?.prompt).toContain("message_id:       om_reply");
+    expect(runOpts[1]?.prompt).not.toContain("is_new_thread:");
     expect(firstCard.startArgs[0]).toMatchObject({
       messageId: threadId,
       replyInThread: true,
@@ -7243,7 +7245,8 @@ describe("native session continuity defaults", () => {
     await h.handler.whenAllTurnsSettled();
     expect(captured[0]?.resumeSessionId).toBe("sess_prev");
     expect(captured[0]?.forceFreshSession).toBe(false);
-    expect(captured[0]?.prompt).toContain("session_key:      p2p-oc_chat");
+    // The sticky key routes the resumed delta turn to the p2p session's state path.
+    expect(captured[0]?.prompt).toContain("sessions/p2p-oc_chat/.larkway/state.json");
     expect(captured[0]?.prompt).not.toContain("<session-reseed>");
     expect(sessionStore.records.get("wsbot:p2p-oc_chat")?.sessionId).toBe("sess_prev");
   });
