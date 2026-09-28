@@ -230,12 +230,15 @@ interface ChannelNormalizedMessage {
   threadId?: string;
   rootId?: string;
   createTime?: number;
-  /** Normalized text (markdown + XML-style tags). Used to synthesize lark
-   *  content when the raw lark content JSON isn't available. */
+  /** Normalized text (markdown + XML-style tags) — the event's text whenever
+   *  present (see {@link liveContent}). */
   content?: string;
   rawContentType?: string;
+  /** Attachments the SDK found (for a debounce-merged burst: across all of it). */
+  resources?: Array<{ type?: string; fileKey?: string }>;
   mentions?: unknown;
-  /** Raw im.message.receive_v1 event body (present when includeRawInMessage). */
+  /** Raw im.message.receive_v1 event body (present when includeRawEvent) —
+   *  see {@link receiveBodyOf} for the shapes it arrives in. */
   raw?: unknown;
 }
 
@@ -501,11 +504,105 @@ export function synthesizeCardActionEvent(
 // Raw event → LarkMessageEvent (lark-cli-identical shape)
 // ---------------------------------------------------------------------------
 
+/** The im.message.receive_v1 body: the part of the event we read. */
+interface RawReceiveBody {
+  message?: Record<string, unknown>;
+  sender?: { sender_id?: { open_id?: string } };
+}
+
+/**
+ * Locate the im.message.receive_v1 body inside `msg.raw`. It comes in two shapes:
+ *  - FLAT — every live delivery. The SDK's EventDispatcher spreads the v2
+ *    envelope before normalizing (node-sdk 1.67.0 `RequestHandle.parse`:
+ *    `{...rest, ...header, ...event}`), so raw is `{ schema, event_id,
+ *    event_type, app_id, tenant_key, create_time, sender, message }` with NO
+ *    `event` key — the SDK's own `RawMessageEvent` type is `{ sender, message }`.
+ *  - NESTED `{ event: { sender, message } }` — the unflattened envelope, which
+ *    gap-fill builds around a recovered list item.
+ * Reading only the nested form found nothing on live traffic: mentions were
+ * always dropped, and image/file/post-image/task-share messages reached
+ * message.ts as the SDK's text alone, with no attachment key or task guid.
+ */
+function receiveBodyOf(raw: unknown): RawReceiveBody | undefined {
+  if (!raw || typeof raw !== "object") return undefined;
+  const r = raw as { message?: unknown; event?: unknown };
+  if (r.message && typeof r.message === "object") return r as RawReceiveBody;
+  if (r.event && typeof r.event === "object") return r.event as RawReceiveBody;
+  return undefined;
+}
+
+/**
+ * Message types whose SDK text is only a tag (`![image](key)`, `<file key=…
+ * name=…/>`, a `<todo>` block without the task guid) while their raw content
+ * holds what message.ts extracts: the attachment key (+ file name) or the task
+ * share's guid.
+ */
+const RAW_KEYS_MESSAGE_TYPES = new Set(["image", "file", "audio", "media", "video", "todo"]);
+
+/**
+ * Lark content JSON for a message the SDK normalized (message.ts reads the text
+ * AND the attachment keys from it).
+ *
+ * The text is always the SDK's: markdown with its paragraphs, links, code
+ * blocks and @names intact — message.ts's own post parsing joins rows into one
+ * line and strips every @placeholder — and, for a debounce-merged burst (the
+ * SDK folds same-chat messages landing within ~600ms into one, keeping only the
+ * LAST one's raw; {@link installInboundBatchSplit} splits such bursts back
+ * apart, so one arrives merged only when it can't), every message's text.
+ * Alongside it go the keys message.ts extracts: an attachment / task-share
+ * message's own raw keys (its SDK text is only a tag), and every image the SDK
+ * found — inline in a post, or anywhere in a burst — as post `img` rows.
+ *
+ * A task share is the one type message.ts renders from its raw keys alone
+ * (`[飞书任务] <title> (task_guid=…)`, ignoring `text`). That suits a lone
+ * share, whose SDK text is just its `<todo>` block; a burst ENDING in one keeps
+ * the SDK text instead, with the guid appended, so its earlier messages stay.
+ */
+function liveContent(
+  msg: ChannelNormalizedMessage,
+  rawContent: string | undefined,
+  messageType: string | undefined,
+): string {
+  let keys: Record<string, unknown> = {};
+  if (rawContent !== undefined && RAW_KEYS_MESSAGE_TYPES.has(messageType ?? "")) {
+    try {
+      const parsed = JSON.parse(rawContent) as unknown;
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        keys = parsed as Record<string, unknown>;
+      }
+    } catch {
+      // unparseable raw: the SDK text alone, as for any other type
+    }
+  }
+  let text = stripAtMarkup(msg.content ?? "");
+  const taskGuid = keys["task_id"];
+  const loneTodoBlock =
+    text.startsWith("<todo>") && text.endsWith("</todo>") && text.lastIndexOf("<todo>") === 0;
+  if (typeof taskGuid === "string" && !loneTodoBlock) {
+    text = `${text} (task_guid=${taskGuid})`;
+    keys = {};
+  }
+  const imageKeys = [
+    ...new Set(
+      (msg.resources ?? [])
+        .filter((r) => r?.type === "image" && typeof r.fileKey === "string" && r.fileKey.length > 0)
+        .map((r) => r.fileKey as string),
+    ),
+  ].filter((key) => key !== keys["image_key"]);
+  return JSON.stringify({
+    ...keys,
+    text,
+    ...(imageKeys.length > 0
+      ? { content: imageKeys.map((image_key) => [{ tag: "img", image_key }]) }
+      : {}),
+  });
+}
+
 /**
  * Reconstruct the lark-cli-compatible LarkMessageEvent from the SDK's raw
  * im.message.receive_v1 body, falling back to the SDK's normalized fields.
- * The RAW `message.content` (text/post JSON string) + `mentions` are preserved
- * verbatim so lark/message.ts parses attachments / post text / @ exactly as before.
+ * Routing fields and `mentions` come from raw verbatim; for content see the
+ * comment at its selection below.
  */
 export function channelMsgToLarkEvent(
   msg: ChannelNormalizedMessage,
@@ -519,11 +616,9 @@ export function channelMsgToLarkEvent(
    */
   fallbackChatType?: string,
 ): LarkMessageEvent | null {
-  const raw = msg.raw as
-    | { event?: { message?: Record<string, unknown>; sender?: { sender_id?: { open_id?: string } } } }
-    | undefined;
-  const m = raw?.event?.message;
-  const senderOpenId = raw?.event?.sender?.sender_id?.open_id ?? msg.senderId;
+  const body = receiveBodyOf(msg.raw);
+  const m = body?.message;
+  const senderOpenId = body?.sender?.sender_id?.open_id ?? msg.senderId;
 
   const message_id = (m?.["message_id"] as string) ?? msg.messageId;
   const chat_id = (m?.["chat_id"] as string) ?? msg.chatId;
@@ -559,14 +654,16 @@ export function channelMsgToLarkEvent(
     (msg as { replyToMessageId?: string }).replyToMessageId ??
     undefined;
 
-  // Content: prefer the RAW lark content JSON (message.ts parses text/post/
-  // image_key with full fidelity). When raw isn't in the expected shape, fall
-  // back to synthesizing a lark TEXT content from the SDK's normalized `content`
-  // (markdown+tags) so the agent still gets the message text. Without this
-  // fallback the agent received an EMPTY user-message (E2E 2026-05-29).
+  // Content: a live message (the SDK normalized it) → the SDK's text plus the
+  // raw keys message.ts extracts ({@link liveContent}); no SDK text (a gap-fill
+  // replay) → the raw content JSON, verbatim; neither → an empty text, never
+  // a missing one (the agent once received an EMPTY user-message, E2E 2026-05-29).
   const rawContent = typeof m?.["content"] === "string" ? (m["content"] as string) : undefined;
+  const messageType = (m?.["message_type"] as string | undefined) ?? msg.rawContentType;
   const content =
-    rawContent ?? JSON.stringify({ text: stripAtMarkup(msg.content ?? "") });
+    typeof msg.content === "string"
+      ? liveContent(msg, rawContent, messageType)
+      : rawContent ?? JSON.stringify({ text: "" });
 
   return {
     message_id,
