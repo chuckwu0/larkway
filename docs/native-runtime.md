@@ -34,7 +34,7 @@ prompt 单元测试使用相同的最小消息固定场景，限制首轮少于 
 
 每轮 `perf.jsonl` 记录 `promptChars`（JavaScript `text.length`，即 UTF-16 code units）、实际 `promptMode`、首个可信答案延迟、工具调用数、总耗时、进程复用方式和 runner 退出结果。流式执行失败也记录 `runnerError`。启动前准备失败及同步 runner 创建异常仍通过运行事件日志观察，不算作完成的性能样本。`pooled: true` 包含热池中新进程的首轮；判断续轮是否复用原进程，还需看 `resumeMode`。
 
-样本还带分段计时（均为可选字段，旧行照常解析）：时间点 `messageCreateAt`（飞书服务端时钟，秒级值换算为毫秒）、`wsAt`、`enqueueAt`、`handleStartAt`、`runnerRunAt`、`runnerDoneAt`、`finalizeStartAt`、`finalizeEndAt`、`finishedAt`，均为 epoch 毫秒，可直接相减；`preRunner` / `postRunner` 记录 runner 启动前各项等待（⏳ reaction 的添加与移除、COT 气泡、卡片创建及 legacy 卡兜底、roster、根消息探测、received hook、prompt 渲染）和收尾阶段的 CardKit 调用次数与单次耗时；成功轮次的样本在交付后写出，收尾超过 60 秒仍未结束时提前写出（缺少尚未到达的时间点），进程在收尾中途退出的轮次没有样本；`usage` 是 runner 报告的本轮原生 token 用量（各请求合计；codex 取线程累计值的差），`lastRequestInputTokens` 是最后一次请求的输入总量；`wrapperChars` 是 prompt 中用户原文以外的字符数。`wsAt` 取自 SDK 去抖之后，入站去抖本身体现在 `wsAt − messageCreateAt` 中（含时钟偏差）。离线复现 runner 启动前的串行调用用 `LW_BENCH=1 npx vitest run src/bridge/handler.latency.bench.test.ts`；真实 CLI 的多轮对照用 `scripts/bench/runner-bench.mts`（会调用模型，按 [Runtime validation](runtime-validation.md) 显式执行）。
+样本还带分段计时（均为可选字段，旧行照常解析）：时间点 `messageCreateAt`（飞书服务端时钟，秒级值换算为毫秒）、`wsAt`、`enqueueAt`、`handleStartAt`、`runnerRunAt`、`runnerDoneAt`、`finalizeStartAt`、`finalizeEndAt`、`finishedAt`，均为 epoch 毫秒，可直接相减；`preRunner` / `postRunner` 记录 runner 启动前各项等待（COT 气泡、卡片创建及 legacy 卡兜底、roster、根消息探测、received hook、prompt 渲染）和收尾阶段的 CardKit 调用次数与单次耗时；`preRunner.reactionAddMs` / `reactionRemoveMs` 只计发起 ⏳ reaction 添加与移除调用的耗时（约为 0，调用不等网络往返），往返耗时与失败见 bridge 日志中的 `processing reaction` 行（成功行带 `ms=`，失败行带 `after …ms`），更早版本写出的这两项含网络往返，不能直接对比；成功轮次的样本在交付后写出，收尾超过 60 秒仍未结束时提前写出（缺少尚未到达的时间点），进程在收尾中途退出的轮次没有样本；`usage` 是 runner 报告的本轮原生 token 用量（各请求合计；codex 取线程累计值的差），`lastRequestInputTokens` 是最后一次请求的输入总量；`wrapperChars` 是 prompt 中用户原文以外的字符数。`wsAt` 取自 SDK 去抖之后，入站去抖本身体现在 `wsAt − messageCreateAt` 中（含时钟偏差）。离线复现 runner 启动前的串行调用用 `LW_BENCH=1 npx vitest run src/bridge/handler.latency.bench.test.ts`；真实 CLI 的多轮对照用 `scripts/bench/runner-bench.mts`（会调用模型，按 [Runtime validation](runtime-validation.md) 显式执行）。
 
 已执行独立目录下的 Web 配置闭环、真实飞书工具任务和同话题续问，以及两底座各自的桥接/直接原生六轮对照。短会话样本覆盖数值修订、指代、岔题后恢复与早先状态引用，没有观察到桥接额外的语义偏差；样本同时保留了两路共有的首轮理解错误，不能描述为模型全部答对。原生对照存在缓存、工具加载和技能目录差异，因此属于观察性比较，不足以证明普遍达到原生效率。
 
@@ -44,4 +44,4 @@ prompt 单元测试使用相同的最小消息固定场景，限制首轮少于 
 
 当前话题补充仍排队进入后续 turn；尚未完整接入 Codex `turn/steer`。原生审批和 `requestUserInput` 也尚未形成完整的飞书往返协议；现有自定义 choices 卡片不能当作原生审批响应。`ask` 模式仍需单独端到端验收。这些是明确的能力差距，精简 prompt 本身不会消除它们。
 
-短会话测试也不替代长上下文 compaction、压缩后恢复、进程重启后的连续性或冲突话题隔离测试。普通回答前的 reaction、初始卡片和进度展示仍可能增加等待；需要逐段计时与重复样本，才能判断具体优化的收益。
+短会话测试也不替代长上下文 compaction、压缩后恢复、进程重启后的连续性或冲突话题隔离测试。普通回答前的初始卡片和进度展示仍可能增加等待；需要逐段计时与重复样本，才能判断具体优化的收益。

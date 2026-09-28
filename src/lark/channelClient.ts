@@ -2225,38 +2225,41 @@ export class ChannelClient {
    * returns WITHOUT waiting for it: the handler awaits this on the pre-runner
    * path, where the round trip used to sit in series before the card. Never
    * rejects; a failed add is logged and makes the later removal a no-op.
-   * Idempotent per message while an add is pending or has landed.
+   * Idempotent per message while an add is pending or has landed. The log
+   * lines carry each round trip's duration (the handler's perf sample only
+   * times the call, which no longer includes it).
    */
   async addProcessingReaction(messageId: string): Promise<void> {
     if (this.processingReactions.has(messageId)) return;
     const channel = this.channel;
     if (!channel) return;
+    const startedAt = Date.now();
     // Started inside a .then so even a synchronous throw from the SDK lands in
-    // the rejection branch below instead of rejecting this method.
-    const pending = Promise.resolve()
+    // the .catch below instead of rejecting this method. The id is read before
+    // that .catch too: `pending` must never reject, since the forget and
+    // remove chains hanging off it are not awaited by anyone.
+    const pending: Promise<string | undefined> = Promise.resolve()
       .then(() =>
         channel.rawClient.im.v1.messageReaction.create({
           path: { message_id: messageId },
           data: { reaction_type: { emoji_type: PROCESSING_REACTION_EMOJI } },
         }),
       )
-      .then(
-        (result) => {
-          const reactionId = result.data?.reaction_id ?? result.reaction_id;
-          if (reactionId) {
-            console.info(
-              `[channel.client] processing reaction added message=${messageId} reaction=${reactionId} emoji=${PROCESSING_REACTION_EMOJI}`,
-            );
-          }
-          return reactionId;
-        },
-        (err: unknown) => {
-          console.warn(
-            `[channel.client] add processing reaction failed for ${messageId}: ${(err as Error).message}`,
-          );
-          return undefined;
-        },
-      );
+      .then((result) => {
+        const reactionId = result.data?.reaction_id ?? result.reaction_id;
+        if (!reactionId) throw new Error("create returned no reaction id");
+        console.info(
+          `[channel.client] processing reaction added message=${messageId} reaction=${reactionId} emoji=${PROCESSING_REACTION_EMOJI} ms=${Date.now() - startedAt}`,
+        );
+        return reactionId;
+      })
+      .catch((err: unknown) => {
+        console.warn(
+          `[channel.client] add processing reaction failed for ${messageId} after ${Date.now() - startedAt}ms: ` +
+            `${err instanceof Error ? err.message : String(err)}`,
+        );
+        return undefined;
+      });
     this.processingReactions.set(messageId, pending);
     this.trackReactionOp(pending);
     // A failed add leaves nothing to remove: forget it, so a later add for the
@@ -2283,16 +2286,18 @@ export class ChannelClient {
       pending.then(async (reactionId) => {
         const channel = this.channel;
         if (!reactionId || !channel) return;
+        const startedAt = Date.now();
         try {
           await channel.rawClient.im.v1.messageReaction.delete({
             path: { message_id: messageId, reaction_id: reactionId },
           });
           console.info(
-            `[channel.client] processing reaction removed message=${messageId} reaction=${reactionId}`,
+            `[channel.client] processing reaction removed message=${messageId} reaction=${reactionId} ms=${Date.now() - startedAt}`,
           );
         } catch (err) {
           console.warn(
-            `[channel.client] remove processing reaction failed for ${messageId}: ${(err as Error).message}`,
+            `[channel.client] remove processing reaction failed for ${messageId} after ${Date.now() - startedAt}ms: ` +
+              `${err instanceof Error ? err.message : String(err)}`,
           );
         }
       }),
@@ -2301,7 +2306,12 @@ export class ChannelClient {
 
   private trackReactionOp(op: Promise<unknown>): void {
     this.reactionOps.add(op);
-    void op.finally(() => this.reactionOps.delete(op));
+    // then(done, done), not finally(): the bookkeeping chain must not re-raise
+    // a rejection as an unhandled one of its own.
+    const done = (): void => {
+      this.reactionOps.delete(op);
+    };
+    void op.then(done, done);
   }
 
   /** Bounded wait for in-flight reaction round trips — see REACTION_DRAIN_TIMEOUT_MS. */

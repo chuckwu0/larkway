@@ -47,9 +47,16 @@ export interface PreRunnerPerf {
   /** task-handle "received" lifecycle hook (≈0 when no task-handle hook is wired). */
   receivedHookMs?: number;
   promptRenderMs?: number;
-  /** ⏳ processing reaction add (only when the client supports reactions). */
+  /**
+   * ⏳ processing reaction add (only when the client supports reactions). Since
+   * WP-3 the call returns before its round trip, so this is ≈0; the round trip
+   * itself is in the ChannelClient log line.
+   */
   reactionAddMs?: number;
-  /** ⏳ processing reaction removal once the reply surface exists (pre-runner sites only). */
+  /**
+   * ⏳ processing reaction removal once the reply surface exists (pre-runner
+   * sites only). ≈0 since WP-3, like reactionAddMs.
+   */
   reactionRemoveMs?: number;
   /** Legacy visible card `start` — the non-CardKit surface or the CardKit-failure fallback. */
   legacyCardMs?: number;

@@ -482,8 +482,9 @@ describe("ChannelClient — processing reaction ack", () => {
    */
   function makeReactionChannel(opts: { createThrowsSync?: boolean } = {}) {
     const calls: ReactionCall[] = [];
-    const creates: Array<{ resolve: (v: unknown) => void; reject: (e: Error) => void }> = [];
+    const creates: Array<{ resolve: (v: unknown) => void; reject: (e: unknown) => void }> = [];
     const deletes: Array<() => void> = [];
+    const deleteFailures: Array<(e: unknown) => void> = [];
     const fakeChannel = {
       botIdentity: { openId: "ou_bot", name: "Test Bot" },
       on() {},
@@ -510,14 +511,17 @@ describe("ChannelClient — processing reaction ack", () => {
                   messageId: payload.path.message_id,
                   reactionId: payload.path.reaction_id,
                 });
-                return new Promise<void>((resolve) => deletes.push(resolve));
+                return new Promise<void>((resolve, reject) => {
+                  deletes.push(resolve);
+                  deleteFailures.push(reject);
+                });
               },
             },
           },
         },
       },
     };
-    return { calls, creates, deletes, fakeChannel };
+    return { calls, creates, deletes, deleteFailures, fakeChannel };
   }
 
   async function connectedClient(fakeChannel: unknown) {
@@ -538,6 +542,27 @@ describe("ChannelClient — processing reaction ack", () => {
 
   /** Let chained promise callbacks run (no timers involved). */
   const flush = () => new Promise<void>((resolve) => setImmediate(resolve));
+
+  /**
+   * Unhandled rejections raised while `body` runs. The reaction calls are no
+   * longer awaited by the handler, so a rejection on one of their floating
+   * chains would surface here (and in production as crash-guard noise).
+   */
+  async function unhandledRejectionsDuring(body: () => Promise<void>): Promise<unknown[]> {
+    const seen: unknown[] = [];
+    const onRejection = (reason: unknown) => {
+      seen.push(reason);
+    };
+    process.on("unhandledRejection", onRejection);
+    try {
+      await body();
+      await flush();
+      await flush();
+    } finally {
+      process.off("unhandledRejection", onRejection);
+    }
+    return seen;
+  }
 
   afterEach(() => {
     vi.useRealTimers();
@@ -622,6 +647,88 @@ describe("ChannelClient — processing reaction ack", () => {
 
     expect(calls.map((c) => c.op)).toEqual(["create"]);
     await client.close();
+  });
+
+  it("treats a create that resolves without a result as a failed add", async () => {
+    const { calls, creates, deletes, fakeChannel } = makeReactionChannel();
+    const client = await connectedClient(fakeChannel);
+
+    const rejections = await unhandledRejectionsDuring(async () => {
+      await client.addProcessingReaction("om_user");
+      await flush();
+      creates[0]!.resolve(undefined);
+      await flush();
+      // Forgotten like any failed add: the next add creates again, and a
+      // removal chained behind that one deletes what it made.
+      await client.addProcessingReaction("om_user");
+      await client.removeProcessingReaction("om_user");
+      await flush();
+      creates[1]!.resolve({ data: { reaction_id: "reaction_2" } });
+      await flush();
+      deletes[0]!();
+    });
+
+    expect(rejections).toEqual([]);
+    expect(calls).toEqual([
+      { op: "create", messageId: "om_user", emoji: "Typing" },
+      { op: "create", messageId: "om_user", emoji: "Typing" },
+      { op: "delete", messageId: "om_user", reactionId: "reaction_2" },
+    ]);
+    await client.close();
+  });
+
+  it("contains non-Error rejections from create and delete", async () => {
+    const { calls, creates, deleteFailures, fakeChannel } = makeReactionChannel();
+    const client = await connectedClient(fakeChannel);
+
+    const rejections = await unhandledRejectionsDuring(async () => {
+      await client.addProcessingReaction("om_a");
+      creates[0]!.reject(undefined);
+      await flush();
+      await client.addProcessingReaction("om_b");
+      creates[1]!.resolve({ data: { reaction_id: "reaction_b" } });
+      await client.removeProcessingReaction("om_b");
+      await flush();
+      deleteFailures[0]!(undefined);
+      await flush();
+    });
+
+    expect(rejections).toEqual([]);
+    expect(calls.map((c) => c.op)).toEqual(["create", "create", "delete"]);
+    await client.close();
+  });
+
+  it("logs the duration of each reaction round trip", async () => {
+    const info = vi.spyOn(console, "info").mockImplementation(() => {});
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const { creates, deletes, fakeChannel } = makeReactionChannel();
+      const client = await connectedClient(fakeChannel);
+
+      await client.addProcessingReaction("om_user");
+      await client.removeProcessingReaction("om_user");
+      await client.addProcessingReaction("om_other");
+      await flush();
+      creates[0]!.resolve({ data: { reaction_id: "reaction_1" } });
+      creates[1]!.reject(new Error("rate limited"));
+      await flush();
+      deletes[0]!();
+      await client.close();
+
+      const infoLines = info.mock.calls.map((args) => String(args[0]));
+      expect(infoLines).toContainEqual(
+        expect.stringMatching(/processing reaction added message=om_user reaction=reaction_1 emoji=Typing ms=\d+$/),
+      );
+      expect(infoLines).toContainEqual(
+        expect.stringMatching(/processing reaction removed message=om_user reaction=reaction_1 ms=\d+$/),
+      );
+      expect(warn.mock.calls.map((args) => String(args[0]))).toContainEqual(
+        expect.stringMatching(/add processing reaction failed for om_other after \d+ms: rate limited$/),
+      );
+    } finally {
+      info.mockRestore();
+      warn.mockRestore();
+    }
   });
 
   it("treats a repeated add or remove as a no-op", async () => {
