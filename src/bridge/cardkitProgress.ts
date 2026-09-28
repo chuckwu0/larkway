@@ -259,8 +259,30 @@ class LiveCardKitProgressHandle implements CardKitProgressHandle {
     metrics: CardKitLiveMetrics & { sequence: number },
   ) => void;
   private answerBuffer = "";
+  /**
+   * WP-4: the answer text the card is known to show — what the last successful
+   * createElements / streamElementContent carried. A patch whose buffer still
+   * equals it would re-send identical content, so it is skipped.
+   */
+  private lastCommittedAnswer = "";
   private pendingPatch: ReturnType<typeof setTimeout> | null = null;
+  /**
+   * Tail of the serial CardKit chain. Sequence numbers must reach CardKit in
+   * order, so there is never more than one call in flight.
+   */
   private inFlight: Promise<void> = Promise.resolve();
+  /**
+   * WP-4 latest-wins: whether a not-yet-started node sits on the chain for the
+   * answer / footer status / COT panel. While one is queued, a new update only
+   * changes the state that node reads when it starts (answerBuffer, statusText,
+   * cotBuffer) instead of appending another call behind a slow one.
+   */
+  private answerQueued = false;
+  private statusQueued = false;
+  private cotQueued = false;
+  /** WP-4: footer text the latest status update asked for / the card shows. */
+  private statusText: string;
+  private lastCommittedStatus: string;
   private closed = false;
   private answerElementCreated = false;
   private immediatePatchStarted = false;
@@ -273,6 +295,8 @@ class LiveCardKitProgressHandle implements CardKitProgressHandle {
   private readonly cotDetail?: "brief" | "detailed";
   private readonly onCotPanelCreated?: (elementId: string) => void;
   private cotBuffer = "";
+  /** WP-4: panel text the card is known to show (same role as lastCommittedAnswer). */
+  private lastCommittedCot = "";
   private cotTruncated = false;
   private cotPanelCreated = false;
   private cotPendingPatch: ReturnType<typeof setTimeout> | null = null;
@@ -296,6 +320,8 @@ class LiveCardKitProgressHandle implements CardKitProgressHandle {
     idempotencyKey: string;
     patchIntervalMs: number;
     maxProgressUpdates: number;
+    /** Footer the card was created with. */
+    initialStatusText: string;
     cot?: { detail: "brief" | "detailed" };
     onCotPanelCreated?: (elementId: string) => void;
     onSequenceCommitted?: (sequence: number) => Promise<void>;
@@ -309,6 +335,8 @@ class LiveCardKitProgressHandle implements CardKitProgressHandle {
     this.idempotencyKey = opts.idempotencyKey;
     this.patchIntervalMs = opts.patchIntervalMs;
     this.maxProgressUpdates = opts.maxProgressUpdates;
+    this.statusText = opts.initialStatusText;
+    this.lastCommittedStatus = opts.initialStatusText;
     this.cotDetail = opts.cot?.detail;
     this.onCotPanelCreated = opts.onCotPanelCreated;
     this.onSequenceCommitted = opts.onSequenceCommitted;
@@ -362,33 +390,28 @@ class LiveCardKitProgressHandle implements CardKitProgressHandle {
   }
 
   async finalize(opts: BuildCardKitFinalCardOpts): Promise<void> {
-    await this.drain();
-    this.closed = true;
+    // WP-4: stop taking work and wait only for the call already in flight.
+    // Pending patch timers and queued nodes that have not started are dropped:
+    // the final card below carries the final answer and reasoning panel (and no
+    // footer), so they could only re-send what it replaces. They must not run
+    // alongside it either — a lower sequence landing after updateCardEntity may
+    // be rejected or overwrite the final card.
+    this.close();
+    await this.inFlight;
     // Embed the collapsed reasoning panel INTO the final card (updateCardEntity
     // rebuilds the whole card, so a separate PATCH would be clobbered).
     const finalOpts: BuildCardKitFinalCardOpts = { ...opts, cotPanel: this.cotPanelForFinalCard() };
-    const finalMarkdown = buildCardKitFinalMarkdown(opts);
-    if (finalMarkdown !== this.answerBuffer) {
-      await this.withAnswerElement(finalMarkdown);
-      await this.next((sequence) =>
-        this.cardKitClient.streamElementContent(
-          this.cardId,
-          CARDKIT_FINAL_ELEMENT_ID,
-          finalMarkdown,
-          {
-            sequence,
-            uuid: sequenceUuid(this.cardId, "final-content", sequence),
-          },
-        ),
-      );
-      this.answerBuffer = finalMarkdown;
-    }
+    // WP-4: no createElements + streamElementContent of the final markdown
+    // first, even when it differs from what streamed — the rebuilt card already
+    // holds it in final_md. The cost is the typing animation for that final
+    // replacement.
     await this.next((sequence) =>
       this.cardKitClient.updateCardEntity(this.cardId, buildCardKitFinalCard(finalOpts), {
         sequence,
         uuid: sequenceUuid(this.cardId, "final-card", sequence),
       }),
     );
+    this.answerBuffer = buildCardKitFinalMarkdown(opts);
     await this.next((sequence) =>
       this.cardKitClient.updateCardSettings(
         this.cardId,
@@ -563,26 +586,43 @@ class LiveCardKitProgressHandle implements CardKitProgressHandle {
 
   private async cotPatch(): Promise<void> {
     if (this.closed || !this.cotBuffer) return;
-    this.inFlight = this.inFlight
-      .then(() => this.cotEnsurePanel())
-      .then(() =>
-        this.next((sequence) =>
-          this.cardKitClient.streamElementContent(
-            this.cardId,
-            CARDKIT_COT_INNER_ELEMENT_ID,
-            this.cotBuffer,
-            { sequence, uuid: sequenceUuid(this.cardId, "cot-inner", sequence) },
-          ),
-        ),
-      )
-      .catch((err) => {
-        console.warn("[cardkit_progress] COT panel patch failed (continuing):", err);
-      });
+    // WP-4: same latest-wins / skip-identical rules as the answer channel.
+    if (this.cotBuffer !== this.lastCommittedCot && !this.cotQueued) {
+      this.cotQueued = true;
+      this.enqueue(() => this.commitCot());
+    }
     await this.inFlight;
   }
 
+  /** One panel node: reads cotBuffer when it starts, not when it was queued. */
+  private async commitCot(): Promise<void> {
+    this.cotQueued = false;
+    try {
+      if (!this.cotPanelCreated) {
+        // The panel is created WITH the current reasoning, so that text is
+        // already on the card — no identical stream right behind it.
+        const initial = this.cotBuffer;
+        await this.cotEnsurePanel(initial);
+        this.lastCommittedCot = initial;
+      }
+      const content = this.cotBuffer;
+      if (this.closed || content === this.lastCommittedCot) return;
+      await this.next((sequence) =>
+        this.cardKitClient.streamElementContent(
+          this.cardId,
+          CARDKIT_COT_INNER_ELEMENT_ID,
+          content,
+          { sequence, uuid: sequenceUuid(this.cardId, "cot-inner", sequence) },
+        ),
+      );
+      this.lastCommittedCot = content;
+    } catch (err) {
+      console.warn("[cardkit_progress] COT panel patch failed (continuing):", err);
+    }
+  }
+
   /** Lazily insert the expanded reasoning panel, once, above the answer/footer. */
-  private async cotEnsurePanel(): Promise<void> {
+  private async cotEnsurePanel(content: string): Promise<void> {
     if (this.cotPanelCreated) return;
     this.cotPanelCreated = true;
     const target = this.answerElementCreated
@@ -591,7 +631,7 @@ class LiveCardKitProgressHandle implements CardKitProgressHandle {
     await this.next((sequence) =>
       this.cardKitClient.createElements(
         this.cardId,
-        [buildCotPanelElement({ expanded: true, title: "思考中…", content: this.cotBuffer || "…" })],
+        [buildCotPanelElement({ expanded: true, title: "思考中…", content: content || "…" })],
         {
           sequence,
           uuid: sequenceUuid(this.cardId, "cot-panel", sequence),
@@ -604,7 +644,9 @@ class LiveCardKitProgressHandle implements CardKitProgressHandle {
   }
 
   private cotPanelForFinalCard(): BuildCardKitFinalCardOpts["cotPanel"] {
-    if (!this.cotPanelCreated) return undefined;
+    // WP-4: finalize drops a panel create that had not started yet; the
+    // reasoning it would have shown still belongs in the final card.
+    if (!this.cotPanelCreated && !this.cotBuffer) return undefined;
     return {
       title: this.cotErrored ? "思考过程（本轮出错）" : "思考过程",
       content: this.cotBuffer,
@@ -644,35 +686,44 @@ class LiveCardKitProgressHandle implements CardKitProgressHandle {
   }
 
   private patchStatus(content: string): void {
-    this.inFlight = this.inFlight
-      .then(() =>
-        this.next((sequence) =>
-          this.cardKitClient.updateElement(
-            this.cardId,
-            CARDKIT_FOOTER_ELEMENT_ID,
-            {
-              tag: "markdown",
-              content,
-              element_id: CARDKIT_FOOTER_ELEMENT_ID,
-            },
-            {
-              sequence,
-              uuid: sequenceUuid(this.cardId, "status", sequence),
-            },
-          ),
+    this.statusText = content;
+    // WP-4 latest-wins: a queued status node reads statusText when it starts,
+    // so a burst of tool_use events costs one footer update, not one each.
+    if (this.statusQueued) return;
+    this.statusQueued = true;
+    this.enqueue(() => this.commitStatus());
+  }
+
+  private async commitStatus(): Promise<void> {
+    this.statusQueued = false;
+    const content = this.statusText;
+    if (content === this.lastCommittedStatus) return;
+    try {
+      await this.next((sequence) =>
+        this.cardKitClient.updateElement(
+          this.cardId,
+          CARDKIT_FOOTER_ELEMENT_ID,
+          {
+            tag: "markdown",
+            content,
+            element_id: CARDKIT_FOOTER_ELEMENT_ID,
+          },
+          {
+            sequence,
+            uuid: sequenceUuid(this.cardId, "status", sequence),
+          },
         ),
-      )
-      .then(() => {
-        this.metrics.statusPatchCount += 1;
-        this.metrics.lastStatusPatchAt = new Date().toISOString();
-        this.metrics.lastPatchError = null;
-        this.emitLiveMetrics();
-      })
-      .catch((err) => {
-        this.metrics.lastPatchError = summarizeError(err);
-        this.emitLiveMetrics();
-        console.warn("[cardkit_progress] status update failed (continuing):", err);
-      });
+      );
+      this.lastCommittedStatus = content;
+      this.metrics.statusPatchCount += 1;
+      this.metrics.lastStatusPatchAt = new Date().toISOString();
+      this.metrics.lastPatchError = null;
+      this.emitLiveMetrics();
+    } catch (err) {
+      this.metrics.lastPatchError = summarizeError(err);
+      this.emitLiveMetrics();
+      console.warn("[cardkit_progress] status update failed (continuing):", err);
+    }
   }
 
   /**
@@ -705,36 +756,57 @@ class LiveCardKitProgressHandle implements CardKitProgressHandle {
   private async patchProgress(): Promise<void> {
     if (this.closed) return;
     if (!this.answerBuffer) return;
-    this.inFlight = this.inFlight
-      .then(() =>
-        this.withAnswerElement(this.answerBuffer).then(() =>
-          this.next((sequence) =>
-            this.cardKitClient.streamElementContent(this.cardId, CARDKIT_FINAL_ELEMENT_ID, this.answerBuffer, {
-              sequence,
-              uuid: sequenceUuid(this.cardId, "answer", sequence),
-            }),
-          ),
-        ),
-      )
-      .then(() => {
-        this.metrics.progressUpdateCount += 1;
-        this.metrics.visibleAnswerLength = this.answerBuffer.length;
-        this.metrics.lastProgressPatchAt = new Date().toISOString();
-        this.metrics.lastPatchError = null;
-        this.emitLiveMetrics();
-        console.info(
-          "[cardkit_progress] progress committed",
-          `progress_update_count=${this.metrics.progressUpdateCount}`,
-          `visible_length=${this.metrics.visibleAnswerLength}`,
-          `sequence=${this.sequence}`,
-        );
-      })
-      .catch((err) => {
-        this.metrics.lastPatchError = summarizeError(err);
-        this.emitLiveMetrics();
-        console.warn("[cardkit_progress] progress update failed (continuing):", err);
-      });
+    // WP-4: nothing new since the last commit, or an answer node is already
+    // queued and will send the latest buffer when it starts.
+    if (this.answerBuffer !== this.lastCommittedAnswer && !this.answerQueued) {
+      this.answerQueued = true;
+      this.enqueue(() => this.commitAnswer());
+    }
     await this.inFlight;
+  }
+
+  /** One answer node: reads answerBuffer when it starts, not when it was queued. */
+  private async commitAnswer(): Promise<void> {
+    this.answerQueued = false;
+    try {
+      if (!this.answerElementCreated) {
+        // The element is created WITH the current text, so that text is
+        // already on the card — no identical stream right behind it.
+        const initial = this.answerBuffer;
+        if (!initial) return;
+        await this.withAnswerElement(initial);
+        this.noteAnswerCommitted(initial);
+      }
+      const content = this.answerBuffer;
+      // closed: finalize arrived during the create above and waits for it only.
+      if (this.closed || !content || content === this.lastCommittedAnswer) return;
+      await this.next((sequence) =>
+        this.cardKitClient.streamElementContent(this.cardId, CARDKIT_FINAL_ELEMENT_ID, content, {
+          sequence,
+          uuid: sequenceUuid(this.cardId, "answer", sequence),
+        }),
+      );
+      this.noteAnswerCommitted(content);
+    } catch (err) {
+      this.metrics.lastPatchError = summarizeError(err);
+      this.emitLiveMetrics();
+      console.warn("[cardkit_progress] progress update failed (continuing):", err);
+    }
+  }
+
+  private noteAnswerCommitted(content: string): void {
+    this.lastCommittedAnswer = content;
+    this.metrics.progressUpdateCount += 1;
+    this.metrics.visibleAnswerLength = content.length;
+    this.metrics.lastProgressPatchAt = new Date().toISOString();
+    this.metrics.lastPatchError = null;
+    this.emitLiveMetrics();
+    console.info(
+      "[cardkit_progress] progress committed",
+      `progress_update_count=${this.metrics.progressUpdateCount}`,
+      `visible_length=${this.metrics.visibleAnswerLength}`,
+      `sequence=${this.sequence}`,
+    );
   }
 
   private async withAnswerElement(initialContent: string): Promise<void> {
@@ -754,6 +826,21 @@ class LiveCardKitProgressHandle implements CardKitProgressHandle {
     this.answerElementCreated = true;
   }
 
+  /**
+   * Append a node to the serial chain. WP-4: a node that has not started when
+   * the handle closes (finalize / close) is skipped, so finalize waits for at
+   * most the one call already in flight. `run` must not reject — a rejected
+   * link would skip every node queued after it.
+   */
+  private enqueue(run: () => Promise<void>): void {
+    this.inFlight = this.inFlight.then(() => (this.closed ? undefined : run()));
+  }
+
+  /**
+   * Run one CardKit call with the next sequence number. The number is taken
+   * when the call starts (not when its node was queued), so skipped nodes
+   * leave no gaps.
+   */
   private async next(fn: (sequence: number) => Promise<void>): Promise<void> {
     this.sequence += 1;
     const startedAt = Date.now();
@@ -806,6 +893,7 @@ export async function createCardKitProgressHandle(
     idempotencyKey: key,
     patchIntervalMs: opts.patchIntervalMs ?? DEFAULT_PATCH_INTERVAL_MS,
     maxProgressUpdates: opts.maxProgressUpdates ?? DEFAULT_MAX_PROGRESS_UPDATES,
+    initialStatusText,
     cot: opts.cot,
     onCotPanelCreated: opts.onCotPanelCreated,
     onSequenceCommitted: opts.onSequenceCommitted,

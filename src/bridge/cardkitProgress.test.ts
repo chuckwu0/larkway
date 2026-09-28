@@ -84,13 +84,9 @@ describe("CardKitProgressHandle", () => {
     handle.handle({ type: "answer_snapshot", text: "用户可见答案", raw: {} });
     await handle.drain();
 
-    const contentCalls = calls.filter((c) => c.name === "streamElementContent");
-    expect(contentCalls).toHaveLength(1);
-    expect(contentCalls[0]!.args[1]).toBe("final_md");
-    expect(contentCalls[0]!.args[2]).toContain("用户可见答案");
-    expect(contentCalls[0]!.args[2]).not.toContain("rg cardkit src");
-    expect(contentCalls[0]!.args[2]).not.toContain("raw assistant prose");
-    expect(contentCalls[0]!.args[2]).not.toContain("raw thinking");
+    // WP-4: the answer element is created WITH the text, so no identical
+    // stream follows it.
+    expect(calls.filter((c) => c.name === "streamElementContent")).toHaveLength(0);
     const createCall = calls.find((c) => c.name === "createElements");
     expect(createCall?.args[1]).toEqual([
       { tag: "markdown", content: "用户可见答案", element_id: "final_md" },
@@ -99,6 +95,17 @@ describe("CardKitProgressHandle", () => {
       type: "insert_before",
       targetElementId: "footer_md",
     });
+    const rendered = JSON.stringify(calls);
+    expect(rendered).not.toContain("rg cardkit src");
+    expect(rendered).not.toContain("raw assistant prose");
+    expect(rendered).not.toContain("raw thinking");
+
+    handle.handle({ type: "answer_delta", text: "，补充", raw: {} });
+    await handle.drain();
+    const contentCalls = calls.filter((c) => c.name === "streamElementContent");
+    expect(contentCalls).toHaveLength(1);
+    expect(contentCalls[0]!.args[1]).toBe("final_md");
+    expect(contentCalls[0]!.args[2]).toBe("用户可见答案，补充");
   });
 
   it("patches only count-only tool usage status without leaking tool details", async () => {
@@ -128,15 +135,14 @@ describe("CardKitProgressHandle", () => {
     });
     await handle.drain();
 
+    // WP-4 latest-wins: two tool_use events before the queued footer update
+    // starts share one call, which carries the latest count.
     const statusCalls = calls.filter((c) => c.name === "updateElement");
-    expect(statusCalls).toHaveLength(2);
+    expect(statusCalls).toHaveLength(1);
     expect(statusCalls[0]?.args[1]).toBe("footer_md");
     expect(statusCalls[0]?.args[2]).toMatchObject({
       tag: "markdown",
       element_id: "footer_md",
-      content: "努力回答中... · 已用 1 个工具",
-    });
-    expect(statusCalls[1]?.args[2]).toMatchObject({
       content: "努力回答中... · 已用 2 个工具",
     });
     const rendered = JSON.stringify(statusCalls);
@@ -147,7 +153,7 @@ describe("CardKitProgressHandle", () => {
     expect(rendered).not.toContain("LARKWAY_SECRET_TOKEN");
     expect(handle.liveMetrics).toMatchObject({
       toolUseCount: 2,
-      statusPatchCount: 2,
+      statusPatchCount: 1,
       lastPatchError: null,
     });
     expect(handle.liveMetrics.lastToolUseAt).toEqual(expect.any(String));
@@ -176,10 +182,14 @@ describe("CardKitProgressHandle", () => {
     handle.handle({ type: "answer_delta", text: "visible", raw: {} });
     await handle.drain();
 
-    const contentCalls = calls.filter((c) => c.name === "streamElementContent");
-    expect(contentCalls).toHaveLength(1);
-    expect(contentCalls[0]!.args[1]).toBe("final_md");
-    expect(contentCalls[0]!.args[2]).toBe("visible");
+    // WP-4: committed by creating the answer element with the text — one
+    // call, no identical stream behind it.
+    expect(calls.filter((c) => c.name === "streamElementContent")).toHaveLength(0);
+    const createCalls = calls.filter((c) => c.name === "createElements");
+    expect(createCalls).toHaveLength(1);
+    expect(createCalls[0]!.args[1]).toEqual([
+      { tag: "markdown", content: "visible", element_id: "final_md" },
+    ]);
     expect(handle.liveMetrics).toMatchObject({
       answerDeltaCount: 1,
       answerSnapshotCount: 0,
@@ -200,11 +210,11 @@ describe("CardKitProgressHandle", () => {
       answerDeltaCount: 1,
       visibleAnswerLength: 7,
       progressUpdateCount: 1,
-      sequence: 2,
+      sequence: 1,
     });
   });
 
-  it("finalizes by writing final content, replacing with a clean card, and closing streaming", async () => {
+  it("finalizes by replacing with a clean card that carries the final content, then closing streaming", async () => {
     const { client, calls } = fakeCardKitClient();
     const handle = await createCardKitProgressHandle({
       cardKitClient: client,
@@ -220,34 +230,29 @@ describe("CardKitProgressHandle", () => {
       choices: [{ label: "继续", value: "继续执行" }],
     });
 
+    // WP-4: no createElements + streamElementContent of the final markdown —
+    // the full-card update already holds it in final_md.
     const names = calls.map((c) => c.name);
     expect(names).toEqual([
       "createCardEntity",
       "replyCardEntity",
-      "createElements",
-      "streamElementContent",
       "updateCardEntity",
       "updateCardSettings",
     ]);
-    expect(calls[2]!.args[2]).toMatchObject({
-      type: "insert_before",
-      targetElementId: "footer_md",
+    const finalCard = calls[2]!.args[1] as { body: { elements: Array<Record<string, unknown>> } };
+    expect(finalCard.body.elements.find((e) => e["element_id"] === "final_md")).toEqual({
+      tag: "markdown",
+      content: "<at id=peer_bot></at>\n\n最终结论",
+      element_id: "final_md",
     });
-    expect(calls[2]!.args[1]).toEqual([
-      { tag: "markdown", content: "<at id=peer_bot></at>\n\n最终结论", element_id: "final_md" },
-    ]);
-    expect(calls[3]!.args[1]).toBe("final_md");
-    expect(calls[3]!.args[2]).toContain("最终结论");
-    const finalCard = calls[4]!.args[1] as Record<string, unknown>;
     expect(JSON.stringify(finalCard)).not.toContain("thinking_md");
     expect(JSON.stringify(finalCard)).toContain("larkway_choice");
-    expect(calls[5]!.args[1]).toEqual({
+    expect(calls[3]!.args[1]).toEqual({
       config: { streaming_mode: false, summary: { content: "最终结论" } },
     });
     expect((calls[2]!.args[2] as { sequence: number }).sequence).toBe(1);
-    expect((calls[3]!.args[3] as { sequence: number }).sequence).toBe(2);
-    expect((calls[4]!.args[2] as { sequence: number }).sequence).toBe(3);
-    expect((calls[5]!.args[2] as { sequence: number }).sequence).toBe(4);
+    expect((calls[3]!.args[2] as { sequence: number }).sequence).toBe(2);
+    expect(handle.answerText).toBe("<at id=peer_bot></at>\n\n最终结论");
   });
 
   it("ensures the answer element before reconciling an existing CardKit card when final_md is missing", async () => {
@@ -356,6 +361,24 @@ describe("CardKitProgressHandle", () => {
 // ---------------------------------------------------------------------------
 
 describe("CardKitProgressHandle — COT-in-card panel (方案 B)", () => {
+  /**
+   * Latest reasoning text sent to the card. WP-4: the panel is created WITH the
+   * reasoning so far, and cot_inner_md is only streamed when it changes after
+   * that — so the latest text is the last panel create or inner stream.
+   */
+  function latestCotText(calls: Array<{ name: string; args: unknown[] }>): string {
+    for (const call of [...calls].reverse()) {
+      if (call.name === "streamElementContent" && call.args[1] === "cot_inner_md") {
+        return call.args[2] as string;
+      }
+      if (call.name === "createElements") {
+        const [panel] = call.args[1] as Array<{ tag?: string; elements?: Array<{ content?: string }> }>;
+        if (panel?.tag === "collapsible_panel") return panel.elements?.[0]?.content ?? "";
+      }
+    }
+    return "";
+  }
+
   function makeHandle(detail: "brief" | "detailed", extra: Record<string, unknown> = {}) {
     const { client, calls } = fakeCardKitClient();
     return { client, calls, promise: createCardKitProgressHandle({
@@ -399,12 +422,20 @@ describe("CardKitProgressHandle — COT-in-card panel (方案 B)", () => {
     expect(JSON.stringify(panelCreate!.args[1])).toContain("思考中");
     expect(JSON.stringify(panelCreate!.args[1])).toContain("cot_inner_md");
     expect(panelCreate!.args[2]).toMatchObject({ type: "insert_before" });
-    // Reasoning streamed into the inner element.
+    // WP-4: the panel is created WITH the reasoning, so no identical stream
+    // into the inner element follows it…
+    expect(
+      calls.filter((c) => c.name === "streamElementContent" && c.args[1] === "cot_inner_md"),
+    ).toHaveLength(0);
+    expect(latestCotText(calls)).toContain("让我想想");
+    // …and later reasoning streams into cot_inner_md.
+    handle.handle({ type: "thinking_delta", text: "，再想想", raw: {} });
+    await handle.drain();
     const innerStream = calls.filter(
       (c) => c.name === "streamElementContent" && c.args[1] === "cot_inner_md",
     );
-    expect(innerStream.length).toBeGreaterThan(0);
-    expect(innerStream.at(-1)!.args[2]).toContain("让我想想");
+    expect(innerStream).toHaveLength(1);
+    expect(innerStream[0]!.args[2]).toBe("让我想想，再想想");
     // Resume hook fired with the panel id.
     expect(panelElementId).toBe("cot_panel");
   });
@@ -420,9 +451,7 @@ describe("CardKitProgressHandle — COT-in-card panel (方案 B)", () => {
       raw: {},
     });
     await handle.drain();
-    const inner = calls
-      .filter((c) => c.name === "streamElementContent" && c.args[1] === "cot_inner_md")
-      .at(-1)!.args[2] as string;
+    const inner = latestCotText(calls);
     expect(inner).toContain("Bash");
     expect(inner).not.toContain("cat /etc/secret.txt");
     expect(inner).not.toContain("SUPERSECRET");
@@ -435,9 +464,7 @@ describe("CardKitProgressHandle — COT-in-card panel (方案 B)", () => {
     handle.handle({ type: "tool_use", toolName: "shell", toolInput: {}, raw: {} });
     handle.handle({ type: "thinking_delta", text: "继续想", raw: {} });
     await handle.drain();
-    const inner = calls
-      .filter((c) => c.name === "streamElementContent" && c.args[1] === "cot_inner_md")
-      .at(-1)!.args[2] as string;
+    const inner = latestCotText(calls);
     // Regression: was "🔧 shell继续想" — the tool name ran into the next reasoning.
     expect(inner).not.toContain("shell继续想");
     expect(inner).toMatch(/🔧 shell\n/);
@@ -452,9 +479,7 @@ describe("CardKitProgressHandle — COT-in-card panel (方案 B)", () => {
       handle.handle({ type: "tool_result", raw: {} });
     }
     await handle.drain();
-    const inner = calls
-      .filter((c) => c.name === "streamElementContent" && c.args[1] === "cot_inner_md")
-      .at(-1)!.args[2] as string;
+    const inner = latestCotText(calls);
     expect(inner).toContain("🔧 shell ×7");
     // Only ONE tool line, not seven stacked "🔧 shell" lines.
     expect(inner.match(/🔧 shell/g)).toHaveLength(1);
@@ -468,9 +493,7 @@ describe("CardKitProgressHandle — COT-in-card panel (方案 B)", () => {
     handle.handle({ type: "tool_use", toolName: "shell", toolInput: {}, raw: {} });
     handle.handle({ type: "tool_use", toolName: "Read", toolInput: {}, raw: {} });
     await handle.drain();
-    const inner = calls
-      .filter((c) => c.name === "streamElementContent" && c.args[1] === "cot_inner_md")
-      .at(-1)!.args[2] as string;
+    const inner = latestCotText(calls);
     expect(inner).toContain("🔧 shell ×2");
     expect(inner).toContain("🔧 Read");
   });
@@ -485,9 +508,7 @@ describe("CardKitProgressHandle — COT-in-card panel (方案 B)", () => {
       raw: { message: { content: [{ type: "tool_result", content: "文件内容 abc" }] } },
     });
     await handle.drain();
-    const inner = calls
-      .filter((c) => c.name === "streamElementContent" && c.args[1] === "cot_inner_md")
-      .at(-1)!.args[2] as string;
+    const inner = latestCotText(calls);
     expect(inner).toContain("Read");
     expect(inner).toContain("/x");
     expect(inner).toContain("文件内容 abc");
@@ -500,9 +521,7 @@ describe("CardKitProgressHandle — COT-in-card panel (方案 B)", () => {
       handle.handle({ type: "thinking_delta", text: "x".repeat(100), raw: {} });
     }
     await handle.drain();
-    const inner = calls
-      .filter((c) => c.name === "streamElementContent" && c.args[1] === "cot_inner_md")
-      .at(-1)!.args[2] as string;
+    const inner = latestCotText(calls);
     expect(inner.length).toBeLessThan(4200); // ~4000 cap + short marker
     expect(inner).toContain("省略");
   });
@@ -544,8 +563,12 @@ describe("CardKitProgressHandle — COT-in-card panel (方案 B)", () => {
     const { client, calls } = fakeCardKitClient();
     // Make ONLY the cot_inner stream throw; the answer path must still finalize.
     const origStream = client.streamElementContent;
+    let panelStreamFailures = 0;
     client.streamElementContent = async (cardId, elementId, content, opts) => {
-      if (elementId === "cot_inner_md") throw new Error("panel stream boom");
+      if (elementId === "cot_inner_md") {
+        panelStreamFailures += 1;
+        throw new Error("panel stream boom");
+      }
       return origStream(cardId, elementId, content, opts);
     };
     const handle = await createCardKitProgressHandle({
@@ -557,10 +580,20 @@ describe("CardKitProgressHandle — COT-in-card panel (方案 B)", () => {
       cot: { detail: "brief" },
     });
     handle.handle({ type: "thinking_delta", text: "推理", raw: {} });
+    await handle.drain();
+    handle.handle({ type: "thinking_delta", text: "继续推理", raw: {} });
     handle.handle({ type: "answer_snapshot", text: "答案", raw: {} });
-    await expect(handle.finalize({ finalText: "答案" })).resolves.toBeUndefined();
+    await handle.drain();
+    handle.handle({ type: "answer_delta", text: "，完整", raw: {} });
+    await handle.drain();
+    expect(panelStreamFailures).toBeGreaterThan(0);
+    await expect(handle.finalize({ finalText: "答案，完整" })).resolves.toBeUndefined();
     // Answer still streamed + final card written.
-    expect(calls.some((c) => c.name === "streamElementContent" && c.args[1] === "final_md")).toBe(true);
+    expect(
+      calls.some(
+        (c) => c.name === "streamElementContent" && c.args[1] === "final_md" && c.args[2] === "答案，完整",
+      ),
+    ).toBe(true);
     expect(calls.some((c) => c.name === "updateCardEntity")).toBe(true);
   });
 });
@@ -646,5 +679,213 @@ describe("CardKitProgressHandle — WP-0 call timings", () => {
     });
     await expect(failing.finalize({ finalText: "final answer" })).rejects.toThrow("fake finalize failed");
     expect(failing.callDurationsMs?.length).toBe(failing.sequence);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// WP-4: CardKit tail slimming — skip identical content, latest-wins per
+// channel, finalize waits only for the call in flight.
+// ---------------------------------------------------------------------------
+
+/**
+ * fakeCardKitClient whose sequenced calls stay in flight until the test
+ * releases them (oldest first), so queued-vs-in-flight states are exact.
+ */
+function heldCardKitClient() {
+  const { client, calls } = fakeCardKitClient();
+  const held: Array<() => void> = [];
+  const hold =
+    <A extends unknown[]>(fn: (...args: A) => Promise<void>) =>
+    async (...args: A): Promise<void> => {
+      await fn(...args);
+      await new Promise<void>((resolve) => held.push(resolve));
+    };
+  const heldClient: OutboundCardKitClient = {
+    ...client,
+    updateCardEntity: hold(client.updateCardEntity),
+    streamElementContent: hold(client.streamElementContent),
+    createElements: hold(client.createElements),
+    updateElement: hold(client.updateElement),
+    updateCardSettings: hold(client.updateCardSettings),
+  };
+  return {
+    client: heldClient,
+    calls,
+    heldCount: () => held.length,
+    /** Complete the oldest held call and let the chain (and 0ms timers) move on. */
+    release: async () => {
+      held.shift()?.();
+      await settle();
+    },
+  };
+}
+
+function settle(): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, 0));
+}
+
+function sequencesOf(calls: Array<{ name: string; args: unknown[] }>): number[] {
+  return calls
+    .filter((c) => c.name !== "createCardEntity" && c.name !== "replyCardEntity")
+    .map((c) => (c.args.at(-1) as { sequence: number }).sequence);
+}
+
+describe("CardKitProgressHandle — WP-4 tail slimming", () => {
+  const facts = { botId: "bot", threadId: "thread", triggerMessageId: "trigger_message" };
+
+  it("skips an answer patch whose text is already on the card", async () => {
+    const { client, calls } = fakeCardKitClient();
+    const handle = await createCardKitProgressHandle({
+      cardKitClient: client, replyToMessageId: "trigger_message", replyInThread: true, facts, patchIntervalMs: 0,
+    });
+    handle.handle({ type: "answer_snapshot", text: "同一段", raw: {} });
+    await handle.drain();
+    const afterFirst = calls.length;
+    handle.handle({ type: "answer_snapshot", text: "同一段", raw: {} });
+    await handle.drain();
+    expect(calls).toHaveLength(afterFirst);
+    handle.handle({ type: "answer_snapshot", text: "同一段。", raw: {} });
+    await handle.drain();
+    expect(calls.slice(afterFirst).map((c) => [c.name, c.args[2]])).toEqual([
+      ["streamElementContent", "同一段。"],
+    ]);
+  });
+
+  it("streams only the latest text once the element create returns, if it changed meanwhile", async () => {
+    const held = heldCardKitClient();
+    const handle = await createCardKitProgressHandle({
+      cardKitClient: held.client, replyToMessageId: "trigger_message", replyInThread: true, facts, patchIntervalMs: 0,
+    });
+    handle.handle({ type: "answer_delta", text: "a", raw: {} });
+    await settle();
+    handle.handle({ type: "answer_delta", text: "b", raw: {} });
+    handle.handle({ type: "answer_delta", text: "c", raw: {} });
+    await settle();
+    expect(held.calls.slice(2).map((c) => c.name)).toEqual(["createElements"]);
+    await held.release(); // create("a") done → the same node streams "abc"
+    await held.release();
+    await handle.drain();
+    const answerCalls = held.calls.slice(2);
+    expect(answerCalls.map((c) => c.name)).toEqual(["createElements", "streamElementContent"]);
+    expect(answerCalls[0]!.args[1]).toEqual([{ tag: "markdown", content: "a", element_id: "final_md" }]);
+    expect(answerCalls[1]!.args[2]).toBe("abc");
+    expect(handle.liveMetrics).toMatchObject({ progressUpdateCount: 2, visibleAnswerLength: 3 });
+  });
+
+  it("latest-wins: at most one queued node per channel, reading the newest text when it starts", async () => {
+    const held = heldCardKitClient();
+    const handle = await createCardKitProgressHandle({
+      cardKitClient: held.client, replyToMessageId: "trigger_message", replyInThread: true, facts, patchIntervalMs: 0,
+    });
+    handle.handle({ type: "answer_delta", text: "a", raw: {} }); // create("a") in flight
+    await settle();
+    for (const text of ["b", "c", "d"]) {
+      handle.handle({ type: "answer_delta", text, raw: {} });
+      handle.handle({ type: "tool_use", toolName: "Read", toolInput: {}, raw: {} });
+      await settle(); // each patch timer fires while create("a") is still in flight
+    }
+    expect(held.heldCount()).toBe(1);
+    await held.release(); // create done; its node streams "abcd"
+    expect(held.calls.at(-1)!.args[2]).toBe("abcd");
+    await held.release(); // stream done; the one queued footer node runs
+    await held.release(); // footer done; the queued answer node finds nothing new
+    await handle.drain();
+    const names = held.calls.slice(2).map((c) => c.name);
+    expect(names).toEqual(["createElements", "streamElementContent", "updateElement"]);
+    expect(held.calls.at(-1)!.args[2]).toMatchObject({ content: "努力回答中... · 已用 3 个工具" });
+    expect(sequencesOf(held.calls)).toEqual([1, 2, 3]);
+  });
+
+  it("does not send a footer update that would leave the footer unchanged", async () => {
+    const { client, calls } = fakeCardKitClient();
+    const handle = await createCardKitProgressHandle({
+      cardKitClient: client, replyToMessageId: "trigger_message", replyInThread: true, facts, patchIntervalMs: 0,
+    });
+    // Waiting notice set and cleared before its update starts: the footer
+    // still shows the initial 努力回答中..., so nothing is sent.
+    handle.markIdleWaiting(200_000);
+    handle.clearIdleWaiting();
+    await handle.drain();
+    expect(calls.filter((c) => c.name === "updateElement")).toHaveLength(0);
+    expect(handle.liveMetrics.statusPatchCount).toBe(0);
+
+    handle.markIdleWaiting(200_000);
+    await handle.drain();
+    handle.clearIdleWaiting();
+    await handle.drain();
+    expect(
+      calls.filter((c) => c.name === "updateElement").map((c) => (c.args[2] as { content: string }).content),
+    ).toEqual([expect.stringContaining("仍在等待"), "努力回答中..."]);
+  });
+
+  it("finalize waits for the call in flight only, drops queued nodes, then sends the final card", async () => {
+    const held = heldCardKitClient();
+    const handle = await createCardKitProgressHandle({
+      cardKitClient: held.client, replyToMessageId: "trigger_message", replyInThread: true, facts, patchIntervalMs: 0,
+      cot: { detail: "brief" },
+    });
+    handle.handle({ type: "answer_delta", text: "草稿", raw: {} }); // create in flight
+    await settle();
+    handle.handle({ type: "answer_delta", text: "继续", raw: {} }); // answer node queued
+    handle.handle({ type: "tool_use", toolName: "Read", toolInput: {}, raw: {} }); // footer + panel queued
+    await settle();
+    expect(held.heldCount()).toBe(1);
+
+    let finalized = false;
+    const finalizing = handle
+      .finalize({ finalText: "正式答案" })
+      .then(() => {
+        finalized = true;
+      });
+    await settle();
+    // Still waiting on the in-flight create — nothing else started.
+    expect(held.calls.slice(2).map((c) => c.name)).toEqual(["createElements"]);
+    await held.release(); // create done → queued nodes skipped → final card
+    expect(held.calls.slice(2).map((c) => c.name)).toEqual(["createElements", "updateCardEntity"]);
+    await held.release();
+    await held.release();
+    await finalizing;
+    expect(finalized).toBe(true);
+    expect(held.calls.slice(2).map((c) => c.name)).toEqual([
+      "createElements",
+      "updateCardEntity",
+      "updateCardSettings",
+    ]);
+    expect(sequencesOf(held.calls)).toEqual([1, 2, 3]);
+    // The dropped nodes' content still lands: final answer + the reasoning
+    // panel whose create never started.
+    const finalCard = held.calls[3]!.args[1] as { body: { elements: Array<Record<string, unknown>> } };
+    expect(finalCard.body.elements.find((e) => e["element_id"] === "final_md")?.["content"]).toBe("正式答案");
+    const panel = finalCard.body.elements.find((e) => e["tag"] === "collapsible_panel");
+    expect(panel?.["expanded"]).toBe(false);
+    expect(JSON.stringify(panel)).toContain("🔧 Read");
+    expect(handle.answerText).toBe("正式答案");
+  });
+
+  it("finalize with a different final text sends no createElements / stream for it", async () => {
+    const { client, calls } = fakeCardKitClient();
+    const handle = await createCardKitProgressHandle({
+      cardKitClient: client, replyToMessageId: "trigger_message", replyInThread: true, facts, patchIntervalMs: 0,
+    });
+    handle.handle({ type: "answer_snapshot", text: "流式草稿", raw: {} });
+    await handle.drain();
+    const beforeFinalize = calls.length;
+    await handle.finalize({ finalText: "流式草稿\n\n📝 本轮期间变更了 memory/example.md" });
+    expect(calls.slice(beforeFinalize).map((c) => c.name)).toEqual(["updateCardEntity", "updateCardSettings"]);
+    expect(JSON.stringify(calls[beforeFinalize]!.args[1])).toContain("📝 本轮期间变更了 memory/example.md");
+  });
+
+  it("close() drops queued nodes as well", async () => {
+    const held = heldCardKitClient();
+    const handle = await createCardKitProgressHandle({
+      cardKitClient: held.client, replyToMessageId: "trigger_message", replyInThread: true, facts, patchIntervalMs: 0,
+    });
+    handle.handle({ type: "answer_delta", text: "a", raw: {} });
+    await settle();
+    handle.handle({ type: "tool_use", toolName: "Read", toolInput: {}, raw: {} });
+    handle.close();
+    await held.release();
+    await handle.drain();
+    expect(held.calls.slice(2).map((c) => c.name)).toEqual(["createElements"]);
   });
 });

@@ -455,6 +455,18 @@ function makeCardKitClient(opts: { failFinalize?: boolean; failCreate?: boolean 
   return { client, calls };
 }
 
+/**
+ * WP-4: finalize no longer streams the final markdown into final_md first —
+ * the final card (updateCardEntity) carries it — so read it from there.
+ */
+function finalCardMarkdown(calls: ReadonlyArray<{ kind: string; payload?: unknown }>): string {
+  const card = calls.filter((c) => c.kind === "updateCard").at(-1)?.payload as
+    | { body?: { elements?: Array<Record<string, unknown>> } }
+    | undefined;
+  const element = card?.body?.elements?.find((e) => e["element_id"] === "final_md");
+  return typeof element?.["content"] === "string" ? element["content"] : "";
+}
+
 async function seedPendingPostLedger(worktreePath: string, text: string): Promise<void> {
   const content = buildPostContent({ text, mentions: [] });
   const contentDigest = digestPostContent(content);
@@ -924,7 +936,11 @@ describe("handleOne — thin-channel finalize", () => {
     expect(cardKitCalls.map((c) => c.kind)).toContain("createCard");
     expect(cardKitCalls.map((c) => c.kind)).toContain("reply");
     expect(cardKitCalls.some((c) => c.kind === "stream" && c.elementId === "thinking_md")).toBe(false);
-    expect(cardKitCalls.some((c) => c.kind === "stream" && c.elementId === "final_md" && c.content?.includes("CardKit 最终正文"))).toBe(true);
+    expect(finalCardMarkdown(cardKitCalls)).toContain("CardKit 最终正文");
+    // WP-4: text that never streamed (the last_message fallback here) lands
+    // through the final card alone — no createElements + stream round trips.
+    expect(cardKitCalls.some((c) => c.kind === "stream" && c.elementId === "final_md")).toBe(false);
+    expect(cardKitCalls.some((c) => c.kind === "createElements")).toBe(false);
     const finalUpdate = cardKitCalls.find((c) => c.kind === "updateCard");
     expect(JSON.stringify(finalUpdate?.payload)).toContain("继续");
     expect(JSON.stringify(finalUpdate?.payload)).toContain("<at id=peer_test></at>");
@@ -1176,14 +1192,17 @@ describe("handleOne — thin-channel finalize", () => {
     expect(startArgs).toHaveLength(0);
     expect(finalizeArgs).toHaveLength(0);
     const statusUpdates = cardKitCalls.filter((c) => c.kind === "updateElement");
-    expect(statusUpdates).toHaveLength(2);
-    expect(statusUpdates[0]?.elementId).toBe("footer_md");
-    expect(statusUpdates[0]?.payload).toMatchObject({
-      content: "努力回答中... · 已用 1 个工具",
-    });
-    expect(statusUpdates[1]?.payload).toMatchObject({
-      content: "努力回答中... · 已用 2 个工具",
-    });
+    // WP-4 latest-wins: back-to-back tool_use events may share one footer
+    // update, and finalize drops one that has not started (the final card has
+    // no footer) — so 1 or 2 updates, each count-only.
+    expect(statusUpdates.length).toBeGreaterThanOrEqual(1);
+    expect(statusUpdates.length).toBeLessThanOrEqual(2);
+    for (const update of statusUpdates) {
+      expect(update.elementId).toBe("footer_md");
+      expect(update.payload).toMatchObject({
+        content: expect.stringMatching(/^努力回答中\.\.\. · 已用 [12] 个工具$/),
+      });
+    }
     const rendered = JSON.stringify(statusUpdates);
     expect(rendered).not.toContain("Bash");
     expect(rendered).not.toContain("Read");
@@ -1633,24 +1652,24 @@ describe("handleOne — thin-channel finalize", () => {
     expect(acked).toEqual(["om_msg"]);
     expect(startArgs).toHaveLength(0);
     expect(finalizeArgs).toHaveLength(0);
-    const stream = cardKitCalls.find((c) => c.kind === "stream" && c.elementId === "final_md");
-    expect(stream?.content).toContain("被中断");
-    expect(stream?.content).toContain("判定卡死");
-    expect(stream?.content).toContain("请重试");
+    const finalMd = finalCardMarkdown(cardKitCalls);
+    expect(finalMd).toContain("被中断");
+    expect(finalMd).toContain("判定卡死");
+    expect(finalMd).toContain("请重试");
     // BL-48: the card names the knob so an owner can fix a too-tight threshold
     // without coming to us.
-    expect(stream?.content).toContain("idle_timeout_seconds");
-    expect(stream?.content).not.toContain("请再 @ 我一次");
+    expect(finalMd).toContain("idle_timeout_seconds");
+    expect(finalMd).not.toContain("请再 @ 我一次");
     const settings = cardKitCalls.find((c) => c.kind === "settings");
     expect(JSON.stringify(settings?.payload)).toContain("本轮被中断");
     // COT-in-card: the failed (idle-interrupted) turn settles the reasoning
     // panel with the errored title — proves handler wires markCotError() on the
-    // failure path (was production-unreachable before).
-    const panelCreate = cardKitCalls.find(
-      (c) => c.kind === "createElements" && JSON.stringify(c.payload).includes("collapsible_panel"),
-    );
-    expect(panelCreate).toBeDefined();
+    // failure path (was production-unreachable before). WP-4: the mid-turn
+    // panel create may still be waiting on its patch timer when finalize runs
+    // (and is then dropped); the final card carries the panel either way.
     const finalCard = cardKitCalls.filter((c) => c.kind === "updateCard").at(-1);
+    expect(JSON.stringify(finalCard?.payload)).toContain("collapsible_panel");
+    expect(JSON.stringify(finalCard?.payload)).toContain("思考中断测试");
     expect(JSON.stringify(finalCard?.payload)).toContain("思考过程（本轮出错）");
   });
 
@@ -1738,9 +1757,9 @@ describe("handleOne — thin-channel finalize", () => {
 
     expect(killed).toBe(false);
     expect(acked).toEqual(["om_msg"]);
-    const stream = cardKitCalls.find((c) => c.kind === "stream" && c.elementId === "final_md");
-    expect(stream?.content).toContain("慢，但没死");
-    expect(stream?.content ?? "").not.toContain("判定卡死");
+    const finalMd = finalCardMarkdown(cardKitCalls);
+    expect(finalMd).toContain("慢，但没死");
+    expect(finalMd).not.toContain("判定卡死");
 
     // Stage 1 must be VISIBLE: the status line said we were still waiting…
     const statusPatches = cardKitCalls
@@ -1823,15 +1842,15 @@ describe("handleOne — thin-channel finalize", () => {
     // The recovery did not spend the grace: the kill came from the SECOND
     // stall, which had to accumulate its own 900ms after 回来了.
     expect(killed).toBe(true);
-    const stream = cardKitCalls.find((c) => c.kind === "stream" && c.elementId === "final_md");
-    expect(stream?.content).toContain("判定卡死");
+    const finalMd = finalCardMarkdown(cardKitCalls);
+    expect(finalMd).toContain("判定卡死");
     // Measured silence, rendered in seconds (~1s here) — NOT "1 分钟", which is
     // what a threshold-based or minute-rounded message would print.
-    expect(stream?.content).toMatch(/连续 \d+ 秒没有任何输出/);
+    expect(finalMd).toMatch(/连续 \d+ 秒没有任何输出/);
     // The hint quotes THIS bot's threshold (300ms → 0s after rounding is
     // meaningless, so just assert it is not the hard-coded global default).
-    expect(stream?.content).toContain("idle_timeout_seconds");
-    expect(stream?.content).not.toContain("默认 180");
+    expect(finalMd).toContain("idle_timeout_seconds");
+    expect(finalMd).not.toContain("默认 180");
   });
 
   it("A3: does not kill an idle-stuck turn while a real tool call is in flight (tool_use with no matching tool_result yet)", async () => {
@@ -1915,8 +1934,8 @@ describe("handleOne — thin-channel finalize", () => {
     expect(acked).toEqual(["om_msg"]);
     expect(startArgs).toHaveLength(0);
     expect(finalizeArgs).toHaveLength(0);
-    const stream = cardKitCalls.find((c) => c.kind === "stream" && c.elementId === "final_md");
-    expect(stream?.content).toContain("build done");
+    const finalMd = finalCardMarkdown(cardKitCalls);
+    expect(finalMd).toContain("build done");
     const settings = cardKitCalls.find((c) => c.kind === "settings");
     expect(JSON.stringify(settings?.payload)).not.toContain("本轮被中断");
   });
@@ -1995,8 +2014,8 @@ describe("handleOne — thin-channel finalize", () => {
     expect(acked).toEqual(["om_msg"]);
     expect(startArgs).toHaveLength(0);
     expect(finalizeArgs).toHaveLength(0);
-    const stream = cardKitCalls.find((c) => c.kind === "stream" && c.elementId === "final_md");
-    expect(stream?.content).toContain("被中断");
+    const finalMd = finalCardMarkdown(cardKitCalls);
+    expect(finalMd).toContain("被中断");
   });
 
   it("批C: threads botConfig.model/effort through to the runner's RunOptions", async () => {
@@ -5640,8 +5659,8 @@ describe("BL-38: poison-session self-heal", () => {
     return { cardKitCalls, acked };
   }
 
-  function finalCardText(cardKitCalls: Array<{ kind: string; elementId?: string; content?: string }>): string {
-    return cardKitCalls.find((c) => c.kind === "stream" && c.elementId === "final_md")?.content ?? "";
+  function finalCardText(cardKitCalls: Array<{ kind: string; payload?: unknown }>): string {
+    return finalCardMarkdown(cardKitCalls);
   }
 
   it("(a) increments + persists the counter on an idle-kill (below threshold → session kept, 请重试 card)", async () => {
@@ -7772,12 +7791,9 @@ describe("批G G6 — mechanical memory-visibility card tail", () => {
     await h.handler.run();
     await h.handler.whenAllTurnsSettled();
 
-    // finalize() streams the FULL final markdown (answer + mechanical tail)
-    // as the LAST final_md write; the first one was the mid-turn snapshot.
-    const finalStreams = (h.cardKitCalls ?? []).filter(
-      (c) => c.kind === "stream" && c.elementId === "final_md",
-    );
-    const finalText = finalStreams[finalStreams.length - 1]?.content ?? "";
+    // The final card (updateCardEntity) carries the FULL final markdown
+    // (answer + mechanical tail); mid-turn writes only held the snapshot.
+    const finalText = finalCardMarkdown(h.cardKitCalls ?? []);
     expect(finalText).toContain(answer);
     expect(finalText).toContain("📝 本轮期间变更了 memory/preferences.md");
     expect(h.metrics).toContainEqual(
