@@ -6515,6 +6515,27 @@ describe("canCoalesceFollowup (批D gated coalescing)", async () => {
     });
     expect(canCoalesceFollowup(primary as never, image as never)).toBe(false);
   });
+
+  it("rejects a follow-up that @-mentions someone besides this bot or quotes an earlier message (those facts come from the primary only)", () => {
+    const primary = mkEvent();
+    const mention = (id: string, name: string) => ({ key: "@_user_1", id: { open_id: id }, name });
+    const withOther = mkEvent({
+      message_id: "om_f1",
+      content: textContent("@_user_1 @_user_2 please sync"),
+      mentions: [mention("ou_test_bot", "Bot"), { ...mention("ou_test_peer", "Peer"), key: "@_user_2" }],
+    });
+    expect(canCoalesceFollowup(primary as never, withOther as never, undefined, "ou_test_bot")).toBe(false);
+    const botOnly = mkEvent({
+      message_id: "om_f2",
+      content: textContent("@_user_1 also this"),
+      mentions: [mention("ou_test_bot", "Bot")],
+    });
+    expect(canCoalesceFollowup(primary as never, botOnly as never, undefined, "ou_test_bot")).toBe(true);
+    const quote = mkEvent({ message_id: "om_f3", parent_id: "om_earlier_card", content: textContent("fix item 2 here") });
+    expect(canCoalesceFollowup(primary as never, quote as never, undefined, "ou_test_bot")).toBe(false);
+    const replyToRoot = mkEvent({ message_id: "om_f4", parent_id: "om_root", content: textContent("and this") });
+    expect(canCoalesceFollowup(primary as never, replyToRoot as never, undefined, "ou_test_bot")).toBe(true);
+  });
 });
 
 // ---------------------------------------------------------------------------

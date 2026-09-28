@@ -50,6 +50,7 @@ import {
   ensureSessionArtifacts,
 } from "../agent/sessionArtifacts.js";
 import { findSessionHarvest } from "../housekeeping/harvest.js";
+import { mentionedOthers, quotedMessageId } from "../agent/triggerFacts.js";
 import { discoverWorkspaceRepoDirs } from "../agent/workspaceRepos.js";
 import type { FreshStartReason } from "../claude/sessionStore.js";
 import { resolveKnowledgeDir, resolveBotLarkCliDir, resolveAgentWorkspacePath, resolveAgentHomeSessionsDir } from "../config/paths.js";
@@ -558,11 +559,16 @@ async function isWorktreeGitHealthy(worktreePath: string): Promise<boolean> {
  *    followup (whose keys ride per-message prompt facts) and an empty-@
  *    followup (whose contract is "pull the thread history first") each keep
  *    their own turn.
+ *  - The candidate neither @-mentions someone besides this bot nor quotes a
+ *    specific earlier message: those facts (mentioned_others / quoted_message)
+ *    are rendered from the turn's primary message only, so a merged followup
+ *    would lose them.
  */
 export function canCoalesceFollowup(
   primary: import("../lark/transport.js").LarkMessageEvent,
   candidate: import("../lark/transport.js").LarkMessageEvent,
   keyOpts?: SessionKeyOptions,
+  selfOpenId?: string,
 ): boolean {
   if (primary.larkway_trigger_type != null || candidate.larkway_trigger_type != null) return false;
   if (primary.reply_anchor_message_id != null || candidate.reply_anchor_message_id != null) return false;
@@ -576,6 +582,7 @@ export function canCoalesceFollowup(
     const parsed = parseMessage(candidate);
     if (parsed.attachments.length > 0) return false;
     if (parsed.text.trim() === "") return false;
+    if (mentionedOthers(parsed, selfOpenId).length > 0 || quotedMessageId(parsed) !== undefined) return false;
   } catch {
     return false;
   }
@@ -1651,7 +1658,7 @@ export class BridgeHandler {
           const primary = pending?.shift();
           if (primary == null) return; // absorbed into an earlier drain's merged turn
           const followups: import("../lark/transport.js").LarkMessageEvent[] = [];
-          while (pending != null && pending.length > 0 && canCoalesceFollowup(primary, pending[0]!, keyOpts)) {
+          while (pending != null && pending.length > 0 && canCoalesceFollowup(primary, pending[0]!, keyOpts, this.deps.botConfig?.bot_open_id)) {
             followups.push(pending.shift()!);
           }
           if (followups.length > 0) {
