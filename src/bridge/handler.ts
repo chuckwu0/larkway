@@ -321,6 +321,15 @@ function idleThresholdHint(idleTimeoutMs: number, idleKillAfterMs?: number): str
 const COT_BUBBLE_CREATE_BUDGET_MS = 3_000;
 
 /**
+ * How long a turn's handoff mirror posts wait for its COT bubble to land. A
+ * new topic's bubble is created after the card without being awaited (WP-2
+ * c) while the mirror of a peer in another process goes out alongside the
+ * final card (WP-8), so a quick turn could post the mirror between the card
+ * and the bubble. Bounded: a slow or failed create never holds a handoff.
+ */
+const HANDOFF_BUBBLE_WAIT_MS = 1_000;
+
+/**
  * WP-0: the success-path perf sample is written once the turn is delivered, so
  * it carries the post-runner timeline. A tail (declare hooks + finalize +
  * handoffs) still running this long after the runner finished writes the
@@ -1092,6 +1101,11 @@ export interface BridgeHandlerDeps {
    * the background. @default COT_BUBBLE_CREATE_BUDGET_MS (3s). Test seam.
    */
   cotBubbleCreateBudgetMs?: number;
+  /**
+   * Max ms the handoff mirror posts wait for this turn's COT bubble to land.
+   * @default HANDOFF_BUBBLE_WAIT_MS (1s). Test seam.
+   */
+  handoffBubbleWaitMs?: number;
   /**
    * WP-10: max ms a model-first turn waits for the in-topic task-root probe.
    * @default MODEL_FIRST_ROOT_PROBE_BUDGET_MS (1s). Test seam.
@@ -3368,6 +3382,8 @@ export class BridgeHandler {
           knowledgeMap,
           agentMemory,
           larkCliProfile: this.deps.larkCliProfile,
+          // Same condition as the runner's larkCliConfigDir below (BL-50).
+          larkCliSharedConfig: !(this.deps.botConfig?.id && this.deps.botConfig.lark_cli_isolated !== false),
           runtimeWarnings,
           runtimeWarningsChanged,
           taskHandleTasklistGuid: this.deps.botConfig?.taskHandle?.tasklistGuid,
@@ -4951,6 +4967,17 @@ export class BridgeHandler {
               ? (async (): Promise<void> => {
                   const handoffsStartedAt = Date.now();
                   try {
+                    // Topic order card → bubble → mirror: a post-card bubble
+                    // still being created is waited for, within a bound.
+                    if (bubbleCreate) {
+                      await Promise.race([
+                        bubbleCreate.catch(() => undefined),
+                        new Promise((resolve) => {
+                          const t = setTimeout(resolve, this.deps.handoffBubbleWaitMs ?? HANDOFF_BUBBLE_WAIT_MS);
+                          t.unref?.();
+                        }),
+                      ]);
+                    }
                     const outcomes = await processHandoffs({
                       handoffs: declaredHandoffs,
                       // WP-2 (b): a delta turn rendered without the live roster, so

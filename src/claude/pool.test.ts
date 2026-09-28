@@ -750,6 +750,58 @@ describe("ClaudeProcessPool — kill()/interrupt", () => {
   });
 });
 
+describe("ClaudeProcessPool — answer text held back at a cut-off turn end", () => {
+  const body = "An answer cut off before its block ended, tail included.";
+  const textDelta = (text: string) =>
+    JSON.stringify({ type: "stream_event", event: { type: "content_block_delta", index: 0, delta: { type: "text_delta", text } } });
+  const answerOf = (events: AgentStreamEvent[]) => {
+    let answer = "";
+    for (const ev of events) {
+      if (ev.type === "answer_delta") answer += ev.text;
+      else if (ev.type === "answer_snapshot") answer = ev.text;
+    }
+    return answer;
+  };
+  async function startCutTurn() {
+    const pool = new ClaudeProcessPool({ botId: "bot-a" });
+    const handle = pool.run({ prompt: "long task", cwd: "/wt/thread-1", threadId: "thread-1" });
+    const events: AgentStreamEvent[] = [];
+    const collected = (async () => {
+      for await (const ev of handle.events) events.push(ev);
+    })();
+    await flush();
+    const child = spawnedChildren[0]!;
+    child.stdout.write(systemInit("s1") + "\n");
+    for (const text of ["LARKWAY_ANSWER_BEGIN\n", body.slice(0, 20), body.slice(20)]) {
+      child.stdout.write(textDelta(text) + "\n");
+    }
+    await flush();
+    return { handle, child, events, collected };
+  }
+
+  it("a /stop whose result comes without the cut block's snapshot releases the held tail", async () => {
+    const { handle, child, events, collected } = await startCutTurn();
+    handle.kill();
+    await flush();
+    const interruptReq = readOutboundLines(child).find((l) => l["type"] === "control_request");
+    child.stdout.write(controlResponse(interruptReq!["request_id"] as string) + "\n");
+    child.stdout.write(resultLine("error_during_execution") + "\n");
+    await flush();
+    await handle.done;
+    await collected;
+    expect(answerOf(events)).toBe(body);
+  });
+
+  it("a warm process that dies mid-block still delivers the held tail", async () => {
+    const { handle, child, events, collected } = await startCutTurn();
+    child.emit("exit");
+    await flush();
+    await expect(handle.done).rejects.toThrow();
+    await collected;
+    expect(answerOf(events)).toBe(body);
+  });
+});
+
 // ---------------------------------------------------------------------------
 // cold fallback — warm process dies before any turn output
 // ---------------------------------------------------------------------------

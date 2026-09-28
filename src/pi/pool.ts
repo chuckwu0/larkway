@@ -758,6 +758,11 @@ export class PiProcessPool implements AgentRunner {
     state.settled = true;
     if (state.timeoutHandle) clearTimeout(state.timeoutHandle);
     if (state.abortEscalateTimer) clearTimeout(state.abortEscalateTimer);
+    // A warm turn that ends without agent_settled (the process died or was
+    // killed mid-turn) still delivers the answer text the extractor holds.
+    if (!state.coldHandle) {
+      for (const ev of state.decoder.finish()) state.queue.push(ev);
+    }
     state.queue.end();
     if (state.entry?.current === state) {
       state.entry.current = undefined;

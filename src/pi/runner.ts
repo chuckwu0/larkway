@@ -212,6 +212,9 @@ function asRecord(value: unknown): JsonRecord | undefined {
  *   {"type":"message_update","assistantMessageEvent":{"type":"thinking_delta","delta":"..."}}
  *     → {type:"thinking_delta", text, raw}   (COT bubble only)
  *
+ *   {"type":"message_update","assistantMessageEvent":{"type":"text_end",...}}
+ *     → extractor flush (the block boundary), then {type:"raw"}
+ *
  *   {"type":"tool_execution_start","toolCallId","toolName","args"}
  *     → {type:"tool_use", toolName, toolInput: args, raw}
  *
@@ -223,10 +226,11 @@ function asRecord(value: unknown): JsonRecord | undefined {
  *       deltas already streamed; markerless catch-up as internal_text);
  *       thinking → thinking_snapshot. Tool-call blocks are not re-emitted
  *       here — tool_execution_start is the single tool_use source, so the
- *       handler's toolsInFlight counter stays balanced.
+ *       handler's toolsInFlight counter stays balanced. Then an extractor
+ *       flush (the message is over).
  *
  *   {"type":"agent_settled"}
- *     → {type:"result", stopReason:"end_turn", raw}
+ *     → extractor flush, then {type:"result", stopReason:"end_turn", raw}
  *     NOT agent_end: pi retries transient provider errors (429/5xx, default
  *     retry.maxRetries=3 with backoff) and continues after an overflow
  *     compaction IN-PROCESS, and every such continuation re-emits
@@ -273,7 +277,9 @@ function* parsePiRecord(
   }
 
   // ── agent_settled → result (see doc comment: agent_end may repeat) ──────
+  // The answer text the extractor still holds goes out first.
   if (topType === "agent_settled") {
+    yield* answerExtractor.flush(obj);
     yield { type: "result", stopReason: "end_turn", raw: obj };
     return;
   }
@@ -291,6 +297,9 @@ function* parsePiRecord(
       yield { type: "thinking_delta", text: delta, raw: obj };
       return;
     }
+    // A text block ended: its deltas ran on straight into the next block's
+    // before message_end, so this is where the extractor learns the boundary.
+    if (evType === "text_end") yield* answerExtractor.flush(obj);
     yield { type: "raw", raw: obj };
     return;
   }
@@ -327,6 +336,9 @@ function* parsePiRecord(
           emitted = true;
         }
       }
+      // The message is over. An error one may carry no text at all, and pi
+      // then retries in-process with a fresh BEGIN line.
+      yield* answerExtractor.flush(obj);
       if (!emitted) yield { type: "raw", raw: obj };
       return;
     }
@@ -487,6 +499,17 @@ export class PiTurnDecoder {
       }
       markPerfForEventType(this.#markPerf, out.type);
       yield out;
+    }
+  }
+
+  /**
+   * stdout ended: what the answer extractor still holds, for a turn cut off
+   * before `agent_settled` (a killed pi). Adds nothing after one.
+   */
+  *finish(): Generator<AgentStreamEvent> {
+    for (const event of this.#answerExtractor.flush({ type: "larkway_stream_end" })) {
+      markPerfForEventType(this.#markPerf, event.type);
+      yield event;
     }
   }
 
@@ -766,11 +789,13 @@ export function runPi(opts: RunOptions, piBinPath = "pi"): RunHandle {
           yield event;
         }
       }
+      yield* decoder.finish();
     } catch (err) {
       const isAbort =
         err instanceof Error && (err.name === "AbortError" || (err as NodeJS.ErrnoException).code === "ABORT_ERR");
       if (!isAbort) throw err;
       console.debug("[pi-runner] readline aborted (child exited with stdout still open) — exiting generateEvents");
+      yield* decoder.finish();
     } finally {
       rl.close();
       generatorState = "finished";

@@ -328,6 +328,29 @@ describe("runPi()", () => {
     __lastSpawnArgs = [];
   });
 
+  it("a killed pi (stdout ends mid-block, no agent_settled) still delivers the answer's held tail", async () => {
+    const fake = makeFakeChild();
+    __nextFakeChild = fake;
+    const { runPi } = await import("./runner.js");
+    const handle = runPi({ prompt: "x", agentBinPath: "/fake/pi", pidFilePath: null });
+    const body = "An answer cut off before its block ended, tail included.";
+    let answer = "";
+    const loop = (async () => {
+      for await (const ev of handle.events) {
+        if (ev.type === "answer_delta") answer += ev.text;
+        else if (ev.type === "answer_snapshot") answer = ev.text;
+      }
+    })();
+    await new Promise<void>((resolve) => setImmediate(() => {
+      fake.stdout.write('{"type":"session","version":3,"id":"s","timestamp":"t","cwd":"/w"}\n');
+      for (const d of ["LARKWAY_ANSWER_BEGIN\n", body.slice(0, 20), body.slice(20)]) fake.stdout.write(textDelta(d) + "\n");
+      setImmediate(() => { fake.triggerClose(0); resolve(); });
+    }));
+    await loop;
+    await handle.done;
+    expect(answer).toBe(body);
+  });
+
   it("writes the prompt to stdin, discovers the session id, resolves done on close", async () => {
     const fake = makeFakeChild();
     __nextFakeChild = fake;

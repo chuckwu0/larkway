@@ -351,7 +351,8 @@ describe("AnswerChannelExtractor — block snapshot after streamed deltas (WP-6)
         claude.blocks([second]),
       ]);
 
-      expect(answer).toBe("Part one of the answer, long enough to stream.Part two.");
+      // Nothing at the joint separates the blocks: the second starts on a new line.
+      expect(answer).toBe("Part one of the answer, long enough to stream.\nPart two.");
     });
 
     it("pi: a BEGIN line glued to the previous block in the delta stream is recovered from the message_end blocks", () => {
@@ -555,7 +556,7 @@ describe("AnswerChannelExtractor — block snapshot after streamed deltas (WP-6)
         claude.blocks([second]),
       ]);
 
-      expect(answer).toBe(`Part one of the answer, long enough.${second}`);
+      expect(answer).toBe(`Part one of the answer, long enough.\n${second}`);
     });
 
     it.each<[string, string[]]>([
@@ -680,5 +681,140 @@ describe("AnswerChannelExtractor — block snapshot after streamed deltas (WP-6)
     const streamedAnswer = streamed.flatMap((event) => (event.type === "answer_delta" ? [event.text] : []));
     expect(streamedAnswer.join("")).toBe(body);
     expect(answerTypes(unrelated)).toEqual([]);
+  });
+
+  // The runners call flush() where a block or the turn ends (claude `result`;
+  // pi `text_end`, assistant `message_end`, `agent_settled`), and a block
+  // that continues the answer starts on a new line when nothing at the joint
+  // separates it from the text before.
+  describe("runner block ends and block joints (integrated review)", () => {
+    const [claude, pi] = backends as [Backend, Backend];
+    const claudeToolUse = JSON.stringify({
+      type: "assistant",
+      message: { content: [{ type: "tool_use", id: "call_1", name: "Read", input: {} }] },
+    });
+    const claudeResult = JSON.stringify({ type: "result", subtype: "success", stop_reason: "end_turn" });
+    const piTextEnd = (content: string) =>
+      JSON.stringify({ type: "message_update", assistantMessageEvent: { type: "text_end", contentIndex: 0, content } });
+    const piSettled = JSON.stringify({ type: "agent_settled" });
+    /** pi deltas of one message's blocks, each closed by text_end, then message_end. */
+    const piMessage = (blocks: string[], stopReason = "stop") => [
+      ...blocks.flatMap((block) => [...chunks(block).map(pi.delta), piTextEnd(block)]),
+      JSON.stringify({
+        type: "message_end",
+        message: { role: "assistant", stopReason, content: blocks.map((text) => ({ type: "text", text })) },
+      }),
+    ];
+
+    /** Answer text after every line, to catch a transient marker leak. */
+    function states(backend: Backend, lines: string[]): string[] {
+      const extractor = new AnswerChannelExtractor();
+      let answer = "";
+      return lines.map((line) => {
+        for (const event of backend.parse(line, extractor)) {
+          if (event.type === "answer_delta") answer += event.text;
+          else if (event.type === "answer_snapshot") answer = event.text;
+        }
+        return answer;
+      });
+    }
+    const leaked = (all: string[]) =>
+      all.some((state) => state.includes(ANSWER_BEGIN_MARKER) || state.includes(ANSWER_END_MARKER));
+
+    it("claude: a result after deltas with no block snapshot releases the held tail", () => {
+      const answerBody = "Short interrupted answer, the answer text.";
+      const all = states(claude, [...chunks(`${ANSWER_BEGIN_MARKER}\n${answerBody}`).map(claude.delta), claudeResult]);
+
+      expect(all.at(-2)).not.toBe(answerBody);
+      expect(all.at(-1)).toBe(answerBody);
+    });
+
+    it.each<[string, string, string, string]>([
+      ["no whitespace at the joint", "Checked the long file.", "Done.", "Checked the long file.\nDone."],
+      ["the next block opens with a space", "Checked the long file.", " Done.", "Checked the long file. Done."],
+      ["the next block opens with a line break", "Checked the long file.", "\nDone.", "Checked the long file.\nDone."],
+      ["the answer so far ends in a line break", "Checked the long file.\n", "Done.", "Checked the long file.\nDone."],
+    ])("claude: the text block after a tool call joins the open answer (%s)", (_label, first, second, want) => {
+      const firstBlock = `${ANSWER_BEGIN_MARKER}\n${first}`;
+      const all = states(claude, [
+        ...chunks(firstBlock).map(claude.delta),
+        claude.blocks([firstBlock]),
+        claudeToolUse,
+        ...chunks(second).map(claude.delta),
+        claude.blocks([second]),
+        claudeResult,
+      ]);
+
+      expect(all.at(-1)).toBe(want);
+      expect(leaked(all)).toBe(false);
+    });
+
+    it("claude: an END-only block after a tool call closes the answer without adding a line", () => {
+      const firstBlock = `${ANSWER_BEGIN_MARKER}\nThe answer, long enough to stream out.`;
+      const all = states(claude, [
+        ...chunks(firstBlock).map(claude.delta),
+        claude.blocks([firstBlock]),
+        claudeToolUse,
+        ...chunks(ANSWER_END_MARKER).map(claude.delta),
+        claude.blocks([ANSWER_END_MARKER]),
+        claudeResult,
+      ]);
+
+      expect(all.at(-1)).toBe("The answer, long enough to stream out.");
+      expect(leaked(all)).toBe(false);
+    });
+
+    it("pi: a later block of the same message that re-opens the answer with an END line replaces it, never leaking BEGIN", () => {
+      const all = states(pi, [
+        ...piMessage([`${ANSWER_BEGIN_MARKER}\nDraft answer.`, `${ANSWER_BEGIN_MARKER}\nFinal answer.\n${ANSWER_END_MARKER}`]),
+        piSettled,
+      ]);
+
+      expect(all.at(-1)).toBe("Final answer.");
+      expect(leaked(all)).toBe(false);
+    });
+
+    it("pi: text blocks of one message join like claude's blocks", () => {
+      const all = states(pi, [
+        ...piMessage([`${ANSWER_BEGIN_MARKER}\nAnswer part A.`, "Part B.", " Part C."]),
+        piSettled,
+      ]);
+
+      expect(all.at(-1)).toBe("Answer part A.\nPart B. Part C.");
+      expect(leaked(all)).toBe(false);
+    });
+
+    it("pi: after an error message_end without text, the retried message with an END line replaces the answer", () => {
+      const cut = `${ANSWER_BEGIN_MARKER}\nFirst attempt answer that was cut`;
+      const retried = `${ANSWER_BEGIN_MARKER}\nSecond attempt answer, complete this time.\n${ANSWER_END_MARKER}`;
+      const all = states(pi, [
+        ...chunks(cut).map(pi.delta),
+        JSON.stringify({ type: "message_end", message: { role: "assistant", content: [], stopReason: "error" } }),
+        ...piMessage([retried]),
+        piSettled,
+      ]);
+
+      expect(all.at(-1)).toBe("Second attempt answer, complete this time.");
+      expect(leaked(all)).toBe(false);
+    });
+
+    it("pi: agent_settled after deltas with no message_end releases the held tail", () => {
+      const answerBody = "Partial answer cut off here, the tail.";
+      const all = states(pi, [...chunks(`${ANSWER_BEGIN_MARKER}\n${answerBody}`).map(pi.delta), piSettled]);
+
+      expect(all.at(-2)).not.toBe(answerBody);
+      expect(all.at(-1)).toBe(answerBody);
+    });
+
+    it("pi: a block snapshot longer than its deltas continues the block after text_end, with no line break", () => {
+      const all = states(pi, [
+        ...chunks(`${ANSWER_BEGIN_MARKER}\nHello wor`).map(pi.delta),
+        piTextEnd(`${ANSWER_BEGIN_MARKER}\nHello wor`),
+        pi.blocks([`${ANSWER_BEGIN_MARKER}\nHello world, the rest of it.`]),
+        piSettled,
+      ]);
+
+      expect(all.at(-1)).toBe("Hello world, the rest of it.");
+    });
   });
 });

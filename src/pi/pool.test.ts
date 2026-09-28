@@ -627,6 +627,29 @@ describe("PiProcessPool cold fallback", () => {
     expect(coldChildren()).toHaveLength(0);
   });
 
+  it("a death mid-block still delivers the answer text held back for a possible END marker", async () => {
+    const pool = newPool();
+    const body = "An answer cut off before its block ended, tail included.";
+    setupChild = (c) => {
+      c.onPrompt = (child) => {
+        child.send({ type: "agent_start" });
+        for (const delta of ["LARKWAY_ANSWER_BEGIN\n", body.slice(0, 20), body.slice(20)]) {
+          child.send({ type: "message_update", assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta } });
+        }
+        setImmediate(() => child.exit(1));
+      };
+    };
+    const handle = pool.run({ ...BASE, prompt: "p", threadId: "t1" });
+    const events = collect(handle);
+    await expect(handle.done).rejects.toThrow(/mid-turn/);
+    let answer = "";
+    for (const ev of await events) {
+      if (ev.type === "answer_delta") answer += ev.text;
+      else if (ev.type === "answer_snapshot") answer = ev.text;
+    }
+    expect(answer).toBe(body);
+  });
+
   it("a process busy with a run larkway did not start is retired and the turn runs cold", async () => {
     const pool = newPool();
     setupChild = (c) => {

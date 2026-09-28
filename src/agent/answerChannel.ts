@@ -35,6 +35,16 @@ function hasUsefulText(text: string): boolean {
 }
 
 /**
+ * Whether a content block that continues the answer (the text after a tool
+ * call, or a later text block of the same message) needs a line break in
+ * front of it: neither the answer written so far nor the block brings
+ * whitespace to the joint, so the two would run together ("…long.Done.").
+ */
+function needsBlockBreak(answer: string, blockText: string): boolean {
+  return answer.length > 0 && blockText.length > 0 && !/\s$/.test(answer) && !/^\s/.test(blockText);
+}
+
+/**
  * Length of the BEGIN line `text` opens with, 0 when it opens with anything
  * else, or null while `text` could still grow into one. `complete` marks the
  * end of the block: a BEGIN without its line break then counts as the line.
@@ -89,10 +99,14 @@ export class AnswerChannelExtractor {
   // drain() matched a BEGIN line at the very end of the buffer, before its
   // line break arrived: that break belongs to the marker line, not the answer.
   private beginLineBreakPending = false;
+  // flush() ran after the last delta: the streamed text ends at a block end
+  // (see the unseen-suffix branch of ingestStreamedBlockSnapshot).
+  private flushedSinceDelta = false;
 
   ingestDelta(text: string, raw: unknown): AgentStreamEvent[] {
     if (!text || this.mode === "closed") return [];
     this.sawDelta = true;
+    this.flushedSinceDelta = false;
     if (this.mode === "answer" && this.blockDeltaAnswerFrom === Infinity) {
       this.blockDeltaAnswerFrom = this.blockDeltaText.length;
     }
@@ -116,16 +130,15 @@ export class AnswerChannelExtractor {
    * snapshot that still arrives, so calling this before or after one is
    * harmless.
    *
-   * No runner calls this yet; in production the block snapshots are the
-   * only block ends the extractor sees. The places that know a block or
-   * turn ended are claude `content_block_stop` / `result` and pi
-   * `text_end`, every assistant `message_end` (an error one may carry no
-   * text before pi retries in-process) and `agent_settled`. Until one of
-   * them calls this, a turn cut off before its snapshot still loses the
-   * held tail, and a pi retry after an error message_end without text can
-   * keep the failed attempt's text in the answer.
+   * Called by the runners where a block or the turn is known to have ended:
+   * claude at `result` (a /stop'd warm turn gets one without the cut block's
+   * snapshot), pi at `text_end`, after every assistant `message_end` (an
+   * error one may carry no text before pi retries in-process) and at
+   * `agent_settled`, and both one-shot runners when stdout ends without
+   * those (a killed process).
    */
   flush(raw: unknown): AgentStreamEvent[] {
+    this.flushedSinceDelta = true;
     return this.endBlock(raw);
   }
 
@@ -230,6 +243,10 @@ export class AnswerChannelExtractor {
       events.push(...this.feed(text.slice(0, carried), raw));
     }
     if (carried > 0 && carried < text.length) {
+      // The suffix continues this block. A flush() after its last delta
+      // (pi text_end) already marked the block's end; the suffix must not
+      // be taken for the start of the next block.
+      if (this.flushedSinceDelta) this.atBlockStart = false;
       this.answerOpenedAt = null;
       events.push(...this.feed(text.slice(carried), raw));
       if (this.answerOpenedAt !== null) openedHere = true;
@@ -335,8 +352,10 @@ export class AnswerChannelExtractor {
    * followed by the final one, or pi retrying a failed attempt). The block's
    * answer replaces the visible one — an empty answer_snapshot first — as a
    * block snapshot with a BEGIN line does (adoptBlockSnapshot). A BEGIN line
-   * further into a block is left to that snapshot. Returns false while the
-   * block's opening text is still undecided.
+   * further into a block is left to that snapshot. Any other block continues
+   * the answer, on a new line when nothing at the joint separates the two
+   * (needsBlockBreak). Returns false while the block's opening text is still
+   * undecided.
    */
   private resolveBlockStart(complete: boolean, events: AgentStreamEvent[], raw: unknown): boolean {
     const lineLength = leadingBeginLineLength(this.buffer, complete);
@@ -347,6 +366,9 @@ export class AnswerChannelExtractor {
       this.answerOpenedAt = this.buffer.length;
       if (this.visibleText) events.push({ type: "answer_snapshot", text: "", raw });
       this.visibleText = "";
+    } else if (needsBlockBreak(this.visibleText, this.buffer)) {
+      // Prepended, so the buffer still ends where the streamed text does.
+      this.buffer = `\n${this.buffer}`;
     }
     return true;
   }

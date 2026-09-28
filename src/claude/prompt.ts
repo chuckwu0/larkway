@@ -70,6 +70,15 @@ export interface RenderPromptInput {
   agentMemory?: string;
   extraRepoPaths?: RepoRef[];
   larkCliProfile?: string;
+  /**
+   * The bot's lark-cli reads the host's shared config (`lark_cli_isolated:
+   * false`, or no bot id): there the profile is what picks this bot's
+   * identity, so delta turns repeat it — native compaction may drop the full
+   * prompt's pointers, and a lark-cli call without it would act as the
+   * host's default profile. An isolated config dir holds only this bot's
+   * profile. Absent = isolated.
+   */
+  larkCliSharedConfig?: boolean;
   runtimeWarnings?: RuntimeWarning[];
   /**
    * Delta turns skip `<runtime-warnings>` only when the handler reports the
@@ -339,6 +348,7 @@ export async function renderPrompt(input: RenderPromptInput): Promise<string> {
     // and a real topic id survive native compaction as reply/history anchors.
     `message_id:       ${parsed.messageId}`,
     `chat_id:          ${parsed.chatId}`,
+    ...(input.larkCliSharedConfig && input.larkCliProfile ? [`lark_cli_profile: ${input.larkCliProfile} (bot身份)`] : []),
     ...(owner !== "unknown" ? [`sender_is_owner:  ${owner}`] : []),
     ...(trigger.triggerType !== DEFAULT_CONTINUATION_TRIGGER_TYPE ? [`trigger_type:     ${trigger.triggerType}`] : []),
     ...(!DEFAULT_MENTION_TYPES.has(trigger.mentionType) ? [`mention_type:     ${trigger.mentionType}`] : []),

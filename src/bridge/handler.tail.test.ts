@@ -9,6 +9,8 @@
  *     another process posts its mirror while the card is finalized;
  *   - a final card that fails still lets the handoffs through, and the turn's
  *     failure is recorded after them;
+ *   - the mirror posts wait (bounded) for the turn's COT bubble, so a quick
+ *     new-topic turn keeps the order card → bubble → mirror;
  *   - a bridge-created guid is handed to the claim as trustedGuid.
  * Drives the REAL handler with the latency bench's fakes (./testFakes.ts);
  * no Feishu, no model, no subprocess.
@@ -22,6 +24,7 @@ import type { PeerBot } from "../claude/prompt.js";
 import { registerRunner, type AgentStreamEvent, type RunHandle, type RunOptions } from "../agent/runner.js";
 import type { BotConfig } from "../config/botLoader.js";
 import type { OutboundCardKitClient } from "../lark/channelCardKitClient.js";
+import type { OutboundCotClient } from "../lark/channelCotClient.js";
 import type { OutboundPostClient } from "../lark/outboundPostClient.js";
 import type { InboundClient, LarkMessageEvent } from "../lark/transport.js";
 import type { TaskHandleClaimPatch } from "../tasklist/types.js";
@@ -518,6 +521,67 @@ describe("WP-8: handoff mirror posts run alongside the final card", () => {
 
     expectBefore(log, "claim:end", "mirror");
     expectBefore(log, "mirror", "dispatch:om_test_mirror");
+  });
+
+  /** COT client whose bubble create lands only once `release` resolves. */
+  function gatedCotClient(log: string[], release: Promise<void>): OutboundCotClient {
+    return {
+      async create() {
+        await release;
+        log.push("bubble");
+        return { cotId: "cot_test", messageId: "om_test_cot" };
+      },
+      async resolveThreadId() {
+        return undefined;
+      },
+      async update() {},
+      async complete() {},
+    };
+  }
+
+  it("a quick new-topic turn posts the mirror only after its post-card COT bubble landed", async () => {
+    const log: string[] = [];
+    const create = deferred();
+    registerStateRunner(HANDOFF_STATE);
+    const { client, outcomes } = singleEventClient(newTopicEvent(), log);
+    const { handler } = makeHandler({
+      client,
+      cardKitClient: loggingCardKitClient(log),
+      log,
+      deps: { ...handoffDeps(log, false), cotClient: gatedCotClient(log, create.promise), handoffBubbleWaitMs: 60_000 },
+    });
+
+    const running = runAll(handler);
+    await vi.waitFor(() => expect(log).toContain("updateCardSettings:end"), CI_WAIT);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(log).not.toContain("mirror");
+
+    create.resolve();
+    await running;
+
+    expect(outcomes).toEqual(["handled:om_test_new"]);
+    expectBefore(log, "bubble", "mirror");
+  });
+
+  it("a bubble create that does not land holds the mirror no longer than the wait bound", async () => {
+    const log: string[] = [];
+    const create = deferred();
+    registerStateRunner(HANDOFF_STATE);
+    const { client, outcomes } = singleEventClient(newTopicEvent(), log);
+    const { handler, events } = makeHandler({
+      client,
+      cardKitClient: loggingCardKitClient(log),
+      log,
+      deps: { ...handoffDeps(log, false), cotClient: gatedCotClient(log, create.promise), handoffBubbleWaitMs: 20 },
+    });
+
+    await runAll(handler);
+
+    expect(outcomes).toEqual(["handled:om_test_new"]);
+    expect(log).toContain("mirror");
+    expect(log).not.toContain("bubble");
+    expect(events.find((e) => e.appendPath === "peer handoff")?.reason).toContain("镜像 post 已发");
+    create.resolve(); // let the late bubble be adopted and completed
   });
 
   it("a final card that fails still hands off; the turn's failure is recorded after the dispatch", async () => {

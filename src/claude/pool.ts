@@ -782,6 +782,7 @@ export class ClaudeProcessPool implements AgentRunner {
     if (state.settled) return;
     state.settled = true;
     this.#clearStateTimers(state);
+    this.#flushAnswer(state);
     state.queue.end();
     if (state.entry?.current === state) {
       state.entry.current = undefined;
@@ -794,12 +795,26 @@ export class ClaudeProcessPool implements AgentRunner {
     if (state.settled) return;
     state.settled = true;
     this.#clearStateTimers(state);
+    this.#flushAnswer(state);
     state.queue.end();
     if (state.entry?.current === state) {
       state.entry.current = undefined;
       state.entry.lastUsedAt = Date.now();
     }
     state.rejectDone(err);
+  }
+
+  /**
+   * A warm turn that ends without its `result` (the process died, or an
+   * escalated interrupt killed it) still delivers the answer text the
+   * extractor holds. After a `result` (which flushes it) this adds nothing.
+   */
+  #flushAnswer(state: TurnState): void {
+    if (state.coldHandle) return;
+    for (const ev of state.answerExtractor.flush({ type: "larkway_stream_end" })) {
+      markPerfForEventType(state.markPerf, ev.type);
+      state.queue.push(ev);
+    }
   }
 
   #clearStateTimers(state: TurnState): void {

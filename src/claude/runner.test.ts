@@ -977,4 +977,41 @@ describe("runClaude() — grandchild-holds-stdout finalize unblock", () => {
 
     vi.useRealTimers();
   }, 15_000);
+
+  it("a killed claude (stdout ends mid-block, no result) still delivers the answer's held tail", async () => {
+    const fake = makeFakeChild();
+    __nextFakeChild = fake;
+    const { runClaude } = await import("./runner.js");
+    const handle = runClaude({ prompt: "test", agentBinPath: "/fake/claude" });
+    const body = "An answer cut off before its block ended, tail included.";
+    let answer = "";
+    const eventsLoopDone = (async () => {
+      for await (const ev of handle.events) {
+        if (ev.type === "answer_delta") answer += ev.text;
+        else if (ev.type === "answer_snapshot") answer = ev.text;
+      }
+    })();
+
+    await new Promise<void>((resolve) => setImmediate(() => {
+      fake.stdout.write(JSON.stringify({ type: "system", subtype: "init", session_id: "sess_killed" }) + "\n");
+      for (const text of [`${ANSWER_BEGIN_MARKER}\n`, body.slice(0, 20), body.slice(20)]) {
+        fake.stdout.write(
+          JSON.stringify({
+            type: "stream_event",
+            event: { type: "content_block_delta", index: 0, delta: { type: "text_delta", text } },
+          }) + "\n",
+        );
+      }
+      fake.stdout.end();
+      fake.child.emit("exit", 0);
+      setImmediate(() => {
+        fake.child.emit("close", 0);
+        resolve();
+      });
+    }));
+
+    await eventsLoopDone;
+    await handle.done;
+    expect(answer).toBe(body);
+  });
 });

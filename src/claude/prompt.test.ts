@@ -445,6 +445,23 @@ describe("delta thread facts", () => {
     expect(facts.split("\n").filter((line) => /^(trigger|mention)_type:/.test(line))).toEqual(expected);
   });
 
+  it("repeats the lark-cli profile only for a bot on the host's shared lark-cli config", async () => {
+    const line = "lark_cli_profile: test-profile (bot身份)";
+    const shared = await resumed({ larkCliProfile: "test-profile", larkCliSharedConfig: true });
+    expect(between(shared, "thread-context")).toContain(line);
+    for (const larkCliSharedConfig of [undefined, false]) {
+      const isolated = await resumed({ larkCliProfile: "test-profile", larkCliSharedConfig });
+      expect(isolated).not.toContain("lark_cli_profile");
+      expect(Array.from(shared).length - Array.from(isolated).length).toBe(Array.from(line).length + 1);
+    }
+    // No profile configured: nothing to repeat.
+    expect(await resumed({ larkCliSharedConfig: true })).not.toContain("lark_cli_profile");
+    // A full prompt keeps its single pointer line.
+    const full = await renderPrompt(makeInput({ larkCliProfile: "test-profile", larkCliSharedConfig: true }));
+    expect(full.split(line)).toHaveLength(2);
+    expect(between(full, "thread-context")).not.toContain("lark_cli_profile");
+  });
+
   it("lists resources only when present, with the raw pointer beside attachments", async () => {
     const plain = between(await resumed({ larkCliProfile: "test-profile" }), "thread-context");
     for (const key of ["raw_pointer", "attachments", "feishu_doc_links", "images", "(none)"]) expect(plain).not.toContain(key);

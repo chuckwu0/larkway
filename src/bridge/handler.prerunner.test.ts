@@ -703,3 +703,25 @@ describe("WP-2 (f): runtime-warnings send-on-change", () => {
     expect(vi.mocked(renderPrompt).mock.calls[0]?.[0].isNewThread).toBe(true);
   });
 });
+
+describe("lark-cli profile on delta turns", () => {
+  it.each([
+    ["shared lark-cli config (lark_cli_isolated: false)", { lark_cli_isolated: false }, true],
+    ["isolated lark-cli config (default)", {}, false],
+  ])("%s: the delta prompt repeats the profile: %s", async (_label, bot, shown) => {
+    const { captured } = registerScriptedRunner([{}]);
+    const { client, outcomes } = sequentialClient([continuationEvent("om_test_reply")]);
+    const { handler } = makeHandler({
+      client,
+      store: fakeSessionStore([existingSession()]),
+      bot,
+      deps: { larkCliProfile: "test-profile" },
+    });
+
+    await runAll(handler);
+
+    expect(outcomes).toEqual(["handled:om_test_reply"]);
+    expect(captured[0]?.prompt).not.toContain("<context-pointers>");
+    expect(captured[0]?.prompt.includes("lark_cli_profile: test-profile (bot身份)")).toBe(shown);
+  });
+});

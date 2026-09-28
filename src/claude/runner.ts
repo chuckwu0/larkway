@@ -420,6 +420,9 @@ function* parseLinesMulti(
   }
 
   if (eventType === "result") {
+    // The turn is over: the answer text the extractor still holds goes out
+    // first (a /stop'd warm turn ends here without the cut block's snapshot).
+    yield* answerExtractor.flush(obj);
     const stopReason =
       typeof record["stop_reason"] === "string" ? record["stop_reason"] : "unknown";
     yield { type: "result", stopReason, raw: obj, ...claudeResultUsage(record, usageState) };
@@ -836,6 +839,14 @@ export function runClaude(opts: RunOptions): RunHandle {
     // proceed to card.finalize() without waiting for stdout to drain).
     const answerExtractor = new AnswerChannelExtractor();
     const usageState = newClaudeTurnUsageState();
+    // stdout ended without a `result` (claude killed mid-turn): the answer
+    // text the extractor still holds. Adds nothing after a `result`.
+    function* flushAnswerAtStreamEnd(): Generator<AgentStreamEvent> {
+      for (const event of answerExtractor.flush({ type: "larkway_stream_end" })) {
+        markPerfForEventType(markPerf, event.type);
+        yield event;
+      }
+    }
 
     try {
       for await (const line of rl) {
@@ -856,6 +867,7 @@ export function runClaude(opts: RunOptions): RunHandle {
           yield event;
         }
       }
+      yield* flushAnswerAtStreamEnd();
     } catch (err) {
       // AbortError from rlAbortController.abort() — normal shutdown signal,
       // not a real error. Close the readline interface and exit the generator.
@@ -864,6 +876,7 @@ export function runClaude(opts: RunOptions): RunHandle {
         err instanceof Error && (err.name === "AbortError" || (err as NodeJS.ErrnoException).code === "ABORT_ERR");
       if (!isAbort) throw err;
       console.debug("[runner] readline aborted (child exited with stdout still open) — exiting generateEvents");
+      yield* flushAnswerAtStreamEnd();
     } finally {
       // Always close readline on generator exit to free the stdout listener.
       // This is idempotent — safe to call even if readline already closed.

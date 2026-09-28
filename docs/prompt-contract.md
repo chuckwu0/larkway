@@ -42,7 +42,7 @@ Larkway 传递飞书触发事实、可选资源指针和最小输出协议。任
 delta 续轮的 `thread-context` 只列会变化的事实，会话常量已在原生历史中：
 
 - 每轮：`message_id`、`chat_id`，以及 `thread_turn_count`、`thread_has_task_card`（如有）。`chat_id` 在原生压缩后仍是回帖和取历史的锚点。
-- 有值时：真实 `omt_` 话题的 `feishu_thread_id`；配置了 owner 时的 `sender_is_owner`；非空的 `attachments`、`images`、`feishu_doc_links`；原始消息含解析文本之外的内容时附 `raw_pointer`（有附件、正文里有资源标记如 `![image](…)` / `<file key=…/>`，或没有可读文本）。
+- 有值时：真实 `omt_` 话题的 `feishu_thread_id`；bot 使用宿主共享 lark-cli 配置（`lark_cli_isolated: false`）时的 `lark_cli_profile`（共享配置里靠 profile 选定本 bot 身份，原生压缩后首轮指针可能不在上下文中；独立配置目录只有本 bot 的 profile，不重复）；配置了 owner 时的 `sender_is_owner`；非空的 `attachments`、`images`、`feishu_doc_links`；原始消息含解析文本之外的内容时附 `raw_pointer`（有附件、正文里有资源标记如 `![image](…)` / `<file key=…/>`，或没有可读文本）。
 - 偏离常态时：`trigger_type`（常态为 `topic_continuation`）、`mention_type`（`bot_or_user_mention` 与 `no_mention_metadata` 都算常态：是否带 mention 元数据取决于送达路径，不反映用户行为）。
 - 只在完整 prompt 出现：`thread_id`、`session_key`、`is_new_thread`、`scene_type`、`chat_type`、`feishu_root_id`。
 
