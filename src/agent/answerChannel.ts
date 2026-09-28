@@ -34,6 +34,22 @@ function hasUsefulText(text: string): boolean {
   return text.length > 0;
 }
 
+/**
+ * Length of the BEGIN line `text` opens with, 0 when it opens with anything
+ * else, or null while `text` could still grow into one. `complete` marks the
+ * end of the block: a BEGIN without its line break then counts as the line.
+ */
+function leadingBeginLineLength(text: string, complete: boolean): number | null {
+  const marker = ANSWER_BEGIN_MARKER;
+  if (text.length < marker.length) return !complete && marker.startsWith(text) ? null : 0;
+  if (!text.startsWith(marker)) return 0;
+  const rest = text.slice(marker.length);
+  if (rest.startsWith("\n")) return marker.length + 1;
+  if (rest.startsWith("\r\n")) return marker.length + 2;
+  if (rest === "" || rest === "\r") return complete ? text.length : null;
+  return 0;
+}
+
 export function splitAnswerChannelText(text: string, raw: unknown): AgentStreamEvent[] {
   const begin = markerLineIndex(text, ANSWER_BEGIN_MARKER);
   if (!begin) return [{ type: "internal_text", text, raw }];
@@ -57,18 +73,54 @@ export class AnswerChannelExtractor {
   private lastSnapshotText = "";
   private lastWaitingCatchUpText = "";
   // Delta-streaming runtimes (claude with --include-partial-messages, pi):
-  // whether this turn has streamed any delta, the text streamed since the
-  // last block snapshot, and whether drain() entered answer mode since then.
-  // See ingestStreamedBlockSnapshot.
+  // whether this turn has streamed any delta, the streamed text no block
+  // snapshot has claimed yet, and the offset into that text from which it
+  // reached the answer (Infinity: none of it did). See
+  // ingestStreamedBlockSnapshot.
   private sawDelta = false;
   private blockDeltaText = "";
-  private answerBeganInBlock = false;
+  private blockDeltaAnswerFrom = Infinity;
+  // Set by drain() when it opens or re-opens the answer: the buffer length
+  // right after the consumed BEGIN line.
+  private answerOpenedAt: number | null = null;
+  // The answer is open and the next text starts a new content block (known
+  // only after a block snapshot or flush()); see resolveBlockStart.
+  private atBlockStart = false;
+  // drain() matched a BEGIN line at the very end of the buffer, before its
+  // line break arrived: that break belongs to the marker line, not the answer.
+  private beginLineBreakPending = false;
 
   ingestDelta(text: string, raw: unknown): AgentStreamEvent[] {
     if (!text || this.mode === "closed") return [];
     this.sawDelta = true;
+    if (this.mode === "answer" && this.blockDeltaAnswerFrom === Infinity) {
+      this.blockDeltaAnswerFrom = this.blockDeltaText.length;
+    }
     this.blockDeltaText += text;
-    return this.feed(text, raw);
+    this.answerOpenedAt = null;
+    const events = this.feed(text, raw);
+    // The buffer ends where blockDeltaText ends, so the opening point maps
+    // onto the streamed text.
+    if (this.answerOpenedAt !== null) {
+      this.blockDeltaAnswerFrom = Math.max(0, this.blockDeltaText.length - this.answerOpenedAt);
+    }
+    return events;
+  }
+
+  /**
+   * The runtime reports the end of the text streamed so far: a content
+   * block (claude `content_block_stop`, pi `text_end`), a pi assistant
+   * message (an error message_end may carry no text before pi retries
+   * in-process), or the turn (claude `result`, pi `agent_settled`).
+   * Releases the tail held back in case it began an END marker and marks a
+   * content block boundary, as a block snapshot does, so a turn cut off
+   * before its snapshot keeps its last characters and a retried answer's
+   * BEGIN line is seen at the start of its block. The streamed text stays
+   * claimable by a block snapshot that still arrives, so calling this
+   * before or after one is harmless.
+   */
+  flush(raw: unknown): AgentStreamEvent[] {
+    return this.endBlock(raw);
   }
 
   ingestSnapshot(text: string, raw: unknown): AgentStreamEvent[] {
@@ -124,37 +176,52 @@ export class AnswerChannelExtractor {
    * The deltas already fed this block through drain(), so the snapshot must
    * not be fed again — re-feeding it whole (the old first-snapshot branch)
    * duplicated the answer and leaked the LARKWAY_ANSWER_BEGIN line into it
-   * whenever the END marker was missing. Only a suffix the deltas never
-   * delivered is fed. The snapshot then marks the block's end: the text held
-   * back in case it was the start of an END marker (STREAM_HOLD_CHARS) is
-   * flushed, and a waiting buffer is dropped, because a marker line never
-   * spans two content blocks.
+   * whenever the END marker was missing. The block claims the streamed text
+   * it matches: all of it, or — a pi message_end carrying several blocks
+   * whose deltas ran on one after another — its own share, leaving the rest
+   * to the blocks after it. Only a suffix the deltas never delivered is fed.
+   * The snapshot then marks the block's end: the text held back in case it
+   * was the start of an END marker (STREAM_HOLD_CHARS) is flushed, and a
+   * waiting buffer is dropped, because a marker line never spans two
+   * content blocks.
    *
    * A block with a BEGIN line is parsed on its own, as the plain snapshot
-   * path does, unless the deltas carried it and entered the answer while
-   * streaming it — i.e. unless the delta stream consumed that BEGIN line.
-   * The others are a block the deltas did not carry (none streamed for it,
-   * or the text diverged), a BEGIN glued to the previous block's last
-   * character in the delta stream (a later text block of the same pi
-   * message), and a BEGIN that re-opens an answer already in progress (a
-   * pi retry after a provider error), which drain() streamed as answer text.
+   * path does, unless the delta stream consumed that BEGIN line, i.e. opened
+   * (or re-opened, see resolveBlockStart) the answer inside this block. The
+   * others are a block the deltas did not carry (none streamed for it, or
+   * the text diverged), a BEGIN glued to the previous block's last character
+   * in the delta stream (a later text block of the same pi message), and a
+   * BEGIN line past the start of a block while the answer was already open.
+   * The blocks after an adopted one in the same pi message are fed from
+   * their snapshots: their deltas were swallowed while waiting, or went to
+   * the answer the adopted block replaced.
    */
   private ingestStreamedBlockSnapshot(text: string, raw: unknown): AgentStreamEvent[] {
     const streamed = this.blockDeltaText;
-    this.blockDeltaText = "";
+    const answerFrom = this.blockDeltaAnswerFrom;
+    let carried = 0;
+    if (streamed.startsWith(text)) carried = text.length;
+    else if (streamed && text.startsWith(streamed)) carried = streamed.length;
+    const rest = carried === text.length ? streamed.slice(carried) : "";
+    this.blockDeltaText = rest;
+    this.blockDeltaAnswerFrom = rest ? Math.max(0, answerFrom - carried) : Infinity;
+
     const events: AgentStreamEvent[] = [];
-    let carried = false;
-    if (streamed && streamed.startsWith(text)) {
-      carried = true;
-    } else if (streamed && text.startsWith(streamed)) {
-      carried = true;
-      events.push(...this.feed(text.slice(streamed.length), raw));
-    }
-    const beganInBlock = this.answerBeganInBlock;
-    this.answerBeganInBlock = false;
     const hasBegin = markerLineIndex(text, ANSWER_BEGIN_MARKER) !== null;
-    if (this.mode !== "closed" && hasBegin && !(carried && beganInBlock)) {
+    let openedHere = carried > 0 && answerFrom > 0 && answerFrom <= carried;
+    if (this.mode === "answer" && carried > 0 && answerFrom === Infinity && !hasBegin) {
+      events.push(...this.feed(text.slice(0, carried), raw));
+    }
+    if (carried > 0 && carried < text.length) {
+      this.answerOpenedAt = null;
+      events.push(...this.feed(text.slice(carried), raw));
+      if (this.answerOpenedAt !== null) openedHere = true;
+    }
+    if (this.mode !== "closed" && hasBegin && !openedHere) {
       events.push(...this.adoptBlockSnapshot(text, raw));
+      // The adopted answer is this block's alone: the streamed text left
+      // for the blocks after it has not reached it.
+      this.blockDeltaAnswerFrom = Infinity;
     } else {
       events.push(...this.endBlock(raw));
     }
@@ -163,9 +230,17 @@ export class AnswerChannelExtractor {
 
   private adoptBlockSnapshot(text: string, raw: unknown): AgentStreamEvent[] {
     this.buffer = "";
+    this.beginLineBreakPending = false;
     const events = this.ingestSnapshot(text, raw);
     // BEGIN without END: later blocks continue the answer, as on the delta path.
     if (this.mode === "waiting") this.mode = "answer";
+    if (this.mode === "answer") {
+      // splitAnswerChannelText drops the answer's trailing line break; with
+      // no END line it separates this block's text from the next block's.
+      const lineBreak = /\r?\n$/.exec(text)?.[0];
+      if (lineBreak && this.visibleText) events.push(this.answerDelta(lineBreak, raw));
+      this.atBlockStart = true;
+    }
     return events;
   }
 
@@ -174,10 +249,39 @@ export class AnswerChannelExtractor {
       this.buffer = "";
       return [];
     }
-    if (this.mode !== "answer" || !hasUsefulText(this.buffer)) return [];
-    const heldTail = this.buffer;
+    if (this.mode !== "answer") return [];
+    const events: AgentStreamEvent[] = [];
+    if (this.atBlockStart) this.resolveBlockStart(true, events, raw);
+    if (this.beginLineBreakPending) {
+      this.buffer = this.buffer.replace(/^\r?\n?/, "");
+      this.beginLineBreakPending = false;
+    }
+    if (hasUsefulText(this.buffer)) events.push(this.answerDelta(this.buffer, raw));
     this.buffer = "";
-    return [this.answerDelta(heldTail, raw)];
+    this.atBlockStart = true;
+    return events;
+  }
+
+  /**
+   * The answer is open and a new content block starts: when the block opens
+   * with a BEGIN line, the agent re-opened the answer (a draft block
+   * followed by the final one, or pi retrying a failed attempt). The block's
+   * answer replaces the visible one — an empty answer_snapshot first — as a
+   * block snapshot with a BEGIN line does (adoptBlockSnapshot). A BEGIN line
+   * further into a block is left to that snapshot. Returns false while the
+   * block's opening text is still undecided.
+   */
+  private resolveBlockStart(complete: boolean, events: AgentStreamEvent[], raw: unknown): boolean {
+    const lineLength = leadingBeginLineLength(this.buffer, complete);
+    if (lineLength === null) return false;
+    this.atBlockStart = false;
+    if (lineLength > 0) {
+      this.buffer = this.buffer.slice(lineLength);
+      this.answerOpenedAt = this.buffer.length;
+      if (this.visibleText) events.push({ type: "answer_snapshot", text: "", raw });
+      this.visibleText = "";
+    }
+    return true;
   }
 
   /**
@@ -234,12 +338,23 @@ export class AnswerChannelExtractor {
       }
       const before = stripTrailingNewline(this.buffer.slice(0, begin.start));
       if (before.trim()) events.push({ type: "internal_text", text: before, raw });
+      // Matched at the end of the buffer: the line break is still to come.
+      this.beginLineBreakPending = begin.end === begin.start + ANSWER_BEGIN_MARKER.length;
       this.buffer = this.buffer.slice(begin.end);
       this.mode = "answer";
-      this.answerBeganInBlock = true;
+      this.atBlockStart = false;
+      this.answerOpenedAt = this.buffer.length;
+    } else if (this.mode === "answer" && this.atBlockStart) {
+      if (!this.resolveBlockStart(false, events, raw)) return events;
     }
 
     if (this.mode !== "answer") return events;
+
+    if (this.beginLineBreakPending) {
+      if (this.buffer === "" || this.buffer === "\r") return events;
+      this.buffer = stripLeadingNewline(this.buffer);
+      this.beginLineBreakPending = false;
+    }
 
     const end = markerLineIndex(this.buffer, ANSWER_END_MARKER);
     if (end) {

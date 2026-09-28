@@ -388,6 +388,208 @@ describe("AnswerChannelExtractor — block snapshot after streamed deltas (WP-6)
     );
   });
 
+  describe("block boundaries (WP-6 review)", () => {
+    const [claude, pi] = backends as [Backend, Backend];
+    const claudeToolUse = JSON.stringify({
+      type: "assistant",
+      message: { content: [{ type: "tool_use", id: "call_1", name: "Read", input: {} }] },
+    });
+
+    /** Applies answer events to a running answer, as the bridge does. */
+    function answerSink(): { take: (events: Iterable<AgentStreamEvent>) => void; answer: () => string } {
+      let answer = "";
+      return {
+        take: (events) => {
+          for (const event of events) {
+            if (event.type === "answer_delta") answer += event.text;
+            else if (event.type === "answer_snapshot") answer = event.text;
+          }
+        },
+        answer: () => answer,
+      };
+    }
+
+    /** Answer text after every line, to catch a transient BEGIN leak. */
+    function answerStates(backend: Backend, lines: string[]): string[] {
+      const extractor = new AnswerChannelExtractor();
+      const sink = answerSink();
+      return lines.map((line) => {
+        sink.take(backend.parse(line, extractor));
+        return sink.answer();
+      });
+    }
+
+    // One pi message_end carries all of a message's text blocks, and their
+    // deltas run on one after another: each block claims only its own share.
+    const piMessages: Array<[string, string[]]> = [
+      ["preamble ending in a line break", ["Checking.\n", `${ANSWER_BEGIN_MARKER}\nAnswer part A.`, " Part B continues."]],
+      ["preamble glued to the BEGIN block", ["Checking.", `${ANSWER_BEGIN_MARKER}\nAnswer part A.`, " Part B continues."]],
+      [
+        "glued preamble, END in the continuation block",
+        ["Checking.", `${ANSWER_BEGIN_MARKER}\nAnswer part A.`, ` Part B continues.\n${ANSWER_END_MARKER}`],
+      ],
+      [
+        "preamble ending in a line break, END in the continuation block",
+        ["Checking.\n", `${ANSWER_BEGIN_MARKER}\nAnswer part A.`, ` Part B continues.\n${ANSWER_END_MARKER}`],
+      ],
+    ];
+    it.each(piMessages)("pi: an answer continued in a later block of the same message is kept (%s)", (_label, blocks) => {
+      const lines = [...blocks.flatMap((block) => chunks(block).map(pi.delta)), pi.blocks(blocks)];
+      const states = answerStates(pi, lines);
+
+      expect(states.at(-1)).toBe("Answer part A. Part B continues.");
+      expect(states.some((state) => state.includes(ANSWER_BEGIN_MARKER))).toBe(false);
+    });
+
+    it("pi: a glued BEGIN block ending in a line break keeps it before the next block's text", () => {
+      const blocks = ["Checking.", `${ANSWER_BEGIN_MARKER}\nLine one.\n`, "Line two."];
+      const { answer } = replay(pi, [...blocks.flatMap((block) => chunks(block).map(pi.delta)), pi.blocks(blocks)]);
+
+      expect(answer).toBe("Line one.\nLine two.");
+    });
+
+    it("pi: the blocks after one that re-opens the answer in the same message continue the new answer", () => {
+      // Without contentIndex the re-opening BEGIN line streams as answer text
+      // until message_end; the blocks then settle the answer.
+      const blocks = [`${ANSWER_BEGIN_MARKER}\nDraft answer.`, `${ANSWER_BEGIN_MARKER}\nFinal answer.`, " More."];
+      const { answer } = replay(pi, [...blocks.flatMap((block) => chunks(block).map(pi.delta)), pi.blocks(blocks)]);
+
+      expect(answer).toBe("Final answer. More.");
+    });
+
+    it("claude: a later block that opens with BEGIN re-opens the answer while streaming, END or not", () => {
+      const draft = `${ANSWER_BEGIN_MARKER}\nDraft answer that is long enough.`;
+      for (const final of [
+        `${ANSWER_BEGIN_MARKER}\nFinal answer text here.\n${ANSWER_END_MARKER}`,
+        `${ANSWER_BEGIN_MARKER}\nFinal answer text here.`,
+      ]) {
+        const lines = [
+          ...chunks(draft).map(claude.delta),
+          claude.blocks([draft]),
+          claudeToolUse,
+          ...chunks(final).map(claude.delta),
+          claude.blocks([final]),
+        ];
+        const states = answerStates(claude, lines);
+
+        expect(states.at(-1)).toBe("Final answer text here.");
+        expect(states.some((state) => state.includes(ANSWER_BEGIN_MARKER))).toBe(false);
+        // Re-opened live: the final answer is already streaming before its block snapshot.
+        expect(states.at(-2)).not.toContain("Draft");
+      }
+    });
+
+    it("pi: a retried message with an END line replaces the failed attempt's answer", () => {
+      const cut = `${ANSWER_BEGIN_MARKER}\nFirst attempt answer that was cut`;
+      const retried = `${ANSWER_BEGIN_MARKER}\nSecond attempt answer, complete this time.\n${ANSWER_END_MARKER}`;
+      const states = answerStates(pi, [
+        ...chunks(cut).map(pi.delta),
+        JSON.stringify({
+          type: "message_end",
+          message: { role: "assistant", content: [{ type: "text", text: cut }], stopReason: "error" },
+        }),
+        ...chunks(retried).map(pi.delta),
+        pi.blocks([retried]),
+      ]);
+
+      expect(states.at(-1)).toBe("Second attempt answer, complete this time.");
+      expect(states.some((state) => state.includes(ANSWER_BEGIN_MARKER))).toBe(false);
+    });
+
+    it("a block that opens with text merely resembling the BEGIN marker continues the answer", () => {
+      const first = `${ANSWER_BEGIN_MARKER}\nPart one of the answer, long enough.`;
+      const second = `${ANSWER_BEGIN_MARKER}S are marker lines.`;
+      const { answer } = replay(claude, [
+        ...chunks(first).map(claude.delta),
+        claude.blocks([first]),
+        ...chunks(second).map(claude.delta),
+        claude.blocks([second]),
+      ]);
+
+      expect(answer).toBe(`Part one of the answer, long enough.${second}`);
+    });
+
+    it.each<[string, string[]]>([
+      ["LF", ["\n"]],
+      ["CRLF", ["\r\n"]],
+      ["CRLF split across deltas", ["\r", "\n"]],
+    ])("a delta boundary between BEGIN and its line break (%s) adds no leading line break", (_label, eolDeltas) => {
+      const eol = eolDeltas.join("");
+      const preamble = `Let me look.${eol}${eol}`;
+      const answerBody = "The answer body, long enough to stream before its snapshot.";
+      const extractor = new AnswerChannelExtractor();
+      const streamed = replay(
+        claude,
+        [
+          ...chunks(preamble).map(claude.delta),
+          claude.blocks([preamble]),
+          ...[ANSWER_BEGIN_MARKER, ...eolDeltas, ...chunks(answerBody)].map(claude.delta),
+        ],
+        extractor,
+      );
+      const final = replay(claude, [claude.blocks([`${ANSWER_BEGIN_MARKER}${eol}${answerBody}`])], extractor);
+
+      expect(streamed.answer.length).toBeGreaterThan(0);
+      expect(answerBody.startsWith(streamed.answer)).toBe(true);
+      expect(streamed.answer + final.answer).toBe(answerBody);
+    });
+
+    describe("flush()", () => {
+      it("releases the held tail of deltas no block snapshot follows (claude killed mid-block)", () => {
+        const answerBody = "Short interrupted answer text ok.";
+        const extractor = new AnswerChannelExtractor();
+        const sink = answerSink();
+        for (const line of chunks(`${ANSWER_BEGIN_MARKER}\n${answerBody}`).map(claude.delta)) {
+          sink.take(claude.parse(line, extractor));
+        }
+        const streamed = sink.answer();
+        sink.take(extractor.flush({ id: "stop" }));
+
+        expect(streamed).not.toBe(answerBody);
+        expect(sink.answer()).toBe(answerBody);
+      });
+
+      it("pi: flushed after an error message_end without text, a retry with an END line replaces the answer", () => {
+        const cut = `${ANSWER_BEGIN_MARKER}\nFirst attempt answer that was cut`;
+        const retried = `${ANSWER_BEGIN_MARKER}\nSecond attempt answer, complete this time.\n${ANSWER_END_MARKER}`;
+        const errorEnd = JSON.stringify({
+          type: "message_end",
+          message: { role: "assistant", content: [], stopReason: "error" },
+        });
+        const extractor = new AnswerChannelExtractor();
+        const sink = answerSink();
+        for (const line of [...chunks(cut).map(pi.delta), errorEnd]) sink.take(pi.parse(line, extractor));
+        sink.take(extractor.flush({ id: "error-end" }));
+        expect(sink.answer()).toBe("First attempt answer that was cut");
+
+        for (const line of [...chunks(retried).map(pi.delta), pi.blocks([retried])]) {
+          sink.take(pi.parse(line, extractor));
+        }
+        expect(sink.answer()).toBe("Second attempt answer, complete this time.");
+      });
+
+      it.each(backends)("$name: is harmless before or after the block snapshot", (backend) => {
+        const blocks = [`${ANSWER_BEGIN_MARKER}\nPart one of the answer, long enough.`, " Part two."];
+        // claude: one snapshot per block; pi: one message_end for both blocks.
+        const perBlockSnapshot = backend.name === "claude";
+        for (const flushFirst of [true, false]) {
+          const extractor = new AnswerChannelExtractor();
+          const sink = answerSink();
+          for (const block of blocks) {
+            for (const line of chunks(block).map(backend.delta)) sink.take(backend.parse(line, extractor));
+            if (flushFirst) sink.take(extractor.flush({}));
+            if (perBlockSnapshot) sink.take(backend.parse(backend.blocks([block]), extractor));
+            if (!flushFirst && perBlockSnapshot) sink.take(extractor.flush({}));
+          }
+          if (!perBlockSnapshot) sink.take(backend.parse(backend.blocks(blocks), extractor));
+          sink.take(extractor.flush({}));
+
+          expect(sink.answer()).toBe("Part one of the answer, long enough. Part two.");
+        }
+      });
+    });
+  });
+
   it("a text block the deltas never carried does not append to an answer in progress", () => {
     const extractor = new AnswerChannelExtractor();
     const block = `${ANSWER_BEGIN_MARKER}\n${body}`;
