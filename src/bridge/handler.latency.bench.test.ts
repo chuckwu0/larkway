@@ -5,17 +5,20 @@
  * round trips before runner.run() — the regression gate for parallelising
  * handleOne's startup (docs: the native-parity perf plan, acceptance A1).
  *
- * Skipped unless LW_BENCH is set, so `pnpm test` never pays its sleeps:
+ * The shape and ordering assertions run in every default `vitest run` (5ms
+ * per fake round trip, one repetition — well under a second for all eight
+ * scenarios). LW_BENCH adds the measurement mode:
  *   LW_BENCH=1 npx vitest run src/bridge/handler.latency.bench.test.ts
- * Knobs: LW_BENCH_NET_MS (default 25) per fake round trip, LW_BENCH_REPS
- * (default 1) repetitions per scenario, LW_BENCH_OUT=<file> appends one JSON
- * row per scenario (p50/p90 when REPS > 1).
+ * Knobs: LW_BENCH_NET_MS per fake round trip (default 25 with LW_BENCH, else
+ * 5); with LW_BENCH only, LW_BENCH_REPS (default 1) repetitions per scenario
+ * and LW_BENCH_OUT=<file> appends one JSON row per scenario (p50/p90 when
+ * REPS > 1).
  *
  * The expected serial counts pin TODAY's handler: a change that moves a call
  * off the critical path must update them here, with the ordering assertions
  * still passing.
  */
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { appendFile, mkdir, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -35,9 +38,30 @@ import {
   registerFakeRunner,
 } from "./testFakes.js";
 
-const NET_MS = Number(process.env["LW_BENCH_NET_MS"] ?? "25");
-const REPS = Math.max(1, Number(process.env["LW_BENCH_REPS"] ?? "1"));
-const OUT = process.env["LW_BENCH_OUT"];
+// Default `vitest run` executes this file, and unit tests never spawn a real
+// subprocess (CLAUDE.md): every child_process entry point records and throws,
+// and each scenario asserts none was reached.
+const spawned = vi.hoisted(() => [] as string[]);
+vi.mock("node:child_process", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:child_process")>();
+  const refuse = (name: string) => (cmd: unknown) => {
+    spawned.push(`${name} ${String(cmd)}`);
+    throw new Error(`latency bench: unexpected child_process.${name}(${String(cmd)})`);
+  };
+  const guarded = Object.fromEntries(
+    ["spawn", "spawnSync", "exec", "execSync", "execFile", "execFileSync", "fork"].map((n) => [n, refuse(n)]),
+  );
+  return {
+    ...actual,
+    ...guarded,
+    default: { ...((actual as { default?: Record<string, unknown> }).default ?? {}), ...guarded },
+  };
+});
+
+const BENCH = Boolean(process.env["LW_BENCH"]);
+const NET_MS = Number(process.env["LW_BENCH_NET_MS"] ?? (BENCH ? "25" : "5"));
+const REPS = BENCH ? Math.max(1, Number(process.env["LW_BENCH_REPS"] ?? "1")) : 1;
+const OUT = BENCH ? process.env["LW_BENCH_OUT"] : undefined;
 const RUNNER_KEY = "latency-bench-runner";
 
 interface Scenario {
@@ -171,6 +195,7 @@ async function runScenario(root: string, s: Scenario, rep: number): Promise<RunR
   expect(await settled).toBe("handled");
   expect(samples).toHaveLength(1);
   expect(timeline.runAt).toBeDefined();
+  expect(spawned, "no real subprocess").toEqual([]);
   const { calls, groups } = timeline.serialGroupsBeforeRun();
   return { serial: groups, calls: calls.map((c) => c.what), sample: samples[0]!, timeline };
 }
@@ -180,7 +205,7 @@ function pct(values: number[], p: number): number {
   return sorted[Math.max(0, Math.ceil(p * sorted.length) - 1)]!;
 }
 
-describe.skipIf(!process.env["LW_BENCH"])("handler latency bench (LW_BENCH)", () => {
+describe("handler latency bench (A1)", () => {
   let root: string;
   let priorHome: string | undefined;
 
@@ -255,7 +280,7 @@ describe.skipIf(!process.env["LW_BENCH"])("handler latency bench (LW_BENCH)", ()
       preRunner: last!.sample.preRunner,
       postRunner: last!.sample.postRunner,
     };
-    console.log(`[latency-bench] ${JSON.stringify(row)}`);
+    if (BENCH) console.log(`[latency-bench] ${JSON.stringify(row)}`);
     if (OUT) await appendFile(OUT, `${JSON.stringify(row)}\n`, "utf8");
   }, 60_000);
 });

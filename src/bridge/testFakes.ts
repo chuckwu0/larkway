@@ -10,18 +10,27 @@
  * Test-only: imported solely by *.test.ts files, never by production code, so
  * the esbuild bundles never include it. Every id here is obviously fake.
  *
- * Not yet unified with handler.test.ts's own fakes (makeClient,
- * makeCardKitClient, makeSessionStore, …): those record calls for assertions
- * and drive different paths (e.g. its CardKit fake has no createCardReply, so
- * it exercises the entity + reply create). TODO: fold both into this module;
- * until then a BridgeHandler deps / client interface change must update both.
+ * Kept apart from handler.test.ts's own fakes (makeClient, makeCardKitClient,
+ * makeSessionStore, …) on purpose: those record calls for assertions and drive
+ * different paths (e.g. its CardKit fake has no createCardReply, so it
+ * exercises the entity + reply create), while these model the production
+ * tenant (createCardReply; COT thread channel rejected). Two guards stop these
+ * fakes drifting from production unnoticed:
+ *  - each client fake is typed against Required<…> of its production
+ *    interface (CardRenderer: all public members), so a new OPTIONAL member —
+ *    one handleOne calls only when present — fails `tsc` here until the fake
+ *    implements it;
+ *  - the bench's shape/ordering assertions run in every default `vitest run`
+ *    (LW_BENCH only adds repetitions, the 25ms latency and JSONL rows), so a
+ *    new REQUIRED call the fakes lack fails the default suite.
  */
 import { registerRunner, type AgentStreamEvent, type RunOptions, type TurnUsage } from "../agent/runner.js";
+import type { CardRenderer } from "../lark/card.js";
 import type { OutboundCardKitClient } from "../lark/channelCardKitClient.js";
 import type { OutboundCotClient, CotTarget } from "../lark/channelCotClient.js";
 import type { MessageInfo, MessageLookupClient } from "../lark/messageLookupClient.js";
 import type { LiveRosterResolver } from "../lark/rosterResolver.js";
-import type { LarkMessageEvent } from "../lark/transport.js";
+import type { InboundClient, LarkMessageEvent } from "../lark/transport.js";
 
 export interface TimelineEntry {
   what: string;
@@ -104,7 +113,7 @@ export function fakeInboundClient(event: LarkMessageEvent, timeline: LatencyTime
     markHandled: () => resolveSettled("handled"),
     markUnhandled: () => resolveSettled("unhandled"),
     close: async () => {},
-  };
+  } satisfies Required<InboundClient>;
   return { client, settled };
 }
 
@@ -113,7 +122,7 @@ export function fakeCardKitClient(
   timeline: LatencyTimeline,
   netMs: number,
   opts: { failCreate?: boolean } = {},
-): OutboundCardKitClient {
+): Required<OutboundCardKitClient> {
   const mutation = (name: string) => () => timeline.net(`cardkit.${name}`, netMs, () => undefined);
   return {
     async createCardReply() {
@@ -152,7 +161,7 @@ export function fakeCardRenderer(timeline: LatencyTimeline, netMs: number) {
   return {
     start: () => timeline.net("legacyCard.start", netMs, () => handleFor("om_bench_legacy_card")),
     handleFor,
-  };
+  } satisfies Pick<CardRenderer, keyof CardRenderer>;
 }
 
 /** COT client whose thread channel is rejected like the production tenant (code=10002). */
@@ -160,7 +169,7 @@ export function fakeCotClient(
   timeline: LatencyTimeline,
   netMs: number,
   opts: { rejectThread?: boolean } = { rejectThread: true },
-): OutboundCotClient {
+): Required<OutboundCotClient> {
   return {
     create: (target: CotTarget) =>
       timeline.net(`cot.create(${target.threadId ? "thread" : "chat"})`, netMs, () => {
@@ -176,7 +185,7 @@ export function fakeCotClient(
 }
 
 /** Root/quoted-message lookup (the v4 task-root probe); never a task card. */
-export function fakeMessageLookup(timeline: LatencyTimeline, netMs: number): MessageLookupClient {
+export function fakeMessageLookup(timeline: LatencyTimeline, netMs: number): Required<MessageLookupClient> {
   return {
     get: () => timeline.net("messageLookup.get", netMs, (): MessageInfo | undefined => ({ msgType: "text" })),
   };
