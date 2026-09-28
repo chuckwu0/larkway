@@ -105,6 +105,17 @@ export interface ProcessHandoffsContext {
   triggerMessageId: string;
   /** Kill switch: when false, mirror posts still go out but nothing is dispatched locally. */
   localDispatchEnabled?: boolean;
+  /**
+   * A handoff to a peer hosted in THIS process waits for this to settle
+   * (either way) before its mirror post — and so before its local dispatch.
+   * The mirror's own WS copy wakes that peer too, so holding back only the
+   * local dispatch would not hold the peer back. Handoffs to peers in other
+   * processes don't wait: the mirror (WS) is their only path.
+   * handler.ts passes its final-card delivery plus its task-signal chain, so
+   * an in-process peer never starts on this bot's card mid-stream or ahead of
+   * this turn's claim.
+   */
+  inProcessHandoffAfter?: Promise<unknown>;
 }
 
 export interface HandoffOutcome {
@@ -153,6 +164,13 @@ export async function processHandoffs(ctx: ProcessHandoffsContext): Promise<Hand
       continue;
     }
 
+    // Peer hosted in this bridge process? Decides the gate below and (b).
+    const targetInfo = rosterEntry && ctx.registry?.describe(rosterEntry.botId);
+    // Gate BEFORE the mirror for in-process peers: either copy of the mirror
+    // (local dispatch or WS) can start that peer's turn. Regardless of the
+    // local-dispatch kill switch — then the WS copy is the one that wakes it.
+    if (targetInfo && ctx.inProcessHandoffAfter) await ctx.inProcessHandoffAfter.catch(() => undefined);
+
     // (a) MIRROR: one real Feishu post with a true at tag, replying in-thread.
     let mirrorMessageId: string;
     try {
@@ -183,7 +201,6 @@ export async function processHandoffs(ctx: ProcessHandoffsContext): Promise<Hand
     // (b) LOCAL DISPATCH — only for peers hosted in this bridge process.
     let localDispatched = false;
     let detail = `镜像 post 已发 (message_id=${mirrorMessageId})`;
-    const targetInfo = rosterEntry && ctx.registry?.describe(rosterEntry.botId);
     if (ctx.localDispatchEnabled === false) {
       detail += "；本地直递已禁用，走 WS 送达";
     } else if (!rosterEntry || !targetInfo) {

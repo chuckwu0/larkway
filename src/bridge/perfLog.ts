@@ -29,7 +29,10 @@ import type { CotChannel } from "./cotProgress.js";
  * stale-session retry re-runs some steps; their time accumulates.
  */
 export interface PreRunnerPerf {
-  /** COT bubble create (target resolve + a rejected thread attempt + chat), both call sites. */
+  /**
+   * The awaited pre-card COT bubble create (target resolve + a rejected thread
+   * attempt + chat). The post-card create is not awaited (WP-2) and adds none.
+   */
   cotMs?: number;
   cotChannel?: CotChannel;
   /**
@@ -39,6 +42,7 @@ export interface PreRunnerPerf {
   cardReplyMs?: number;
   /** CardKit `card.idConvert` of the placeholder reply. */
   cardIdConvertMs?: number;
+  /** Wait on the live-roster lookup before a full prompt (a delta turn does not wait on it, WP-2). */
   rosterMs?: number;
   /** How the live-roster lookup was served; "skip" = no peers / no resolver, no lookup. */
   rosterCache?: NonNullable<RosterLookupInfo["cache"]> | "skip";
@@ -60,6 +64,13 @@ export interface PreRunnerPerf {
   reactionRemoveMs?: number;
   /** Legacy visible card `start` — the non-CardKit surface or the CardKit-failure fallback. */
   legacyCardMs?: number;
+  /**
+   * WP-10: the turn ran model-first (LARKWAY_MODEL_FIRST). Its reaction, COT
+   * and card timings above then ran alongside the runner, not in front of it
+   * (absent: they were awaited before it). Its tail (runnerDoneAt →
+   * finalizeEndAt) includes waiting for them: `postRunner.surfaceWaitMs`.
+   */
+  modelFirst?: boolean;
 }
 
 /** WP-0: the post-runner tail, runner done → final card delivered. */
@@ -69,10 +80,19 @@ export interface PostRunnerPerf {
   cardkitCallMsMax?: number;
   /** Nearest-rank median of those calls. */
   cardkitCallMsP50?: number;
-  /** task-handle declare + claim hooks before finalize (only when one of them ran). */
+  /** task-handle declare + claim hooks (only when one of them ran); overlaps finalize since WP-8. */
   declareMs?: number;
-  /** processHandoffs (only when the agent declared handoffs). */
+  /**
+   * processHandoffs (only when the agent declared handoffs); overlaps finalize
+   * since WP-8, and includes an in-process peer's wait for the final card.
+   */
   handoffMs?: number;
+  /**
+   * WP-10: a model-first turn's wait, once its runner is done, for the reply
+   * surfaces still opening alongside it (the card, and the early events
+   * replayed into it). Absent when the surfaces were awaited before the runner.
+   */
+  surfaceWaitMs?: number;
 }
 
 export interface PerfSample {
@@ -156,8 +176,12 @@ type PerfTimelinePoint =
 type PreRunnerMsField = {
   [K in keyof PreRunnerPerf]-?: PreRunnerPerf[K] extends number | undefined ? K : never;
 }[keyof PreRunnerPerf];
-type PostRunnerMsField = "declareMs" | "handoffMs";
-const POST_RUNNER_MS_FIELDS: ReadonlySet<string> = new Set<PostRunnerMsField>(["declareMs", "handoffMs"]);
+type PostRunnerMsField = "declareMs" | "handoffMs" | "surfaceWaitMs";
+const POST_RUNNER_MS_FIELDS: ReadonlySet<string> = new Set<PostRunnerMsField>([
+  "declareMs",
+  "handoffMs",
+  "surfaceWaitMs",
+]);
 
 function nearestRankP50(values: readonly number[]): number {
   const sorted = [...values].sort((a, b) => a - b);
@@ -222,8 +246,8 @@ export class TurnPerfRecorder {
     }
   }
 
-  markRunnerDone(cardkitCallDurations?: readonly number[]): void {
-    this.mark("runnerDoneAt");
+  markRunnerDone(cardkitCallDurations?: readonly number[], at = Date.now()): void {
+    this.mark("runnerDoneAt", at);
     this.cardkitCallsAtRunnerDone = cardkitCallDurations?.length ?? 0;
   }
 

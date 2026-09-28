@@ -16,15 +16,26 @@
  *
  * The expected serial counts pin TODAY's handler: a change that moves a call
  * off the critical path must update them here, with the ordering assertions
- * still passing.
+ * still passing. A call the handler starts but does not wait on shows up in
+ * `expectInFlight`, not in the serial count.
+ *
+ * WP-10: the scenarios with `mode` run under LARKWAY_MODEL_FIRST. Where the
+ * turn goes model-first, every fake round trip is held until run() (see
+ * LatencyTimeline.holdUntilRun), so "0 serial, all in flight" means the
+ * runner waited on no network call at all. The bench bot has no task-claim
+ * hook unless a scenario sets `taskClaim` — main.ts wires one for every bot
+ * with an id, and then a model-first follow-up waits for the in-topic root
+ * lookup (within its budget) when the root is not cached yet.
  */
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { appendFile, mkdir, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { BridgeHandler } from "./handler.js";
+import { createCotProgressHandle } from "./cotProgress.js";
 import type { PerfSample } from "./perfLog.js";
 import type { BotConfig } from "../config/botLoader.js";
+import type { MessageLookupClient } from "../lark/messageLookupClient.js";
 import type { LarkMessageEvent } from "../lark/transport.js";
 import {
   LatencyTimeline,
@@ -69,30 +80,108 @@ interface Scenario {
   thread: "new" | "continuation";
   roster: "warm" | "cold";
   cardkit: "ok" | "fail";
-  /** Serial network round trips before runner.run() in today's handler. */
+  /**
+   * Continuation only: whether this chat already learned that the COT thread
+   * channel rejects (code=10002) — the steady state after the first in-topic
+   * turn since boot ("untried").
+   */
+  cotThread?: "known-rejected" | "untried";
+  /** Serial network round trips completed before runner.run() in today's handler. */
   expectSerial: number;
   /** Awaitable (non-detached) network calls started before runner.run(). */
   expectCalls: number;
+  /** Calls started before runner.run() but not waited on (still in flight at run()). */
+  expectInFlight: number;
+  /** WP-10: LARKWAY_MODEL_FIRST for this scenario (unset = off). */
+  mode?: "continuation" | "all";
+  /**
+   * WP-10, continuation only: the bot has a task-claim hook (as main.ts
+   * wires for every bot with an id), and the topic root's lookup is `cold`
+   * (one round trip — the bot's first look at this root since boot) or
+   * `cached` (answered from the lookup cache, no round trip). Unset: no hook.
+   */
+  taskClaim?: "cold" | "cached";
 }
 
-// new topic:   card (reply+idConvert | failed reply → legacy card)
-//              → COT bubble on the card → [roster]
-// continuation: [root probe ‖ COT thread (rejected)] → COT chat → card → [roster]
-//              (the probe is only awaited pre-prompt, so it rides along)
+/** WP-10: does the scenario's turn start its runner before its surfaces? */
+function goesModelFirst(s: Scenario): boolean {
+  return s.mode === "all" || (s.mode === "continuation" && s.thread === "continuation");
+}
+
+// new topic:    [roster ‖ card reply] → card idConvert (| failed reply →
+//               legacy card); the COT bubble create on the card is started,
+//               not awaited (in flight at run()).
+// continuation: [root probe ‖ roster ‖ COT (chat; a rejected thread attempt
+//               first when untried, then chat)] → card.
+// The delta prompt does not wait on the roster; the full (new-topic) prompt
+// does, by which time it has long completed alongside the card reply.
 // The ⏳ reaction's add (at the start) and delete (once the card exists) run
-// detached since WP-3: the client returns before either round trip, so they
-// are off the serial path. WP-0 baseline: new 6/5, continuation 7/6 — there
-// the awaited add sat alone after [probe ‖ add] and the delete before roster.
+// detached since WP-3 (see fakeInboundClient): the client returns before
+// either round trip, so neither is counted in calls, serial or in-flight.
+// WP-0 baseline: new 6/5, continuation 7/6 serial (roster cold/warm).
 const SCENARIOS: Scenario[] = [
-  { name: "new/roster-cold/cardkit-ok", thread: "new", roster: "cold", cardkit: "ok", expectSerial: 4, expectCalls: 4 },
-  { name: "new/roster-warm/cardkit-ok", thread: "new", roster: "warm", cardkit: "ok", expectSerial: 3, expectCalls: 3 },
-  { name: "new/roster-cold/cardkit-fail", thread: "new", roster: "cold", cardkit: "fail", expectSerial: 4, expectCalls: 4 },
-  { name: "new/roster-warm/cardkit-fail", thread: "new", roster: "warm", cardkit: "fail", expectSerial: 3, expectCalls: 3 },
-  { name: "continuation/roster-cold/cardkit-ok", thread: "continuation", roster: "cold", cardkit: "ok", expectSerial: 5, expectCalls: 6 },
-  { name: "continuation/roster-warm/cardkit-ok", thread: "continuation", roster: "warm", cardkit: "ok", expectSerial: 4, expectCalls: 5 },
-  { name: "continuation/roster-cold/cardkit-fail", thread: "continuation", roster: "cold", cardkit: "fail", expectSerial: 5, expectCalls: 6 },
-  { name: "continuation/roster-warm/cardkit-fail", thread: "continuation", roster: "warm", cardkit: "fail", expectSerial: 4, expectCalls: 5 },
+  { name: "new/roster-cold/cardkit-ok", thread: "new", roster: "cold", cardkit: "ok", expectSerial: 2, expectCalls: 4, expectInFlight: 1 },
+  { name: "new/roster-warm/cardkit-ok", thread: "new", roster: "warm", cardkit: "ok", expectSerial: 2, expectCalls: 3, expectInFlight: 1 },
+  { name: "new/roster-cold/cardkit-fail", thread: "new", roster: "cold", cardkit: "fail", expectSerial: 2, expectCalls: 4, expectInFlight: 1 },
+  { name: "new/roster-warm/cardkit-fail", thread: "new", roster: "warm", cardkit: "fail", expectSerial: 2, expectCalls: 3, expectInFlight: 1 },
+  { name: "continuation/roster-cold/cardkit-ok", thread: "continuation", roster: "cold", cardkit: "ok", expectSerial: 3, expectCalls: 5, expectInFlight: 0 },
+  { name: "continuation/roster-warm/cardkit-ok", thread: "continuation", roster: "warm", cardkit: "ok", expectSerial: 3, expectCalls: 4, expectInFlight: 0 },
+  { name: "continuation/roster-cold/cardkit-fail", thread: "continuation", roster: "cold", cardkit: "fail", expectSerial: 3, expectCalls: 5, expectInFlight: 0 },
+  { name: "continuation/roster-warm/cardkit-fail", thread: "continuation", roster: "warm", cardkit: "fail", expectSerial: 3, expectCalls: 4, expectInFlight: 0 },
+  {
+    name: "continuation/roster-warm/cardkit-ok/cot-thread-untried",
+    thread: "continuation", roster: "warm", cardkit: "ok", cotThread: "untried",
+    expectSerial: 4, expectCalls: 5, expectInFlight: 0,
+  },
+  // WP-10 model-first: before run() only the calls fired at turn start — the
+  // root probe (not awaited: this bot has no task-claim hook), the roster —
+  // and the lane's first step (COT, or the card on a new topic), which starts
+  // at once because the detached ⏳ add returns at once; none is waited on
+  // (holdUntilRun keeps them all in flight at run()).
+  { name: "mf-continuation:continuation/roster-cold/cardkit-ok", mode: "continuation", thread: "continuation", roster: "cold", cardkit: "ok", expectSerial: 0, expectCalls: 3, expectInFlight: 3 },
+  { name: "mf-continuation:continuation/roster-warm/cardkit-ok", mode: "continuation", thread: "continuation", roster: "warm", cardkit: "ok", expectSerial: 0, expectCalls: 2, expectInFlight: 2 },
+  { name: "mf-continuation:continuation/roster-cold/cardkit-fail", mode: "continuation", thread: "continuation", roster: "cold", cardkit: "fail", expectSerial: 0, expectCalls: 3, expectInFlight: 3 },
+  {
+    name: "mf-continuation:continuation/roster-warm/cardkit-ok/cot-thread-untried",
+    mode: "continuation", thread: "continuation", roster: "warm", cardkit: "ok", cotThread: "untried",
+    expectSerial: 0, expectCalls: 2, expectInFlight: 2,
+  },
+  // `continuation` keeps a new topic card-first: exactly the off numbers.
+  { name: "mf-continuation:new/roster-cold/cardkit-ok", mode: "continuation", thread: "new", roster: "cold", cardkit: "ok", expectSerial: 2, expectCalls: 4, expectInFlight: 1 },
+  { name: "mf-continuation:new/roster-warm/cardkit-fail", mode: "continuation", thread: "new", roster: "warm", cardkit: "fail", expectSerial: 2, expectCalls: 3, expectInFlight: 1 },
+  // `all`: a new topic too. Its full prompt does not wait on a cold roster.
+  { name: "mf-all:new/roster-cold/cardkit-ok", mode: "all", thread: "new", roster: "cold", cardkit: "ok", expectSerial: 0, expectCalls: 2, expectInFlight: 2 },
+  { name: "mf-all:new/roster-warm/cardkit-fail", mode: "all", thread: "new", roster: "warm", cardkit: "fail", expectSerial: 0, expectCalls: 1, expectInFlight: 1 },
+  { name: "mf-all:continuation/roster-cold/cardkit-ok", mode: "all", thread: "continuation", roster: "cold", cardkit: "ok", expectSerial: 0, expectCalls: 3, expectInFlight: 3 },
+  // A bot with a task-claim hook (every bot with an id, in main.ts): its
+  // model-first follow-up waits for the root lookup, within the budget — one
+  // round trip when the root is not cached yet, none when it is.
+  {
+    name: "mf-continuation:continuation/roster-warm/cardkit-ok/claim-hook-cold-root",
+    mode: "continuation", thread: "continuation", roster: "warm", cardkit: "ok", taskClaim: "cold",
+    expectSerial: 1, expectCalls: 2, expectInFlight: 1,
+  },
+  {
+    name: "mf-continuation:continuation/roster-warm/cardkit-ok/claim-hook-cached-root",
+    mode: "continuation", thread: "continuation", roster: "warm", cardkit: "ok", taskClaim: "cached",
+    expectSerial: 0, expectCalls: 1, expectInFlight: 1,
+  },
 ];
+
+/**
+ * The root/quoted-message lookup the scenario's bot sees. With `taskClaim`,
+ * a model-first turn waits for it on purpose, so its round trip is not held
+ * until run() (held, it could only lose to the handler's budget timer).
+ */
+function rootLookupFor(s: Scenario, timeline: LatencyTimeline): MessageLookupClient {
+  if (s.taskClaim === "cached") return { get: async () => ({ msgType: "text" }) };
+  if (s.taskClaim === "cold") {
+    return {
+      get: () => timeline.net("messageLookup.get", NET_MS, () => ({ msgType: "text" }), { notBefore: Promise.resolve() }),
+    };
+  }
+  return fakeMessageLookup(timeline, NET_MS);
+}
 
 const ROOT_ID = "om_bench_root";
 
@@ -118,19 +207,53 @@ function eventFor(s: Scenario): LarkMessageEvent {
 interface RunResult {
   serial: number;
   calls: string[];
+  inFlight: string[];
   detached: string[];
   sample: PerfSample;
   timeline: LatencyTimeline;
 }
 
 async function runScenario(root: string, s: Scenario, rep: number): Promise<RunResult> {
-  const home = join(root, `${s.name.replace(/\//g, "_")}-${rep}`);
+  const priorMode = process.env["LARKWAY_MODEL_FIRST"];
+  if (s.mode) process.env["LARKWAY_MODEL_FIRST"] = s.mode;
+  else delete process.env["LARKWAY_MODEL_FIRST"];
+  try {
+    return await runScenarioIn(root, s, rep);
+  } finally {
+    if (priorMode === undefined) delete process.env["LARKWAY_MODEL_FIRST"];
+    else process.env["LARKWAY_MODEL_FIRST"] = priorMode;
+  }
+}
+
+async function runScenarioIn(root: string, s: Scenario, rep: number): Promise<RunResult> {
+  const home = join(root, `${s.name.replace(/[/:]/g, "_")}-${rep}`);
   const workspace = join(home, "workspace");
   await mkdir(join(workspace, "repos"), { recursive: true });
   const timeline = new LatencyTimeline();
   registerFakeRunner(RUNNER_KEY, timeline, {
+    // Outlasts one fake round trip, so a not-awaited bubble create lands
+    // (and reports its channel) before the turn's sample is written.
+    runMs: Math.max(20, 2 * NET_MS),
     usage: { inputTokens: 10, cacheCreationTokens: 100, cacheReadTokens: 1000, outputTokens: 5 },
   });
+  const cotClient = fakeCotClient(timeline, NET_MS, { createAfterRun: s.thread === "new" });
+  if (s.thread === "continuation" && s.cotThread !== "untried") {
+    // Prime through the real code path: an earlier in-topic turn in this chat
+    // saw the thread channel rejected and chat_id succeed.
+    const primed = await createCotProgressHandle({
+      cotClient,
+      target: { chatId: "oc_bench_chat", threadId: "omt_bench_topic", originMessageId: "om_bench_earlier" },
+      detail: "brief",
+      runId: "bench-prime",
+      scope: ROOT_ID,
+      inputPreview: "",
+      throttleMs: 60_000,
+    });
+    primed.close();
+    expect(primed.channel).toBe("chat-after-thread");
+    timeline.clear();
+  }
+  timeline.holdUntilRun = goesModelFirst(s);
   const store = fakeSessionStore(
     s.thread === "continuation"
       ? [{
@@ -187,8 +310,9 @@ async function runScenario(root: string, s: Scenario, rep: number): Promise<RunR
       },
     } as unknown as BotConfig,
     cardKitClient: fakeCardKitClient(timeline, NET_MS, { failCreate: s.cardkit === "fail" }),
-    cotClient: fakeCotClient(timeline, NET_MS),
-    messageLookup: fakeMessageLookup(timeline, NET_MS),
+    cotClient,
+    messageLookup: rootLookupFor(s, timeline),
+    ...(s.taskClaim ? { taskHandleClaim: async () => {} } : {}),
     peers: [{ id: "ou_bench_peer", name: "Peer", description: "bench peer" }],
     resolveLiveRoster: fakeRosterResolver(timeline, NET_MS, s.roster === "warm"),
     recordPerfSample: async (sample) => {
@@ -201,10 +325,11 @@ async function runScenario(root: string, s: Scenario, rep: number): Promise<RunR
   expect(samples).toHaveLength(1);
   expect(timeline.runAt).toBeDefined();
   expect(spawned, "no real subprocess").toEqual([]);
-  const { calls, groups } = timeline.serialGroupsBeforeRun();
+  const { calls, inFlight, groups } = timeline.serialGroupsBeforeRun();
   return {
     serial: groups,
     calls: calls.map((c) => c.what),
+    inFlight: inFlight.map((c) => c.what),
     detached: timeline.detachedBeforeRun().map((c) => c.what),
     sample: samples[0]!,
     timeline,
@@ -215,6 +340,30 @@ function pct(values: number[], p: number): number {
   const sorted = [...values].sort((a, b) => a - b);
   return sorted[Math.max(0, Math.ceil(p * sorted.length) - 1)]!;
 }
+
+describe("LatencyTimeline serial-group count", () => {
+  it("counts a call fired alongside the next one as parallel even when the ms clock shows no overlap", async () => {
+    // Under CPU contention a fired-and-not-awaited call (the roster, the root
+    // probe) and the next awaited one can start and end on the same
+    // millisecond. Freeze the clock to make that tie certain: the count must
+    // follow issue/completion order, not Date.now().
+    const clock = vi.spyOn(Date, "now").mockReturnValue(1_000);
+    try {
+      const timeline = new LatencyTimeline();
+      const side = timeline.net("side", 1, () => undefined); // not awaited here
+      await timeline.net("first", 1, () => undefined);
+      await timeline.net("second", 1, () => undefined); // issued after "first" completed
+      timeline.markRunnerRun();
+      await side;
+      const { calls, inFlight, groups } = timeline.serialGroupsBeforeRun();
+      expect(calls.map((c) => c.what).sort()).toEqual(["first", "second", "side"]);
+      expect(inFlight).toEqual([]);
+      expect(groups).toBe(2);
+    } finally {
+      clock.mockRestore();
+    }
+  });
+});
 
 describe("handler latency bench (A1)", () => {
   let root: string;
@@ -244,8 +393,14 @@ describe("handler latency bench (A1)", () => {
       // Critical-path shape.
       expect(r.serial, `serial round trips before run(): ${r.calls.join(" → ")}`).toBe(s.expectSerial);
       expect(r.calls).toHaveLength(s.expectCalls);
-      // The ⏳ add is fired before run() but nothing waits for it.
+      expect(r.inFlight, "started before run(), not waited on").toHaveLength(s.expectInFlight);
+      // The ⏳ add is fired before run() but nothing waits for it (WP-3).
       expect(r.detached).toContain("reaction.add");
+      // A model-first turn waits on nothing — with a task-claim hook, nothing
+      // but the uncached root lookup.
+      const waitedOn = s.taskClaim === "cold" ? ["messageLookup.get"] : [];
+      if (goesModelFirst(s)) expect(r.inFlight.sort()).toEqual(r.calls.filter((c) => !waitedOn.includes(c)).sort());
+      else if (s.thread === "new") expect(r.inFlight).toEqual(["cot.create(chat)"]);
 
       // Ordering: an existing topic's bubble lands BEFORE the card, a new
       // topic's AFTER it (the topic does not exist until the card creates it).
@@ -264,7 +419,22 @@ describe("handler latency bench (A1)", () => {
       // WP-0 fields land in the sample.
       expect(sample.handleStartAt).toBeLessThanOrEqual(sample.runnerRunAt!);
       expect(sample.preRunner?.rosterCache).toBe(s.roster === "warm" ? "hit" : "miss");
-      expect(sample.preRunner?.cotChannel).toBe(s.thread === "continuation" ? "chat-after-thread" : "chat");
+      expect(sample.preRunner?.cotChannel).toBe(s.cotThread === "untried" ? "chat-after-thread" : "chat");
+      // A delta turn never waits on the roster; a full prompt does (≈0 here),
+      // unless it went model-first on a cold lookup (WP-10).
+      if (s.thread === "continuation" || (goesModelFirst(s) && s.roster === "cold")) {
+        expect(sample.preRunner?.rosterMs).toBeUndefined();
+      } else {
+        expect(sample.preRunner?.rosterMs).toBeGreaterThanOrEqual(0);
+      }
+      expect(sample.preRunner?.modelFirst).toBe(goesModelFirst(s) ? true : undefined);
+      // Only a model-first tail waits for the surfaces; the runner's own
+      // duration never includes that wait.
+      expect(sample.postRunner?.surfaceWaitMs !== undefined).toBe(goesModelFirst(s));
+      expect(sample.turnDurationMs).toBe(sample.runnerDoneAt! - Date.parse(sample.spawnedAt));
+      // A model-first runner waited on the root lookup only with a task-claim
+      // hook (rootProbeMs is what remained of it once the local setup was done).
+      if (goesModelFirst(s)) expect(sample.preRunner?.rootProbeMs !== undefined).toBe(s.taskClaim !== undefined);
       expect(sample.preRunner?.cardReplyMs).toBeGreaterThanOrEqual(NET_MS - 5);
       // Still timed, but the client call returns before its round trip (WP-3).
       expect(sample.preRunner?.reactionAddMs).toBeGreaterThanOrEqual(0);
@@ -287,6 +457,7 @@ describe("handler latency bench (A1)", () => {
       reps: REPS,
       serialBeforeRun: last!.serial,
       callsBeforeRun: last!.calls,
+      inFlightAtRun: last!.inFlight,
       detachedBeforeRun: last!.detached,
       preRunnerMsP50: pct(preRunnerMs, 0.5),
       preRunnerMsP90: pct(preRunnerMs, 0.9),

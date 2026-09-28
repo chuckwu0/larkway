@@ -566,9 +566,8 @@ async function runV2Mode({
     )
       ? client.outboundCardKitClient()
       : undefined;
-    // COT (思维链) bubble transport — 方案 B made the bubble the EXPERIMENTAL
-    // surface, so this is provisioned only when the bot opts into
-    // cotSurface="bubble" (and cot != "off"). The default "card" surface folds
+    // COT (思维链) bubble transport — provisioned for cotSurface="bubble" (the
+    // default) when cot != "off". The experimental "card" surface folds
     // reasoning into the answer card and needs no message_cot client.
     const cotClient =
       bot.cot !== "off" && bot.cotSurface === "bubble"

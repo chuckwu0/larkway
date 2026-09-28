@@ -138,10 +138,11 @@ describe("TurnPerfRecorder", () => {
     rec.addMs("rootProbeMs", 10);
     rec.addMs("rootProbeMs", 5);
     rec.addMs("handoffMs", 7);
+    rec.addMs("surfaceWaitMs", 3);
     await expect(rec.timed("rosterMs", Promise.reject(new Error("boom")))).rejects.toThrow("boom");
     expect(rec.preRunner.rootProbeMs).toBe(15);
     expect(rec.preRunner.rosterMs).toBeGreaterThanOrEqual(0); // timed also on rejection
-    expect(rec.postRunner).toEqual({ handoffMs: 7 });
+    expect(rec.postRunner).toEqual({ handoffMs: 7, surfaceWaitMs: 3 });
     expect(await rec.timed("promptRenderMs", Promise.resolve("ok"))).toBe("ok");
   });
 
@@ -157,11 +158,13 @@ describe("TurnPerfRecorder", () => {
   it("summarises only the CardKit calls that completed after the runner finished", () => {
     const rec = new TurnPerfRecorder({});
     const calls = [50, 60]; // mid-turn patches
-    rec.markRunnerDone(calls);
+    const doneAt = Date.now();
+    rec.markRunnerDone(calls, doneAt);
     calls.push(300, 100, 200, 400); // drain + finalize
     rec.markFinalizeEnd(calls);
     expect(rec.postRunner).toEqual({ cardkitCalls: 4, cardkitCallMsMax: 400, cardkitCallMsP50: 200 });
     const filled = rec.fill(sample());
+    expect(filled.runnerDoneAt).toBe(doneAt);
     expect(filled.runnerDoneAt).toBeLessThanOrEqual(filled.finalizeEndAt!);
   });
 

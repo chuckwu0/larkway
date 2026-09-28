@@ -1,9 +1,10 @@
 /**
  * Tests for src/lark/rosterResolver.ts — PRB-6/§11.3 peer-@ correct delivery.
  * Pure parse/remap + the injected-exec resolver + per-chat cache. No real
- * subprocess (per CLAUDE.md).
+ * subprocess (per CLAUDE.md): child_process.execFile is replaced by a recorder
+ * for the default-exec (env) cases.
  */
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi, afterEach } from "vitest";
 import {
   parseBotRoster,
   remapPeersToLiveRoster,
@@ -12,6 +13,29 @@ import {
   type RosterLookupInfo,
 } from "./rosterResolver.js";
 import type { PeerBot } from "../claude/prompt.js";
+
+const execFileCalls = vi.hoisted(
+  () => [] as Array<{ cmd: string; args: string[]; env?: Record<string, string | undefined> }>,
+);
+vi.mock("node:child_process", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:child_process")>();
+  return {
+    ...actual,
+    execFile: (
+      cmd: string,
+      args: string[],
+      opts: { env?: Record<string, string | undefined> },
+      cb: (err: Error | null, stdout: string) => void,
+    ) => {
+      execFileCalls.push({ cmd, args, env: opts.env });
+      setImmediate(() => cb(null, JSON.stringify({ data: { items: [{ bot_id: "ou_live_x", bot_name: "X" }] } })));
+    },
+  };
+});
+
+afterEach(() => {
+  execFileCalls.length = 0;
+});
 
 const rosterStdout = JSON.stringify({
   ok: true,
@@ -128,7 +152,7 @@ describe("createCachedRosterResolver", () => {
     await resolver("oc_1"); // within TTL → cached
     expect(execCount).toBe(1);
 
-    clock += 2000; // past TTL
+    clock += 2000; // past TTL → served stale, refreshed in the background
     await resolver("oc_1");
     expect(execCount).toBe(2);
 
@@ -153,6 +177,102 @@ describe("createCachedRosterResolver", () => {
     clock += 2000;
     const expired: RosterLookupInfo = {};
     await resolver("oc_1", expired);
+    expect(expired.cache).toBe("stale");
+  });
+
+  it("WP-2: an expired entry is returned at once while one background lookup refreshes it", async () => {
+    const peerRoster = (id: string) => JSON.stringify({ data: { items: [{ bot_id: id, bot_name: "Peer" }] } });
+    let clock = 1_000;
+    let release!: () => void;
+    let calls = 0;
+    const resolver = createCachedRosterResolver({
+      ttlMs: 1000,
+      now: () => clock,
+      exec: async () => {
+        calls += 1;
+        if (calls === 1) return peerRoster("ou_test_peer_v1");
+        await new Promise<void>((resolve) => {
+          release = resolve;
+        });
+        return peerRoster("ou_test_peer_v2");
+      },
+    });
+    await resolver("oc_1");
+    clock += 2000;
+
+    // The refresh is still hanging, yet both lookups return the old roster now,
+    // and share ONE refresh spawn.
+    expect((await resolver("oc_1"))?.get("Peer")).toBe("ou_test_peer_v1");
+    expect((await resolver("oc_1"))?.get("Peer")).toBe("ou_test_peer_v1");
+    expect(calls).toBe(2);
+
+    release();
+    await vi.waitFor(async () => {
+      const info: RosterLookupInfo = {};
+      expect((await resolver("oc_1", info))?.get("Peer")).toBe("ou_test_peer_v2");
+      expect(info.cache).toBe("hit");
+    });
+    expect(calls).toBe(2);
+  });
+
+  it("WP-2: an expired failed lookup (null) is awaited again, not served stale", async () => {
+    let clock = 1_000;
+    let calls = 0;
+    const resolver = createCachedRosterResolver({
+      ttlMs: 1000,
+      now: () => clock,
+      exec: async () => {
+        calls += 1;
+        if (calls === 1) throw new Error("lark-cli timed out");
+        await new Promise((resolve) => setTimeout(resolve, 5));
+        return JSON.stringify({ data: { items: [{ bot_id: "ou_test_peer", bot_name: "Peer" }] } });
+      },
+    });
+    expect(await resolver("oc_1")).toBeNull();
+    const cached: RosterLookupInfo = {};
+    expect(await resolver("oc_1", cached)).toBeNull(); // within TTL: the failure stays cached
+    expect(cached.cache).toBe("hit");
+    expect(calls).toBe(1);
+
+    clock += 2000;
+    const expired: RosterLookupInfo = {};
+    expect((await resolver("oc_1", expired))?.get("Peer")).toBe("ou_test_peer");
     expect(expired.cache).toBe("miss");
+    expect(calls).toBe(2);
+  });
+
+  it("WP-2: concurrent first lookups of one chat share a single lark-cli spawn", async () => {
+    let calls = 0;
+    const resolver = createCachedRosterResolver({
+      exec: async () => {
+        calls += 1;
+        await new Promise((resolve) => setTimeout(resolve, 5));
+        return JSON.stringify({ data: { items: [{ bot_id: "ou_test_peer", bot_name: "Peer" }] } });
+      },
+    });
+    const infos: RosterLookupInfo[] = [{}, {}];
+    const [a, b] = await Promise.all([resolver("oc_1", infos[0]), resolver("oc_1", infos[1])]);
+    expect(calls).toBe(1);
+    expect(a?.get("Peer")).toBe("ou_test_peer");
+    expect(b).toBe(a);
+    expect(infos.map((i) => i.cache)).toEqual(["miss", "miss"]);
+  });
+
+  it("WP-2: passes the bot's private lark-cli config dir to lark-cli as LARKSUITE_CLI_CONFIG_DIR", async () => {
+    const resolver = createCachedRosterResolver({
+      profile: "cli_x",
+      larkCliConfigDir: "/tmp/bench-bot/lark-cli",
+    });
+    expect((await resolver("oc_1"))?.get("X")).toBe("ou_live_x");
+    expect(execFileCalls).toHaveLength(1);
+    expect(execFileCalls[0]?.cmd).toBe("lark-cli");
+    expect(execFileCalls[0]?.env?.["LARKSUITE_CLI_CONFIG_DIR"]).toBe("/tmp/bench-bot/lark-cli");
+  });
+
+  it("WP-2: without a config dir the lark-cli spawn inherits the environment unchanged", async () => {
+    const resolver = createCachedRosterResolver({ profile: "cli_x" });
+    await resolver("oc_1");
+    expect(execFileCalls).toHaveLength(1);
+    expect(execFileCalls[0]?.env).toBeUndefined();
   });
 });

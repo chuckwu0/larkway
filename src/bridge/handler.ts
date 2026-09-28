@@ -36,6 +36,7 @@ import { buildTopicDeepLink, realTopicThreadId, type MessageLookupClient } from 
 import { renderPrompt } from "../claude/prompt.js";
 import {
   remapPeersToLiveRoster,
+  type LiveBotRoster,
   type LiveRosterResolver,
   type RosterLookupInfo,
 } from "../lark/rosterResolver.js";
@@ -78,6 +79,7 @@ import {
   stateFilePathOf,
 } from "./stateFile.js";
 import { processHandoffs, type LocalHandoffRegistry } from "./localHandoff.js";
+import { BufferedSurface, createCotEventBuffer, type BufferedSink } from "./bufferedSink.js";
 import { writeCardFile, deleteCardFile } from "./cardFile.js";
 import { writeCotFile, deleteCotFileIfMatches } from "./cotFile.js";
 import {
@@ -373,6 +375,41 @@ function resolveStuckSessionResetAfter(): number {
   const n = Number.parseInt(raw, 10);
   return Number.isFinite(n) && n > 0 ? n : DEFAULT_STUCK_SESSION_RESET_AFTER;
 }
+
+/**
+ * WP-10 model-first surface lane, env LARKWAY_MODEL_FIRST:
+ *   - `off` (default; also unset or unrecognised): the reply surfaces (⏳
+ *     reaction, answer card, COT bubble) exist before the runner starts.
+ *   - `continuation`: a follow-up turn in a topic this bot already has a
+ *     session for starts the runner first; its surfaces open alongside it, in
+ *     their usual order, and its early events wait for the card. Every other
+ *     turn stays card-first: the card of a turn that opens a topic is what
+ *     creates the topic, and an agent that replied through lark-cli ahead of
+ *     it would land outside.
+ *   - `all`: every turn starts the runner first.
+ * Pure scheduling: the same calls happen either way, only what the runner
+ * waits for changes.
+ */
+export type ModelFirstMode = "off" | "continuation" | "all";
+
+let warnedModelFirstValue: string | undefined;
+
+export function resolveModelFirstMode(raw: string | undefined = process.env.LARKWAY_MODEL_FIRST): ModelFirstMode {
+  const value = raw?.trim().toLowerCase() ?? "";
+  if (value === "continuation" || value === "all") return value;
+  if (value !== "" && value !== "off" && warnedModelFirstValue !== value) {
+    warnedModelFirstValue = value;
+    console.warn(`[bridge.handler] LARKWAY_MODEL_FIRST=${raw}: expected off|continuation|all — using off`);
+  }
+  return "off";
+}
+
+/**
+ * WP-10: how long a model-first turn waits for the in-topic task-root probe
+ * (a message lookup, cached per root) before rendering without <task-root>.
+ * A turn of a bot with no task-claim hook does not wait for it at all.
+ */
+const MODEL_FIRST_ROOT_PROBE_BUDGET_MS = 1_000;
 
 function summarizeMentionPolicyRules(rules: string[]): string {
   const counts = new Map<string, number>();
@@ -1056,6 +1093,11 @@ export interface BridgeHandlerDeps {
    */
   cotBubbleCreateBudgetMs?: number;
   /**
+   * WP-10: max ms a model-first turn waits for the in-topic task-root probe.
+   * @default MODEL_FIRST_ROOT_PROBE_BUDGET_MS (1s). Test seam.
+   */
+  modelFirstRootProbeBudgetMs?: number;
+  /**
    * WP-0: max ms between runner done and the success-path perf sample write.
    * @default PERF_SAMPLE_TAIL_BUDGET_MS (60s). Test seam.
    */
@@ -1140,7 +1182,7 @@ export interface BridgeHandlerDeps {
      * 缺省视为 "brief"。仅在非 "off" 时 main.ts 才注入 cotClient。
      */
     cot?: "off" | "brief" | "detailed";
-    /** COT 展示形态(方案 B):"card"(默认,折叠进卡片)| "bubble"(实验,message_cot 气泡)。 */
+    /** COT 展示形态(方案 B):"bubble"(默认,message_cot 气泡)| "card"(实验,折叠进卡片)。 */
     cotSurface?: "card" | "bubble";
   };
   /**
@@ -1361,6 +1403,14 @@ export class BridgeHandler {
   private readonly threadLastOutcome = new Map<string, "completed" | "failed">();
   /** WP-0 perf: when run() pulled each event off the inbound queue (perf `enqueueAt`). */
   private readonly perfEnqueueAt = new WeakMap<object, number>();
+  /**
+   * WP-2 (f): per session key, the fingerprint of the <runtime-warnings> list
+   * the session's native history last received (recorded when a turn that
+   * carried it succeeds). A delta prompt repeats the block only when the list
+   * differs. In-memory like threadReceivedAt: empty after a restart, so each
+   * session gets the block once more.
+   */
+  private readonly runtimeWarningsSent = new Map<string, string>();
 
   constructor(deps: BridgeHandlerDeps) {
     this.deps = deps;
@@ -1416,6 +1466,11 @@ export class BridgeHandler {
     return (this.deps.runtimeRequirements ?? []).filter((req) =>
       !req.ok && (req.severity === "required" || req.kind === "secret")
     );
+  }
+
+  /** WP-2 (f): identity of the rendered warning lines — see runtimeWarningsSent. */
+  private static runtimeWarningsFingerprint(warnings: readonly RuntimeRequirement[]): string {
+    return JSON.stringify(warnings.map((w) => [w.label, w.command, w.reason, w.installHint]));
   }
 
   /**
@@ -1697,10 +1752,16 @@ export class BridgeHandler {
     // gap-fill window (pre-existing behavior), not the steady-state replay.
     let agentRunCompleted = false;
     // COT (思维链) side channel — declared at function scope so the finally
-    // safety net below can close() it on any exit path. Created once per turn
-    // inside the try, fed every event, finalized on success/error. Always
-    // best-effort; a disabled handle is a no-op (see src/bridge/cotProgress.ts).
+    // safety net below can see it on any exit path. Created once per turn
+    // inside the try, fed every event, finalized on success/error; the
+    // finally has no close() (WP-2) — its idempotent finalize chain on
+    // bubbleCreate also clears the throttle timer. Always best-effort; a
+    // disabled handle is a no-op (see src/bridge/cotProgress.ts).
     let cotPublisher: CotProgressHandle | undefined;
+    // WP-2 (c): what the stream loop feeds instead of cotPublisher — buffers
+    // the events that arrive before a background-adopted handle exists and
+    // replays them into it on adoption (see createCotBubble).
+    let cotSink: BufferedSink<AgentStreamEvent> | undefined;
     // The bubble-create promise itself (see the ordering block below). Held at
     // function scope so the finally can guarantee a late-resolving handle —
     // adopted in the BACKGROUND after the 3s budget — still gets finalized:
@@ -1731,6 +1792,30 @@ export class BridgeHandler {
         }),
       ]);
     let cotTurnOutcome: "done" | "error" = "done";
+    // The RUN_ERROR text that goes with cotTurnOutcome, set at the same two
+    // sites, so a bubble adopted only after them (routine for the post-card
+    // create, WP-2) still shows the real reason instead of "run failed".
+    let cotTurnMessage: string | undefined;
+    // WP-8: the turn's task-signal chain (declare → claim), started once
+    // state.json is read and run alongside the final card. Every exit path
+    // waits for it: the lifecycle writeback reads the claim it records, and
+    // so does the next turn's "received" hook (a thread's turns are serialized
+    // on handleOne resolving). Never rejects.
+    let taskSignalsSettled: Promise<void> | undefined;
+    // WP-10: the model-first surface lane (see resolveModelFirstMode) — the
+    // reply surfaces' steps, chained in their usual order, running alongside
+    // the runner. undefined when this turn awaits each step inline instead.
+    // Every exit that reads or finalizes a surface waits for it first. Never
+    // rejects: a failed step is logged and the next one still runs.
+    let surfaceReady: Promise<void> | undefined;
+    const chainSurface = (step: () => Promise<unknown>): void => {
+      surfaceReady = (surfaceReady ?? Promise.resolve()).then(step).then(
+        () => undefined,
+        (err: unknown) => {
+          console.warn("[bridge.handler] surface lane step failed (continuing):", err);
+        },
+      );
+    };
     const settle = (ok: boolean): void => {
       if (settled) return;
       settled = true;
@@ -1888,6 +1973,103 @@ export class BridgeHandler {
         console.warn("[bridge.handler] recordPerfSample failed (continuing):", err);
       }
     };
+    // Set right before this turn's terminal event record (completed / failed),
+    // so a late side-lane write (the roster diagnostic below) can't reopen it.
+    let turnTerminalRecorded = false;
+
+    // PRB-6/§11.3 live roster: peer @ targets resolved to their same-app-scope
+    // open_id (the static config id may be cross-scope). WP-2 (b): the lookup
+    // starts here and runs alongside the reaction + card round trips instead
+    // of in front of the prompt. Only a FULL prompt renders <peer-bots>, so a
+    // full turn awaits it just before rendering; a delta turn never waits on
+    // it before the runner — the handoff @ targets settle it after the run.
+    // Best-effort as before: any failure keeps the static config ids.
+    const staticPeers = this.deps.peers;
+    const rosterLookup: RosterLookupInfo = {};
+    let rosterTask: Promise<PeerBot[]> | undefined;
+    // One lookup, mapped onto the static peers. Never rejects: a failure — a
+    // synchronous throw from an injected resolver included (the type allows a
+    // non-async one) — yields `fallback`, as does a lookup that found nothing.
+    let lookUpPeers:
+      | ((info: RosterLookupInfo, opts: { fallback: PeerBot[]; record: boolean }) => Promise<PeerBot[]>)
+      | undefined;
+    if (staticPeers?.length && this.deps.resolveLiveRoster) {
+      const resolveLiveRoster = this.deps.resolveLiveRoster;
+      const recordRosterDiagnostic = async (reason: string): Promise<void> => {
+        // `settled` covers a turn released before any terminal record (an
+        // early abort): a "running" write would make it look live again.
+        if (turnTerminalRecorded || settled) {
+          console.info(`[bridge.handler] peer roster resolved after turn end: ${reason}`);
+          return;
+        }
+        await recordEvent({ status: "running", appendPath: "peer roster", reason });
+      };
+      lookUpPeers = (info, { fallback, record }) => {
+        let lookup: Promise<LiveBotRoster | null>;
+        try {
+          lookup = resolveLiveRoster(parsed.chatId, info);
+        } catch (err) {
+          lookup = Promise.reject(err);
+        }
+        return lookup
+          .then(async (liveRoster) => {
+            if (!liveRoster) {
+              if (record) {
+                await recordRosterDiagnostic(
+                  "live-roster resolve returned nothing; kept static <peer-bots> open_ids " +
+                    "(may be cross-app-scope / undeliverable).",
+                );
+              }
+              return fallback;
+            }
+            const { peers: remappedPeers, remapped, unresolved } = remapPeersToLiveRoster(
+              staticPeers,
+              liveRoster,
+            );
+            if (record && (remapped.length > 0 || unresolved.length > 0)) {
+              await recordRosterDiagnostic(
+                `live-roster resolve: remapped [${remapped.join(", ") || "none"}] to ` +
+                  `same-app-scope open_id; unresolved (kept static config id, may not be ` +
+                  `deliverable) [${unresolved.join(", ") || "none"}].`,
+              );
+            }
+            return remappedPeers;
+          })
+          .catch((err: unknown) => {
+            console.warn("[bridge.handler] live-roster resolve failed (using static peers):", err);
+            return fallback;
+          });
+      };
+      rosterTask = lookUpPeers(rosterLookup, { fallback: staticPeers, record: true }).then((peers) => {
+        // A resolver that only reports once it settles (the contract allows
+        // it) still gets recorded here, if the sample is not written yet.
+        if (rosterLookup.cache) turnPerf.preRunner.rosterCache = rosterLookup.cache;
+        return peers;
+      });
+      // The cached resolver sets `cache` synchronously, on the call. Record it
+      // now: on a delta turn nothing waits for the lookup, and one slower than
+      // the whole turn (a cold miss, up to lark-cli's timeout) would otherwise
+      // land after the perf sample was written, without its miss.
+      if (rosterLookup.cache) turnPerf.preRunner.rosterCache = rosterLookup.cache;
+    } else {
+      turnPerf.preRunner.rosterCache = "skip";
+    }
+
+    // WP-10: does this turn start its runner first? A "continuation" is a
+    // follow-up in a topic this bot already has a session for, whose reply
+    // does not open a topic (replyInThread below stays false: a thread reply
+    // not retargeted onto a task card). The session store is only peeked
+    // when the flag is on.
+    const modelFirstMode = resolveModelFirstMode();
+    const modelFirst =
+      modelFirstMode === "all" ||
+      (modelFirstMode === "continuation" &&
+        typeof parsed.raw.root_id === "string" &&
+        parsed.raw.root_id.length > 0 &&
+        !taskCardAnchorId &&
+        this.deps.sessionStore.get(threadId, botId) !== undefined);
+    if (modelFirst) turnPerf.preRunner.modelFirst = true;
+
     const triggerType =
       typeof parsed.raw.root_id === "string" && parsed.raw.root_id
         ? "thread_reply"
@@ -1911,7 +2093,10 @@ export class BridgeHandler {
     // Since WP-3 both calls return before their round trip (ChannelClient
     // logs its duration), so these time only the call itself.
     if (this.deps.client.addProcessingReaction) {
-      await turnPerf.timed("reactionAddMs", this.deps.client.addProcessingReaction(messageId));
+      const reactionAdded = turnPerf.timed("reactionAddMs", this.deps.client.addProcessingReaction(messageId));
+      // WP-10: the model-first lane's first step (its removal must follow).
+      if (modelFirst) chainSurface(() => reactionAdded);
+      else await reactionAdded;
     }
     const removeProcessingReactionPreRunner = async (): Promise<void> => {
       if (!this.deps.client.removeProcessingReaction) return;
@@ -2064,41 +2249,47 @@ export class BridgeHandler {
     let legacyCardStartFailed = false;
     let legacyCardStartFailureReason: string | undefined;
     let startFailurePostFallbackSent = false;
-    if (!cardKitAvailable) {
-      try {
-        card = await turnPerf.timed(
-          "legacyCardMs",
-          this.deps.cardRenderer.start(replyAnchorId, { replyInThread, threadId }),
-        );
+    const startCardOrDefer = async (): Promise<void> => {
+      if (!cardKitAvailable) {
+        try {
+          card = await turnPerf.timed(
+            "legacyCardMs",
+            this.deps.cardRenderer.start(replyAnchorId, { replyInThread, threadId }),
+          );
+          await recordEvent({
+            status: "running",
+            startedAt: new Date().toISOString(),
+            appendPath: "已创建卡片",
+            reason: "已交给本地 Agent 处理。",
+          });
+        } catch (err) {
+          legacyCardStartFailed = true;
+          legacyCardStartFailureReason = String(err);
+          console.error("[bridge.handler] Failed to start card for thread", threadId, err);
+          await recordEvent({
+            status: "running",
+            startedAt: new Date().toISOString(),
+            appendPath: "卡片创建失败，继续执行",
+            reason: "卡片创建失败，但 bridge 会继续启动本地 Agent。",
+          });
+          // Without a card we can still run Claude, but operator won't see output.
+          // Proceed — sessionStore still needs updating.
+        } finally {
+          await removeProcessingReactionPreRunner();
+        }
+      } else {
         await recordEvent({
           status: "running",
           startedAt: new Date().toISOString(),
-          appendPath: "已创建卡片",
-          reason: "已交给本地 Agent 处理。",
+          appendPath: "延迟创建卡片",
+          reason: "CardKit response surface is available; legacy card is reserved for fallback.",
         });
-      } catch (err) {
-        legacyCardStartFailed = true;
-        legacyCardStartFailureReason = String(err);
-        console.error("[bridge.handler] Failed to start card for thread", threadId, err);
-        await recordEvent({
-          status: "running",
-          startedAt: new Date().toISOString(),
-          appendPath: "卡片创建失败，继续执行",
-          reason: "卡片创建失败，但 bridge 会继续启动本地 Agent。",
-        });
-        // Without a card we can still run Claude, but operator won't see output.
-        // Proceed — sessionStore still needs updating.
-      } finally {
-        await removeProcessingReactionPreRunner();
       }
-    } else {
-      await recordEvent({
-        status: "running",
-        startedAt: new Date().toISOString(),
-        appendPath: "延迟创建卡片",
-        reason: "CardKit response surface is available; legacy card is reserved for fallback.",
-      });
-    }
+    };
+    // WP-10: next in the model-first lane, still ahead of the setup below; a
+    // failure there then finds this card to finalize, as it would inline.
+    if (modelFirst) chainSurface(startCardOrDefer);
+    else await startCardOrDefer();
 
     try {
       // Step 4a: build conventions (per-thread worktreePath)
@@ -2223,9 +2414,9 @@ export class BridgeHandler {
       };
 
       // COT (方案 B) surface resolution — shared by the CardKit panel (below)
-      // and the experimental bubble (further down). "card" (default) folds
-      // reasoning into the answer card's collapsible panel; "bubble" uses the
-      // message_cot side channel.
+      // and the bubble (further down). "bubble" (default) uses the message_cot
+      // side channel; "card" (experimental) folds reasoning into the answer
+      // card's collapsible panel.
       const cotDetail = this.deps.botConfig?.cot ?? "brief";
       const cotSurface = this.deps.botConfig?.cotSurface ?? "bubble";
       const cotCardOption =
@@ -2233,8 +2424,8 @@ export class BridgeHandler {
           ? { detail: cotDetail as "brief" | "detailed" }
           : undefined;
 
-      // COT (思维链) bubble — 方案 B experimental surface (cotSurface="bubble";
-      // the default "card" folds reasoning into the panel via `cot` above).
+      // COT (思维链) bubble — 方案 B default surface (cotSurface="bubble"; the
+      // experimental "card" folds reasoning into the panel via `cot` above).
       // Extracted to a closure because its position relative to the answer card
       // depends on whether this is the FIRST turn of a NEW topic:
       //   - existing topic (later turns): create the bubble BEFORE the card so
@@ -2247,21 +2438,29 @@ export class BridgeHandler {
       //     every later turn. A first-turn bubble slightly below the card is the
       //     correct trade here (users want "bubble inside the topic" over "on top").
       // Created ONCE per turn (before the retry loop). Bypass rule preserved:
-      // createCotProgressHandle never throws. To keep a SLOW create off the
-      // card's critical path (worst case = hung GET + two-tier create, each
-      // 8s-bounded), race a 3s budget — past it, proceed and adopt the handle in
-      // the background (the finally's anti-orphan finalize completes a late
-      // handle). This holds for BOTH orderings (a first-turn, post-card create
-      // can be slow/fail too).
+      // createCotProgressHandle never throws. The pre-card create is awaited
+      // (the bubble must land before the card) but raced against a 3s budget
+      // (worst case = hung GET + two-tier create, each 8s-bounded) — past it,
+      // proceed and adopt the handle in the background. WP-2 (c): the post-card
+      // create is never awaited at all — nothing visible depends on it, so it
+      // stays off the runner's critical path. Either way a background-adopted
+      // handle gets the events that arrived before it (cotSink replays them)
+      // and the finally's anti-orphan finalize completes a late handle.
       // `originMessageId` is the message_cot anchor. Its POSITION in the topic
       // decides where the bubble lands (control-var experiment, cot-write-probe
       // §F/F2): origin = the topic ROOT (首楼, pos=-1) → the bubble quote-replies
       // at the GROUP top level (thread_id=None); origin = an IN-topic message
       // (pos≥0) → the bubble inherits its thread and lands INSIDE the topic. So
       // callers pass an in-topic message id whenever they have one.
-      const createCotBubble = async (originMessageId: string): Promise<void> => {
+      const createCotBubble = async (
+        originMessageId: string,
+        opts: { awaitCreate: boolean },
+      ): Promise<void> => {
         if (!(this.deps.cotClient && cotDetail !== "off" && cotSurface === "bubble")) return;
         if (bubbleCreate) return; // once per turn
+        // A model-first turn made the sink before its runner started (WP-10).
+        const sink = cotSink ?? createCotEventBuffer();
+        cotSink = sink;
         bubbleCreate = createCotProgressHandle({
           cotClient: this.deps.cotClient,
           detail: cotDetail,
@@ -2298,6 +2497,25 @@ export class BridgeHandler {
           }
         };
 
+        const adopt = (handle: CotProgressHandle): Promise<void> => {
+          cotPublisher = handle;
+          turnPerf.preRunner.cotChannel = handle.channel;
+          // Replays, in order, whatever the runner emitted before the handle
+          // existed; from here on events pass straight through.
+          sink.attach(handle);
+          return persistBubbleRef(handle);
+        };
+        // Captured (not fire-and-forget): the finally's finalize+delete chain
+        // waits on it, so on the slow-create path the ledger write can no longer
+        // land AFTER its own delete and strand an orphan pointing at a bubble
+        // that was already completed (independent review 2026-07-28).
+        if (!opts.awaitCreate) {
+          // Adopt in the background once it resolves (never throws; the
+          // finally guarantees it's finalized).
+          cotPersistSettled = bubbleCreate.then(adopt);
+          return;
+        }
+
         const cotStartedAt = Date.now();
         const raced = await Promise.race([
           bubbleCreate.then((handle) => ({ ready: true as const, handle })),
@@ -2310,23 +2528,8 @@ export class BridgeHandler {
           }),
         ]);
         turnPerf.addMs("cotMs", Date.now() - cotStartedAt);
-        if (raced.ready) {
-          cotPublisher = raced.handle;
-          turnPerf.preRunner.cotChannel = raced.handle.channel;
-          // Captured (not fire-and-forget): the finally's finalize+delete chain
-          // waits on it, so on the slow-create path the ledger write can no longer
-          // land AFTER its own delete and strand an orphan pointing at a bubble
-          // that was already completed (independent review 2026-07-28).
-          cotPersistSettled = persistBubbleRef(raced.handle);
-        } else {
-          // Slow create — proceed now; adopt the handle in the background once
-          // it resolves (never throws; the finally guarantees it's finalized).
-          cotPersistSettled = bubbleCreate.then((handle) => {
-            cotPublisher = handle;
-            turnPerf.preRunner.cotChannel = handle.channel;
-            return persistBubbleRef(handle);
-          });
-        }
+        // Slow create — proceed now and adopt in the background.
+        cotPersistSettled = raced.ready ? adopt(raced.handle) : bubbleCreate.then(adopt);
       };
 
       // Existing session → bubble BEFORE the card, anchored on the TRIGGER
@@ -2361,8 +2564,16 @@ export class BridgeHandler {
       // the same treatment a brand-new topic already gets.
       const triggerIsRealMessage =
         typeof parsed.raw.message_id === "string" && parsed.raw.message_id.startsWith("om_");
-      if (!isNewThread && triggerIsRealMessage && (triggerInTopic || !taskCardAnchorId)) {
-        await createCotBubble(messageId);
+      const preCardBubble = !isNewThread && triggerIsRealMessage && (triggerInTopic || !taskCardAnchorId);
+      // WP-10: a model-first turn makes it in its surface lane, right before
+      // the card (chainCardStep below). Its runner may emit before either
+      // bubble exists, so the sink that holds those events is made now, ahead
+      // of every lane step that could create the bubble and adopt it.
+      if (preCardBubble && !modelFirst) {
+        await createCotBubble(messageId, { awaitCreate: true });
+      }
+      if (modelFirst && this.deps.cotClient && cotDetail !== "off" && cotSurface === "bubble") {
+        cotSink = createCotEventBuffer();
       }
 
       // CardKit response surface: default main surface when the transport and
@@ -2499,10 +2710,21 @@ export class BridgeHandler {
         }
       };
 
+      // WP-10: a model-first turn chains, at each runtime's card site below,
+      // what the flag-off turn awaits there — the pre-card bubble of an
+      // existing session, then the card. Same sites as inline, so a setup
+      // step that throws after one still finds its card to finalize.
+      const chainCardStep = (): void =>
+        chainSurface(async () => {
+          if (preCardBubble) await createCotBubble(messageId, { awaitCreate: true });
+          await createCardKitPlaceholder();
+        });
+
       if (isAgentWorkspace) {
         // A1 early path: safe (see rationale above) — no bridge-managed
         // worktree to race against.
-        await createCardKitPlaceholder();
+        if (modelFirst) chainCardStep();
+        else await createCardKitPlaceholder();
       }
 
       // Provisioning decision tree (unified — no read/write split):
@@ -2751,27 +2973,35 @@ export class BridgeHandler {
         // Legacy runtime: baseline ordering — the worktree definitely exists
         // (built above) before the card is created. See the A1 rationale at
         // the other call site for why legacy does NOT get the early-card path.
-        await createCardKitPlaceholder();
+        // (WP-10: model-first chains its pre-card bubble here too, with the
+        // card — the bubble's cot.json lands in the same worktree.)
+        if (modelFirst) chainCardStep();
+        else await createCardKitPlaceholder();
       }
 
       // Step 4a-v-bis: persist a card.json handle so boot reconcile can
       //   finalize this card if the bridge crashes before card.finalize().
       //   Gated on a live card handle. Best-effort: a write failure must not
       //   abort the turn.
-      if (card) {
-        try {
-          await writeCardFile(worktreePath, {
-            messageId: card.messageId,
-            chatId: parsed.chatId,
-            threadId,
-            botId: this.deps.botConfig?.id ?? "",
-            replyInThread,
-            createdAt: new Date().toISOString(),
-          });
-        } catch (err) {
-          console.warn("[bridge.handler] writeCardFile failed (continuing):", err);
+      const writeCardLedger = async (): Promise<void> => {
+        if (card) {
+          try {
+            await writeCardFile(worktreePath, {
+              messageId: card.messageId,
+              chatId: parsed.chatId,
+              threadId,
+              botId: this.deps.botConfig?.id ?? "",
+              replyInThread,
+              createdAt: new Date().toISOString(),
+            });
+          } catch (err) {
+            console.warn("[bridge.handler] writeCardFile failed (continuing):", err);
+          }
         }
-      }
+      };
+      // WP-10: model-first — next in the lane, after the card it records.
+      if (modelFirst) chainSurface(writeCardLedger);
+      else await writeCardLedger();
 
       // Step 4a-vi: pre-install node_modules in the worktree (best-effort).
       //   Without this the bot trips on `Cannot find module 'ts-node/register'`
@@ -2882,18 +3112,60 @@ export class BridgeHandler {
       // card id is available (both surfaces failed) — origin=首楼 lands at the
       // top level but is still usable; never block the turn. createCotBubble's
       // once-per-turn guard makes this a no-op when the early site already ran.
-      {
+      // WP-2 (c): not awaited — the card is already out, so nothing visible
+      // is ordered behind this bubble; the runner starts right away and the
+      // handle is adopted (with any buffered events) when the create lands.
+      const createDeferredBubble = (): void => {
         const anchorMessageId = cardKitProgress?.messageId ?? card?.messageId ?? messageId;
-        await createCotBubble(anchorMessageId);
+        void createCotBubble(anchorMessageId, { awaitCreate: false });
+      };
+
+      // WP-10: what the stream loop and the idle notice feed instead of the
+      // card handles. Not model-first: attached now, so it passes straight
+      // through to whichever handle is live. Model-first: it holds the
+      // runner's early events (bounded, answer text coalesced, never dropped)
+      // until the lane below has the card, then replays them in order.
+      const surface = new BufferedSurface({
+        handle: (ev) => {
+          if (cardKitProgress) cardKitProgress.handle(ev);
+          else if (card) card.handle(ev);
+        },
+        markIdleWaiting: (silentMs, idleOpts) => cardKitProgress?.markIdleWaiting(silentMs, idleOpts),
+        clearIdleWaiting: () => cardKitProgress?.clearIdleWaiting(),
+      });
+      if (!modelFirst) {
+        surface.attach();
+        createDeferredBubble();
+      } else {
+        // The lane's last steps, behind the card and its ledger (chained at
+        // their inline sites above): the post-card bubble, then the card
+        // takes over from the buffer.
+        chainSurface(async () => createDeferredBubble());
+        chainSurface(async () => surface.attach());
       }
 
       // Step 4b–4f: spawn + stream + finalize, with one stale-session retry.
       // `currentExisting` may be reset to undefined on retry (ghost session cleared).
       let currentExisting = existing;
       let attempt = 0;
+      // WP-10: a /stop that came while a stale-session retry waited for the
+      // lane — the retry's runner is stopped as soon as it starts.
+      let stopRequestedBeforeRetry = false;
 
       while (true) {
         attempt++;
+        // WP-10: only the first attempt runs ahead of the surfaces; a
+        // stale-session retry starts once they are up. The first attempt's
+        // kill hook is gone by now and the retry's is not registered yet, so
+        // a /stop meanwhile is held for the retry's runner.
+        if (attempt > 1 && surfaceReady) {
+          if (queueKey) {
+            this.activeTurnStops.set(queueKey, () => {
+              stopRequestedBeforeRetry = true;
+            });
+          }
+          await surfaceReady;
+        }
 
         // Step 4b: render prompt — isNewThread reflects current attempt's state.
         const backend = this.deps.botConfig?.backend ?? "claude";
@@ -2925,58 +3197,35 @@ export class BridgeHandler {
         // and artifacts are retained.
         const currentIsNewThread = !currentExisting?.sessionId || incompatibleSession;
         const promptMode = this.deps.botConfig?.promptMode ?? (isAgentWorkspace ? "delta" : "full");
-        // PRB-6/§11.3: resolve peer @ targets to their same-app-scope open_id
-        // from the LIVE chat roster before building the prompt, so a handoff @
-        // actually wakes the peer (the static config id may be cross-scope).
-        // Best-effort: any failure keeps the static ids and never blocks the turn.
-        let effectivePeers = this.deps.peers;
-        if (effectivePeers?.length && this.deps.resolveLiveRoster) {
-          try {
-            const rosterLookup: RosterLookupInfo = {};
-            const liveRoster = await turnPerf.timed(
-              "rosterMs",
-              this.deps.resolveLiveRoster(parsed.chatId, rosterLookup),
-            );
-            turnPerf.preRunner.rosterCache = rosterLookup.cache;
-            if (liveRoster) {
-              const { peers: remappedPeers, remapped, unresolved } = remapPeersToLiveRoster(
-                effectivePeers,
-                liveRoster,
-              );
-              effectivePeers = remappedPeers;
-              if (remapped.length > 0 || unresolved.length > 0) {
-                await recordEvent({
-                  status: "running",
-                  appendPath: "peer roster",
-                  reason:
-                    `live-roster resolve: remapped [${remapped.join(", ") || "none"}] to ` +
-                    `same-app-scope open_id; unresolved (kept static config id, may not be ` +
-                    `deliverable) [${unresolved.join(", ") || "none"}].`,
-                });
-              }
-            } else {
-              await recordEvent({
-                status: "running",
-                appendPath: "peer roster",
-                reason:
-                  "live-roster resolve returned nothing; kept static <peer-bots> open_ids " +
-                  "(may be cross-app-scope / undeliverable).",
-              });
-            }
-          } catch (err) {
-            console.warn("[bridge.handler] live-roster resolve failed (using static peers):", err);
-          }
-        } else {
-          turnPerf.preRunner.rosterCache = "skip";
-        }
 
         // v4 任务派单 — deferred in-thread probe (see the dispatch-site
         // comment): resolve it here, where the <task-root> facts are consumed.
         // The topic already exists (we're inside it), so the deep link comes
         // straight from the event's own thread_id — no dependency on the
         // (possibly pre-topic, cached) probe result's threadId field.
-        if (deferredTaskRootProbe) {
-          const info = await turnPerf.timed("rootProbeMs", deferredTaskRootProbe);
+        // WP-10: a model-first turn waits for it within a budget, and not at
+        // all when this bot has no task-claim hook — then only the prompt's
+        // <task-root> facts would use it. A late answer still fills the lookup
+        // cache for the next turn. main.ts wires the hook for every bot with
+        // an id, so there a root not yet in the lookup cache (the bot's first
+        // look at this topic since boot) costs one lookup ahead of the runner,
+        // at most the budget; a cached root costs none.
+        const taskRootProbe = !modelFirst
+          ? deferredTaskRootProbe
+          : deferredTaskRootProbe && this.deps.taskHandleClaim && botId
+            ? Promise.race([
+                deferredTaskRootProbe,
+                new Promise<undefined>((resolve) => {
+                  const t = setTimeout(
+                    () => resolve(undefined),
+                    this.deps.modelFirstRootProbeBudgetMs ?? MODEL_FIRST_ROOT_PROBE_BUDGET_MS,
+                  );
+                  t.unref?.();
+                }),
+              ])
+            : undefined;
+        if (taskRootProbe) {
+          const info = await turnPerf.timed("rootProbeMs", taskRootProbe);
           if (info?.msgType === "todo" && info.content) {
             const todo = parseTodoShareContent(info.content);
             if (todo) {
@@ -3005,6 +3254,8 @@ export class BridgeHandler {
         // the fresh omt_* id so the <task-root> fact can carry the topic deep
         // link the agent pastes into its claim comment. Best-effort.
         if (taskRootInfo && !taskRootInfo.topicLink && replyAnchorId !== messageId && this.deps.messageLookup) {
+          // WP-10: that card is in the model-first lane — wait for it here.
+          if (surfaceReady) await surfaceReady;
           const refreshed = await this.deps.messageLookup.get(replyAnchorId, { refresh: true }).catch(() => undefined);
           const refreshedThreadId = realTopicThreadId(refreshed?.threadId);
           if (refreshedThreadId) {
@@ -3021,6 +3272,28 @@ export class BridgeHandler {
           currentIsNewThread ||
           forceFreshSession ||
           promptMode !== "delta";
+        // PRB-6/§11.3: <peer-bots> (full prompts only) carries the live
+        // same-app-scope ids so a handoff @ actually wakes the peer. See
+        // rosterTask (WP-2 (b)): started at turn start, awaited here only by a
+        // full prompt; a delta turn renders without it.
+        // WP-10: model-first waits only for an answer served from the cache;
+        // a cold lookup keeps running (it fills the cache) while this prompt
+        // renders the static ids, and the handoff @ below still waits for it.
+        let effectivePeers = this.deps.peers;
+        if (
+          rosterTask &&
+          rendersFullPrompt &&
+          (!modelFirst || rosterLookup.cache === "hit" || rosterLookup.cache === "stale")
+        ) {
+          effectivePeers = await turnPerf.timed("rosterMs", rosterTask);
+        }
+        // WP-2 (f): the session's native history already holds the last
+        // <runtime-warnings> block it was sent; a delta prompt repeats it only
+        // when the list changed since (or this process never delivered it).
+        const runtimeWarnings = this.runtimeWarnings();
+        const runtimeWarningsKey = BridgeHandler.runtimeWarningsFingerprint(runtimeWarnings);
+        const runtimeWarningsChanged =
+          rendersFullPrompt || this.runtimeWarningsSent.get(threadId) !== runtimeWarningsKey;
         let knowledgeMap: string | undefined;
         if (knowledgeDir && rendersFullPrompt) {
           try {
@@ -3095,7 +3368,8 @@ export class BridgeHandler {
           knowledgeMap,
           agentMemory,
           larkCliProfile: this.deps.larkCliProfile,
-          runtimeWarnings: this.runtimeWarnings(),
+          runtimeWarnings,
+          runtimeWarningsChanged,
           taskHandleTasklistGuid: this.deps.botConfig?.taskHandle?.tasklistGuid,
           taskHandleClaimed: this.deps.taskHandleClaimedLookup?.(threadId) ?? false,
           // BL-49: mechanical 建卡 判据 facts. Counts THIS turn (a brand-new
@@ -3153,8 +3427,10 @@ export class BridgeHandler {
         const perfMarkers: Partial<Record<PerfMarkerName, number>> = {};
 
         // Share the exact discovery inputs with prewarm. Changes in repo
-        // directories invalidate the warm child's spawn signature.
-        const addDirs = isAgentWorkspace && conventions.workspaceReposPath
+        // directories invalidate the warm child's spawn signature. WP-2 (e):
+        // codex has no add-dir input (its command and pool ignore addDirs), so
+        // it skips the scan.
+        const addDirs = isAgentWorkspace && conventions.workspaceReposPath && backend !== "codex"
           ? await discoverWorkspaceRepoDirs(conventions.workspaceReposPath) : [];
 
         // Workspace-move resume gate: agent CLI sessions encode the cwd they
@@ -3369,7 +3645,7 @@ export class BridgeHandler {
               if (idleSuspected && silentMs - idleNoticeAtMs >= noticeRefreshMs) {
                 idleNoticeAtMs = silentMs;
                 try {
-                  cardKitProgress?.markIdleWaiting(silentMs, {
+                  surface.markIdleWaiting(silentMs, {
                     hasBubble: cotPublisher?.bubbleRef !== undefined,
                     toolInFlight: toolExemptsKill,
                   });
@@ -3390,7 +3666,7 @@ export class BridgeHandler {
                     (this.deps.botConfig?.id ? ` [bot ${this.deps.botConfig.id}]` : ""),
                 );
                 try {
-                  cardKitProgress?.markIdleWaiting(silentMs, {
+                  surface.markIdleWaiting(silentMs, {
                     hasBubble: cotPublisher?.bubbleRef !== undefined,
                     toolInFlight: toolExemptsKill,
                   });
@@ -3449,14 +3725,16 @@ export class BridgeHandler {
         // BL-42 /stop: expose this turn's kill switch to run()'s intercept.
         // Cleared on both watchdog-teardown paths + handleOne's outer finally.
         if (queueKey) {
-          this.activeTurnStops.set(queueKey, () => {
+          const stopTurn = (): void => {
             stoppedByUser = true;
             try {
               handle.kill();
             } catch {
               /* best-effort — finalization below still renders 已停止 */
             }
-          });
+          };
+          this.activeTurnStops.set(queueKey, stopTurn);
+          if (stopRequestedBeforeRetry) stopTurn();
         }
 
         // GC liveness (agent_workspace only): the runner's cwd is the SHARED
@@ -3539,7 +3817,7 @@ export class BridgeHandler {
                   (this.deps.botConfig?.id ? ` [bot ${this.deps.botConfig.id}]` : ""),
               );
               try {
-                cardKitProgress?.clearIdleWaiting();
+                surface.clearIdleWaiting();
               } catch {
                 /* status notice is best-effort */
               }
@@ -3568,11 +3846,13 @@ export class BridgeHandler {
                 }
               }
             }
-            if (cardKitProgress) cardKitProgress.handle(ev);
-            else if (card) card.handle(ev);
+            // Through `surface` (WP-10): straight to the live card handle,
+            // or held until the model-first lane has the card.
+            surface.handle(ev);
             // COT is a parallel channel, not an either/or with the card: feed
-            // it every event regardless of which primary surface is live.
-            if (cotPublisher) cotPublisher.handle(ev);
+            // it every event regardless of which primary surface is live
+            // (through cotSink, which holds them until the handle is adopted).
+            if (cotSink) cotSink.handle(ev);
             if (ev.type === "system_init") {
               sessionId = ev.sessionId;
             }
@@ -3590,7 +3870,10 @@ export class BridgeHandler {
           }
 
           const result = await handle.done;
-          turnPerf.markRunnerDone(cardKitProgress?.callDurationsMs);
+          const runnerDoneAt = Date.now();
+          // A model-first card may not exist yet: then all of its calls (the
+          // replay of the early events included) land in the tail below.
+          turnPerf.markRunnerDone(cardKitProgress?.callDurationsMs, runnerDoneAt);
           // From here on the agent's work is done — a later failure must not
           // proactively re-run the whole turn (see agentRunCompleted doc).
           agentRunCompleted = true;
@@ -3599,6 +3882,10 @@ export class BridgeHandler {
             idleWatchdog = undefined;
           }
           if (queueKey) this.activeTurnStops.delete(queueKey);
+          // WP-10: everything below reads or finalizes the surfaces — a
+          // model-first turn waits for its lane (the card, and the early events
+          // replayed into it) here, a /stop'd one included.
+          if (surfaceReady) await turnPerf.timed("surfaceWaitMs", surfaceReady);
 
           // COT bubble teardown is deferred to just after `success` is known
           // (search cotTurnOutcome below). It used to run here and had to guess
@@ -3651,7 +3938,8 @@ export class BridgeHandler {
             promptMode: currentIsNewThread || forceFreshSession || promptMode === "full" ? "full" : "delta",
             exitCode: result.exitCode,
             toolUseCount: toolUseTotalCount,
-            turnDurationMs: Date.now() - runnerStartedAt,
+            // Spawn → done: not the lane wait or the cleanup above.
+            turnDurationMs: runnerDoneAt - runnerStartedAt,
             // 批B Phase 1 A0 extension: only a pooled runner (src/codex/
             // pool.ts) ever sets these on `result`; every other runner leaves
             // them undefined, same as every perf sample recorded before this.
@@ -3718,123 +4006,114 @@ export class BridgeHandler {
           // task_handle v5 (BL-48) — declarative signals BEFORE the claim, so a
           // bridge-created task's guid flows into the claim below. Best-effort:
           // any failure degrades that signal, never the turn.
+          // WP-8: the chain is only STARTED here. It runs alongside session
+          // persistence and the final card, and is joined after finalize —
+          // before the 任务卡黑洞 check and the lifecycle writeback, which read
+          // the claim it records. Never rejects (both hooks swallow).
           const declaredTaskHandle = reportedState?.task_handle;
-          let bridgeCreatedTaskGuid: string | undefined;
-          const taskSignalsStartedAt = Date.now();
-          let taskSignalHookCalled = false;
-          if (
-            declaredTaskHandle &&
-            (declaredTaskHandle.create || declaredTaskHandle.due || declaredTaskHandle.blocked) &&
-            this.deps.taskHandleDeclare &&
-            botId
-          ) {
-            taskSignalHookCalled = true;
-            try {
-              // Topic backlink (硬性要求): ONLY a real omt_* id makes a live
-              // deep link. Resolve from the event first, then one refresh
-              // lookup; unresolvable → chat-link fallback (explicit, never
-              // silent). Lookup cost is only paid on turns that declare create.
-              let topicLink: string | undefined;
-              if (declaredTaskHandle.create) {
-                const direct = realTopicThreadId(parsed.raw.thread_id);
-                if (direct) {
-                  topicLink = buildTopicDeepLink(parsed.chatId, direct);
-                } else if (this.deps.messageLookup) {
-                  const refreshed = await this.deps.messageLookup
-                    .get(replyAnchorId, { refresh: true })
-                    .catch(() => undefined);
-                  const refreshedThreadId = realTopicThreadId(refreshed?.threadId);
-                  if (refreshedThreadId) {
-                    topicLink = buildTopicDeepLink(parsed.chatId, refreshedThreadId);
+          const runTaskSignals = async (): Promise<void> => {
+            let bridgeCreatedTaskGuid: string | undefined;
+            const taskSignalsStartedAt = Date.now();
+            let taskSignalHookCalled = false;
+            if (
+              declaredTaskHandle &&
+              (declaredTaskHandle.create || declaredTaskHandle.due || declaredTaskHandle.blocked) &&
+              this.deps.taskHandleDeclare &&
+              botId
+            ) {
+              taskSignalHookCalled = true;
+              try {
+                // Topic backlink (硬性要求): ONLY a real omt_* id makes a live
+                // deep link. Resolve from the event first, then one refresh
+                // lookup; unresolvable → chat-link fallback (explicit, never
+                // silent). Lookup cost is only paid on turns that declare create.
+                let topicLink: string | undefined;
+                if (declaredTaskHandle.create) {
+                  const direct = realTopicThreadId(parsed.raw.thread_id);
+                  if (direct) {
+                    topicLink = buildTopicDeepLink(parsed.chatId, direct);
+                  } else if (this.deps.messageLookup) {
+                    const refreshed = await this.deps.messageLookup
+                      .get(replyAnchorId, { refresh: true })
+                      .catch(() => undefined);
+                    const refreshedThreadId = realTopicThreadId(refreshed?.threadId);
+                    if (refreshedThreadId) {
+                      topicLink = buildTopicDeepLink(parsed.chatId, refreshedThreadId);
+                    }
                   }
                 }
+                const result = await this.deps.taskHandleDeclare({
+                  botId,
+                  threadId,
+                  chatId: parsed.chatId,
+                  senderOpenId: parsed.senderOpenId || undefined,
+                  create: declaredTaskHandle.create,
+                  declaredGuid: declaredTaskHandle.guid,
+                  due: declaredTaskHandle.due,
+                  dueReason: declaredTaskHandle.due_reason,
+                  blocked: declaredTaskHandle.blocked,
+                  topicLink,
+                  chatLink: `https://applink.feishu.cn/client/chat/open?openChatId=${parsed.chatId}`,
+                });
+                bridgeCreatedTaskGuid = result?.createdGuid;
+                for (const line of result?.outcomes ?? []) {
+                  await recordEvent({ status: "running", appendPath: "任务信号", reason: line });
+                }
+              } catch (err) {
+                console.warn("[bridge.handler] taskHandleDeclare hook failed (continuing):", err);
               }
-              const result = await this.deps.taskHandleDeclare({
-                botId,
-                threadId,
-                chatId: parsed.chatId,
-                senderOpenId: parsed.senderOpenId || undefined,
-                create: declaredTaskHandle.create,
-                declaredGuid: declaredTaskHandle.guid,
-                due: declaredTaskHandle.due,
-                dueReason: declaredTaskHandle.due_reason,
-                blocked: declaredTaskHandle.blocked,
-                topicLink,
-                chatLink: `https://applink.feishu.cn/client/chat/open?openChatId=${parsed.chatId}`,
-              });
-              bridgeCreatedTaskGuid = result?.createdGuid;
-              for (const line of result?.outcomes ?? []) {
-                await recordEvent({ status: "running", appendPath: "任务信号", reason: line });
+            }
+
+            // Task-handle claim declaration (docs/task-handle.md §5.2): the agent
+            // wrote `task_handle.guid` this turn — this is the ONLY path that
+            // records a new thread↔task claim. v5: a bridge-created task (create
+            // declaration above) claims its fresh guid the same way.
+            const claimedTaskGuid = bridgeCreatedTaskGuid ?? reportedState?.task_handle?.guid;
+            if (claimedTaskGuid && this.deps.taskHandleClaim && botId) {
+              taskSignalHookCalled = true;
+              try {
+                await this.deps.taskHandleClaim({
+                  botId,
+                  threadId,
+                  chatId: parsed.chatId,
+                  taskGuid: claimedTaskGuid,
+                  // v4 任务派单 (docs/task-handle.md §15.3): a claim on the very
+                  // task this thread's ROOT message shares is comment-mode —
+                  // maintenance goes through task comments only (share-to-chat
+                  // grants read+comment; no tasklist/editor rights needed, and
+                  // completion is ALWAYS ticked by the human). Mechanical
+                  // equality check, not a judgment call.
+                  //
+                  // BL-49 (2026-07-27 dogfood): a BRIDGE-CREATED card (v5
+                  // `create`) gets the same treatment. It used to fall through to
+                  // undefined → the pre-v4.1 full-mode writeback, which patched a
+                  // status block into the description, auto-ticked completion off
+                  // `done: true`, and auto-reopened — all three explicitly retired
+                  // by v4.1 (§15.3/§15.6). Real-machine symptoms: a task that was
+                  // already `status: done` the moment the user first saw it (so
+                  // the human confirmation step vanished), and a description log
+                  // nobody reads (description changes don't push; comments do).
+                  // v4.1's semantics are path-independent — the reason completion
+                  // belongs to the human doesn't change just because the bridge
+                  // opened the card.
+                  mode:
+                    taskRootInfo?.guid === claimedTaskGuid || claimedTaskGuid === bridgeCreatedTaskGuid
+                      ? "comment"
+                      : undefined,
+                  // WP-8: the create response just proved this guid exists, so
+                  // claim.ts skips its getTask check for it (bridge-side value
+                  // only — an agent-declared guid is still verified).
+                  trustedGuid: bridgeCreatedTaskGuid,
+                });
+              } catch (err) {
+                console.warn("[bridge.handler] taskHandleClaim hook failed (continuing):", err);
               }
-            } catch (err) {
-              console.warn("[bridge.handler] taskHandleDeclare hook failed (continuing):", err);
             }
-          }
-
-          // Task-handle claim declaration (docs/task-handle.md §5.2): the agent
-          // wrote `task_handle.guid` this turn — this is the ONLY path that
-          // records a new thread↔task claim. v5: a bridge-created task (create
-          // declaration above) claims its fresh guid the same way.
-          const claimedTaskGuid = bridgeCreatedTaskGuid ?? reportedState?.task_handle?.guid;
-          if (claimedTaskGuid && this.deps.taskHandleClaim && botId) {
-            taskSignalHookCalled = true;
-            try {
-              await this.deps.taskHandleClaim({
-                botId,
-                threadId,
-                chatId: parsed.chatId,
-                taskGuid: claimedTaskGuid,
-                // v4 任务派单 (docs/task-handle.md §15.3): a claim on the very
-                // task this thread's ROOT message shares is comment-mode —
-                // maintenance goes through task comments only (share-to-chat
-                // grants read+comment; no tasklist/editor rights needed, and
-                // completion is ALWAYS ticked by the human). Mechanical
-                // equality check, not a judgment call.
-                //
-                // BL-49 (2026-07-27 dogfood): a BRIDGE-CREATED card (v5
-                // `create`) gets the same treatment. It used to fall through to
-                // undefined → the pre-v4.1 full-mode writeback, which patched a
-                // status block into the description, auto-ticked completion off
-                // `done: true`, and auto-reopened — all three explicitly retired
-                // by v4.1 (§15.3/§15.6). Real-machine symptoms: a task that was
-                // already `status: done` the moment the user first saw it (so
-                // the human confirmation step vanished), and a description log
-                // nobody reads (description changes don't push; comments do).
-                // v4.1's semantics are path-independent — the reason completion
-                // belongs to the human doesn't change just because the bridge
-                // opened the card.
-                mode:
-                  taskRootInfo?.guid === claimedTaskGuid || claimedTaskGuid === bridgeCreatedTaskGuid
-                    ? "comment"
-                    : undefined,
-              });
-            } catch (err) {
-              console.warn("[bridge.handler] taskHandleClaim hook failed (continuing):", err);
-            }
-          }
-          if (taskSignalHookCalled) turnPerf.addMs("declareMs", Date.now() - taskSignalsStartedAt);
-
-          // BL-49 "任务卡黑洞" diagnostic. The v5 main path has no equivalent of
-          // the 辅路径's candidate black-hole alert (§14.1): if the agent simply
-          // never declares `task_handle.create`, a long-running thread silently
-          // has no tracking handle and NOBODY finds out — which is precisely why
-          // the low create rate went unnoticed until the 2026-07-27 dogfood.
-          // This is observability only: a runtime-event line for the operator
-          // dashboard, no user-visible output, no nudge, no bridge-side judgment
-          // about whether a card SHOULD exist (that stays the agent's call).
-          {
-            const turnsSoFar = (existing?.turnCount ?? 0) + 1;
-            const stillNoCard = !(this.deps.taskHandleClaimedLookup?.(threadId) ?? false);
-            if (stillNoCard && turnsSoFar >= TASK_CARD_BLACKHOLE_TURNS) {
-              await recordEvent({
-                status: "running",
-                appendPath: "任务卡黑洞",
-                reason:
-                  `本话题已进行 ${turnsSoFar} 轮仍无任务卡(agent 未声明 task_handle.create)。` +
-                  `跨轮次的活没有任务卡 = 用户没有追踪入口/推送。仅诊断,不影响本轮。`,
-              });
-            }
-          }
+            if (taskSignalHookCalled) turnPerf.addMs("declareMs", Date.now() - taskSignalsStartedAt);
+          };
+          taskSignalsSettled = runTaskSignals().catch((err) => {
+            console.warn("[bridge.handler] task signal chain failed (continuing):", err);
+          });
 
           // Thin-channel: NO dev_url HTTP probe, NO stage state-machine, NO
           // demotion. The finalize truth-ordering below reduces to status/exitCode
@@ -4048,6 +4327,12 @@ export class BridgeHandler {
           if (success && mtimeAdvance) {
             await writeMtimeBaseline(mtimeAdvance.baselinePath, mtimeAdvance.baseline);
           }
+          // WP-2 (f): same rule for the <runtime-warnings> list. Not on the
+          // first runner event: codex yields system_init off thread/start|resume,
+          // before turn/start carries the prompt (src/codex/pool.ts), so a turn
+          // that fails from there never put the block into the session history.
+          // A failed turn repeats it next time — the cheap direction.
+          if (success) this.runtimeWarningsSent.set(threadId, runtimeWarningsKey);
 
           // BL-38 counter: a confirmed idle-stuck turn accrues (+1); a clean
           // success resets to 0; any OTHER failure (crash / explicit `failed`)
@@ -4062,21 +4347,23 @@ export class BridgeHandler {
           // Fire-and-forget on PURPOSE: COT is a best-effort side channel and must
           // never sit in front of the final card / session persistence, even with
           // ChannelCotClient's own per-call timeout. finalize() is idempotent and
-          // never throws; the finally's close() only cancels the throttle timer.
-          // Also recorded for the finally's late-adoption finalize (a
-          // background-adopted bubble may not exist as cotPublisher yet here).
+          // never throws (the finally has no close(); its finalize chain also
+          // clears the throttle timer). Outcome and message are also recorded
+          // for the finally's late-adoption finalize (a background-adopted
+          // bubble may not exist as cotPublisher yet here).
           cotTurnOutcome = success ? "done" : "error";
+          cotTurnMessage = stoppedByUser
+            ? "stopped by user"
+            : interruptedByIdle
+              ? "idle timeout"
+              : undefined;
           if (cotPublisher) {
             const publisher = cotPublisher;
             const ledgerAt = cotFileAt;
             void publisher
               .finalize(
                 cotTurnOutcome,
-                stoppedByUser
-                  ? { message: "stopped by user" }
-                  : interruptedByIdle
-                    ? { message: "idle timeout" }
-                    : undefined,
+                cotTurnMessage !== undefined ? { message: cotTurnMessage } : undefined,
               )
               // The ledger delete belongs to THIS call — the one that actually
               // performs the completion. Round 4 hung it off the finally-block's
@@ -4476,115 +4763,68 @@ export class BridgeHandler {
           };
 
           turnPerf.mark("finalizeStartAt");
-          if (cardKitProgress) {
-            const declaredMentions = reportedState?.response_surface?.post?.mentions ?? [];
-            const responseSurfacePostDeclared = reportedState?.response_surface?.post !== undefined;
-            const mentionPolicyResults = declaredMentions.map((mention) => ({
-              mention,
-              policy: evaluateResponseSurfaceMentionPolicy(prototypeConfig, mention.user_id),
-            }));
-            const mentions = mentionPolicyResults
-              .filter(({ policy }) => policy.allowed)
-              .map(({ mention }) => mention);
-            const blockedMentionRules = mentionPolicyResults
-              .filter(({ policy }) => !policy.allowed)
-              .map(({ policy }) => policy.rule);
-            if (responseSurfacePostDeclared && declaredMentions.length === 0) {
-              const reason = "response_surface.post was declared with an empty mentions array.";
-              console.warn("[bridge.handler] response_surface post has no mentions");
-              await recordEvent({
-                status: "running",
-                appendPath: "mention 诊断",
-                reason,
-              });
-            } else if (declaredMentions.length > mentions.length) {
-              const reason =
-                `response_surface mentions filtered by policy: ` +
-                `${mentions.length}/${declaredMentions.length} allowed; ` +
-                `blocked rules: ${summarizeMentionPolicyRules(blockedMentionRules)}.`;
-              console.warn("[bridge.handler] response_surface mention policy filtered targets");
-              await recordEvent({
-                status: "running",
-                appendPath: "mention 诊断",
-                reason,
-              });
-            }
-            try {
-              // COT-in-card: a failed turn (bot-reported failure OR idle-timeout
-              // interrupt — both set success=false) settles the reasoning panel
-              // with the errored title. No-op when no panel was created.
-              if (!success) cardKitProgress.markCotError();
-              await cardKitProgress.finalize({
-                title: baseCardPayload.titleOverride,
-                finalText: baseCardPayload.finalText,
-                mentions,
-                choices: baseCardPayload.choices,
-                choicePrompt: baseCardPayload.choicePrompt,
-                imageBlocks: baseCardPayload.imageBlocks,
-                contentBlocks: baseCardPayload.contentBlocks,
-              });
-              await updateCardKitRecord({
-                status: "finalized",
-                sequence: cardKitProgress.sequence,
-              });
-              await deleteCardKitFile(worktreePath);
-            } catch (err) {
-              const fallbackReason =
-                `CardKit finalize failed; visible legacy card fallback used: ${String(err)}`;
-              console.warn("[bridge.handler] CardKit finalize failed; using card fallback:", err);
-              cardKitProgress.close();
-              try {
-                card = await this.deps.cardRenderer.start(replyAnchorId, { replyInThread, threadId });
-                await writeCardFile(worktreePath, {
-                  messageId: card.messageId,
-                  chatId: parsed.chatId,
-                  threadId,
-                  botId: this.deps.botConfig?.id ?? "",
-                  replyInThread,
-                  createdAt: new Date().toISOString(),
-                }).catch((writeErr) => {
-                  console.warn("[bridge.handler] writeCardFile(cardkit fallback) failed:", writeErr);
+          // WP-8: the final card no longer waits for the task-signal chain
+          // started above; both run concurrently and are joined below.
+          const finalizeCard = async (): Promise<void> => {
+            if (cardKitProgress) {
+              const declaredMentions = reportedState?.response_surface?.post?.mentions ?? [];
+              const responseSurfacePostDeclared = reportedState?.response_surface?.post !== undefined;
+              const mentionPolicyResults = declaredMentions.map((mention) => ({
+                mention,
+                policy: evaluateResponseSurfaceMentionPolicy(prototypeConfig, mention.user_id),
+              }));
+              const mentions = mentionPolicyResults
+                .filter(({ policy }) => policy.allowed)
+                .map(({ mention }) => mention);
+              const blockedMentionRules = mentionPolicyResults
+                .filter(({ policy }) => !policy.allowed)
+                .map(({ policy }) => policy.rule);
+              if (responseSurfacePostDeclared && declaredMentions.length === 0) {
+                const reason = "response_surface.post was declared with an empty mentions array.";
+                console.warn("[bridge.handler] response_surface post has no mentions");
+                await recordEvent({
+                  status: "running",
+                  appendPath: "mention 诊断",
+                  reason,
                 });
-                await card.finalize({
-                  ...baseCardPayload,
-                  success: false,
-                  failureReason: fallbackReason,
+              } else if (declaredMentions.length > mentions.length) {
+                const reason =
+                  `response_surface mentions filtered by policy: ` +
+                  `${mentions.length}/${declaredMentions.length} allowed; ` +
+                  `blocked rules: ${summarizeMentionPolicyRules(blockedMentionRules)}.`;
+                console.warn("[bridge.handler] response_surface mention policy filtered targets");
+                await recordEvent({
+                  status: "running",
+                  appendPath: "mention 诊断",
+                  reason,
+                });
+              }
+              try {
+                // COT-in-card: a failed turn (bot-reported failure OR idle-timeout
+                // interrupt — both set success=false) settles the reasoning panel
+                // with the errored title. No-op when no panel was created.
+                if (!success) cardKitProgress.markCotError();
+                await cardKitProgress.finalize({
+                  title: baseCardPayload.titleOverride,
+                  finalText: baseCardPayload.finalText,
+                  mentions,
+                  choices: baseCardPayload.choices,
+                  choicePrompt: baseCardPayload.choicePrompt,
+                  imageBlocks: baseCardPayload.imageBlocks,
+                  contentBlocks: baseCardPayload.contentBlocks,
                 });
                 await updateCardKitRecord({
-                  status: "fallback_visible",
+                  status: "finalized",
                   sequence: cardKitProgress.sequence,
-                  lastVisibleFallbackMessageId: card.messageId,
                 });
-                await deleteCardFile(worktreePath);
-              } catch (legacyErr) {
-                const postFallback = await createOnlyPostFallback({
-                  postClient: this.deps.postClient,
-                  replyToMessageId: replyAnchorId,
-                  replyInThread,
-                  botId: this.deps.botConfig?.id ?? "v1-default",
-                  threadId,
-                  triggerMessageId: messageId,
-                  finalText: baseCardPayload.finalText,
-                  failureReason: `${fallbackReason}; legacy visible card fallback also failed: ${String(legacyErr)}`,
-                  title: baseCardPayload.titleOverride ?? "Larkway fallback",
-                  logPrefix: "[bridge.handler]",
-                });
-                if (postFallback) {
-                  await updateCardKitRecord({
-                    status: "fallback_visible",
-                    sequence: cardKitProgress.sequence,
-                    lastVisibleFallbackMessageId: postFallback.messageId,
-                  });
-                  await deleteCardFile(worktreePath);
-                  await deleteCardKitFile(worktreePath);
-                }
-              }
-            }
-          } else {
-            if (!card) {
-              try {
-                card = await this.deps.cardRenderer.start(replyAnchorId, { replyInThread, threadId });
+                await deleteCardKitFile(worktreePath);
+              } catch (err) {
+                const fallbackReason =
+                  `CardKit finalize failed; visible legacy card fallback used: ${String(err)}`;
+                console.warn("[bridge.handler] CardKit finalize failed; using card fallback:", err);
+                cardKitProgress.close();
                 try {
+                  card = await this.deps.cardRenderer.start(replyAnchorId, { replyInThread, threadId });
                   await writeCardFile(worktreePath, {
                     messageId: card.messageId,
                     chatId: parsed.chatId,
@@ -4592,82 +4832,191 @@ export class BridgeHandler {
                     botId: this.deps.botConfig?.id ?? "",
                     replyInThread,
                     createdAt: new Date().toISOString(),
+                  }).catch((writeErr) => {
+                    console.warn("[bridge.handler] writeCardFile(cardkit fallback) failed:", writeErr);
                   });
-                } catch (err) {
-                  console.warn("[bridge.handler] writeCardFile(late) failed (continuing):", err);
+                  await card.finalize({
+                    ...baseCardPayload,
+                    success: false,
+                    failureReason: fallbackReason,
+                  });
+                  await updateCardKitRecord({
+                    status: "fallback_visible",
+                    sequence: cardKitProgress.sequence,
+                    lastVisibleFallbackMessageId: card.messageId,
+                  });
+                  await deleteCardFile(worktreePath);
+                } catch (legacyErr) {
+                  const postFallback = await createOnlyPostFallback({
+                    postClient: this.deps.postClient,
+                    replyToMessageId: replyAnchorId,
+                    replyInThread,
+                    botId: this.deps.botConfig?.id ?? "v1-default",
+                    threadId,
+                    triggerMessageId: messageId,
+                    finalText: baseCardPayload.finalText,
+                    failureReason: `${fallbackReason}; legacy visible card fallback also failed: ${String(legacyErr)}`,
+                    title: baseCardPayload.titleOverride ?? "Larkway fallback",
+                    logPrefix: "[bridge.handler]",
+                  });
+                  if (postFallback) {
+                    await updateCardKitRecord({
+                      status: "fallback_visible",
+                      sequence: cardKitProgress.sequence,
+                      lastVisibleFallbackMessageId: postFallback.messageId,
+                    });
+                    await deleteCardFile(worktreePath);
+                    await deleteCardKitFile(worktreePath);
+                  }
                 }
-              } catch (err) {
-                console.error(
-                  "[bridge.handler] late visible card fallback start failed; creating post fallback:",
-                  err,
-                );
-                const failureReason = [
-                  legacyCardStartFailed
-                    ? `initial legacy visible card start failed: ${legacyCardStartFailureReason ?? "unknown"}`
-                    : undefined,
-                  `late legacy visible card fallback start failed: ${String(err)}`,
-                ]
-                  .filter((part): part is string => !!part)
-                  .join("; ");
-                const postFallback = await createOnlyPostFallback({
-                  postClient: this.deps.postClient,
-                  replyToMessageId: replyAnchorId,
-                  replyInThread,
-                  botId: this.deps.botConfig?.id ?? "v1-default",
-                  threadId,
-                  triggerMessageId: messageId,
-                  finalText: baseCardPayload.finalText,
-                  failureReason,
-                  title: baseCardPayload.titleOverride ?? "Larkway fallback",
-                  logPrefix: "[bridge.handler]",
-                });
-                if (!postFallback) throw err;
+              }
+            } else {
+              if (!card) {
+                try {
+                  card = await this.deps.cardRenderer.start(replyAnchorId, { replyInThread, threadId });
+                  try {
+                    await writeCardFile(worktreePath, {
+                      messageId: card.messageId,
+                      chatId: parsed.chatId,
+                      threadId,
+                      botId: this.deps.botConfig?.id ?? "",
+                      replyInThread,
+                      createdAt: new Date().toISOString(),
+                    });
+                  } catch (err) {
+                    console.warn("[bridge.handler] writeCardFile(late) failed (continuing):", err);
+                  }
+                } catch (err) {
+                  console.error(
+                    "[bridge.handler] late visible card fallback start failed; creating post fallback:",
+                    err,
+                  );
+                  const failureReason = [
+                    legacyCardStartFailed
+                      ? `initial legacy visible card start failed: ${legacyCardStartFailureReason ?? "unknown"}`
+                      : undefined,
+                    `late legacy visible card fallback start failed: ${String(err)}`,
+                  ]
+                    .filter((part): part is string => !!part)
+                    .join("; ");
+                  const postFallback = await createOnlyPostFallback({
+                    postClient: this.deps.postClient,
+                    replyToMessageId: replyAnchorId,
+                    replyInThread,
+                    botId: this.deps.botConfig?.id ?? "v1-default",
+                    threadId,
+                    triggerMessageId: messageId,
+                    finalText: baseCardPayload.finalText,
+                    failureReason,
+                    title: baseCardPayload.titleOverride ?? "Larkway fallback",
+                    logPrefix: "[bridge.handler]",
+                  });
+                  if (!postFallback) throw err;
+                }
+              }
+
+              if (card) {
+                await card.finalize(baseCardPayload);
+
+                // Card was finalized successfully — drop its card.json so boot
+                // reconcile doesn't re-finalize an already-finalized card.
+                await deleteCardFile(worktreePath);
               }
             }
+            turnPerf.markFinalizeEnd(cardKitProgress?.callDurationsMs);
+          };
+          const cardDelivered = finalizeCard();
 
-            if (card) {
-              await card.finalize(baseCardPayload);
-
-              // Card was finalized successfully — drop its card.json so boot
-              // reconcile doesn't re-finalize an already-finalized card.
-              await deleteCardFile(worktreePath);
-            }
-          }
-          turnPerf.markFinalizeEnd(cardKitProgress?.callDurationsMs);
-
-          // Peer-handoff fast path (local dispatch + Feishu mirror) — after the
-          // card settled, before terminal bookkeeping. Best-effort by design:
-          // a handoff problem must never fail an otherwise-successful turn
-          // (each entry degrades to a recorded diagnostic; WS delivery remains
-          // the fallback whenever local dispatch doesn't apply).
+          // Peer-handoff fast path (local dispatch + Feishu mirror) — before
+          // terminal bookkeeping. Best-effort by design: a handoff problem must
+          // never fail an otherwise-successful turn (each entry degrades to a
+          // recorded diagnostic; WS delivery remains the fallback whenever local
+          // dispatch doesn't apply).
+          // WP-8: runs alongside the final card instead of after it.
+          //   - Peer in ANOTHER process: its mirror post goes out right away.
+          //     The mirror's WS copy is that peer's only path, so it can wake
+          //     before this card is final or this turn's claim has landed.
+          //   - Peer hosted in THIS process: the mirror and the local dispatch
+          //     both wait for the card (it must not read this card mid-stream)
+          //     and for the task-signal chain (this turn's claim lands before
+          //     that peer's turn starts; its pre-runner claim check reads this
+          //     bot's store). Both, because the mirror's WS copy wakes that
+          //     peer just as the local dispatch does.
+          // A rejected card still lets the handoffs through (allSettled): the
+          // agent's handoff stands, and the turn then fails as before.
+          const inProcessHandoffAfter = Promise.allSettled([cardDelivered, taskSignalsSettled]);
           const declaredHandoffs = reportedState?.handoffs;
-          if (declaredHandoffs && declaredHandoffs.length > 0) {
-            const handoffsStartedAt = Date.now();
-            try {
-              const outcomes = await processHandoffs({
-                handoffs: declaredHandoffs,
-                peers: effectivePeers ?? [],
-                roster: this.deps.taskHandleMentionRoster ?? [],
-                selfBotId: this.deps.botConfig?.id ?? "v1-default",
-                postClient: this.deps.postClient,
-                registry: this.deps.localHandoffRegistry,
-                replyAnchorId,
-                chatId: parsed.chatId,
-                threadId,
-                triggerMessageId: messageId,
-                localDispatchEnabled: process.env["LARKWAY_LOCAL_HANDOFF"] !== "off",
+          const handoffsSettled =
+            declaredHandoffs && declaredHandoffs.length > 0
+              ? (async (): Promise<void> => {
+                  const handoffsStartedAt = Date.now();
+                  try {
+                    const outcomes = await processHandoffs({
+                      handoffs: declaredHandoffs,
+                      // WP-2 (b): a delta turn rendered without the live roster, so
+                      // settle it for the @ targets now (a full turn's is already in,
+                      // unless it went model-first on a cold lookup, WP-10).
+                      // A turn-start answer served "stale" came with a refresh; by now
+                      // it has usually landed, so ask again (a lookup that finds
+                      // nothing keeps the turn-start peers).
+                      peers:
+                        (rosterTask
+                          ? rosterLookup.cache === "stale" && lookUpPeers
+                            ? await lookUpPeers({}, { fallback: await rosterTask, record: false })
+                            : await rosterTask
+                          : effectivePeers) ?? [],
+                      roster: this.deps.taskHandleMentionRoster ?? [],
+                      selfBotId: this.deps.botConfig?.id ?? "v1-default",
+                      postClient: this.deps.postClient,
+                      registry: this.deps.localHandoffRegistry,
+                      replyAnchorId,
+                      chatId: parsed.chatId,
+                      threadId,
+                      triggerMessageId: messageId,
+                      localDispatchEnabled: process.env["LARKWAY_LOCAL_HANDOFF"] !== "off",
+                      inProcessHandoffAfter,
+                    });
+                    for (const o of outcomes) {
+                      await recordEvent({
+                        status: "running",
+                        appendPath: "peer handoff",
+                        reason: `→ ${o.to}: ${o.detail}`,
+                      });
+                    }
+                  } catch (err) {
+                    console.warn("[bridge.handler] processHandoffs failed (turn unaffected):", err);
+                  }
+                  turnPerf.addMs("handoffMs", Date.now() - handoffsStartedAt);
+                })()
+              : undefined;
+
+          // WP-8 join. The card delivery's error is the turn's error (same as
+          // when it was awaited inline); the handoffs and the task signals
+          // never reject, and both finish before any terminal record below —
+          // their running-status events must not land after 已完成.
+          const [cardDelivery] = await Promise.allSettled([cardDelivered, handoffsSettled, taskSignalsSettled]);
+          if (cardDelivery.status === "rejected") throw cardDelivery.reason;
+
+          // BL-49 "任务卡黑洞" diagnostic. The v5 main path has no equivalent of
+          // the 辅路径's candidate black-hole alert (§14.1): if the agent simply
+          // never declares `task_handle.create`, a long-running thread silently
+          // has no tracking handle and NOBODY finds out — which is precisely why
+          // the low create rate went unnoticed until the 2026-07-27 dogfood.
+          // This is observability only: a runtime-event line for the operator
+          // dashboard, no user-visible output, no nudge, no bridge-side judgment
+          // about whether a card SHOULD exist (that stays the agent's call).
+          {
+            const turnsSoFar = (existing?.turnCount ?? 0) + 1;
+            const stillNoCard = !(this.deps.taskHandleClaimedLookup?.(threadId) ?? false);
+            if (stillNoCard && turnsSoFar >= TASK_CARD_BLACKHOLE_TURNS) {
+              await recordEvent({
+                status: "running",
+                appendPath: "任务卡黑洞",
+                reason:
+                  `本话题已进行 ${turnsSoFar} 轮仍无任务卡(agent 未声明 task_handle.create)。` +
+                  `跨轮次的活没有任务卡 = 用户没有追踪入口/推送。仅诊断,不影响本轮。`,
               });
-              for (const o of outcomes) {
-                await recordEvent({
-                  status: "running",
-                  appendPath: "peer handoff",
-                  reason: `→ ${o.to}: ${o.detail}`,
-                });
-              }
-            } catch (err) {
-              console.warn("[bridge.handler] processHandoffs failed (turn unaffected):", err);
             }
-            turnPerf.addMs("handoffMs", Date.now() - handoffsStartedAt);
           }
 
           // WP-0: the turn is delivered — write its perf sample (see donePerf).
@@ -4679,6 +5028,7 @@ export class BridgeHandler {
           // this process or post-restart). This is the single terminal call on
           // the success path (Fix B / Bug #10 + self-heal in-flight tracking).
           settle(true);
+          turnTerminalRecorded = true;
           await recordEvent({
             status: "completed",
             finishedAt: new Date().toISOString(),
@@ -4723,7 +5073,7 @@ export class BridgeHandler {
           writeDonePerf();
           if (!perfRecorded) {
             perfRecorded = true;
-            void recordPerf(turnPerf.fill({
+            const errorSample: PerfSample = {
               botId, threadId, backend,
               spawnedAt: new Date(runnerStartedAt).toISOString(),
               promptChars: prompt.length,
@@ -4733,7 +5083,13 @@ export class BridgeHandler {
               toolUseCount: toolUseTotalCount,
               turnDurationMs: Date.now() - runnerStartedAt,
               runnerError: true,
-            }));
+            };
+            // WP-10: a model-first lane may still be opening the surfaces —
+            // fill the sample once it is done, so it carries their timings.
+            // Not awaited: the retry and the outer catch wait for the lane.
+            const writeErrorSample = (): void => void recordPerf(turnPerf.fill(errorSample));
+            if (surfaceReady) void surfaceReady.then(writeErrorSample);
+            else writeErrorSample();
           }
           // The watchdog interval is created BEFORE this try; the success path
           // clears it after handle.done, but this path used to leak it — worst
@@ -4835,6 +5191,11 @@ export class BridgeHandler {
       }
     } catch (err) {
       console.error("[bridge.handler] handleOne failed for thread", threadId, err);
+      // WP-10: a model-first turn can fail (run() throwing, the stream dying,
+      // a setup step) while its lane is still opening the card; the failure
+      // card below needs it, and nothing may outlive the turn as an orphan
+      // 努力回答中 card. Never rejects.
+      if (surfaceReady) await surfaceReady;
       // v4.2 round-2 fix: exception exits (spawn throw, pre-finalize throw)
       // bypass the success-path outcome write — without this, a STALE
       // "completed" from an earlier turn masks a peer whose post-mention turn
@@ -4843,14 +5204,16 @@ export class BridgeHandler {
       // Close the COT bubble as errored. Fire-and-forget (same rationale as the
       // success path): the error teardown below — reaction removal, event log,
       // markUnhandled self-heal — must not wait on a best-effort COT call.
-      // finalize() is idempotent + never throws; the finally's close() only
-      // cancels the throttle timer.
+      // finalize() is idempotent + never throws (the finally has no close();
+      // its finalize chain also clears the throttle timer, and carries this
+      // message to a bubble adopted after this point).
       cotTurnOutcome = "error";
+      cotTurnMessage = String(err);
       if (cotPublisher) {
         const publisher = cotPublisher;
         const ledgerAt = cotFileAt;
         void publisher
-          .finalize("error", { message: String(err) })
+          .finalize("error", { message: cotTurnMessage })
           // The ledger delete belongs on THIS chain too. Round 5 moved it onto the
           // success path's finalize and left the catch without one, so every
           // rejecting turn — the documented cold-claude contract for a self-initiated
@@ -4867,6 +5230,11 @@ export class BridgeHandler {
         });
       }
       await this.deps.client.removeProcessingReaction?.(messageId);
+      // WP-8: a throw after state.json was read (session write, card delivery)
+      // can leave the task-signal chain running. Its claim precedes the failed
+      // writeback, and its running-status events precede the terminal record.
+      if (taskSignalsSettled) await taskSignalsSettled;
+      turnTerminalRecorded = true;
       await recordEvent({
         status: "failed",
         finishedAt: new Date().toISOString(),
@@ -4972,17 +5340,18 @@ export class BridgeHandler {
       // being awaited) was closed first, which turned the chained finalize
       // into a no-op and left the bubble spinning `Working`.
       // Anti-orphan for the background-adopted bubble: a create slower than the
-      // 3s budget resolves AFTER the turn ended, so cotPublisher was still
-      // undefined at both finalize sites (and above) — the bubble would be
-      // created (RUN_STARTED sent) but never completed. Attach an idempotent
-      // finalize to the create promise itself: an already-finalized (early-
-      // adopted) handle no-ops via its closed guard; a late one gets completed
-      // when it resolves. Never throws.
+      // 3s budget (or any post-card create, WP-2) can resolve after the turn's
+      // finalize site, so cotPublisher was still undefined there — the bubble
+      // would be created (RUN_STARTED sent) but never completed. Attach an
+      // idempotent finalize to the create promise itself: an already-finalized
+      // (early-adopted) handle no-ops via its closed guard; a late one gets
+      // completed when it resolves, with the outcome and RUN_ERROR text the
+      // success / error site recorded. Never throws.
       if (bubbleCreate) {
         void Promise.resolve(bubbleCreate!)
           .then((handle) =>
           handle
-            .finalize(cotTurnOutcome)
+            .finalize(cotTurnOutcome, cotTurnMessage !== undefined ? { message: cotTurnMessage } : undefined)
             .catch(() => false as boolean)
             // `completed` is true only when THIS call performed the completion (a
             // late-adopted bubble the primary path never saw). When the primary
@@ -5015,6 +5384,9 @@ export class BridgeHandler {
       // here — releasing the message as UNHANDLED instead of stranding it
       // in-flight forever. Idempotent: only the FIRST settle() wins.
       settle(false);
+      // WP-8: handleOne never resolves ahead of its task-signal chain (the
+      // success and error paths already joined it; this covers any other exit).
+      if (taskSignalsSettled) await taskSignalsSettled;
     }
   }
 }
