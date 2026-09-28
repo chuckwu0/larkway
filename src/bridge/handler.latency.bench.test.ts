@@ -22,7 +22,10 @@
  * WP-10: the scenarios with `mode` run under LARKWAY_MODEL_FIRST. Where the
  * turn goes model-first, every fake round trip is held until run() (see
  * LatencyTimeline.holdUntilRun), so "0 serial, all in flight" means the
- * runner waited on no network call at all.
+ * runner waited on no network call at all. The bench bot has no task-claim
+ * hook unless a scenario sets `taskClaim` — main.ts wires one for every bot
+ * with an id, and then a model-first follow-up waits for the in-topic root
+ * lookup (within its budget) when the root is not cached yet.
  */
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { appendFile, mkdir, mkdtemp, rm } from "node:fs/promises";
@@ -32,6 +35,7 @@ import { BridgeHandler } from "./handler.js";
 import { createCotProgressHandle } from "./cotProgress.js";
 import type { PerfSample } from "./perfLog.js";
 import type { BotConfig } from "../config/botLoader.js";
+import type { MessageLookupClient } from "../lark/messageLookupClient.js";
 import type { LarkMessageEvent } from "../lark/transport.js";
 import {
   LatencyTimeline,
@@ -90,6 +94,13 @@ interface Scenario {
   expectInFlight: number;
   /** WP-10: LARKWAY_MODEL_FIRST for this scenario (unset = off). */
   mode?: "continuation" | "all";
+  /**
+   * WP-10, continuation only: the bot has a task-claim hook (as main.ts
+   * wires for every bot with an id), and the topic root's lookup is `cold`
+   * (one round trip — the bot's first look at this root since boot) or
+   * `cached` (answered from the lookup cache, no round trip). Unset: no hook.
+   */
+  taskClaim?: "cold" | "cached";
 }
 
 /** WP-10: does the scenario's turn start its runner before its surfaces? */
@@ -139,7 +150,35 @@ const SCENARIOS: Scenario[] = [
   { name: "mf-all:new/roster-cold/cardkit-ok", mode: "all", thread: "new", roster: "cold", cardkit: "ok", expectSerial: 0, expectCalls: 2, expectInFlight: 2 },
   { name: "mf-all:new/roster-warm/cardkit-fail", mode: "all", thread: "new", roster: "warm", cardkit: "fail", expectSerial: 0, expectCalls: 1, expectInFlight: 1 },
   { name: "mf-all:continuation/roster-cold/cardkit-ok", mode: "all", thread: "continuation", roster: "cold", cardkit: "ok", expectSerial: 0, expectCalls: 3, expectInFlight: 3 },
+  // A bot with a task-claim hook (every bot with an id, in main.ts): its
+  // model-first follow-up waits for the root lookup, within the budget — one
+  // round trip when the root is not cached yet, none when it is.
+  {
+    name: "mf-continuation:continuation/roster-warm/cardkit-ok/claim-hook-cold-root",
+    mode: "continuation", thread: "continuation", roster: "warm", cardkit: "ok", taskClaim: "cold",
+    expectSerial: 1, expectCalls: 2, expectInFlight: 1,
+  },
+  {
+    name: "mf-continuation:continuation/roster-warm/cardkit-ok/claim-hook-cached-root",
+    mode: "continuation", thread: "continuation", roster: "warm", cardkit: "ok", taskClaim: "cached",
+    expectSerial: 0, expectCalls: 1, expectInFlight: 1,
+  },
 ];
+
+/**
+ * The root/quoted-message lookup the scenario's bot sees. With `taskClaim`,
+ * a model-first turn waits for it on purpose, so its round trip is not held
+ * until run() (held, it could only lose to the handler's budget timer).
+ */
+function rootLookupFor(s: Scenario, timeline: LatencyTimeline): MessageLookupClient {
+  if (s.taskClaim === "cached") return { get: async () => ({ msgType: "text" }) };
+  if (s.taskClaim === "cold") {
+    return {
+      get: () => timeline.net("messageLookup.get", NET_MS, () => ({ msgType: "text" }), { notBefore: Promise.resolve() }),
+    };
+  }
+  return fakeMessageLookup(timeline, NET_MS);
+}
 
 const ROOT_ID = "om_bench_root";
 
@@ -268,7 +307,8 @@ async function runScenarioIn(root: string, s: Scenario, rep: number): Promise<Ru
     } as unknown as BotConfig,
     cardKitClient: fakeCardKitClient(timeline, NET_MS, { failCreate: s.cardkit === "fail" }),
     cotClient,
-    messageLookup: fakeMessageLookup(timeline, NET_MS),
+    messageLookup: rootLookupFor(s, timeline),
+    ...(s.taskClaim ? { taskHandleClaim: async () => {} } : {}),
     peers: [{ id: "ou_bench_peer", name: "Peer", description: "bench peer" }],
     resolveLiveRoster: fakeRosterResolver(timeline, NET_MS, s.roster === "warm"),
     recordPerfSample: async (sample) => {
@@ -349,7 +389,10 @@ describe("handler latency bench (A1)", () => {
       expect(r.serial, `serial round trips before run(): ${r.calls.join(" → ")}`).toBe(s.expectSerial);
       expect(r.calls).toHaveLength(s.expectCalls);
       expect(r.inFlight, "started before run(), not waited on").toHaveLength(s.expectInFlight);
-      if (goesModelFirst(s)) expect(r.inFlight.sort()).toEqual([...r.calls].sort());
+      // A model-first turn waits on nothing — with a task-claim hook, nothing
+      // but the uncached root lookup.
+      const waitedOn = s.taskClaim === "cold" ? ["messageLookup.get"] : [];
+      if (goesModelFirst(s)) expect(r.inFlight.sort()).toEqual(r.calls.filter((c) => !waitedOn.includes(c)).sort());
       else if (s.thread === "new") expect(r.inFlight).toEqual(["cot.create(chat)"]);
 
       // Ordering: an existing topic's bubble lands BEFORE the card, a new
@@ -378,6 +421,9 @@ describe("handler latency bench (A1)", () => {
         expect(sample.preRunner?.rosterMs).toBeGreaterThanOrEqual(0);
       }
       expect(sample.preRunner?.modelFirst).toBe(goesModelFirst(s) ? true : undefined);
+      // A model-first runner waited on the root lookup only with a task-claim
+      // hook (rootProbeMs is what remained of it once the local setup was done).
+      if (goesModelFirst(s)) expect(sample.preRunner?.rootProbeMs !== undefined).toBe(s.taskClaim !== undefined);
       expect(sample.preRunner?.cardReplyMs).toBeGreaterThanOrEqual(NET_MS - 5);
       expect(sample.preRunner?.reactionAddMs).toBeGreaterThanOrEqual(NET_MS - 5);
       expect(sample.preRunner?.reactionRemoveMs).toBeGreaterThanOrEqual(NET_MS - 5);

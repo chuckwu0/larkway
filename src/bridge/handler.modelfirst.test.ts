@@ -19,7 +19,8 @@
  * subprocess.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { EventEmitter } from "node:events";
+import { mkdir, mkdtemp, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { BridgeHandler, resolveModelFirstMode, type BridgeHandlerDeps } from "./handler.js";
@@ -38,9 +39,17 @@ import type { PerfSample } from "./perfLog.js";
 import { stateFilePathOf } from "./stateFile.js";
 import { fakeSessionStore } from "./testFakes.js";
 
+// A test may stand in for child_process.spawn (the legacy runtime's git and
+// pnpm calls); unset, spawn refuses like every other entry point.
+const spawnStandIn = vi.hoisted(() => ({
+  current: undefined as undefined | ((cmd: string, args: readonly string[]) => unknown),
+}));
 vi.mock("node:child_process", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:child_process")>();
-  const refuse = (name: string) => (cmd: unknown) => {
+  const refuse = (name: string) => (cmd: unknown, args?: unknown) => {
+    if (name === "spawn" && spawnStandIn.current) {
+      return spawnStandIn.current(String(cmd), Array.isArray(args) ? (args as string[]) : []);
+    }
     throw new Error(`model-first test: unexpected child_process.${name}(${String(cmd)})`);
   };
   const guarded = Object.fromEntries(
@@ -87,6 +96,7 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
+  spawnStandIn.current = undefined;
   if (priorHome === undefined) delete process.env["LARKWAY_HOME"];
   else process.env["LARKWAY_HOME"] = priorHome;
   if (priorMode === undefined) delete process.env["LARKWAY_MODEL_FIRST"];
@@ -103,6 +113,17 @@ function deferred<T = void>() {
 }
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/** A spawned child that closes with the code `exit` resolves to. */
+function fakeChild(exit: Promise<number>) {
+  const child = Object.assign(new EventEmitter(), {
+    stdout: new EventEmitter(),
+    stderr: new EventEmitter(),
+    kill: () => true,
+  });
+  void exit.then((code) => child.emit("close", code));
+  return child;
+}
 
 function newTopicEvent(): LarkMessageEvent {
   return {
@@ -634,6 +655,81 @@ describe("WP-10: which turns go model-first", () => {
     expectCardFinalized(log);
   });
 
+  describe("legacy runtime with a repo worktree: the card is out while the worktree's pnpm install runs", () => {
+    /**
+     * A follow-up in a monorep worktree whose node_modules is missing, so the
+     * setup runs `pnpm install` — held here until the test releases it. The
+     * card (and its card.json) are chained right after state.json, where the
+     * flag-off turn makes them, not behind the install.
+     */
+    async function heldInstallTurn(opts: { bot?: Record<string, unknown> } = {}) {
+      process.env["LARKWAY_MODEL_FIRST"] = "continuation";
+      const log: string[] = [];
+      const worktreesDir = join(root, "worktrees");
+      const worktree = join(worktreesDir, ROOT_ID);
+      const repoCache = join(root, "repo-cache");
+      await mkdir(join(repoCache, ".git"), { recursive: true });
+      await mkdir(join(worktree, "monorep"), { recursive: true });
+      await writeFile(join(worktree, "monorep", "package.json"), "{}", "utf8");
+      const install = deferred<number>();
+      spawnStandIn.current = (cmd) => {
+        if (cmd !== "pnpm") return fakeChild(Promise.resolve(0)); // git: a healthy worktree, a background fetch
+        log.push("pnpm:start");
+        return fakeChild(install.promise);
+      };
+      const cardKit = recordingCardKit(log);
+      const { captured } = registerScript([{ events: [answer(EARLY_ANSWER)] }], log);
+      const { client, outcomes } = inboundClient(log, continuationEvent());
+      const { handler, legacy } = makeHandler({
+        log,
+        client,
+        cardKit,
+        bot: opts.bot,
+        store: fakeSessionStore([{ ...existingSession(), workspacePath: worktree }]),
+        deps: {
+          conventions: {
+            runtime: "legacy",
+            worktreesDir,
+            repoCachePath: repoCache,
+            defaultBranch: "main",
+            devHostname: "127.0.0.1",
+            portRangeStart: 3000,
+            portRangeEnd: 3999,
+          },
+        },
+      });
+      const running = runAll(handler);
+      await vi.waitFor(() => expect(log).toContain("pnpm:start"), CI_WAIT);
+      return {
+        log,
+        worktree,
+        captured,
+        legacy,
+        finish: async () => {
+          install.resolve(0);
+          await running;
+          return outcomes;
+        },
+      };
+    }
+
+    it("CardKit: the card is created before the install ends", async () => {
+      const turn = await heldInstallTurn();
+      await vi.waitFor(() => expect(turn.log).toContain("cardkit:create:end"), CI_WAIT);
+      expect(turn.captured).toHaveLength(0); // the setup (the install) is still running
+      expect(await turn.finish()).toEqual([{ id: "om_test_reply", outcome: "handled" }]);
+      expectCardFinalized(turn.log);
+    });
+
+    it("legacy card: its card.json is on disk before the install ends", async () => {
+      const turn = await heldInstallTurn({ bot: { response_surface_prototype: undefined } });
+      await vi.waitFor(() => stat(join(turn.worktree, ".larkway", "card.json")), CI_WAIT);
+      expect(turn.captured).toHaveLength(0);
+      expect(await turn.finish()).toEqual([{ id: "om_test_reply", outcome: "handled" }]);
+      expect(turn.legacy.finals.map((f) => f["success"])).toEqual([true]);
+    });
+  });
+
   it("the flag unset: the same follow-up is card-first", async () => {
     const log: string[] = [];
     registerScript([{}], log);
@@ -807,10 +903,56 @@ describe("WP-10: every exit of a model-first turn waits for its card (no orphan 
     expect(log.indexOf("legacy:start")).toBeLessThan(log.indexOf("legacy:finalize:false"));
     expect(legacy.finals).toHaveLength(1);
   });
+
+  it.each(["continuation", "off"])("agent_workspace: ensureAgentWorkspace throwing still leaves a failure card (%s)", async (mode) => {
+    // The CardKit card is chained where the flag-off turn creates it, ahead
+    // of the setup. Here the workspace setup fails (its repos dir sits under
+    // a regular file — ENOTDIR, like a full disk's ENOSPC) while the card
+    // create is still pending: the turn must wait for that card and finalize
+    // it, not end with nothing but the ⏳ reaction.
+    process.env["LARKWAY_MODEL_FIRST"] = mode;
+    const log: string[] = [];
+    const notADir = join(root, "not-a-dir");
+    await writeFile(notADir, "", "utf8");
+    const cardKit = slowCardKit(log);
+    const { captured } = registerScript([{}], log);
+    const { client, outcomes } = inboundClient(log, continuationEvent());
+    const { handler } = makeHandler({
+      log,
+      client,
+      cardKit,
+      store: fakeSessionStore([existingSession()]),
+      deps: {
+        conventions: {
+          runtime: "agent_workspace",
+          worktreesDir: join(root, "legacy"),
+          agentWorkspacePath: workspace,
+          workspaceSessionsDir: join(workspace, "sessions"),
+          workspaceReposPath: join(notADir, "repos"),
+          devHostname: "127.0.0.1",
+          portRangeStart: 3000,
+          portRangeEnd: 3999,
+        },
+      },
+    });
+    await runAll(handler);
+    expect(captured).toHaveLength(0);
+    expect(outcomes).toEqual([{ id: "om_test_reply", outcome: "unhandled", replay: true }]);
+    expectCardFinalized(log);
+    expect(cardKit.afterCreate.join("\n")).toMatch(/ENOTDIR|EEXIST/);
+  });
 });
 
 describe("WP-10: what a model-first runner does not wait for", () => {
-  it("the COT bubble of an existing topic still comes before the card, and gets the early reasoning", async () => {
+  // Slow ⏳ reaction (40ms): the lane is held, so the runner's reasoning
+  // arrives before the bubble's lane step even starts. Fast reaction: the
+  // bubble's create starts during the setup, ahead of the runner, and is
+  // still pending when the reasoning arrives. Either way it must be held for
+  // the bubble, not dropped.
+  it.each([
+    { addDelayMs: 40, bubbleStep: "after" },
+    { addDelayMs: 0, bubbleStep: "before" },
+  ])("the COT bubble of an existing topic still comes before the card, and gets the early reasoning (its create starts $bubbleStep run())", async ({ addDelayMs, bubbleStep }) => {
     process.env["LARKWAY_MODEL_FIRST"] = "continuation";
     const log: string[] = [];
     const gate = deferred();
@@ -826,9 +968,7 @@ describe("WP-10: what a model-first runner does not wait for", () => {
       }],
       log,
     );
-    // A slow ⏳ reaction holds the lane, so the runner's reasoning arrives
-    // before the bubble's lane step even starts: it must be held, not dropped.
-    const { client } = inboundClient(log, continuationEvent(), undefined, { addDelayMs: 40 });
+    const { client } = inboundClient(log, continuationEvent(), undefined, { addDelayMs });
     const { handler } = makeHandler({
       log,
       client,
@@ -842,6 +982,7 @@ describe("WP-10: what a model-first runner does not wait for", () => {
     await running;
     await vi.waitFor(() => expect(cot.completes).toEqual(["done"]), CI_WAIT);
 
+    expect(log.indexOf("cot:create:start") < log.indexOf("run:1")).toBe(bubbleStep === "before");
     expect(log.indexOf("cot:create:end")).toBeLessThan(log.indexOf("cardkit:create:start"));
     expect(cot.sent).toEqual(expect.arrayContaining(["REASONING_MESSAGE_CONTENT", "TOOL_CALL_START", "TOOL_CALL_END"]));
     expect(cot.sent.indexOf("REASONING_MESSAGE_CONTENT")).toBeLessThan(cot.sent.indexOf("TOOL_CALL_START"));

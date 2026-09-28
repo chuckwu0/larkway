@@ -2563,9 +2563,15 @@ export class BridgeHandler {
       const triggerIsRealMessage =
         typeof parsed.raw.message_id === "string" && parsed.raw.message_id.startsWith("om_");
       const preCardBubble = !isNewThread && triggerIsRealMessage && (triggerInTopic || !taskCardAnchorId);
-      // WP-10: a model-first turn makes it in its surface lane, ahead of the card.
+      // WP-10: a model-first turn makes it in its surface lane, right before
+      // the card (chainCardStep below). Its runner may emit before either
+      // bubble exists, so the sink that holds those events is made now, ahead
+      // of every lane step that could create the bubble and adopt it.
       if (preCardBubble && !modelFirst) {
         await createCotBubble(messageId, { awaitCreate: true });
+      }
+      if (modelFirst && this.deps.cotClient && cotDetail !== "off" && cotSurface === "bubble") {
+        cotSink = createCotEventBuffer();
       }
 
       // CardKit response surface: default main surface when the transport and
@@ -2702,11 +2708,21 @@ export class BridgeHandler {
         }
       };
 
-      if (isAgentWorkspace && !modelFirst) {
+      // WP-10: a model-first turn chains, at each runtime's card site below,
+      // what the flag-off turn awaits there — the pre-card bubble of an
+      // existing session, then the card. Same sites as inline, so a setup
+      // step that throws after one still finds its card to finalize.
+      const chainCardStep = (): void =>
+        chainSurface(async () => {
+          if (preCardBubble) await createCotBubble(messageId, { awaitCreate: true });
+          await createCardKitPlaceholder();
+        });
+
+      if (isAgentWorkspace) {
         // A1 early path: safe (see rationale above) — no bridge-managed
-        // worktree to race against. (WP-10: a model-first turn creates it in
-        // its surface lane, started once this setup is done.)
-        await createCardKitPlaceholder();
+        // worktree to race against.
+        if (modelFirst) chainCardStep();
+        else await createCardKitPlaceholder();
       }
 
       // Provisioning decision tree (unified — no read/write split):
@@ -2951,11 +2967,14 @@ export class BridgeHandler {
         console.warn("[bridge.handler] ensureStateFile failed (continuing):", err);
       }
 
-      if (!isAgentWorkspace && !modelFirst) {
+      if (!isAgentWorkspace) {
         // Legacy runtime: baseline ordering — the worktree definitely exists
         // (built above) before the card is created. See the A1 rationale at
         // the other call site for why legacy does NOT get the early-card path.
-        await createCardKitPlaceholder();
+        // (WP-10: model-first chains its pre-card bubble here too, with the
+        // card — the bubble's cot.json lands in the same worktree.)
+        if (modelFirst) chainCardStep();
+        else await createCardKitPlaceholder();
       }
 
       // Step 4a-v-bis: persist a card.json handle so boot reconcile can
@@ -2978,7 +2997,9 @@ export class BridgeHandler {
           }
         }
       };
-      if (!modelFirst) await writeCardLedger();
+      // WP-10: model-first — next in the lane, after the card it records.
+      if (modelFirst) chainSurface(writeCardLedger);
+      else await writeCardLedger();
 
       // Step 4a-vi: pre-install node_modules in the worktree (best-effort).
       //   Without this the bot trips on `Cannot find module 'ts-node/register'`
@@ -3114,19 +3135,10 @@ export class BridgeHandler {
         surface.attach();
         createDeferredBubble();
       } else {
-        // The rest of the lane, in the inline order: the pre-card bubble of an
-        // existing session, the card (CardKit, else the legacy fallback tree,
-        // else a post), its ledger, the post-card bubble. Started only now, so
-        // a legacy worktree exists before anything writes into it.
-        if (this.deps.cotClient && cotDetail !== "off" && cotSurface === "bubble") {
-          cotSink = createCotEventBuffer(); // the runner may emit before the bubble exists
-        }
-        chainSurface(async () => {
-          if (preCardBubble) await createCotBubble(messageId, { awaitCreate: true });
-          await createCardKitPlaceholder();
-          await writeCardLedger();
-          createDeferredBubble();
-        });
+        // The lane's last steps, behind the card and its ledger (chained at
+        // their inline sites above): the post-card bubble, then the card
+        // takes over from the buffer.
+        chainSurface(async () => createDeferredBubble());
         chainSurface(async () => surface.attach());
       }
 
@@ -3180,7 +3192,10 @@ export class BridgeHandler {
         // WP-10: a model-first turn waits for it within a budget, and not at
         // all when this bot has no task-claim hook — then only the prompt's
         // <task-root> facts would use it. A late answer still fills the lookup
-        // cache for the next turn.
+        // cache for the next turn. main.ts wires the hook for every bot with
+        // an id, so there a root not yet in the lookup cache (the bot's first
+        // look at this topic since boot) costs one lookup ahead of the runner,
+        // at most the budget; a cached root costs none.
         const taskRootProbe = !modelFirst
           ? deferredTaskRootProbe
           : deferredTaskRootProbe && this.deps.taskHandleClaim && botId
