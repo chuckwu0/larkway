@@ -176,6 +176,31 @@ describe("processHandoffs — mirror + local dispatch", () => {
     expect(inbound.client.ingestLocalEvent).not.toHaveBeenCalled();
   });
 
+  it("onMirrorPosted reports the display name of each peer whose mirror went out, and only those", async () => {
+    const posted: string[] = [];
+    const postClient = makePostClient();
+    postClient.createPostReply.mockImplementationOnce(async () => {
+      throw new Error("feishu 5xx");
+    });
+    await processHandoffs(
+      baseCtx({
+        postClient,
+        registry: new LocalHandoffRegistry(),
+        peers: [
+          { id: "ou_review_in_sender_scope", name: "ReviewBot", description: "code review" },
+          { id: "ou_qa_in_sender_scope", name: "QA Bot", description: "qa" },
+        ],
+        handoffs: [
+          { to: "ReviewBot", text: "mirror fails" },
+          { to: "NoSuchBot", text: "unknown peer" },
+          { to: "@qa bot", text: "resolved by display name" },
+        ],
+        onMirrorPosted: (name) => posted.push(name),
+      }),
+    );
+    expect(posted).toEqual(["QA Bot"]);
+  });
+
   it("missing postClient → skip with diagnostic (never throw)", async () => {
     const outcomes = await processHandoffs(baseCtx({ postClient: undefined }));
     expect(outcomes[0]!.posted).toBe(false);

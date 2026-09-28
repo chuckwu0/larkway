@@ -19,7 +19,7 @@ Larkway 传递飞书触发事实、可选资源指针和最小输出协议。任
 | `agent-workspace` / `workspace` | workspace/session/repo/知识库位置 | 完整 prompt |
 | `peer-bots` / `turn-taking` | peer 名册、配置的协作参数 | 完整 prompt，且有配置 |
 | `workspace-file-changes` | 工作区文件变化事实 | 有变化时，包括 delta |
-| `task-root` / `task-handle` | 任务分享入口或关联/候选任务事实 | 有相关任务时，包括 delta（候选只带 guid、summary、话题 id；指向本话题的候选另带描述） |
+| `task-root` / `task-handle` | 任务分享入口或关联/候选任务事实 | 有相关任务时，包括 delta（清单 guid 行照带；候选只带 guid、summary、话题 id；指向本话题的候选另带描述） |
 | `session-reseed` | 明确重开会话的原因、摘要和转录摘录、完整转录路径 | 显式恢复时 |
 | `user-message` | 用户原文和按到达顺序合并的追加消息 | 每轮 |
 
@@ -92,13 +92,13 @@ Codex 使用原生 `final_answer` 通道：已知 final phase 的消息直接流
 | `handoffs` | 最多 3 个 `{to,text}`；bridge 发带真实 at 标签的 post 并直递本地 peer，`text` 自包含 |
 | `task_handle` | 按需声明 `{create:{summary,due?}}`、`guid`、`note`、`due`/`due_reason`、`blocked`、`done`；不因聊天轮数自动要求使用 |
 
-tasklist 候选行形如 `guid=… | summary=… | thread=omt_…`：`thread` 由 bridge 从描述里的 applink 机械提取（被摘录截断的 id 不提取；描述指向多个话题时不给出），是与本话题 `feishu_thread_id` 精确对照的信号；URL 本身不注入。完整 prompt 另附去掉 URL 的描述摘录和清单 guid。delta 续轮省略清单 guid（认领只需要任务 guid），描述摘录只留给 `thread` 等于本话题 `feishu_thread_id` 的候选：候选随轮询变化，续轮才出现的候选此前没有注入过描述，而指向本话题的那一条正是认领会作用的对象，描述里的「由 X 创建」是区分同话题其他 bot 自建任务的依据（摘录的 200 字符上限只计链接以外的文字，链接保持完整、渲染时再去掉，所以 bridge 自建任务在长链接之后的这一行能看到）。已知取舍：续轮才出现、描述里没有话题链接的候选只带 guid 和 summary，agent 只能按 summary 判断。
+tasklist 候选行形如 `guid=… | summary=… | thread=omt_…`：`thread` 由 bridge 从描述里的 applink 机械提取（被摘录截断的 id 不提取；描述指向多个话题时不给出），是与本话题 `feishu_thread_id` 精确对照的信号；URL 本身不注入。完整 prompt 另附去掉 URL 的描述摘录。清单 guid 行 `task_handle_tasklist_guid` 与块同条件出现（有候选或已认领），首轮和续轮都带：认领只需要任务 guid，这一行是为已安装的旧版 task-handle skill 保留的块识别标志。delta 续轮的描述摘录只留给 `thread` 等于本话题 `feishu_thread_id` 的候选：候选随轮询变化，续轮才出现的候选此前没有注入过描述，而指向本话题的那一条正是认领会作用的对象，描述里的「由 X 创建」是区分同话题其他 bot 自建任务的依据（摘录的 200 字符上限只计链接以外的文字，链接保持完整、渲染时再去掉，所以 bridge 自建任务在长链接之后的这一行能看到）。已知取舍：续轮才出现、描述里没有话题链接的候选只带 guid 和 summary，agent 只能按 summary 判断。
 
 任务分享入口的 `task-root` 块只暴露 guid、summary、回链、认领状态和刚认领事实。其评论模式由用户在任务中心确认完成；是否评论或声明交付由当前任务决定。该块替代 tasklist 候选块，避免提供冲突目标。
 
 peer 卡片正文并非可靠的 peer 输入通道。需要交接时使用自包含的 `handoffs` 文本或真实 post + at 标签；不强制增加 ack、台账或 deadline 流程。
 
-bridge 发本轮终卡的同时发出 `handoffs` 镜像 post：另一个 bridge 进程里的 peer 可能在本轮卡片定稿之前被唤醒（CardKit 定稿失败时，也可能早于兜底卡出现）；同一进程内的 peer 等终卡投递结束、本轮任务认领落地之后才收到。终卡投递失败时，已声明的 handoff 照常发出，本轮随后记为失败，失败卡不提交接已发出；用户重新 @ 后重跑的一轮，或断线重连补抓（gap-fill）把这条消息重新投递后重跑的一轮，如果再次声明 handoff，peer 会再收到一次（agent 已跑完的轮次不走稳态自动重投）。
+bridge 发本轮终卡的同时发出 `handoffs` 镜像 post：另一个 bridge 进程里的 peer 可能在本轮卡片定稿之前被唤醒（CardKit 定稿失败时，也可能早于兜底卡出现）；同一进程内的 peer 等终卡投递结束、本轮任务认领落地之后才收到。终卡投递失败时，已声明的 handoff 照常发出，本轮随后记为失败；bridge 生成的失败卡或兜底 post 追加一行「已交接给 <peer 显示名>」（多个用顿号分隔），只列生成那张卡时镜像 post 已经发出的 peer（CardKit 定稿失败后立即补发的兜底卡不含同一进程内的 peer：它的镜像要等终卡投递结束才发），没有已发出的交接则不加这一行；用户重新 @ 后重跑的一轮，或断线重连补抓（gap-fill）把这条消息重新投递后重跑的一轮，如果再次声明 handoff，peer 会再收到一次（agent 已跑完的轮次不走稳态自动重投）。
 
 ## 连续性与预算
 

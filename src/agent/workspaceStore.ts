@@ -307,22 +307,32 @@ export const ROLE_NOTES_START = "<!-- larkway:role-notes:start (bridge-projected
 export const ROLE_NOTES_END = "<!-- larkway:role-notes:end -->";
 
 /**
- * Retired template lines, each with the short label the startup migration
- * logs (docs/native-runtime.md lists them for operators).
+ * Retired template lines the unattended startup migration removes, each with
+ * the short label it logs (docs/native-runtime.md lists them for operators).
+ * Only the two that cost every turn work: a state-file write before each
+ * turn ends, and a memory read before each reply.
  */
-const RETIRED_CONTRACT_LINE_LABELS = new Map([
+const STARTUP_RETIRED_LINE_LABELS = new Map([
   ["- Write the per-session state file path provided by the prompt before ending a turn so the Feishu card can finalize.", "state-each-turn"],
-  ["- Read `permissions-request.md` and `permissions-granted.md` before write/deploy/external-message work.", "perms-preread"],
-  ["- 长期知识纪律:每轮 prompt 带有 `sender_is_owner` 事实。owner 的指示可进组织知识库 inbox;非 owner 提供的新知识只写进本 session 的 summary.md 并标注 `[未经 owner 确认]`,由保养轮决定是否晋升 —— 不直接写 AGENTS.md、L2 或知识库。", "knowledge-discipline"],
   // The memory ritual line exactly as the pre-批G template wrote it.
   ["- 开场不可跳过:回应 owner 前,先 Read `memory/index.md`,并按相关性 Read 相关 category 文件,再开始干活(防止新 session 失忆)。", "memory-ritual"],
 ]);
-const RETIRED_CONTRACT_LINES: ReadonlySet<string> = new Set(RETIRED_CONTRACT_LINE_LABELS.keys());
 
 /**
- * Projection path only (runs on an owner-initiated save): the exact retired
- * lines plus any variant of the memory ritual. The unattended startup
- * migration matches RETIRED_CONTRACT_LINES exactly and never uses the
+ * Every retired template line. The two policy lines (permission pre-read,
+ * non-owner knowledge discipline) are left to the projection path, so they
+ * go only when the owner saves the config.
+ */
+const RETIRED_CONTRACT_LINES: ReadonlySet<string> = new Set([
+  ...STARTUP_RETIRED_LINE_LABELS.keys(),
+  "- Read `permissions-request.md` and `permissions-granted.md` before write/deploy/external-message work.",
+  "- 长期知识纪律:每轮 prompt 带有 `sender_is_owner` 事实。owner 的指示可进组织知识库 inbox;非 owner 提供的新知识只写进本 session 的 summary.md 并标注 `[未经 owner 确认]`,由保养轮决定是否晋升 —— 不直接写 AGENTS.md、L2 或知识库。",
+]);
+
+/**
+ * Projection path only (runs on an owner-initiated save): every exact retired
+ * line plus any variant of the memory ritual. The unattended startup
+ * migration matches STARTUP_RETIRED_LINE_LABELS exactly and never uses the
  * substring rule, so an owner's own line mentioning both is left alone.
  */
 function isRetiredContractLine(line: string): boolean {
@@ -357,7 +367,7 @@ async function replaceFileAtomic(filePath: string, content: string): Promise<voi
 
 /** One retired line the startup migration removed (or, dry-run, would remove). */
 export interface RetiredContractLineRemoval {
-  /** Short name of the retired template line, e.g. `knowledge-discipline`. */
+  /** Short name of the retired template line, e.g. `state-each-turn`. */
   label: string;
   /** 1-based line number in the AGENTS.md as it was before the migration. */
   line: number;
@@ -375,9 +385,9 @@ export interface RetiredContractMigrationResult {
  * ensure only creates a missing file and only a config save re-projects it,
  * so retired contract lines (e.g. "write the state file before ending a
  * turn") would otherwise keep steering every new native session. Removes
- * only lines equal to a RETIRED_CONTRACT_LINES entry; every other byte, line
- * endings included, stays as the owner left it. A read-only AGENTS.md is left
- * as is and the call rejects with EACCES.
+ * only lines equal to a STARTUP_RETIRED_LINE_LABELS entry; every other byte,
+ * line endings included, stays as the owner left it. A read-only AGENTS.md is
+ * left as is and the call rejects with EACCES.
  *
  * `dryRun` reports what would go and writes nothing. `backupPath`: before the
  * first rewrite, the file as it was is copied there (an existing copy is kept,
@@ -393,7 +403,7 @@ export async function migrateRetiredContractLines(
   const lines = current.split(/(?<=\n)/);
   const removed: RetiredContractLineRemoval[] = [];
   const kept = lines.filter((line, index) => {
-    const label = RETIRED_CONTRACT_LINE_LABELS.get(line.replace(/\r?\n$/, ""));
+    const label = STARTUP_RETIRED_LINE_LABELS.get(line.replace(/\r?\n$/, ""));
     if (label) removed.push({ label, line: index + 1 });
     return label === undefined;
   });

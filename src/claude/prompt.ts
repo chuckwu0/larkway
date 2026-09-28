@@ -253,10 +253,10 @@ function renderTaskContext(input: RenderPromptInput, full: boolean, topicId: str
   const candidates = input.taskHandleCandidates ?? [];
   if (!input.taskHandleClaimed && candidates.length === 0) return [];
   return block("task-handle", [
-    // Static within a session and not needed to claim (task_handle takes the
-    // task guid), so delta omits it; a block first shown on a delta turn
-    // never carries it.
-    ...(full ? [`task_handle_tasklist_guid: ${input.taskHandleTasklistGuid}`] : []),
+    // Not needed to claim (task_handle takes the task guid), but kept on delta
+    // turns too: task-handle skill copies installed before delta prompts
+    // recognise the block by this line.
+    `task_handle_tasklist_guid: ${input.taskHandleTasklistGuid}`,
     `task_handle_claimed: ${input.taskHandleClaimed ? "yes" : "no"}`,
     ...(input.taskHandleClaimed
       ? ["已有关联任务,task_handle 可表达 note/due/blocked/done。"]

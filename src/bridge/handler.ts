@@ -395,7 +395,9 @@ function resolveStuckSessionResetAfter(): number {
  *     turn stays card-first: the card of a turn that opens a topic is what
  *     creates the topic, and an agent that replied through lark-cli ahead of
  *     it would land outside.
- *   - `all`: every turn starts the runner first.
+ *   - `all`: every turn starts the runner first, including one that opens a
+ *     topic — so its agent's early lark-cli replies can land outside the topic
+ *     (docs/native-runtime.md recommends `continuation`).
  * Pure scheduling: the same calls happen either way, only what the runner
  * waits for changes.
  */
@@ -990,6 +992,18 @@ async function createOnlyPostFallback(opts: {
   }
 }
 
+/**
+ * Appends 「已交接给 <peer>」 (display names, 、-joined) to a bridge failure
+ * card's or fallback post's text when this turn's handoff mirrors already
+ * went out. WP-8 sends them alongside the final card, so a turn can fail
+ * after its peer was woken; without the line the user sees only the failure
+ * and a re-@ would hand off again.
+ */
+function withHandoffSentNote(text: string, peerNames: readonly string[]): string {
+  const names = [...new Set(peerNames)];
+  return names.length > 0 ? `${text}\n\n已交接给 ${names.join("、")}` : text;
+}
+
 // ---------------------------------------------------------------------------
 // Public types
 // ---------------------------------------------------------------------------
@@ -1106,6 +1120,11 @@ export interface BridgeHandlerDeps {
    * @default HANDOFF_BUBBLE_WAIT_MS (1s). Test seam.
    */
   handoffBubbleWaitMs?: number;
+  /**
+   * Max ms a failed CardKit finalize spends patching up its card before the
+   * fallback card is posted. @default the handle's own (5s). Test seam.
+   */
+  cardKitSalvageBudgetMs?: number;
   /**
    * WP-10: max ms a model-first turn waits for the in-topic task-root probe.
    * @default MODEL_FIRST_ROOT_PROBE_BUDGET_MS (1s). Test seam.
@@ -2266,6 +2285,9 @@ export class BridgeHandler {
     let legacyCardStartFailed = false;
     let legacyCardStartFailureReason: string | undefined;
     let startFailurePostFallbackSent = false;
+    // Display names of the peers whose handoff mirror post this turn already
+    // sent (filled as each goes out); failure surfaces name them.
+    const handoffsSentTo: string[] = [];
     const startCardOrDefer = async (): Promise<void> => {
       if (!cardKitAvailable) {
         try {
@@ -2630,9 +2652,16 @@ export class BridgeHandler {
                 }).catch(() => {});
               },
               onSequenceCommitted: async (sequence) => {
+                // A call that commits after the turn settled the record — a
+                // finalize-failure salvage call still running past its budget,
+                // alongside the fallback card — must not turn it back into
+                // "streaming" (a restart would reconcile the card again) or
+                // rewrite a record already deleted.
+                if (cardKitRecord?.status === "finalized" || cardKitRecord?.status === "fallback_visible") return;
                 await updateCardKitRecord({ status: "streaming", sequence });
               },
               onLiveMetricsChanged: updateCardKitLiveMetrics,
+              finalFailureSalvageBudgetMs: this.deps.cardKitSalvageBudgetMs,
             });
             turnPerf.noteCardCreate(cardKitProgress.createTimings, Date.now() - cardCreateStartedAt);
             cardKitRecord = {
@@ -4864,7 +4893,9 @@ export class BridgeHandler {
                   await card.finalize({
                     ...baseCardPayload,
                     success: false,
-                    failureReason: fallbackReason,
+                    // Only the mirrors already out: an in-process peer's waits
+                    // for this delivery, so it is not named here.
+                    failureReason: withHandoffSentNote(fallbackReason, handoffsSentTo),
                   });
                   await updateCardKitRecord({
                     status: "fallback_visible",
@@ -4881,7 +4912,10 @@ export class BridgeHandler {
                     threadId,
                     triggerMessageId: messageId,
                     finalText: baseCardPayload.finalText,
-                    failureReason: `${fallbackReason}; legacy visible card fallback also failed: ${String(legacyErr)}`,
+                    failureReason: withHandoffSentNote(
+                      `${fallbackReason}; legacy visible card fallback also failed: ${String(legacyErr)}`,
+                      handoffsSentTo,
+                    ),
                     title: baseCardPayload.titleOverride ?? "Larkway fallback",
                     logPrefix: "[bridge.handler]",
                   });
@@ -4933,7 +4967,7 @@ export class BridgeHandler {
                     threadId,
                     triggerMessageId: messageId,
                     finalText: baseCardPayload.finalText,
-                    failureReason,
+                    failureReason: withHandoffSentNote(failureReason, handoffsSentTo),
                     title: baseCardPayload.titleOverride ?? "Larkway fallback",
                     logPrefix: "[bridge.handler]",
                   });
@@ -5012,6 +5046,7 @@ export class BridgeHandler {
                       triggerMessageId: messageId,
                       localDispatchEnabled: process.env["LARKWAY_LOCAL_HANDOFF"] !== "off",
                       inProcessHandoffAfter,
+                      onMirrorPosted: (peerName) => handoffsSentTo.push(peerName),
                     });
                     for (const o of outcomes) {
                       await recordEvent({
@@ -5294,7 +5329,10 @@ export class BridgeHandler {
         this.deps.conventions.workspaceSessionsDir
         ? path.join(this.deps.conventions.workspaceSessionsDir, threadId)
         : path.join(this.deps.conventions.worktreesDir, threadId);
-      const hardFailureText = `执行失败: ${String(err)}`;
+      // A card delivery that failed is thrown only after the handoffs settled,
+      // so every mirror already sent is named here; a failure before them
+      // (runner, setup) names none.
+      const hardFailureText = withHandoffSentNote(`执行失败: ${String(err)}`, handoffsSentTo);
       const createHardFailurePostFallback = async (failureReason: string) => {
         const fallback = await createOnlyPostFallback({
           postClient: this.deps.postClient,
@@ -5350,7 +5388,7 @@ export class BridgeHandler {
         try {
           await card.finalize({
             success: false,
-            failureReason: String(err),
+            failureReason: withHandoffSentNote(String(err), handoffsSentTo),
             // No choices on the hard-crash path: reportedState isn't in scope
             // here, and a crashed turn offering pick-an-option buttons is wrong.
           });

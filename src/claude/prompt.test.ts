@@ -288,8 +288,9 @@ describe("optional collaboration and task facts", () => {
     expect(prompt).toContain("task_handle_claimed: no");
     expect(prompt).toContain("- guid=task_one | summary=Review API\n");
     expect(prompt).not.toContain("lark-cli task");
-    // The static list guid and the description excerpt stay with the full prompt.
-    expect(prompt).not.toContain("task_handle_tasklist_guid");
+    // The list guid line stays for task-handle skill copies that key on it;
+    // the description excerpt stays with the full prompt.
+    expect(prompt).toContain("task_handle_tasklist_guid: list_one\ntask_handle_claimed: no\n");
     expect(prompt).not.toContain("Check compatibility");
     const full = await renderPrompt(makeInput({ taskHandleTasklistGuid: "list_one", taskHandleCandidates: [candidate] }));
     expect(full).toContain("task_handle_tasklist_guid: list_one");
@@ -327,7 +328,13 @@ describe("optional collaboration and task facts", () => {
     expect(prompt).toContain("- guid=task_one | summary=Review API\n");
     expect(prompt).not.toContain("由 Planner 创建");
     expect(prompt).not.toContain("Check compatibility");
-    expect(prompt).not.toContain("task_handle_tasklist_guid");
+  });
+
+  it.each([true, false])("keeps the list guid line whenever the block is shown (first turn: %s)", async (isNewThread) => {
+    const claimed = await renderPrompt(makeInput({ isNewThread, taskHandleTasklistGuid: "list_one", taskHandleClaimed: true }));
+    expect(between(claimed, "task-handle")).toContain("task_handle_tasklist_guid: list_one\ntask_handle_claimed: yes\n");
+    // Same condition as the block itself: no claim and no candidate, no line.
+    expect(await renderPrompt(makeInput({ isNewThread, taskHandleTasklistGuid: "list_one" }))).not.toContain("task_handle_tasklist_guid");
   });
 
   it("an existing claim suppresses candidates", async () => {
@@ -757,10 +764,11 @@ describe("production-shape wrapper budget", () => {
 
   // Measured on this fixture + 10%, never above the plan's initial targets
   // (delta without candidates ≤ 550, candidate line ≤ 140). Codex drops the marker line.
+  // deltaCandidates includes the task_handle_tasklist_guid line (measured 1072 / 1020).
   const BUDGET = {
-    claude: { deltaTopic: 550, deltaP2p: 550, deltaCandidates: 1106, full: 4543 },
-    pi: { deltaTopic: 550, deltaP2p: 550, deltaCandidates: 1106, full: 4543 },
-    codex: { deltaTopic: 532, deltaP2p: 493, deltaCandidates: 1049, full: 4587 },
+    claude: { deltaTopic: 550, deltaP2p: 550, deltaCandidates: 1179, full: 4543 },
+    pi: { deltaTopic: 550, deltaP2p: 550, deltaCandidates: 1179, full: 4543 },
+    codex: { deltaTopic: 532, deltaP2p: 493, deltaCandidates: 1122, full: 4587 },
   };
 
   it.each(Object.entries(BUDGET))("%s stays within its wrapper budget", async (backend, budget) => {

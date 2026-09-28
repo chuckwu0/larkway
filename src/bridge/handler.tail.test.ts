@@ -32,6 +32,8 @@ import type { RuntimeEventPatch } from "./eventLog.js";
 import { LocalHandoffRegistry } from "./localHandoff.js";
 import { stateFilePathOf } from "./stateFile.js";
 import { LatencyTimeline, fakeCardKitClient, fakeCardRenderer, fakeSessionStore } from "./testFakes.js";
+import { CARDKIT_FINAL_FAILURE_FOOTER } from "./cardkitProgress.js";
+import { readCardKitFile } from "./cardkitFile.js";
 
 vi.mock("node:child_process", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:child_process")>();
@@ -627,5 +629,185 @@ describe("WP-8: handoff mirror posts run alongside the final card", () => {
     const handoffAt = events.findIndex((e) => e.appendPath === "peer handoff");
     expect(handoffAt).toBeGreaterThan(-1);
     expect(handoffAt).toBeLessThan(events.findIndex((e) => e.status === "failed"));
+  });
+
+  /**
+   * Legacy visible card whose delivery finalize rejects; the failure card's
+   * payload (success: false) is captured.
+   */
+  function failingLegacyCard(log: string[], failureCards: Array<{ failureReason?: string }>) {
+    const legacy = fakeCardRenderer(new LatencyTimeline(), 1);
+    const failingDelivery = (messageId: string) => ({
+      ...legacy.handleFor(messageId),
+      finalize: async (payload: { success?: boolean; failureReason?: string }) => {
+        if (payload.success === false) {
+          failureCards.push(payload);
+          return;
+        }
+        log.push("legacyCard.finalize:rejected");
+        throw new Error("legacy card: finalize failed");
+      },
+    });
+    return {
+      start: async () => failingDelivery("om_test_legacy_card"),
+      handleFor: failingDelivery,
+    } as unknown as ReturnType<typeof fakeCardRenderer>;
+  }
+
+  it("the failure card of a turn whose card delivery failed names the peers already handed off to", async () => {
+    const log: string[] = [];
+    registerStateRunner({
+      ...HANDOFF_STATE,
+      handoffs: [{ to: "Peer", text: "please continue" }, { to: "Other", text: "please check" }],
+    });
+    const { client, outcomes } = singleEventClient(newTopicEvent(), log);
+    const failureCards: Array<{ failureReason?: string }> = [];
+    const base = handoffDeps(log);
+    const { handler } = makeHandler({
+      client,
+      cardRenderer: failingLegacyCard(log, failureCards),
+      log,
+      deps: {
+        ...base,
+        peers: [...PEERS, { id: "ou_test_other", name: "Other", description: "another peer" }],
+        taskHandleMentionRoster: [{ name: "Peer", botId: "peer-bot" }, { name: "Other", botId: "other-bot" }],
+      },
+    });
+
+    await runAll(handler);
+
+    expect(outcomes).toEqual(["unhandled:om_test_new"]);
+    expect(log.filter((l) => l === "mirror")).toHaveLength(2);
+    expect(failureCards).toHaveLength(1);
+    expect(failureCards[0]!.failureReason).toContain("legacy card: finalize failed");
+    expect(failureCards[0]!.failureReason).toMatch(/\n\n已交接给 Peer、Other$/);
+  });
+
+  it("the failure card of a turn without a handoff has no handoff line", async () => {
+    const log: string[] = [];
+    registerStateRunner({ status: "ready", last_message: "no handoff" });
+    const { client, outcomes } = singleEventClient(newTopicEvent(), log);
+    const failureCards: Array<{ failureReason?: string }> = [];
+    const { handler } = makeHandler({
+      client,
+      cardRenderer: failingLegacyCard(log, failureCards),
+      log,
+      deps: handoffDeps(log),
+    });
+
+    await runAll(handler);
+
+    expect(outcomes).toEqual(["unhandled:om_test_new"]);
+    expect(log).not.toContain("mirror");
+    expect(failureCards).toHaveLength(1);
+    expect(failureCards[0]!.failureReason).toContain("legacy card: finalize failed");
+    expect(failureCards[0]!.failureReason).not.toContain("已交接给");
+  });
+
+  it("a CardKit fallback card names a peer in another process whose mirror went out first", async () => {
+    const log: string[] = [];
+    registerStateRunner(HANDOFF_STATE);
+    const { client, outcomes } = singleEventClient(newTopicEvent(), log);
+    const mirrorSent = deferred();
+    const deps = handoffDeps(log, false);
+    const postClient = deps.postClient!;
+    const cardKitClient: OutboundCardKitClient = {
+      ...fakeCardKitClient(new LatencyTimeline(), 1),
+      // The final rebuild fails once the mirror is out (the order a slow
+      // CardKit call gives in production).
+      async updateCardEntity() {
+        await mirrorSent.promise;
+        log.push("updateCardEntity:rejected");
+        throw new Error("fake final rebuild failed");
+      },
+    };
+    const fallbackCards: Array<{ success?: boolean; failureReason?: string }> = [];
+    const legacy = fakeCardRenderer(new LatencyTimeline(), 1);
+    const cardRenderer = {
+      start: async () => ({
+        ...legacy.handleFor("om_test_fallback_card"),
+        finalize: async (payload: { success?: boolean; failureReason?: string }) => {
+          fallbackCards.push(payload);
+        },
+      }),
+      handleFor: legacy.handleFor,
+    } as unknown as ReturnType<typeof fakeCardRenderer>;
+    const { handler } = makeHandler({
+      client,
+      cardKitClient,
+      cardRenderer,
+      log,
+      deps: {
+        ...deps,
+        cardKitSalvageBudgetMs: 20,
+        postClient: {
+          ...postClient,
+          async createPostReply(...args: Parameters<typeof postClient.createPostReply>) {
+            const sent = await postClient.createPostReply(...args);
+            mirrorSent.resolve();
+            return sent;
+          },
+        },
+      },
+    });
+
+    await runAll(handler);
+
+    expect(outcomes).toEqual(["handled:om_test_new"]);
+    expectBefore(log, "mirror", "updateCardEntity:rejected");
+    expect(fallbackCards).toHaveLength(1);
+    expect(fallbackCards[0]!.success).toBe(false);
+    expect(fallbackCards[0]!.failureReason).toContain("CardKit finalize failed");
+    expect(fallbackCards[0]!.failureReason).toMatch(/\n\n已交接给 Peer$/);
+  });
+});
+
+describe("CardKit finalize failure: a salvage call that lands after the fallback", () => {
+  it("leaves the crash-recovery record at fallback_visible", async () => {
+    const log: string[] = [];
+    registerStateRunner({ status: "ready", last_message: "final answer" });
+    const { client, outcomes } = singleEventClient(newTopicEvent(), log);
+    const holdFooter = deferred();
+    const base = fakeCardKitClient(new LatencyTimeline(), 1);
+    const cardKitClient: OutboundCardKitClient = {
+      ...base,
+      async updateCardEntity() {
+        throw new Error("fake final rebuild failed");
+      },
+      // The salvage's footer call outlives the salvage budget.
+      async updateElement(...args: Parameters<typeof base.updateElement>) {
+        const element = args[2] as { content?: string };
+        if (element.content === CARDKIT_FINAL_FAILURE_FOOTER) {
+          log.push("salvage:footer:start");
+          await holdFooter.promise;
+        }
+        await base.updateElement(...args);
+      },
+      async updateCardSettings(...args: Parameters<typeof base.updateCardSettings>) {
+        await base.updateCardSettings(...args);
+        log.push("salvage:settings:end");
+      },
+    };
+    const { handler } = makeHandler({
+      client,
+      cardKitClient,
+      log,
+      deps: { cardKitSalvageBudgetMs: 20 },
+    });
+    const sessionPath = join(workspace, "sessions", "om_test_new");
+
+    await runAll(handler);
+
+    expect(outcomes).toEqual(["handled:om_test_new"]);
+    expect(log).toContain("salvage:footer:start");
+    expect(log).not.toContain("salvage:settings:end");
+    const settled = await readCardKitFile(sessionPath);
+    expect(settled).toMatchObject({ status: "fallback_visible", lastVisibleFallbackMessageId: "om_bench_legacy_card" });
+
+    // The held footer call and the settings call after it now commit.
+    holdFooter.resolve();
+    await vi.waitFor(() => expect(log).toContain("salvage:settings:end"), CI_WAIT);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(await readCardKitFile(sessionPath)).toEqual(settled);
   });
 });

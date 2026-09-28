@@ -92,8 +92,10 @@ turn prompt。runtime 从 cwd 原生读取 `AGENTS.md` / `CLAUDE.md`;Larkway 不
 手动合并。已知的旧模板退役句(每轮写 state、先读权限文件、开场先读
 `memory/index.md` 等)在安全投影时移除,投影还会移除开场读 memory 句的改写变体;
 bridge 每次启动也会对托管 workspace(不含 BYO)的 `AGENTS.md` 做一次清理,但只删
-与已声明退役行逐字相同的行,其余内容逐字保留,文件无变化时不写入;只读(owner
-锁定)的 `AGENTS.md` 不改写,启动日志给出警告。清理后的说明只对新 session 生效。
+每轮写 state 与开场先读 `memory/index.md` 这两条性能类退役行,且只删逐字相同的行;
+先读权限文件、长期知识纪律两条策略行仍只在 owner 保存配置时移除。其余内容逐字
+保留,文件无变化时不写入;只读(owner 锁定)的 `AGENTS.md` 不改写,启动日志给出
+警告。清理后的说明只对新 session 生效。
 
 ## 4. BYO workspace
 

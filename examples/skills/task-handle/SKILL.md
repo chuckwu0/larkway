@@ -59,7 +59,7 @@ description: 话题 ↔ 飞书任务句柄 —— 主路径:用户建任务发�
 
 每轮 prompt 事实里如果有 `<task-handle>` 块,说明这个 bot 已经有一个可用的
 「Agent Team」共享清单(owner 的一整组 bot 共用同一个,不管来自哪个群、哪个 bot 被 @)。
-块有两种形态,取决于本话题是否已经认领(`task_handle_tasklist_guid` 行和候选的 `description` 只在完整 prompt
+块有两种形态,取决于本话题是否已经认领(`task_handle_tasklist_guid` 行每轮都有;候选的 `description` 只在完整 prompt
 ——新话题首轮或会话重开——里出现,续轮省略;候选随轮询变化,续轮才出现的候选从没带过描述。例外:`thread=`
 等于本话题 `feishu_thread_id` 的候选在续轮也带 `description`。认领只需要候选 guid):
 

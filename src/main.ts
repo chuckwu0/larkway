@@ -205,10 +205,12 @@ async function runV2Mode({
           );
         }
         // Retired contract lines in an existing managed AGENTS.md are otherwise
-        // dropped only by a config save. Strip them once per boot — never on the
-        // per-turn path, where agent self-edits and web saves could race it.
-        // retiredContractMigrationPath returns undefined for BYO workspaces.
-        // Dry-run only reports what a real start would remove.
+        // dropped only by a config save. Strip the per-turn-cost ones
+        // (state-each-turn, memory-ritual) once per boot — never on the per-turn
+        // path, where agent self-edits and web saves could race it; the policy
+        // lines still wait for a config save. retiredContractMigrationPath
+        // returns undefined for BYO workspaces. Dry-run only reports what a
+        // real start would remove.
         const migrationPath = retiredContractMigrationPath(bot, larkwayHome());
         if (migrationPath) {
           try {

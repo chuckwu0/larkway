@@ -118,6 +118,8 @@ export interface CreateCardKitProgressHandleOpts {
   onCotPanelCreated?: (elementId: string) => void;
   onSequenceCommitted?: (sequence: number) => Promise<void>;
   onLiveMetricsChanged?: (metrics: CardKitLiveMetrics & { sequence: number }) => void;
+  /** @default FINAL_FAILURE_SALVAGE_BUDGET_MS (5s). Test seam. */
+  finalFailureSalvageBudgetMs?: number;
 }
 
 function idempotencyKey(facts: CreateCardKitProgressHandleOpts["facts"]): string {
@@ -265,6 +267,7 @@ class LiveCardKitProgressHandle implements CardKitProgressHandle {
   private readonly onLiveMetricsChanged?: (
     metrics: CardKitLiveMetrics & { sequence: number },
   ) => void;
+  private readonly finalFailureSalvageBudgetMs: number;
   private answerBuffer = "";
   /**
    * WP-4: the answer text the card is known to show — what the last successful
@@ -340,6 +343,7 @@ class LiveCardKitProgressHandle implements CardKitProgressHandle {
     onSequenceCommitted?: (sequence: number) => Promise<void>;
     onLiveMetricsChanged?: (metrics: CardKitLiveMetrics & { sequence: number }) => void;
     createTimings?: CardKitCreateTimings;
+    finalFailureSalvageBudgetMs?: number;
   }) {
     this.cardKitClient = opts.cardKitClient;
     this.createTimings = opts.createTimings;
@@ -354,6 +358,7 @@ class LiveCardKitProgressHandle implements CardKitProgressHandle {
     this.onCotPanelCreated = opts.onCotPanelCreated;
     this.onSequenceCommitted = opts.onSequenceCommitted;
     this.onLiveMetricsChanged = opts.onLiveMetricsChanged;
+    this.finalFailureSalvageBudgetMs = opts.finalFailureSalvageBudgetMs ?? FINAL_FAILURE_SALVAGE_BUDGET_MS;
   }
 
   get answerText(): string {
@@ -456,7 +461,9 @@ class LiveCardKitProgressHandle implements CardKitProgressHandle {
    * Best effort, bounded by FINAL_FAILURE_SALVAGE_BUDGET_MS, each step on its
    * own: stream the final text into it (the pre-WP-4 order, on this path
    * only), point its footer at the fallback, and stop its streaming state.
-   * Calls still running when the budget ends finish in the background.
+   * Calls still running when the budget ends finish in the background, so
+   * their onSequenceCommitted can fire after the caller has already recorded
+   * the fallback (the handler keeps that record terminal).
    */
   private async salvageAfterFinalFailure(finalMarkdown: string, finalText: string): Promise<void> {
     const step = async (label: string, run: () => Promise<void>): Promise<void> => {
@@ -506,7 +513,7 @@ class LiveCardKitProgressHandle implements CardKitProgressHandle {
     await Promise.race([
       salvage,
       new Promise<void>((resolve) => {
-        timer = setTimeout(resolve, FINAL_FAILURE_SALVAGE_BUDGET_MS);
+        timer = setTimeout(resolve, this.finalFailureSalvageBudgetMs);
         timer.unref?.();
       }),
     ]);
@@ -985,6 +992,7 @@ export async function createCardKitProgressHandle(
     onCotPanelCreated: opts.onCotPanelCreated,
     onSequenceCommitted: opts.onSequenceCommitted,
     onLiveMetricsChanged: opts.onLiveMetricsChanged,
+    finalFailureSalvageBudgetMs: opts.finalFailureSalvageBudgetMs,
     // Only createCardReply reports split timings; the entity+reply path has none.
     createTimings: (created as { timings?: CardKitCreateTimings }).timings,
   });

@@ -116,6 +116,13 @@ export interface ProcessHandoffsContext {
    * this turn's claim.
    */
   inProcessHandoffAfter?: Promise<unknown>;
+  /**
+   * Called with the peer's display name once its mirror post is sent (the
+   * handoff is out from then on), before any local dispatch. handler.ts uses
+   * it so a failure card rendered while later entries are still pending names
+   * only the handoffs already sent.
+   */
+  onMirrorPosted?: (peerName: string) => void;
 }
 
 export interface HandoffOutcome {
@@ -197,6 +204,8 @@ export async function processHandoffs(ctx: ProcessHandoffsContext): Promise<Hand
       });
       continue;
     }
+
+    ctx.onMirrorPosted?.(peer.name);
 
     // (b) LOCAL DISPATCH — only for peers hosted in this bridge process.
     let localDispatched = false;
