@@ -1756,6 +1756,12 @@ export class BridgeHandler {
     // sites, so a bubble adopted only after them (routine for the post-card
     // create, WP-2) still shows the real reason instead of "run failed".
     let cotTurnMessage: string | undefined;
+    // WP-8: the turn's task-signal chain (declare → claim), started once
+    // state.json is read and run alongside the final card. Every exit path
+    // waits for it: the lifecycle writeback reads the claim it records, and
+    // so does the next turn's "received" hook (a thread's turns are serialized
+    // on handleOne resolving). Never rejects.
+    let taskSignalsSettled: Promise<void> | undefined;
     const settle = (ok: boolean): void => {
       if (settled) return;
       settled = true;
@@ -3812,123 +3818,114 @@ export class BridgeHandler {
           // task_handle v5 (BL-48) — declarative signals BEFORE the claim, so a
           // bridge-created task's guid flows into the claim below. Best-effort:
           // any failure degrades that signal, never the turn.
+          // WP-8: the chain is only STARTED here. It runs alongside session
+          // persistence and the final card, and is joined after finalize —
+          // before the 任务卡黑洞 check and the lifecycle writeback, which read
+          // the claim it records. Never rejects (both hooks swallow).
           const declaredTaskHandle = reportedState?.task_handle;
-          let bridgeCreatedTaskGuid: string | undefined;
-          const taskSignalsStartedAt = Date.now();
-          let taskSignalHookCalled = false;
-          if (
-            declaredTaskHandle &&
-            (declaredTaskHandle.create || declaredTaskHandle.due || declaredTaskHandle.blocked) &&
-            this.deps.taskHandleDeclare &&
-            botId
-          ) {
-            taskSignalHookCalled = true;
-            try {
-              // Topic backlink (硬性要求): ONLY a real omt_* id makes a live
-              // deep link. Resolve from the event first, then one refresh
-              // lookup; unresolvable → chat-link fallback (explicit, never
-              // silent). Lookup cost is only paid on turns that declare create.
-              let topicLink: string | undefined;
-              if (declaredTaskHandle.create) {
-                const direct = realTopicThreadId(parsed.raw.thread_id);
-                if (direct) {
-                  topicLink = buildTopicDeepLink(parsed.chatId, direct);
-                } else if (this.deps.messageLookup) {
-                  const refreshed = await this.deps.messageLookup
-                    .get(replyAnchorId, { refresh: true })
-                    .catch(() => undefined);
-                  const refreshedThreadId = realTopicThreadId(refreshed?.threadId);
-                  if (refreshedThreadId) {
-                    topicLink = buildTopicDeepLink(parsed.chatId, refreshedThreadId);
+          const runTaskSignals = async (): Promise<void> => {
+            let bridgeCreatedTaskGuid: string | undefined;
+            const taskSignalsStartedAt = Date.now();
+            let taskSignalHookCalled = false;
+            if (
+              declaredTaskHandle &&
+              (declaredTaskHandle.create || declaredTaskHandle.due || declaredTaskHandle.blocked) &&
+              this.deps.taskHandleDeclare &&
+              botId
+            ) {
+              taskSignalHookCalled = true;
+              try {
+                // Topic backlink (硬性要求): ONLY a real omt_* id makes a live
+                // deep link. Resolve from the event first, then one refresh
+                // lookup; unresolvable → chat-link fallback (explicit, never
+                // silent). Lookup cost is only paid on turns that declare create.
+                let topicLink: string | undefined;
+                if (declaredTaskHandle.create) {
+                  const direct = realTopicThreadId(parsed.raw.thread_id);
+                  if (direct) {
+                    topicLink = buildTopicDeepLink(parsed.chatId, direct);
+                  } else if (this.deps.messageLookup) {
+                    const refreshed = await this.deps.messageLookup
+                      .get(replyAnchorId, { refresh: true })
+                      .catch(() => undefined);
+                    const refreshedThreadId = realTopicThreadId(refreshed?.threadId);
+                    if (refreshedThreadId) {
+                      topicLink = buildTopicDeepLink(parsed.chatId, refreshedThreadId);
+                    }
                   }
                 }
+                const result = await this.deps.taskHandleDeclare({
+                  botId,
+                  threadId,
+                  chatId: parsed.chatId,
+                  senderOpenId: parsed.senderOpenId || undefined,
+                  create: declaredTaskHandle.create,
+                  declaredGuid: declaredTaskHandle.guid,
+                  due: declaredTaskHandle.due,
+                  dueReason: declaredTaskHandle.due_reason,
+                  blocked: declaredTaskHandle.blocked,
+                  topicLink,
+                  chatLink: `https://applink.feishu.cn/client/chat/open?openChatId=${parsed.chatId}`,
+                });
+                bridgeCreatedTaskGuid = result?.createdGuid;
+                for (const line of result?.outcomes ?? []) {
+                  await recordEvent({ status: "running", appendPath: "任务信号", reason: line });
+                }
+              } catch (err) {
+                console.warn("[bridge.handler] taskHandleDeclare hook failed (continuing):", err);
               }
-              const result = await this.deps.taskHandleDeclare({
-                botId,
-                threadId,
-                chatId: parsed.chatId,
-                senderOpenId: parsed.senderOpenId || undefined,
-                create: declaredTaskHandle.create,
-                declaredGuid: declaredTaskHandle.guid,
-                due: declaredTaskHandle.due,
-                dueReason: declaredTaskHandle.due_reason,
-                blocked: declaredTaskHandle.blocked,
-                topicLink,
-                chatLink: `https://applink.feishu.cn/client/chat/open?openChatId=${parsed.chatId}`,
-              });
-              bridgeCreatedTaskGuid = result?.createdGuid;
-              for (const line of result?.outcomes ?? []) {
-                await recordEvent({ status: "running", appendPath: "任务信号", reason: line });
+            }
+
+            // Task-handle claim declaration (docs/task-handle.md §5.2): the agent
+            // wrote `task_handle.guid` this turn — this is the ONLY path that
+            // records a new thread↔task claim. v5: a bridge-created task (create
+            // declaration above) claims its fresh guid the same way.
+            const claimedTaskGuid = bridgeCreatedTaskGuid ?? reportedState?.task_handle?.guid;
+            if (claimedTaskGuid && this.deps.taskHandleClaim && botId) {
+              taskSignalHookCalled = true;
+              try {
+                await this.deps.taskHandleClaim({
+                  botId,
+                  threadId,
+                  chatId: parsed.chatId,
+                  taskGuid: claimedTaskGuid,
+                  // v4 任务派单 (docs/task-handle.md §15.3): a claim on the very
+                  // task this thread's ROOT message shares is comment-mode —
+                  // maintenance goes through task comments only (share-to-chat
+                  // grants read+comment; no tasklist/editor rights needed, and
+                  // completion is ALWAYS ticked by the human). Mechanical
+                  // equality check, not a judgment call.
+                  //
+                  // BL-49 (2026-07-27 dogfood): a BRIDGE-CREATED card (v5
+                  // `create`) gets the same treatment. It used to fall through to
+                  // undefined → the pre-v4.1 full-mode writeback, which patched a
+                  // status block into the description, auto-ticked completion off
+                  // `done: true`, and auto-reopened — all three explicitly retired
+                  // by v4.1 (§15.3/§15.6). Real-machine symptoms: a task that was
+                  // already `status: done` the moment the user first saw it (so
+                  // the human confirmation step vanished), and a description log
+                  // nobody reads (description changes don't push; comments do).
+                  // v4.1's semantics are path-independent — the reason completion
+                  // belongs to the human doesn't change just because the bridge
+                  // opened the card.
+                  mode:
+                    taskRootInfo?.guid === claimedTaskGuid || claimedTaskGuid === bridgeCreatedTaskGuid
+                      ? "comment"
+                      : undefined,
+                  // WP-8: the create response just proved this guid exists, so
+                  // claim.ts skips its getTask check for it (bridge-side value
+                  // only — an agent-declared guid is still verified).
+                  trustedGuid: bridgeCreatedTaskGuid,
+                });
+              } catch (err) {
+                console.warn("[bridge.handler] taskHandleClaim hook failed (continuing):", err);
               }
-            } catch (err) {
-              console.warn("[bridge.handler] taskHandleDeclare hook failed (continuing):", err);
             }
-          }
-
-          // Task-handle claim declaration (docs/task-handle.md §5.2): the agent
-          // wrote `task_handle.guid` this turn — this is the ONLY path that
-          // records a new thread↔task claim. v5: a bridge-created task (create
-          // declaration above) claims its fresh guid the same way.
-          const claimedTaskGuid = bridgeCreatedTaskGuid ?? reportedState?.task_handle?.guid;
-          if (claimedTaskGuid && this.deps.taskHandleClaim && botId) {
-            taskSignalHookCalled = true;
-            try {
-              await this.deps.taskHandleClaim({
-                botId,
-                threadId,
-                chatId: parsed.chatId,
-                taskGuid: claimedTaskGuid,
-                // v4 任务派单 (docs/task-handle.md §15.3): a claim on the very
-                // task this thread's ROOT message shares is comment-mode —
-                // maintenance goes through task comments only (share-to-chat
-                // grants read+comment; no tasklist/editor rights needed, and
-                // completion is ALWAYS ticked by the human). Mechanical
-                // equality check, not a judgment call.
-                //
-                // BL-49 (2026-07-27 dogfood): a BRIDGE-CREATED card (v5
-                // `create`) gets the same treatment. It used to fall through to
-                // undefined → the pre-v4.1 full-mode writeback, which patched a
-                // status block into the description, auto-ticked completion off
-                // `done: true`, and auto-reopened — all three explicitly retired
-                // by v4.1 (§15.3/§15.6). Real-machine symptoms: a task that was
-                // already `status: done` the moment the user first saw it (so
-                // the human confirmation step vanished), and a description log
-                // nobody reads (description changes don't push; comments do).
-                // v4.1's semantics are path-independent — the reason completion
-                // belongs to the human doesn't change just because the bridge
-                // opened the card.
-                mode:
-                  taskRootInfo?.guid === claimedTaskGuid || claimedTaskGuid === bridgeCreatedTaskGuid
-                    ? "comment"
-                    : undefined,
-              });
-            } catch (err) {
-              console.warn("[bridge.handler] taskHandleClaim hook failed (continuing):", err);
-            }
-          }
-          if (taskSignalHookCalled) turnPerf.addMs("declareMs", Date.now() - taskSignalsStartedAt);
-
-          // BL-49 "任务卡黑洞" diagnostic. The v5 main path has no equivalent of
-          // the 辅路径's candidate black-hole alert (§14.1): if the agent simply
-          // never declares `task_handle.create`, a long-running thread silently
-          // has no tracking handle and NOBODY finds out — which is precisely why
-          // the low create rate went unnoticed until the 2026-07-27 dogfood.
-          // This is observability only: a runtime-event line for the operator
-          // dashboard, no user-visible output, no nudge, no bridge-side judgment
-          // about whether a card SHOULD exist (that stays the agent's call).
-          {
-            const turnsSoFar = (existing?.turnCount ?? 0) + 1;
-            const stillNoCard = !(this.deps.taskHandleClaimedLookup?.(threadId) ?? false);
-            if (stillNoCard && turnsSoFar >= TASK_CARD_BLACKHOLE_TURNS) {
-              await recordEvent({
-                status: "running",
-                appendPath: "任务卡黑洞",
-                reason:
-                  `本话题已进行 ${turnsSoFar} 轮仍无任务卡(agent 未声明 task_handle.create)。` +
-                  `跨轮次的活没有任务卡 = 用户没有追踪入口/推送。仅诊断,不影响本轮。`,
-              });
-            }
-          }
+            if (taskSignalHookCalled) turnPerf.addMs("declareMs", Date.now() - taskSignalsStartedAt);
+          };
+          taskSignalsSettled = runTaskSignals().catch((err) => {
+            console.warn("[bridge.handler] task signal chain failed (continuing):", err);
+          });
 
           // Thin-channel: NO dev_url HTTP probe, NO stage state-machine, NO
           // demotion. The finalize truth-ordering below reduces to status/exitCode
@@ -4578,115 +4575,68 @@ export class BridgeHandler {
           };
 
           turnPerf.mark("finalizeStartAt");
-          if (cardKitProgress) {
-            const declaredMentions = reportedState?.response_surface?.post?.mentions ?? [];
-            const responseSurfacePostDeclared = reportedState?.response_surface?.post !== undefined;
-            const mentionPolicyResults = declaredMentions.map((mention) => ({
-              mention,
-              policy: evaluateResponseSurfaceMentionPolicy(prototypeConfig, mention.user_id),
-            }));
-            const mentions = mentionPolicyResults
-              .filter(({ policy }) => policy.allowed)
-              .map(({ mention }) => mention);
-            const blockedMentionRules = mentionPolicyResults
-              .filter(({ policy }) => !policy.allowed)
-              .map(({ policy }) => policy.rule);
-            if (responseSurfacePostDeclared && declaredMentions.length === 0) {
-              const reason = "response_surface.post was declared with an empty mentions array.";
-              console.warn("[bridge.handler] response_surface post has no mentions");
-              await recordEvent({
-                status: "running",
-                appendPath: "mention 诊断",
-                reason,
-              });
-            } else if (declaredMentions.length > mentions.length) {
-              const reason =
-                `response_surface mentions filtered by policy: ` +
-                `${mentions.length}/${declaredMentions.length} allowed; ` +
-                `blocked rules: ${summarizeMentionPolicyRules(blockedMentionRules)}.`;
-              console.warn("[bridge.handler] response_surface mention policy filtered targets");
-              await recordEvent({
-                status: "running",
-                appendPath: "mention 诊断",
-                reason,
-              });
-            }
-            try {
-              // COT-in-card: a failed turn (bot-reported failure OR idle-timeout
-              // interrupt — both set success=false) settles the reasoning panel
-              // with the errored title. No-op when no panel was created.
-              if (!success) cardKitProgress.markCotError();
-              await cardKitProgress.finalize({
-                title: baseCardPayload.titleOverride,
-                finalText: baseCardPayload.finalText,
-                mentions,
-                choices: baseCardPayload.choices,
-                choicePrompt: baseCardPayload.choicePrompt,
-                imageBlocks: baseCardPayload.imageBlocks,
-                contentBlocks: baseCardPayload.contentBlocks,
-              });
-              await updateCardKitRecord({
-                status: "finalized",
-                sequence: cardKitProgress.sequence,
-              });
-              await deleteCardKitFile(worktreePath);
-            } catch (err) {
-              const fallbackReason =
-                `CardKit finalize failed; visible legacy card fallback used: ${String(err)}`;
-              console.warn("[bridge.handler] CardKit finalize failed; using card fallback:", err);
-              cardKitProgress.close();
-              try {
-                card = await this.deps.cardRenderer.start(replyAnchorId, { replyInThread, threadId });
-                await writeCardFile(worktreePath, {
-                  messageId: card.messageId,
-                  chatId: parsed.chatId,
-                  threadId,
-                  botId: this.deps.botConfig?.id ?? "",
-                  replyInThread,
-                  createdAt: new Date().toISOString(),
-                }).catch((writeErr) => {
-                  console.warn("[bridge.handler] writeCardFile(cardkit fallback) failed:", writeErr);
+          // WP-8: the final card no longer waits for the task-signal chain
+          // started above; both run concurrently and are joined below.
+          const finalizeCard = async (): Promise<void> => {
+            if (cardKitProgress) {
+              const declaredMentions = reportedState?.response_surface?.post?.mentions ?? [];
+              const responseSurfacePostDeclared = reportedState?.response_surface?.post !== undefined;
+              const mentionPolicyResults = declaredMentions.map((mention) => ({
+                mention,
+                policy: evaluateResponseSurfaceMentionPolicy(prototypeConfig, mention.user_id),
+              }));
+              const mentions = mentionPolicyResults
+                .filter(({ policy }) => policy.allowed)
+                .map(({ mention }) => mention);
+              const blockedMentionRules = mentionPolicyResults
+                .filter(({ policy }) => !policy.allowed)
+                .map(({ policy }) => policy.rule);
+              if (responseSurfacePostDeclared && declaredMentions.length === 0) {
+                const reason = "response_surface.post was declared with an empty mentions array.";
+                console.warn("[bridge.handler] response_surface post has no mentions");
+                await recordEvent({
+                  status: "running",
+                  appendPath: "mention 诊断",
+                  reason,
                 });
-                await card.finalize({
-                  ...baseCardPayload,
-                  success: false,
-                  failureReason: fallbackReason,
+              } else if (declaredMentions.length > mentions.length) {
+                const reason =
+                  `response_surface mentions filtered by policy: ` +
+                  `${mentions.length}/${declaredMentions.length} allowed; ` +
+                  `blocked rules: ${summarizeMentionPolicyRules(blockedMentionRules)}.`;
+                console.warn("[bridge.handler] response_surface mention policy filtered targets");
+                await recordEvent({
+                  status: "running",
+                  appendPath: "mention 诊断",
+                  reason,
+                });
+              }
+              try {
+                // COT-in-card: a failed turn (bot-reported failure OR idle-timeout
+                // interrupt — both set success=false) settles the reasoning panel
+                // with the errored title. No-op when no panel was created.
+                if (!success) cardKitProgress.markCotError();
+                await cardKitProgress.finalize({
+                  title: baseCardPayload.titleOverride,
+                  finalText: baseCardPayload.finalText,
+                  mentions,
+                  choices: baseCardPayload.choices,
+                  choicePrompt: baseCardPayload.choicePrompt,
+                  imageBlocks: baseCardPayload.imageBlocks,
+                  contentBlocks: baseCardPayload.contentBlocks,
                 });
                 await updateCardKitRecord({
-                  status: "fallback_visible",
+                  status: "finalized",
                   sequence: cardKitProgress.sequence,
-                  lastVisibleFallbackMessageId: card.messageId,
                 });
-                await deleteCardFile(worktreePath);
-              } catch (legacyErr) {
-                const postFallback = await createOnlyPostFallback({
-                  postClient: this.deps.postClient,
-                  replyToMessageId: replyAnchorId,
-                  replyInThread,
-                  botId: this.deps.botConfig?.id ?? "v1-default",
-                  threadId,
-                  triggerMessageId: messageId,
-                  finalText: baseCardPayload.finalText,
-                  failureReason: `${fallbackReason}; legacy visible card fallback also failed: ${String(legacyErr)}`,
-                  title: baseCardPayload.titleOverride ?? "Larkway fallback",
-                  logPrefix: "[bridge.handler]",
-                });
-                if (postFallback) {
-                  await updateCardKitRecord({
-                    status: "fallback_visible",
-                    sequence: cardKitProgress.sequence,
-                    lastVisibleFallbackMessageId: postFallback.messageId,
-                  });
-                  await deleteCardFile(worktreePath);
-                  await deleteCardKitFile(worktreePath);
-                }
-              }
-            }
-          } else {
-            if (!card) {
-              try {
-                card = await this.deps.cardRenderer.start(replyAnchorId, { replyInThread, threadId });
+                await deleteCardKitFile(worktreePath);
+              } catch (err) {
+                const fallbackReason =
+                  `CardKit finalize failed; visible legacy card fallback used: ${String(err)}`;
+                console.warn("[bridge.handler] CardKit finalize failed; using card fallback:", err);
+                cardKitProgress.close();
                 try {
+                  card = await this.deps.cardRenderer.start(replyAnchorId, { replyInThread, threadId });
                   await writeCardFile(worktreePath, {
                     messageId: card.messageId,
                     chatId: parsed.chatId,
@@ -4694,92 +4644,183 @@ export class BridgeHandler {
                     botId: this.deps.botConfig?.id ?? "",
                     replyInThread,
                     createdAt: new Date().toISOString(),
+                  }).catch((writeErr) => {
+                    console.warn("[bridge.handler] writeCardFile(cardkit fallback) failed:", writeErr);
                   });
-                } catch (err) {
-                  console.warn("[bridge.handler] writeCardFile(late) failed (continuing):", err);
+                  await card.finalize({
+                    ...baseCardPayload,
+                    success: false,
+                    failureReason: fallbackReason,
+                  });
+                  await updateCardKitRecord({
+                    status: "fallback_visible",
+                    sequence: cardKitProgress.sequence,
+                    lastVisibleFallbackMessageId: card.messageId,
+                  });
+                  await deleteCardFile(worktreePath);
+                } catch (legacyErr) {
+                  const postFallback = await createOnlyPostFallback({
+                    postClient: this.deps.postClient,
+                    replyToMessageId: replyAnchorId,
+                    replyInThread,
+                    botId: this.deps.botConfig?.id ?? "v1-default",
+                    threadId,
+                    triggerMessageId: messageId,
+                    finalText: baseCardPayload.finalText,
+                    failureReason: `${fallbackReason}; legacy visible card fallback also failed: ${String(legacyErr)}`,
+                    title: baseCardPayload.titleOverride ?? "Larkway fallback",
+                    logPrefix: "[bridge.handler]",
+                  });
+                  if (postFallback) {
+                    await updateCardKitRecord({
+                      status: "fallback_visible",
+                      sequence: cardKitProgress.sequence,
+                      lastVisibleFallbackMessageId: postFallback.messageId,
+                    });
+                    await deleteCardFile(worktreePath);
+                    await deleteCardKitFile(worktreePath);
+                  }
                 }
-              } catch (err) {
-                console.error(
-                  "[bridge.handler] late visible card fallback start failed; creating post fallback:",
-                  err,
-                );
-                const failureReason = [
-                  legacyCardStartFailed
-                    ? `initial legacy visible card start failed: ${legacyCardStartFailureReason ?? "unknown"}`
-                    : undefined,
-                  `late legacy visible card fallback start failed: ${String(err)}`,
-                ]
-                  .filter((part): part is string => !!part)
-                  .join("; ");
-                const postFallback = await createOnlyPostFallback({
-                  postClient: this.deps.postClient,
-                  replyToMessageId: replyAnchorId,
-                  replyInThread,
-                  botId: this.deps.botConfig?.id ?? "v1-default",
-                  threadId,
-                  triggerMessageId: messageId,
-                  finalText: baseCardPayload.finalText,
-                  failureReason,
-                  title: baseCardPayload.titleOverride ?? "Larkway fallback",
-                  logPrefix: "[bridge.handler]",
-                });
-                if (!postFallback) throw err;
+              }
+            } else {
+              if (!card) {
+                try {
+                  card = await this.deps.cardRenderer.start(replyAnchorId, { replyInThread, threadId });
+                  try {
+                    await writeCardFile(worktreePath, {
+                      messageId: card.messageId,
+                      chatId: parsed.chatId,
+                      threadId,
+                      botId: this.deps.botConfig?.id ?? "",
+                      replyInThread,
+                      createdAt: new Date().toISOString(),
+                    });
+                  } catch (err) {
+                    console.warn("[bridge.handler] writeCardFile(late) failed (continuing):", err);
+                  }
+                } catch (err) {
+                  console.error(
+                    "[bridge.handler] late visible card fallback start failed; creating post fallback:",
+                    err,
+                  );
+                  const failureReason = [
+                    legacyCardStartFailed
+                      ? `initial legacy visible card start failed: ${legacyCardStartFailureReason ?? "unknown"}`
+                      : undefined,
+                    `late legacy visible card fallback start failed: ${String(err)}`,
+                  ]
+                    .filter((part): part is string => !!part)
+                    .join("; ");
+                  const postFallback = await createOnlyPostFallback({
+                    postClient: this.deps.postClient,
+                    replyToMessageId: replyAnchorId,
+                    replyInThread,
+                    botId: this.deps.botConfig?.id ?? "v1-default",
+                    threadId,
+                    triggerMessageId: messageId,
+                    finalText: baseCardPayload.finalText,
+                    failureReason,
+                    title: baseCardPayload.titleOverride ?? "Larkway fallback",
+                    logPrefix: "[bridge.handler]",
+                  });
+                  if (!postFallback) throw err;
+                }
+              }
+
+              if (card) {
+                await card.finalize(baseCardPayload);
+
+                // Card was finalized successfully — drop its card.json so boot
+                // reconcile doesn't re-finalize an already-finalized card.
+                await deleteCardFile(worktreePath);
               }
             }
+            turnPerf.markFinalizeEnd(cardKitProgress?.callDurationsMs);
+          };
+          const cardDelivered = finalizeCard();
 
-            if (card) {
-              await card.finalize(baseCardPayload);
-
-              // Card was finalized successfully — drop its card.json so boot
-              // reconcile doesn't re-finalize an already-finalized card.
-              await deleteCardFile(worktreePath);
-            }
-          }
-          turnPerf.markFinalizeEnd(cardKitProgress?.callDurationsMs);
-
-          // Peer-handoff fast path (local dispatch + Feishu mirror) — after the
-          // card settled, before terminal bookkeeping. Best-effort by design:
-          // a handoff problem must never fail an otherwise-successful turn
-          // (each entry degrades to a recorded diagnostic; WS delivery remains
-          // the fallback whenever local dispatch doesn't apply).
+          // Peer-handoff fast path (local dispatch + Feishu mirror) — before
+          // terminal bookkeeping. Best-effort by design: a handoff problem must
+          // never fail an otherwise-successful turn (each entry degrades to a
+          // recorded diagnostic; WS delivery remains the fallback whenever local
+          // dispatch doesn't apply).
+          // WP-8: runs alongside the final card instead of after it. The mirror
+          // post goes out right away; the LOCAL dispatch waits for the card
+          // (a peer woken in-process must not read this card mid-stream) and
+          // for the task-signal chain (so its claim still lands before that
+          // peer's turn starts, as when both preceded the handoff).
+          const localDispatchAfter = Promise.allSettled([cardDelivered, taskSignalsSettled]);
           const declaredHandoffs = reportedState?.handoffs;
-          if (declaredHandoffs && declaredHandoffs.length > 0) {
-            const handoffsStartedAt = Date.now();
-            try {
-              const outcomes = await processHandoffs({
-                handoffs: declaredHandoffs,
-                // WP-2 (b): a delta turn rendered without the live roster, so
-                // settle it for the @ targets now (a full turn's is already in).
-                // A turn-start answer served "stale" came with a refresh; by now
-                // it has usually landed, so ask again (a lookup that finds
-                // nothing keeps the turn-start peers).
-                peers:
-                  (rosterTask
-                    ? rosterLookup.cache === "stale" && lookUpPeers
-                      ? await lookUpPeers({}, { fallback: await rosterTask, record: false })
-                      : await rosterTask
-                    : effectivePeers) ?? [],
-                roster: this.deps.taskHandleMentionRoster ?? [],
-                selfBotId: this.deps.botConfig?.id ?? "v1-default",
-                postClient: this.deps.postClient,
-                registry: this.deps.localHandoffRegistry,
-                replyAnchorId,
-                chatId: parsed.chatId,
-                threadId,
-                triggerMessageId: messageId,
-                localDispatchEnabled: process.env["LARKWAY_LOCAL_HANDOFF"] !== "off",
+          const handoffsSettled =
+            declaredHandoffs && declaredHandoffs.length > 0
+              ? (async (): Promise<void> => {
+                  const handoffsStartedAt = Date.now();
+                  try {
+                    const outcomes = await processHandoffs({
+                      handoffs: declaredHandoffs,
+                      // WP-2 (b): a delta turn rendered without the live roster, so
+                      // settle it for the @ targets now (a full turn's is already in).
+                      // A turn-start answer served "stale" came with a refresh; by now
+                      // it has usually landed, so ask again (a lookup that finds
+                      // nothing keeps the turn-start peers).
+                      peers:
+                        (rosterTask
+                          ? rosterLookup.cache === "stale" && lookUpPeers
+                            ? await lookUpPeers({}, { fallback: await rosterTask, record: false })
+                            : await rosterTask
+                          : effectivePeers) ?? [],
+                      roster: this.deps.taskHandleMentionRoster ?? [],
+                      selfBotId: this.deps.botConfig?.id ?? "v1-default",
+                      postClient: this.deps.postClient,
+                      registry: this.deps.localHandoffRegistry,
+                      replyAnchorId,
+                      chatId: parsed.chatId,
+                      threadId,
+                      triggerMessageId: messageId,
+                      localDispatchEnabled: process.env["LARKWAY_LOCAL_HANDOFF"] !== "off",
+                      localDispatchAfter,
+                    });
+                    for (const o of outcomes) {
+                      await recordEvent({
+                        status: "running",
+                        appendPath: "peer handoff",
+                        reason: `→ ${o.to}: ${o.detail}`,
+                      });
+                    }
+                  } catch (err) {
+                    console.warn("[bridge.handler] processHandoffs failed (turn unaffected):", err);
+                  }
+                  turnPerf.addMs("handoffMs", Date.now() - handoffsStartedAt);
+                })()
+              : undefined;
+
+          // WP-8 join. The card delivery's error is the turn's error (same as
+          // when it was awaited inline); the handoffs and the task signals
+          // never reject, and both finish before any terminal record below —
+          // their running-status events must not land after 已完成.
+          const [cardDelivery] = await Promise.allSettled([cardDelivered, handoffsSettled, taskSignalsSettled]);
+          if (cardDelivery.status === "rejected") throw cardDelivery.reason;
+
+          // BL-49 "任务卡黑洞" diagnostic. The v5 main path has no equivalent of
+          // the 辅路径's candidate black-hole alert (§14.1): if the agent simply
+          // never declares `task_handle.create`, a long-running thread silently
+          // has no tracking handle and NOBODY finds out — which is precisely why
+          // the low create rate went unnoticed until the 2026-07-27 dogfood.
+          // This is observability only: a runtime-event line for the operator
+          // dashboard, no user-visible output, no nudge, no bridge-side judgment
+          // about whether a card SHOULD exist (that stays the agent's call).
+          {
+            const turnsSoFar = (existing?.turnCount ?? 0) + 1;
+            const stillNoCard = !(this.deps.taskHandleClaimedLookup?.(threadId) ?? false);
+            if (stillNoCard && turnsSoFar >= TASK_CARD_BLACKHOLE_TURNS) {
+              await recordEvent({
+                status: "running",
+                appendPath: "任务卡黑洞",
+                reason:
+                  `本话题已进行 ${turnsSoFar} 轮仍无任务卡(agent 未声明 task_handle.create)。` +
+                  `跨轮次的活没有任务卡 = 用户没有追踪入口/推送。仅诊断,不影响本轮。`,
               });
-              for (const o of outcomes) {
-                await recordEvent({
-                  status: "running",
-                  appendPath: "peer handoff",
-                  reason: `→ ${o.to}: ${o.detail}`,
-                });
-              }
-            } catch (err) {
-              console.warn("[bridge.handler] processHandoffs failed (turn unaffected):", err);
             }
-            turnPerf.addMs("handoffMs", Date.now() - handoffsStartedAt);
           }
 
           // WP-0: the turn is delivered — write its perf sample (see donePerf).
@@ -4982,6 +5023,10 @@ export class BridgeHandler {
         });
       }
       await this.deps.client.removeProcessingReaction?.(messageId);
+      // WP-8: a throw after state.json was read (session write, card delivery)
+      // can leave the task-signal chain running. Its claim precedes the failed
+      // writeback, and its running-status events precede the terminal record.
+      if (taskSignalsSettled) await taskSignalsSettled;
       turnTerminalRecorded = true;
       await recordEvent({
         status: "failed",
@@ -5132,6 +5177,9 @@ export class BridgeHandler {
       // here — releasing the message as UNHANDLED instead of stranding it
       // in-flight forever. Idempotent: only the FIRST settle() wins.
       settle(false);
+      // WP-8: handleOne never resolves ahead of its task-signal chain (the
+      // success and error paths already joined it; this covers any other exit).
+      if (taskSignalsSettled) await taskSignalsSettled;
     }
   }
 }

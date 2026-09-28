@@ -105,6 +105,12 @@ export interface ProcessHandoffsContext {
   triggerMessageId: string;
   /** Kill switch: when false, mirror posts still go out but nothing is dispatched locally. */
   localDispatchEnabled?: boolean;
+  /**
+   * Local dispatch waits for this to settle (either way); mirror posts don't.
+   * handler.ts passes its final-card delivery, so a peer woken in-process
+   * never reads this bot's card while it is still streaming.
+   */
+  localDispatchAfter?: Promise<unknown>;
 }
 
 export interface HandoffOutcome {
@@ -189,6 +195,7 @@ export async function processHandoffs(ctx: ProcessHandoffsContext): Promise<Hand
     } else if (!rosterEntry || !targetInfo) {
       detail += "；目标不在本 bridge 进程内，走 WS 送达";
     } else {
+      if (ctx.localDispatchAfter) await ctx.localDispatchAfter.catch(() => undefined);
       const ev: LarkMessageEvent = {
         message_id: mirrorMessageId,
         chat_id: ctx.chatId,

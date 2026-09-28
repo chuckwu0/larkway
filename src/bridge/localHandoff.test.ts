@@ -179,6 +179,47 @@ describe("processHandoffs — mirror + local dispatch", () => {
     expect(outcomes[0]!.posted).toBe(false);
     expect(outcomes[0]!.detail).toContain("postClient");
   });
+
+  it("localDispatchAfter holds the local dispatch, not the mirror post", async () => {
+    const postClient = makePostClient();
+    const inbound = makeInbound();
+    const registry = new LocalHandoffRegistry();
+    registry.register(
+      { botId: "review-bot", name: "ReviewBot", botOpenId: "ou_review_own_scope" },
+      inbound.client,
+    );
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+
+    const running = processHandoffs(baseCtx({ postClient, registry, localDispatchAfter: gate }));
+    await vi.waitFor(() => expect(postClient.createPostReply).toHaveBeenCalledTimes(1));
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(inbound.client.ingestLocalEvent).not.toHaveBeenCalled();
+
+    release();
+    const outcomes = await running;
+    expect(outcomes[0]!.localDispatched).toBe(true);
+    expect(inbound.events[0]!.message_id).toBe("om_mirror_1");
+  });
+
+  it("a rejected localDispatchAfter still dispatches (the mirror is already on record)", async () => {
+    const postClient = makePostClient();
+    const inbound = makeInbound();
+    const registry = new LocalHandoffRegistry();
+    registry.register(
+      { botId: "review-bot", name: "ReviewBot", botOpenId: "ou_review_own_scope" },
+      inbound.client,
+    );
+    const gate = Promise.reject(new Error("final card failed"));
+    gate.catch(() => {});
+
+    const outcomes = await processHandoffs(baseCtx({ postClient, registry, localDispatchAfter: gate }));
+
+    expect(outcomes[0]!.posted).toBe(true);
+    expect(outcomes[0]!.localDispatched).toBe(true);
+  });
 });
 
 describe("LocalHandoffRegistry", () => {

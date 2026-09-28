@@ -66,9 +66,12 @@ export interface PostRunnerPerf {
   cardkitCallMsMax?: number;
   /** Nearest-rank median of those calls. */
   cardkitCallMsP50?: number;
-  /** task-handle declare + claim hooks before finalize (only when one of them ran). */
+  /** task-handle declare + claim hooks (only when one of them ran); overlaps finalize since WP-8. */
   declareMs?: number;
-  /** processHandoffs (only when the agent declared handoffs). */
+  /**
+   * processHandoffs (only when the agent declared handoffs); overlaps finalize
+   * since WP-8, and includes a local dispatch's wait for the final card.
+   */
   handoffMs?: number;
 }
 
