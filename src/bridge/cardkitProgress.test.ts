@@ -818,6 +818,57 @@ describe("CardKitProgressHandle — WP-4 tail slimming", () => {
     ).toEqual([expect.stringContaining("仍在等待"), "努力回答中..."]);
   });
 
+  it("sends the next footer text after a failed status update, even if it matches the pre-failure text", async () => {
+    // CardKit applied the waiting notice, but the persistence hook then threw
+    // (e.g. ENOSPC writing cardkit.json): the footer baseline is unknown, so
+    // switching back to 努力回答中... must still be sent.
+    const { client, calls } = fakeCardKitClient();
+    let failCommit = false;
+    const handle = await createCardKitProgressHandle({
+      cardKitClient: client, replyToMessageId: "trigger_message", replyInThread: true, facts, patchIntervalMs: 0,
+      onSequenceCommitted: async () => {
+        if (failCommit) throw new Error("ENOSPC: no space left on device");
+      },
+    });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    failCommit = true;
+    handle.markIdleWaiting(200_000);
+    await handle.drain();
+    failCommit = false;
+    handle.clearIdleWaiting();
+    await handle.drain();
+    warn.mockRestore();
+    expect(
+      calls.filter((c) => c.name === "updateElement").map((c) => (c.args[2] as { content: string }).content),
+    ).toEqual([expect.stringContaining("仍在等待"), "努力回答中..."]);
+    expect(handle.liveMetrics.lastPatchError).toBeNull();
+  });
+
+  it("sends an answer snapshot after a failed stream, even if it matches the pre-failure text", async () => {
+    const { client, calls } = fakeCardKitClient();
+    let failCommit = false;
+    const handle = await createCardKitProgressHandle({
+      cardKitClient: client, replyToMessageId: "trigger_message", replyInThread: true, facts, patchIntervalMs: 0,
+      onSequenceCommitted: async () => {
+        if (failCommit) throw new Error("ENOSPC: no space left on device");
+      },
+    });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    handle.handle({ type: "answer_snapshot", text: "第一段", raw: {} });
+    await handle.drain(); // element created with 第一段
+    failCommit = true;
+    handle.handle({ type: "answer_snapshot", text: "第二段", raw: {} });
+    await handle.drain(); // CardKit shows 第二段, but the commit hook threw
+    failCommit = false;
+    handle.handle({ type: "answer_snapshot", text: "第一段", raw: {} });
+    await handle.drain();
+    warn.mockRestore();
+    expect(calls.filter((c) => c.name === "streamElementContent").map((c) => c.args[2])).toEqual([
+      "第二段",
+      "第一段",
+    ]);
+  });
+
   it("finalize waits for the call in flight only, drops queued nodes, then sends the final card", async () => {
     const held = heldCardKitClient();
     const handle = await createCardKitProgressHandle({

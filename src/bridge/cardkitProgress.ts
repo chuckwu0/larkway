@@ -262,7 +262,8 @@ class LiveCardKitProgressHandle implements CardKitProgressHandle {
   /**
    * WP-4: the answer text the card is known to show — what the last successful
    * createElements / streamElementContent carried. A patch whose buffer still
-   * equals it would re-send identical content, so it is skipped.
+   * equals it would re-send identical content, so it is skipped. Reset to ""
+   * after a failed call, for the same reason as lastCommittedStatus.
    */
   private lastCommittedAnswer = "";
   private pendingPatch: ReturnType<typeof setTimeout> | null = null;
@@ -282,7 +283,12 @@ class LiveCardKitProgressHandle implements CardKitProgressHandle {
   private cotQueued = false;
   /** WP-4: footer text the latest status update asked for / the card shows. */
   private statusText: string;
-  private lastCommittedStatus: string;
+  /**
+   * undefined after a failed update: CardKit may or may not have applied it
+   * (e.g. the call landed but onSequenceCommitted threw), so the next status
+   * is sent even if it matches the text from before the failure.
+   */
+  private lastCommittedStatus: string | undefined;
   private closed = false;
   private answerElementCreated = false;
   private immediatePatchStarted = false;
@@ -720,6 +726,7 @@ class LiveCardKitProgressHandle implements CardKitProgressHandle {
       this.metrics.lastPatchError = null;
       this.emitLiveMetrics();
     } catch (err) {
+      this.lastCommittedStatus = undefined;
       this.metrics.lastPatchError = summarizeError(err);
       this.emitLiveMetrics();
       console.warn("[cardkit_progress] status update failed (continuing):", err);
@@ -788,6 +795,8 @@ class LiveCardKitProgressHandle implements CardKitProgressHandle {
       );
       this.noteAnswerCommitted(content);
     } catch (err) {
+      // A snapshot can move the text back to an earlier value.
+      this.lastCommittedAnswer = "";
       this.metrics.lastPatchError = summarizeError(err);
       this.emitLiveMetrics();
       console.warn("[cardkit_progress] progress update failed (continuing):", err);
