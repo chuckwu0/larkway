@@ -12,7 +12,9 @@ import { describe, it, expect, afterEach, vi } from "vitest";
 import { EventEmitter, PassThrough } from "node:stream";
 import { AnswerChannelExtractor } from "../agent/answerChannel.js";
 import {
+  PiTurnDecoder,
   buildPiCommand,
+  buildPiConfigArgs,
   buildPiEnv,
   piThinkingFromLarkway,
   piAssistantOutcomeFromLine,
@@ -272,6 +274,47 @@ describe("piAssistantOutcomeFromLine", () => {
     expect(piAssistantOutcomeFromLine(line)).toEqual({
       usage: { input: 11973, output: 3, cacheRead: 128, cacheWrite: 0, reasoning: 0 },
     });
+  });
+});
+
+describe("buildPiConfigArgs", () => {
+  it("is the per-bot tail of buildPiCommand — model, thinking, skills — without mode or session", () => {
+    const opts = { prompt: "x", resumeSessionId: "s1", model: "prov/m1", effort: "low", addDirs: ["/ws/repos/a"] };
+    const config = buildPiConfigArgs(opts, () => true);
+    expect(config).toEqual(["--model", "prov/m1", "--thinking", "low", "--skill", "/ws/repos/a/.agents/skills"]);
+    const [, full] = buildPiCommand(opts, "pi", () => true);
+    expect(full).toEqual(["-p", "--mode", "json", "--approve", "--session-id", "s1", ...config]);
+  });
+});
+
+describe("PiTurnDecoder", () => {
+  it("decodes already-parsed records (RPC path): session id, agent_start marker, last outcome and summed usage on result", () => {
+    const markers: string[] = [];
+    const decoder = new PiTurnDecoder((m) => markers.push(m));
+    const init = decoder.sessionInit("s-rpc", { type: "session", id: "s-rpc" });
+    expect(init).toMatchObject({ type: "system_init", sessionId: "s-rpc" });
+    const usage = (input: number) => ({ input, output: 1, cacheRead: 5, cacheWrite: 0 });
+    const records = [
+      { type: "agent_start" },
+      { type: "message_end", message: { role: "assistant", content: [], stopReason: "error", errorMessage: "429", usage: usage(3) } },
+      { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "ok" }], stopReason: "stop", usage: usage(4) } },
+      { type: "agent_settled" },
+    ];
+    const events = records.flatMap((r) => [...decoder.decodeRecord(r)]);
+    expect(decoder.sessionId).toBe("s-rpc");
+    expect(decoder.assistantError).toBeUndefined(); // a later success clears the retried error
+    expect(events[events.length - 1]).toMatchObject({
+      type: "result",
+      usage: { inputTokens: 7, cacheReadTokens: 10, outputTokens: 2, requests: 2 },
+      lastRequestInputTokens: 9,
+    });
+    expect(markers).toEqual(["session_init", "agent_start", "first_content"]);
+  });
+
+  it("decodeLine turns a non-JSON line into one raw event", () => {
+    const decoder = new PiTurnDecoder(() => {});
+    expect([...decoder.decodeLine("not json")]).toEqual([{ type: "raw", raw: "not json" }]);
+    expect([...decoder.decodeLine("   ")]).toEqual([]);
   });
 });
 

@@ -48,6 +48,7 @@ import { spawnPiped } from "../platform/spawn.js";
 import type { AgentRunner } from "../agent/runner.js";
 import {
   type AgentStreamEvent,
+  type PerfMarkerName,
   type RunOptions,
   type RunHandle,
   type TurnUsage,
@@ -156,7 +157,22 @@ export function buildPiCommand(
   if (opts.resumeSessionId != null) {
     args.push("--session-id", opts.resumeSessionId);
   }
+  args.push(...buildPiConfigArgs(opts, skillDirExists));
 
+  return [bin, args];
+}
+
+/**
+ * The per-bot configuration flags every pi spawn carries — `--model`,
+ * `--thinking` and one `--skill` per repo skills directory — shared by the
+ * one-shot command above and the warm RPC command (src/pi/pool.ts), so both
+ * start pi with the same model, thinking level and skills.
+ */
+export function buildPiConfigArgs(
+  opts: Pick<RunOptions, "model" | "effort" | "addDirs">,
+  skillDirExists: (dir: string) => boolean = existsSync,
+): string[] {
+  const args: string[] = [];
   // Per-bot model override. Passed verbatim — pi accepts a bare model id,
   // a `provider/id` pair, or a fuzzy pattern; larkway does not validate it.
   if (opts.model) {
@@ -169,8 +185,7 @@ export function buildPiCommand(
     const skills = join(dir, PROJECT_SKILLS_SUBDIR);
     if (skillDirExists(skills)) args.push("--skill", skills);
   }
-
-  return [bin, args];
+  return args;
 }
 
 // ---------------------------------------------------------------------------
@@ -236,7 +251,14 @@ function* parsePiLine(
     yield { type: "raw", raw: trimmed };
     return;
   }
+  yield* parsePiRecord(obj, answerExtractor);
+}
 
+/** {@link parsePiLine} for a record that is already JSON-parsed. */
+function* parsePiRecord(
+  obj: unknown,
+  answerExtractor: AnswerChannelExtractor,
+): Generator<AgentStreamEvent> {
   const record = asRecord(obj);
   if (!record) {
     yield { type: "raw", raw: obj };
@@ -337,6 +359,11 @@ export function piAssistantOutcomeFromLine(
   } catch {
     return undefined;
   }
+  return piAssistantOutcome(obj);
+}
+
+/** {@link piAssistantOutcomeFromLine} for a record that is already JSON-parsed. */
+function piAssistantOutcome(obj: unknown): { error?: string; usage?: PiRequestUsage } | undefined {
   const record = asRecord(obj);
   if (record?.["type"] !== "message_end") return undefined;
   const message = asRecord(record["message"]);
@@ -393,6 +420,88 @@ export function addPiRequestUsage(acc: TurnUsage | undefined, u: PiRequestUsage)
 }
 
 // ---------------------------------------------------------------------------
+// PiTurnDecoder — one turn's record → event decoding, shared with the pool
+// ---------------------------------------------------------------------------
+
+/**
+ * Decodes one turn of pi event records into AgentStreamEvents and keeps the
+ * turn-level facts the runner settles on: the session id, the LAST assistant
+ * outcome (see {@link piAssistantOutcomeFromLine}) and the summed usage that
+ * rides on the `result` event. Shared by runPi() (one-shot `--mode json`) and
+ * PiProcessPool (src/pi/pool.ts, `--mode rpc`), which stream the same
+ * session events. Each record is JSON-parsed once (PI-7): decodeLine() takes
+ * a raw stdout line, decodeRecord() a record the caller already parsed.
+ */
+export class PiTurnDecoder {
+  readonly #answerExtractor = new AnswerChannelExtractor();
+  readonly #markPerf: (marker: PerfMarkerName) => void;
+  /** Error of the LAST assistant message_end seen; cleared by a later success. */
+  assistantError: string | undefined;
+  sessionId: string | undefined;
+  /** WP-0: summed over every assistant message_end, attached to the `result` event. */
+  #turnUsage: TurnUsage | undefined;
+  #lastRequestInputTokens: number | undefined;
+
+  constructor(markPerf: (marker: PerfMarkerName) => void) {
+    this.#markPerf = markPerf;
+  }
+
+  *decodeLine(line: string): Generator<AgentStreamEvent> {
+    const trimmed = line.trim();
+    if (trimmed === "") return;
+    let obj: unknown;
+    try {
+      obj = JSON.parse(trimmed);
+    } catch {
+      yield { type: "raw", raw: trimmed };
+      return;
+    }
+    yield* this.decodeRecord(obj);
+  }
+
+  *decodeRecord(obj: unknown): Generator<AgentStreamEvent> {
+    const outcome = piAssistantOutcome(obj);
+    if (outcome !== undefined) {
+      this.assistantError = outcome.error;
+      if (outcome.usage) {
+        this.#turnUsage = addPiRequestUsage(this.#turnUsage, outcome.usage);
+        this.#lastRequestInputTokens = outcome.usage.input + outcome.usage.cacheRead + outcome.usage.cacheWrite;
+      }
+    }
+    for (const event of parsePiRecord(obj, this.#answerExtractor)) {
+      if (event.type === "system_init") {
+        this.sessionId = event.sessionId;
+      }
+      if (event.type === "raw" && asRecord(event.raw)?.["type"] === "agent_start") {
+        this.#markPerf("agent_start");
+      }
+      let out: AgentStreamEvent = event;
+      if (event.type === "result" && this.#turnUsage) {
+        out = {
+          ...event,
+          usage: this.#turnUsage,
+          ...(this.#lastRequestInputTokens !== undefined
+            ? { lastRequestInputTokens: this.#lastRequestInputTokens }
+            : {}),
+        };
+      }
+      markPerfForEventType(this.#markPerf, out.type);
+      yield out;
+    }
+  }
+
+  /**
+   * A `system_init` for a session id learned out of band — RPC mode prints no
+   * session header, so the pool asks `get_state` and synthesizes this.
+   */
+  sessionInit(sessionId: string, raw: unknown): AgentStreamEvent {
+    this.sessionId = sessionId;
+    markPerfForEventType(this.#markPerf, "system_init");
+    return { type: "system_init", sessionId, raw };
+  }
+}
+
+// ---------------------------------------------------------------------------
 // runPi — spawn + stream
 // ---------------------------------------------------------------------------
 
@@ -436,15 +545,11 @@ export function runPi(opts: RunOptions, piBinPath = "pi"): RunHandle {
       });
   }
 
-  let discoveredSessionId: string | undefined;
-  /** Error of the LAST assistant message_end seen; cleared by a later success. */
-  let assistantError: string | undefined;
-  /** WP-0: summed over every assistant message_end, attached to the `result` event. */
-  let turnUsage: TurnUsage | undefined;
-  let lastRequestInputTokens: number | undefined;
+  /** Session id, last assistant outcome and usage of this (only) turn. */
+  const decoder = new PiTurnDecoder(markPerf);
   /**
    * The events generator is consumer-driven: lines (and with them the
-   * session id and assistantError above) are only processed as fast as the
+   * decoder's session id and assistantError) are only processed as fast as the
    * bridge iterates. On a normal 'close' we therefore let the generator drain
    * what readline has buffered before deciding resolve-vs-reject, instead of
    * settling on whatever had been iterated at the instant the pipe closed.
@@ -553,17 +658,17 @@ export function runPi(opts: RunOptions, piBinPath = "pi"): RunHandle {
         // pi exits 0 even when the provider call itself failed (the failure
         // is an assistant message with stopReason "error"). Surface it as a
         // runner error so the card shows the cause instead of "no answer".
-        if (assistantError !== undefined && !killScheduled) {
+        if (decoder.assistantError !== undefined && !killScheduled) {
           const stderr = Buffer.concat(stderrChunks).toString("utf8").trim();
           reject(
             new Error(
-              `pi provider error: ${assistantError}` +
+              `pi provider error: ${decoder.assistantError}` +
                 (stderr ? `\nstderr: ${stderr}` : ""),
             ),
           );
           return;
         }
-        resolve({ exitCode, sessionId: discoveredSessionId });
+        resolve({ exitCode, sessionId: decoder.sessionId });
       };
 
       _forceFinalizeForTimeout = () => {
@@ -651,40 +756,14 @@ export function runPi(opts: RunOptions, piBinPath = "pi"): RunHandle {
       crlfDelay: Infinity,
       signal: rlAbortController.signal,
     });
-    const answerExtractor = new AnswerChannelExtractor();
     generatorState = "running";
 
     try {
       for await (const line of rl) {
         markPerf("first_line");
-        const outcome = piAssistantOutcomeFromLine(line);
-        if (outcome !== undefined) {
-          assistantError = outcome.error;
-          if (outcome.usage) {
-            turnUsage = addPiRequestUsage(turnUsage, outcome.usage);
-            lastRequestInputTokens = outcome.usage.input + outcome.usage.cacheRead + outcome.usage.cacheWrite;
-          }
-        }
-        for (const event of parsePiLine(line, answerExtractor)) {
-          if (event.type === "system_init") {
-            discoveredSessionId = event.sessionId;
-          }
-          if (event.type === "raw" && asRecord(event.raw)?.["type"] === "agent_start") {
-            markPerf("agent_start");
-          }
-          let out: AgentStreamEvent = event;
-          if (event.type === "result") {
-            scheduleGrandchildGrace();
-            if (turnUsage) {
-              out = {
-                ...event,
-                usage: turnUsage,
-                ...(lastRequestInputTokens !== undefined ? { lastRequestInputTokens } : {}),
-              };
-            }
-          }
-          markPerfForEventType(markPerf, out.type);
-          yield out;
+        for (const event of decoder.decodeLine(line)) {
+          if (event.type === "result") scheduleGrandchildGrace();
+          yield event;
         }
       }
     } catch (err) {

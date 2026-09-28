@@ -1129,6 +1129,36 @@ warmProcessMaxProcesses: 3
     }
   });
 
+  it("WP-9: warmProcess: true + backend: pi parses through with no warning", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      await createBotsDir();
+      await writeYaml(
+        "pooled-pi.yaml",
+        `
+id: pooled-pi-bot
+name: Pooled Pi Bot
+description: bot with warmProcess enabled on the pi backend
+app_id: cli_pooled_pi
+app_secret_env: POOLED_PI_SECRET
+bot_open_id: ou_pooled_pi
+backend: pi
+model: provider-x/model-y
+warmProcess: true
+warmProcessMaxProcesses: 2
+`,
+      );
+
+      const bots = await loadBots(botsDir());
+      expect(bots).toHaveLength(1);
+      expect(bots[0]?.warmProcess).toBe(true);
+      expect(bots[0]?.warmProcessMaxProcesses).toBe(2);
+      expect(warnSpy).not.toHaveBeenCalled();
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+
   it("warmProcess: true on an unsupported backend parses through but warns", async () => {
     const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
     try {
@@ -1332,6 +1362,13 @@ describe("effectiveWarmProcess / effectivePrewarmProcess (批D default-on)", () 
     expect(effectiveWarmProcess({ backend: "claude", warmProcess: undefined })).toBe(true);
     expect(effectiveWarmProcess({ backend: "codex", warmProcess: undefined })).toBe(true);
     expect(effectiveWarmProcess({ backend: "gemini", warmProcess: undefined })).toBe(false);
+  });
+
+  it("WP-9: pi's warm pool is opt-in — off unless warmProcess is explicitly true", async () => {
+    const { effectiveWarmProcess } = await import("./botLoader.js");
+    expect(effectiveWarmProcess({ backend: "pi", warmProcess: undefined })).toBe(false);
+    expect(effectiveWarmProcess({ backend: "pi", warmProcess: false })).toBe(false);
+    expect(effectiveWarmProcess({ backend: "pi", warmProcess: true })).toBe(true);
   });
 
   it("explicit warmProcess:false opts out; explicit true on an unsupported backend is honored as-written (main.ts never builds a pool for it anyway)", async () => {

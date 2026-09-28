@@ -567,16 +567,18 @@ export const BotConfigSchema = z.object({
    * docs/larkway-perf-plan.md §4 — persistent warm process instead of a
    * one-shot cold start per turn. Takes effect for `backend: "codex"` (a
    * single bot-level `codex app-server` process — src/codex/pool.ts
-   * CodexProcessPool) and `backend: "claude"` (one warm process per active
-   * thread — src/claude/pool.ts ClaudeProcessPool). Any other backend value
-   * is a no-op (main.ts only constructs a pool for these two; botLoader's
-   * advisory warn below flags the mismatch upfront).
+   * CodexProcessPool), `backend: "claude"` (one warm process per active
+   * thread — src/claude/pool.ts ClaudeProcessPool) and `backend: "pi"` (one
+   * warm `pi --mode rpc` per active thread — src/pi/pool.ts PiProcessPool).
+   * Any other backend value is a no-op (main.ts only constructs a pool for
+   * these three; botLoader's advisory warn below flags the mismatch upfront).
    *
    * 批D (warm-by-default):
-   * DEFAULT IS NOW ON for the two supported backends — `undefined` means
-   * `true` when backend is codex/claude (see {@link effectiveWarmProcess},
-   * the single source of that rule). Set `warmProcess: false` explicitly to
-   * opt a bot back out. `.optional()` (not `.default(true)`) is still
+   * DEFAULT IS NOW ON for codex/claude — `undefined` means `true` there (see
+   * {@link effectiveWarmProcess}, the single source of that rule). Set
+   * `warmProcess: false` explicitly to opt a bot back out. pi stays OFF
+   * unless set to `true` (WP-9 opt-in; see docs/native-runtime.md for how a
+   * warm pi process differs from the cold one). `.optional()` (not `.default(true)`) is still
    * deliberate: a `.default()` would make every future `larkway bot` yaml
    * write-out bake the value in, and — because this schema is `.strict()` —
    * would break loading that yaml back with an OLDER larkway build that
@@ -594,6 +596,7 @@ export const BotConfigSchema = z.object({
    * backend=codex: CodexProcessPool spawns its app-server eagerly at boot
    * instead of on the first turn. Set false to keep warm pooling but skip
    * the always-resident standby (saves ~300MB RSS per bot at idle).
+   * backend=pi: no standby is kept; the value has no effect.
    */
   prewarmProcess: z.boolean().optional(),
 
@@ -602,16 +605,16 @@ export const BotConfigSchema = z.object({
    * no in-flight turn gets SIGTERM'd. Only meaningful when `warmProcess` is
    * true. @default 10 * 60 * 1000 (10 min) — see DEFAULT_WARM_PROCESS_IDLE_MS
    * in src/codex/pool.ts (backend "codex") / src/claude/pool.ts (backend
-   * "claude") — both use the same default value.
+   * "claude") / src/pi/pool.ts (backend "pi") — all use the same default value.
    */
   warmProcessIdleMs: z.number().int().positive().optional(),
 
   /**
-   * `backend: "claude"` only: cap on how many warm per-thread processes
-   * ClaudeProcessPool keeps alive at once (LRU-evicts the longest-idle one
-   * past this). Meaningless for `backend: "codex"`, which only ever holds
-   * one bot-level process regardless. @default 6 — see DEFAULT_MAX_PROCESSES
-   * in src/claude/pool.ts.
+   * `backend: "claude"` / `"pi"`: cap on how many warm per-thread processes
+   * ClaudeProcessPool / PiProcessPool keeps alive at once (LRU-evicts the
+   * longest-idle one past this). Meaningless for `backend: "codex"`, which
+   * only ever holds one bot-level process regardless. @default 6 — see
+   * DEFAULT_MAX_PROCESSES in src/claude/pool.ts and src/pi/pool.ts.
    */
   warmProcessMaxProcesses: z.number().int().positive().optional(),
 }).strict();
@@ -629,9 +632,9 @@ export type BotConfig = z.infer<typeof BotConfigSchema> & {
 
 /**
  * 批D: the single source of the warm-pool default. Warm pooling is ON by
- * default for the two backends that implement it (claude/codex) and can only
- * be disabled with an explicit `warmProcess: false`; every other backend has
- * no pool implementation, so the default there stays off regardless.
+ * default for claude/codex and can only be disabled with an explicit
+ * `warmProcess: false`. Every other backend — pi included (WP-9: its pool is
+ * opt-in, on only with an explicit `warmProcess: true`) — defaults off.
  * main.ts's pool wiring must consult THIS, never `bot.warmProcess` directly.
  */
 export function effectiveWarmProcess(bot: Pick<BotConfig, "warmProcess" | "backend">): boolean {
@@ -775,15 +778,15 @@ export async function loadBotsDetailed(botsDir: string): Promise<LoadBotsResult>
     }
 
     // perf plan §4: warmProcess only has an implementation for backend=codex
-    // (CodexProcessPool) and backend=claude (ClaudeProcessPool) today.
-    // Advisory only — matches the effort-typo warning style above —
-    // main.ts is the actual enforcement point (it simply never constructs a
-    // pool for any other backend), this is just an upfront heads-up for a
-    // likely-surprising no-op.
-    if (bot.warmProcess && bot.backend !== "codex" && bot.backend !== "claude") {
+    // (CodexProcessPool), backend=claude (ClaudeProcessPool) and backend=pi
+    // (PiProcessPool, WP-9) today. Advisory only — matches the effort-typo
+    // warning style above — main.ts is the actual enforcement point (it
+    // simply never constructs a pool for any other backend), this is just an
+    // upfront heads-up for a likely-surprising no-op.
+    if (bot.warmProcess && bot.backend !== "codex" && bot.backend !== "claude" && bot.backend !== "pi") {
       console.warn(
         `[botLoader] Bot "${bot.id}" sets warmProcess:true but backend is "${bot.backend}" ` +
-          `(only "codex"/"claude" are supported as of this writing). warmProcess will be a no-op for this bot.`,
+          `(only "codex"/"claude"/"pi" are supported as of this writing). warmProcess will be a no-op for this bot.`,
       );
     }
 
