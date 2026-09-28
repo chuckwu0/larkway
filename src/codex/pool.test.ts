@@ -488,6 +488,41 @@ describe("CodexProcessPool — wire protocol", () => {
     }
   });
 
+  it("WP-7: a ghost thread's resume (excludeTurns set) still surfaces the error the handler's stale-session recovery matches", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      // Wording from codex-cli 0.156.1 app-server for a bogus threadId — the
+      // same with and without excludeTurns (isolated CODEX_HOME probe).
+      const ghost = (id: number) => jsonRpcErrorResponse(id, "no rollout found for thread id gone-thread");
+      const pool = new CodexProcessPool({});
+      const handle = pool.run({ prompt: "continue", resumeSessionId: "gone-thread" });
+      const doneOutcome = handle.done.then(() => "resolved", (err: Error) => err.message);
+      await flush();
+      const child = spawnedChildren[0]!;
+      child.stdout.write(initResponse(1) + "\n");
+      await flush();
+      child.stdout.write(ghost(2) + "\n");
+      await flush();
+      expect(readOutboundRequests(child).filter((r) => r.method === "thread/resume")
+        .map((r) => r.params?.["excludeTurns"])).toEqual([true]);
+
+      // Pre-thread failure → cold fallback, which resumes the same way and
+      // hands the handler the app-server's own wording.
+      expect(spawnedChildren).toHaveLength(2);
+      const cold = spawnedChildren[1]!;
+      cold.stdout.write(initResponse(1) + "\n");
+      await flush();
+      cold.stdout.write(ghost(2) + "\n");
+      const message = await doneOutcome;
+      expect(message).toContain("thread/resume failed");
+      expect(message).toContain("no rollout found");
+      expect(readOutboundRequests(cold).filter((r) => r.method === "thread/resume")
+        .map((r) => r.params?.["excludeTurns"])).toEqual([true]);
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+
   it("reports same-process only for a thread already loaded by this live child", async () => {
     const pool = new CodexProcessPool({});
     const first = pool.run({ prompt: "remember this" });

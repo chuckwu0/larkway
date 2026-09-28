@@ -285,7 +285,7 @@ describe("ClaudeProcessPool — key drift", () => {
     const plain = await makeRepo(reposRoot, "plain");
     const skilled = await makeRepo(reposRoot, "skilled", { skill: true });
     const pool = new ClaudeProcessPool({ botId: "bot-a" });
-    const opts = { prompt: "first", cwd: "/workspace", threadId: "one", pidFilePath: null };
+    const opts = { prompt: "first", cwd: reposRoot, threadId: "one", pidFilePath: null };
 
     const first = pool.run(opts);
     await flush();
@@ -336,7 +336,7 @@ describe("ClaudeProcessPool — key drift", () => {
     reposRoot = await mkdtemp(path.join(tmpdir(), "claude-pool-repos-"));
     const skilled = await makeRepo(reposRoot, "new", { skill: true });
     const pool = new ClaudeProcessPool({ botId: "bot-a" });
-    const opts = { cwd: "/workspace", pidFilePath: null };
+    const opts = { cwd: reposRoot, pidFilePath: null };
     pool.prewarm(opts);
     const blank = spawnedChildren[0]!;
     const turn = pool.run({ ...opts, prompt: "hello", threadId: "new", addDirs: [skilled] });
@@ -362,7 +362,7 @@ describe("ClaudeProcessPool — key drift", () => {
       const plain = await makeRepo(reposRoot, "plain");
       const skilled = await makeRepo(reposRoot, "skilled", { skill: true });
       const pool = new ClaudeProcessPool({ botId: "bot-a" });
-      const opts = { cwd: "/workspace", pidFilePath: null };
+      const opts = { cwd: reposRoot, pidFilePath: null };
       pool.prewarm({ ...opts, addDirs: [skilled] });
       const blank = spawnedChildren[0]!;
       expect(spawnArgs[0]).toEqual(expect.arrayContaining(["--add-dir", skilled]));
@@ -380,13 +380,43 @@ describe("ClaudeProcessPool — key drift", () => {
     }
   });
 
+  it.skipIf(process.platform === "win32")(
+    "WP-7: a skill-less repo linked in from outside the cwd stays on --add-dir — blank and turn agree, the blank is adopted",
+    async () => {
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+      try {
+        reposRoot = await mkdtemp(path.join(tmpdir(), "claude-pool-repos-"));
+        const ws = path.join(reposRoot, "ws");
+        const plain = await makeRepo(path.join(ws, "repos"), "plain");
+        const outside = await makeRepo(reposRoot, "elsewhere");
+        const linked = path.join(ws, "repos", "linked");
+        await symlink(outside, linked);
+        const pool = new ClaudeProcessPool({ botId: "bot-a" });
+        const opts = { cwd: ws, pidFilePath: null, addDirs: [linked, plain] };
+        pool.prewarm(opts);
+        const blank = spawnedChildren[0]!;
+        expect(spawnArgs[0]).toEqual(expect.arrayContaining(["--add-dir", linked]));
+        expect(spawnArgs[0]).not.toContain(plain);
+
+        const turn = pool.run({ ...opts, prompt: "hello", threadId: "new" });
+        await flush();
+        expect(turn.pid).toBe(blank.pid);
+        expect(warnSpy.mock.calls.some((c) => String(c[0]).includes("doesn't match"))).toBe(false);
+        blank.stdout.write(resultLine("success") + "\n");
+        await turn.done;
+      } finally {
+        warnSpy.mockRestore();
+      }
+    },
+  );
+
   it("WP-7: a repo listed at boot that later gains a skill replaces the stale blank (proto and turn move together)", async () => {
     const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
     try {
       reposRoot = await mkdtemp(path.join(tmpdir(), "claude-pool-repos-"));
       const repo = await makeRepo(reposRoot, "repo");
       const pool = new ClaudeProcessPool({ botId: "bot-a" });
-      const opts = { cwd: "/workspace", pidFilePath: null, addDirs: [repo] };
+      const opts = { cwd: reposRoot, pidFilePath: null, addDirs: [repo] };
       pool.prewarm(opts);
       const staleBlank = spawnedChildren[0]!;
       expect(spawnArgs[0]).not.toContain("--add-dir");
@@ -419,7 +449,7 @@ describe("ClaudeProcessPool — key drift", () => {
       reposRoot = await mkdtemp(path.join(tmpdir(), "claude-pool-repos-"));
       const repo = await makeRepo(reposRoot, "repo");
       const pool = new ClaudeProcessPool({ botId: "bot-a" });
-      const opts = { cwd: "/workspace", pidFilePath: null, addDirs: [repo] };
+      const opts = { cwd: reposRoot, pidFilePath: null, addDirs: [repo] };
       // Another thread's clone/checkout lands the skill mid-spawn: after the
       // blank's argv was built, before the pool records what it spawned.
       __onSpawn = () => {
@@ -449,7 +479,7 @@ describe("ClaudeProcessPool — key drift", () => {
     const repo = await makeRepo(reposRoot, "repo", { skill: true });
     const skillFile = path.join(repo, ".claude", "skills", "deploy", "SKILL.md");
     const pool = new ClaudeProcessPool({ botId: "bot-a" });
-    const opts = { prompt: "turn", cwd: "/workspace", threadId: "one", pidFilePath: null, addDirs: [repo] };
+    const opts = { prompt: "turn", cwd: reposRoot, threadId: "one", pidFilePath: null, addDirs: [repo] };
 
     const first = pool.run(opts);
     await flush();

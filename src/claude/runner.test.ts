@@ -325,9 +325,42 @@ describe("repoShipsClaudeSkills (WP-7)", () => {
     expect(repoShipsClaudeSkills(path.join(root, "missing"))).toBe(false);
 
     // Default predicate in the builder: same answer, no injection needed.
-    const [, args] = buildCommand({ prompt: "go", addDirs: [plain, withSkill, emptySkill] });
+    // (cwd: root — the repos sit under the child's cwd, as in a workspace.)
+    const [, args] = buildCommand({ prompt: "go", cwd: root, addDirs: [plain, withSkill, emptySkill] });
     expect(args.flatMap((a, i) => (a === "--add-dir" ? [args[i + 1]] : []))).toEqual([withSkill]);
   });
+
+  it.skipIf(process.platform === "win32")(
+    "WP-7: a skill-less repo that resolves outside the cwd keeps --add-dir — its working-directory grant",
+    async () => {
+      root = await mkdtemp(path.join(tmpdir(), "larkway-claude-skills-"));
+      const ws = path.join(root, "ws");
+      const repos = path.join(ws, "repos");
+      await mkdir(repos, { recursive: true });
+      const inTree = path.join(repos, "in-tree");
+      await mkdir(inTree);
+      await mkdir(path.join(ws, "vendor", "lib"), { recursive: true });
+      const linkedInside = path.join(repos, "linked-inside");
+      await symlink(path.join(ws, "vendor", "lib"), linkedInside);
+      await mkdir(path.join(root, "elsewhere", "foo"), { recursive: true });
+      const linkedOutside = path.join(repos, "linked-outside");
+      await symlink(path.join(root, "elsewhere", "foo"), linkedOutside);
+      const gone = path.join(repos, "gone");
+      await symlink(path.join(root, "elsewhere", "missing"), gone);
+      const addDirs = [gone, inTree, linkedInside, linkedOutside];
+      const addDirArgs = (args: string[]) => args.flatMap((a, i) => (a === "--add-dir" ? [args[i + 1]] : []));
+
+      // The entry as given (the link path, as before WP-7), not its realpath.
+      expect(addDirArgs(buildCommand({ prompt: "go", cwd: ws, addDirs })[1])).toEqual([linkedOutside]);
+      expect(addDirArgs(buildWarmCommand({ prompt: "go", cwd: ws, addDirs })[1])).toEqual([linkedOutside]);
+      // A cwd reached through a symlink compares by realpath too.
+      const wsLink = path.join(root, "ws-link");
+      await symlink(ws, wsLink);
+      expect(addDirArgs(buildWarmCommand({ prompt: "go", cwd: wsLink, addDirs })[1])).toEqual([linkedOutside]);
+      // An unresolvable cwd grants nothing extra (the spawn fails on it anyway).
+      expect(addDirArgs(buildWarmCommand({ prompt: "go", cwd: path.join(root, "no-such-cwd"), addDirs })[1])).toEqual([]);
+    },
+  );
 
   it.skipIf(process.platform === "win32")(
     "follows a symlinked .claude/skills (the cross-backend scaffold's layout)",

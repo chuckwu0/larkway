@@ -13,9 +13,9 @@
 
 import { spawn } from "node:child_process";
 import { spawnPipedOutput } from "../platform/spawn.js";
-import { readdirSync, statSync } from "node:fs";
+import { readdirSync, realpathSync, statSync } from "node:fs";
 import { writeFile, unlink, mkdir } from "node:fs/promises";
-import { dirname, join } from "node:path";
+import { dirname, isAbsolute, join, relative, sep } from "node:path";
 import { createInterface } from "node:readline";
 import type { AgentRunner } from "../agent/runner.js";
 import {
@@ -141,19 +141,47 @@ export function repoShipsClaudeSkills(dir: string): boolean {
 }
 
 /**
- * The `--add-dir` subset of `opts.addDirs`. Workspace repos sit under the
- * workspace cwd, so the flag buys them nothing but skill discovery; a repo
- * without skills is dropped. That keeps a clone/removal of an ordinary repo
- * out of the warm pool's spawn signature (src/claude/pool.ts), which would
- * otherwise cold-start every hot thread's next turn. Both builders below go
- * through this, so prewarm and per-turn signatures agree by construction.
- * Not applied in discoverWorkspaceRepoDirs: pi looks for `.agents/skills`.
+ * WP-7: does `dir` resolve — symlinks followed — outside `cwd` (the child's
+ * cwd; the bridge's own when unset, which the child then inherits)? false
+ * when either path cannot be resolved: a missing dir has nothing to grant,
+ * and a missing cwd fails the spawn anyway.
  */
-function claudeSkillAddDirs(
-  opts: RunOptions,
-  shipsSkills: (dir: string) => boolean,
-): string[] {
-  return (opts.addDirs ?? []).filter((dir) => shipsSkills(dir));
+function resolvesOutsideCwd(dir: string, cwd: string | undefined): boolean {
+  let rel: string;
+  try {
+    rel = relative(realpathSync(cwd ?? process.cwd()), realpathSync(dir));
+  } catch {
+    return false;
+  }
+  return rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel);
+}
+
+/**
+ * WP-7: does an `opts.addDirs` entry need claude's `--add-dir`? Only when
+ * the flag buys it something: skill discovery (it ships Claude skills), or
+ * the working-directory grant — discoverWorkspaceRepoDirs accepts symlinked
+ * repos, and a BYO workspace may link one in from outside the cwd. Such a
+ * repo keeps the flag it always had, so a permission mode other than
+ * bypassPermissions never depends on how claude resolves the link. A repo
+ * under the cwd without skills needs neither and is dropped.
+ */
+export function claudeNeedsAddDir(dir: string, cwd: string | undefined): boolean {
+  return repoShipsClaudeSkills(dir) || resolvesOutsideCwd(dir, cwd);
+}
+
+/** Which `opts.addDirs` entries reach `--add-dir`; the warm pool passes a per-operation snapshot. */
+export type ClaudeAddDirProbe = (dir: string, cwd: string | undefined) => boolean;
+
+/**
+ * The `--add-dir` subset of `opts.addDirs` (see claudeNeedsAddDir). Dropping
+ * the rest keeps a clone/removal of an ordinary in-workspace repo out of the
+ * warm pool's spawn signature (src/claude/pool.ts), which would otherwise
+ * cold-start every hot thread's next turn. Both builders below go through
+ * this, so prewarm and per-turn signatures agree by construction. Not
+ * applied in discoverWorkspaceRepoDirs: pi looks for `.agents/skills`.
+ */
+function claudeAddDirs(opts: RunOptions, needsAddDir: ClaudeAddDirProbe): string[] {
+  return (opts.addDirs ?? []).filter((dir) => needsAddDir(dir, opts.cwd));
 }
 
 /**
@@ -162,7 +190,7 @@ function claudeSkillAddDirs(
  */
 function buildCommand(
   opts: RunOptions,
-  shipsSkills: (dir: string) => boolean = repoShipsClaudeSkills,
+  needsAddDir: ClaudeAddDirProbe = claudeNeedsAddDir,
 ): [string, string[]] {
   const bin = opts.agentBinPath ?? "claude";
   const mode = opts.permissionMode ?? "acceptEdits";
@@ -192,7 +220,7 @@ function buildCommand(
   if (opts.effort) {
     args.push("--effort", opts.effort);
   }
-  for (const dir of claudeSkillAddDirs(opts, shipsSkills)) {
+  for (const dir of claudeAddDirs(opts, needsAddDir)) {
     args.push("--add-dir", dir);
   }
 
@@ -223,7 +251,7 @@ function buildCommand(
  */
 export function buildWarmCommand(
   opts: RunOptions,
-  shipsSkills: (dir: string) => boolean = repoShipsClaudeSkills,
+  needsAddDir: ClaudeAddDirProbe = claudeNeedsAddDir,
 ): [string, string[]] {
   const bin = opts.agentBinPath ?? "claude";
   const mode = opts.permissionMode ?? "acceptEdits";
@@ -249,13 +277,13 @@ export function buildWarmCommand(
   if (opts.effort) {
     args.push("--effort", opts.effort);
   }
-  // Spawn-time-only, like model/effort. The pool takes a fresh skills
-  // snapshot for each run(), so a repo that starts or stops shipping skills
+  // Spawn-time-only, like model/effort. The pool takes a fresh --add-dir
+  // snapshot for each run(), so a repo that starts or stops needing the flag
   // after this warm child started (clone, removal, branch switch, a skill
-  // added) changes the pool's signature and the next turn respawns with the
-  // new set. Within one operation the pool reuses that snapshot, so the argv
-  // and the signature it records agree.
-  for (const dir of claudeSkillAddDirs(opts, shipsSkills)) {
+  // added, a symlink retargeted) changes the pool's signature and the next
+  // turn respawns with the new set. Within one operation the pool reuses
+  // that snapshot, so the argv and the signature it records agree.
+  for (const dir of claudeAddDirs(opts, needsAddDir)) {
     args.push("--add-dir", dir);
   }
 

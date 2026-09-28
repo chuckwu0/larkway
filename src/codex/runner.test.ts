@@ -1428,6 +1428,34 @@ describe("runCodex() — spawn-level integration", () => {
       }
     });
 
+    it("a ghost thread's error keeps the wording the handler's stale-session recovery matches", async () => {
+      // codex-cli 0.156.1 app-server, bogus threadId, isolated CODEX_HOME:
+      // thread/resume answers -32600 "no rollout found for thread id <id>"
+      // with and without excludeTurns alike. src/bridge/handler.ts marks the
+      // record fresh-start only when the error carries BOTH substrings below.
+      const fake = makeFakeCodexChild();
+      __nextFakeCodexChild = fake;
+      const { runCodex } = await import("./runner.js");
+      const handle = runCodex({ prompt: "go", resumeSessionId: APP_THREAD_ID });
+      const doneOutcome = handle.done.then(() => "resolved", (err: Error) => err.message);
+      const eventsPromise = collectEvents(handle.events);
+      await new Promise<void>((res) => setImmediate(() => {
+        fake.stdout.write(APP_INIT_RESPONSE + "\n");
+        fake.stdout.write(JSON.stringify({
+          id: 2,
+          error: { code: -32600, message: `no rollout found for thread id ${APP_THREAD_ID}` },
+        }) + "\n");
+        res();
+      }));
+      await eventsPromise;
+      const message = await doneOutcome;
+      expect(message).toContain("thread/resume failed");
+      expect(message).toContain("no rollout found");
+      // Not mistaken for an excludeTurns rejection: no retry.
+      const resumes = outboundRequests(fake).filter((r) => r.method === "thread/resume");
+      expect(resumes.map((r) => r.params?.["excludeTurns"])).toEqual([true]);
+    });
+
     it("any other thread/resume error still fails the turn — no retry", async () => {
       const fake = makeFakeCodexChild();
       __nextFakeCodexChild = fake;

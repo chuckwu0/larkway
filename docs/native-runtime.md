@@ -10,7 +10,7 @@ Larkway 的目标是把飞书话题接到本地 Claude Code / Codex。在相同�
 - `sessionReseedTurns`、`sessionReseedChars`、`p2pStickyIdleMs` 默认均为 `0`。优先沿用原生 session 和原生压缩；显式设置的重开策略、用户重置和已确认的失效会话恢复仍保留。
 - Codex 使用协议的 `phase: final_answer`，不要求输出自定义答案标记；未带 phase 的旧协议保留标记兼容。Claude 保留简短的答案标记约定。Codex 不再强制详细 reasoning summary，沿用宿主配置。
 - pi（`backend: pi`，自带模型底座）走 `pi -p --mode json --approve`，每轮冷启动、无热池；prompt 经 stdin 传入，`--session-id` 续接原生 session，`model` 直接传 `--model`（支持 `provider/id`），`effort` 传 `--thinking`。答案沿用 Claude 的标记约定。`--approve` 必带：非交互模式下 pi 不弹项目信任提示，不带它会静默跳过 workspace 的 `.agents/skills/`。pi 无权限系统，所有权限模式等价全量访问；环境变量原样透传（provider key 即登录态）。
-- Claude 热进程的复用与预热匹配包含实际启动参数，包括权限模式、可执行文件和带 skills 的仓库目录。`addDirs` 中只有含非空 `.claude/skills/<name>/SKILL.md` 的仓库会传 `--add-dir`；clone 或删除不带 skills 的仓库不改变启动参数，热进程照常复用。仓库开始或不再带 skills（新 clone、切分支、新增 skill）后，下一轮起新进程并按原 session 恢复，避免漏掉原生 skills。
+- Claude 热进程的复用与预热匹配包含实际启动参数，包括权限模式、可执行文件和需要 `--add-dir` 的仓库目录。`addDirs` 中只有两类仓库会传 `--add-dir`：含非空 `.claude/skills/<name>/SKILL.md` 的（skills 发现），以及解析符号链接后位于 cwd 之外的（例如链接进 workspace 的外部仓库，`--add-dir` 同时是它的目录访问授权）。clone 或删除 cwd 内不带 skills 的仓库不改变启动参数，热进程照常复用。仓库开始或不再需要该参数（新 clone、切分支、新增 skill、链接改指向）后，下一轮起新进程并按原 session 恢复，避免漏掉原生 skills。
 - Agent 默认使用自己的 lark-cli 配置目录。启动时在该目录配置应用 profile，不复制宿主的个人授权。显式 `lark_cli_isolated: false` 仍保留旧的共享配置兼容行为。
 - 跨 Agent 的共享知识仓库需显式 `sharedKnowledge: true`。默认回收归档留在 `agents/<id>/runtime/archive/`；开启后写入已有的共享知识路径。恢复时兼容两种旧归档位置。
 
