@@ -85,7 +85,11 @@ function arg(name: string, def?: string): string | undefined {
 }
 const backend = (arg("backend", "claude") as Backend);
 const arm = (arg("arm", "runner-bridge") as Arm);
-const cwd = path.resolve(arg("cwd", fs.mkdtempSync(path.join(os.tmpdir(), "lw-bench-")))!);
+// No --cwd → a scratch dir of our own, removed when the run ends (a --cwd the
+// caller passed is never removed).
+const cwdArg = arg("cwd");
+const ownsCwd = cwdArg === undefined;
+const cwd = ownsCwd ? fs.mkdtempSync(path.join(os.tmpdir(), "lw-bench-")) : path.resolve(cwdArg);
 const turns = Number(arg("turns", "6"));
 const outFile = path.resolve(arg("out", `bench-${backend}-${arm}-${Date.now()}.jsonl`)!);
 const model = arg("model");
@@ -406,4 +410,10 @@ async function main(): Promise<void> {
   console.error(`[bench] wrote ${rows.length} rows → ${outFile}; totals ${JSON.stringify(tot)}`);
 }
 
-main().catch((err) => { console.error(err); process.exit(1); });
+let failed = false;
+main()
+  .catch((err) => { console.error(err); failed = true; })
+  .finally(() => {
+    if (ownsCwd) fs.rmSync(cwd, { recursive: true, force: true });
+    if (failed) process.exit(1);
+  });

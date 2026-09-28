@@ -228,9 +228,14 @@ describe.skipIf(!process.env["LW_BENCH"])("handler latency bench (LW_BENCH)", ()
       expect(sample.preRunner?.rosterCache).toBe(s.roster === "warm" ? "hit" : "miss");
       expect(sample.preRunner?.cotChannel).toBe(s.thread === "continuation" ? "chat-after-thread" : "chat");
       expect(sample.preRunner?.cardReplyMs).toBeGreaterThanOrEqual(NET_MS - 5);
+      expect(sample.preRunner?.reactionAddMs).toBeGreaterThanOrEqual(NET_MS - 5);
+      expect(sample.preRunner?.reactionRemoveMs).toBeGreaterThanOrEqual(NET_MS - 5);
       if (s.cardkit === "ok") {
         expect(sample.preRunner?.cardIdConvertMs).toBeGreaterThanOrEqual(NET_MS - 5);
+        expect(sample.preRunner?.legacyCardMs).toBeUndefined();
         expect(sample.postRunner?.cardkitCalls).toBeGreaterThanOrEqual(2);
+      } else {
+        expect(sample.preRunner?.legacyCardMs).toBeGreaterThanOrEqual(NET_MS - 5);
       }
       expect(sample.usage).toMatchObject({ inputTokens: 10, cacheReadTokens: 1000 });
       preRunnerMs.push(sample.runnerRunAt! - sample.handleStartAt!);

@@ -12,11 +12,15 @@
  * WP-0 (native-parity perf work) adds the per-turn timeline, pre/post-runner
  * segment timings and native token usage, so each later change can be judged
  * segment by segment. All additions are optional fields: old lines still parse.
+ * A completed turn's line is written after delivery, or once its tail has run
+ * past handler.ts's PERF_SAMPLE_TAIL_BUDGET_MS; a bridge that dies mid-tail
+ * inside that budget leaves no line for the turn.
  */
 import fs from "node:fs/promises";
 import path from "node:path";
 import type { TurnUsage } from "../agent/runner.js";
 import type { RosterLookupInfo } from "../lark/rosterResolver.js";
+import { larkEpochMs } from "../lark/transport.js";
 import type { CotChannel } from "./cotProgress.js";
 
 /**
@@ -43,6 +47,12 @@ export interface PreRunnerPerf {
   /** task-handle "received" lifecycle hook (≈0 when no task-handle hook is wired). */
   receivedHookMs?: number;
   promptRenderMs?: number;
+  /** ⏳ processing reaction add (only when the client supports reactions). */
+  reactionAddMs?: number;
+  /** ⏳ processing reaction removal once the reply surface exists (pre-runner sites only). */
+  reactionRemoveMs?: number;
+  /** Legacy visible card `start` — the non-CardKit surface or the CardKit-failure fallback. */
+  legacyCardMs?: number;
 }
 
 /** WP-0: the post-runner tail, runner done → final card delivered. */
@@ -98,7 +108,8 @@ export interface PerfSample {
    * Every point is optional: samples written before WP-0, gap-fill
    * deliveries (no `wsAt`) and turns that failed early simply lack some.
    *
-   * `messageCreateAt` is the message's Feishu `create_time` (SERVER clock):
+   * `messageCreateAt` is the message's Feishu `create_time` (SERVER clock,
+   * normalised to ms — lark surfaces both s and ms epochs):
    * `wsAt − messageCreateAt` covers delivery + the node-sdk inbound debounce,
    * which runs before the channel hands us the message, subject to clock skew.
    */
@@ -162,9 +173,8 @@ export class TurnPerfRecorder {
   private cardkitCallsAtRunnerDone = 0;
 
   constructor(event: { ws_at?: unknown; create_time?: unknown }, enqueueAt?: number, now = Date.now()) {
-    const createTime = Number(event.create_time);
     this.timeline = {
-      messageCreateAt: Number.isFinite(createTime) && createTime > 0 ? createTime : undefined,
+      messageCreateAt: larkEpochMs(event.create_time),
       wsAt: typeof event.ws_at === "number" ? event.ws_at : undefined,
       enqueueAt,
       handleStartAt: now,

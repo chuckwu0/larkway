@@ -2241,6 +2241,9 @@ describe("handleOne — thin-channel finalize", () => {
     expect(s.preRunner?.promptRenderMs).toBeGreaterThanOrEqual(0);
     expect(s.preRunner?.receivedHookMs).toBeGreaterThanOrEqual(0);
     expect(s.preRunner?.cardReplyMs).toBeGreaterThanOrEqual(0); // fake client: no split timings
+    expect(s.preRunner?.reactionAddMs).toBeGreaterThanOrEqual(0);
+    expect(s.preRunner?.reactionRemoveMs).toBeGreaterThanOrEqual(0);
+    expect(s.preRunner?.legacyCardMs).toBeUndefined(); // CardKit surface, no fallback
     // finalize always sends at least the final card entity + settings.
     expect(s.postRunner?.cardkitCalls).toBeGreaterThanOrEqual(2);
     expect(s.postRunner?.cardkitCallMsMax).toBeGreaterThanOrEqual(s.postRunner!.cardkitCallMsP50!);
@@ -2284,6 +2287,86 @@ describe("handleOne — thin-channel finalize", () => {
     expect(typeof samples[0]?.finalizeStartAt).toBe("number");
     expect(samples[0]?.finalizeEndAt).toBeUndefined(); // finalize threw
     expect(samples[0]?.finishedAt).toBeUndefined();
+    // legacy (non-CardKit) surface: the card start and the reaction removal are timed
+    expect(samples[0]?.preRunner?.legacyCardMs).toBeGreaterThanOrEqual(0);
+    expect(samples[0]?.preRunner?.reactionAddMs).toBeGreaterThanOrEqual(0);
+    expect(samples[0]?.preRunner?.reactionRemoveMs).toBeGreaterThanOrEqual(0);
+  });
+
+  it("WP-0: a tail outliving the budget still writes the sample, once — without the points it never reached", async () => {
+    await seedWorktree("om_msg");
+    await seedRepoCachePath();
+    runClaudeImpl = () => ({
+      events: (async function* () {
+        yield { type: "system_init", sessionId: "sess_wp0c", raw: {} };
+        yield { type: "answer_snapshot", text: "done", raw: {} };
+        yield {
+          type: "result",
+          stopReason: "end_turn",
+          raw: {},
+          usage: { inputTokens: 3, cacheCreationTokens: 0, cacheReadTokens: 800, outputTokens: 4 },
+        };
+      })(),
+      done: Promise.resolve({ exitCode: 0, sessionId: "sess_wp0c" }),
+      kill: () => {},
+    });
+    // The legacy card's finalize (the delivery tail) hangs until released.
+    let releaseFinalize!: () => void;
+    const finalizeGate = new Promise<void>((resolve) => {
+      releaseFinalize = resolve;
+    });
+    const base = makeCardRenderer();
+    const renderer = {
+      ...base.renderer,
+      async start(messageId: string, startOpts?: { replyInThread?: boolean; threadId?: string }) {
+        const handle = await base.renderer.start(messageId, startOpts);
+        return {
+          ...handle,
+          finalize: async (a: FinalizeArgs) => {
+            await finalizeGate;
+            await handle.finalize(a);
+          },
+        };
+      },
+    };
+    const { client, acked } = makeClient(makeEvent());
+    const { store } = makeSessionStore();
+    const samples: PerfSample[] = [];
+    let resolveFirstSample!: () => void;
+    const firstSample = new Promise<void>((resolve) => {
+      resolveFirstSample = resolve;
+    });
+    const handler = new BridgeHandler({
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      client: client as any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      cardRenderer: renderer as any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      sessionStore: store as any,
+      conventions: makeConventions(),
+      botConfig: { id: "frontend", name: "Frontend", turn_taking_limit: 10, backend: "claude" },
+      perfSampleTailBudgetMs: 20,
+      recordPerfSample: async (sample) => {
+        samples.push(sample);
+        resolveFirstSample();
+      },
+    });
+
+    await handler.run();
+    await firstSample;
+    expect(samples).toHaveLength(1);
+    expect(samples[0]).toMatchObject({ exitCode: 0, usage: { cacheReadTokens: 800 } });
+    expect(samples[0]?.runnerError).toBeUndefined();
+    expect(typeof samples[0]?.runnerDoneAt).toBe("number");
+    expect(typeof samples[0]?.finalizeStartAt).toBe("number");
+    expect(samples[0]?.finalizeEndAt).toBeUndefined(); // still hanging when the budget ran out
+    expect(samples[0]?.finishedAt).toBeUndefined();
+    expect(acked).toEqual([]);
+
+    releaseFinalize();
+    await handler.whenAllTurnsSettled();
+    expect(acked).toEqual(["om_msg"]);
+    expect(samples).toHaveLength(1); // the delivered turn does not write a second row
   });
 
   it("A1 (agent_workspace): creates the CardKit placeholder card BEFORE the (local-fs-only) prewarm work", async () => {

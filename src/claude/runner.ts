@@ -203,25 +203,37 @@ function finiteNumber(value: unknown): number | undefined {
 }
 
 /**
+ * The CLI's own locally-built assistant messages (API-error / "Prompt is too
+ * long" notices, launch failures) carry this model and all-zero usage — no
+ * model request behind them.
+ */
+const CLAUDE_SYNTHETIC_MODEL = "<synthetic>";
+
+/**
  * One API response streams as several `assistant` lines (one per content
  * block, same message id, same input usage) — count distinct ids. Subagent
  * traffic carries `parent_tool_use_id` and is not this turn's own context.
+ * Synthetic messages (and any line reporting zero input) made no request:
+ * they neither count nor overwrite the last request's input size.
  */
 function noteClaudeAssistantUsage(record: Record<string, unknown>, state: ClaudeTurnUsageState): void {
   if (record["parent_tool_use_id"] != null) return;
   const message = record["message"] as Record<string, unknown> | undefined;
+  if (message?.["model"] === CLAUDE_SYNTHETIC_MODEL) return;
   const usage = message?.["usage"];
   if (typeof usage !== "object" || usage === null) return;
   const u = usage as Record<string, unknown>;
+  const inputTokens =
+    (finiteNumber(u["input_tokens"]) ?? 0) +
+    (finiteNumber(u["cache_creation_input_tokens"]) ?? 0) +
+    (finiteNumber(u["cache_read_input_tokens"]) ?? 0);
+  if (inputTokens === 0) return;
   const id = typeof message?.["id"] === "string" ? message["id"] : undefined;
   if (id !== undefined && id !== state.lastMessageId) {
     state.requests += 1;
     state.lastMessageId = id;
   }
-  state.lastRequestInputTokens =
-    (finiteNumber(u["input_tokens"]) ?? 0) +
-    (finiteNumber(u["cache_creation_input_tokens"]) ?? 0) +
-    (finiteNumber(u["cache_read_input_tokens"]) ?? 0);
+  state.lastRequestInputTokens = inputTokens;
 }
 
 /**

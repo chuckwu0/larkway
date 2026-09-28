@@ -28,7 +28,7 @@ import { mkdir, readFile, writeFile, rename, unlink } from "node:fs/promises";
 import path from "node:path";
 import { promisify } from "node:util";
 import type { LarkMessageEvent, LarkClientOptions } from "./transport.js";
-import { AsyncQueue } from "./transport.js";
+import { AsyncQueue, larkEpochMs } from "./transport.js";
 import { ChannelCardClient, type OutboundLarkChannel } from "./channelCardClient.js";
 import {
   ChannelCardKitClient,
@@ -2286,10 +2286,7 @@ export class ChannelClient {
    * — wide enough to cover the message without flooding the replay pull.
    */
   private noteInFlightMeta(ev: LarkMessageEvent): void {
-    const t = Number(ev.create_time);
-    const createTimeMs = Number.isFinite(t) && t > 0
-      ? (t < 1e12 ? t * 1000 : t) // lark surfaces both s and ms epochs
-      : Date.now() - 60_000;
+    const createTimeMs = larkEpochMs(ev.create_time) ?? Date.now() - 60_000;
     this.inFlightMessageMeta.set(ev.message_id, { chatId: ev.chat_id, createTimeMs });
   }
 

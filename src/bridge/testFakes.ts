@@ -9,6 +9,12 @@
  *
  * Test-only: imported solely by *.test.ts files, never by production code, so
  * the esbuild bundles never include it. Every id here is obviously fake.
+ *
+ * Not yet unified with handler.test.ts's own fakes (makeClient,
+ * makeCardKitClient, makeSessionStore, …): those record calls for assertions
+ * and drive different paths (e.g. its CardKit fake has no createCardReply, so
+ * it exercises the entity + reply create). TODO: fold both into this module;
+ * until then a BridgeHandler deps / client interface change must update both.
  */
 import { registerRunner, type AgentStreamEvent, type RunOptions, type TurnUsage } from "../agent/runner.js";
 import type { OutboundCardKitClient } from "../lark/channelCardKitClient.js";

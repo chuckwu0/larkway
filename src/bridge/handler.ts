@@ -319,6 +319,16 @@ function idleThresholdHint(idleTimeoutMs: number, idleKillAfterMs?: number): str
 const COT_BUBBLE_CREATE_BUDGET_MS = 3_000;
 
 /**
+ * WP-0: the success-path perf sample is written once the turn is delivered, so
+ * it carries the post-runner timeline. A tail (declare hooks + finalize +
+ * handoffs) still running this long after the runner finished writes the
+ * sample anyway — without the points it has not reached — so a stuck tail
+ * does not also lose the turn's usage and runner timings. A process that dies
+ * inside the budget still loses that turn's sample.
+ */
+const PERF_SAMPLE_TAIL_BUDGET_MS = 60_000;
+
+/**
  * BL-38 (poison-session self-heal): after this many CONSECUTIVE turns that end
  * by the idle watchdog (a confirmed hang — the thread keeps resuming into a
  * session that goes silent before its first tool call), the thread's session
@@ -1045,6 +1055,11 @@ export interface BridgeHandlerDeps {
    * the background. @default COT_BUBBLE_CREATE_BUDGET_MS (3s). Test seam.
    */
   cotBubbleCreateBudgetMs?: number;
+  /**
+   * WP-0: max ms between runner done and the success-path perf sample write.
+   * @default PERF_SAMPLE_TAIL_BUDGET_MS (60s). Test seam.
+   */
+  perfSampleTailBudgetMs?: number;
   /**
    * V2: fully-resolved peer bot list for this bot.
    * Pre-resolved by runV2Mode: each entry has the peer bot's open_id, name, description.
@@ -1891,7 +1906,15 @@ export class BridgeHandler {
       statusPath: ["已收到"],
       reason: "已进入 bridge，准备创建处理卡片。",
     });
-    await this.deps.client.addProcessingReaction?.(messageId);
+    // WP-0: the ⏳ reaction round trips on the pre-runner path, timed for the
+    // perf sample (the error-path removal further down is not pre-runner).
+    if (this.deps.client.addProcessingReaction) {
+      await turnPerf.timed("reactionAddMs", this.deps.client.addProcessingReaction(messageId));
+    }
+    const removeProcessingReactionPreRunner = async (): Promise<void> => {
+      if (!this.deps.client.removeProcessingReaction) return;
+      await turnPerf.timed("reactionRemoveMs", this.deps.client.removeProcessingReaction(messageId));
+    };
 
     // 批D: make each coalesced followup visible in the runtime event log (Web
     // UI "why didn't my message get its own reply" debugging) — best-effort,
@@ -2041,7 +2064,10 @@ export class BridgeHandler {
     let startFailurePostFallbackSent = false;
     if (!cardKitAvailable) {
       try {
-        card = await this.deps.cardRenderer.start(replyAnchorId, { replyInThread, threadId });
+        card = await turnPerf.timed(
+          "legacyCardMs",
+          this.deps.cardRenderer.start(replyAnchorId, { replyInThread, threadId }),
+        );
         await recordEvent({
           status: "running",
           startedAt: new Date().toISOString(),
@@ -2061,7 +2087,7 @@ export class BridgeHandler {
         // Without a card we can still run Claude, but operator won't see output.
         // Proceed — sessionStore still needs updating.
       } finally {
-        await this.deps.client.removeProcessingReaction?.(messageId);
+        await removeProcessingReactionPreRunner();
       }
     } else {
       await recordEvent({
@@ -2403,7 +2429,7 @@ export class BridgeHandler {
               updatedAt: new Date().toISOString(),
             };
             await writeCardKitFile(worktreePath, cardKitRecord);
-            await this.deps.client.removeProcessingReaction?.(messageId);
+            await removeProcessingReactionPreRunner();
             await recordEvent({
               status: "running",
               startedAt: new Date().toISOString(),
@@ -2415,7 +2441,7 @@ export class BridgeHandler {
             const existingMessageId = cardKitReplyConversionMessageId(err);
             if (existingMessageId) {
               card = this.deps.cardRenderer.handleFor(existingMessageId);
-              await this.deps.client.removeProcessingReaction?.(messageId);
+              await removeProcessingReactionPreRunner();
               await recordEvent({
                 status: "running",
                 startedAt: new Date().toISOString(),
@@ -2431,8 +2457,11 @@ export class BridgeHandler {
 
         if (!card && cardKitStartFailed) {
           try {
-            card = await this.deps.cardRenderer.start(replyAnchorId, { replyInThread, threadId });
-            await this.deps.client.removeProcessingReaction?.(messageId);
+            card = await turnPerf.timed(
+              "legacyCardMs",
+              this.deps.cardRenderer.start(replyAnchorId, { replyInThread, threadId }),
+            );
+            await removeProcessingReactionPreRunner();
             await recordEvent({
               status: "running",
               startedAt: new Date().toISOString(),
@@ -2457,7 +2486,7 @@ export class BridgeHandler {
               logPrefix: "[bridge.handler]",
             });
             if (postFallback) startFailurePostFallbackSent = true;
-            await this.deps.client.removeProcessingReaction?.(messageId);
+            await removeProcessingReactionPreRunner();
             await recordEvent({
               status: "running",
               startedAt: new Date().toISOString(),
@@ -3255,8 +3284,14 @@ export class BridgeHandler {
         // written once the turn is delivered (finalize + handoffs), so it can
         // carry the post-runner timeline. A throw in between still writes it
         // from the catch below — never as a runnerError: the runner did finish.
+        // A tail outliving PERF_SAMPLE_TAIL_BUDGET_MS writes it from the timer.
         let donePerf: PerfSample | undefined;
+        let donePerfTimer: ReturnType<typeof setTimeout> | undefined;
         const writeDonePerf = (): void => {
+          if (donePerfTimer) {
+            clearTimeout(donePerfTimer);
+            donePerfTimer = undefined;
+          }
           if (!donePerf || perfRecorded) return;
           perfRecorded = true;
           void recordPerf(turnPerf.fill(donePerf));
@@ -3623,6 +3658,11 @@ export class BridgeHandler {
             usage: resultEvent?.usage,
             lastRequestInputTokens: resultEvent?.lastRequestInputTokens,
           };
+          donePerfTimer = setTimeout(
+            writeDonePerf,
+            this.deps.perfSampleTailBudgetMs ?? PERF_SAMPLE_TAIL_BUDGET_MS,
+          );
+          donePerfTimer.unref?.();
           // PRB-9: a turn is "interrupted" when the idle watchdog killed it
           // (real hang), NOT when total wall-clock elapsed. Routed to the same
           // explicit-failure sink as crash/restart (§12.2). Surface-independent:

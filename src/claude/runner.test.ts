@@ -480,6 +480,37 @@ describe("parseLinesMulti — WP-0 turn usage", () => {
     });
   });
 
+  it("ignores the CLI's synthetic assistant messages (API-error notices: model <synthetic>, zero usage)", () => {
+    const extractor = new AnswerChannelExtractor();
+    const state = newClaudeTurnUsageState();
+    const zero = { input_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0, output_tokens: 0 };
+    const lines = [
+      assistant("msg_1", { input_tokens: 9, cache_creation_input_tokens: 150, cache_read_input_tokens: 180000, output_tokens: 3 }),
+      // Shape of the CLI's local error message (random id, parent_tool_use_id null).
+      JSON.stringify({
+        type: "assistant",
+        parent_tool_use_id: null,
+        message: {
+          id: "synthetic-uuid-1",
+          model: "<synthetic>",
+          role: "assistant",
+          stop_reason: "stop_sequence",
+          content: [{ type: "text", text: "Prompt is too long" }],
+          usage: zero,
+        },
+      }),
+      // A zero-input line without the model tag made no request either.
+      assistant("synthetic-uuid-2", zero),
+      resultLine,
+    ];
+    const events = lines.flatMap((line) => [...parseLinesMulti(line, extractor, state)]);
+    const result = events.find((e) => e.type === "result");
+    expect(result).toMatchObject({
+      usage: { requests: 1 },
+      lastRequestInputTokens: 9 + 150 + 180000,
+    });
+  });
+
   it("without per-turn state still reports result.usage (no request count / context size)", () => {
     const [result] = [...parseLinesMulti(resultLine, new AnswerChannelExtractor())];
     expect(result).toMatchObject({ type: "result", usage: { inputTokens: 12, outputTokens: 250 } });

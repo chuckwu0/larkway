@@ -112,13 +112,20 @@ describe("perfLog — WP-0 fields", () => {
 
 describe("TurnPerfRecorder", () => {
   it("seeds the timeline from the event (ws_at, create_time) and the enqueue stamp", () => {
-    const rec = new TurnPerfRecorder({ ws_at: 1_600, create_time: "1000" }, 1_601, 1_602);
+    const rec = new TurnPerfRecorder(
+      { ws_at: 1_700_000_000_600, create_time: "1700000000000" },
+      1_700_000_000_601,
+      1_700_000_000_602,
+    );
     expect(rec.fill(sample())).toMatchObject({
-      messageCreateAt: 1_000,
-      wsAt: 1_600,
-      enqueueAt: 1_601,
-      handleStartAt: 1_602,
+      messageCreateAt: 1_700_000_000_000,
+      wsAt: 1_700_000_000_600,
+      enqueueAt: 1_700_000_000_601,
+      handleStartAt: 1_700_000_000_602,
     });
+    // a second-epoch create_time is normalised to ms, like the channel's gap windows
+    expect(new TurnPerfRecorder({ create_time: "1700000000" }).fill(sample()).messageCreateAt)
+      .toBe(1_700_000_000_000);
     // gap-fill / synthetic events carry no ws_at; junk create_time is dropped
     const bare = new TurnPerfRecorder({ create_time: "not-a-number" }).fill(sample());
     expect(bare.wsAt).toBeUndefined();

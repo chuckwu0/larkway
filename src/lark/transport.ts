@@ -12,6 +12,7 @@
  *   - AsyncQueue<T>      (class)     — VALUE import; bridges events into a generator
  *   - LarkClientOptions  (interface) — inbound client construction options
  *   - ActiveThreadInfo   (interface) — per-thread catch-up high-water mark
+ *   - larkEpochMs        (function)  — s/ms epoch normalisation for `create_time`
  */
 
 // ---------------------------------------------------------------------------
@@ -200,6 +201,16 @@ export interface LarkClientOptions {
    * disables it (tests / dry-run).
    */
   openChatDiscoveryMs?: number;
+}
+
+/**
+ * A Feishu epoch field (e.g. `create_time`) as epoch ms — lark surfaces both
+ * second and millisecond epochs. Undefined when absent or unparseable.
+ */
+export function larkEpochMs(raw: unknown): number | undefined {
+  const t = Number(raw);
+  if (!Number.isFinite(t) || t <= 0) return undefined;
+  return t < 1e12 ? t * 1000 : t;
 }
 
 // ---------------------------------------------------------------------------
