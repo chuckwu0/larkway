@@ -22,6 +22,10 @@
  *     session events that follow are the records `pi --mode json` prints,
  *     decoded by the same PiTurnDecoder; the turn ends at `agent_settled`
  *     (never agent_end — see parsePiLine's doc in runner.ts);
+ *   - pi prints the `prompt` response before the first event of the run it
+ *     starts, so only records after an accepted prompt belong to the turn —
+ *     anything earlier (preflight compaction, a run an extension started) is
+ *     not the turn's and is dropped like output between turns;
  *   - `abort` stops the running turn, which pi then settles;
  *   - RPC mode binds a UI context, so extension dialogs (`extension_ui_request`
  *     select / confirm / input / editor) arrive here. Nobody is at a terminal:
@@ -37,17 +41,21 @@
  *     not (spike 2026-09-28). The dialogs they open are auto-cancelled, i.e.
  *     declined; setting `settings.sampling: false` / `settings.elicitation:
  *     false` in the pi MCP config removes the declarations entirely.
- *   - Background processes a bash tool call leaves running survive between
- *     turns until the warm process is retired; retirement sends SIGTERM, on
- *     which pi kills the detached children it tracks. The cold runner's
- *     30 s after-settle kill has no per-turn equivalent: a warm turn is over
- *     at `agent_settled` whatever still holds pi's stdout.
+ *   - A warm turn is over at `agent_settled`, whatever still holds pi's
+ *     stdout: the cold runner's 30 s after-settle SIGTERM has no per-turn
+ *     equivalent. Retirement's SIGTERM makes pi kill only the shells of bash
+ *     calls still executing; a background process that an already-finished
+ *     bash call left behind (`npm run dev &`) is cleaned up by neither
+ *     larkway nor pi, and outlives the warm process just as it outlives a
+ *     cold one.
  *   - About 130–150 MB RSS per idle process (n=1).
  *
  * Session single-writer rule: a pi session file must never be open in two
  * processes. A thread's replacement process (changed options, a different
  * session, a forced fresh start) and a cold fallback therefore wait until the
- * thread's retiring process has actually exited.
+ * thread's retiring process has actually exited. On Windows that is when pi
+ * closes its stdout, not the earlier 'exit' of cross-spawn's cmd.exe wrapper
+ * (bounded by EXIT_WAIT_MS; not yet exercised on a Windows host).
  *
  * Crash/fallback scope (same contract as the claude pool): a turn that has
  * not pushed any event yet falls back transparently to a cold runPi(); a turn
@@ -165,8 +173,10 @@ interface TurnState {
   resolveDone: (result: DoneResult) => void;
   rejectDone: (err: Error) => void;
   settled: boolean;
-  /** Set once the `prompt` command is written — session events route to this turn only from then on. */
+  /** Set once the `prompt` command is written (a kill from then on goes through `abort`). */
   promptSent: boolean;
+  /** Set, synchronously with pi's success response, once pi accepted the prompt — session events route to this turn only from then on. */
+  promptAccepted: boolean;
   /** True once ANY event was pushed — past this a process death rejects instead of falling back. */
   reachedWire: boolean;
   killRequested: boolean;
@@ -305,6 +315,7 @@ export class PiProcessPool implements AgentRunner {
       rejectDone,
       settled: false,
       promptSent: false,
+      promptAccepted: false,
       reachedWire: false,
       killRequested: false,
       reusedProcess: false,
@@ -364,7 +375,10 @@ export class PiProcessPool implements AgentRunner {
       return { events: queue, done, kill, pid: undefined };
     }
     const entry = this.#place(state, key, threadId);
-    return { events: queue, done, kill, pid: entry?.child.pid };
+    // A turn #place sent cold at once (pool full and busy) reports the cold
+    // child's pid: the bridge writes it into the session's pid file, the GC
+    // liveness gate for the session dir while that run lasts.
+    return { events: queue, done, kill, pid: entry?.child.pid ?? state.coldHandle?.pid };
   }
 
   /** Graceful drain + shutdown — call from the owning bot's shutdown path. */
@@ -497,6 +511,15 @@ export class PiProcessPool implements AgentRunner {
       this.#destroyEntry(entry, "process is busy with a run larkway did not start");
       return;
     }
+    if (state.opts.resumeSessionId != null && sessionId !== state.opts.resumeSessionId) {
+      // #canContinue matched the session this process held after its last
+      // turn; something inside it has since moved it to another one (an
+      // extension's newSession / switchSession / fork), and a prompt now
+      // would land there. Retire as above: this turn resumes its own session
+      // cold, like `--session-id` would.
+      this.#destroyEntry(entry, `process switched to session ${sessionId}, turn resumes ${state.opts.resumeSessionId}`);
+      return;
+    }
 
     // Re-apply the per-bot model and thinking level on every turn. The CLI
     // flags set both at spawn; this keeps them if anything in the process
@@ -519,10 +542,34 @@ export class PiProcessPool implements AgentRunner {
     state.pendingSessionInit = { sessionId, raw: { type: "session", id: sessionId, source: "rpc get_state" } };
     state.promptSent = true;
     entry.hasRunTurn = true;
-    const promptResponse = await this.#command(entry, { type: "prompt", message: state.opts.prompt });
-    if (promptResponse != null && promptResponse["success"] !== true && !state.settled && entry.current === state) {
-      this.#settleReject(state, new Error(`pi rejected the prompt: ${String(promptResponse["error"] ?? "unknown error")}`));
+    const promptResponse = await this.#command(entry, { type: "prompt", message: state.opts.prompt }, (response) => {
+      // On the response line itself: the run's first event can follow in the same chunk.
+      if (response["success"] === true && entry.current === state) state.promptAccepted = true;
+    });
+    if (promptResponse != null && promptResponse["success"] !== true && this.#stillOwns(entry, state)) {
+      const error = String(promptResponse["error"] ?? "unknown error");
+      if (/already processing/i.test(error)) {
+        // A run larkway did not start began after get_state: retire and run
+        // this turn cold, as in the isStreaming case above.
+        this.#destroyEntry(entry, "process started a run larkway did not start");
+        return;
+      }
+      this.#settleReject(state, new Error(`pi rejected the prompt: ${error}`));
       return;
+    }
+    if (state.promptAccepted && this.#stillOwns(entry, state) && !state.reachedWire) {
+      // pi also accepts a prompt an extension consumes (an `input` handler
+      // returning "handled", an extension /command); no run starts, so no
+      // agent_settled would ever end the turn. A run that did start is
+      // streaming from the moment pi printed that response and prints its
+      // agent_start before it stops being so: one get_state tells them apart.
+      const probe = await this.#command(entry, { type: "get_state" });
+      if (probe != null && this.#stillOwns(entry, state) && !state.reachedWire && asRecord(probe["data"])?.["isStreaming"] === false) {
+        // What the cold runner reports when pi starts no run: the session, exit 0.
+        this.#pushSessionInit(state);
+        this.#settleResolve(state, state.killRequested ? 1 : 0);
+        return;
+      }
     }
 
     // Hold this entry's chain until the turn concludes, so a queued sibling
@@ -532,14 +579,9 @@ export class PiProcessPool implements AgentRunner {
     });
   }
 
-  /** A session event for the entry's current turn (only after its prompt was sent). */
+  /** A session event for the entry's current turn (only after pi accepted its prompt). */
   #onTurnRecord(entry: PoolEntry, state: TurnState, obj: unknown): void {
-    if (state.pendingSessionInit) {
-      const { sessionId, raw } = state.pendingSessionInit;
-      state.pendingSessionInit = undefined;
-      state.reachedWire = true;
-      state.queue.push(state.decoder.sessionInit(sessionId, raw));
-    }
+    this.#pushSessionInit(state);
     for (const ev of state.decoder.decodeRecord(obj)) {
       state.reachedWire = true;
       state.queue.push(ev);
@@ -548,6 +590,15 @@ export class PiProcessPool implements AgentRunner {
         return;
       }
     }
+  }
+
+  /** Push get_state's synthesized system_init, once, ahead of the turn's first event. */
+  #pushSessionInit(state: TurnState): void {
+    if (!state.pendingSessionInit) return;
+    const { sessionId, raw } = state.pendingSessionInit;
+    state.pendingSessionInit = undefined;
+    state.reachedWire = true;
+    state.queue.push(state.decoder.sessionInit(sessionId, raw));
   }
 
   #onTurnSettled(entry: PoolEntry, state: TurnState): void {
@@ -618,7 +669,13 @@ export class PiProcessPool implements AgentRunner {
       // Nothing started on the wire yet (queued, waiting for a retiring
       // process, or still in preflight): a deliberate kill resolves `done`,
       // as the cold runner's kill() does.
+      const inPreflight = entry != null && entry.current === state;
       this.#settleResolve(state, 1);
+      // A healthy process answers get_state / set_* within milliseconds; a
+      // kill that finds one still unanswered most likely means the process
+      // is stuck (e.g. an extension's startup hanging on the network).
+      // Retire it, or the thread's next turn would queue behind it.
+      if (inPreflight) this.#destroyEntry(entry, "turn killed while a preflight command was unanswered");
       return;
     }
     void this.#command(entry, { type: "abort" });
@@ -734,8 +791,14 @@ export class PiProcessPool implements AgentRunner {
         this.#onEntryExit(entry, err);
         return;
       }
+      // Windows: for a process we retired, this 'exit' is cross-spawn's
+      // cmd.exe wrapper, killed at once, while pi itself is still shutting
+      // down on its stdin EOF and holds stdout (and the session file) until
+      // it is gone. The single-writer waits key off #onEntryExit, so wait for
+      // stdout for as long as those waits are bounded anyway.
+      const graceMs = process.platform === "win32" && entry.destroyed ? EXIT_WAIT_MS : EXIT_DRAIN_GRACE_MS;
       const grace = new Promise<void>((resolve) => {
-        const t = setTimeout(resolve, EXIT_DRAIN_GRACE_MS);
+        const t = setTimeout(resolve, graceMs);
         t.unref?.();
       });
       void Promise.race([stdoutDone, grace]).then(() => this.#onEntryExit(entry, err));
@@ -769,7 +832,7 @@ export class PiProcessPool implements AgentRunner {
     }
 
     const state = entry.current;
-    if (state == null || state.settled || !state.promptSent) return; // between turns / before the prompt
+    if (state == null || state.settled || !state.promptAccepted) return; // between turns / before pi accepted the prompt
     if (obj === undefined) {
       state.queue.push({ type: "raw", raw: line.trim() });
       return;
@@ -796,12 +859,23 @@ export class PiProcessPool implements AgentRunner {
     }
   }
 
-  /** Send one command; resolves with its `response`, or undefined if the process is gone first. */
-  #command(entry: PoolEntry, command: JsonRecord): Promise<JsonRecord | undefined> {
+  /**
+   * Send one command; resolves with its `response`, or undefined if the
+   * process is gone first. `onResponse` runs on the response line itself,
+   * before any later stdout line is handled.
+   */
+  #command(
+    entry: PoolEntry,
+    command: JsonRecord,
+    onResponse?: (response: JsonRecord) => void,
+  ): Promise<JsonRecord | undefined> {
     if (entry.exitHandled) return Promise.resolve(undefined);
     const id = `lw-${entry.nextCommandId++}`;
     return new Promise((resolve) => {
-      entry.pendingCommands.set(id, resolve);
+      entry.pendingCommands.set(id, (response) => {
+        if (response) onResponse?.(response);
+        resolve(response);
+      });
       if (!this.#write(entry, { ...command, id })) {
         entry.pendingCommands.delete(id);
         resolve(undefined);
@@ -847,7 +921,8 @@ export class PiProcessPool implements AgentRunner {
 
   /**
    * Retire an entry: unusable at once, killed SIGTERM → grace → SIGKILL. pi's
-   * SIGTERM handler kills the detached children it tracks before exiting.
+   * SIGTERM handler kills the shells of bash calls still executing before
+   * exiting (not what finished calls left running in the background).
    * Never settles `entry.current` itself — #onEntryExit does, on the real exit.
    */
   #destroyEntry(entry: PoolEntry, reason: string): void {

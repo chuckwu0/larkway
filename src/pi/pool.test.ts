@@ -49,6 +49,8 @@ type FakeChild = EventEmitter & {
   heldGetState?: Cmd;
   dieOnGetState: boolean;
   promptError?: string;
+  /** Runs when a prompt arrives, before pi answers it (preflight-time output). */
+  onPromptReceived?: (c: FakeChild) => void;
   onPrompt: (c: FakeChild, message: string) => void;
 };
 
@@ -131,7 +133,7 @@ function makeFakeChild(args: string[]): FakeChild {
           c.heldGetState = cmd;
           return;
         }
-        return respond(cmd, { sessionId: c.sessionId, model: c.model, thinkingLevel: c.thinkingLevel, isStreaming: c.isStreaming, messageCount: 0 });
+        return respond(cmd, { sessionId: c.sessionId, model: c.model, thinkingLevel: c.thinkingLevel, isStreaming: c.isStreaming || c.running, messageCount: 0 });
       case "set_thinking_level":
         c.thinkingLevel = String(cmd["level"]);
         return respond(cmd);
@@ -139,6 +141,11 @@ function makeFakeChild(args: string[]): FakeChild {
         c.model = { provider: String(cmd["provider"]), id: String(cmd["modelId"]) };
         return respond(cmd, c.model);
       case "prompt":
+        c.onPromptReceived?.(c);
+        if (c.running) {
+          c.send({ id: cmd.id, type: "response", command: "prompt", success: false, error: "Agent is already processing. Specify streamingBehavior ('steer' or 'followUp') to queue the message." });
+          return;
+        }
         if (c.promptError) {
           c.send({ id: cmd.id, type: "response", command: "prompt", success: false, error: c.promptError });
           return;
@@ -378,6 +385,50 @@ describe("PiProcessPool turns", () => {
     void collect(h2);
     await expect(h2.done).rejects.toThrow(/pi rejected the prompt: No API key found for prov/);
   });
+
+  it("a prompt pi accepts without starting a run (an extension consumed the input) settles exit 0 on the session, like the cold runner's empty run", async () => {
+    const pool = newPool();
+    setupChild = (c) => {
+      c.onPrompt = () => {}; // success response, then nothing: no agent_start, no agent_settled
+    };
+    const { events, result } = await runTurn(pool, { ...BASE, prompt: "p", threadId: "t1" });
+    const child = rpcChildren()[0]!;
+    expect(cmdTypes(child)).toEqual(["get_state", "set_thinking_level", "prompt", "get_state"]);
+    expect(events).toEqual([expect.objectContaining({ type: "system_init", sessionId: "sess-new-1" })]);
+    expect(result).toEqual({ exitCode: 0, sessionId: "sess-new-1", pooled: true, resumeMode: undefined });
+    expect(child.killSignals).toEqual([]);
+    expect(pool.activeProcessCount).toBe(1);
+  });
+
+  it("a run whose first event comes after the prompt response is not taken for a consumed prompt: the probe sees it streaming", async () => {
+    const pool = newPool();
+    setupChild = (c) => {
+      c.onPrompt = (child) => {
+        child.running = true; // pi marks the run active as it answers the prompt
+        setImmediate(() => setImmediate(() => standardTurn(child)));
+      };
+    };
+    const { events, result } = await runTurn(pool, { ...BASE, prompt: "p", threadId: "t1" });
+    expect(cmdTypes(rpcChildren()[0]!)).toEqual(["get_state", "set_thinking_level", "prompt", "get_state"]);
+    expect(answerText(events)).toBe(ANSWER);
+    expect(events.filter((e) => e.type === "result")).toHaveLength(1);
+    expect(result).toMatchObject({ exitCode: 0, sessionId: "sess-new-1", pooled: true });
+  });
+
+  it("records printed before pi accepts the prompt belong to no turn: a foreign run's text and agent_settled do not end this one", async () => {
+    const pool = newPool();
+    setupChild = (c) => {
+      // e.g. an extension-started run settling while pi still holds this prompt back
+      c.onPromptReceived = (child) => {
+        child.send({ type: "message_update", assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "LARKWAY_ANSWER_BEGIN\nforeign run text\nLARKWAY_ANSWER_END" } });
+        child.send({ type: "agent_settled" });
+      };
+    };
+    const { events, result } = await runTurn(pool, { ...BASE, prompt: "p", threadId: "t1" });
+    expect(answerText(events)).toBe(ANSWER);
+    expect(events.filter((e) => e.type === "result")).toHaveLength(1);
+    expect(result).toMatchObject({ exitCode: 0, sessionId: "sess-new-1", pooled: true });
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -455,6 +506,27 @@ describe("PiProcessPool kill", () => {
     for (let i = 0; i < 20; i++) await tick();
     expect(cmdTypes(child)).toEqual(["get_state"]);
   });
+
+  it("kill() during preflight retires the process: the thread's next turn gets a new one instead of queueing behind the stuck get_state", async () => {
+    const pool = newPool();
+    setupChild = (c) => {
+      if (rpcChildren().length === 0) c.holdGetState = true; // the first process never answers get_state
+    };
+    const h1 = pool.run({ ...BASE, prompt: "one", threadId: "t1" });
+    void collect(h1);
+    const stuck = rpcChildren()[0]!;
+    await waitFor(() => stuck.heldGetState !== undefined);
+    h1.kill();
+    await expect(h1.done).resolves.toMatchObject({ exitCode: 1, pooled: true });
+    expect(stuck.killSignals).toEqual(["SIGTERM"]);
+
+    const second = await runTurn(pool, { ...BASE, prompt: "again", threadId: "t1" });
+    expect(rpcChildren()).toHaveLength(2);
+    expect(cmdTypes(rpcChildren()[1]!)).toEqual(["get_state", "set_thinking_level", "prompt"]);
+    expect(cmdTypes(stuck)).toEqual(["get_state"]);
+    expect(answerText(second.events)).toBe(ANSWER);
+    expect(second.result).toMatchObject({ exitCode: 0, sessionId: "sess-new-2", pooled: true });
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -513,6 +585,40 @@ describe("PiProcessPool cold fallback", () => {
     expect(coldChildren()).toHaveLength(1);
     expect(result).toMatchObject({ exitCode: 0, pooled: false });
   });
+
+  it("a prompt pi rejects as already processing (a run larkway did not start began after get_state) retires the process and runs cold", async () => {
+    const pool = newPool();
+    setupChild = (c) => {
+      if (c.args.includes("rpc")) {
+        c.onPromptReceived = (child) => {
+          child.running = true;
+          child.send({ type: "agent_start" });
+          child.send({ type: "message_update", assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "LARKWAY_ANSWER_BEGIN\nforeign run text\nLARKWAY_ANSWER_END" } });
+        };
+      }
+    };
+    const { events, result } = await runTurn(pool, { ...BASE, prompt: "p", threadId: "t1", resumeSessionId: "s-9" });
+    expect(rpcChildren()[0]!.killSignals).toEqual(["SIGTERM"]);
+    expect(coldChildren()).toHaveLength(1);
+    expect(answerText(events)).not.toContain("foreign");
+    expect(answerText(events)).toContain("Cold answer");
+    expect(result).toMatchObject({ exitCode: 0, sessionId: "s-9", pooled: false, resumeMode: "cold" });
+  });
+
+  it("a process whose session was switched in-process (e.g. by an extension) is retired; the resume runs cold on the session it asked for", async () => {
+    const pool = newPool();
+    const first = await runTurn(pool, { ...BASE, prompt: "one", threadId: "t1" });
+    const child = rpcChildren()[0]!;
+    child.sessionId = "switched-by-extension";
+
+    const second = await runTurn(pool, { ...BASE, prompt: "two", threadId: "t1", resumeSessionId: first.result.sessionId });
+    expect(child.killSignals).toEqual(["SIGTERM"]);
+    expect(cmdTypes(child).filter((t) => t === "prompt")).toHaveLength(1);
+    expect(coldChildren()).toHaveLength(1);
+    expect(argValue(coldChildren()[0]!.args, "--session-id")).toBe("sess-new-1");
+    expect(second.result).toMatchObject({ exitCode: 0, sessionId: "sess-new-1", pooled: false, resumeMode: "cold" });
+    expect(second.events.filter((e) => e.type === "system_init")).toEqual([expect.objectContaining({ sessionId: "sess-new-1" })]);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -541,6 +647,35 @@ describe("PiProcessPool retirement", () => {
     expect(result).toMatchObject({ exitCode: 0, sessionId: "sess-new-1", pooled: true, resumeMode: "cold" });
   });
 
+  it("win32: a retired process counts as gone when pi closes its stdout, not at the cmd.exe wrapper's exit", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval"] });
+    const pool = newPool();
+    const first = await runTurn(pool, { ...BASE, prompt: "one", threadId: "t1" });
+    const old = rpcChildren()[0]!;
+    old.exitOnSigterm = false;
+
+    const platform = Object.getOwnPropertyDescriptor(process, "platform")!;
+    let handle: RunHandle;
+    Object.defineProperty(process, "platform", { ...platform, value: "win32" });
+    try {
+      handle = pool.run({ ...BASE, effort: "low", prompt: "two", threadId: "t1", resumeSessionId: first.result.sessionId });
+      expect(old.stdin.writableEnded).toBe(true); // stdin EOF is what reaches pi through the wrapper
+      old.emit("exit", 1, null); // the wrapper is gone; pi itself still holds stdout
+    } finally {
+      Object.defineProperty(process, "platform", platform);
+    }
+    const eventsP = collect(handle);
+    await vi.advanceTimersByTimeAsync(2_500);
+    expect(rpcChildren()).toHaveLength(1); // no second writer on the session yet
+
+    old.stdout.end(); // pi exited
+    const result = await handle.done;
+    await eventsP;
+    expect(rpcChildren()).toHaveLength(2);
+    expect(argValue(rpcChildren()[1]!.args, "--session-id")).toBe("sess-new-1");
+    expect(result).toMatchObject({ exitCode: 0, sessionId: "sess-new-1", pooled: true });
+  });
+
   it("forceFreshSession (reseed) retires a used process and starts a new session without --session-id", async () => {
     const pool = newPool();
     await runTurn(pool, { ...BASE, prompt: "one", threadId: "t1" });
@@ -558,7 +693,7 @@ describe("PiProcessPool retirement", () => {
     expect(argValue(rpcChildren()[1]!.args, "--session-id")).toBe("other-sess");
   });
 
-  it("at capacity the least-recently-used idle process is evicted; with every process busy the turn runs cold with no pid", async () => {
+  it("at capacity the least-recently-used idle process is evicted; with every process busy the turn runs cold under the cold child's pid", async () => {
     const pool = newPool({ maxProcesses: 1 });
     await runTurn(pool, { ...BASE, prompt: "one", threadId: "t1" });
     setupChild = (c) => {
@@ -576,9 +711,10 @@ describe("PiProcessPool retirement", () => {
     await waitFor(() => cmdTypes(rpcChildren()[1]!).includes("prompt"));
 
     const cold = pool.run({ ...BASE, prompt: "three", threadId: "t3" });
-    expect(cold.pid).toBeUndefined();
-    const [, result] = await Promise.all([collect(cold), cold.done]);
+    // The bridge writes this pid into the session's pid file (GC liveness gate).
     expect(coldChildren()).toHaveLength(1);
+    expect(cold.pid).toBe(coldChildren()[0]!.pid);
+    const [, result] = await Promise.all([collect(cold), cold.done]);
     expect(result).toMatchObject({ pooled: false });
     busy.kill();
     await busy.done;
