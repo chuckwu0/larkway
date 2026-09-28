@@ -3146,12 +3146,24 @@ export class BridgeHandler {
       // `currentExisting` may be reset to undefined on retry (ghost session cleared).
       let currentExisting = existing;
       let attempt = 0;
+      // WP-10: a /stop that came while a stale-session retry waited for the
+      // lane — the retry's runner is stopped as soon as it starts.
+      let stopRequestedBeforeRetry = false;
 
       while (true) {
         attempt++;
         // WP-10: only the first attempt runs ahead of the surfaces; a
-        // stale-session retry starts once they are up.
-        if (attempt > 1 && surfaceReady) await surfaceReady;
+        // stale-session retry starts once they are up. The first attempt's
+        // kill hook is gone by now and the retry's is not registered yet, so
+        // a /stop meanwhile is held for the retry's runner.
+        if (attempt > 1 && surfaceReady) {
+          if (queueKey) {
+            this.activeTurnStops.set(queueKey, () => {
+              stopRequestedBeforeRetry = true;
+            });
+          }
+          await surfaceReady;
+        }
 
         // Step 4b: render prompt — isNewThread reflects current attempt's state.
         const backend = this.deps.botConfig?.backend ?? "claude";
@@ -3711,14 +3723,16 @@ export class BridgeHandler {
         // BL-42 /stop: expose this turn's kill switch to run()'s intercept.
         // Cleared on both watchdog-teardown paths + handleOne's outer finally.
         if (queueKey) {
-          this.activeTurnStops.set(queueKey, () => {
+          const stopTurn = (): void => {
             stoppedByUser = true;
             try {
               handle.kill();
             } catch {
               /* best-effort — finalization below still renders 已停止 */
             }
-          });
+          };
+          this.activeTurnStops.set(queueKey, stopTurn);
+          if (stopRequestedBeforeRetry) stopTurn();
         }
 
         // GC liveness (agent_workspace only): the runner's cwd is the SHARED
@@ -3854,7 +3868,10 @@ export class BridgeHandler {
           }
 
           const result = await handle.done;
-          turnPerf.markRunnerDone(cardKitProgress?.callDurationsMs);
+          const runnerDoneAt = Date.now();
+          // A model-first card may not exist yet: then all of its calls (the
+          // replay of the early events included) land in the tail below.
+          turnPerf.markRunnerDone(cardKitProgress?.callDurationsMs, runnerDoneAt);
           // From here on the agent's work is done — a later failure must not
           // proactively re-run the whole turn (see agentRunCompleted doc).
           agentRunCompleted = true;
@@ -3866,7 +3883,7 @@ export class BridgeHandler {
           // WP-10: everything below reads or finalizes the surfaces — a
           // model-first turn waits for its lane (the card, and the early events
           // replayed into it) here, a /stop'd one included.
-          if (surfaceReady) await surfaceReady;
+          if (surfaceReady) await turnPerf.timed("surfaceWaitMs", surfaceReady);
 
           // COT bubble teardown is deferred to just after `success` is known
           // (search cotTurnOutcome below). It used to run here and had to guess
@@ -3919,7 +3936,8 @@ export class BridgeHandler {
             promptMode: currentIsNewThread || forceFreshSession || promptMode === "full" ? "full" : "delta",
             exitCode: result.exitCode,
             toolUseCount: toolUseTotalCount,
-            turnDurationMs: Date.now() - runnerStartedAt,
+            // Spawn → done: not the lane wait or the cleanup above.
+            turnDurationMs: runnerDoneAt - runnerStartedAt,
             // 批B Phase 1 A0 extension: only a pooled runner (src/codex/
             // pool.ts) ever sets these on `result`; every other runner leaves
             // them undefined, same as every perf sample recorded before this.
@@ -5053,7 +5071,7 @@ export class BridgeHandler {
           writeDonePerf();
           if (!perfRecorded) {
             perfRecorded = true;
-            void recordPerf(turnPerf.fill({
+            const errorSample: PerfSample = {
               botId, threadId, backend,
               spawnedAt: new Date(runnerStartedAt).toISOString(),
               promptChars: prompt.length,
@@ -5063,7 +5081,13 @@ export class BridgeHandler {
               toolUseCount: toolUseTotalCount,
               turnDurationMs: Date.now() - runnerStartedAt,
               runnerError: true,
-            }));
+            };
+            // WP-10: a model-first lane may still be opening the surfaces —
+            // fill the sample once it is done, so it carries their timings.
+            // Not awaited: the retry and the outer catch wait for the lane.
+            const writeErrorSample = (): void => void recordPerf(turnPerf.fill(errorSample));
+            if (surfaceReady) void surfaceReady.then(writeErrorSample);
+            else writeErrorSample();
           }
           // The watchdog interval is created BEFORE this try; the success path
           // clears it after handle.done, but this path used to leak it — worst

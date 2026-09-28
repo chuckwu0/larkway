@@ -831,6 +831,44 @@ describe("WP-10: every exit of a model-first turn waits for its card (no orphan 
     expect(captured).toHaveLength(2);
   });
 
+  it("a /stop while the retry waits for the card: the retry's runner is stopped as soon as it starts", async () => {
+    // Between the first attempt's failure and the retry's run() no runner is
+    // registered for /stop; that wait is now as long as the card create.
+    const log: string[] = [];
+    const gate = deferred();
+    const cardKit = recordingCardKit(log, { gate: gate.promise });
+    const { captured } = registerScript([{ end: "stale" }, { events: [answer(EARLY_ANSWER)] }], log);
+    const retryWaiting = deferred();
+    const stopEvent: LarkMessageEvent = { ...continuationEvent("/stop"), message_id: "om_test_stop" };
+    const { client, outcomes } = inboundClient(log, continuationEvent(), { after: retryWaiting.promise, event: stopEvent });
+    const { handler, events } = makeHandler({ log, client, cardKit, store: fakeSessionStore([existingSession()]) });
+    const stopLogs: string[] = [];
+    const consoleLog = vi.spyOn(console, "log").mockImplementation((...args: unknown[]) => {
+      if (String(args[0]).includes("/stop")) stopLogs.push(String(args[0]));
+    });
+    try {
+      const running = runAll(handler);
+      await vi.waitFor(
+        () => expect(events.some((e) => e.appendPath === "session 换血(ghost-purge)")).toBe(true),
+        CI_WAIT,
+      );
+      retryWaiting.resolve();
+      await vi.waitFor(() => expect(stopLogs).toHaveLength(1), CI_WAIT);
+      expect(captured).toHaveLength(1);
+      gate.resolve();
+      await running;
+    } finally {
+      consoleLog.mockRestore();
+    }
+
+    expect(stopLogs[0]).toContain("killing in-flight turn");
+    expect(captured).toHaveLength(2);
+    expect(log.indexOf("run:2")).toBeLessThan(log.indexOf("kill"));
+    expect(outcomes).toEqual([{ id: "om_test_reply", outcome: "handled" }]);
+    expectCardFinalized(log);
+    expect(cardKit.afterCreate.join("\n")).toContain("已按 /stop 停止本轮");
+  });
+
   it("a CardKit create that fails: the legacy card takes over and gets the early events, in order", async () => {
     const log: string[] = [];
     const gate = deferred();
@@ -1132,5 +1170,63 @@ describe("WP-10: what a model-first runner does not wait for", () => {
       expect(captured[0]?.prompt).toContain("guid_test_task");
       expect(claims.map((c) => c.taskGuid)).toEqual(["guid_test_task"]);
     });
+  });
+});
+
+describe("WP-10: the perf sample of a model-first turn", () => {
+  beforeEach(() => {
+    process.env["LARKWAY_MODEL_FIRST"] = "continuation";
+  });
+
+  /** One follow-up turn whose card create is held until `release` resolves. */
+  async function sampledTurn(script: TurnScript, release: (captured: RunOptions[], log: string[]) => Promise<void>) {
+    const log: string[] = [];
+    const gate = deferred();
+    const cardKit = recordingCardKit(log, { gate: gate.promise });
+    const { captured } = registerScript([script], log);
+    const { client } = inboundClient(log, continuationEvent());
+    const samples: PerfSample[] = [];
+    const { handler } = makeHandler({
+      log,
+      client,
+      cardKit,
+      store: fakeSessionStore([existingSession()]),
+      deps: {
+        recordPerfSample: async (sample) => {
+          log.push("perf:sample");
+          samples.push(sample);
+        },
+      },
+    });
+    const running = runAll(handler);
+    await release(captured, log);
+    gate.resolve();
+    await running;
+    await vi.waitFor(() => expect(samples).toHaveLength(1), CI_WAIT);
+    return { log, sample: samples[0]! };
+  }
+
+  it("the runner's duration leaves out the wait for the card, which is recorded on its own", async () => {
+    const { sample } = await sampledTurn({ events: [answer(EARLY_ANSWER)] }, async (captured) => {
+      await vi.waitFor(() => expect(captured).toHaveLength(1), CI_WAIT);
+      await sleep(40);
+    });
+    expect(sample.runnerError).toBeUndefined();
+    expect(sample.turnDurationMs).toBe(sample.runnerDoneAt! - Date.parse(sample.spawnedAt));
+    expect(sample.postRunner?.surfaceWaitMs).toBeGreaterThan(0);
+    // The tail splits into that wait and the rest.
+    expect(sample.finalizeStartAt! - sample.runnerDoneAt!).toBeGreaterThanOrEqual(sample.postRunner!.surfaceWaitMs!);
+  });
+
+  it("a runner that dies before the card exists: its sample is written once the card is, with the card's timings", async () => {
+    const { log, sample } = await sampledTurn({ end: "reject" }, async (captured) => {
+      await vi.waitFor(() => expect(captured).toHaveLength(1), CI_WAIT);
+      await sleep(20);
+    });
+    expect(log.indexOf("perf:sample")).toBeGreaterThan(log.indexOf("cardkit:create:end"));
+    expect(sample.runnerError).toBe(true);
+    expect(sample.preRunner?.modelFirst).toBe(true);
+    expect(sample.preRunner?.cardReplyMs).toBeGreaterThanOrEqual(0);
+    expect(sample.preRunner?.reactionRemoveMs).toBeGreaterThanOrEqual(0);
   });
 });

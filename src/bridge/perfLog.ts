@@ -60,7 +60,8 @@ export interface PreRunnerPerf {
   /**
    * WP-10: the turn ran model-first (LARKWAY_MODEL_FIRST). Its reaction, COT
    * and card timings above then ran alongside the runner, not in front of it
-   * (absent: they were awaited before it).
+   * (absent: they were awaited before it). Its tail (runnerDoneAt →
+   * finalizeEndAt) includes waiting for them: `postRunner.surfaceWaitMs`.
    */
   modelFirst?: boolean;
 }
@@ -79,6 +80,12 @@ export interface PostRunnerPerf {
    * since WP-8, and includes an in-process peer's wait for the final card.
    */
   handoffMs?: number;
+  /**
+   * WP-10: a model-first turn's wait, once its runner is done, for the reply
+   * surfaces still opening alongside it (the card, and the early events
+   * replayed into it). Absent when the surfaces were awaited before the runner.
+   */
+  surfaceWaitMs?: number;
 }
 
 export interface PerfSample {
@@ -162,8 +169,12 @@ type PerfTimelinePoint =
 type PreRunnerMsField = {
   [K in keyof PreRunnerPerf]-?: PreRunnerPerf[K] extends number | undefined ? K : never;
 }[keyof PreRunnerPerf];
-type PostRunnerMsField = "declareMs" | "handoffMs";
-const POST_RUNNER_MS_FIELDS: ReadonlySet<string> = new Set<PostRunnerMsField>(["declareMs", "handoffMs"]);
+type PostRunnerMsField = "declareMs" | "handoffMs" | "surfaceWaitMs";
+const POST_RUNNER_MS_FIELDS: ReadonlySet<string> = new Set<PostRunnerMsField>([
+  "declareMs",
+  "handoffMs",
+  "surfaceWaitMs",
+]);
 
 function nearestRankP50(values: readonly number[]): number {
   const sorted = [...values].sort((a, b) => a - b);
@@ -228,8 +239,8 @@ export class TurnPerfRecorder {
     }
   }
 
-  markRunnerDone(cardkitCallDurations?: readonly number[]): void {
-    this.mark("runnerDoneAt");
+  markRunnerDone(cardkitCallDurations?: readonly number[], at = Date.now()): void {
+    this.mark("runnerDoneAt", at);
     this.cardkitCallsAtRunnerDone = cardkitCallDurations?.length ?? 0;
   }
 

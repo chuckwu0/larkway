@@ -421,6 +421,10 @@ describe("handler latency bench (A1)", () => {
         expect(sample.preRunner?.rosterMs).toBeGreaterThanOrEqual(0);
       }
       expect(sample.preRunner?.modelFirst).toBe(goesModelFirst(s) ? true : undefined);
+      // Only a model-first tail waits for the surfaces; the runner's own
+      // duration never includes that wait.
+      expect(sample.postRunner?.surfaceWaitMs !== undefined).toBe(goesModelFirst(s));
+      expect(sample.turnDurationMs).toBe(sample.runnerDoneAt! - Date.parse(sample.spawnedAt));
       // A model-first runner waited on the root lookup only with a task-claim
       // hook (rootProbeMs is what remained of it once the local setup was done).
       if (goesModelFirst(s)) expect(sample.preRunner?.rootProbeMs !== undefined).toBe(s.taskClaim !== undefined);
