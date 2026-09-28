@@ -48,27 +48,32 @@
  *     bash call left behind (`npm run dev &`) is cleaned up by neither
  *     larkway nor pi, and outlives the warm process just as it outlives a
  *     cold one.
+ *   - RPC mode refreshes the model catalogs and provider availability in the
+ *     background at every process start; print mode never does. pi's
+ *     `PI_OFFLINE=1` turns that off for both paths.
  *   - About 130–150 MB RSS per idle process (n=1).
  *
  * Session single-writer rule: a pi session file must never be open in two
  * processes. A thread's replacement process (changed options, a different
  * session, a forced fresh start) and a cold fallback therefore wait until the
- * thread's retiring process has actually exited. On Windows that is when pi
- * closes its stdout, not the earlier 'exit' of cross-spawn's cmd.exe wrapper
- * (bounded by EXIT_WAIT_MS; not yet exercised on a Windows host).
+ * thread's retiring process has actually exited (bounded by EXIT_WAIT_MS).
+ * On Windows the child is cross-spawn's cmd.exe wrapper, which a signal
+ * would kill without reaching pi: retirement closes stdin instead and the
+ * backstop kills the whole tree (#destroyEntry). Not yet exercised on a
+ * Windows host.
  *
  * Crash/fallback scope (same contract as the claude pool): a turn that has
  * not pushed any event yet falls back transparently to a cold runPi(); a turn
  * that dies mid-stream rejects `done`, like the cold runner's own crash.
  */
 
-import type { ChildProcessByStdio } from "node:child_process";
+import type { ChildProcess, ChildProcessByStdio } from "node:child_process";
 import { existsSync } from "node:fs";
 import { mkdir, readFile, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 import type { Readable, Writable } from "node:stream";
 import { StringDecoder } from "node:string_decoder";
-import { spawnPiped } from "../platform/spawn.js";
+import { spawnPiped, spawnProcess } from "../platform/spawn.js";
 import type { AgentRunner, AgentStreamEvent, PerfMarkerName, RunHandle, RunOptions } from "../agent/runner.js";
 import { createPerfMarker, markPerfForEventType } from "../agent/runner.js";
 import { TurnEventQueue } from "../agent/turnEventQueue.js";
@@ -207,7 +212,7 @@ interface PoolEntry {
    * asked yet (a brand-new session).
    */
   sessionId: string | undefined;
-  /** The model the first get_state reported — re-applied when a later get_state shows it changed. */
+  /** With a per-bot `model` only: the model the first get_state reported, re-applied when a later get_state shows it changed. */
   pinnedModel: ModelRef | undefined;
   /** True once a `prompt` was written to this process. */
   hasRunTurn: boolean;
@@ -247,6 +252,26 @@ function pushCapped(chunks: Buffer[], chunk: Buffer): void {
 
 function stderrTail(chunks: Buffer[]): string {
   return Buffer.concat(chunks).toString("utf8").trim().slice(-2_000);
+}
+
+/**
+ * `taskkill /F /T` on a Windows child that is still running: ends it and
+ * every descendant, the method of pi's own killProcessTree (utils/shell.js).
+ * Skipped once the child has exited, since its pid may belong to another
+ * process by then.
+ */
+function killProcessTreeWin32(child: ChildProcess): void {
+  if (child.pid == null || child.exitCode !== null || child.signalCode !== null) return;
+  try {
+    const taskkill = spawnProcess(
+      path.win32.join(process.env["SystemRoot"] ?? "C:\\Windows", "System32", "taskkill.exe"),
+      ["/F", "/T", "/PID", String(child.pid)],
+      { stdio: "ignore", windowsHide: true },
+    );
+    taskkill.once("error", () => child.kill("SIGKILL"));
+  } catch {
+    child.kill("SIGKILL");
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -504,11 +529,13 @@ export class PiProcessPool implements AgentRunner {
       this.#settleReject(state, new Error(`[pi-pool] get_state failed: ${String(stateResponse["error"] ?? "no session id")}`));
       return;
     }
-    if (data?.["isStreaming"] === true) {
-      // A run larkway did not start (e.g. extension-triggered) is still
-      // going; a prompt now would be rejected or interleave. Retire and let
-      // #onEntryExit hand this not-yet-started turn to the cold runner.
-      this.#destroyEntry(entry, "process is busy with a run larkway did not start");
+    if (data?.["isStreaming"] === true || data?.["isCompacting"] === true) {
+      // A run or a compaction larkway did not start (e.g. extension-
+      // triggered) is still going; a prompt now would be rejected or
+      // interleave. Retire and let #onEntryExit hand this not-yet-started
+      // turn to the cold runner.
+      const busyWith = data?.["isStreaming"] === true ? "a run" : "a compaction";
+      this.#destroyEntry(entry, `process is busy with ${busyWith} larkway did not start`);
       return;
     }
     if (state.opts.resumeSessionId != null && sessionId !== state.opts.resumeSessionId) {
@@ -524,9 +551,11 @@ export class PiProcessPool implements AgentRunner {
     // Re-apply the per-bot model and thinking level on every turn. The CLI
     // flags set both at spawn; this keeps them if anything in the process
     // changed them since. set_model is only sent on an actual change —
-    // pi appends a model_change entry to the session on every call.
+    // pi appends a model_change entry to the session on every call. Without
+    // a per-bot model nothing is pinned: a cold `--session-id` start without
+    // `--model` also continues on the session's last model.
     const model = modelRefOf(data?.["model"]);
-    entry.pinnedModel ??= model;
+    if (state.opts.model) entry.pinnedModel ??= model;
     const pinned = entry.pinnedModel;
     if (pinned && (model?.provider !== pinned.provider || model.id !== pinned.id)) {
       const r = await this.#command(entry, { type: "set_model", provider: pinned.provider, modelId: pinned.id });
@@ -547,11 +576,17 @@ export class PiProcessPool implements AgentRunner {
       if (response["success"] === true && entry.current === state) state.promptAccepted = true;
     });
     if (promptResponse != null && promptResponse["success"] !== true && this.#stillOwns(entry, state)) {
+      if (state.killRequested) {
+        // Killed while pi still held the prompt back: a stopped turn, as the
+        // cold runner's kill() reports it, whatever pi then said about it.
+        this.#settleResolve(state, 1);
+        return;
+      }
       const error = String(promptResponse["error"] ?? "unknown error");
-      if (/already processing/i.test(error)) {
-        // A run larkway did not start began after get_state: retire and run
-        // this turn cold, as in the isStreaming case above.
-        this.#destroyEntry(entry, "process started a run larkway did not start");
+      if (/already processing|compaction is in progress/i.test(error)) {
+        // A run or a compaction larkway did not start began after get_state:
+        // retire and run this turn cold, as in the isStreaming case above.
+        this.#destroyEntry(entry, "process started a run or compaction larkway did not start");
         return;
       }
       this.#settleReject(state, new Error(`pi rejected the prompt: ${error}`));
@@ -635,6 +670,10 @@ export class PiProcessPool implements AgentRunner {
     const threadId = state.entry?.threadId ?? state.opts.threadId;
     const start = (): void => {
       if (state.settled || state.coldHandle) return;
+      // Only run()'s synchronous capacity fallback hands this child's pid to
+      // the bridge. Here the handle already went out with the warm pid, or
+      // none, and RunHandle cannot announce a later one (the claude pool's
+      // async fallback has the same gap).
       const cold = runPi(state.opts);
       state.coldHandle = cold;
       void (async () => {
@@ -791,11 +830,10 @@ export class PiProcessPool implements AgentRunner {
         this.#onEntryExit(entry, err);
         return;
       }
-      // Windows: for a process we retired, this 'exit' is cross-spawn's
-      // cmd.exe wrapper, killed at once, while pi itself is still shutting
-      // down on its stdin EOF and holds stdout (and the session file) until
-      // it is gone. The single-writer waits key off #onEntryExit, so wait for
-      // stdout for as long as those waits are bounded anyway.
+      // Windows: this 'exit' is cross-spawn's cmd.exe wrapper. A process we
+      // retired counts as gone once the wrapper exited and stdout closed,
+      // whichever comes last: the single-writer waits key off #onEntryExit,
+      // so wait for stdout for as long as those waits are bounded anyway.
       const graceMs = process.platform === "win32" && entry.destroyed ? EXIT_WAIT_MS : EXIT_DRAIN_GRACE_MS;
       const grace = new Promise<void>((resolve) => {
         const t = setTimeout(resolve, graceMs);
@@ -920,9 +958,10 @@ export class PiProcessPool implements AgentRunner {
   }
 
   /**
-   * Retire an entry: unusable at once, killed SIGTERM → grace → SIGKILL. pi's
-   * SIGTERM handler kills the shells of bash calls still executing before
-   * exiting (not what finished calls left running in the background).
+   * Retire an entry: unusable at once, killed SIGTERM → grace → SIGKILL
+   * (Windows: stdin EOF → grace → tree kill). pi's SIGTERM handler kills the
+   * shells of bash calls still executing before exiting (not what finished
+   * calls left running in the background).
    * Never settles `entry.current` itself — #onEntryExit does, on the real exit.
    */
   #destroyEntry(entry: PoolEntry, reason: string): void {
@@ -933,13 +972,18 @@ export class PiProcessPool implements AgentRunner {
     this.#dying.add(entry);
     console.warn(`[pi-pool] tearing down warm process pid=${entry.child.pid ?? "?"} (key=${entry.key}): ${reason}`);
     const child = entry.child;
-    // Windows: the child is cross-spawn's cmd.exe wrapper around the pi shim,
-    // and killing it leaves pi itself running. Closing stdin reaches pi
-    // through the wrapper and makes it shut down on its own.
-    if (process.platform === "win32") child.stdin.end();
-    child.kill("SIGTERM");
+    // Windows: the child is cross-spawn's cmd.exe wrapper around the pi shim.
+    // A signal would terminate only the wrapper, leaving pi running with
+    // nothing left to escalate against. Closing stdin reaches pi through the
+    // wrapper and pi shuts down on its own; the wrapper (`cmd /c`) lives
+    // exactly as long as pi, so the backstop can still kill the whole tree.
+    const win32 = process.platform === "win32";
+    if (win32) child.stdin.end();
+    else child.kill("SIGTERM");
     const killTimer = setTimeout(() => {
-      if (!entry.exitHandled) child.kill("SIGKILL");
+      if (entry.exitHandled) return;
+      if (win32) killProcessTreeWin32(child);
+      else child.kill("SIGKILL");
     }, SIGKILL_GRACE_MS);
     killTimer.unref?.();
   }

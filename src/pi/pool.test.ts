@@ -29,6 +29,10 @@ type FakeChild = EventEmitter & {
   stdout: PassThrough;
   stderr: PassThrough;
   pid: number;
+  bin: string;
+  /** Set before 'exit' is emitted, as node's ChildProcess does. */
+  exitCode: number | null;
+  signalCode: string | null;
   killed: boolean;
   killSignals: string[];
   kill: (sig?: string) => void;
@@ -42,6 +46,7 @@ type FakeChild = EventEmitter & {
   model: { provider: string; id: string } | undefined;
   thinkingLevel: string;
   isStreaming: boolean;
+  isCompacting: boolean;
   running: boolean;
   exitOnSigterm: boolean;
   ignoreAbort: boolean;
@@ -91,6 +96,9 @@ function makeFakeChild(args: string[]): FakeChild {
   c.stdout = new PassThrough();
   c.stderr = new PassThrough();
   c.pid = nextPid++;
+  c.bin = "pi";
+  c.exitCode = null;
+  c.signalCode = null;
   c.killed = false;
   c.killSignals = [];
   c.args = args;
@@ -101,6 +109,7 @@ function makeFakeChild(args: string[]): FakeChild {
   c.model = modelArg ? { provider: modelArg.split("/")[0]!, id: modelArg.split("/")[1] ?? modelArg } : undefined;
   c.thinkingLevel = argValue(args, "--thinking") ?? "medium";
   c.isStreaming = false;
+  c.isCompacting = false;
   c.running = false;
   c.exitOnSigterm = true;
   c.ignoreAbort = false;
@@ -113,6 +122,8 @@ function makeFakeChild(args: string[]): FakeChild {
   c.exit = (code, signal = null) => {
     if (c.exited) return;
     c.exited = true;
+    c.exitCode = code;
+    c.signalCode = signal;
     c.emit("exit", code, signal);
     c.stdout.end();
     c.emit("close", code, signal);
@@ -133,7 +144,7 @@ function makeFakeChild(args: string[]): FakeChild {
           c.heldGetState = cmd;
           return;
         }
-        return respond(cmd, { sessionId: c.sessionId, model: c.model, thinkingLevel: c.thinkingLevel, isStreaming: c.isStreaming || c.running, messageCount: 0 });
+        return respond(cmd, { sessionId: c.sessionId, model: c.model, thinkingLevel: c.thinkingLevel, isStreaming: c.isStreaming || c.running, isCompacting: c.isCompacting, messageCount: 0 });
       case "set_thinking_level":
         c.thinkingLevel = String(cmd["level"]);
         return respond(cmd);
@@ -142,6 +153,10 @@ function makeFakeChild(args: string[]): FakeChild {
         return respond(cmd, c.model);
       case "prompt":
         c.onPromptReceived?.(c);
+        if (c.isCompacting) {
+          c.send({ id: cmd.id, type: "response", command: "prompt", success: false, error: "Cannot submit a prompt while compaction is in progress. Wait for compaction to finish and retry." });
+          return;
+        }
         if (c.running) {
           c.send({ id: cmd.id, type: "response", command: "prompt", success: false, error: "Agent is already processing. Specify streamingBehavior ('steer' or 'followUp') to queue the message." });
           return;
@@ -194,9 +209,15 @@ vi.mock("node:child_process", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:child_process")>();
   return {
     ...actual,
-    spawn: (_bin: string, args: string[]) => {
+    spawn: (bin: string, args: string[]) => {
       const c = makeFakeChild(args);
+      c.bin = bin;
       spawned.push(c);
+      // `taskkill /F /T /PID <pid>` ends that child's whole tree.
+      if (bin.endsWith("taskkill.exe")) {
+        const target = spawned.find((s) => s.pid === Number(args[3]));
+        if (target) setImmediate(() => target.exit(1));
+      }
       return c;
     },
   };
@@ -230,6 +251,7 @@ const answerText = (events: AgentStreamEvent[]): string =>
 
 const rpcChildren = (): FakeChild[] => spawned.filter((c) => c.args.includes("rpc"));
 const coldChildren = (): FakeChild[] => spawned.filter((c) => c.args[0] === "-p");
+const taskkills = (): FakeChild[] => spawned.filter((c) => c.bin.endsWith("taskkill.exe"));
 const cmdTypes = (c: FakeChild): string[] => c.commands.map((cmd) => cmd.type);
 
 const BASE = { cwd: "/ws", pidFilePath: null, model: "prov/m1", effort: "high" } as const;
@@ -338,6 +360,21 @@ describe("PiProcessPool turns", () => {
     await runTurn(pool, { ...opts, prompt: "two", resumeSessionId: first.result.sessionId });
     expect(cmdTypes(child).slice(2)).toEqual(["get_state", "set_model", "prompt"]);
     expect(child.commands[3]).toMatchObject({ type: "set_model", provider: "prov", modelId: "m1" });
+  });
+
+  it("without a per-bot model, a model changed inside the session is kept, as a cold --session-id start without --model keeps it", async () => {
+    const pool = newPool();
+    setupChild = (c) => {
+      c.model = { provider: "prov", id: "default" }; // pi's own pick at startup
+    };
+    const opts = { cwd: "/ws", pidFilePath: null, threadId: "t1" } as const;
+    const first = await runTurn(pool, { ...opts, prompt: "one" });
+    const child = rpcChildren()[0]!;
+
+    child.model = { provider: "other", id: "m9" }; // e.g. an extension command's setModel
+    await runTurn(pool, { ...opts, prompt: "two", resumeSessionId: first.result.sessionId });
+    expect(cmdTypes(child)).toEqual(["get_state", "prompt", "get_state", "prompt"]);
+    expect(child.model).toEqual({ provider: "other", id: "m9" });
   });
 
   it("extension dialogs are answered cancelled, fire-and-forget UI requests get no reply, and neither becomes a turn event", async () => {
@@ -527,6 +564,22 @@ describe("PiProcessPool kill", () => {
     expect(answerText(second.events)).toBe(ANSWER);
     expect(second.result).toMatchObject({ exitCode: 0, sessionId: "sess-new-2", pooled: true });
   });
+
+  it("a kill that lands while pi still holds the prompt back resolves killed even when pi then refuses the prompt", async () => {
+    const pool = newPool();
+    let handle!: RunHandle;
+    setupChild = (c) => {
+      c.promptError = "No API key found for prov";
+      c.onPromptReceived = () => handle.kill(); // /stop or the idle watchdog, racing pi's preflight
+    };
+    handle = pool.run({ ...BASE, prompt: "p", threadId: "t1" });
+    void collect(handle);
+    await expect(handle.done).resolves.toMatchObject({ exitCode: 1, pooled: true });
+    const child = rpcChildren()[0]!;
+    await waitFor(() => cmdTypes(child).includes("abort"));
+    expect(cmdTypes(child)).toEqual(["get_state", "set_thinking_level", "prompt", "abort"]);
+    expect(child.killSignals).toEqual([]);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -584,6 +637,33 @@ describe("PiProcessPool cold fallback", () => {
     expect(cmdTypes(rpcChildren()[0]!)).toEqual(["get_state"]);
     expect(coldChildren()).toHaveLength(1);
     expect(result).toMatchObject({ exitCode: 0, pooled: false });
+  });
+
+  it("a process compacting its session (a compaction larkway did not start) is retired and the turn runs cold", async () => {
+    const pool = newPool();
+    setupChild = (c) => {
+      if (c.args.includes("rpc")) c.isCompacting = true;
+    };
+    const { result } = await runTurn(pool, { ...BASE, prompt: "p", threadId: "t1", resumeSessionId: "s-9" });
+    expect(rpcChildren()[0]!.killSignals).toEqual(["SIGTERM"]);
+    expect(cmdTypes(rpcChildren()[0]!)).toEqual(["get_state"]);
+    expect(coldChildren()).toHaveLength(1);
+    expect(result).toMatchObject({ exitCode: 0, sessionId: "s-9", pooled: false, resumeMode: "cold" });
+  });
+
+  it("a prompt pi refuses because a compaction began after get_state retires the process and runs cold", async () => {
+    const pool = newPool();
+    setupChild = (c) => {
+      if (c.args.includes("rpc")) {
+        c.onPromptReceived = (child) => {
+          child.isCompacting = true;
+        };
+      }
+    };
+    const { result } = await runTurn(pool, { ...BASE, prompt: "p", threadId: "t1", resumeSessionId: "s-9" });
+    expect(rpcChildren()[0]!.killSignals).toEqual(["SIGTERM"]);
+    expect(coldChildren()).toHaveLength(1);
+    expect(result).toMatchObject({ exitCode: 0, sessionId: "s-9", pooled: false, resumeMode: "cold" });
   });
 
   it("a prompt pi rejects as already processing (a run larkway did not start began after get_state) retires the process and runs cold", async () => {
@@ -647,12 +727,11 @@ describe("PiProcessPool retirement", () => {
     expect(result).toMatchObject({ exitCode: 0, sessionId: "sess-new-1", pooled: true, resumeMode: "cold" });
   });
 
-  it("win32: a retired process counts as gone when pi closes its stdout, not at the cmd.exe wrapper's exit", async () => {
+  it("win32: retirement closes stdin without signalling the cmd.exe wrapper; the process counts as gone once the wrapper exited and stdout closed", async () => {
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval"] });
     const pool = newPool();
     const first = await runTurn(pool, { ...BASE, prompt: "one", threadId: "t1" });
     const old = rpcChildren()[0]!;
-    old.exitOnSigterm = false;
 
     const platform = Object.getOwnPropertyDescriptor(process, "platform")!;
     let handle: RunHandle;
@@ -660,20 +739,55 @@ describe("PiProcessPool retirement", () => {
     try {
       handle = pool.run({ ...BASE, effort: "low", prompt: "two", threadId: "t1", resumeSessionId: first.result.sessionId });
       expect(old.stdin.writableEnded).toBe(true); // stdin EOF is what reaches pi through the wrapper
-      old.emit("exit", 1, null); // the wrapper is gone; pi itself still holds stdout
+      expect(old.killSignals).toEqual([]); // killing the wrapper would orphan pi
+      old.exitCode = 1;
+      old.emit("exit", 1, null); // the wrapper is gone; something still holds pi's stdout
     } finally {
       Object.defineProperty(process, "platform", platform);
     }
     const eventsP = collect(handle);
     await vi.advanceTimersByTimeAsync(2_500);
     expect(rpcChildren()).toHaveLength(1); // no second writer on the session yet
+    await vi.advanceTimersByTimeAsync(3_000);
+    expect(taskkills()).toHaveLength(0); // the wrapper's pid may already be another process's
 
-    old.stdout.end(); // pi exited
+    old.stdout.end();
     const result = await handle.done;
     await eventsP;
     expect(rpcChildren()).toHaveLength(2);
     expect(argValue(rpcChildren()[1]!.args, "--session-id")).toBe("sess-new-1");
     expect(result).toMatchObject({ exitCode: 0, sessionId: "sess-new-1", pooled: true });
+    expect(old.killSignals).toEqual([]);
+  });
+
+  it("win32: a pi that does not exit on stdin EOF within the grace window is tree-killed through the live wrapper before the replacement starts", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval"] });
+    const pool = newPool();
+    const first = await runTurn(pool, { ...BASE, prompt: "one", threadId: "t1" });
+    const old = rpcChildren()[0]!; // never exits on its own: e.g. a session_shutdown handler hangs
+
+    const platform = Object.getOwnPropertyDescriptor(process, "platform")!;
+    Object.defineProperty(process, "platform", { ...platform, value: "win32" });
+    try {
+      const handle = pool.run({ ...BASE, effort: "low", prompt: "two", threadId: "t1", resumeSessionId: first.result.sessionId });
+      const eventsP = collect(handle);
+      expect(old.stdin.writableEnded).toBe(true);
+      await vi.advanceTimersByTimeAsync(4_900);
+      expect(taskkills()).toHaveLength(0);
+      expect(rpcChildren()).toHaveLength(1);
+
+      await vi.advanceTimersByTimeAsync(100);
+      expect(taskkills().map((c) => c.args)).toEqual([["/F", "/T", "/PID", String(old.pid)]]);
+      expect(taskkills()[0]!.bin).toMatch(/[\\/]System32[\\/]taskkill\.exe$/);
+      const result = await handle.done;
+      await eventsP;
+      expect(old.killSignals).toEqual([]);
+      expect(rpcChildren()).toHaveLength(2);
+      expect(argValue(rpcChildren()[1]!.args, "--session-id")).toBe("sess-new-1");
+      expect(result).toMatchObject({ exitCode: 0, sessionId: "sess-new-1", pooled: true });
+    } finally {
+      Object.defineProperty(process, "platform", platform);
+    }
   });
 
   it("forceFreshSession (reseed) retires a used process and starts a new session without --session-id", async () => {
