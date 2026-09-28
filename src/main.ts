@@ -975,9 +975,12 @@ async function runV2Mode({
       runnerKey = `pi-pool:${bot.id}`;
       registerRunner(runnerKey, () => piPool!);
       // Before WP-9 a pi `warmProcess: true` was a warned no-op; it now turns
-      // the pool on. Say so at boot, so a flag left over from an earlier
-      // backend shows up in the log.
-      console.log(`[larkway] bot "${bot.id}": pi warm process pool ON (warmProcess: true in its yaml)`);
+      // the pool on. Warn at boot, so a flag left over from an earlier backend
+      // shows up among the warnings rather than the routine boot lines.
+      console.warn(
+        `[larkway] bot "${bot.id}": pi warm process pool ON (warmProcess: true in its yaml; ` +
+          "earlier versions ignored this key for pi — remove it to keep cold starts)",
+      );
     }
 
     const handler = new BridgeHandler({

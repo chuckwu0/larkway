@@ -10,8 +10,9 @@
  *
  * Bounded by event count and approximate size. Past a limit the oldest event
  * the policy marks evictable goes first (reasoning text), then the oldest of
- * any kind; the newest event is always kept. Pure scheduling — no Feishu
- * calls, no interpretation of event contents.
+ * any kind; the newest event is always kept. A tool call and its result leave
+ * together, since the consumer pairs them by arrival order. Pure scheduling —
+ * no Feishu calls, no interpretation of event contents.
  *
  * WP-10 reuses it in front of the answer card of a model-first turn
  * ({@link BufferedSurface}): there the answer text must survive the limits,
@@ -45,9 +46,20 @@ export interface BufferedSinkOptions<E> {
    * together.
    */
   coalesce?: (earlier: E, later: E) => E | undefined;
+  /**
+   * Opening / closing half of a pair the consumer matches by arrival order,
+   * without ids (a tool call and its result: the n-th result goes with the
+   * oldest call still open). A pair is evicted as a unit — an opener takes its
+   * closer along, or, when the closer has not arrived yet, that closer is
+   * dropped on arrival (also after attach) — so every replayed closer still
+   * meets its own opener. Paired events are never coalesced.
+   */
+  pairRole?: (event: E) => "open" | "close" | undefined;
   maxEvents?: number;
   maxBytes?: number;
 }
+
+type Entry<E> = { event: E; size: number; partner?: Entry<E> };
 
 export const BUFFERED_SINK_MAX_EVENTS = 200;
 export const BUFFERED_SINK_MAX_BYTES = 64 * 1024;
@@ -57,9 +69,13 @@ export class BufferedSink<E> implements EventSink<E> {
   private readonly maxEvents: number;
   private readonly maxBytes: number;
   private target: EventSink<E> | undefined;
-  private buffer: Array<{ event: E; size: number }> = [];
+  private buffer: Array<Entry<E>> = [];
   private bytes = 0;
   private droppedCount = 0;
+  /** Buffered openers whose closer has not arrived, oldest first. */
+  private openOpeners: Array<Entry<E>> = [];
+  /** Closers still to come whose opener was evicted: dropped on arrival. */
+  private orphanClosers = 0;
 
   constructor(opts: BufferedSinkOptions<E>) {
     this.opts = opts;
@@ -67,7 +83,7 @@ export class BufferedSink<E> implements EventSink<E> {
     this.maxBytes = opts.maxBytes ?? BUFFERED_SINK_MAX_BYTES;
   }
 
-  /** Events evicted (or refused by `accept`) while buffering. */
+  /** Events evicted (or refused by `accept`) while buffering, plus closers of evicted openers. */
   get dropped(): number {
     return this.droppedCount;
   }
@@ -78,6 +94,12 @@ export class BufferedSink<E> implements EventSink<E> {
   }
 
   handle(event: E): void {
+    const role = this.opts.pairRole?.(event);
+    if (role === "close" && this.orphanClosers > 0) {
+      this.orphanClosers -= 1;
+      this.droppedCount += 1;
+      return;
+    }
     if (this.target) {
       this.target.handle(event);
       return;
@@ -86,27 +108,53 @@ export class BufferedSink<E> implements EventSink<E> {
       this.droppedCount += 1;
       return;
     }
-    const size = Math.max(0, this.opts.sizeOf(event));
-    this.buffer.push({ event, size });
-    this.bytes += size;
+    const entry: Entry<E> = { event, size: Math.max(0, this.opts.sizeOf(event)) };
+    if (role === "open") this.openOpeners.push(entry);
+    if (role === "close") {
+      const opener = this.openOpeners.shift();
+      if (opener) {
+        opener.partner = entry;
+        entry.partner = opener;
+      }
+    }
+    this.buffer.push(entry);
+    this.bytes += entry.size;
     this.coalesceAt(this.buffer.length - 1);
     while (
       this.buffer.length > 1 &&
       (this.buffer.length > this.maxEvents || this.bytes > this.maxBytes)
     ) {
-      // Never the newest entry (index length-1): it is kept even when it
-      // alone exceeds maxBytes.
-      const evictable = (b: { event: E }, i: number): boolean =>
-        i < this.buffer.length - 1 && !this.opts.keep?.(b.event);
+      // Never the newest entry (index length-1), nor the other half of its
+      // pair: it is kept even when it alone exceeds maxBytes.
+      const newest = this.buffer[this.buffer.length - 1];
+      const evictable = (b: Entry<E>, i: number): boolean =>
+        i < this.buffer.length - 1 && !this.opts.keep?.(b.event) && b.partner !== newest;
       const preferred = this.opts.evictFirst
         ? this.buffer.findIndex((b, i) => evictable(b, i) && this.opts.evictFirst!(b.event))
         : -1;
       const index = preferred >= 0 ? preferred : this.buffer.findIndex(evictable);
       if (index < 0) break; // only kept events left, already coalesced
-      const [evicted] = this.buffer.splice(index, 1);
-      this.bytes -= evicted!.size;
+      this.evict(index);
+    }
+  }
+
+  /** Remove buffer[index] and, for one half of a pair, the other half with it. */
+  private evict(index: number): void {
+    const entry = this.buffer[index]!;
+    const partner = entry.partner;
+    const opener = this.openOpeners.indexOf(entry);
+    if (opener >= 0) {
+      // Its closer is still to come; the consumer must not see it either.
+      this.openOpeners.splice(opener, 1);
+      this.orphanClosers += 1;
+    }
+    const partnerIndex = partner ? this.buffer.indexOf(partner) : -1;
+    // The later index first, so the earlier one stays valid.
+    for (const i of [index, partnerIndex].filter((i) => i >= 0).sort((a, b) => b - a)) {
+      const [removed] = this.buffer.splice(i, 1);
+      this.bytes -= removed!.size;
       this.droppedCount += 1;
-      if (index > 0 && index < this.buffer.length) this.coalesceAt(index);
+      if (i > 0 && i < this.buffer.length) this.coalesceAt(i);
     }
   }
 
@@ -114,6 +162,7 @@ export class BufferedSink<E> implements EventSink<E> {
   private coalesceAt(index: number): void {
     if (!this.opts.coalesce || index < 1) return;
     const earlier = this.buffer[index - 1]!;
+    if (this.opts.pairRole?.(earlier.event) || this.opts.pairRole?.(this.buffer[index]!.event)) return;
     const merged = this.opts.coalesce(earlier.event, this.buffer[index]!.event);
     if (merged === undefined) return;
     const size = Math.max(0, this.opts.sizeOf(merged));
@@ -128,6 +177,7 @@ export class BufferedSink<E> implements EventSink<E> {
     const pending = this.buffer;
     this.buffer = [];
     this.bytes = 0;
+    this.openOpeners = []; // orphanClosers stays: those closers are still to come
     for (const { event } of pending) target.handle(event);
   }
 }
@@ -146,7 +196,8 @@ function jsonLength(value: unknown, fallback: number): number {
  * + tool activity, see cotProgress.ts) are kept; answer text never reaches the
  * bubble and goes to the card, not through here. Reasoning text is evicted
  * before tool events, which the bubble pairs start↔result in arrival order
- * (no ids), so a tool event is only evicted once no reasoning is left.
+ * (no ids), so a tool event is only evicted once no reasoning is left, and
+ * then a call together with its result.
  *
  * An event's size is what the bubble renders from it, clipped as cotProgress
  * clips it — not its raw payload. Otherwise one large tool output (a Read of a
@@ -160,7 +211,15 @@ export function createCotEventBuffer(): BufferedSink<AgentStreamEvent> {
     accept: isCotEvent,
     sizeOf: cotRenderedSize,
     evictFirst: isReasoningEvent,
+    pairRole: toolPairRole,
   });
+}
+
+/** tool_use / tool_result: paired by arrival order in the bubble and the in-card panel. */
+function toolPairRole(ev: AgentStreamEvent): "open" | "close" | undefined {
+  if (ev.type === "tool_use") return "open";
+  if (ev.type === "tool_result") return "close";
+  return undefined;
 }
 
 function isReasoningEvent(ev: AgentStreamEvent): boolean {
@@ -197,7 +256,8 @@ function cotRenderedSize(ev: AgentStreamEvent): number {
  * are never evicted: an adjacent pair folds into one (delta + delta or
  * snapshot + delta → the concatenated text; anything + snapshot → the
  * snapshot, which replaces it anyway), so the replayed answer is the one the
- * runner streamed. Past a limit reasoning goes first, then tool events.
+ * runner streamed. Past a limit reasoning goes first, then tool events (a call
+ * with its result, which the COT-in-card panel pairs by arrival order).
  */
 export function createSurfaceEventBuffer(): BufferedSink<AgentStreamEvent> {
   return new BufferedSink<AgentStreamEvent>({
@@ -206,6 +266,7 @@ export function createSurfaceEventBuffer(): BufferedSink<AgentStreamEvent> {
       ev.type === "answer_delta" || ev.type === "answer_snapshot" ? ev.text.length : cotRenderedSize(ev),
     evictFirst: isReasoningEvent,
     keep: isAnswerEvent,
+    pairRole: toolPairRole,
     coalesce: (earlier, later) => {
       if (later.type === "answer_snapshot" && isAnswerEvent(earlier)) return later;
       if (later.type === "answer_delta") {

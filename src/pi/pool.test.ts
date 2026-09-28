@@ -263,7 +263,14 @@ function newPool(opts: Partial<ConstructorParameters<typeof PiProcessPool>[0]> =
   return pool;
 }
 
+// The fake child is a POSIX pi: it exits on a signal, never on stdin EOF. On
+// win32 the pool retires a process by closing stdin (see #destroyEntry), so
+// every runner — windows-latest CI included — runs these cases as linux; the
+// two win32 cases switch the platform themselves.
+const realPlatform = Object.getOwnPropertyDescriptor(process, "platform")!;
+
 beforeEach(() => {
+  Object.defineProperty(process, "platform", { ...realPlatform, value: "linux" });
   nextSession = 1;
   vi.spyOn(console, "warn").mockImplementation(() => {});
 });
@@ -275,6 +282,7 @@ afterEach(async () => {
   spawned = [];
   setupChild = () => {};
   vi.restoreAllMocks();
+  Object.defineProperty(process, "platform", realPlatform);
 });
 
 // ---------------------------------------------------------------------------
@@ -289,7 +297,8 @@ describe("buildPiRpcCommand", () => {
       () => true,
     );
     expect(bin).toBe("pi");
-    expect(args).toEqual(["--mode", "rpc", "--approve", "--session-id", "s1", "--model", "prov/m1", "--thinking", "high", "--skill", "/ws/repos/a/.agents/skills"]);
+    // Joined with node:path: `\ws\repos\a\.agents\skills` on Windows.
+    expect(args).toEqual(["--mode", "rpc", "--approve", "--session-id", "s1", "--model", "prov/m1", "--thinking", "high", "--skill", path.join("/ws/repos/a", ".agents", "skills")]);
     expect(args).not.toContain("--offline");
   });
 });

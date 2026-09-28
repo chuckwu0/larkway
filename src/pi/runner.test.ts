@@ -9,6 +9,7 @@
  */
 
 import { describe, it, expect, afterEach, vi } from "vitest";
+import { join } from "node:path";
 import { EventEmitter, PassThrough } from "node:stream";
 import { AnswerChannelExtractor } from "../agent/answerChannel.js";
 import {
@@ -142,13 +143,16 @@ describe("buildPiCommand", () => {
   });
 
   it("addDirs become --skill <dir>/.agents/skills only where that directory exists", () => {
+    // buildPiCommand joins with node:path, so the skill dir uses the native
+    // separator (`\ws\repos\a\.agents\skills` on Windows).
+    const repoA = join("/ws/repos/a");
     const [, args] = buildPiCommand(
       { prompt: "x", addDirs: ["/ws/repos/a", "/ws/repos/b"] },
       "pi",
-      (dir) => dir.startsWith("/ws/repos/a"),
+      (dir) => dir.startsWith(repoA),
     );
     expect(args.filter((a) => a === "--skill")).toHaveLength(1);
-    expect(args[args.indexOf("--skill") + 1]).toBe("/ws/repos/a/.agents/skills");
+    expect(args[args.indexOf("--skill") + 1]).toBe(join(repoA, ".agents", "skills"));
   });
 
   it("agentBinPath overrides the binary", () => {
@@ -281,7 +285,7 @@ describe("buildPiConfigArgs", () => {
   it("is the per-bot tail of buildPiCommand — model, thinking, skills — without mode or session", () => {
     const opts = { prompt: "x", resumeSessionId: "s1", model: "prov/m1", effort: "low", addDirs: ["/ws/repos/a"] };
     const config = buildPiConfigArgs(opts, () => true);
-    expect(config).toEqual(["--model", "prov/m1", "--thinking", "low", "--skill", "/ws/repos/a/.agents/skills"]);
+    expect(config).toEqual(["--model", "prov/m1", "--thinking", "low", "--skill", join("/ws/repos/a", ".agents", "skills")]);
     const [, full] = buildPiCommand(opts, "pi", () => true);
     expect(full).toEqual(["-p", "--mode", "json", "--approve", "--session-id", "s1", ...config]);
   });

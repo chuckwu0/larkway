@@ -107,6 +107,90 @@ describe("BufferedSink (WP-2 (c))", () => {
   });
 });
 
+describe("BufferedSink pairs (tool call ↔ result, matched by arrival order)", () => {
+  type Step = { kind: "call" | "result" | "reason"; n: number; size?: number };
+  const pairSink = (opts: { maxEvents?: number; maxBytes?: number }) =>
+    new BufferedSink<Step>({
+      accept: () => true,
+      sizeOf: (e) => e.size ?? 1,
+      evictFirst: (e) => e.kind === "reason",
+      pairRole: (e) => (e.kind === "call" ? "open" : e.kind === "result" ? "close" : undefined),
+      ...opts,
+    });
+  /** Pairs results with calls the way the bubble does: FIFO, no ids. */
+  function fifoConsumer(): EventSink<Step> & { seen: number[]; pairs: Array<[number, number]> } {
+    const open: number[] = [];
+    const seen: number[] = [];
+    const pairs: Array<[number, number]> = [];
+    return {
+      seen,
+      pairs,
+      handle: (e) => {
+        seen.push(e.n);
+        if (e.kind === "call") open.push(e.n);
+        if (e.kind === "result") pairs.push([open.shift() ?? -1, e.n]);
+      },
+    };
+  }
+
+  it("evicts a call together with its result, so every replayed result still meets its own call", () => {
+    const s = pairSink({ maxEvents: 4 });
+    // Three parallel calls, then their results in order.
+    for (const n of [1, 2, 3]) s.handle({ kind: "call", n });
+    for (const n of [1, 2, 3]) s.handle({ kind: "result", n });
+    const target = fifoConsumer();
+    s.attach(target);
+    expect(target.seen).toEqual([2, 3, 2, 3]);
+    expect(target.pairs).toEqual([
+      [2, 2],
+      [3, 3],
+    ]);
+    expect(s.dropped).toBe(2);
+  });
+
+  it("a call evicted before its result arrived: that result is dropped on arrival, also after attach", () => {
+    const s = pairSink({ maxEvents: 2 });
+    s.handle({ kind: "call", n: 1 });
+    s.handle({ kind: "call", n: 2 });
+    s.handle({ kind: "call", n: 3 }); // over → call 1 goes; its result is owed
+    s.handle({ kind: "result", n: 1 }); // dropped
+    s.handle({ kind: "result", n: 2 }); // over → call 3 goes (call 2's pair holds the newest)
+    const target = fifoConsumer();
+    s.attach(target);
+    s.handle({ kind: "result", n: 3 }); // dropped, though attached
+    s.handle({ kind: "call", n: 4 });
+    s.handle({ kind: "result", n: 4 });
+    expect(target.seen).toEqual([2, 2, 4, 4]);
+    expect(target.pairs).toEqual([
+      [2, 2],
+      [4, 4],
+    ]);
+  });
+
+  it("keeps the newest event's pair whole even over the byte limit", () => {
+    const s = pairSink({ maxBytes: 10 });
+    s.handle({ kind: "call", n: 1, size: 1 });
+    s.handle({ kind: "result", n: 1, size: 50 });
+    const target = fifoConsumer();
+    s.attach(target);
+    expect(target.pairs).toEqual([[1, 1]]);
+    expect(s.dropped).toBe(0);
+  });
+
+  it("still evicts reasoning first, and a result with no open call on its own", () => {
+    const s = pairSink({ maxEvents: 3 });
+    s.handle({ kind: "result", n: 0 }); // no call before it
+    s.handle({ kind: "reason", n: 1 });
+    s.handle({ kind: "call", n: 2 });
+    s.handle({ kind: "result", n: 2 }); // over → the reasoning goes
+    s.handle({ kind: "call", n: 3 }); // over → the lone result goes
+    const target = fifoConsumer();
+    s.attach(target);
+    expect(target.seen).toEqual([2, 2, 3]);
+    expect(target.pairs).toEqual([[2, 2]]);
+  });
+});
+
 describe("createCotEventBuffer", () => {
   it("keeps only the event types the COT bubble renders", () => {
     const s = createCotEventBuffer();
@@ -160,6 +244,67 @@ describe("createCotEventBuffer", () => {
     s.attach(target);
     expect(target.seen.map((e) => e.type)).toEqual(["tool_use", "tool_use", "tool_result", "tool_result"]);
     expect(s.dropped).toBe(0);
+  });
+});
+
+/** Tool events tagged with n, and a consumer that pairs them FIFO like cotProgress / the in-card panel. */
+const toolUse = (n: number): AgentStreamEvent => ({ type: "tool_use", toolName: "Read", toolInput: { n }, raw: {} });
+const toolResult = (n: number): AgentStreamEvent => ({ type: "tool_result", raw: { n } });
+function toolPairs(events: AgentStreamEvent[]): Array<[number, number]> {
+  const open: number[] = [];
+  const pairs: Array<[number, number]> = [];
+  for (const e of events) {
+    if (e.type === "tool_use") open.push((e.toolInput as { n: number }).n);
+    if (e.type === "tool_result") pairs.push([open.shift() ?? -1, (e.raw as { n: number }).n]);
+  }
+  return pairs;
+}
+
+describe("createCotEventBuffer: tool pairs past the limits", () => {
+  it("a fast agent's parallel calls past 200 events with no reasoning: every replayed result is shown under its own call", () => {
+    const s = createCotEventBuffer();
+    let n = 0;
+    for (let batch = 0; batch < 42; batch++) {
+      const calls = [n + 1, n + 2, n + 3];
+      n += 3;
+      for (const c of calls) s.handle(toolUse(c));
+      for (const c of calls) s.handle(toolResult(c));
+    }
+    s.handle(toolUse(n + 1)); // still running at attach
+    expect(s.dropped).toBeGreaterThan(0);
+    const target = recorder<AgentStreamEvent>();
+    s.attach(target);
+    s.handle(toolResult(n + 1));
+    const pairs = toolPairs(target.seen);
+    expect(pairs.length).toBeGreaterThan(0);
+    expect(pairs.every(([call, result]) => call === result)).toBe(true);
+    expect(pairs.at(-1)).toEqual([n + 1, n + 1]);
+  });
+
+  it("past 64KB of large results the pairs stay aligned too", () => {
+    const big = (k: number): AgentStreamEvent => ({
+      type: "tool_result",
+      raw: { n: k, type: "user", message: { content: [{ type: "tool_result", content: "x".repeat(5_000) }] } },
+    });
+    // Each result renders 1200 characters: 72 of them (86,400) pass 64KB
+    // long before the 200-event limit. Three parallel calls at a time.
+    const s = createCotEventBuffer();
+    for (let k = 1; k <= 72; k += 3) {
+      for (const c of [k, k + 1, k + 2]) s.handle(toolUse(c));
+      for (const c of [k, k + 1, k + 2]) s.handle(big(c));
+    }
+    // The bubble lands mid-batch: one result in, two still running.
+    for (const c of [73, 74, 75]) s.handle(toolUse(c));
+    s.handle(big(73));
+    expect(s.dropped).toBeGreaterThan(0);
+    const target = recorder<AgentStreamEvent>();
+    s.attach(target);
+    s.handle(big(74));
+    s.handle(big(75));
+    const pairs = toolPairs(target.seen);
+    expect(pairs.length).toBeGreaterThan(0);
+    expect(pairs.every(([call, result]) => call === result)).toBe(true);
+    expect(pairs.at(-1)).toEqual([75, 75]);
   });
 });
 
@@ -262,6 +407,30 @@ describe("createSurfaceEventBuffer (WP-10)", () => {
     expect(replayed).toBe(expected);
     expect(target.seen.some((e) => e.type === "thinking_delta")).toBe(false);
     expect(s.dropped).toBeGreaterThan(0);
+  });
+});
+
+describe("createSurfaceEventBuffer: tool pairs (WP-10)", () => {
+  it("past the event limit evicts a call with its result; the answer text around them folds and survives", () => {
+    const s = createSurfaceEventBuffer();
+    let expected = "";
+    for (let k = 1; k <= 150; k += 3) {
+      for (const c of [k, k + 1, k + 2]) s.handle(toolUse(c));
+      for (const c of [k, k + 1, k + 2]) s.handle(toolResult(c));
+      s.handle({ type: "answer_delta", text: `a${k};`, raw: {} });
+      expected += `a${k};`;
+    }
+    expect(s.buffered).toBeLessThanOrEqual(200);
+    const target = recorder<AgentStreamEvent>();
+    s.attach(target);
+    const replayed = target.seen
+      .filter((e) => e.type === "answer_delta")
+      .map((e) => ("text" in e ? e.text : ""))
+      .join("");
+    expect(replayed).toBe(expected);
+    const pairs = toolPairs(target.seen);
+    expect(pairs.length).toBeGreaterThan(0);
+    expect(pairs.every(([call, result]) => call === result)).toBe(true);
   });
 });
 

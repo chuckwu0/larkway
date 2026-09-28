@@ -324,6 +324,38 @@ export function resolveInboundBatchDelayMs(): number | undefined {
   return parsed > 0 ? parsed : 0;
 }
 
+/** How often a channel cache drops its expired entries (checked on write). */
+export const CHANNEL_CACHE_SWEEP_MS = 5 * 60_000;
+
+/**
+ * The per-bot channel cache (see connect()). node-sdk's DefaultCache only
+ * ignores an expired entry on read and never deletes it, and the SDK's inbound
+ * dedup (SeenCache, 12h TTL) writes into it every dispatched message, card
+ * action and reaction id. With one cache per bot, a message reaching N bots is
+ * stored N times, so a long-running bridge would grow without bound. This one
+ * drops expired entries on the first write after each sweep interval; entries
+ * without an expiry (the app ticket) stay.
+ */
+export class ExpiringChannelCache extends DefaultCache {
+  #lastSweepAt = Date.now();
+
+  override async set(
+    key: string | symbol,
+    value: string,
+    expiredTime?: number,
+    options?: { namespace?: string },
+  ): Promise<boolean> {
+    const now = Date.now();
+    if (now - this.#lastSweepAt >= CHANNEL_CACHE_SWEEP_MS) {
+      this.#lastSweepAt = now;
+      for (const [cacheKey, entry] of this.values) {
+        if (entry.expiredTime && entry.expiredTime <= now) this.values.delete(cacheKey);
+      }
+    }
+    return super.set(key, value, expiredTime, options);
+  }
+}
+
 function safeFilePart(s: string): string {
   return s.replace(/[^A-Za-z0-9_.-]/g, "_");
 }
@@ -1002,8 +1034,9 @@ export class ChannelClient {
       // offline: deliveries 700ms apart under the default 600ms window lose
       // bot B's; with the window at 0, even 50ms apart do. A per-channel
       // instance scopes dedup to this bot. The tenant-token cache moves along
-      // with it; it is keyed by appId either way.
-      cache: new DefaultCache(),
+      // with it; it is keyed by appId either way. Expired entries are swept
+      // (ExpiringChannelCache), so N copies of the dedup ids stay bounded.
+      cache: new ExpiringChannelCache(),
       // Opt-in: see resolveInboundBatchDelayMs. The SDK resolves `safety`
       // field by field against its own defaults (resolveBatchConfig, dedup,
       // chatQueue, stale window — node-sdk 1.67.0), so passing only

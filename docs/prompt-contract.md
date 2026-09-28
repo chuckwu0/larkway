@@ -97,6 +97,8 @@ tasklist 候选行形如 `guid=… | summary=… | thread=omt_…`：`thread` �
 
 peer 卡片正文并非可靠的 peer 输入通道。需要交接时使用自包含的 `handoffs` 文本或真实 post + at 标签；不强制增加 ack、台账或 deadline 流程。
 
+bridge 发本轮终卡的同时发出 `handoffs` 镜像 post：另一个 bridge 进程里的 peer 可能在本轮卡片定稿之前被唤醒（CardKit 定稿失败时，也可能早于兜底卡出现）；同一进程内的 peer 等终卡投递结束、本轮任务认领落地之后才收到。终卡投递失败时，已声明的 handoff 照常发出，本轮随后记为失败；用户重新 @ 后重跑的一轮如果再次声明 handoff，peer 会再收到一次。
+
 ## 连续性与预算
 
 原生 runtime 管理会话历史与压缩。桥接 prompt 不假定 “resume 无压缩”，不把累积字符数解释为原生当前 context 用量。确需重开会话时，`session-reseed` 明确说明此前原生对话不在上下文中，并提供可用的摘要、转录摘录与文件指针；摘录可能不完整，不被视为事实完备的替代上下文。

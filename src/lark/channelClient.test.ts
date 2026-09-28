@@ -15,6 +15,8 @@ import { describe, it, expect, vi, afterEach } from "vitest";
 // backs the WP-3 tests that drive the SDK's own inbound pipeline.
 import { DefaultCache, createLarkChannel as realCreateLarkChannel } from "@larksuiteoapi/node-sdk";
 import {
+  CHANNEL_CACHE_SWEEP_MS,
+  ExpiringChannelCache,
   channelMsgToLarkEvent,
   resolveInboundBatchDelayMs,
   resolveOpenChatDiscoveryMs,
@@ -918,9 +920,66 @@ describe("ChannelClient — inbound safety options (WP-3)", () => {
     const [a, b] = await capturedChannelOptions(2);
     expect(a!["cache"]).toBeInstanceOf(DefaultCache);
     expect(b!["cache"]).toBeInstanceOf(DefaultCache);
+    // A fresh module instance (resetModules), so compare by class name.
+    expect((a!["cache"] as object).constructor.name).toBe(ExpiringChannelCache.name);
     expect(a!["cache"]).not.toBe(b!["cache"]);
     expect(a).not.toHaveProperty("safety");
     expect(b).not.toHaveProperty("safety");
+  });
+
+  it("the per-bot cache drops expired entries (the dedup ids) on a write after the sweep interval; unexpired and non-expiring entries stay", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      const cache = new ExpiringChannelCache();
+      const t0 = Date.now();
+      await cache.set("om_test_old", "1", t0 + 1_000, { namespace: "channel:seen" });
+      await cache.set("om_test_live", "1", t0 + 12 * 3_600_000, { namespace: "channel:seen" });
+      await cache.set("app_ticket", "ticket");
+      vi.setSystemTime(t0 + CHANNEL_CACHE_SWEEP_MS - 1);
+      await cache.set("om_test_next", "1", t0 + 12 * 3_600_000, { namespace: "channel:seen" });
+      expect(cache.values.size).toBe(4); // expired but not swept yet (reads ignore it)
+      expect(await cache.get("om_test_old", { namespace: "channel:seen" })).toBeUndefined();
+      vi.setSystemTime(t0 + CHANNEL_CACHE_SWEEP_MS);
+      await cache.set("om_test_later", "1", t0 + 13 * 3_600_000, { namespace: "channel:seen" });
+      expect([...cache.values.keys()].sort()).toEqual([
+        "app_ticket",
+        "channel:seen/om_test_later",
+        "channel:seen/om_test_live",
+        "channel:seen/om_test_next",
+      ]);
+      expect(await cache.get("om_test_live", { namespace: "channel:seen" })).toBe("1");
+      expect(await cache.get("app_ticket")).toBe("ticket");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("the SDK's dedup ids land in the per-bot cache, still dedup a redelivery, and are swept once expired", async () => {
+    delete process.env[ENV_KEY];
+    const [opts] = await capturedChannelOptions(1);
+    const cache = opts!["cache"] as DefaultCache;
+    const seenKeys = () => [...cache.values.keys()].filter((k) => String(k).startsWith("channel:seen/"));
+    const got: string[] = [];
+    const ch = realChannel(opts!);
+    ch.on("message", (msg) => got.push(msg.messageId));
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+    try {
+      await ch.safety.pushMessage(groupMessage("om_test_first"));
+      await vi.advanceTimersByTimeAsync(3_000);
+      await ch.safety.pushMessage(groupMessage("om_test_first")); // WS redelivery
+      await vi.advanceTimersByTimeAsync(3_000);
+      expect(got).toEqual(["om_test_first"]);
+      expect(seenKeys()).toEqual(["channel:seen/om_test_first"]);
+
+      // Past the SDK's 12h dedup TTL and a sweep interval: the next write drops it.
+      vi.setSystemTime(Date.now() + 12 * 3_600_000 + CHANNEL_CACHE_SWEEP_MS);
+      await ch.safety.pushMessage(groupMessage("om_test_second"));
+      await vi.advanceTimersByTimeAsync(3_000);
+      expect(got).toEqual(["om_test_first", "om_test_second"]);
+      expect(seenKeys()).toEqual(["channel:seen/om_test_second"]);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("passes only batch.text.delayMs when LARKWAY_INBOUND_BATCH_DELAY_MS is set", async () => {
