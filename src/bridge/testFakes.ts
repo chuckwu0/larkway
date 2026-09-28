@@ -97,24 +97,31 @@ export class LatencyTimeline {
 
   /**
    * Network calls started before the first run() call (`calls`), and how many
-   * SERIAL groups the ones that also COMPLETED before it form: calls whose
-   * intervals overlap ran in parallel and count once. N groups ≈ N
-   * back-to-back round trips the runner could have been waiting on. Calls
-   * still in flight at run() (`inFlight`) were not waited on.
+   * SERIAL groups the ones that also COMPLETED before it form: a call issued
+   * before an earlier one completed ran in parallel with it and counts once.
+   * N groups ≈ N back-to-back round trips the runner could have been waiting
+   * on. Calls still in flight at run() (`inFlight`) were not waited on.
+   *
+   * Overlap is decided on the exact seq/endSeq order, not on the ms clock: a
+   * call the handler fires and does not await (the roster, the root probe)
+   * and the next awaited one are issued in one synchronous stretch, so the
+   * first can only complete after the second was issued — but under CPU
+   * contention both can land on the same millisecond, which a `start < end`
+   * test on Date.now() read as "one after the other" (an extra group).
    */
   serialGroupsBeforeRun(): { calls: TimelineEntry[]; inFlight: TimelineEntry[]; groups: number } {
     const runSeq = this.runSeq ?? Infinity;
     const calls = this.netEntries().filter((e) => e.seq < runSeq);
     const inFlight = calls.filter((e) => e.endSeq > runSeq);
     let groups = 0;
-    let groupEnd = -Infinity;
-    for (const call of calls) {
+    let groupEndSeq = -Infinity;
+    for (const call of [...calls].sort((a, b) => a.seq - b.seq)) {
       if (call.endSeq > runSeq) continue;
-      if (call.start < groupEnd) {
-        groupEnd = Math.max(groupEnd, call.end);
+      if (call.seq < groupEndSeq) {
+        groupEndSeq = Math.max(groupEndSeq, call.endSeq);
       } else {
         groups += 1;
-        groupEnd = call.end;
+        groupEndSeq = call.endSeq;
       }
     }
     return { calls, inFlight, groups };

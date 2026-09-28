@@ -1711,9 +1711,11 @@ export class BridgeHandler {
     // gap-fill window (pre-existing behavior), not the steady-state replay.
     let agentRunCompleted = false;
     // COT (思维链) side channel — declared at function scope so the finally
-    // safety net below can close() it on any exit path. Created once per turn
-    // inside the try, fed every event, finalized on success/error. Always
-    // best-effort; a disabled handle is a no-op (see src/bridge/cotProgress.ts).
+    // safety net below can see it on any exit path. Created once per turn
+    // inside the try, fed every event, finalized on success/error; the
+    // finally has no close() (WP-2) — its idempotent finalize chain on
+    // bubbleCreate also clears the throttle timer. Always best-effort; a
+    // disabled handle is a no-op (see src/bridge/cotProgress.ts).
     let cotPublisher: CotProgressHandle | undefined;
     // WP-2 (c): what the stream loop feeds instead of cotPublisher — buffers
     // the events that arrive before a background-adopted handle exists and
@@ -1749,6 +1751,10 @@ export class BridgeHandler {
         }),
       ]);
     let cotTurnOutcome: "done" | "error" = "done";
+    // The RUN_ERROR text that goes with cotTurnOutcome, set at the same two
+    // sites, so a bubble adopted only after them (routine for the post-card
+    // create, WP-2) still shows the real reason instead of "run failed".
+    let cotTurnMessage: string | undefined;
     const settle = (ok: boolean): void => {
       if (settled) return;
       settled = true;
@@ -1931,7 +1937,9 @@ export class BridgeHandler {
       rosterTask = this.deps
         .resolveLiveRoster(parsed.chatId, rosterLookup)
         .then(async (liveRoster) => {
-          turnPerf.preRunner.rosterCache = rosterLookup.cache;
+          // A resolver that only reports once it settles (the contract allows
+          // it) still gets recorded here, if the sample is not written yet.
+          if (rosterLookup.cache) turnPerf.preRunner.rosterCache = rosterLookup.cache;
           if (!liveRoster) {
             await recordRosterDiagnostic(
               "live-roster resolve returned nothing; kept static <peer-bots> open_ids " +
@@ -1956,6 +1964,11 @@ export class BridgeHandler {
           console.warn("[bridge.handler] live-roster resolve failed (using static peers):", err);
           return staticPeers;
         });
+      // The cached resolver sets `cache` synchronously, on the call. Record it
+      // now: on a delta turn nothing waits for the lookup, and one slower than
+      // the whole turn (a cold miss, up to lark-cli's timeout) would otherwise
+      // land after the perf sample was written, without its miss.
+      if (rosterLookup.cache) turnPerf.preRunner.rosterCache = rosterLookup.cache;
     } else {
       turnPerf.preRunner.rosterCache = "skip";
     }
@@ -4128,21 +4141,23 @@ export class BridgeHandler {
           // Fire-and-forget on PURPOSE: COT is a best-effort side channel and must
           // never sit in front of the final card / session persistence, even with
           // ChannelCotClient's own per-call timeout. finalize() is idempotent and
-          // never throws; the finally's close() only cancels the throttle timer.
-          // Also recorded for the finally's late-adoption finalize (a
-          // background-adopted bubble may not exist as cotPublisher yet here).
+          // never throws (the finally has no close(); its finalize chain also
+          // clears the throttle timer). Outcome and message are also recorded
+          // for the finally's late-adoption finalize (a background-adopted
+          // bubble may not exist as cotPublisher yet here).
           cotTurnOutcome = success ? "done" : "error";
+          cotTurnMessage = stoppedByUser
+            ? "stopped by user"
+            : interruptedByIdle
+              ? "idle timeout"
+              : undefined;
           if (cotPublisher) {
             const publisher = cotPublisher;
             const ledgerAt = cotFileAt;
             void publisher
               .finalize(
                 cotTurnOutcome,
-                stoppedByUser
-                  ? { message: "stopped by user" }
-                  : interruptedByIdle
-                    ? { message: "idle timeout" }
-                    : undefined,
+                cotTurnMessage !== undefined ? { message: cotTurnMessage } : undefined,
               )
               // The ledger delete belongs to THIS call — the one that actually
               // performs the completion. Round 4 hung it off the finally-block's
@@ -4912,14 +4927,16 @@ export class BridgeHandler {
       // Close the COT bubble as errored. Fire-and-forget (same rationale as the
       // success path): the error teardown below — reaction removal, event log,
       // markUnhandled self-heal — must not wait on a best-effort COT call.
-      // finalize() is idempotent + never throws; the finally's close() only
-      // cancels the throttle timer.
+      // finalize() is idempotent + never throws (the finally has no close();
+      // its finalize chain also clears the throttle timer, and carries this
+      // message to a bubble adopted after this point).
       cotTurnOutcome = "error";
+      cotTurnMessage = String(err);
       if (cotPublisher) {
         const publisher = cotPublisher;
         const ledgerAt = cotFileAt;
         void publisher
-          .finalize("error", { message: String(err) })
+          .finalize("error", { message: cotTurnMessage })
           // The ledger delete belongs on THIS chain too. Round 5 moved it onto the
           // success path's finalize and left the catch without one, so every
           // rejecting turn — the documented cold-claude contract for a self-initiated
@@ -5047,12 +5064,13 @@ export class BridgeHandler {
       // would be created (RUN_STARTED sent) but never completed. Attach an
       // idempotent finalize to the create promise itself: an already-finalized
       // (early-adopted) handle no-ops via its closed guard; a late one gets
-      // completed when it resolves. Never throws.
+      // completed when it resolves, with the outcome and RUN_ERROR text the
+      // success / error site recorded. Never throws.
       if (bubbleCreate) {
         void Promise.resolve(bubbleCreate!)
           .then((handle) =>
           handle
-            .finalize(cotTurnOutcome)
+            .finalize(cotTurnOutcome, cotTurnMessage !== undefined ? { message: cotTurnMessage } : undefined)
             .catch(() => false as boolean)
             // `completed` is true only when THIS call performed the completion (a
             // late-adopted bubble the primary path never saw). When the primary

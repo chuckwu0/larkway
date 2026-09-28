@@ -15,6 +15,7 @@
  */
 
 import type { AgentStreamEvent } from "../agent/runner.js";
+import { COT_TEXT_MAX, COT_TOOL_RESULT_MAX, extractToolResultText } from "./cotProgress.js";
 
 export interface EventSink<E> {
   handle(event: E): void;
@@ -23,7 +24,7 @@ export interface EventSink<E> {
 export interface BufferedSinkOptions<E> {
   /** Events worth keeping until attach(); the rest are dropped while buffering. */
   accept: (event: E) => boolean;
-  /** Approximate retained size of one event, counted against maxBytes. */
+  /** Approximate size of one event, counted against maxBytes. */
   sizeOf: (event: E) => number;
   /** Evicted first (oldest first) once a limit is hit. */
   evictFirst?: (event: E) => boolean;
@@ -110,7 +111,15 @@ function jsonLength(value: unknown, fallback: number): number {
  * The COT bubble's buffer: only the event types the bubble renders (reasoning
  * + tool activity, see cotProgress.ts) are kept; answer text never reaches the
  * bubble and goes to the card, not through here. Reasoning text is evicted
- * before tool events, which the bubble pairs start↔result.
+ * before tool events, which the bubble pairs start↔result in arrival order
+ * (no ids), so a tool event is only evicted once no reasoning is left.
+ *
+ * An event's size is what the bubble renders from it, clipped as cotProgress
+ * clips it — not its raw payload. Otherwise one large tool output (a Read of a
+ * big file: tens of KB of raw JSON, ≤ COT_TOOL_RESULT_MAX characters shown)
+ * would alone exceed maxBytes and evict every tool event before it, leaving
+ * the replayed results paired with the wrong calls. Memory stays bounded by
+ * maxEvents, and only until the create settles (it has its own timeout).
  */
 export function createCotEventBuffer(): BufferedSink<AgentStreamEvent> {
   return new BufferedSink<AgentStreamEvent>({
@@ -123,11 +132,11 @@ export function createCotEventBuffer(): BufferedSink<AgentStreamEvent> {
       switch (ev.type) {
         case "thinking_delta":
         case "thinking_snapshot":
-          return ev.text.length;
+          return Math.min(ev.text.length, COT_TEXT_MAX);
         case "tool_use":
-          return ev.toolName.length + jsonLength(ev.toolInput, BUFFERED_SINK_MAX_BYTES);
+          return ev.toolName.length + Math.min(jsonLength(ev.toolInput, COT_TEXT_MAX), COT_TEXT_MAX);
         case "tool_result":
-          return jsonLength(ev.raw, BUFFERED_SINK_MAX_BYTES);
+          return Math.min(extractToolResultText(ev.raw).length, COT_TOOL_RESULT_MAX);
         default:
           return 0;
       }

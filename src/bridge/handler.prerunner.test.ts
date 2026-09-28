@@ -22,6 +22,7 @@ import type { OutboundPostClient } from "../lark/outboundPostClient.js";
 import type { LiveBotRoster, LiveRosterResolver } from "../lark/rosterResolver.js";
 import type { InboundClient, LarkMessageEvent } from "../lark/transport.js";
 import type { RuntimeEventPatch } from "./eventLog.js";
+import type { PerfSample } from "./perfLog.js";
 import { stateFilePathOf } from "./stateFile.js";
 import {
   LatencyTimeline,
@@ -279,10 +280,17 @@ describe("WP-2 (b): live roster off the runner's critical path", () => {
     };
     const { captured } = registerScriptedRunner([{}]);
     const { client, outcomes } = sequentialClient([continuationEvent("om_test_reply")]);
+    const samples: PerfSample[] = [];
     const { handler, events } = makeHandler({
       client,
       store: fakeSessionStore([existingSession()]),
-      deps: { peers: PEERS, resolveLiveRoster: resolver },
+      deps: {
+        peers: PEERS,
+        resolveLiveRoster: resolver,
+        recordPerfSample: async (sample) => {
+          samples.push(sample);
+        },
+      },
     });
 
     await runAll(handler);
@@ -292,6 +300,11 @@ describe("WP-2 (b): live roster off the runner's critical path", () => {
     expect(outcomes).toEqual(["handled:om_test_reply"]);
     const completedAt = events.findIndex((e) => e.status === "completed");
     expect(completedAt).toBeGreaterThan(-1);
+    // The sample is written while the lookup is still pending; the cold miss
+    // it is waiting on is recorded all the same.
+    await vi.waitFor(() => expect(samples).toHaveLength(1), CI_WAIT);
+    expect(samples[0]?.preRunner?.rosterCache).toBe("miss");
+    expect(samples[0]?.preRunner?.rosterMs).toBeUndefined();
 
     // The lookup answers after the turn ended: its diagnostic must not reopen
     // the finished event (a status "running" write after "completed").
@@ -372,6 +385,7 @@ describe("WP-2 (b): live roster off the runner's critical path", () => {
 describe("WP-2 (c): the post-card COT bubble is not awaited", () => {
   function gatedCotClient(release: Promise<unknown>) {
     const batches: string[][] = [];
+    const sentEvents: CotEvent[] = [];
     const completes: string[] = [];
     const client: OutboundCotClient = {
       async create() {
@@ -383,12 +397,13 @@ describe("WP-2 (c): the post-card COT bubble is not awaited", () => {
       },
       async update(_ref, events: readonly CotEvent[]) {
         batches.push(events.map((e) => e.event_type));
+        sentEvents.push(...events);
       },
       async complete(_ref, reason) {
         completes.push(reason);
       },
     };
-    return { client, batches, completes };
+    return { client, batches, sentEvents, completes };
   }
 
   const EARLY_EVENTS: AgentStreamEvent[] = [
@@ -438,6 +453,24 @@ describe("WP-2 (c): the post-card COT bubble is not awaited", () => {
 
     expect(outcomes).toEqual(["handled:om_test_new"]);
     await vi.waitFor(() => expect(completes).toEqual(["done"]), CI_WAIT);
+  });
+
+  it("a turn that fails before the bubble is adopted still shows the real error in it", async () => {
+    // run() throws at once, long before the post-card create lands: the error
+    // site has no handle yet, so only the anti-orphan chain completes it.
+    const create = deferred<void>();
+    const { client: cotClient, sentEvents, completes } = gatedCotClient(create.promise);
+    registerScriptedRunner([{ throwOnRun: true }]);
+    const { client, outcomes } = sequentialClient([newTopicEvent()]);
+    const { handler } = makeHandler({ client, deps: { cotClient } });
+
+    await runAll(handler);
+    expect(outcomes).toEqual(["unhandled:om_test_new"]);
+    create.resolve();
+    await vi.waitFor(() => expect(completes).toEqual(["error"]), CI_WAIT);
+
+    const runError = sentEvents.find((e) => e.event_type === "RUN_ERROR");
+    expect(JSON.parse(runError!.content).message).toContain("scripted runner: spawn failed");
   });
 
   it("existing topic past the create budget: events before the late adoption are replayed, not dropped", async () => {

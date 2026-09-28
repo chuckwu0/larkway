@@ -252,6 +252,30 @@ function pct(values: number[], p: number): number {
   return sorted[Math.max(0, Math.ceil(p * sorted.length) - 1)]!;
 }
 
+describe("LatencyTimeline serial-group count", () => {
+  it("counts a call fired alongside the next one as parallel even when the ms clock shows no overlap", async () => {
+    // Under CPU contention a fired-and-not-awaited call (the roster, the root
+    // probe) and the next awaited one can start and end on the same
+    // millisecond. Freeze the clock to make that tie certain: the count must
+    // follow issue/completion order, not Date.now().
+    const clock = vi.spyOn(Date, "now").mockReturnValue(1_000);
+    try {
+      const timeline = new LatencyTimeline();
+      const side = timeline.net("side", 1, () => undefined); // not awaited here
+      await timeline.net("first", 1, () => undefined);
+      await timeline.net("second", 1, () => undefined); // issued after "first" completed
+      timeline.markRunnerRun();
+      await side;
+      const { calls, inFlight, groups } = timeline.serialGroupsBeforeRun();
+      expect(calls.map((c) => c.what).sort()).toEqual(["first", "second", "side"]);
+      expect(inFlight).toEqual([]);
+      expect(groups).toBe(2);
+    } finally {
+      clock.mockRestore();
+    }
+  });
+});
+
 describe("handler latency bench (A1)", () => {
   let root: string;
   let priorHome: string | undefined;

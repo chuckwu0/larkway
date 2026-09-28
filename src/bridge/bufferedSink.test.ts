@@ -121,10 +121,37 @@ describe("createCotEventBuffer", () => {
   it("drops reasoning text before tool events once 64KB is exceeded", () => {
     const s = createCotEventBuffer();
     s.handle({ type: "tool_use", toolName: "Read", toolInput: { file_path: "/a" }, raw: {} });
-    s.handle({ type: "thinking_delta", text: "x".repeat(40_000), raw: {} });
-    s.handle({ type: "thinking_delta", text: "y".repeat(40_000), raw: {} });
+    // 60 full-size chunks (1200 each, as rendered) = 72,000 > 64KB; the tool
+    // event is 22. Past chunk 54 each new chunk pushes out the oldest one.
+    for (let n = 1; n <= 60; n++) {
+      s.handle({ type: "thinking_delta", text: `${n}:`.padEnd(1200, "x"), raw: {} });
+    }
     const target = recorder<AgentStreamEvent>();
     s.attach(target);
-    expect(target.seen.map((e) => (e.type === "thinking_delta" ? e.text[0] : e.type))).toEqual(["tool_use", "y"]);
+    expect(target.seen[0]?.type).toBe("tool_use");
+    expect(target.seen).toHaveLength(55);
+    expect(target.seen[1]?.type === "thinking_delta" && target.seen[1].text.startsWith("7:")).toBe(true);
+    expect(s.dropped).toBe(6);
+  });
+
+  it("sizes an event by what the bubble renders, so one large tool output evicts nothing", () => {
+    // Two parallel calls whose first result is a big file read: ~80KB of raw
+    // JSON, of which the bubble shows at most 1200 characters. Sized by its
+    // raw form it alone would exceed 64KB and push out both tool_use events,
+    // replaying the results under the wrong calls.
+    const bigText = "line\n".repeat(16_000);
+    const toolResult = (text: string): AgentStreamEvent => ({
+      type: "tool_result",
+      raw: { type: "user", message: { content: [{ type: "tool_result", content: text }] } },
+    });
+    const s = createCotEventBuffer();
+    s.handle({ type: "tool_use", toolName: "Read", toolInput: { file_path: "/big" }, raw: {} });
+    s.handle({ type: "tool_use", toolName: "Write", toolInput: { file_path: "/out", content: bigText }, raw: {} });
+    s.handle(toolResult(bigText));
+    s.handle(toolResult("ok"));
+    const target = recorder<AgentStreamEvent>();
+    s.attach(target);
+    expect(target.seen.map((e) => e.type)).toEqual(["tool_use", "tool_use", "tool_result", "tool_result"]);
+    expect(s.dropped).toBe(0);
   });
 });

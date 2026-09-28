@@ -30,8 +30,10 @@ import type {
 export type CotDetail = "brief" | "detailed";
 
 const DEFAULT_THROTTLE_MS = 600;
-const COT_TOOL_RESULT_MAX = 1200;
-const COT_TEXT_MAX = 1200;
+/** Longest tool_result text the bubble renders (detailed tier); the rest is clipped. */
+export const COT_TOOL_RESULT_MAX = 1200;
+/** Longest reasoning chunk / tool-args JSON the bubble renders per event. */
+export const COT_TEXT_MAX = 1200;
 const COT_INPUT_PREVIEW_MAX = 200;
 
 /**
