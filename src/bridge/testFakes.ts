@@ -40,6 +40,11 @@ export interface TimelineEntry {
   /** Epoch ms (Date.now()) — same clock as the perf sample's timeline. */
   start: number;
   end: number;
+  /**
+   * Started by a fake that returns before the round trip lands (nothing
+   * awaits it), so it can never be on the serial path before run().
+   */
+  detached?: boolean;
 }
 
 export class LatencyTimeline {
@@ -51,11 +56,11 @@ export class LatencyTimeline {
   private nextSeq = 0;
 
   /** One fake network round trip: sleep `ms`, record it, then return / throw. */
-  async net<T>(what: string, ms: number, result: () => T): Promise<T> {
+  async net<T>(what: string, ms: number, result: () => T, opts: { detached?: boolean } = {}): Promise<T> {
     const seq = this.nextSeq++;
     const start = Date.now();
     await new Promise((resolve) => setTimeout(resolve, ms));
-    this.entries.push({ what, kind: "net", seq, start, end: Date.now() });
+    this.entries.push({ what, kind: "net", seq, start, end: Date.now(), ...(opts.detached ? { detached: true } : {}) });
     return result();
   }
 
@@ -71,13 +76,14 @@ export class LatencyTimeline {
   }
 
   /**
-   * Network calls started before the first run() call, and how many SERIAL
-   * groups they form: calls whose intervals overlap ran in parallel and count
-   * once. N groups ≈ N back-to-back round trips on the critical path.
+   * Awaitable (non-detached) network calls started before the first run()
+   * call, and how many SERIAL groups they form: calls whose intervals overlap
+   * ran in parallel and count once. N groups ≈ N back-to-back round trips on
+   * the critical path.
    */
   serialGroupsBeforeRun(): { calls: TimelineEntry[]; groups: number } {
     const runSeq = this.runSeq ?? Infinity;
-    const calls = this.netEntries().filter((e) => e.seq < runSeq);
+    const calls = this.netEntries().filter((e) => e.seq < runSeq && !e.detached);
     let groups = 0;
     let groupEnd = -Infinity;
     for (const call of calls) {
@@ -91,24 +97,44 @@ export class LatencyTimeline {
     return { calls, groups };
   }
 
+  /** Detached network calls started before the first run() call. */
+  detachedBeforeRun(): TimelineEntry[] {
+    const runSeq = this.runSeq ?? Infinity;
+    return this.netEntries().filter((e) => e.seq < runSeq && e.detached);
+  }
+
   firstStart(what: string): number | undefined {
     return this.netEntries().find((e) => e.what.startsWith(what))?.start;
   }
 }
 
-/** Inbound client yielding one event; reactions are round trips; settles resolve `settled`. */
+/**
+ * Inbound client yielding one event; settles resolve `settled`. The ⏳
+ * reaction follows ChannelClient's contract (WP-3): add and remove return at
+ * once, their round trips run detached, and a remove's delete is chained
+ * behind that message's add.
+ */
 export function fakeInboundClient(event: LarkMessageEvent, timeline: LatencyTimeline, netMs: number) {
   let resolveSettled!: (outcome: "handled" | "unhandled") => void;
   const settled = new Promise<"handled" | "unhandled">((resolve) => {
     resolveSettled = resolve;
   });
+  const reactionAdds = new Map<string, Promise<void>>();
   const client = {
     // eslint-disable-next-line @typescript-eslint/require-await
     async *events() {
       yield event;
     },
-    addProcessingReaction: (_id: string) => timeline.net("reaction.add", netMs, () => undefined),
-    removeProcessingReaction: (_id: string) => timeline.net("reaction.delete", netMs, () => undefined),
+    addProcessingReaction: async (id: string) => {
+      if (reactionAdds.has(id)) return;
+      reactionAdds.set(id, timeline.net("reaction.add", netMs, () => undefined, { detached: true }));
+    },
+    removeProcessingReaction: async (id: string) => {
+      const add = reactionAdds.get(id);
+      if (!add) return;
+      reactionAdds.delete(id);
+      void add.then(() => timeline.net("reaction.delete", netMs, () => undefined, { detached: true }));
+    },
     acknowledgeMessage: () => {},
     markHandled: () => resolveSettled("handled"),
     markUnhandled: () => resolveSettled("unhandled"),

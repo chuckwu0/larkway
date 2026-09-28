@@ -84,12 +84,16 @@ export interface InboundClient {
   /**
    * Best-effort visual ack for an inbound message. Implementations may add a
    * temporary Feishu reaction so the operator immediately sees "the bridge got
-   * it" before a card is created.
+   * it" before a card is created. The handler awaits this on the pre-runner
+   * path, so implementations should return without waiting for the network
+   * round trip.
    */
   addProcessingReaction?(messageId: string): Promise<void>;
   /**
    * Best-effort cleanup for the temporary visual ack. Called once the bridge has
    * moved from "received" to the real processing surface (or after hard failure).
+   * Same non-blocking contract as the add; it may be called while that add is
+   * still in flight, and must then still remove the reaction once it lands.
    */
   removeProcessingReaction?(messageId: string): Promise<void>;
   acknowledgeMessage(messageId: string): void;

@@ -22,7 +22,7 @@
  * `lark/message.ts` parsing is unchanged.
  */
 
-import { createLarkChannel } from "@larksuiteoapi/node-sdk";
+import { createLarkChannel, DefaultCache } from "@larksuiteoapi/node-sdk";
 import { execFile as execFileCallback } from "node:child_process";
 import { mkdir, readFile, writeFile, rename, unlink } from "node:fs/promises";
 import path from "node:path";
@@ -69,6 +69,14 @@ const MAX_MESSAGE_ATTEMPTS = 5;
 const OPEN_CHAT_DISCOVERY_LOOKBACK_BUFFER_MS = 30_000;
 const OPEN_CHAT_DISCOVERY_BOOTSTRAP_LOOKBACK_MS = 30 * 60 * 1000;
 const PROCESSING_REACTION_EMOJI = "Typing";
+/**
+ * Upper bound close() waits for ⏳ reaction round trips still in flight. Those
+ * calls no longer block the turn (see {@link ChannelClient.addProcessingReaction}),
+ * so a removal fired by the last turn can still be on the wire at shutdown;
+ * cut off by process exit, it would leave the Typing reaction on the message
+ * for good. One add plus its chained delete is two round trips.
+ */
+const REACTION_DRAIN_TIMEOUT_MS = 2_000;
 
 // ── open-chat discovery storm controls (root cause: multi-bot, chats:[]) ──────
 /**
@@ -293,6 +301,27 @@ export function resolveOpenChatDiscoveryMs(ctorValue: number | undefined): numbe
     raw = Number.isFinite(parsed) ? parsed : DEFAULT_OPEN_CHAT_DISCOVERY_MS;
   }
   return Number.isFinite(raw) && raw > 0 ? raw : 0;
+}
+
+/**
+ * Opt-in override for the Channel SDK's inbound text batching, from env
+ * LARKWAY_INBOUND_BATCH_DELAY_MS. The SDK holds every inbound message for a
+ * per-chat debounce window before dispatching it — 600ms, or 2000ms once the
+ * buffered text reaches 1000 chars (node-sdk 1.67.0 DEFAULT_BATCH) — and merges
+ * same-chat messages that land inside the window into one turn carrying the
+ * LATEST message's id and sender. That wait happens before our `wsAt` stamp.
+ *
+ * Unset, empty or non-numeric → `undefined`: keep the SDK default (today's
+ * deployed behaviour). `0` (negatives clamp to 0) → the SDK's pure-serial
+ * mode: dispatch at once, no merging — the long-message delay is skipped too.
+ * A positive value replaces only the short-message window.
+ */
+export function resolveInboundBatchDelayMs(): number | undefined {
+  const env = process.env["LARKWAY_INBOUND_BATCH_DELAY_MS"];
+  if (env === undefined || env.trim() === "") return undefined;
+  const parsed = Number(env);
+  if (!Number.isFinite(parsed)) return undefined;
+  return parsed > 0 ? parsed : 0;
 }
 
 function safeFilePart(s: string): string {
@@ -761,7 +790,15 @@ export class ChannelClient {
   );
   /** Monotonic suffix so overlapping atomic writes get distinct temp files. */
   private atomicWriteSeq = 0;
-  private readonly processingReactions = new Map<string, string>();
+  /**
+   * messageId → the ⏳ reaction's create call, resolving to its reaction id
+   * (undefined when the add failed). Holding the PROMISE rather than the id
+   * lets a removal that arrives while the add is still in flight chain onto
+   * it instead of finding nothing and leaving the reaction behind for good.
+   */
+  private readonly processingReactions = new Map<string, Promise<string | undefined>>();
+  /** Reaction round trips in flight — drained (bounded) by close(). */
+  private readonly reactionOps = new Set<Promise<unknown>>();
   /**
    * Shared messageId -> threadId map. Populated by ChannelCardClient.createCard
    * (the thread each card was posted into) and read here on a cardAction click
@@ -942,6 +979,10 @@ export class ChannelClient {
     if (this.opts.allowedChatIds.size > 0) {
       policy.groupAllowlist = [...this.opts.allowedChatIds];
     }
+    const inboundBatchDelayMs = resolveInboundBatchDelayMs();
+    if (inboundBatchDelayMs !== undefined) {
+      log(`inbound text batch delay ${inboundBatchDelayMs}ms (LARKWAY_INBOUND_BATCH_DELAY_MS)`);
+    }
     const channel = createLarkChannel({
       appId: this.opts.appId,
       appSecret: this.opts.appSecret,
@@ -951,6 +992,25 @@ export class ChannelClient {
       // We need the raw event body to reconstruct the lark-cli-shaped content.
       // (`includeRawInMessage` is the deprecated alias for this.)
       includeRawEvent: true,
+      // ONE CACHE PER BOT. Without `cache` the SDK falls back to its
+      // process-global `internalCache`, and its inbound dedup (SeenCache)
+      // writes every dispatched message id there under one fixed namespace
+      // ("channel:seen") — shared by every bot in this process. A message that
+      // @-mentions two of our bots reaches each bot's WS separately; once the
+      // first bot has dispatched it (after the batch window below), the second
+      // finds the id already "seen" and silently drops its copy. Reproduced
+      // offline: deliveries 700ms apart under the default 600ms window lose
+      // bot B's; with the window at 0, even 50ms apart do. A per-channel
+      // instance scopes dedup to this bot. The tenant-token cache moves along
+      // with it; it is keyed by appId either way.
+      cache: new DefaultCache(),
+      // Opt-in: see resolveInboundBatchDelayMs. The SDK resolves `safety`
+      // field by field against its own defaults (resolveBatchConfig, dedup,
+      // chatQueue, stale window — node-sdk 1.67.0), so passing only
+      // batch.text.delayMs changes nothing else. Omitted when unset.
+      ...(inboundBatchDelayMs !== undefined
+        ? { safety: { batch: { text: { delayMs: inboundBatchDelayMs } } } }
+        : {}),
       // ── WS robustness knobs (node-sdk ≥1.64; all OFF by default) ──────────
       // Abort a handshake that hangs on a stuck DNS/proxy/NAT path so the retry
       // loop can try again, instead of waiting indefinitely. Successful TLS
@@ -2160,45 +2220,101 @@ export class ChannelClient {
     await this.atomicWriteJson(file, { chats, chatTypes });
   }
 
+  /**
+   * Put the ⏳ reaction on an inbound message. Starts the create call and
+   * returns WITHOUT waiting for it: the handler awaits this on the pre-runner
+   * path, where the round trip used to sit in series before the card. Never
+   * rejects; a failed add is logged and makes the later removal a no-op.
+   * Idempotent per message while an add is pending or has landed.
+   */
   async addProcessingReaction(messageId: string): Promise<void> {
     if (this.processingReactions.has(messageId)) return;
-    if (!this.channel) return;
-    try {
-      const result = await this.channel.rawClient.im.v1.messageReaction.create({
-        path: { message_id: messageId },
-        data: { reaction_type: { emoji_type: PROCESSING_REACTION_EMOJI } },
-      });
-      const reactionId = result.data?.reaction_id ?? result.reaction_id;
-      if (reactionId) {
-        this.processingReactions.set(messageId, reactionId);
-        console.info(
-          `[channel.client] processing reaction added message=${messageId} reaction=${reactionId} emoji=${PROCESSING_REACTION_EMOJI}`,
-        );
-      }
-    } catch (err) {
-      console.warn(
-        `[channel.client] add processing reaction failed for ${messageId}: ${(err as Error).message}`,
+    const channel = this.channel;
+    if (!channel) return;
+    // Started inside a .then so even a synchronous throw from the SDK lands in
+    // the rejection branch below instead of rejecting this method.
+    const pending = Promise.resolve()
+      .then(() =>
+        channel.rawClient.im.v1.messageReaction.create({
+          path: { message_id: messageId },
+          data: { reaction_type: { emoji_type: PROCESSING_REACTION_EMOJI } },
+        }),
+      )
+      .then(
+        (result) => {
+          const reactionId = result.data?.reaction_id ?? result.reaction_id;
+          if (reactionId) {
+            console.info(
+              `[channel.client] processing reaction added message=${messageId} reaction=${reactionId} emoji=${PROCESSING_REACTION_EMOJI}`,
+            );
+          }
+          return reactionId;
+        },
+        (err: unknown) => {
+          console.warn(
+            `[channel.client] add processing reaction failed for ${messageId}: ${(err as Error).message}`,
+          );
+          return undefined;
+        },
       );
-    }
+    this.processingReactions.set(messageId, pending);
+    this.trackReactionOp(pending);
+    // A failed add leaves nothing to remove: forget it, so a later add for the
+    // same message tries again (as when the add was awaited).
+    void pending.then((reactionId) => {
+      if (!reactionId && this.processingReactions.get(messageId) === pending) {
+        this.processingReactions.delete(messageId);
+      }
+    });
   }
 
+  /**
+   * Take the ⏳ reaction off again. Returns without waiting: the delete is
+   * chained after this message's add (a delete racing ahead of its add would
+   * find no reaction id and leave Typing on the message permanently). Never
+   * rejects; no-op when no add was made, the add failed, or it was already
+   * removed.
+   */
   async removeProcessingReaction(messageId: string): Promise<void> {
-    const reactionId = this.processingReactions.get(messageId);
-    if (!reactionId) return;
+    const pending = this.processingReactions.get(messageId);
+    if (!pending) return;
     this.processingReactions.delete(messageId);
-    if (!this.channel) return;
-    try {
-      await this.channel.rawClient.im.v1.messageReaction.delete({
-        path: { message_id: messageId, reaction_id: reactionId },
-      });
-      console.info(
-        `[channel.client] processing reaction removed message=${messageId} reaction=${reactionId}`,
-      );
-    } catch (err) {
-      console.warn(
-        `[channel.client] remove processing reaction failed for ${messageId}: ${(err as Error).message}`,
-      );
-    }
+    this.trackReactionOp(
+      pending.then(async (reactionId) => {
+        const channel = this.channel;
+        if (!reactionId || !channel) return;
+        try {
+          await channel.rawClient.im.v1.messageReaction.delete({
+            path: { message_id: messageId, reaction_id: reactionId },
+          });
+          console.info(
+            `[channel.client] processing reaction removed message=${messageId} reaction=${reactionId}`,
+          );
+        } catch (err) {
+          console.warn(
+            `[channel.client] remove processing reaction failed for ${messageId}: ${(err as Error).message}`,
+          );
+        }
+      }),
+    );
+  }
+
+  private trackReactionOp(op: Promise<unknown>): void {
+    this.reactionOps.add(op);
+    void op.finally(() => this.reactionOps.delete(op));
+  }
+
+  /** Bounded wait for in-flight reaction round trips — see REACTION_DRAIN_TIMEOUT_MS. */
+  private async drainReactionOps(): Promise<void> {
+    if (this.reactionOps.size === 0) return;
+    let timer: NodeJS.Timeout | undefined;
+    await Promise.race([
+      Promise.allSettled([...this.reactionOps]),
+      new Promise<void>((resolve) => {
+        timer = setTimeout(resolve, REACTION_DRAIN_TIMEOUT_MS);
+      }),
+    ]);
+    clearTimeout(timer);
   }
 
   /**
@@ -2305,6 +2421,7 @@ export class ChannelClient {
       this.livenessTimer = undefined;
     }
     this.queue.close();
+    await this.drainReactionOps();
     if (this.channel && this.connected) {
       try {
         await this.channel.disconnect();
