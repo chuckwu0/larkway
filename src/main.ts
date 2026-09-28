@@ -43,7 +43,7 @@ import { ensureLarkCliProfile, deriveLarkCliProfile } from "./lark/profileBootst
 import { isSyntheticSessionKey } from "./lark/message.js";
 import { createCachedRosterResolver } from "./lark/rosterResolver.js";
 import { checkWorkspacePermissionGrant } from "./agent/permissionGate.js";
-import { migrateRetiredContractLines } from "./agent/workspaceStore.js";
+import { migrateRetiredContractLines, retiredContractMigrationPath } from "./agent/workspaceStore.js";
 import { ensureLocalBinOnPath, probeBackendReadiness } from "./agent/readiness.js";
 import { runtimeRequirementsForBots } from "./runtimeRequirements.js";
 import { registerCrashGuard } from "./crashGuard.js";
@@ -202,9 +202,11 @@ async function runV2Mode({
         // Retired contract lines in an existing managed AGENTS.md are otherwise
         // dropped only by a config save. Strip them once per boot — never on the
         // per-turn path, where agent self-edits and web saves could race it.
-        if (!dryRun) {
+        // retiredContractMigrationPath returns undefined for BYO workspaces.
+        const migrationPath = retiredContractMigrationPath(bot, larkwayHome());
+        if (migrationPath && !dryRun) {
           try {
-            const removed = await migrateRetiredContractLines(resolveAgentWorkspacePath(bot.id));
+            const removed = await migrateRetiredContractLines(migrationPath);
             if (removed > 0) {
               console.log(
                 `[larkway] bot "${bot.id}": removed ${removed} retired contract line(s) from workspace AGENTS.md ` +

@@ -3,7 +3,12 @@ import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { ensureAgentWorkspace, migrateRetiredContractLines, resetAgentWorkspacePermissions } from "./workspaceStore.js";
+import {
+  ensureAgentWorkspace,
+  migrateRetiredContractLines,
+  resetAgentWorkspacePermissions,
+  retiredContractMigrationPath,
+} from "./workspaceStore.js";
 
 describe("ensureAgentWorkspace", () => {
   let dir: string;
@@ -594,6 +599,8 @@ describe("migrateRetiredContractLines", () => {
     "- 长期知识纪律:每轮 prompt 带有 `sender_is_owner` 事实。owner 的指示可进组织知识库 inbox;非 owner 提供的新知识只写进本 session 的 summary.md 并标注 `[未经 owner 确认]`,由保养轮决定是否晋升 —— 不直接写 AGENTS.md、L2 或知识库。";
   const RITUAL_LINE =
     "- 开场不可跳过:回应 owner 前,先 Read `memory/index.md`,并按相关性 Read 相关 category 文件,再开始干活(防止新 session 失忆)。";
+  // Owner-written; mentions both ritual keywords but is not the retired line.
+  const OWNER_RITUAL_LIKE_LINE = "- 开场不可跳过的检查:先读 memory/index.md 里的部署清单再动手。";
   const RETIRED = new Set([STATE_LINE, PERMS_LINE, KNOWLEDGE_LINE, RITUAL_LINE]);
   const OLD = new Date("2001-01-01T00:00:00Z");
 
@@ -616,6 +623,7 @@ describe("migrateRetiredContractLines", () => {
     `${STATE_LINE} `,
     `  ${PERMS_LINE}`,
     "- 长期知识纪律:owner 自定规则,涉及团队记忆时先核实来源。",
+    OWNER_RITUAL_LIKE_LINE,
     "- Write the per-session state file path provided by the prompt before ending a turn.",
     "",
     "## Custom Rules",
@@ -640,6 +648,14 @@ describe("migrateRetiredContractLines", () => {
     expect(await migrateRetiredContractLines(dir)).toBe(4);
     const expected = LEGACY_LINES.filter((line) => !RETIRED.has(line)).join("\n");
     expect(await fs.readFile(agentsPath, "utf8")).toBe(expected);
+  });
+
+  it("matches retired lines exactly, never by the projection path's ritual substring rule", async () => {
+    const agentsPath = path.join(dir, "AGENTS.md");
+    const content = ["## Custom Rules", "", OWNER_RITUAL_LIKE_LINE, RITUAL_LINE, ""].join("\n");
+    await fs.writeFile(agentsPath, content, "utf8");
+    expect(await migrateRetiredContractLines(dir)).toBe(1);
+    expect(await fs.readFile(agentsPath, "utf8")).toBe(["## Custom Rules", "", OWNER_RITUAL_LIKE_LINE, ""].join("\n"));
   });
 
   it("keeps CRLF line endings of the surviving lines", async () => {
@@ -693,5 +709,25 @@ describe("migrateRetiredContractLines", () => {
     expect(await fs.readFile(realPath, "utf8")).toBe(LEGACY_LINES.filter((line) => !RETIRED.has(line)).join("\n"));
     expect((await fs.stat(realPath)).mode & 0o777).toBe(0o600);
     expect((await fs.readdir(dir)).sort()).toEqual(["shared-agents.md", "workspace"]);
+  });
+});
+
+describe("retiredContractMigrationPath", () => {
+  const HOME = path.join(tmpdir(), "larkway-home-fixture");
+
+  it("targets the Larkway-managed workspace of an agent_workspace bot", () => {
+    expect(retiredContractMigrationPath({ id: "demo", runtime: "agent_workspace" }, HOME))
+      .toBe(path.join(HOME, "agents", "demo", "workspace"));
+  });
+
+  it("skips a BYO workspace, which Larkway never writes into", () => {
+    expect(retiredContractMigrationPath(
+      { id: "demo", runtime: "agent_workspace", workspace: path.join(tmpdir(), "owner-byo") },
+      HOME,
+    )).toBeUndefined();
+  });
+
+  it("skips a legacy-runtime bot", () => {
+    expect(retiredContractMigrationPath({ id: "demo", runtime: "legacy" }, HOME)).toBeUndefined();
   });
 });
