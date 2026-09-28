@@ -36,6 +36,7 @@ import { buildTopicDeepLink, realTopicThreadId, type MessageLookupClient } from 
 import { renderPrompt } from "../claude/prompt.js";
 import {
   remapPeersToLiveRoster,
+  type LiveBotRoster,
   type LiveRosterResolver,
   type RosterLookupInfo,
 } from "../lark/rosterResolver.js";
@@ -1364,10 +1365,10 @@ export class BridgeHandler {
   private readonly perfEnqueueAt = new WeakMap<object, number>();
   /**
    * WP-2 (f): per session key, the fingerprint of the <runtime-warnings> list
-   * the session's native history last received (recorded once the runner's
-   * first event proves the prompt was delivered). A delta prompt repeats the
-   * block only when the list differs. In-memory like threadReceivedAt: empty
-   * after a restart, so each session gets the block once more.
+   * the session's native history last received (recorded when a turn that
+   * carried it succeeds). A delta prompt repeats the block only when the list
+   * differs. In-memory like threadReceivedAt: empty after a restart, so each
+   * session gets the block once more.
    */
   private readonly runtimeWarningsSent = new Map<string, string>();
 
@@ -1924,46 +1925,67 @@ export class BridgeHandler {
     // it before the runner — the handoff @ targets settle it after the run.
     // Best-effort as before: any failure keeps the static config ids.
     const staticPeers = this.deps.peers;
+    const rosterLookup: RosterLookupInfo = {};
     let rosterTask: Promise<PeerBot[]> | undefined;
+    // One lookup, mapped onto the static peers. Never rejects: a failure — a
+    // synchronous throw from an injected resolver included (the type allows a
+    // non-async one) — yields `fallback`, as does a lookup that found nothing.
+    let lookUpPeers:
+      | ((info: RosterLookupInfo, opts: { fallback: PeerBot[]; record: boolean }) => Promise<PeerBot[]>)
+      | undefined;
     if (staticPeers?.length && this.deps.resolveLiveRoster) {
-      const rosterLookup: RosterLookupInfo = {};
+      const resolveLiveRoster = this.deps.resolveLiveRoster;
       const recordRosterDiagnostic = async (reason: string): Promise<void> => {
-        if (turnTerminalRecorded) {
+        // `settled` covers a turn released before any terminal record (an
+        // early abort): a "running" write would make it look live again.
+        if (turnTerminalRecorded || settled) {
           console.info(`[bridge.handler] peer roster resolved after turn end: ${reason}`);
           return;
         }
         await recordEvent({ status: "running", appendPath: "peer roster", reason });
       };
-      rosterTask = this.deps
-        .resolveLiveRoster(parsed.chatId, rosterLookup)
-        .then(async (liveRoster) => {
-          // A resolver that only reports once it settles (the contract allows
-          // it) still gets recorded here, if the sample is not written yet.
-          if (rosterLookup.cache) turnPerf.preRunner.rosterCache = rosterLookup.cache;
-          if (!liveRoster) {
-            await recordRosterDiagnostic(
-              "live-roster resolve returned nothing; kept static <peer-bots> open_ids " +
-                "(may be cross-app-scope / undeliverable).",
+      lookUpPeers = (info, { fallback, record }) => {
+        let lookup: Promise<LiveBotRoster | null>;
+        try {
+          lookup = resolveLiveRoster(parsed.chatId, info);
+        } catch (err) {
+          lookup = Promise.reject(err);
+        }
+        return lookup
+          .then(async (liveRoster) => {
+            if (!liveRoster) {
+              if (record) {
+                await recordRosterDiagnostic(
+                  "live-roster resolve returned nothing; kept static <peer-bots> open_ids " +
+                    "(may be cross-app-scope / undeliverable).",
+                );
+              }
+              return fallback;
+            }
+            const { peers: remappedPeers, remapped, unresolved } = remapPeersToLiveRoster(
+              staticPeers,
+              liveRoster,
             );
-            return staticPeers;
-          }
-          const { peers: remappedPeers, remapped, unresolved } = remapPeersToLiveRoster(
-            staticPeers,
-            liveRoster,
-          );
-          if (remapped.length > 0 || unresolved.length > 0) {
-            await recordRosterDiagnostic(
-              `live-roster resolve: remapped [${remapped.join(", ") || "none"}] to ` +
-                `same-app-scope open_id; unresolved (kept static config id, may not be ` +
-                `deliverable) [${unresolved.join(", ") || "none"}].`,
-            );
-          }
-          return remappedPeers;
-        })
-        .catch((err: unknown) => {
-          console.warn("[bridge.handler] live-roster resolve failed (using static peers):", err);
-          return staticPeers;
-        });
+            if (record && (remapped.length > 0 || unresolved.length > 0)) {
+              await recordRosterDiagnostic(
+                `live-roster resolve: remapped [${remapped.join(", ") || "none"}] to ` +
+                  `same-app-scope open_id; unresolved (kept static config id, may not be ` +
+                  `deliverable) [${unresolved.join(", ") || "none"}].`,
+              );
+            }
+            return remappedPeers;
+          })
+          .catch((err: unknown) => {
+            console.warn("[bridge.handler] live-roster resolve failed (using static peers):", err);
+            return fallback;
+          });
+      };
+      rosterTask = lookUpPeers(rosterLookup, { fallback: staticPeers, record: true }).then((peers) => {
+        // A resolver that only reports once it settles (the contract allows
+        // it) still gets recorded here, if the sample is not written yet.
+        if (rosterLookup.cache) turnPerf.preRunner.rosterCache = rosterLookup.cache;
+        return peers;
+      });
       // The cached resolver sets `cache` synchronously, on the call. Record it
       // now: on a delta turn nothing waits for the lookup, and one slower than
       // the whole turn (a cold miss, up to lark-cli's timeout) would otherwise
@@ -3584,15 +3606,8 @@ export class BridgeHandler {
         let turnToolResultChars = 0;
         let lastCountedToolResultRaw: unknown;
 
-        // WP-2 (f): the first runner event proves the prompt reached the session.
-        let promptDelivered = false;
-
         try {
           for await (const ev of handle.events) {
-            if (!promptDelivered) {
-              promptDelivered = true;
-              this.runtimeWarningsSent.set(threadId, runtimeWarningsKey);
-            }
             // PRB-9: any runner event = activity; resets the idle watchdog.
             // Measure the gap BEFORE resetting — this is the only place the real
             // silence of a recovered turn can still be read.
@@ -4127,6 +4142,12 @@ export class BridgeHandler {
           if (success && mtimeAdvance) {
             await writeMtimeBaseline(mtimeAdvance.baselinePath, mtimeAdvance.baseline);
           }
+          // WP-2 (f): same rule for the <runtime-warnings> list. Not on the
+          // first runner event: codex yields system_init off thread/start|resume,
+          // before turn/start carries the prompt (src/codex/pool.ts), so a turn
+          // that fails from there never put the block into the session history.
+          // A failed turn repeats it next time — the cheap direction.
+          if (success) this.runtimeWarningsSent.set(threadId, runtimeWarningsKey);
 
           // BL-38 counter: a confirmed idle-stuck turn accrues (+1); a clean
           // success resets to 0; any OTHER failure (crash / explicit `failed`)
@@ -4729,7 +4750,15 @@ export class BridgeHandler {
                 handoffs: declaredHandoffs,
                 // WP-2 (b): a delta turn rendered without the live roster, so
                 // settle it for the @ targets now (a full turn's is already in).
-                peers: (rosterTask ? await rosterTask : effectivePeers) ?? [],
+                // A turn-start answer served "stale" came with a refresh; by now
+                // it has usually landed, so ask again (a lookup that finds
+                // nothing keeps the turn-start peers).
+                peers:
+                  (rosterTask
+                    ? rosterLookup.cache === "stale" && lookUpPeers
+                      ? await lookUpPeers({}, { fallback: await rosterTask, record: false })
+                      : await rosterTask
+                    : effectivePeers) ?? [],
                 roster: this.deps.taskHandleMentionRoster ?? [],
                 selfBotId: this.deps.botConfig?.id ?? "v1-default",
                 postClient: this.deps.postClient,

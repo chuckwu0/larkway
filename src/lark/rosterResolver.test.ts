@@ -215,6 +215,32 @@ describe("createCachedRosterResolver", () => {
     expect(calls).toBe(2);
   });
 
+  it("WP-2: an expired failed lookup (null) is awaited again, not served stale", async () => {
+    let clock = 1_000;
+    let calls = 0;
+    const resolver = createCachedRosterResolver({
+      ttlMs: 1000,
+      now: () => clock,
+      exec: async () => {
+        calls += 1;
+        if (calls === 1) throw new Error("lark-cli timed out");
+        await new Promise((resolve) => setTimeout(resolve, 5));
+        return JSON.stringify({ data: { items: [{ bot_id: "ou_test_peer", bot_name: "Peer" }] } });
+      },
+    });
+    expect(await resolver("oc_1")).toBeNull();
+    const cached: RosterLookupInfo = {};
+    expect(await resolver("oc_1", cached)).toBeNull(); // within TTL: the failure stays cached
+    expect(cached.cache).toBe("hit");
+    expect(calls).toBe(1);
+
+    clock += 2000;
+    const expired: RosterLookupInfo = {};
+    expect((await resolver("oc_1", expired))?.get("Peer")).toBe("ou_test_peer");
+    expect(expired.cache).toBe("miss");
+    expect(calls).toBe(2);
+  });
+
   it("WP-2: concurrent first lookups of one chat share a single lark-cli spawn", async () => {
     let calls = 0;
     const resolver = createCachedRosterResolver({

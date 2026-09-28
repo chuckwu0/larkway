@@ -67,8 +67,8 @@ export interface RenderPromptInput {
   larkCliProfile?: string;
   runtimeWarnings?: RuntimeWarning[];
   /**
-   * Delta turns skip `<runtime-warnings>` only when the handler reports the
-   * set unchanged since the session last received it. Absent = changed.
+   * WP-2 (f): false = the session already received this exact warning list
+   * (handler-computed). Absent behaves as today.
    */
   runtimeWarningsChanged?: boolean;
   taskHandleTasklistGuid?: string;

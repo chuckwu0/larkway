@@ -19,7 +19,7 @@ import { registerRunner, type AgentStreamEvent, type RunHandle, type RunOptions 
 import type { BotConfig } from "../config/botLoader.js";
 import type { OutboundCotClient, CotEvent } from "../lark/channelCotClient.js";
 import type { OutboundPostClient } from "../lark/outboundPostClient.js";
-import type { LiveBotRoster, LiveRosterResolver } from "../lark/rosterResolver.js";
+import type { LiveBotRoster, LiveRosterResolver, RosterLookupInfo } from "../lark/rosterResolver.js";
 import type { InboundClient, LarkMessageEvent } from "../lark/transport.js";
 import type { RuntimeEventPatch } from "./eventLog.js";
 import type { PerfSample } from "./perfLog.js";
@@ -144,6 +144,11 @@ function sequentialClient(events: LarkMessageEvent[]) {
 type TurnBehavior = {
   /** Throw synchronously from run() (the prompt never reaches a session). */
   throwOnRun?: boolean;
+  /**
+   * Yield system_init, then end with a rejected done — codex's shape when
+   * turn/start (the request carrying the prompt) fails after thread/start.
+   */
+  failAfterInit?: boolean;
   /** Emitted after system_init. */
   events?: AgentStreamEvent[];
   /** Resolved before the runner yields its events (after system_init). */
@@ -166,6 +171,14 @@ function registerScriptedRunner(behaviors: TurnBehavior[], timeline?: LatencyTim
       timeline?.markRunnerRun();
       if (behavior.throwOnRun) throw new Error("scripted runner: spawn failed");
       const sessionPath = join(workspace, "sessions", opts.threadId ?? "");
+      if (behavior.failAfterInit) {
+        const done = Promise.reject(new Error("scripted runner: turn/start failed"));
+        done.catch(() => {}); // the handler awaits it once the events end
+        const events = (async function* (): AsyncGenerator<AgentStreamEvent> {
+          yield { type: "system_init", sessionId: "sess_test", raw: {} };
+        })();
+        return { events, done, kill: () => {} };
+      }
       const events = (async function* (): AsyncGenerator<AgentStreamEvent> {
         yield { type: "system_init", sessionId: "sess_test", raw: {} };
         if (behavior.beforeEvents) await behavior.beforeEvents;
@@ -380,6 +393,111 @@ describe("WP-2 (b): live roster off the runner's critical path", () => {
     expect(posts[0]).toContain("ou_test_live_peer");
     expect(posts[0]).not.toContain("ou_test_static_peer");
   });
+
+  /** One delta turn that hands off to Peer; returns the handoff mirror posts. */
+  async function handoffTurn(resolver: LiveRosterResolver): Promise<string[]> {
+    const posts: string[] = [];
+    const postClient: OutboundPostClient = {
+      async createPostReply(_replyTo, content) {
+        posts.push(content);
+        return { messageId: "om_test_mirror" };
+      },
+      async createPost() {
+        return { messageId: "om_test_top" };
+      },
+      async updatePost(messageId) {
+        return { messageId };
+      },
+    };
+    registerScriptedRunner([
+      { state: { status: "ready", last_message: "handing over", handoffs: [{ to: "Peer", text: "please continue" }] } },
+    ]);
+    const { client, outcomes } = sequentialClient([continuationEvent("om_test_reply")]);
+    const { handler } = makeHandler({
+      client,
+      store: fakeSessionStore([existingSession()]),
+      deps: { peers: PEERS, resolveLiveRoster: resolver, postClient },
+    });
+    await runAll(handler);
+    expect(outcomes).toEqual(["handled:om_test_reply"]);
+    return posts;
+  }
+
+  it("a turn-start answer served stale is asked again for the handoff @", async () => {
+    const infos: RosterLookupInfo[] = [];
+    const resolver: LiveRosterResolver = async (_chatId, info) => {
+      if (info) infos.push(info);
+      if (infos.length === 1) {
+        if (info) info.cache = "stale"; // the refresh it started lands during the run
+        return new Map([["Peer", "ou_test_stale_peer"]]);
+      }
+      if (info) info.cache = "hit";
+      return LIVE_ROSTER;
+    };
+    const posts = await handoffTurn(resolver);
+    expect(infos.map((i) => i.cache)).toEqual(["stale", "hit"]);
+    expect(posts).toHaveLength(1);
+    expect(posts[0]).toContain("ou_test_live_peer");
+    expect(posts[0]).not.toContain("ou_test_stale_peer");
+  });
+
+  it("a stale re-ask that finds nothing keeps the turn-start roster, not the static ids", async () => {
+    let calls = 0;
+    const resolver: LiveRosterResolver = async (_chatId, info) => {
+      calls += 1;
+      if (calls === 1) {
+        if (info) info.cache = "stale";
+        return LIVE_ROSTER;
+      }
+      return null;
+    };
+    const posts = await handoffTurn(resolver);
+    expect(calls).toBe(2);
+    expect(posts[0]).toContain("ou_test_live_peer");
+    expect(posts[0]).not.toContain("ou_test_static_peer");
+  });
+
+  it("a resolver that throws synchronously keeps the static ids and the turn goes on", async () => {
+    const resolver = ((_chatId: string) => {
+      throw new Error("resolver: bad chat id");
+    }) as unknown as LiveRosterResolver;
+    const { captured } = registerScriptedRunner([{}]);
+    const { client, outcomes } = sequentialClient([newTopicEvent()]);
+    const { handler, events } = makeHandler({
+      client,
+      deps: { peers: PEERS, resolveLiveRoster: resolver },
+    });
+
+    await runAll(handler);
+
+    expect(outcomes).toEqual(["handled:om_test_new"]);
+    expect(captured[0]?.prompt).toContain("ou_test_static_peer");
+    expect(events.some((e) => e.status === "completed")).toBe(true);
+  });
+
+  it("a turn aborted before its terminal record gets no roster diagnostic afterwards", async () => {
+    const lookup = deferred<LiveBotRoster | null>();
+    const resolver: LiveRosterResolver = () => lookup.promise;
+    const { captured } = registerScriptedRunner([{}]);
+    const { client, outcomes } = sequentialClient([continuationEvent("om_test_reply")]);
+    client.addProcessingReaction = async () => {
+      throw new Error("reaction: TLS handshake timeout");
+    };
+    const { handler, events } = makeHandler({
+      client,
+      store: fakeSessionStore([existingSession()]),
+      deps: { peers: PEERS, resolveLiveRoster: resolver },
+    });
+
+    await runAll(handler);
+    expect(captured).toHaveLength(0);
+    expect(outcomes).toEqual(["unhandled:om_test_reply"]);
+
+    lookup.resolve(LIVE_ROSTER); // a remap that would otherwise be recorded
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(events.filter((e) => e.appendPath === "peer roster")).toEqual([]);
+    expect(events.filter((e) => e.status === "running")).toEqual([]);
+  });
 });
 
 describe("WP-2 (c): the post-card COT bubble is not awaited", () => {
@@ -554,6 +672,24 @@ describe("WP-2 (f): runtime-warnings send-on-change", () => {
     });
     await runAll(restarted.handler);
     expect(changedFlags()).toEqual([true, true, false, true]);
+  });
+
+  it("a turn that fails after system_init (codex: turn/start rejected) does not count as delivered", async () => {
+    registerScriptedRunner([{ failAfterInit: true }, {}, {}]);
+    const { client, outcomes } = sequentialClient([
+      continuationEvent("om_test_t1"),
+      continuationEvent("om_test_t2"),
+      continuationEvent("om_test_t3"),
+    ]);
+    const { handler } = makeHandler({
+      client,
+      store: fakeSessionStore([existingSession("codex")]),
+      bot: { backend: "codex" },
+      deps: { runtimeRequirements: REQUIREMENTS },
+    });
+    await runAll(handler);
+    expect(outcomes).toEqual(["unhandled:om_test_t1", "handled:om_test_t2", "handled:om_test_t3"]);
+    expect(changedFlags()).toEqual([true, true, false]);
   });
 
   it("a full prompt always counts as changed", async () => {

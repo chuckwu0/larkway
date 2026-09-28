@@ -136,9 +136,9 @@ function defaultExec(
 
 /**
  * WP-0 diagnostics out-param: how the lookup was served. Resolvers without a
- * cache leave it unset. "stale" = an expired entry returned while a background
- * lookup refreshes it (createCachedRosterResolver). Set before the returned
- * promise settles.
+ * cache leave it unset. "stale" = an expired roster returned while a background
+ * lookup refreshes it (createCachedRosterResolver; never an expired failure).
+ * Set before the returned promise settles.
  */
 export interface RosterLookupInfo {
   cache?: "hit" | "stale" | "miss";
@@ -155,10 +155,10 @@ export type LiveRosterResolver = (
  * chat) so a short TTL cache keeps the prompt-build path from spawning lark-cli
  * on every message. main.ts wires one of these per bot with that bot's profile.
  *
- * WP-2 (b): stale-while-revalidate — an expired entry is returned at once
- * ("stale") while one background lookup refreshes it; only a chat never seen
- * waits for lark-cli ("miss"). Concurrent lookups of one chat share a single
- * in-flight spawn.
+ * WP-2 (b): stale-while-revalidate — an expired roster is returned at once
+ * ("stale") while one background lookup refreshes it; a chat never seen, or
+ * whose cached lookup failed (null) and expired, waits for lark-cli ("miss").
+ * Concurrent lookups of one chat share a single in-flight spawn.
  */
 export function createCachedRosterResolver(opts: {
   profile?: string;
@@ -200,7 +200,10 @@ export function createCachedRosterResolver(opts: {
       if (info) info.cache = "hit";
       return hit.roster;
     }
-    if (hit) {
+    // An expired failure (null) is not worth serving: a peer @ built from it
+    // falls back to static ids that may not wake anyone. Wait for the lookup,
+    // as for a chat never seen.
+    if (hit && hit.roster !== null) {
       if (info) info.cache = "stale";
       // resolveChatBotRoster never rejects; the catch only keeps a surprise
       // from becoming an unhandled rejection.
