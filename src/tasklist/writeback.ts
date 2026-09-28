@@ -13,6 +13,12 @@
  *   1. Best-effort, never throws back to the caller (applyTaskHandleWriteback
  *      swallows everything and just warns).
  *   2. Task/tasklist deleted upstream → drop the mapping, log, do NOT recreate.
+ *      Here that only happens on the patches that still read the task (every
+ *      full-mode patch, comment-mode "failed"). A comment-mode claim's
+ *      received/completed patches skip the read, so its deletion is found by
+ *      CommentPoller (next cycle, about one 60s interval by default) or by
+ *      StallDetector when it is about to nudge — until then the thread still
+ *      counts as claimed (e.g. a v5 `create` in that thread is skipped).
  *   3. No claim for this thread → silent no-op (feature/claim absent = same
  *      as feature disabled).
  *   5. Never touch a title or anything a human wrote outside the bridge's own
@@ -52,8 +58,8 @@
  */
 
 import type { TaskHandleLifecyclePatch } from "./types.js";
-import type { TaskHandleStore } from "./store.js";
-import { TaskListClient, isTaskNotFoundError, isPermissionDeniedError } from "./client.js";
+import type { TaskHandleRecord, TaskHandleStore } from "./store.js";
+import { TaskListClient, isTaskNotFoundError, isPermissionDeniedError, type TaskSnapshot } from "./client.js";
 
 /**
  * Marks the start of the bridge-owned status block inside a task's
@@ -264,6 +270,31 @@ export interface WritebackDeps {
 }
 
 /**
+ * Read the claimed task, or drop the claim when the platform says it's gone
+ * (§6.2 — log, never recreate). Resolves null exactly when the mapping was
+ * dropped; any other failure (403 included) throws to the caller's catch,
+ * which leaves the mapping in place.
+ */
+async function getTaskOrDropClaim(
+  record: TaskHandleRecord,
+  threadId: string,
+  deps: WritebackDeps,
+): Promise<TaskSnapshot | null> {
+  const task = await deps.client.getTask(record.taskGuid).catch((err) => {
+    if (isTaskNotFoundError(err)) return null;
+    throw err;
+  });
+  if (!task) {
+    console.warn(
+      `[tasklist.writeback] task ${record.taskGuid} (thread ${threadId}) not found or inaccessible` +
+        " — dropping claim mapping (no auto-recreate, per docs/task-handle.md §6.2)",
+    );
+    await deps.store.delete(threadId);
+  }
+  return task;
+}
+
+/**
  * Apply one lifecycle patch to the claimed task for `patch.threadId`, if any.
  * Never throws — every failure is logged and swallowed (§6.1).
  */
@@ -275,21 +306,6 @@ export async function applyTaskHandleWriteback(
     const record = deps.store.get(patch.threadId);
     if (!record) return; // no claim for this thread — no-op, same as feature disabled
 
-    const task = await deps.client.getTask(record.taskGuid).catch((err) => {
-      if (isTaskNotFoundError(err)) return null;
-      throw err;
-    });
-    if (!task) {
-      console.warn(
-        `[tasklist.writeback] task ${record.taskGuid} (thread ${patch.threadId}) not found or inaccessible` +
-          " — dropping claim mapping (no auto-recreate, per docs/task-handle.md §6.2)",
-      );
-      await deps.store.delete(patch.threadId);
-      return;
-    }
-
-    const isCompleted = !!task.completedAt && task.completedAt !== "0";
-
     // v4 任务派单 comment-mode (docs/task-handle.md §15.3): maintenance is
     // task-comments-only. No description patches, no complete(), no reopen —
     // share-to-chat grants read+comment and nothing more (§9.14), and v4.1
@@ -298,6 +314,15 @@ export async function applyTaskHandleWriteback(
     // StallDetector/CommentPoller depend on, plus the one crash fallback the
     // dead agent can't do for itself (failure comment — comments DO push,
     // which is strictly better than the old description annotation anyway).
+    //
+    // No getTask on received/completed: neither branch reads the snapshot,
+    // and "received" is awaited before the runner spawns, so the lookup was
+    // pure critical-path latency on every claimed turn. A task deleted
+    // upstream still loses its claim, just off the turn path: CommentPoller
+    // drops it on a not-found listComments, StallDetector on a null getTask
+    // before it nudges (the lag and what it costs: module header, contract
+    // item 2). Only "failed" keeps the lookup: it is about to post a
+    // comment, and a gone task should drop the claim, not fail the post.
     if (record.mode === "comment") {
       switch (patch.status) {
         case "received": {
@@ -335,6 +360,7 @@ export async function applyTaskHandleWriteback(
           break;
         }
         case "failed": {
+          if (!(await getTaskOrDropClaim(record, patch.threadId, deps))) return;
           await deps.store.update(patch.threadId, (current) =>
             current
               ? { ...current, lastTurnOutcome: "failed", lastTurnMentions: undefined, lastTurnMentionsAt: undefined }
@@ -346,6 +372,11 @@ export async function applyTaskHandleWriteback(
       }
       return;
     }
+
+    const task = await getTaskOrDropClaim(record, patch.threadId, deps);
+    if (!task) return;
+
+    const isCompleted = !!task.completedAt && task.completedAt !== "0";
 
     switch (patch.status) {
       case "received": {
