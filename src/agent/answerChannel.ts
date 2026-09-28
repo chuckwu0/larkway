@@ -108,16 +108,22 @@ export class AnswerChannelExtractor {
   }
 
   /**
-   * The runtime reports the end of the text streamed so far: a content
-   * block (claude `content_block_stop`, pi `text_end`), a pi assistant
-   * message (an error message_end may carry no text before pi retries
-   * in-process), or the turn (claude `result`, pi `agent_settled`).
-   * Releases the tail held back in case it began an END marker and marks a
-   * content block boundary, as a block snapshot does, so a turn cut off
-   * before its snapshot keeps its last characters and a retried answer's
-   * BEGIN line is seen at the start of its block. The streamed text stays
-   * claimable by a block snapshot that still arrives, so calling this
-   * before or after one is harmless.
+   * Marks the end of the text streamed so far as a content block boundary,
+   * as a block snapshot does: releases the tail held back in case it began
+   * an END marker, so a turn cut off before its snapshot keeps its last
+   * characters, and lets a BEGIN line at the start of the next block
+   * re-open the answer. The streamed text stays claimable by a block
+   * snapshot that still arrives, so calling this before or after one is
+   * harmless.
+   *
+   * No runner calls this yet; in production the block snapshots are the
+   * only block ends the extractor sees. The places that know a block or
+   * turn ended are claude `content_block_stop` / `result` and pi
+   * `text_end`, every assistant `message_end` (an error one may carry no
+   * text before pi retries in-process) and `agent_settled`. Until one of
+   * them calls this, a turn cut off before its snapshot still loses the
+   * held tail, and a pi retry after an error message_end without text can
+   * keep the failed attempt's text in the answer.
    */
   flush(raw: unknown): AgentStreamEvent[] {
     return this.endBlock(raw);
@@ -183,7 +189,13 @@ export class AnswerChannelExtractor {
    * The snapshot then marks the block's end: the text held back in case it
    * was the start of an END marker (STREAM_HOLD_CHARS) is flushed, and a
    * waiting buffer is dropped, because a marker line never spans two
-   * content blocks.
+   * content blocks. Held text that the blocks after it streamed stays held
+   * for their snapshots.
+   *
+   * Those later blocks' deltas ran on without a break, so a block that
+   * opens with the END line may have reached drain() glued to the previous
+   * block's last character, not at a line start; its snapshot closes the
+   * answer instead (closeAtLeadingEnd).
    *
    * A block with a BEGIN line is parsed on its own, as the plain snapshot
    * path does, unless the delta stream consumed that BEGIN line, i.e. opened
@@ -206,6 +218,11 @@ export class AnswerChannelExtractor {
     this.blockDeltaText = rest;
     this.blockDeltaAnswerFrom = rest ? Math.max(0, answerFrom - carried) : Infinity;
 
+    if (this.mode === "answer" && carried > 0 && answerFrom === 0) {
+      const closed = this.closeAtLeadingEnd(text, streamed, rest, raw);
+      if (closed) return closed;
+    }
+
     const events: AgentStreamEvent[] = [];
     const hasBegin = markerLineIndex(text, ANSWER_BEGIN_MARKER) !== null;
     let openedHere = carried > 0 && answerFrom > 0 && answerFrom <= carried;
@@ -223,9 +240,46 @@ export class AnswerChannelExtractor {
       // for the blocks after it has not reached it.
       this.blockDeltaAnswerFrom = Infinity;
     } else {
-      events.push(...this.endBlock(raw));
+      const laterInAnswer = rest ? Math.max(0, rest.length - this.blockDeltaAnswerFrom) : 0;
+      events.push(...this.endBlock(raw, laterInAnswer));
     }
     return this.withWaitingCatchUp(events, text, raw);
+  }
+
+  /**
+   * A block the deltas carried into the open answer opens with the END
+   * line, which drain() missed: the previous block's last character came
+   * right before it in the delta stream. The answer is the text written
+   * before this block; this block's and the later blocks' streamed text is
+   * taken back, and whatever follows the END line is trailing text. Null
+   * when the written answer does not end with that streamed text.
+   */
+  private closeAtLeadingEnd(
+    text: string,
+    streamed: string,
+    rest: string,
+    raw: unknown,
+  ): AgentStreamEvent[] | null {
+    const end = markerLineIndex(text, ANSWER_END_MARKER);
+    if (end?.start !== 0) return null;
+    const written = this.visibleText + this.buffer;
+    if (!written.endsWith(streamed)) return null;
+    const answer = written.slice(0, written.length - streamed.length);
+    const events: AgentStreamEvent[] = [];
+    if (answer.startsWith(this.visibleText)) {
+      // As drain() closes: the held part loses its line break before END.
+      const tail = stripTrailingNewline(answer.slice(this.visibleText.length));
+      if (hasUsefulText(tail)) events.push(this.answerDelta(tail, raw));
+    } else {
+      // Part of the END block already streamed out (it outgrew the held tail).
+      this.visibleText = stripTrailingNewline(answer);
+      events.push({ type: "answer_snapshot", text: this.visibleText, raw });
+    }
+    const trailing = stripLeadingNewline(text.slice(end.end) + rest);
+    if (trailing.trim()) events.push({ type: "internal_text", text: trailing, raw });
+    this.buffer = "";
+    this.mode = "closed";
+    return events;
   }
 
   private adoptBlockSnapshot(text: string, raw: unknown): AgentStreamEvent[] {
@@ -244,13 +298,26 @@ export class AnswerChannelExtractor {
     return events;
   }
 
-  private endBlock(raw: unknown): AgentStreamEvent[] {
+  /**
+   * `laterInAnswer`: how many characters at the end of the answer's text
+   * the blocks after this one streamed (the later text blocks of a pi
+   * message). The held tail may be theirs: only the part before them is
+   * released, and the block boundary is left to their snapshots.
+   */
+  private endBlock(raw: unknown, laterInAnswer = 0): AgentStreamEvent[] {
     if (this.mode === "waiting") {
       this.buffer = "";
       return [];
     }
     if (this.mode !== "answer") return [];
     const events: AgentStreamEvent[] = [];
+    if (laterInAnswer > 0) {
+      const keep = Math.min(this.buffer.length, laterInAnswer);
+      const released = this.buffer.slice(0, this.buffer.length - keep);
+      this.buffer = this.buffer.slice(this.buffer.length - keep);
+      if (hasUsefulText(released)) events.push(this.answerDelta(released, raw));
+      return events;
+    }
     if (this.atBlockStart) this.resolveBlockStart(true, events, raw);
     if (this.beginLineBreakPending) {
       this.buffer = this.buffer.replace(/^\r?\n?/, "");

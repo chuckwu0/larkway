@@ -457,6 +457,55 @@ describe("AnswerChannelExtractor — block snapshot after streamed deltas (WP-6)
       expect(answer).toBe("Final answer. More.");
     });
 
+    // The END block's deltas run on right behind the answer block's last
+    // character, so drain() never sees END at a line start.
+    const gluedAnswer = `${ANSWER_BEGIN_MARKER}\nThe answer starts here and is long enough to be streamed out in pieces.`;
+    const gluedAnswerBody = "The answer starts here and is long enough to be streamed out in pieces.";
+    it.each<[string, string[]]>([
+      ["after a preamble block", ["Let me look.\n\n", gluedAnswer, ANSWER_END_MARKER]],
+      ["without a preamble", [gluedAnswer, ANSWER_END_MARKER]],
+      ["END followed by a line break", [gluedAnswer, `${ANSWER_END_MARKER}\n`]],
+      ["END block before a short later block", ["Let me look.\n\n", gluedAnswer, ANSWER_END_MARKER, "ok"]],
+    ])("pi: an END-only block glued to the answer block in the delta stream closes the answer (%s)", (_label, blocks) => {
+      const lines = [...blocks.flatMap((block) => chunks(block).map(pi.delta)), pi.blocks(blocks)];
+      const states = answerStates(pi, lines);
+      const { events } = replay(pi, lines);
+
+      expect(states.at(-1)).toBe(gluedAnswerBody);
+      expect(states.some((state) => state.includes(ANSWER_BEGIN_MARKER) || state.includes(ANSWER_END_MARKER))).toBe(false);
+      // The held END tail was never released, so closing needs no replace.
+      expect(answerTypes(events).every((type) => type === "answer_delta")).toBe(true);
+    });
+
+    it("pi: an END block whose trailing text outgrew the held tail closes the answer at its snapshot", () => {
+      const trailing = "Trailing note after the end line, long enough to stream.";
+      const blocks = [gluedAnswer, `${ANSWER_END_MARKER}\n${trailing}`];
+      const deltas = blocks.flatMap((block) => chunks(block).map(pi.delta));
+      const extractor = new AnswerChannelExtractor();
+      const streamed = replay(pi, deltas, extractor);
+      const final = replay(pi, [pi.blocks(blocks)], extractor);
+
+      // Without text_end the END line streams out as answer text first...
+      expect(streamed.answer).toContain(ANSWER_END_MARKER);
+      // ...and the message_end blocks put the answer back.
+      expect(answerTypes(final.events)).toEqual(["answer_snapshot"]);
+      expect(final.answer).toBe(gluedAnswerBody);
+      expect(final.internals).toEqual([trailing]);
+    });
+
+    it("claude: an END block completing a partial END delta closes without replacing the answer", () => {
+      const first = `${ANSWER_BEGIN_MARKER}\nPart one of the answer, long enough.\n`;
+      const { events, answer } = replay(claude, [
+        ...chunks(first).map(claude.delta),
+        claude.blocks([first]),
+        claude.delta(ANSWER_END_MARKER.slice(0, -1)),
+        claude.blocks([ANSWER_END_MARKER]),
+      ]);
+
+      expect(answer).toBe("Part one of the answer, long enough.\n");
+      expect(answerTypes(events).every((type) => type === "answer_delta")).toBe(true);
+    });
+
     it("claude: a later block that opens with BEGIN re-opens the answer while streaming, END or not", () => {
       const draft = `${ANSWER_BEGIN_MARKER}\nDraft answer that is long enough.`;
       for (const final of [
@@ -586,6 +635,35 @@ describe("AnswerChannelExtractor — block snapshot after streamed deltas (WP-6)
 
           expect(sink.answer()).toBe("Part one of the answer, long enough. Part two.");
         }
+      });
+
+      // Block ends only flush() reports (a runner calling it at pi text_end).
+      it("a block ending right after BEGIN and a lone CR adds no CR to the answer", () => {
+        const extractor = new AnswerChannelExtractor();
+        const sink = answerSink();
+        for (const line of ["Checking.\n", ANSWER_BEGIN_MARKER, "\r"].map(pi.delta)) sink.take(pi.parse(line, extractor));
+        sink.take(extractor.flush({}));
+        for (const line of chunks("Answer in the next block.").map(pi.delta)) sink.take(pi.parse(line, extractor));
+        sink.take(extractor.flush({}));
+
+        expect(sink.answer()).toBe("Answer in the next block.");
+      });
+
+      it("a block that is exactly the BEGIN marker re-opens the answer", () => {
+        const extractor = new AnswerChannelExtractor();
+        const sink = answerSink();
+        const states: string[] = [];
+        for (const block of [`${ANSWER_BEGIN_MARKER}\nDraft answer that is long enough.`, ANSWER_BEGIN_MARKER, "Final answer."]) {
+          for (const line of chunks(block).map(pi.delta)) {
+            sink.take(pi.parse(line, extractor));
+            states.push(sink.answer());
+          }
+          sink.take(extractor.flush({}));
+          states.push(sink.answer());
+        }
+
+        expect(sink.answer()).toBe("Final answer.");
+        expect(states.some((state) => state.includes(ANSWER_BEGIN_MARKER))).toBe(false);
       });
     });
   });
