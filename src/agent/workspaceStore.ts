@@ -1,6 +1,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import type { BotConfig } from "../config/botLoader.js";
+import { resolveAgentWorkspacePathFromHome } from "../config/paths.js";
 import { permissionItemsFromCapabilities } from "./permissionPlan.js";
 
 export interface WorkspaceRepoPointer {
@@ -309,13 +310,78 @@ const RETIRED_CONTRACT_LINES = new Set([
   "- Write the per-session state file path provided by the prompt before ending a turn so the Feishu card can finalize.",
   "- Read `permissions-request.md` and `permissions-granted.md` before write/deploy/external-message work.",
   "- 长期知识纪律:每轮 prompt 带有 `sender_is_owner` 事实。owner 的指示可进组织知识库 inbox;非 owner 提供的新知识只写进本 session 的 summary.md 并标注 `[未经 owner 确认]`,由保养轮决定是否晋升 —— 不直接写 AGENTS.md、L2 或知识库。",
+  // The memory ritual line exactly as the pre-批G template wrote it.
+  "- 开场不可跳过:回应 owner 前,先 Read `memory/index.md`,并按相关性 Read 相关 category 文件,再开始干活(防止新 session 失忆)。",
 ]);
 
+/**
+ * Projection path only (runs on an owner-initiated save): the exact retired
+ * lines plus any variant of the memory ritual. The unattended startup
+ * migration matches RETIRED_CONTRACT_LINES exactly and never uses the
+ * substring rule, so an owner's own line mentioning both is left alone.
+ */
+function isRetiredContractLine(line: string): boolean {
+  return RETIRED_CONTRACT_LINES.has(line) ||
+    (line.includes("开场不可跳过") && line.includes("memory/index.md"));
+}
+
 function removeRetiredContractLines(content: string): string {
-  return content.split(/\r?\n/).filter((line) =>
-    !RETIRED_CONTRACT_LINES.has(line) &&
-    !(line.includes("开场不可跳过") && line.includes("memory/index.md")),
-  ).join("\n");
+  return content.split(/\r?\n/).filter((line) => !isRetiredContractLine(line)).join("\n");
+}
+
+/**
+ * tmp + rename next to the real file, so a symlinked AGENTS.md keeps its link
+ * and mode. rename(2) only needs a writable directory, so check the file
+ * itself first: an owner-locked (read-only) file fails with EACCES, exactly as
+ * the config-save paths' plain writeFile does.
+ */
+async function replaceFileAtomic(filePath: string, content: string): Promise<void> {
+  const target = await fs.realpath(filePath);
+  await fs.access(target, fs.constants.W_OK);
+  const { mode } = await fs.stat(target);
+  const tmp = `${target}.${process.pid}.${Date.now()}.tmp`;
+  try {
+    await fs.writeFile(tmp, content, "utf8");
+    await fs.chmod(tmp, mode & 0o7777);
+    await fs.rename(tmp, target);
+  } catch (err) {
+    await fs.rm(tmp, { force: true });
+    throw err;
+  }
+}
+
+/**
+ * Bridge-startup migration for an existing managed AGENTS.md. The per-turn
+ * ensure only creates a missing file and only a config save re-projects it,
+ * so retired contract lines (e.g. "write the state file before ending a
+ * turn") would otherwise keep steering every new native session. Removes
+ * only lines equal to a RETIRED_CONTRACT_LINES entry; every other byte, line
+ * endings included, stays as the owner left it. Returns the number of removed
+ * lines (0 = missing or already clean; nothing is written). A read-only
+ * AGENTS.md is left as is and the call rejects with EACCES.
+ */
+export async function migrateRetiredContractLines(workspacePath: string): Promise<number> {
+  const agentsPath = path.join(workspacePath, "AGENTS.md");
+  const current = await readTextIfExists(agentsPath);
+  if (current === undefined) return 0;
+  const lines = current.split(/(?<=\n)/);
+  const kept = lines.filter((line) => !RETIRED_CONTRACT_LINES.has(line.replace(/\r?\n$/, "")));
+  if (kept.length === lines.length) return 0;
+  await replaceFileAtomic(agentsPath, kept.join(""));
+  return lines.length - kept.length;
+}
+
+/**
+ * Workspace whose AGENTS.md the startup migration may rewrite, or undefined.
+ * A BYO workspace (`bot.workspace`) is owner-owned by contract and never
+ * touched; a legacy-runtime bot has no managed AGENTS.md.
+ */
+export function retiredContractMigrationPath(
+  bot: Pick<BotConfig, "id" | "runtime" | "workspace">,
+  home: string,
+): string | undefined {
+  if (bot.runtime !== "agent_workspace" || bot.workspace) return undefined;
+  return resolveAgentWorkspacePathFromHome(home, bot.id);
 }
 
 interface SectionProjection {
