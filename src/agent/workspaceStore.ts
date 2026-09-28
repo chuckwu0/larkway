@@ -329,9 +329,15 @@ function removeRetiredContractLines(content: string): string {
   return content.split(/\r?\n/).filter((line) => !isRetiredContractLine(line)).join("\n");
 }
 
-/** tmp + rename next to the real file, so a symlinked AGENTS.md keeps its link and mode. */
+/**
+ * tmp + rename next to the real file, so a symlinked AGENTS.md keeps its link
+ * and mode. rename(2) only needs a writable directory, so check the file
+ * itself first: an owner-locked (read-only) file fails with EACCES, exactly as
+ * the config-save paths' plain writeFile does.
+ */
 async function replaceFileAtomic(filePath: string, content: string): Promise<void> {
   const target = await fs.realpath(filePath);
+  await fs.access(target, fs.constants.W_OK);
   const { mode } = await fs.stat(target);
   const tmp = `${target}.${process.pid}.${Date.now()}.tmp`;
   try {
@@ -351,7 +357,8 @@ async function replaceFileAtomic(filePath: string, content: string): Promise<voi
  * turn") would otherwise keep steering every new native session. Removes
  * only lines equal to a RETIRED_CONTRACT_LINES entry; every other byte, line
  * endings included, stays as the owner left it. Returns the number of removed
- * lines (0 = missing or already clean; nothing is written).
+ * lines (0 = missing or already clean; nothing is written). A read-only
+ * AGENTS.md is left as is and the call rejects with EACCES.
  */
 export async function migrateRetiredContractLines(workspacePath: string): Promise<number> {
   const agentsPath = path.join(workspacePath, "AGENTS.md");

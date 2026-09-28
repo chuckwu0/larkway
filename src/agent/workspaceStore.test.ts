@@ -710,6 +710,22 @@ describe("migrateRetiredContractLines", () => {
     expect((await fs.stat(realPath)).mode & 0o777).toBe(0o600);
     expect((await fs.readdir(dir)).sort()).toEqual(["shared-agents.md", "workspace"]);
   });
+
+  // rename(2) would replace a read-only file in a writable directory; the
+  // migration must respect the owner's lock like a plain writeFile does.
+  it.skipIf(process.platform === "win32" || process.getuid?.() === 0)(
+    "leaves an owner-locked (read-only) AGENTS.md untouched",
+    async () => {
+      const agentsPath = path.join(dir, "AGENTS.md");
+      const content = LEGACY_LINES.join("\n");
+      await fs.writeFile(agentsPath, content, "utf8");
+      await fs.chmod(agentsPath, 0o444);
+      await expect(migrateRetiredContractLines(dir)).rejects.toMatchObject({ code: "EACCES" });
+      expect(await fs.readFile(agentsPath, "utf8")).toBe(content);
+      expect((await fs.stat(agentsPath)).mode & 0o777).toBe(0o444);
+      expect(await fs.readdir(dir)).toEqual(["AGENTS.md"]);
+    },
+  );
 });
 
 describe("retiredContractMigrationPath", () => {
