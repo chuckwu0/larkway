@@ -307,7 +307,7 @@ export function resolveOpenChatDiscoveryMs(ctorValue: number | undefined): numbe
 }
 
 /**
- * Opt-in override for the Channel SDK's inbound debounce window, from env
+ * The Channel SDK's inbound debounce window, from env
  * LARKWAY_INBOUND_BATCH_DELAY_MS. The SDK holds every inbound message for a
  * per-chat window before dispatching it — 600ms, or 2000ms once the buffered
  * text reaches 1000 chars, restarted by each new message in the chat (node-sdk
@@ -316,17 +316,19 @@ export function resolveOpenChatDiscoveryMs(ctorValue: number | undefined): numbe
  * dispatch per message, so the window does not decide how messages become
  * turns; it only delays them. That wait happens before our `wsAt` stamp.
  *
- * Unset, empty or non-numeric → `undefined`: keep the SDK default (today's
- * deployed timing). `0` (negatives clamp to 0) → the SDK's pure-serial mode:
- * dispatch at once, the long-message delay skipped too. A positive value
- * replaces only the short-message window. Whatever the value, each message is
- * dispatched on its own, in arrival order.
+ * Because the window is pure latency here, larkway defaults it to `0`:
+ * unset, empty or non-numeric → `0`, the SDK's pure-serial mode (dispatch at
+ * once, the long-message delay skipped too; negatives clamp to 0). A positive
+ * value replaces only the short-message window. `sdk` → `undefined`: keep the
+ * SDK's own default timing. Whatever the value, each message is dispatched on
+ * its own, in arrival order.
  */
 export function resolveInboundBatchDelayMs(): number | undefined {
-  const env = process.env["LARKWAY_INBOUND_BATCH_DELAY_MS"];
-  if (env === undefined || env.trim() === "") return undefined;
+  const env = process.env["LARKWAY_INBOUND_BATCH_DELAY_MS"]?.trim();
+  if (env === undefined || env === "") return 0;
+  if (env.toLowerCase() === "sdk") return undefined;
   const parsed = Number(env);
-  if (!Number.isFinite(parsed)) return undefined;
+  if (!Number.isFinite(parsed)) return 0;
   return parsed > 0 ? parsed : 0;
 }
 
@@ -1229,10 +1231,10 @@ export class ChannelClient {
       // with it; it is keyed by appId either way. Expired entries are swept
       // (ExpiringChannelCache), so N copies of the dedup ids stay bounded.
       cache: new ExpiringChannelCache(),
-      // Opt-in: see resolveInboundBatchDelayMs. The SDK resolves `safety`
+      // See resolveInboundBatchDelayMs (default 0). The SDK resolves `safety`
       // field by field against its own defaults (resolveBatchConfig, dedup,
       // chatQueue, stale window — node-sdk 1.67.0), so passing only
-      // batch.text.delayMs changes nothing else. Omitted when unset.
+      // batch.text.delayMs changes nothing else. Omitted only for `sdk`.
       ...(inboundBatchDelayMs !== undefined
         ? { safety: { batch: { text: { delayMs: inboundBatchDelayMs } } } }
         : {}),

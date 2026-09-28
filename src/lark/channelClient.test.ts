@@ -1177,8 +1177,8 @@ describe("ChannelClient — processing reaction ack", () => {
 
 // ---------------------------------------------------------------------------
 // WP-3 inbound safety options. Each bot gets its own SDK cache (multi-bot
-// dedup fix) and LARKWAY_INBOUND_BATCH_DELAY_MS optionally overrides the
-// SDK's inbound debounce. The last tests feed the options ChannelClient
+// dedup fix) and LARKWAY_INBOUND_BATCH_DELAY_MS sets the SDK's inbound
+// debounce (larkway default 0; "sdk" keeps the SDK's own). The last tests feed the options ChannelClient
 // actually built into REAL SDK channels (no network: connect() is never
 // called) and drive the SDK's inbound pipeline directly — the entry its WS
 // event handler calls — to pin how node-sdk 1.67.0 treats them.
@@ -1284,14 +1284,18 @@ describe("ChannelClient — inbound safety options (WP-3)", () => {
     return got;
   }
 
-  it("resolveInboundBatchDelayMs: unset/empty/non-numeric keep the SDK default; negatives clamp to 0", () => {
+  it("resolveInboundBatchDelayMs: unset/empty/non-numeric default to 0; \"sdk\" keeps the SDK default; negatives clamp to 0", () => {
     delete process.env[ENV_KEY];
-    expect(resolveInboundBatchDelayMs()).toBeUndefined();
+    expect(resolveInboundBatchDelayMs()).toBe(0);
     process.env[ENV_KEY] = "";
-    expect(resolveInboundBatchDelayMs()).toBeUndefined();
+    expect(resolveInboundBatchDelayMs()).toBe(0);
     process.env[ENV_KEY] = "  ";
-    expect(resolveInboundBatchDelayMs()).toBeUndefined();
+    expect(resolveInboundBatchDelayMs()).toBe(0);
     process.env[ENV_KEY] = "abc";
+    expect(resolveInboundBatchDelayMs()).toBe(0);
+    process.env[ENV_KEY] = "sdk";
+    expect(resolveInboundBatchDelayMs()).toBeUndefined();
+    process.env[ENV_KEY] = " SDK ";
     expect(resolveInboundBatchDelayMs()).toBeUndefined();
     process.env[ENV_KEY] = "0";
     expect(resolveInboundBatchDelayMs()).toBe(0);
@@ -1301,7 +1305,7 @@ describe("ChannelClient — inbound safety options (WP-3)", () => {
     expect(resolveInboundBatchDelayMs()).toBe(250);
   });
 
-  it("gives every bot its own cache instance and passes no safety config when the env is unset", async () => {
+  it("gives every bot its own cache instance and defaults the debounce to 0 when the env is unset", async () => {
     delete process.env[ENV_KEY];
     const [a, b] = await capturedChannelOptions(2);
     expect(a!["cache"]).toBeInstanceOf(DefaultCache);
@@ -1309,8 +1313,14 @@ describe("ChannelClient — inbound safety options (WP-3)", () => {
     // A fresh module instance (resetModules), so compare by class name.
     expect((a!["cache"] as object).constructor.name).toBe(ExpiringChannelCache.name);
     expect(a!["cache"]).not.toBe(b!["cache"]);
-    expect(a).not.toHaveProperty("safety");
-    expect(b).not.toHaveProperty("safety");
+    expect(a!["safety"]).toEqual({ batch: { text: { delayMs: 0 } } });
+    expect(b!["safety"]).toEqual({ batch: { text: { delayMs: 0 } } });
+  });
+
+  it("passes no safety config (SDK default timing) when the env is \"sdk\"", async () => {
+    process.env[ENV_KEY] = "sdk";
+    const [opts] = await capturedChannelOptions(1);
+    expect(opts).not.toHaveProperty("safety");
   });
 
   it("the per-bot cache drops expired entries (the dedup ids) on a write after the sweep interval; unexpired and non-expiring entries stay", async () => {
@@ -1374,8 +1384,8 @@ describe("ChannelClient — inbound safety options (WP-3)", () => {
     expect(opts!["safety"]).toEqual({ batch: { text: { delayMs: 0 } } });
   });
 
-  it("two bots both receive a message that @-mentions both, 700ms apart, under the default debounce", async () => {
-    delete process.env[ENV_KEY];
+  it("two bots both receive a message that @-mentions both, 700ms apart, under the SDK's default debounce", async () => {
+    process.env[ENV_KEY] = "sdk";
     const [a, b] = await capturedChannelOptions(2);
     expect(await deliverToBothBots(a!, b!, "om_test_multibot_default", 700)).toEqual(["botA", "botB"]);
 
@@ -1398,9 +1408,12 @@ describe("ChannelClient — inbound safety options (WP-3)", () => {
   });
 
   it("the SDK keeps its other batch defaults around the override", async () => {
-    // Default: short text waits 600ms.
-    delete process.env[ENV_KEY];
+    // "sdk": the SDK's own default — short text waits 600ms.
+    process.env[ENV_KEY] = "sdk";
     const [dflt] = await capturedChannelOptions(1);
+    // Unset: larkway's default 0.
+    delete process.env[ENV_KEY];
+    const [unset] = await capturedChannelOptions(1);
     // 0: dispatch at once — the 2000ms long-message wait is skipped too.
     process.env[ENV_KEY] = "0";
     const [zero] = await capturedChannelOptions(1);
@@ -1424,6 +1437,8 @@ describe("ChannelClient — inbound safety options (WP-3)", () => {
 
     const long = "x".repeat(1_200);
     expect(await dispatchDelayMs(dflt!, "om_test_batch_default", "hi")).toBe(600);
+    expect(await dispatchDelayMs(unset!, "om_test_batch_unset_short", "hi")).toBe(0);
+    expect(await dispatchDelayMs(unset!, "om_test_batch_unset_long", long)).toBe(0);
     expect(await dispatchDelayMs(zero!, "om_test_batch_zero_short", "hi")).toBe(0);
     expect(await dispatchDelayMs(zero!, "om_test_batch_zero_long", long)).toBe(0);
     expect(await dispatchDelayMs(custom!, "om_test_batch_custom_short", "hi")).toBe(250);

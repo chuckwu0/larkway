@@ -298,7 +298,7 @@ describe("ChannelClient — installs the inbound batch split on its SDK channel"
   }
 
   it("two @s in different topics of one group inside the debounce window reach the handler as two events", async () => {
-    delete process.env[ENV_KEY];
+    process.env[ENV_KEY] = "sdk";
     const { client, sdkChannel, events } = await connectRealClient();
 
     const a = await groupAt({ id: uid("e2e_a"), sender: "ou_test_user_a", text: "topic A question", rootId: "om_test_root_a", threadId: "omt_test_a" });
@@ -322,7 +322,8 @@ describe("ChannelClient — installs the inbound batch split on its SDK channel"
   // own create_time (the perf sample's messageCreateAt, read off the flat raw)
   // and gets a ws_at stamped at dispatch, after the window.
   it.each([
-    { env: undefined, name: "unset (SDK default 600ms)", wsAtMs: [800, 800] },
+    { env: "sdk", name: "sdk (SDK default 600ms)", wsAtMs: [800, 800] },
+    { env: undefined, name: "unset (larkway default 0)", wsAtMs: [0, 200] },
     { env: "0", name: "0 (dispatch at once)", wsAtMs: [0, 200] },
   ])("delay $name: the same two events, each with its own create_time; only ws_at moves", async ({ env, wsAtMs }) => {
     if (env === undefined) delete process.env[ENV_KEY];
