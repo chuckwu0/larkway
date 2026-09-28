@@ -583,6 +583,98 @@ export function channelMsgToLarkEvent(
 }
 
 // ---------------------------------------------------------------------------
+// SDK inbound batching → one dispatch per message
+// ---------------------------------------------------------------------------
+
+/** One flush of the SDK's inbound batcher: the message it dispatches + the ids folded into it. */
+interface SdkInboundBatch {
+  message: ChannelNormalizedMessage;
+  sourceIds: string[];
+}
+
+/** node-sdk's private per-chat batcher, reached as `channel.safety.manager`. */
+interface SdkChatPipelineManager {
+  push(
+    scope: string,
+    msg: ChannelNormalizedMessage,
+    handler: (batch: SdkInboundBatch) => Promise<void>,
+  ): void;
+}
+
+/**
+ * Stop the Channel SDK's inbound debounce from merging messages into one turn.
+ *
+ * node-sdk's SafetyPipeline (1.67.0; unchanged through 1.74.0) batches
+ * inbound messages PER CHAT — `manager.push(msg.chatId, …)`, with no thread
+ * or sender in the key and no option to change it — for a debounce window
+ * (600ms, 2000ms once the buffer reaches 1000 chars; forced flush at 8
+ * messages / 4000 chars). It then dispatches ONE message from `mergeBatch`:
+ * the LAST message's id, sender, root/thread id and `raw`, with every
+ * message's text joined into `content`. The event channelMsgToLarkEvent
+ * builds from it is routed to the last message's topic and sender. So two @s
+ * in different topics of one group inside the window became a single turn in
+ * the later topic, and the earlier @ either rode along in the joined text,
+ * under the wrong topic and sender, or was dropped, when content came from
+ * the last message's `raw`. The SDK marks every folded id seen, so a Feishu
+ * re-delivery of the earlier @ is dropped too.
+ *
+ * This wraps the batcher's push. It remembers each buffered message and,
+ * when a flush carries more than one, dispatches every one of them, in
+ * arrival order, each with its own id, sender and raw body. Debounce timing
+ * is unchanged: a lone message still waits out the SDK window. A burst in
+ * one topic is therefore no longer one turn: its first message starts a turn
+ * and the rest queue behind it, where the handler's canCoalesceFollowup folds
+ * same-session plain-text follow-ups into the next turn together.
+ *
+ * The hook depends on SDK internals: `channel.safety.manager.push` and the
+ * `{ message, sourceIds }` flush shape. The exact package pin keeps them
+ * fixed, and channelClient.batchSplit.test.ts drives the real SDK, so a bump
+ * that moves them fails there. Returns false, changing nothing, when they
+ * are missing.
+ */
+export function installInboundBatchSplit(
+  channel: unknown,
+  log: (s: string) => void = () => {},
+): boolean {
+  const manager = (channel as { safety?: { manager?: Partial<SdkChatPipelineManager> } } | null)
+    ?.safety?.manager;
+  if (!manager || typeof manager.push !== "function") return false;
+  const push = manager.push.bind(manager);
+  // messageId → the message as it entered the batcher; dropped at its flush.
+  const buffered = new Map<string, ChannelNormalizedMessage>();
+  manager.push = (scope, msg, handler) => {
+    if (msg.messageId) buffered.set(msg.messageId, msg);
+    push(scope, msg, async (batch) => {
+      // A flush without an id list means the SDK's shape moved: hand it on
+      // untouched (the SDK's own behavior) rather than throw inside its queue,
+      // which would swallow the error and never dispatch the batch. Nothing
+      // buffered can be matched to a flush any more, so drop it all.
+      if (!Array.isArray(batch?.sourceIds)) {
+        buffered.clear();
+        return handler(batch);
+      }
+      const originals = batch.sourceIds.flatMap((id) => {
+        const m = buffered.get(id);
+        buffered.delete(id);
+        return m ? [{ id, m }] : [];
+      });
+      // A lone message is dispatched as-is. A batch holding an id this hook
+      // never saw can't be rebuilt, so it too goes through unchanged.
+      if (batch.sourceIds.length < 2 || originals.length !== batch.sourceIds.length) {
+        return handler(batch);
+      }
+      log(`split SDK-merged inbound batch: chat=${scope} message_ids=${batch.sourceIds.join(",")}`);
+      // One at a time: the SDK handler awaits our listener, so a listener that
+      // finishes asynchronously still hands the chat's messages over in
+      // arrival order. Each call marks its own source id seen and releases
+      // its lock, so that bookkeeping stays per message.
+      for (const { id, m } of originals) await handler({ message: m, sourceIds: [id] });
+    });
+  };
+  return true;
+}
+
+// ---------------------------------------------------------------------------
 // ChannelClient
 // ---------------------------------------------------------------------------
 
@@ -996,6 +1088,12 @@ export class ChannelClient {
       // orthogonal and SAFE precisely because this net still triggers reconnect.
       wsConfig: { pingTimeout: 60 },
     } as Parameters<typeof createLarkChannel>[0]) as unknown as LarkChannel;
+    if (!installInboundBatchSplit(channel, log)) {
+      console.warn(
+        "[channel.client] WARN: node-sdk inbound batcher not found (channel.safety.manager.push); " +
+          "messages in one chat inside the SDK debounce window may be merged into a single turn",
+      );
+    }
 
     channel.on("message", (msg) => {
       if (this.closed) return;
