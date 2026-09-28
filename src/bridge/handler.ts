@@ -4964,11 +4964,13 @@ export class BridgeHandler {
       }
     }
     } finally {
-      // COT safety net: cancel any pending flush on every exit path. If a
-      // finalize already ran (success/error site), this is a no-op; if the
-      // turn escaped both (e.g. threw before finalize), close() at least stops
-      // a dangling throttle timer. Never completes the bubble on its own.
-      cotPublisher?.close();
+      // COT safety net. There is deliberately no close() here any more (WP-2):
+      // every bubble this turn created goes through the idempotent finalize
+      // chained below, which also clears its throttle timer. A close() here
+      // raced background adoption — a handle adopted AFTER the success/error
+      // finalize site had passed (routine once the post-card create stopped
+      // being awaited) was closed first, which turned the chained finalize
+      // into a no-op and left the bubble spinning `Working`.
       // Anti-orphan for the background-adopted bubble: a create slower than the
       // 3s budget resolves AFTER the turn ended, so cotPublisher was still
       // undefined at both finalize sites (and above) — the bubble would be
