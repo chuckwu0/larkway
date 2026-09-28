@@ -1906,8 +1906,10 @@ export class BridgeHandler {
       statusPath: ["已收到"],
       reason: "已进入 bridge，准备创建处理卡片。",
     });
-    // WP-0: the ⏳ reaction round trips on the pre-runner path, timed for the
+    // WP-0: the ⏳ reaction add / removal on the pre-runner path, timed for the
     // perf sample (the error-path removal further down is not pre-runner).
+    // Since WP-3 both calls return before their round trip (ChannelClient
+    // logs its duration), so these time only the call itself.
     if (this.deps.client.addProcessingReaction) {
       await turnPerf.timed("reactionAddMs", this.deps.client.addProcessingReaction(messageId));
     }

@@ -71,23 +71,27 @@ interface Scenario {
   cardkit: "ok" | "fail";
   /** Serial network round trips before runner.run() in today's handler. */
   expectSerial: number;
-  /** Total network calls started before runner.run(). */
+  /** Awaitable (non-detached) network calls started before runner.run(). */
   expectCalls: number;
 }
 
-// new topic:   reaction.add → card (reply+idConvert | failed reply → legacy card)
-//              → reaction.delete → COT bubble on the card → [roster]
-// continuation: [root probe ‖ reaction.add] → COT thread (rejected) → COT chat
-//              → card → reaction.delete → [roster]
+// new topic:   card (reply+idConvert | failed reply → legacy card)
+//              → COT bubble on the card → [roster]
+// continuation: [root probe ‖ COT thread (rejected)] → COT chat → card → [roster]
+//              (the probe is only awaited pre-prompt, so it rides along)
+// The ⏳ reaction's add (at the start) and delete (once the card exists) run
+// detached since WP-3: the client returns before either round trip, so they
+// are off the serial path. WP-0 baseline: new 6/5, continuation 7/6 — there
+// the awaited add sat alone after [probe ‖ add] and the delete before roster.
 const SCENARIOS: Scenario[] = [
-  { name: "new/roster-cold/cardkit-ok", thread: "new", roster: "cold", cardkit: "ok", expectSerial: 6, expectCalls: 6 },
-  { name: "new/roster-warm/cardkit-ok", thread: "new", roster: "warm", cardkit: "ok", expectSerial: 5, expectCalls: 5 },
-  { name: "new/roster-cold/cardkit-fail", thread: "new", roster: "cold", cardkit: "fail", expectSerial: 6, expectCalls: 6 },
-  { name: "new/roster-warm/cardkit-fail", thread: "new", roster: "warm", cardkit: "fail", expectSerial: 5, expectCalls: 5 },
-  { name: "continuation/roster-cold/cardkit-ok", thread: "continuation", roster: "cold", cardkit: "ok", expectSerial: 7, expectCalls: 8 },
-  { name: "continuation/roster-warm/cardkit-ok", thread: "continuation", roster: "warm", cardkit: "ok", expectSerial: 6, expectCalls: 7 },
-  { name: "continuation/roster-cold/cardkit-fail", thread: "continuation", roster: "cold", cardkit: "fail", expectSerial: 7, expectCalls: 8 },
-  { name: "continuation/roster-warm/cardkit-fail", thread: "continuation", roster: "warm", cardkit: "fail", expectSerial: 6, expectCalls: 7 },
+  { name: "new/roster-cold/cardkit-ok", thread: "new", roster: "cold", cardkit: "ok", expectSerial: 4, expectCalls: 4 },
+  { name: "new/roster-warm/cardkit-ok", thread: "new", roster: "warm", cardkit: "ok", expectSerial: 3, expectCalls: 3 },
+  { name: "new/roster-cold/cardkit-fail", thread: "new", roster: "cold", cardkit: "fail", expectSerial: 4, expectCalls: 4 },
+  { name: "new/roster-warm/cardkit-fail", thread: "new", roster: "warm", cardkit: "fail", expectSerial: 3, expectCalls: 3 },
+  { name: "continuation/roster-cold/cardkit-ok", thread: "continuation", roster: "cold", cardkit: "ok", expectSerial: 5, expectCalls: 6 },
+  { name: "continuation/roster-warm/cardkit-ok", thread: "continuation", roster: "warm", cardkit: "ok", expectSerial: 4, expectCalls: 5 },
+  { name: "continuation/roster-cold/cardkit-fail", thread: "continuation", roster: "cold", cardkit: "fail", expectSerial: 5, expectCalls: 6 },
+  { name: "continuation/roster-warm/cardkit-fail", thread: "continuation", roster: "warm", cardkit: "fail", expectSerial: 4, expectCalls: 5 },
 ];
 
 const ROOT_ID = "om_bench_root";
@@ -114,6 +118,7 @@ function eventFor(s: Scenario): LarkMessageEvent {
 interface RunResult {
   serial: number;
   calls: string[];
+  detached: string[];
   sample: PerfSample;
   timeline: LatencyTimeline;
 }
@@ -197,7 +202,13 @@ async function runScenario(root: string, s: Scenario, rep: number): Promise<RunR
   expect(timeline.runAt).toBeDefined();
   expect(spawned, "no real subprocess").toEqual([]);
   const { calls, groups } = timeline.serialGroupsBeforeRun();
-  return { serial: groups, calls: calls.map((c) => c.what), sample: samples[0]!, timeline };
+  return {
+    serial: groups,
+    calls: calls.map((c) => c.what),
+    detached: timeline.detachedBeforeRun().map((c) => c.what),
+    sample: samples[0]!,
+    timeline,
+  };
 }
 
 function pct(values: number[], p: number): number {
@@ -233,6 +244,8 @@ describe("handler latency bench (A1)", () => {
       // Critical-path shape.
       expect(r.serial, `serial round trips before run(): ${r.calls.join(" → ")}`).toBe(s.expectSerial);
       expect(r.calls).toHaveLength(s.expectCalls);
+      // The ⏳ add is fired before run() but nothing waits for it.
+      expect(r.detached).toContain("reaction.add");
 
       // Ordering: an existing topic's bubble lands BEFORE the card, a new
       // topic's AFTER it (the topic does not exist until the card creates it).
@@ -253,8 +266,9 @@ describe("handler latency bench (A1)", () => {
       expect(sample.preRunner?.rosterCache).toBe(s.roster === "warm" ? "hit" : "miss");
       expect(sample.preRunner?.cotChannel).toBe(s.thread === "continuation" ? "chat-after-thread" : "chat");
       expect(sample.preRunner?.cardReplyMs).toBeGreaterThanOrEqual(NET_MS - 5);
-      expect(sample.preRunner?.reactionAddMs).toBeGreaterThanOrEqual(NET_MS - 5);
-      expect(sample.preRunner?.reactionRemoveMs).toBeGreaterThanOrEqual(NET_MS - 5);
+      // Still timed, but the client call returns before its round trip (WP-3).
+      expect(sample.preRunner?.reactionAddMs).toBeGreaterThanOrEqual(0);
+      expect(sample.preRunner?.reactionRemoveMs).toBeGreaterThanOrEqual(0);
       if (s.cardkit === "ok") {
         expect(sample.preRunner?.cardIdConvertMs).toBeGreaterThanOrEqual(NET_MS - 5);
         expect(sample.preRunner?.legacyCardMs).toBeUndefined();
@@ -273,6 +287,7 @@ describe("handler latency bench (A1)", () => {
       reps: REPS,
       serialBeforeRun: last!.serial,
       callsBeforeRun: last!.calls,
+      detachedBeforeRun: last!.detached,
       preRunnerMsP50: pct(preRunnerMs, 0.5),
       preRunnerMsP90: pct(preRunnerMs, 0.9),
       tailMsP50: pct(tailMs, 0.5),

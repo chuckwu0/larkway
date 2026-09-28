@@ -9,13 +9,20 @@ import { mkdtemp, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { describe, it, expect, vi, afterEach } from "vitest";
+// The REAL SDK module (no hoisted vi.mock of it in this file). Every vi.doMock
+// of the SDK below passes DefaultCache through, since connect() builds one
+// cache per channel (a mock without it would throw); realCreateLarkChannel
+// backs the WP-3 tests that drive the SDK's own inbound pipeline.
+import { DefaultCache, createLarkChannel as realCreateLarkChannel } from "@larksuiteoapi/node-sdk";
 import {
   channelMsgToLarkEvent,
+  resolveInboundBatchDelayMs,
   resolveOpenChatDiscoveryMs,
   resolveRecoveredThreadId,
   synthesizeCardActionEvent,
   type ChannelCardAction,
 } from "./channelClient.js";
+import { silentSdkLogger } from "./sdkLogger.js";
 
 function rawEvent(message: Record<string, unknown>, openId = "ou_sender") {
   return {
@@ -240,6 +247,7 @@ describe("ChannelClient cardAction → inbound queue (integration)", () => {
 
     vi.resetModules();
     vi.doMock("@larksuiteoapi/node-sdk", () => ({
+      DefaultCache,
       createLarkChannel: () => fakeChannel,
     }));
     const { ChannelClient } = await import("./channelClient.js");
@@ -295,7 +303,7 @@ describe("ChannelClient cardAction → inbound queue (integration)", () => {
     };
 
     vi.resetModules();
-    vi.doMock("@larksuiteoapi/node-sdk", () => ({ createLarkChannel: () => fakeChannel }));
+    vi.doMock("@larksuiteoapi/node-sdk", () => ({ DefaultCache, createLarkChannel: () => fakeChannel }));
     const { ChannelClient } = await import("./channelClient.js");
     const client = new ChannelClient({
       allowedChatIds: new Set(["oc_1"]),
@@ -403,6 +411,7 @@ describe("ChannelClient — open chat policy", () => {
     let captured: unknown;
     vi.resetModules();
     vi.doMock("@larksuiteoapi/node-sdk", () => ({
+      DefaultCache,
       createLarkChannel: (opts: unknown) => {
         captured = opts;
         return makeFakeChannel();
@@ -432,6 +441,7 @@ describe("ChannelClient — open chat policy", () => {
     let captured: unknown;
     vi.resetModules();
     vi.doMock("@larksuiteoapi/node-sdk", () => ({
+      DefaultCache,
       createLarkChannel: (opts: unknown) => {
         captured = opts;
         return makeFakeChannel();
@@ -458,10 +468,25 @@ describe("ChannelClient — open chat policy", () => {
 });
 
 describe("ChannelClient — processing reaction ack", () => {
-  it("adds a temporary reaction and removes the same reaction id", async () => {
-    const calls: Array<{ op: "create" | "delete"; messageId: string; reactionId?: string; emoji?: string }> = [];
+  interface ReactionCall {
+    op: "create" | "delete";
+    messageId: string;
+    reactionId?: string;
+    emoji?: string;
+  }
+
+  /**
+   * Fake channel whose reaction calls stay pending until the test settles
+   * them, so "returns before the round trip" and "removal lands after its
+   * add" are observable without timers.
+   */
+  function makeReactionChannel(opts: { createThrowsSync?: boolean } = {}) {
+    const calls: ReactionCall[] = [];
+    const creates: Array<{ resolve: (v: unknown) => void; reject: (e: unknown) => void }> = [];
+    const deletes: Array<() => void> = [];
+    const deleteFailures: Array<(e: unknown) => void> = [];
     const fakeChannel = {
-      botIdentity: { openId: "ou_bot", name: "Lee-QA" },
+      botIdentity: { openId: "ou_bot", name: "Test Bot" },
       on() {},
       async connect() {},
       async disconnect() {},
@@ -471,19 +496,24 @@ describe("ChannelClient — processing reaction ack", () => {
           v1: {
             message: { async reply() { return { data: {} }; } },
             messageReaction: {
-              async create(payload: { path: { message_id: string }; data: { reaction_type: { emoji_type: string } } }) {
+              create(payload: { path: { message_id: string }; data: { reaction_type: { emoji_type: string } } }) {
                 calls.push({
                   op: "create",
                   messageId: payload.path.message_id,
                   emoji: payload.data.reaction_type.emoji_type,
                 });
-                return { data: { reaction_id: "reaction_1" } };
+                if (opts.createThrowsSync) throw new Error("sync SDK failure");
+                return new Promise((resolve, reject) => creates.push({ resolve, reject }));
               },
-              async delete(payload: { path: { message_id: string; reaction_id: string } }) {
+              delete(payload: { path: { message_id: string; reaction_id: string } }) {
                 calls.push({
                   op: "delete",
                   messageId: payload.path.message_id,
                   reactionId: payload.path.reaction_id,
+                });
+                return new Promise<void>((resolve, reject) => {
+                  deletes.push(resolve);
+                  deleteFailures.push(reject);
                 });
               },
             },
@@ -491,11 +521,12 @@ describe("ChannelClient — processing reaction ack", () => {
         },
       },
     };
+    return { calls, creates, deletes, deleteFailures, fakeChannel };
+  }
 
+  async function connectedClient(fakeChannel: unknown) {
     vi.resetModules();
-    vi.doMock("@larksuiteoapi/node-sdk", () => ({
-      createLarkChannel: () => fakeChannel,
-    }));
+    vi.doMock("@larksuiteoapi/node-sdk", () => ({ DefaultCache, createLarkChannel: () => fakeChannel }));
     const { ChannelClient } = await import("./channelClient.js");
     const client = new ChannelClient({
       allowedChatIds: new Set(),
@@ -505,61 +536,453 @@ describe("ChannelClient — processing reaction ack", () => {
       connectGraceMs: 0,
       openChatDiscoveryMs: 0,
     });
-
     await client.connect();
+    return client;
+  }
+
+  /** Let chained promise callbacks run (no timers involved). */
+  const flush = () => new Promise<void>((resolve) => setImmediate(resolve));
+
+  /**
+   * Unhandled rejections raised while `body` runs. The reaction calls are no
+   * longer awaited by the handler, so a rejection on one of their floating
+   * chains would surface here (and in production as crash-guard noise).
+   */
+  async function unhandledRejectionsDuring(body: () => Promise<void>): Promise<unknown[]> {
+    const seen: unknown[] = [];
+    const onRejection = (reason: unknown) => {
+      seen.push(reason);
+    };
+    process.on("unhandledRejection", onRejection);
+    try {
+      await body();
+      await flush();
+      await flush();
+    } finally {
+      process.off("unhandledRejection", onRejection);
+    }
+    return seen;
+  }
+
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.doUnmock("@larksuiteoapi/node-sdk");
+    vi.resetModules();
+  });
+
+  it("adds a temporary reaction and removes the same reaction id", async () => {
+    const { calls, creates, deletes, fakeChannel } = makeReactionChannel();
+    const client = await connectedClient(fakeChannel);
+
     await client.addProcessingReaction("om_user");
+    await flush();
+    creates[0]!.resolve({ data: { reaction_id: "reaction_1" } });
     await client.removeProcessingReaction("om_user");
+    await flush();
+    deletes[0]!();
+    await client.close();
 
     expect(calls).toEqual([
       { op: "create", messageId: "om_user", emoji: "Typing" },
       { op: "delete", messageId: "om_user", reactionId: "reaction_1" },
     ]);
+  });
 
+  it("returns before either round trip lands, and a removal made mid-add still removes it", async () => {
+    const { calls, creates, deletes, fakeChannel } = makeReactionChannel();
+    const client = await connectedClient(fakeChannel);
+
+    // Both calls resolve while the create is still on the wire.
+    await client.addProcessingReaction("om_user");
+    await client.removeProcessingReaction("om_user");
+    await flush();
+    expect(calls).toEqual([{ op: "create", messageId: "om_user", emoji: "Typing" }]);
+
+    // The delete is chained behind the add: it fires once the id is known.
+    creates[0]!.resolve({ data: { reaction_id: "reaction_1" } });
+    await flush();
+    expect(calls).toEqual([
+      { op: "create", messageId: "om_user", emoji: "Typing" },
+      { op: "delete", messageId: "om_user", reactionId: "reaction_1" },
+    ]);
+    deletes[0]!();
     await client.close();
+  });
+
+  it("swallows reaction add failures so message handling can continue", async () => {
+    const { calls, creates, fakeChannel } = makeReactionChannel();
+    const client = await connectedClient(fakeChannel);
+
+    // A removal chained behind an add that then fails has nothing to delete.
+    await expect(client.addProcessingReaction("om_user")).resolves.toBeUndefined();
+    await expect(client.removeProcessingReaction("om_user")).resolves.toBeUndefined();
+    creates[0]!.reject(new Error("permission denied"));
+    await flush();
+    expect(calls.map((c) => c.op)).toEqual(["create"]);
+    await client.close();
+  });
+
+  it("forgets a failed add, so the next add for the message tries again", async () => {
+    const { calls, creates, fakeChannel } = makeReactionChannel();
+    const client = await connectedClient(fakeChannel);
+
+    await client.addProcessingReaction("om_user");
+    await flush();
+    creates[0]!.reject(new Error("rate limited"));
+    await flush();
+    await client.addProcessingReaction("om_user");
+    await flush();
+    expect(calls.map((c) => c.op)).toEqual(["create", "create"]);
+    creates[1]!.resolve({ data: { reaction_id: "reaction_2" } });
+    await client.close();
+  });
+
+  it("absorbs a synchronous SDK throw from the add", async () => {
+    const { calls, fakeChannel } = makeReactionChannel({ createThrowsSync: true });
+    const client = await connectedClient(fakeChannel);
+
+    await expect(client.addProcessingReaction("om_user")).resolves.toBeUndefined();
+    await expect(client.removeProcessingReaction("om_user")).resolves.toBeUndefined();
+    await flush();
+
+    expect(calls.map((c) => c.op)).toEqual(["create"]);
+    await client.close();
+  });
+
+  it("treats a create that resolves without a result as a failed add", async () => {
+    const { calls, creates, deletes, fakeChannel } = makeReactionChannel();
+    const client = await connectedClient(fakeChannel);
+
+    const rejections = await unhandledRejectionsDuring(async () => {
+      await client.addProcessingReaction("om_user");
+      await flush();
+      creates[0]!.resolve(undefined);
+      await flush();
+      // Forgotten like any failed add: the next add creates again, and a
+      // removal chained behind that one deletes what it made.
+      await client.addProcessingReaction("om_user");
+      await client.removeProcessingReaction("om_user");
+      await flush();
+      creates[1]!.resolve({ data: { reaction_id: "reaction_2" } });
+      await flush();
+      deletes[0]!();
+    });
+
+    expect(rejections).toEqual([]);
+    expect(calls).toEqual([
+      { op: "create", messageId: "om_user", emoji: "Typing" },
+      { op: "create", messageId: "om_user", emoji: "Typing" },
+      { op: "delete", messageId: "om_user", reactionId: "reaction_2" },
+    ]);
+    await client.close();
+  });
+
+  it("contains non-Error rejections from create and delete", async () => {
+    const { calls, creates, deleteFailures, fakeChannel } = makeReactionChannel();
+    const client = await connectedClient(fakeChannel);
+
+    const rejections = await unhandledRejectionsDuring(async () => {
+      await client.addProcessingReaction("om_a");
+      creates[0]!.reject(undefined);
+      await flush();
+      await client.addProcessingReaction("om_b");
+      creates[1]!.resolve({ data: { reaction_id: "reaction_b" } });
+      await client.removeProcessingReaction("om_b");
+      await flush();
+      deleteFailures[0]!(undefined);
+      await flush();
+    });
+
+    expect(rejections).toEqual([]);
+    expect(calls.map((c) => c.op)).toEqual(["create", "create", "delete"]);
+    await client.close();
+  });
+
+  it("logs the duration of each reaction round trip", async () => {
+    const info = vi.spyOn(console, "info").mockImplementation(() => {});
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const { creates, deletes, fakeChannel } = makeReactionChannel();
+      const client = await connectedClient(fakeChannel);
+
+      await client.addProcessingReaction("om_user");
+      await client.removeProcessingReaction("om_user");
+      await client.addProcessingReaction("om_other");
+      await flush();
+      creates[0]!.resolve({ data: { reaction_id: "reaction_1" } });
+      creates[1]!.reject(new Error("rate limited"));
+      await flush();
+      deletes[0]!();
+      await client.close();
+
+      const infoLines = info.mock.calls.map((args) => String(args[0]));
+      expect(infoLines).toContainEqual(
+        expect.stringMatching(/processing reaction added message=om_user reaction=reaction_1 emoji=Typing ms=\d+$/),
+      );
+      expect(infoLines).toContainEqual(
+        expect.stringMatching(/processing reaction removed message=om_user reaction=reaction_1 ms=\d+$/),
+      );
+      expect(warn.mock.calls.map((args) => String(args[0]))).toContainEqual(
+        expect.stringMatching(/add processing reaction failed for om_other after \d+ms: rate limited$/),
+      );
+    } finally {
+      info.mockRestore();
+      warn.mockRestore();
+    }
+  });
+
+  it("treats a repeated add or remove as a no-op", async () => {
+    const { calls, creates, deletes, fakeChannel } = makeReactionChannel();
+    const client = await connectedClient(fakeChannel);
+
+    await client.addProcessingReaction("om_user");
+    await client.addProcessingReaction("om_user");
+    await flush();
+    creates[0]!.resolve({ data: { reaction_id: "reaction_1" } });
+    await client.removeProcessingReaction("om_user");
+    await client.removeProcessingReaction("om_user");
+    await flush();
+    deletes.forEach((resolve) => resolve());
+    await client.close();
+
+    expect(calls.map((c) => c.op)).toEqual(["create", "delete"]);
+  });
+
+  it("close() waits for a removal still on the wire", async () => {
+    const { calls, creates, deletes, fakeChannel } = makeReactionChannel();
+    const client = await connectedClient(fakeChannel);
+    await client.addProcessingReaction("om_user");
+    await flush();
+    creates[0]!.resolve({ data: { reaction_id: "reaction_1" } });
+    await client.removeProcessingReaction("om_user");
+    await flush();
+    expect(calls.map((c) => c.op)).toEqual(["create", "delete"]);
+
+    let closed = false;
+    const closing = client.close().then(() => {
+      closed = true;
+    });
+    await flush();
+    expect(closed).toBe(false);
+    deletes[0]!();
+    await closing;
+    expect(closed).toBe(true);
+  });
+
+  it("close() gives up on a hung reaction call after the drain bound", async () => {
+    const { fakeChannel } = makeReactionChannel();
+    const client = await connectedClient(fakeChannel);
+    await client.addProcessingReaction("om_user"); // create never settles
+
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    let closed = false;
+    const closing = client.close().then(() => {
+      closed = true;
+    });
+    await vi.advanceTimersByTimeAsync(1_999);
+    expect(closed).toBe(false);
+    await vi.advanceTimersByTimeAsync(1);
+    await closing;
+    expect(closed).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// WP-3 inbound safety options. Each bot gets its own SDK cache (multi-bot
+// dedup fix) and LARKWAY_INBOUND_BATCH_DELAY_MS optionally overrides the
+// SDK's inbound debounce. The last tests feed the options ChannelClient
+// actually built into REAL SDK channels (no network: connect() is never
+// called) and drive the SDK's inbound pipeline directly — the entry its WS
+// event handler calls — to pin how node-sdk 1.67.0 treats them.
+// ---------------------------------------------------------------------------
+describe("ChannelClient — inbound safety options (WP-3)", () => {
+  const ENV_KEY = "LARKWAY_INBOUND_BATCH_DELAY_MS";
+  const original = process.env[ENV_KEY];
+
+  afterEach(() => {
+    if (original === undefined) delete process.env[ENV_KEY];
+    else process.env[ENV_KEY] = original;
+    vi.useRealTimers();
     vi.doUnmock("@larksuiteoapi/node-sdk");
     vi.resetModules();
   });
 
-  it("swallows reaction add failures so message handling can continue", async () => {
-    const fakeChannel = {
-      botIdentity: { openId: "ou_bot", name: "Lee-QA" },
+  function makeFakeChannel() {
+    return {
+      botIdentity: { openId: "ou_bot", name: "Test Bot" },
       on() {},
       async connect() {},
       async disconnect() {},
       async updateCard() {},
-      rawClient: {
-        im: {
-          v1: {
-            message: { async reply() { return { data: {} }; } },
-            messageReaction: {
-              async create() { throw new Error("permission denied"); },
-              async delete() {},
-            },
-          },
-        },
-      },
+      rawClient: { im: { v1: { message: { async reply() { return { data: {} }; } } } } },
     };
+  }
 
+  /** Connect `count` ChannelClients (one per bot) and return the options each passed to the SDK. */
+  async function capturedChannelOptions(count: number): Promise<Array<Record<string, unknown>>> {
+    const captured: Array<Record<string, unknown>> = [];
     vi.resetModules();
     vi.doMock("@larksuiteoapi/node-sdk", () => ({
-      createLarkChannel: () => fakeChannel,
+      DefaultCache,
+      createLarkChannel: (opts: Record<string, unknown>) => {
+        captured.push(opts);
+        return makeFakeChannel();
+      },
     }));
     const { ChannelClient } = await import("./channelClient.js");
-    const client = new ChannelClient({
-      allowedChatIds: new Set(),
-      botOpenId: "ou_bot",
-      appId: "cli_x",
-      appSecret: "secret",
-      connectGraceMs: 0,
-      openChatDiscoveryMs: 0,
-    });
+    for (let i = 0; i < count; i++) {
+      const client = new ChannelClient({
+        allowedChatIds: new Set(),
+        botOpenId: `ou_test_bot_${i}`,
+        appId: `cli_test_bot_${i}`,
+        appSecret: "secret",
+        connectGraceMs: 0,
+        openChatDiscoveryMs: 0,
+      });
+      await client.connect();
+      await client.close();
+    }
+    return captured;
+  }
 
-    await client.connect();
-    await expect(client.addProcessingReaction("om_user")).resolves.toBeUndefined();
+  interface SdkInbound {
+    on(event: "message", handler: (msg: { messageId: string; content: string }) => void): void;
+    /** SDK-private inbound pipeline entry (stale → dedup → policy → batch → dispatch). */
+    safety: { pushMessage(msg: Record<string, unknown>): Promise<void> };
+  }
 
-    await client.close();
-    vi.doUnmock("@larksuiteoapi/node-sdk");
-    vi.resetModules();
+  function realChannel(opts: Record<string, unknown>): SdkInbound {
+    return realCreateLarkChannel({
+      ...(opts as unknown as Parameters<typeof realCreateLarkChannel>[0]),
+      logger: silentSdkLogger,
+    }) as unknown as SdkInbound;
+  }
+
+  function groupMessage(messageId: string, content = "hi") {
+    return {
+      messageId,
+      chatId: "oc_test_group",
+      chatType: "group",
+      senderId: "ou_test_user",
+      content,
+      rawContentType: "text",
+      resources: [],
+      mentions: [],
+      mentionAll: false,
+      mentionedBot: true,
+      createTime: Date.now(),
+      raw: {},
+    };
+  }
+
+  /** The same @-both-bots message reaches bot A's WS, then bot B's `gapMs` later. */
+  async function deliverToBothBots(
+    optsA: Record<string, unknown>,
+    optsB: Record<string, unknown>,
+    messageId: string,
+    gapMs: number,
+  ): Promise<string[]> {
+    const got: string[] = [];
+    const a = realChannel(optsA);
+    const b = realChannel(optsB);
+    a.on("message", () => got.push("botA"));
+    b.on("message", () => got.push("botB"));
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    await a.safety.pushMessage(groupMessage(messageId));
+    await vi.advanceTimersByTimeAsync(gapMs);
+    await b.safety.pushMessage(groupMessage(messageId));
+    await vi.advanceTimersByTimeAsync(3_000);
+    vi.useRealTimers();
+    return got;
+  }
+
+  it("resolveInboundBatchDelayMs: unset/empty/non-numeric keep the SDK default; negatives clamp to 0", () => {
+    delete process.env[ENV_KEY];
+    expect(resolveInboundBatchDelayMs()).toBeUndefined();
+    process.env[ENV_KEY] = "";
+    expect(resolveInboundBatchDelayMs()).toBeUndefined();
+    process.env[ENV_KEY] = "  ";
+    expect(resolveInboundBatchDelayMs()).toBeUndefined();
+    process.env[ENV_KEY] = "abc";
+    expect(resolveInboundBatchDelayMs()).toBeUndefined();
+    process.env[ENV_KEY] = "0";
+    expect(resolveInboundBatchDelayMs()).toBe(0);
+    process.env[ENV_KEY] = "-5";
+    expect(resolveInboundBatchDelayMs()).toBe(0);
+    process.env[ENV_KEY] = "250";
+    expect(resolveInboundBatchDelayMs()).toBe(250);
+  });
+
+  it("gives every bot its own cache instance and passes no safety config when the env is unset", async () => {
+    delete process.env[ENV_KEY];
+    const [a, b] = await capturedChannelOptions(2);
+    expect(a!["cache"]).toBeInstanceOf(DefaultCache);
+    expect(b!["cache"]).toBeInstanceOf(DefaultCache);
+    expect(a!["cache"]).not.toBe(b!["cache"]);
+    expect(a).not.toHaveProperty("safety");
+    expect(b).not.toHaveProperty("safety");
+  });
+
+  it("passes only batch.text.delayMs when LARKWAY_INBOUND_BATCH_DELAY_MS is set", async () => {
+    process.env[ENV_KEY] = "0";
+    const [opts] = await capturedChannelOptions(1);
+    expect(opts!["safety"]).toEqual({ batch: { text: { delayMs: 0 } } });
+  });
+
+  it("two bots both receive a message that @-mentions both, 700ms apart, under the default debounce", async () => {
+    delete process.env[ENV_KEY];
+    const [a, b] = await capturedChannelOptions(2);
+    expect(await deliverToBothBots(a!, b!, "om_test_multibot_default", 700)).toEqual(["botA", "botB"]);
+
+    // Control: the pre-fix options (no cache → the SDK's process-global one)
+    // drop bot B's copy as a duplicate — the bug the per-bot cache fixes.
+    const withoutCache = (opts: Record<string, unknown>) => {
+      const copy = { ...opts };
+      delete copy["cache"];
+      return copy;
+    };
+    expect(
+      await deliverToBothBots(withoutCache(a!), withoutCache(b!), "om_test_multibot_shared", 700),
+    ).toEqual(["botA"]);
+  });
+
+  it("two bots both receive it 50ms apart with the debounce at 0", async () => {
+    process.env[ENV_KEY] = "0";
+    const [a, b] = await capturedChannelOptions(2);
+    expect(await deliverToBothBots(a!, b!, "om_test_multibot_zero", 50)).toEqual(["botA", "botB"]);
+  });
+
+  it("the SDK keeps its other batch defaults around the override", async () => {
+    // Default: short text waits 600ms.
+    delete process.env[ENV_KEY];
+    const [dflt] = await capturedChannelOptions(1);
+    // 0: dispatch at once — the 2000ms long-message wait is skipped too.
+    process.env[ENV_KEY] = "0";
+    const [zero] = await capturedChannelOptions(1);
+    // 250: only the short window changes; long text keeps the SDK's 2000ms.
+    process.env[ENV_KEY] = "250";
+    const [custom] = await capturedChannelOptions(1);
+
+    async function dispatchDelayMs(opts: Record<string, unknown>, messageId: string, content: string) {
+      const channel = realChannel(opts);
+      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+      const t0 = Date.now();
+      let at: number | undefined;
+      channel.on("message", () => {
+        at ??= Date.now() - t0;
+      });
+      await channel.safety.pushMessage(groupMessage(messageId, content));
+      await vi.advanceTimersByTimeAsync(3_000);
+      vi.useRealTimers();
+      return at;
+    }
+
+    const long = "x".repeat(1_200);
+    expect(await dispatchDelayMs(dflt!, "om_test_batch_default", "hi")).toBe(600);
+    expect(await dispatchDelayMs(zero!, "om_test_batch_zero_short", "hi")).toBe(0);
+    expect(await dispatchDelayMs(zero!, "om_test_batch_zero_long", long)).toBe(0);
+    expect(await dispatchDelayMs(custom!, "om_test_batch_custom_short", "hi")).toBe(250);
+    expect(await dispatchDelayMs(custom!, "om_test_batch_custom_long", long)).toBe(2_000);
   });
 });
 
@@ -590,6 +1013,7 @@ describe("ChannelClient — pre-connect restart grace", () => {
     const connectLog = { calledAt: null as number | null };
     vi.resetModules();
     vi.doMock("@larksuiteoapi/node-sdk", () => ({
+      DefaultCache,
       createLarkChannel: () => makeFakeChannel(connectLog),
     }));
     const { ChannelClient } = await import("./channelClient.js");
@@ -614,6 +1038,7 @@ describe("ChannelClient — pre-connect restart grace", () => {
     const connectLog = { calledAt: null as number | null };
     vi.resetModules();
     vi.doMock("@larksuiteoapi/node-sdk", () => ({
+      DefaultCache,
       createLarkChannel: () => makeFakeChannel(connectLog),
     }));
     const { ChannelClient } = await import("./channelClient.js");
@@ -647,6 +1072,7 @@ describe("ChannelClient — pre-connect restart grace", () => {
     let createCount = 0;
     vi.resetModules();
     vi.doMock("@larksuiteoapi/node-sdk", () => ({
+      DefaultCache,
       createLarkChannel: () => {
         createCount++;
         return makeFakeChannel(connectLog);
@@ -736,6 +1162,7 @@ describe("ChannelClient — gap-fill after reconnect (BL-15)", () => {
     // bound to a channel nobody captured → handlers never registered → flaky.)
     const chObj = makeFakeChannelWithHandlers();
     vi.doMock("@larksuiteoapi/node-sdk", () => ({
+      DefaultCache,
       createLarkChannel: () => chObj.ch,
     }));
 
@@ -824,6 +1251,7 @@ describe("ChannelClient — gap-fill after reconnect (BL-15)", () => {
     }));
     const chObj = makeFakeChannelWithHandlers();
     vi.doMock("@larksuiteoapi/node-sdk", () => ({
+      DefaultCache,
       createLarkChannel: () => chObj.ch,
     }));
 
@@ -897,6 +1325,7 @@ describe("ChannelClient — gap-fill after reconnect (BL-15)", () => {
 
     const chObj = makeFakeChannelWithHandlers();
     vi.doMock("@larksuiteoapi/node-sdk", () => ({
+      DefaultCache,
       createLarkChannel: () => chObj.ch,
     }));
 
@@ -977,6 +1406,7 @@ describe("ChannelClient — gap-fill after reconnect (BL-15)", () => {
 
     const chObj = makeFakeChannelWithHandlers();
     vi.doMock("@larksuiteoapi/node-sdk", () => ({
+      DefaultCache,
       createLarkChannel: () => chObj.ch,
     }));
 
@@ -1040,6 +1470,7 @@ describe("ChannelClient — gap-fill after reconnect (BL-15)", () => {
     vi.resetModules();
     const chObj = makeFakeChannelWithHandlers();
     vi.doMock("@larksuiteoapi/node-sdk", () => ({
+      DefaultCache,
       createLarkChannel: () => chObj.ch,
     }));
 
@@ -1157,6 +1588,7 @@ describe("ChannelClient — gap-fill after reconnect (BL-15)", () => {
 
     const chObj = makeFakeChannelWithHandlers();
     vi.doMock("@larksuiteoapi/node-sdk", () => ({
+      DefaultCache,
       createLarkChannel: () => chObj.ch,
     }));
 
@@ -1225,6 +1657,7 @@ describe("ChannelClient — gap-fill after reconnect (BL-15)", () => {
 
     const chObj2 = makeFakeChannelWithHandlers();
     vi.doMock("@larksuiteoapi/node-sdk", () => ({
+      DefaultCache,
       createLarkChannel: () => chObj2.ch,
     }));
 
@@ -1308,6 +1741,7 @@ describe("ChannelClient — gap-fill after reconnect (BL-15)", () => {
 
     const chObj3 = makeFakeChannelWithHandlers();
     vi.doMock("@larksuiteoapi/node-sdk", () => ({
+      DefaultCache,
       createLarkChannel: () => chObj3.ch,
     }));
 
@@ -1404,6 +1838,7 @@ describe("ChannelClient — p2p gap-fill across restart + 230002 untracking", ()
     }));
     const chObj = makeFakeChannelWithHandlers();
     vi.doMock("@larksuiteoapi/node-sdk", () => ({
+      DefaultCache,
       createLarkChannel: () => chObj.ch,
     }));
 
@@ -1475,6 +1910,7 @@ describe("ChannelClient — p2p gap-fill across restart + 230002 untracking", ()
     }));
     const chObj = makeFakeChannelWithHandlers();
     vi.doMock("@larksuiteoapi/node-sdk", () => ({
+      DefaultCache,
       createLarkChannel: () => chObj.ch,
     }));
 
@@ -1666,7 +2102,7 @@ describe("ChannelClient — in-flight self-heal (markHandled/markUnhandled)", ()
     vi.resetModules();
     vi.doMock("node:child_process", () => ({ execFile: execMock }));
     const chObj = makeFakeChannelWithHandlers();
-    vi.doMock("@larksuiteoapi/node-sdk", () => ({ createLarkChannel: () => chObj.ch }));
+    vi.doMock("@larksuiteoapi/node-sdk", () => ({ DefaultCache, createLarkChannel: () => chObj.ch }));
 
     const { ChannelClient } = await import("./channelClient.js");
     const client = new ChannelClient({
@@ -2101,7 +2537,7 @@ describe("ChannelClient — gap-fill retry + failed-window replay (0.3.17)", () 
     vi.resetModules();
     vi.doMock("node:child_process", () => ({ execFile: execMock }));
     const chObj = makeFakeChannelWithHandlers();
-    vi.doMock("@larksuiteoapi/node-sdk", () => ({ createLarkChannel: () => chObj.ch }));
+    vi.doMock("@larksuiteoapi/node-sdk", () => ({ DefaultCache, createLarkChannel: () => chObj.ch }));
 
     const { ChannelClient } = await import("./channelClient.js");
     const client = new ChannelClient({
@@ -2338,6 +2774,7 @@ describe("ChannelClient — keep half-open WS detection (0.3.28)", () => {
     let captured: Record<string, unknown> | undefined;
     vi.resetModules();
     vi.doMock("@larksuiteoapi/node-sdk", () => ({
+      DefaultCache,
       createLarkChannel: (opts: Record<string, unknown>) => {
         captured = opts;
         return makeFakeChannel();
@@ -2422,7 +2859,7 @@ describe("ChannelClient — open-chat discovery storm controls (0.3.28)", () => 
       },
     }));
     const chObj = makeFakeChannelWithHandlers();
-    vi.doMock("@larksuiteoapi/node-sdk", () => ({ createLarkChannel: () => chObj.ch }));
+    vi.doMock("@larksuiteoapi/node-sdk", () => ({ DefaultCache, createLarkChannel: () => chObj.ch }));
 
     const { ChannelClient } = await import("./channelClient.js");
     const client = new ChannelClient({
@@ -2524,7 +2961,7 @@ describe("ChannelClient — open-chat discovery storm controls (0.3.28)", () => 
       },
     }));
     const chObj = makeFakeChannelWithHandlers();
-    vi.doMock("@larksuiteoapi/node-sdk", () => ({ createLarkChannel: () => chObj.ch }));
+    vi.doMock("@larksuiteoapi/node-sdk", () => ({ DefaultCache, createLarkChannel: () => chObj.ch }));
 
     const { ChannelClient } = await import("./channelClient.js");
     const client = new ChannelClient({
@@ -2608,7 +3045,7 @@ describe("ChannelClient — open-chat discovery storm controls (0.3.28)", () => 
       },
     }));
     const chObj = makeFakeChannelWithHandlers();
-    vi.doMock("@larksuiteoapi/node-sdk", () => ({ createLarkChannel: () => chObj.ch }));
+    vi.doMock("@larksuiteoapi/node-sdk", () => ({ DefaultCache, createLarkChannel: () => chObj.ch }));
 
     const { ChannelClient } = await import("./channelClient.js");
     const client = new ChannelClient({
@@ -2673,7 +3110,7 @@ describe("ChannelClient — atomic seen-state writes (0.3.28)", () => {
     const larkwayDir = await mkdtemp(path.join(tmpdir(), "larkway-atomic-"));
     vi.resetModules();
     const chObj = makeFakeChannelWithHandlers();
-    vi.doMock("@larksuiteoapi/node-sdk", () => ({ createLarkChannel: () => chObj.ch }));
+    vi.doMock("@larksuiteoapi/node-sdk", () => ({ DefaultCache, createLarkChannel: () => chObj.ch }));
 
     const { ChannelClient } = await import("./channelClient.js");
     const client = new ChannelClient({
@@ -2771,7 +3208,7 @@ describe("ChannelClient ingestLocalEvent — local dispatch + WS-copy dedup", ()
   it("dispatches the local copy once; a second local ingest of the same id is deduped", async () => {
     const handlers: Record<string, ((arg: unknown) => void) | undefined> = {};
     vi.resetModules();
-    vi.doMock("@larksuiteoapi/node-sdk", () => ({ createLarkChannel: () => makeFakeChannel(handlers) }));
+    vi.doMock("@larksuiteoapi/node-sdk", () => ({ DefaultCache, createLarkChannel: () => makeFakeChannel(handlers) }));
     const { ChannelClient } = await import("./channelClient.js");
     const client = new ChannelClient({
       allowedChatIds: new Set(["oc_1"]),
@@ -2807,7 +3244,7 @@ describe("ChannelClient ingestLocalEvent — local dispatch + WS-copy dedup", ()
   it("the WS copy of a locally-dispatched message is deduped (and vice versa)", async () => {
     const handlers: Record<string, ((arg: unknown) => void) | undefined> = {};
     vi.resetModules();
-    vi.doMock("@larksuiteoapi/node-sdk", () => ({ createLarkChannel: () => makeFakeChannel(handlers) }));
+    vi.doMock("@larksuiteoapi/node-sdk", () => ({ DefaultCache, createLarkChannel: () => makeFakeChannel(handlers) }));
     const { ChannelClient } = await import("./channelClient.js");
     const client = new ChannelClient({
       allowedChatIds: new Set(["oc_1"]),
@@ -2917,7 +3354,7 @@ describe("ChannelClient — gap-fill window + paging (BL-55)", () => {
       },
     }));
     const chObj = makeFakeChannelWithHandlers();
-    vi.doMock("@larksuiteoapi/node-sdk", () => ({ createLarkChannel: () => chObj.ch }));
+    vi.doMock("@larksuiteoapi/node-sdk", () => ({ DefaultCache, createLarkChannel: () => chObj.ch }));
 
     const { ChannelClient } = await import("./channelClient.js");
     const client = new ChannelClient({
@@ -2973,7 +3410,7 @@ describe("ChannelClient — gap-fill window + paging (BL-55)", () => {
       },
     }));
     const chObj = makeFakeChannelWithHandlers();
-    vi.doMock("@larksuiteoapi/node-sdk", () => ({ createLarkChannel: () => chObj.ch }));
+    vi.doMock("@larksuiteoapi/node-sdk", () => ({ DefaultCache, createLarkChannel: () => chObj.ch }));
 
     const { ChannelClient } = await import("./channelClient.js");
     const client = new ChannelClient({
@@ -3024,7 +3461,7 @@ describe("ChannelClient — gap-fill window + paging (BL-55)", () => {
       },
     }));
     const chObj = makeFakeChannelWithHandlers();
-    vi.doMock("@larksuiteoapi/node-sdk", () => ({ createLarkChannel: () => chObj.ch }));
+    vi.doMock("@larksuiteoapi/node-sdk", () => ({ DefaultCache, createLarkChannel: () => chObj.ch }));
 
     // shouldAdvanceTime keeps the test's own async polling alive while letting
     // us jump the wall clock to simulate a suspended machine.
