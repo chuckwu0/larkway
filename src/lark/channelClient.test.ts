@@ -949,6 +949,91 @@ describe("ChannelClient — gap-fill after reconnect (BL-15)", () => {
     vi.resetModules();
   });
 
+  it("WP-0: stamps ws_at on live deliveries only (gap-fill replays carry none)", async () => {
+    const liveMessageId = "om_live_ws_at";
+    const gapMessageId = "om_gap_ws_at";
+
+    vi.resetModules();
+    vi.doMock("node:child_process", () => ({
+      execFile: (
+        _cmd: string,
+        _args: string[],
+        cb: (err: null, result: { stdout: string; stderr: string }) => void,
+      ) => {
+        const items = [
+          {
+            message_id: gapMessageId,
+            chat_id: "oc_open",
+            chat_type: "group",
+            content: JSON.stringify({ text: "@bot 断线期间的消息" }),
+            sender: { id: "ou_sender" },
+            create_time: String(Date.now()),
+            mentions: [{ id: { open_id: "ou_bot" } }],
+          },
+        ];
+        cb(null, { stdout: JSON.stringify(items), stderr: "" });
+      },
+    }));
+
+    const chObj = makeFakeChannelWithHandlers();
+    vi.doMock("@larksuiteoapi/node-sdk", () => ({
+      createLarkChannel: () => chObj.ch,
+    }));
+
+    const { ChannelClient } = await import("./channelClient.js");
+    const client = new ChannelClient({
+      allowedChatIds: new Set(),
+      botOpenId: "ou_bot",
+      appId: "cli_x",
+      appSecret: "secret",
+      connectGraceMs: 0,
+      channelStaleMs: 0,
+      openChatDiscoveryMs: 0,
+    });
+
+    const dispatched = new Map<string, unknown>();
+    void (async () => {
+      for await (const ev of client.events()) dispatched.set(ev.message_id, ev.ws_at);
+    })();
+    for (let i = 0; i < 100 && !chObj.handlers["message"]; i++) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
+
+    const before = Date.now();
+    chObj.handlers["message"]!({
+      raw: {
+        event: {
+          message: {
+            message_id: liveMessageId,
+            chat_id: "oc_open",
+            chat_type: "group",
+            content: JSON.stringify({ text: "@bot 实时消息" }),
+            mentions: [{ id: { open_id: "ou_bot" } }],
+          },
+          sender: { sender_id: { open_id: "ou_sender" } },
+        },
+      },
+    });
+    const after = Date.now();
+    chObj.handlers["reconnecting"]!(undefined);
+    chObj.handlers["reconnected"]!(undefined);
+
+    for (let i = 0; i < 100 && !dispatched.has(gapMessageId); i++) {
+      await new Promise((r) => setTimeout(r, 20));
+    }
+    const liveWsAt = dispatched.get(liveMessageId);
+    expect(typeof liveWsAt).toBe("number");
+    expect(liveWsAt as number).toBeGreaterThanOrEqual(before);
+    expect(liveWsAt as number).toBeLessThanOrEqual(after);
+    expect(dispatched.has(gapMessageId)).toBe(true);
+    expect(dispatched.get(gapMessageId)).toBeUndefined();
+
+    await client.close();
+    vi.doUnmock("@larksuiteoapi/node-sdk");
+    vi.doUnmock("node:child_process");
+    vi.resetModules();
+  });
+
   it("persists live-seen chats so open-bot gap-fill survives bridge restart", async () => {
     const larkwayDir = await mkdtemp(path.join(tmpdir(), "larkway-seen-chats-"));
 

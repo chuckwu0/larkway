@@ -163,6 +163,8 @@ export class CodexProcessPool implements AgentRunner {
   readonly #pidFilePath: string | undefined;
 
   #child: ChildProcess | undefined;
+  /** WP-0: when the current child was spawned — for the idle-reap log line. */
+  #childSpawnedAt: number | undefined;
   #nextRequestId = 1;
   #nextTurnKey = 1;
   readonly #pending = new Map<number, PendingRequest>();
@@ -506,6 +508,7 @@ export class CodexProcessPool implements AgentRunner {
     const env = buildCodexEnv(this.#botGitIdentity, this.#gitlabToken, this.#larkCliConfigDir);
     const child = spawnPiped(bin, args, { env });
     this.#child = child;
+    this.#childSpawnedAt = Date.now();
     this.#pending.clear();
     this.#threadOwners.clear();
     this.#loadedThreadIds.clear();
@@ -643,6 +646,16 @@ export class CodexProcessPool implements AgentRunner {
     if (this.#idleTimer) {
       clearInterval(this.#idleTimer);
       this.#idleTimer = undefined;
+    }
+    // WP-0 (CDX-6): make reaps countable in bridge logs — whether always-on
+    // hosts actually cold-resume after idling is an open question (D5).
+    if (this.#child != null) {
+      const now = Date.now();
+      console.warn(
+        `[codex-pool] reaping idle warm app-server pid=${this.#child.pid ?? "?"} ` +
+          `childAgeMs=${this.#childSpawnedAt != null ? now - this.#childSpawnedAt : "?"} ` +
+          `idleMs=${this.#idleSince != null ? now - this.#idleSince : "?"} — the next turn cold-starts it`,
+      );
     }
     this.#killChildNow();
   }

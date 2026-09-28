@@ -2156,6 +2156,136 @@ describe("handleOne — thin-channel finalize", () => {
     expect(capturedSample?.runnerError).toBeUndefined();
   });
 
+  it("WP-0: the perf sample carries the turn timeline, segment timings, usage and wrapper size", async () => {
+    const threadId = "om_msg";
+    await seedWorktree(threadId);
+    await seedRepoCachePath();
+    const { client: cardKitClient } = makeCardKitClient();
+    let actualPrompt = "";
+    runClaudeImpl = (opts: unknown) => {
+      actualPrompt = (opts as { prompt: string }).prompt;
+      return {
+        events: (async function* () {
+          yield { type: "system_init", sessionId: "sess_wp0", raw: {} };
+          yield { type: "answer_snapshot", text: "done", raw: {} };
+          yield {
+            type: "result",
+            stopReason: "end_turn",
+            raw: {},
+            usage: { inputTokens: 12, cacheCreationTokens: 300, cacheReadTokens: 9000, outputTokens: 250, requests: 2 },
+            lastRequestInputTokens: 5207,
+          };
+        })(),
+        done: Promise.resolve({ exitCode: 0, sessionId: "sess_wp0" }),
+        kill: () => {},
+      };
+    };
+    const wsAt = Date.now();
+    const { client } = makeClient({ ...makeEvent(), ws_at: wsAt });
+    const { store } = makeSessionStore();
+    const samples: PerfSample[] = [];
+    const handler = new BridgeHandler({
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      client: client as any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      cardRenderer: makeCardRenderer().renderer as any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      sessionStore: store as any,
+      conventions: makeConventions(),
+      botConfig: {
+        id: "frontend",
+        name: "Frontend",
+        turn_taking_limit: 10,
+        backend: "claude",
+        response_surface_prototype: {
+          enabled: true,
+          allowed_chats: [],
+          allowed_threads: ["om_msg"],
+          kill_switch: false,
+          post_outbound_enabled: false,
+          cardkit_streaming_enabled: true,
+          allow_agent_mentions: true,
+          denied_mention_open_ids: [],
+          allowed_mention_open_ids: [],
+        },
+      },
+      cardKitClient,
+      recordPerfSample: async (sample) => {
+        samples.push(sample);
+      },
+    });
+
+    await handler.run();
+    await handler.whenAllTurnsSettled();
+
+    expect(samples).toHaveLength(1);
+    const s = samples[0]!;
+    expect(s).toMatchObject({
+      messageCreateAt: 1700000000000,
+      wsAt,
+      usage: { inputTokens: 12, cacheCreationTokens: 300, cacheReadTokens: 9000, outputTokens: 250, requests: 2 },
+      lastRequestInputTokens: 5207,
+      promptChars: actualPrompt.length,
+      wrapperChars: actualPrompt.length - "看下进度".length,
+      exitCode: 0,
+    });
+    expect(s.runnerError).toBeUndefined();
+    // Timeline points are monotone in handling order.
+    const order = [
+      s.wsAt, s.enqueueAt, s.handleStartAt, s.runnerRunAt, s.runnerDoneAt,
+      s.finalizeStartAt, s.finalizeEndAt, s.finishedAt,
+    ];
+    expect(order.every((t) => typeof t === "number")).toBe(true);
+    for (let i = 1; i < order.length; i++) expect(order[i]!).toBeGreaterThanOrEqual(order[i - 1]!);
+    expect(s.preRunner).toMatchObject({ rosterCache: "skip" });
+    expect(s.preRunner?.promptRenderMs).toBeGreaterThanOrEqual(0);
+    expect(s.preRunner?.receivedHookMs).toBeGreaterThanOrEqual(0);
+    expect(s.preRunner?.cardReplyMs).toBeGreaterThanOrEqual(0); // fake client: no split timings
+    // finalize always sends at least the final card entity + settings.
+    expect(s.postRunner?.cardkitCalls).toBeGreaterThanOrEqual(2);
+    expect(s.postRunner?.cardkitCallMsMax).toBeGreaterThanOrEqual(s.postRunner!.cardkitCallMsP50!);
+  });
+
+  it("WP-0: a throw after the runner finished still writes the sample — without runnerError", async () => {
+    await seedWorktree("om_msg");
+    await seedRepoCachePath();
+    runClaudeImpl = () => ({
+      events: (async function* () {
+        yield { type: "system_init", sessionId: "sess_wp0b", raw: {} };
+        yield { type: "answer_snapshot", text: "done", raw: {} };
+      })(),
+      done: Promise.resolve({ exitCode: 0, sessionId: "sess_wp0b" }),
+      kill: () => {},
+    });
+    const { client } = makeClient(makeEvent());
+    const { store } = makeSessionStore();
+    const samples: PerfSample[] = [];
+    const handler = new BridgeHandler({
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      client: client as any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      cardRenderer: makeCardRenderer({ failFinalize: true }).renderer as any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      sessionStore: store as any,
+      conventions: makeConventions(),
+      botConfig: { id: "frontend", name: "Frontend", turn_taking_limit: 10, backend: "claude" },
+      recordPerfSample: async (sample) => {
+        samples.push(sample);
+      },
+    });
+
+    await handler.run();
+    await handler.whenAllTurnsSettled();
+
+    expect(samples).toHaveLength(1);
+    expect(samples[0]).toMatchObject({ exitCode: 0 });
+    expect(samples[0]?.runnerError).toBeUndefined();
+    expect(typeof samples[0]?.runnerDoneAt).toBe("number");
+    expect(typeof samples[0]?.finalizeStartAt).toBe("number");
+    expect(samples[0]?.finalizeEndAt).toBeUndefined(); // finalize threw
+    expect(samples[0]?.finishedAt).toBeUndefined();
+  });
+
   it("A1 (agent_workspace): creates the CardKit placeholder card BEFORE the (local-fs-only) prewarm work", async () => {
     // agent_workspace has no bridge-managed git worktree at all — the A1
     // early-card path is safe here (see the BLOCKER writeup on the legacy

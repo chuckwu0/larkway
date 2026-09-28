@@ -21,6 +21,7 @@ import {
   type AgentStreamEvent,
   type RunOptions,
   type RunHandle,
+  type TurnUsage,
   createPerfMarker,
   markPerfForEventType,
 } from "../agent/runner.js";
@@ -181,6 +182,85 @@ export function buildWarmCommand(opts: RunOptions): [string, string[]] {
 }
 
 /**
+ * WP-0: per-turn state for {@link parseLinesMulti}'s usage extraction. The
+ * `result` line carries the turn's summed usage; only the per-request
+ * `assistant` lines know how many model requests the turn made and how large
+ * the last one's input (the native context) was. One per turn, like the
+ * answer extractor.
+ */
+export interface ClaudeTurnUsageState {
+  lastMessageId?: string;
+  requests: number;
+  lastRequestInputTokens?: number;
+}
+
+export function newClaudeTurnUsageState(): ClaudeTurnUsageState {
+  return { requests: 0 };
+}
+
+function finiteNumber(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+/**
+ * One API response streams as several `assistant` lines (one per content
+ * block, same message id, same input usage) — count distinct ids. Subagent
+ * traffic carries `parent_tool_use_id` and is not this turn's own context.
+ */
+function noteClaudeAssistantUsage(record: Record<string, unknown>, state: ClaudeTurnUsageState): void {
+  if (record["parent_tool_use_id"] != null) return;
+  const message = record["message"] as Record<string, unknown> | undefined;
+  const usage = message?.["usage"];
+  if (typeof usage !== "object" || usage === null) return;
+  const u = usage as Record<string, unknown>;
+  const id = typeof message?.["id"] === "string" ? message["id"] : undefined;
+  if (id !== undefined && id !== state.lastMessageId) {
+    state.requests += 1;
+    state.lastMessageId = id;
+  }
+  state.lastRequestInputTokens =
+    (finiteNumber(u["input_tokens"]) ?? 0) +
+    (finiteNumber(u["cache_creation_input_tokens"]) ?? 0) +
+    (finiteNumber(u["cache_read_input_tokens"]) ?? 0);
+}
+
+/**
+ * WP-0: normalise a claude `result` line's `usage` (the whole turn, every
+ * model request summed) into {@link TurnUsage}. Keys are omitted — never set
+ * to undefined — when unknown, so the result event keeps its old shape.
+ */
+export function claudeResultUsage(
+  record: Record<string, unknown>,
+  state?: ClaudeTurnUsageState,
+): Pick<Extract<AgentStreamEvent, { type: "result" }>, "usage" | "lastRequestInputTokens"> {
+  const out: Pick<Extract<AgentStreamEvent, { type: "result" }>, "usage" | "lastRequestInputTokens"> = {};
+  const raw = record["usage"];
+  const u = typeof raw === "object" && raw !== null ? (raw as Record<string, unknown>) : undefined;
+  const inputTokens = finiteNumber(u?.["input_tokens"]);
+  const outputTokens = finiteNumber(u?.["output_tokens"]);
+  if (u && inputTokens !== undefined && outputTokens !== undefined) {
+    const usage: TurnUsage = {
+      inputTokens,
+      cacheCreationTokens: finiteNumber(u["cache_creation_input_tokens"]) ?? 0,
+      cacheReadTokens: finiteNumber(u["cache_read_input_tokens"]) ?? 0,
+      outputTokens,
+    };
+    const details = u["output_tokens_details"];
+    const thinking =
+      typeof details === "object" && details !== null
+        ? finiteNumber((details as Record<string, unknown>)["thinking_tokens"])
+        : undefined;
+    if (thinking !== undefined) usage.reasoningTokens = thinking;
+    if (state && state.requests > 0) usage.requests = state.requests;
+    out.usage = usage;
+  }
+  if (state?.lastRequestInputTokens !== undefined) {
+    out.lastRequestInputTokens = state.lastRequestInputTokens;
+  }
+  return out;
+}
+
+/**
  * Like parseLine but yields *all* events from a single NDJSON line.
  * An `assistant` message with multiple content blocks (e.g. text + tool_use)
  * would emit one event per block.
@@ -188,6 +268,7 @@ export function buildWarmCommand(opts: RunOptions): [string, string[]] {
 function* parseLinesMulti(
   line: string,
   answerExtractor = new AnswerChannelExtractor(),
+  usageState?: ClaudeTurnUsageState,
 ): Generator<AgentStreamEvent> {
   const trimmed = line.trim();
   if (trimmed === "") return;
@@ -220,11 +301,12 @@ function* parseLinesMulti(
   if (eventType === "result") {
     const stopReason =
       typeof record["stop_reason"] === "string" ? record["stop_reason"] : "unknown";
-    yield { type: "result", stopReason, raw: obj };
+    yield { type: "result", stopReason, raw: obj, ...claudeResultUsage(record, usageState) };
     return;
   }
 
   if (eventType === "assistant") {
+    if (usageState) noteClaudeAssistantUsage(record, usageState);
     const message = record["message"];
     if (
       typeof message === "object" &&
@@ -632,12 +714,13 @@ export function runClaude(opts: RunOptions): RunHandle {
     // called by finalizeResolve() so this loop exits and handler.ts can
     // proceed to card.finalize() without waiting for stdout to drain).
     const answerExtractor = new AnswerChannelExtractor();
+    const usageState = newClaudeTurnUsageState();
 
     try {
       for await (const line of rl) {
         // A0: first stdout line observed, regardless of content (marks once).
         markPerf("first_line");
-        for (const event of parseLinesMulti(line, answerExtractor)) {
+        for (const event of parseLinesMulti(line, answerExtractor, usageState)) {
           // Track sessionId as we see it
           if (event.type === "system_init") {
             discoveredSessionId = event.sessionId;

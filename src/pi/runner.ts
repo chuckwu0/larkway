@@ -50,6 +50,7 @@ import {
   type AgentStreamEvent,
   type RunOptions,
   type RunHandle,
+  type TurnUsage,
   createPerfMarker,
   markPerfForEventType,
 } from "../agent/runner.js";
@@ -323,8 +324,13 @@ function* parsePiLine(
  * The runner keeps only the LAST outcome: pi retries transient errors and
  * continues after overflow compaction in-process, so an error message_end
  * followed by a successful one is a recovered turn, not a failed one.
+ *
+ * WP-0: `usage` is that model request's own usage (`message.usage`, one per
+ * assistant message_end), present only when pi reported one.
  */
-export function piAssistantOutcomeFromLine(line: string): { error?: string } | undefined {
+export function piAssistantOutcomeFromLine(
+  line: string,
+): { error?: string; usage?: PiRequestUsage } | undefined {
   let obj: unknown;
   try {
     obj = JSON.parse(line);
@@ -335,9 +341,55 @@ export function piAssistantOutcomeFromLine(line: string): { error?: string } | u
   if (record?.["type"] !== "message_end") return undefined;
   const message = asRecord(record["message"]);
   if (message?.["role"] !== "assistant") return undefined;
-  if (message["stopReason"] !== "error") return {};
+  const usage = piRequestUsage(message["usage"]);
+  const withUsage = usage ? { usage } : {};
+  if (message["stopReason"] !== "error") return withUsage;
   const msg = message["errorMessage"];
-  return { error: typeof msg === "string" && msg.trim() ? msg.trim() : "pi reported an assistant error" };
+  return {
+    error: typeof msg === "string" && msg.trim() ? msg.trim() : "pi reported an assistant error",
+    ...withUsage,
+  };
+}
+
+/** WP-0: one pi model request's usage (`message.usage` on an assistant message_end). */
+export interface PiRequestUsage {
+  input: number;
+  output: number;
+  cacheRead: number;
+  cacheWrite: number;
+  reasoning?: number;
+}
+
+function piRequestUsage(value: unknown): PiRequestUsage | undefined {
+  const u = asRecord(value);
+  const n = (key: string): number | undefined =>
+    typeof u?.[key] === "number" && Number.isFinite(u[key]) ? (u[key] as number) : undefined;
+  const input = n("input");
+  const output = n("output");
+  if (input === undefined || output === undefined) return undefined;
+  const reasoning = n("reasoning");
+  return {
+    input,
+    output,
+    cacheRead: n("cacheRead") ?? 0,
+    cacheWrite: n("cacheWrite") ?? 0,
+    ...(reasoning !== undefined ? { reasoning } : {}),
+  };
+}
+
+/** WP-0: add one request to the turn's running {@link TurnUsage} (pi is one prompt per process). */
+export function addPiRequestUsage(acc: TurnUsage | undefined, u: PiRequestUsage): TurnUsage {
+  const reasoning = u.reasoning !== undefined || acc?.reasoningTokens !== undefined
+    ? (acc?.reasoningTokens ?? 0) + (u.reasoning ?? 0)
+    : undefined;
+  return {
+    inputTokens: (acc?.inputTokens ?? 0) + u.input,
+    cacheCreationTokens: (acc?.cacheCreationTokens ?? 0) + u.cacheWrite,
+    cacheReadTokens: (acc?.cacheReadTokens ?? 0) + u.cacheRead,
+    outputTokens: (acc?.outputTokens ?? 0) + u.output,
+    ...(reasoning !== undefined ? { reasoningTokens: reasoning } : {}),
+    requests: (acc?.requests ?? 0) + 1,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -387,6 +439,9 @@ export function runPi(opts: RunOptions, piBinPath = "pi"): RunHandle {
   let discoveredSessionId: string | undefined;
   /** Error of the LAST assistant message_end seen; cleared by a later success. */
   let assistantError: string | undefined;
+  /** WP-0: summed over every assistant message_end, attached to the `result` event. */
+  let turnUsage: TurnUsage | undefined;
+  let lastRequestInputTokens: number | undefined;
   /**
    * The events generator is consumer-driven: lines (and with them the
    * session id and assistantError above) are only processed as fast as the
@@ -603,16 +658,33 @@ export function runPi(opts: RunOptions, piBinPath = "pi"): RunHandle {
       for await (const line of rl) {
         markPerf("first_line");
         const outcome = piAssistantOutcomeFromLine(line);
-        if (outcome !== undefined) assistantError = outcome.error;
+        if (outcome !== undefined) {
+          assistantError = outcome.error;
+          if (outcome.usage) {
+            turnUsage = addPiRequestUsage(turnUsage, outcome.usage);
+            lastRequestInputTokens = outcome.usage.input + outcome.usage.cacheRead + outcome.usage.cacheWrite;
+          }
+        }
         for (const event of parsePiLine(line, answerExtractor)) {
           if (event.type === "system_init") {
             discoveredSessionId = event.sessionId;
           }
+          if (event.type === "raw" && asRecord(event.raw)?.["type"] === "agent_start") {
+            markPerf("agent_start");
+          }
+          let out: AgentStreamEvent = event;
           if (event.type === "result") {
             scheduleGrandchildGrace();
+            if (turnUsage) {
+              out = {
+                ...event,
+                usage: turnUsage,
+                ...(lastRequestInputTokens !== undefined ? { lastRequestInputTokens } : {}),
+              };
+            }
           }
-          markPerfForEventType(markPerf, event.type);
-          yield event;
+          markPerfForEventType(markPerf, out.type);
+          yield out;
         }
       }
     } catch (err) {

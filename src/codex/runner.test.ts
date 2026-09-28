@@ -685,6 +685,78 @@ describe("CodexAppServerLineParser — non-shell tool items", () => {
 // buildCodexCommand — unit tests
 // ---------------------------------------------------------------------------
 
+describe("CodexAppServerLineParser — WP-0 turn usage", () => {
+  // Wire shapes from codex app-server 0.156 (thread/tokenUsage/updated +
+  // turn/started/completed); numbers from captured runs.
+  const THREAD = "thread-usage-test";
+  function turnStarted(turnId: string): unknown {
+    return { method: "turn/started", params: { threadId: THREAD, turn: { id: turnId, items: [], status: "inProgress" } } };
+  }
+  function turnCompleted(turnId: string): unknown {
+    return { method: "turn/completed", params: { threadId: THREAD, turn: { id: turnId, items: [], status: "completed" } } };
+  }
+  function breakdown(totalTokens: number, inputTokens: number, cachedInputTokens: number, outputTokens: number) {
+    return { totalTokens, inputTokens, cachedInputTokens, cacheWriteInputTokens: 0, outputTokens, reasoningOutputTokens: 0 };
+  }
+  function tokenUsage(turnId: string, total: ReturnType<typeof breakdown>, last: ReturnType<typeof breakdown>): unknown {
+    return {
+      method: "thread/tokenUsage/updated",
+      params: { threadId: THREAD, turnId, tokenUsage: { total, last, modelContextWindow: 258400 } },
+    };
+  }
+  function run(parser: InstanceType<typeof CodexAppServerLineParser>, messages: unknown[]) {
+    return messages.flatMap((m) => [...parser.parseMessage(m)]);
+  }
+
+  it("first turn of a new thread: total = last → the turn's own usage", () => {
+    const events = run(new CodexAppServerLineParser(), [
+      turnStarted("t1"),
+      tokenUsage("t1", breakdown(19776, 19771, 12544, 5), breakdown(19776, 19771, 12544, 5)),
+      turnCompleted("t1"),
+    ]);
+    expect(events.find((e) => e.type === "result")).toMatchObject({
+      usage: { inputTokens: 19771 - 12544, cacheReadTokens: 12544, cacheCreationTokens: 0, outputTokens: 5, reasoningTokens: 0, requests: 1 },
+      lastRequestInputTokens: 19771,
+    });
+    // bookkeeping notifications still surface as raw (watchdog activity)
+    expect(events.filter((e) => e.type === "raw")).toHaveLength(2);
+  });
+
+  it("cold resume: a replayed pre-turn total (previous turn id) is the baseline, not usage", () => {
+    const events = run(new CodexAppServerLineParser(), [
+      tokenUsage("t-prev", breakdown(39570, 39559, 32128, 11), breakdown(19794, 19788, 19584, 6)),
+      turnStarted("t2"),
+      tokenUsage("t2", breakdown(65109, 65092, 51712, 17), breakdown(25539, 25533, 19584, 6)),
+      turnCompleted("t2"),
+    ]);
+    expect(events.find((e) => e.type === "result")).toMatchObject({
+      usage: { inputTokens: (65092 - 39559) - (51712 - 32128), cacheReadTokens: 51712 - 32128, outputTokens: 6, requests: 1 },
+      lastRequestInputTokens: 25533,
+    });
+  });
+
+  it("several requests in one turn, with a replayed update: difference of totals, replay not double-counted", () => {
+    const events = run(new CodexAppServerLineParser(), [
+      turnStarted("t1"),
+      tokenUsage("t1", breakdown(1100, 1090, 0, 10), breakdown(1100, 1090, 0, 10)),
+      tokenUsage("t1", breakdown(2300, 2270, 1000, 30), breakdown(1200, 1180, 1000, 20)),
+      tokenUsage("t1", breakdown(2300, 2270, 1000, 30), breakdown(1200, 1180, 1000, 20)), // replay
+      turnCompleted("t1"),
+    ]);
+    expect(events.find((e) => e.type === "result")).toMatchObject({
+      usage: { inputTokens: 2270 - 1000, cacheReadTokens: 1000, outputTokens: 30, requests: 2 },
+      lastRequestInputTokens: 1180,
+    });
+  });
+
+  it("no tokenUsage notification → the result event keeps its old shape", () => {
+    const events = run(new CodexAppServerLineParser(), [turnStarted("t1"), turnCompleted("t1")]);
+    const result = events.find((e) => e.type === "result");
+    expect(result).not.toHaveProperty("usage");
+    expect(result).not.toHaveProperty("lastRequestInputTokens");
+  });
+});
+
 describe("buildCodexCommand", () => {
   it("fresh session: runs codex app-server over stdio", () => {
     const [bin, args] = buildCodexCommand({ prompt: "hello" });

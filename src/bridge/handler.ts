@@ -34,10 +34,14 @@ import {
 } from "../lark/message.js";
 import { buildTopicDeepLink, realTopicThreadId, type MessageLookupClient } from "../lark/messageLookupClient.js";
 import { renderPrompt } from "../claude/prompt.js";
-import { remapPeersToLiveRoster, type LiveRosterResolver } from "../lark/rosterResolver.js";
+import {
+  remapPeersToLiveRoster,
+  type LiveRosterResolver,
+  type RosterLookupInfo,
+} from "../lark/rosterResolver.js";
 import type { PeerBot, RepoRef } from "../claude/prompt.js";
 import { createRunner } from "../agent/runner.js";
-import type { PerfMarkerName } from "../agent/runner.js";
+import type { AgentStreamEvent, PerfMarkerName } from "../agent/runner.js";
 import type { BotConfig } from "../config/botLoader.js";
 import {
   appendTranscriptAnswer,
@@ -93,7 +97,7 @@ import {
 } from "./cotProgress.js";
 import type { OutboundCotClient } from "../lark/channelCotClient.js";
 import type { RuntimeEventPatch } from "./eventLog.js";
-import type { PerfSample } from "./perfLog.js";
+import { TurnPerfRecorder, type PerfSample } from "./perfLog.js";
 import type { RuntimeRequirement } from "../runtimeRequirements.js";
 import type {
   TaskCandidate,
@@ -1340,6 +1344,8 @@ export class BridgeHandler {
    * after restart → detector falls back to its documented restart posture).
    */
   private readonly threadLastOutcome = new Map<string, "completed" | "failed">();
+  /** WP-0 perf: when run() pulled each event off the inbound queue (perf `enqueueAt`). */
+  private readonly perfEnqueueAt = new WeakMap<object, number>();
 
   constructor(deps: BridgeHandlerDeps) {
     this.deps = deps;
@@ -1510,6 +1516,7 @@ export class BridgeHandler {
       const receivedAt = Date.now();
       this.threadReceivedAt.set(key, receivedAt);
       if (sessionKey !== key) this.threadReceivedAt.set(sessionKey, receivedAt);
+      this.perfEnqueueAt.set(event, receivedAt);
 
       // Housekeeping only sees lastActiveTs, which is normally written when a
       // turn finishes. Refresh existing records at receipt time as well so a
@@ -1650,6 +1657,9 @@ export class BridgeHandler {
     /** run()'s serial-queue key — the BL-42 /stop kill-hook registry key. */
     queueKey?: string,
   ): Promise<void> {
+    // WP-0: this turn's perf timeline + segment timings (perfLog.ts) —
+    // bookkeeping only, written with the perf sample.
+    const turnPerf = new TurnPerfRecorder(event, this.perfEnqueueAt.get(event));
     // Terminal-settle guard: EVERY exit path of handleOne must settle the
     // message exactly once (markHandled on success, markUnhandled on failure).
     // The dispatcher adds the message to inFlightMessageIds BEFORE handleOne
@@ -1818,7 +1828,7 @@ export class BridgeHandler {
         if (realTopic) {
           deferredTaskRootProbe = probe; // already in a real topic: facts only, resolved pre-prompt
         } else {
-          const info = await probe;
+          const info = await turnPerf.timed("rootProbeMs", probe);
           if (info?.msgType === "todo" && info.content) {
             const todo = parseTodoShareContent(info.content);
             if (todo) {
@@ -1924,7 +1934,7 @@ export class BridgeHandler {
     // "received": fires on every turn for this thread (new or continuation) so
     // a previously-completed claimed task auto-reopens before the agent starts
     // working on it again (docs/task-handle.md §4 step 4).
-    await invokeTaskHandleLifecycle({ status: "received" });
+    await turnPerf.timed("receivedHookMs", invokeTaskHandleLifecycle({ status: "received" }));
 
     // Step 2: session lookup — determines is_new_thread.
     const existing = this.deps.sessionStore.get(threadId, botId);
@@ -2260,6 +2270,7 @@ export class BridgeHandler {
           }
         };
 
+        const cotStartedAt = Date.now();
         const raced = await Promise.race([
           bubbleCreate.then((handle) => ({ ready: true as const, handle })),
           new Promise<{ ready: false }>((resolve) => {
@@ -2270,8 +2281,10 @@ export class BridgeHandler {
             t.unref?.();
           }),
         ]);
+        turnPerf.addMs("cotMs", Date.now() - cotStartedAt);
         if (raced.ready) {
           cotPublisher = raced.handle;
+          turnPerf.preRunner.cotChannel = raced.handle.channel;
           // Captured (not fire-and-forget): the finally's finalize+delete chain
           // waits on it, so on the slow-create path the ledger write can no longer
           // land AFTER its own delete and strand an orphan pointing at a bubble
@@ -2282,6 +2295,7 @@ export class BridgeHandler {
           // it resolves (never throws; the finally guarantees it's finalized).
           cotPersistSettled = bubbleCreate.then((handle) => {
             cotPublisher = handle;
+            turnPerf.preRunner.cotChannel = handle.channel;
             return persistBubbleRef(handle);
           });
         }
@@ -2332,6 +2346,7 @@ export class BridgeHandler {
       // duplicate ~90 lines of identical create/fallback logic.
       const createCardKitPlaceholder = async (): Promise<void> => {
         if (!card && cardKitAvailable && this.deps.cardKitClient) {
+          const cardCreateStartedAt = Date.now();
           try {
             cardKitProgress = await createCardKitProgressHandle({
               cardKitClient: this.deps.cardKitClient,
@@ -2363,6 +2378,7 @@ export class BridgeHandler {
               },
               onLiveMetricsChanged: updateCardKitLiveMetrics,
             });
+            turnPerf.noteCardCreate(cardKitProgress.createTimings, Date.now() - cardCreateStartedAt);
             cardKitRecord = {
               surface: "cardkit_stream",
               status: "message_sent",
@@ -2395,6 +2411,7 @@ export class BridgeHandler {
               reason: "response surface 使用 CardKit 作为本轮主回复面。",
             });
           } catch (err) {
+            turnPerf.noteCardCreate(undefined, Date.now() - cardCreateStartedAt);
             const existingMessageId = cardKitReplyConversionMessageId(err);
             if (existingMessageId) {
               card = this.deps.cardRenderer.handleFor(existingMessageId);
@@ -2884,7 +2901,12 @@ export class BridgeHandler {
         let effectivePeers = this.deps.peers;
         if (effectivePeers?.length && this.deps.resolveLiveRoster) {
           try {
-            const liveRoster = await this.deps.resolveLiveRoster(parsed.chatId);
+            const rosterLookup: RosterLookupInfo = {};
+            const liveRoster = await turnPerf.timed(
+              "rosterMs",
+              this.deps.resolveLiveRoster(parsed.chatId, rosterLookup),
+            );
+            turnPerf.preRunner.rosterCache = rosterLookup.cache;
             if (liveRoster) {
               const { peers: remappedPeers, remapped, unresolved } = remapPeersToLiveRoster(
                 effectivePeers,
@@ -2913,6 +2935,8 @@ export class BridgeHandler {
           } catch (err) {
             console.warn("[bridge.handler] live-roster resolve failed (using static peers):", err);
           }
+        } else {
+          turnPerf.preRunner.rosterCache = "skip";
         }
 
         // v4 任务派单 — deferred in-thread probe (see the dispatch-site
@@ -2921,7 +2945,7 @@ export class BridgeHandler {
         // straight from the event's own thread_id — no dependency on the
         // (possibly pre-topic, cached) probe result's threadId field.
         if (deferredTaskRootProbe) {
-          const info = await deferredTaskRootProbe;
+          const info = await turnPerf.timed("rootProbeMs", deferredTaskRootProbe);
           if (info?.msgType === "todo" && info.content) {
             const todo = parseTodoShareContent(info.content);
             if (todo) {
@@ -2975,6 +2999,7 @@ export class BridgeHandler {
           }
         }
 
+        const promptRenderStartedAt = Date.now();
         const prompt = await renderPrompt({
           parsed,
           // 批F (F2): a reseed turn renders the FULL new-thread prompt — the
@@ -3062,6 +3087,7 @@ export class BridgeHandler {
             : undefined,
           mtimeFacts,
         });
+        turnPerf.addMs("promptRenderMs", Date.now() - promptRenderStartedAt);
 
         // Step 4c: spawn local agent backend.
         // Both bot classes (agent_workspace and legacy) default to
@@ -3115,6 +3141,7 @@ export class BridgeHandler {
           );
         }
 
+        turnPerf.mark("runnerRunAt");
         const handle = createRunner(runnerKey).run({
           prompt,
           // 批F (F2): reseed = no resume. The record itself is kept (write-back
@@ -3222,6 +3249,20 @@ export class BridgeHandler {
         let toolUseTotalCount = 0;
         let firstAnswerAt: number | undefined;
         let perfRecorded = false;
+        // WP-0: the runner's `result` event (native usage rides on it).
+        let resultEvent: Extract<AgentStreamEvent, { type: "result" }> | undefined;
+        // WP-0: the success-path sample is built when the runner finishes but
+        // written once the turn is delivered (finalize + handoffs), so it can
+        // carry the post-runner timeline. A throw in between still writes it
+        // from the catch below — never as a runnerError: the runner did finish.
+        let donePerf: PerfSample | undefined;
+        const writeDonePerf = (): void => {
+          if (!donePerf || perfRecorded) return;
+          perfRecorded = true;
+          void recordPerf(turnPerf.fill(donePerf));
+        };
+        const userTextChars =
+          parsed.text.length + queuedFollowups.reduce((n, f) => n + f.text.length, 0);
         let idleWatchdog: ReturnType<typeof setInterval> | undefined;
         // Armed for EVERY response surface, not just CardKit: the idle judgment
         // (activity timestamps + toolsInFlight exemption) is surface-independent,
@@ -3498,6 +3539,7 @@ export class BridgeHandler {
             if (ev.type === "system_init") {
               sessionId = ev.sessionId;
             }
+            if (ev.type === "result") resultEvent = ev;
             if ((ev.type === "answer_delta" || ev.type === "answer_snapshot") && ev.text.trim()) {
               firstAnswerAt ??= Date.now();
             }
@@ -3511,6 +3553,7 @@ export class BridgeHandler {
           }
 
           const result = await handle.done;
+          turnPerf.markRunnerDone(cardKitProgress?.callDurationsMs);
           // From here on the agent's work is done — a later failure must not
           // proactively re-run the whole turn (see agentRunCompleted doc).
           agentRunCompleted = true;
@@ -3556,8 +3599,7 @@ export class BridgeHandler {
             perfMarkers.spawn != null && perfMarkers[marker] != null
               ? perfMarkers[marker]! - perfMarkers.spawn
               : undefined;
-          perfRecorded = true;
-          void recordPerf({
+          donePerf = {
             botId,
             threadId,
             backend,
@@ -3565,8 +3607,10 @@ export class BridgeHandler {
             spawnToFirstLineMs: deltaFrom("first_line"),
             spawnToSessionInitMs: deltaFrom("session_init"),
             spawnToFirstContentMs: deltaFrom("first_content"),
+            spawnToAgentStartMs: deltaFrom("agent_start"),
             spawnToFirstAnswerMs: firstAnswerAt === undefined ? undefined : firstAnswerAt - runnerStartedAt,
             promptChars: prompt.length,
+            wrapperChars: prompt.length - userTextChars,
             promptMode: currentIsNewThread || forceFreshSession || promptMode === "full" ? "full" : "delta",
             exitCode: result.exitCode,
             toolUseCount: toolUseTotalCount,
@@ -3576,7 +3620,9 @@ export class BridgeHandler {
             // them undefined, same as every perf sample recorded before this.
             pooled: result.pooled,
             resumeMode: result.resumeMode,
-          });
+            usage: resultEvent?.usage,
+            lastRequestInputTokens: resultEvent?.lastRequestInputTokens,
+          };
           // PRB-9: a turn is "interrupted" when the idle watchdog killed it
           // (real hang), NOT when total wall-clock elapsed. Routed to the same
           // explicit-failure sink as crash/restart (§12.2). Surface-independent:
@@ -3632,12 +3678,15 @@ export class BridgeHandler {
           // any failure degrades that signal, never the turn.
           const declaredTaskHandle = reportedState?.task_handle;
           let bridgeCreatedTaskGuid: string | undefined;
+          const taskSignalsStartedAt = Date.now();
+          let taskSignalHookCalled = false;
           if (
             declaredTaskHandle &&
             (declaredTaskHandle.create || declaredTaskHandle.due || declaredTaskHandle.blocked) &&
             this.deps.taskHandleDeclare &&
             botId
           ) {
+            taskSignalHookCalled = true;
             try {
               // Topic backlink (硬性要求): ONLY a real omt_* id makes a live
               // deep link. Resolve from the event first, then one refresh
@@ -3686,6 +3735,7 @@ export class BridgeHandler {
           // declaration above) claims its fresh guid the same way.
           const claimedTaskGuid = bridgeCreatedTaskGuid ?? reportedState?.task_handle?.guid;
           if (claimedTaskGuid && this.deps.taskHandleClaim && botId) {
+            taskSignalHookCalled = true;
             try {
               await this.deps.taskHandleClaim({
                 botId,
@@ -3720,6 +3770,7 @@ export class BridgeHandler {
               console.warn("[bridge.handler] taskHandleClaim hook failed (continuing):", err);
             }
           }
+          if (taskSignalHookCalled) turnPerf.addMs("declareMs", Date.now() - taskSignalsStartedAt);
 
           // BL-49 "任务卡黑洞" diagnostic. The v5 main path has no equivalent of
           // the 辅路径's candidate black-hole alert (§14.1): if the agent simply
@@ -4382,6 +4433,7 @@ export class BridgeHandler {
             contentBlocks: contentBlocksWithTail,
           };
 
+          turnPerf.mark("finalizeStartAt");
           if (cardKitProgress) {
             const declaredMentions = reportedState?.response_surface?.post?.mentions ?? [];
             const responseSurfacePostDeclared = reportedState?.response_surface?.post !== undefined;
@@ -4539,6 +4591,7 @@ export class BridgeHandler {
               await deleteCardFile(worktreePath);
             }
           }
+          turnPerf.markFinalizeEnd(cardKitProgress?.callDurationsMs);
 
           // Peer-handoff fast path (local dispatch + Feishu mirror) — after the
           // card settled, before terminal bookkeeping. Best-effort by design:
@@ -4547,6 +4600,7 @@ export class BridgeHandler {
           // the fallback whenever local dispatch doesn't apply).
           const declaredHandoffs = reportedState?.handoffs;
           if (declaredHandoffs && declaredHandoffs.length > 0) {
+            const handoffsStartedAt = Date.now();
             try {
               const outcomes = await processHandoffs({
                 handoffs: declaredHandoffs,
@@ -4571,7 +4625,12 @@ export class BridgeHandler {
             } catch (err) {
               console.warn("[bridge.handler] processHandoffs failed (turn unaffected):", err);
             }
+            turnPerf.addMs("handoffMs", Date.now() - handoffsStartedAt);
           }
+
+          // WP-0: the turn is delivered — write its perf sample (see donePerf).
+          turnPerf.mark("finishedAt");
+          writeDonePerf();
 
           // Terminal SUCCESS: promote the message out of in-flight into the
           // persisted seen set so it is never re-dispatched (live WS or gap-fill,
@@ -4619,18 +4678,20 @@ export class BridgeHandler {
           // Success — exit the retry loop
           break;
         } catch (spawnErr) {
+          writeDonePerf();
           if (!perfRecorded) {
             perfRecorded = true;
-            void recordPerf({
+            void recordPerf(turnPerf.fill({
               botId, threadId, backend,
               spawnedAt: new Date(runnerStartedAt).toISOString(),
               promptChars: prompt.length,
+              wrapperChars: prompt.length - userTextChars,
               promptMode: currentIsNewThread || forceFreshSession || promptMode === "full" ? "full" : "delta",
               spawnToFirstAnswerMs: firstAnswerAt === undefined ? undefined : firstAnswerAt - runnerStartedAt,
               toolUseCount: toolUseTotalCount,
               turnDurationMs: Date.now() - runnerStartedAt,
               runnerError: true,
-            });
+            }));
           }
           // The watchdog interval is created BEFORE this try; the success path
           // clears it after handle.done, but this path used to leak it — worst

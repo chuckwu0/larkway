@@ -673,6 +673,49 @@ describe("CodexProcessPool — concurrent turns on one process", () => {
 });
 
 // ---------------------------------------------------------------------------
+// WP-0: native usage reaches the pooled turn's result event
+// ---------------------------------------------------------------------------
+
+describe("CodexProcessPool — WP-0 turn usage", () => {
+  it("routes thread/tokenUsage/updated to the turn and attaches the difference to its result", async () => {
+    const pool = new CodexProcessPool();
+    const handle = pool.run({ prompt: "hi", resumeSessionId: "thread-a" });
+    const eventsP = collectEvents(handle.events);
+    await flush();
+    const child = spawnedChildren[0]!;
+    const usage = (turnId: string, total: number[], last: number[]) =>
+      JSON.stringify({
+        method: "thread/tokenUsage/updated",
+        params: {
+          threadId: "thread-a",
+          turnId,
+          tokenUsage: {
+            total: { totalTokens: total[0], inputTokens: total[1], cachedInputTokens: total[2], cacheWriteInputTokens: 0, outputTokens: total[3], reasoningOutputTokens: 0 },
+            last: { totalTokens: last[0], inputTokens: last[1], cachedInputTokens: last[2], cacheWriteInputTokens: 0, outputTokens: last[3], reasoningOutputTokens: 0 },
+          },
+        },
+      });
+    child.stdout.write(initResponse(1) + "\n");
+    await flush();
+    child.stdout.write(threadResponse(2, "thread-a") + "\n");
+    // cold resume: the app-server replays the restored total under the previous turn id
+    child.stdout.write(usage("turn-prev", [1000, 990, 800, 10], [600, 594, 500, 6]) + "\n");
+    await flush();
+    child.stdout.write(turnStartResponse(3, "turn-b") + "\n");
+    child.stdout.write(JSON.stringify({ method: "turn/started", params: { threadId: "thread-a", turn: { id: "turn-b" } } }) + "\n");
+    child.stdout.write(usage("turn-b", [1700, 1686, 1400, 14], [700, 696, 600, 4]) + "\n");
+    child.stdout.write(turnCompleted("thread-a", "turn-b") + "\n");
+    await flush();
+    await handle.done;
+    const result = (await eventsP).find((e) => e.type === "result");
+    expect(result).toMatchObject({
+      usage: { inputTokens: (1686 - 990) - (1400 - 800), cacheReadTokens: 600, outputTokens: 4, requests: 1 },
+      lastRequestInputTokens: 696,
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
 // idle reap
 // ---------------------------------------------------------------------------
 
@@ -704,6 +747,33 @@ describe("CodexProcessPool — idle reap", () => {
       expect(spawnedChildren).toHaveLength(2);
       expect(handle2.pid).toBe(spawnedChildren[1]!.pid);
     } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("WP-0: logs the reaped child's age and idle time", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "Date"] });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const pool = new CodexProcessPool({ idleMs: 1_000 });
+      const handle = pool.run({ prompt: "hi" });
+      await flush();
+      const child = spawnedChildren[0]!;
+      child.stdout.write(initResponse(1) + "\n");
+      await flush();
+      child.stdout.write(threadResponse(2, "thread-a") + "\n");
+      await flush();
+      child.stdout.write(turnStartResponse(3, "turn-a") + "\n");
+      child.stdout.write(turnCompleted("thread-a", "turn-a") + "\n");
+      await flush();
+      await handle.done;
+
+      await vi.advanceTimersByTimeAsync(1_100);
+      expect(child.killed).toBe(true);
+      const line = warn.mock.calls.map((c) => String(c[0])).find((m) => m.includes("reaping idle warm app-server"));
+      expect(line).toMatch(/childAgeMs=\d+ idleMs=\d+/);
+    } finally {
+      warn.mockRestore();
       vi.useRealTimers();
     }
   });

@@ -999,6 +999,7 @@ export class ChannelClient {
 
     channel.on("message", (msg) => {
       if (this.closed) return;
+      const wsAt = Date.now();
       const ev = channelMsgToLarkEvent(msg);
       if (!ev) {
         log(`dropped (unmappable raw): ${JSON.stringify(msg.messageId ?? "?")}`);
@@ -1025,7 +1026,7 @@ export class ChannelClient {
       this.noteInFlightMeta(ev);
       this.noteDispatchAttempt(ev.message_id);
       log(`dispatching (channel-sdk): message_id=${ev.message_id} thread=${ev.thread_id ?? "?"}`);
-      this.queue.push(ev);
+      this.queue.push({ ...ev, ws_at: wsAt });
     });
     // Card-button click → synthesize a normal turn onto the SAME inbound queue.
     channel.on("cardAction", (evt) => {

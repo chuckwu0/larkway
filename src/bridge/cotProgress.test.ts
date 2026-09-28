@@ -637,6 +637,16 @@ describe("CotProgressHandle create degradation chain (thread → chat_id)", () =
       { chatId: "oc_x", threadId: undefined, originMessageId: "om_trigger" },
     ]);
   });
+
+  it("WP-0: reports where create landed (perf cotChannel)", async () => {
+    expect((await startWithHint(selectiveClient({}).client, "omt_topic")).channel).toBe("thread");
+    expect((await startWithHint(selectiveClient({ failThread: true }).client, "omt_topic")).channel)
+      .toBe("chat-after-thread");
+    expect((await startWithHint(selectiveClient({}).client, undefined)).channel).toBe("chat");
+    expect(
+      (await startWithHint(selectiveClient({ failThread: true, failChat: true }).client, "omt_topic")).channel,
+    ).toBe("none");
+  });
 });
 
 describe("extractToolResultText", () => {

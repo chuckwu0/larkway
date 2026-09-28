@@ -23,6 +23,7 @@ import {
   type AgentStreamEvent,
   type RunOptions,
   type RunHandle,
+  type TurnUsage,
   createPerfMarker,
   markPerfForEventType,
 } from "../agent/runner.js";
@@ -468,11 +469,106 @@ function codexToolItemResultRaw(obj: unknown, item: JsonRecord): unknown {
   return { ...notification, params: { ...params, item: trimmedItem } };
 }
 
+/** WP-0: one `ThreadTokenUsage` breakdown (`total` or `last`) off the wire. */
+interface CodexTokenBreakdown {
+  totalTokens: number;
+  inputTokens: number;
+  cachedInputTokens: number;
+  cacheWriteInputTokens: number;
+  outputTokens: number;
+  reasoningOutputTokens: number;
+}
+
+function codexTokenBreakdown(value: unknown): CodexTokenBreakdown | undefined {
+  const r = asRecord(value);
+  const n = (key: string): number | undefined =>
+    typeof r?.[key] === "number" && Number.isFinite(r[key]) ? (r[key] as number) : undefined;
+  const totalTokens = n("totalTokens");
+  const inputTokens = n("inputTokens");
+  if (totalTokens === undefined || inputTokens === undefined) return undefined;
+  return {
+    totalTokens,
+    inputTokens,
+    cachedInputTokens: n("cachedInputTokens") ?? 0,
+    cacheWriteInputTokens: n("cacheWriteInputTokens") ?? 0,
+    outputTokens: n("outputTokens") ?? 0,
+    reasoningOutputTokens: n("reasoningOutputTokens") ?? 0,
+  };
+}
+
+function subtractBreakdown(a: CodexTokenBreakdown, b: CodexTokenBreakdown): CodexTokenBreakdown {
+  const d = (key: keyof CodexTokenBreakdown): number => Math.max(0, a[key] - b[key]);
+  return {
+    totalTokens: d("totalTokens"),
+    inputTokens: d("inputTokens"),
+    cachedInputTokens: d("cachedInputTokens"),
+    cacheWriteInputTokens: d("cacheWriteInputTokens"),
+    outputTokens: d("outputTokens"),
+    reasoningOutputTokens: d("reasoningOutputTokens"),
+  };
+}
+
 class CodexAppServerLineParser {
   private readonly answerExtractor = new AnswerChannelExtractor();
   private readonly messagePhases = new Map<string, string>();
   private activeFinalItemId: string | undefined;
   private visibleAnswer = "";
+
+  /**
+   * WP-0 token accounting. `thread/tokenUsage/updated` carries THREAD totals
+   * (`total`) plus the latest request (`last`), and the app-server replays
+   * them (e.g. right after a cold thread/resume, tagged with the PREVIOUS
+   * turn's id, and again after turn/completed) — so the turn's usage is the
+   * difference between its last total and the total before it, never a sum.
+   */
+  private turnId: string | undefined;
+  private usageBaseline: CodexTokenBreakdown | undefined;
+  private usageFirst: { total: CodexTokenBreakdown; last?: CodexTokenBreakdown } | undefined;
+  private usageLatest: { total: CodexTokenBreakdown; last?: CodexTokenBreakdown } | undefined;
+  private usageRequests = 0;
+
+  private noteTokenUsage(params: JsonRecord | undefined): void {
+    const tokenUsage = asRecord(params?.["tokenUsage"]);
+    const total = codexTokenBreakdown(tokenUsage?.["total"]);
+    if (!total) return;
+    const last = codexTokenBreakdown(tokenUsage?.["last"]);
+    const updateTurnId = params?.["turnId"];
+    const inTurn = this.turnId !== undefined && (updateTurnId === this.turnId || updateTurnId == null);
+    if (!inTurn) {
+      // A snapshot from before this turn's own requests: the baseline.
+      if (this.usageFirst === undefined) this.usageBaseline = total;
+      return;
+    }
+    // A replay repeats the same total; only a changed total is a new request.
+    if (this.usageLatest?.total.totalTokens !== total.totalTokens) this.usageRequests += 1;
+    this.usageFirst ??= { total, last };
+    this.usageLatest = { total, last };
+  }
+
+  private turnUsage(): Pick<Extract<AgentStreamEvent, { type: "result" }>, "usage" | "lastRequestInputTokens"> {
+    const first = this.usageFirst;
+    const latest = this.usageLatest;
+    // Without a replayed pre-turn total, the thread total before this turn is
+    // the first in-turn total minus that request's own `last`.
+    const baseline = this.usageBaseline ?? (first?.last ? subtractBreakdown(first.total, first.last) : undefined);
+    this.usageBaseline = latest?.total ?? this.usageBaseline;
+    this.usageFirst = undefined;
+    this.usageLatest = undefined;
+    this.turnId = undefined;
+    const requests = this.usageRequests;
+    this.usageRequests = 0;
+    if (!latest || !baseline) return {};
+    const delta = subtractBreakdown(latest.total, baseline);
+    const usage: TurnUsage = {
+      inputTokens: Math.max(0, delta.inputTokens - delta.cachedInputTokens),
+      cacheCreationTokens: delta.cacheWriteInputTokens,
+      cacheReadTokens: delta.cachedInputTokens,
+      outputTokens: delta.outputTokens,
+      reasoningTokens: delta.reasoningOutputTokens,
+      requests,
+    };
+    return latest.last ? { usage, lastRequestInputTokens: latest.last.inputTokens } : { usage };
+  }
 
   private *nativeFinalSnapshot(text: string, itemId: string | undefined, raw: unknown): Generator<AgentStreamEvent> {
     this.activeFinalItemId = itemId;
@@ -526,7 +622,21 @@ class CodexAppServerLineParser {
     if (method === "turn/completed") {
       this.openToolItems.clear();
       this.messagePhases.clear();
-      yield { type: "result", stopReason: "end_turn", raw: obj };
+      yield { type: "result", stopReason: "end_turn", raw: obj, ...this.turnUsage() };
+      return;
+    }
+
+    // WP-0: bookkeeping only — both still surface as `raw` (watchdog activity),
+    // exactly as they did when they fell through to the default below.
+    if (method === "turn/started") {
+      const turnId = asRecord(params?.["turn"])?.["id"];
+      if (typeof turnId === "string") this.turnId = turnId;
+      yield { type: "raw", raw: obj };
+      return;
+    }
+    if (method === "thread/tokenUsage/updated") {
+      this.noteTokenUsage(params);
+      yield { type: "raw", raw: obj };
       return;
     }
 

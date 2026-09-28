@@ -45,6 +45,12 @@ export interface CotProgressHandle {
    * `Working` forever with no way to reach it.
    */
   readonly bubbleRef: CotRef | undefined;
+  /**
+   * WP-0 diagnostics: where create landed — "chat-after-thread" means the
+   * thread channel was tried and rejected first (one extra round trip).
+   * Undefined until create settles.
+   */
+  readonly channel?: CotChannel;
   /** Feed one runner event. Reasoning + tool events map to COT; others ignored. */
   handle(event: AgentStreamEvent): void;
   /** Flush + complete the bubble. `done` on normal end, `error` otherwise. */
@@ -58,6 +64,9 @@ export interface CotProgressHandle {
   /** Cancel any pending flush without completing (e.g. the run threw). */
   close(): void;
 }
+
+/** WP-0: the bubble's create outcome — see {@link CotProgressHandle.channel}. */
+export type CotChannel = "thread" | "chat" | "chat-after-thread" | "none";
 
 export interface CreateCotProgressHandleOpts {
   cotClient: OutboundCotClient;
@@ -207,6 +216,7 @@ class LiveCotProgressHandle implements CotProgressHandle {
   private readonly reasoningMessageId: string;
 
   private ref: CotRef | undefined;
+  private _channel: CotChannel | undefined;
   private _disabled = false;
   private closed = false;
   /** Whether `complete` was accepted by the platform; memoized for repeat finalizes. */
@@ -245,6 +255,10 @@ class LiveCotProgressHandle implements CotProgressHandle {
     return this.ref;
   }
 
+  get channel(): CotChannel | undefined {
+    return this._channel;
+  }
+
   async start(target: CotTarget, inputPreview: string): Promise<void> {
     try {
       // Resolve om_/omt_ once here (run start), not per flush.
@@ -277,6 +291,7 @@ class LiveCotProgressHandle implements CotProgressHandle {
       const attempt = attempts[i]!;
       try {
         const ref = await this.cotClient.create(attempt);
+        this._channel = attempt.threadId ? "thread" : i > 0 ? "chat-after-thread" : "chat";
         console.info(
           "[cot_progress] created",
           `cotId=${ref.cotId}`,
@@ -301,6 +316,7 @@ class LiveCotProgressHandle implements CotProgressHandle {
         }
       }
     }
+    this._channel = "none";
     return undefined;
   }
 

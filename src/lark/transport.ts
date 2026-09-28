@@ -63,6 +63,13 @@ export interface LarkMessageEvent {
    * real inbound event.
    */
   reply_anchor_message_id?: string;
+  /**
+   * WP-0 perf: epoch ms at which the live WS channel handed this message to
+   * larkway (after the node-sdk's own inbound debounce). Set only by
+   * ChannelClient's live `message` callback — absent on gap-fill replays and
+   * synthetic events. Diagnostics only (perf.jsonl `wsAt`).
+   */
+  ws_at?: number;
   [key: string]: unknown;
 }
 

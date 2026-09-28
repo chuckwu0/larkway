@@ -259,6 +259,20 @@ describe("piAssistantOutcomeFromLine", () => {
     expect(piAssistantOutcomeFromLine(JSON.stringify({ type: "message_end", message: { role: "toolResult", content: [] } }))).toBeUndefined();
     expect(piAssistantOutcomeFromLine("nope")).toBeUndefined();
   });
+  it("WP-0: carries the request's own usage when pi reports one (spike shape)", () => {
+    const line = JSON.stringify({
+      type: "message_end",
+      message: {
+        role: "assistant",
+        content: [{ type: "text", text: "OK" }],
+        usage: { input: 11973, output: 3, cacheRead: 128, cacheWrite: 0, reasoning: 0, totalTokens: 12104, cost: { total: 0.0009 } },
+        stopReason: "stop",
+      },
+    });
+    expect(piAssistantOutcomeFromLine(line)).toEqual({
+      usage: { input: 11973, output: 3, cacheRead: 128, cacheWrite: 0, reasoning: 0 },
+    });
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -313,6 +327,36 @@ describe("runPi()", () => {
     // argv carries no prompt text; the spawn was headless json with trust approved.
     const args = __lastSpawnArgs[1] as string[];
     expect(args).toEqual(["-p", "--mode", "json", "--approve"]);
+  });
+
+  it("WP-0: sums every assistant request's usage onto the result and marks agent_start", async () => {
+    const fake = makeFakeChild();
+    __nextFakeChild = fake;
+    const { runPi } = await import("./runner.js");
+    const markers: string[] = [];
+    const handle = runPi({ prompt: "x", agentBinPath: "/fake/pi", pidFilePath: null, onPerfMarker: (m) => markers.push(m) });
+    const events: import("../agent/runner.js").AgentStreamEvent[] = [];
+    const loop = (async () => { for await (const ev of handle.events) events.push(ev); })();
+    const assistantWithUsage = (usage: Record<string, number>, stopReason = "stop") =>
+      JSON.stringify({ type: "message_end", message: { role: "assistant", content: [], stopReason, usage } });
+    await new Promise<void>((resolve) => setImmediate(() => {
+      fake.stdout.write('{"type":"session","version":3,"id":"s","timestamp":"t","cwd":"/w"}\n');
+      fake.stdout.write('{"type":"agent_start"}\n');
+      // an in-process retry: the failed request still reports what it consumed
+      fake.stdout.write(assistantWithUsage({ input: 100, output: 0, cacheRead: 0, cacheWrite: 0 }, "error") + "\n");
+      fake.stdout.write('{"type":"agent_start"}\n');
+      fake.stdout.write(assistantWithUsage({ input: 40, output: 7, cacheRead: 60, cacheWrite: 5, reasoning: 3 }) + "\n");
+      fake.stdout.write('{"type":"agent_settled"}\n');
+      setImmediate(() => { fake.triggerClose(0); resolve(); });
+    }));
+    await loop;
+    await expect(handle.done).resolves.toMatchObject({ exitCode: 0 });
+    expect(events.find((e) => e.type === "result")).toMatchObject({
+      usage: { inputTokens: 140, outputTokens: 7, cacheReadTokens: 60, cacheCreationTokens: 5, reasoningTokens: 3, requests: 2 },
+      lastRequestInputTokens: 40 + 60 + 5,
+    });
+    expect(markers.filter((m) => m === "agent_start")).toHaveLength(1);
+    expect(markers.indexOf("agent_start")).toBeGreaterThan(markers.indexOf("session_init"));
   });
 
   it("rejects done with the provider error when pi exits 0 after an assistant error", async () => {

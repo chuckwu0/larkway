@@ -1,6 +1,7 @@
 import type { AgentStreamEvent } from "../agent/runner.js";
 import {
   deriveCardKitUuid,
+  type CardKitCreateTimings,
   type OutboundCardKitClient,
 } from "../lark/channelCardKitClient.js";
 import {
@@ -60,6 +61,14 @@ export interface CardKitProgressHandle {
   sequence: number;
   answerText: string;
   liveMetrics: CardKitLiveMetrics;
+  /** WP-0: create round trips, when the client reports them (see createCardReply). */
+  readonly createTimings?: CardKitCreateTimings;
+  /**
+   * WP-0: wall time (ms) of every sequenced CardKit call this handle made, in
+   * completion order, failed calls included — the per-call API span the perf
+   * sample summarises for the post-runner tail.
+   */
+  readonly callDurationsMs?: readonly number[];
   handle(event: AgentStreamEvent): void;
   drain(): Promise<void>;
   finalize(opts: BuildCardKitFinalCardOpts): Promise<void>;
@@ -257,6 +266,8 @@ class LiveCardKitProgressHandle implements CardKitProgressHandle {
   private immediatePatchStarted = false;
   private metrics: CardKitLiveMetrics = initialLiveMetrics();
   sequence = 0;
+  readonly createTimings?: CardKitCreateTimings;
+  readonly callDurationsMs: number[] = [];
 
   // COT-in-card (方案 B) state. All no-ops when cotDetail is undefined.
   private readonly cotDetail?: "brief" | "detailed";
@@ -289,8 +300,10 @@ class LiveCardKitProgressHandle implements CardKitProgressHandle {
     onCotPanelCreated?: (elementId: string) => void;
     onSequenceCommitted?: (sequence: number) => Promise<void>;
     onLiveMetricsChanged?: (metrics: CardKitLiveMetrics & { sequence: number }) => void;
+    createTimings?: CardKitCreateTimings;
   }) {
     this.cardKitClient = opts.cardKitClient;
+    this.createTimings = opts.createTimings;
     this.cardId = opts.cardId;
     this.messageId = opts.messageId;
     this.idempotencyKey = opts.idempotencyKey;
@@ -743,7 +756,12 @@ class LiveCardKitProgressHandle implements CardKitProgressHandle {
 
   private async next(fn: (sequence: number) => Promise<void>): Promise<void> {
     this.sequence += 1;
-    await fn(this.sequence);
+    const startedAt = Date.now();
+    try {
+      await fn(this.sequence);
+    } finally {
+      this.callDurationsMs.push(Date.now() - startedAt);
+    }
     await this.onSequenceCommitted?.(this.sequence);
   }
 
@@ -792,6 +810,8 @@ export async function createCardKitProgressHandle(
     onCotPanelCreated: opts.onCotPanelCreated,
     onSequenceCommitted: opts.onSequenceCommitted,
     onLiveMetricsChanged: opts.onLiveMetricsChanged,
+    // Only createCardReply reports split timings; the entity+reply path has none.
+    createTimings: (created as { timings?: CardKitCreateTimings }).timings,
   });
 }
 

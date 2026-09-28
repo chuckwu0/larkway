@@ -606,3 +606,45 @@ describe("BL-48 修订: the waiting notice only names ⏹ when a bubble exists",
     }
   });
 });
+
+describe("CardKitProgressHandle — WP-0 call timings", () => {
+  const facts = { botId: "bot", threadId: "thread", triggerMessageId: "trigger_message" };
+
+  it("passes createCardReply's split timings through; the entity+reply path has none", async () => {
+    const { client } = fakeCardKitClient();
+    const withReply: OutboundCardKitClient = {
+      ...client,
+      async createCardReply() {
+        return { cardId: "card_entity", messageId: "card_message", timings: { replyMs: 30, idConvertMs: 20 } };
+      },
+    };
+    const replied = await createCardKitProgressHandle({
+      cardKitClient: withReply, replyToMessageId: "trigger_message", replyInThread: true, facts,
+    });
+    expect(replied.createTimings).toEqual({ replyMs: 30, idConvertMs: 20 });
+
+    const entity = await createCardKitProgressHandle({
+      cardKitClient: client, replyToMessageId: "trigger_message", replyInThread: true, facts,
+    });
+    expect(entity.createTimings).toBeUndefined();
+  });
+
+  it("records one duration per sequenced call, failed calls included", async () => {
+    const { client } = fakeCardKitClient();
+    const handle = await createCardKitProgressHandle({
+      cardKitClient: client, replyToMessageId: "trigger_message", replyInThread: true, facts, patchIntervalMs: 0,
+    });
+    handle.handle({ type: "answer_snapshot", text: "an answer long enough to stream", raw: {} });
+    await handle.drain();
+    await handle.finalize({ finalText: "final answer" });
+    expect(handle.callDurationsMs?.length).toBe(handle.sequence);
+    expect(handle.callDurationsMs?.every((ms) => ms >= 0)).toBe(true);
+
+    const failing = await createCardKitProgressHandle({
+      cardKitClient: { ...client, async updateCardEntity() { throw new Error("fake finalize failed"); } },
+      replyToMessageId: "trigger_message", replyInThread: true, facts, patchIntervalMs: 0,
+    });
+    await expect(failing.finalize({ finalText: "final answer" })).rejects.toThrow("fake finalize failed");
+    expect(failing.callDurationsMs?.length).toBe(failing.sequence);
+  });
+});

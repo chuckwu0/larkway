@@ -79,7 +79,14 @@ import type {
 import { createPerfMarker, markPerfForEventType } from "../agent/runner.js";
 import { TurnEventQueue } from "../agent/turnEventQueue.js";
 import { AnswerChannelExtractor } from "../agent/answerChannel.js";
-import { buildEnv, buildWarmCommand, parseLinesMulti, runClaude } from "./runner.js";
+import {
+  type ClaudeTurnUsageState,
+  buildEnv,
+  buildWarmCommand,
+  newClaudeTurnUsageState,
+  parseLinesMulti,
+  runClaude,
+} from "./runner.js";
 
 type DoneResult = { exitCode: number; sessionId?: string; pooled?: boolean; resumeMode?: "same-process" | "cold" };
 
@@ -121,6 +128,8 @@ interface TurnState {
   killRequested: boolean;
   sessionId: string | undefined;
   answerExtractor: AnswerChannelExtractor;
+  /** WP-0: per-turn usage extraction state for parseLinesMulti. */
+  usageState: ClaudeTurnUsageState;
   /** Whether this turn continues an entry that already accepted a prior turn. */
   reusedProcess: boolean;
   /**
@@ -347,6 +356,7 @@ export class ClaudeProcessPool implements AgentRunner {
       killRequested: false,
       sessionId: undefined,
       answerExtractor: new AnswerChannelExtractor(),
+      usageState: newClaudeTurnUsageState(),
       reusedProcess: false,
       entry: undefined,
     };
@@ -908,7 +918,7 @@ export class ClaudeProcessPool implements AgentRunner {
     }
 
     state.markPerf("first_line");
-    for (const ev of parseLinesMulti(line, state.answerExtractor)) {
+    for (const ev of parseLinesMulti(line, state.answerExtractor, state.usageState)) {
       state.reachedWire = true;
       if (ev.type === "system_init") state.sessionId = ev.sessionId;
       markPerfForEventType(state.markPerf, ev.type);

@@ -43,8 +43,45 @@ export type AgentStreamEvent =
   | { type: "thinking_snapshot"; text: string; raw: unknown }
   | { type: "tool_use"; toolName: string; toolInput: unknown; raw: unknown }
   | { type: "tool_result"; raw: unknown }
-  | { type: "result"; stopReason: string; raw: unknown }
+  | {
+      type: "result";
+      stopReason: string;
+      raw: unknown;
+      /** WP-0: the turn's native token usage, when the backend reports it. */
+      usage?: TurnUsage;
+      /**
+       * WP-0: total input (cached included) of the turn's LAST model request —
+       * i.e. how large the native context had grown. Absent when unknown.
+       */
+      lastRequestInputTokens?: number;
+    }
   | { type: "raw"; raw: unknown };
+
+/**
+ * WP-0: one turn's native token usage, summed over every model request the
+ * turn made. Normalised across backends so perf.jsonl rows compare:
+ *   - inputTokens: input neither read from nor written to the prompt cache
+ *     (claude `input_tokens`; codex Δ(`inputTokens` − `cachedInputTokens`);
+ *     pi `input`).
+ *   - cacheCreationTokens: claude `cache_creation_input_tokens`; codex
+ *     Δ`cacheWriteInputTokens` (whether codex also counts these inside
+ *     `inputTokens` is unverified — 0 on OpenAI models); pi `cacheWrite`.
+ *   - cacheReadTokens: claude `cache_read_input_tokens`; codex
+ *     Δ`cachedInputTokens`; pi `cacheRead`.
+ *   - outputTokens / reasoningTokens: as the backend reports them (claude's
+ *     `thinking_tokens` is a breakdown of `output_tokens`).
+ *   - requests: model requests observed this turn, when countable.
+ * Codex reports thread-cumulative totals, so its runner takes the DIFFERENCE
+ * across the turn (notifications may be replayed — never summed).
+ */
+export interface TurnUsage {
+  inputTokens: number;
+  cacheCreationTokens: number;
+  cacheReadTokens: number;
+  outputTokens: number;
+  reasoningTokens?: number;
+  requests?: number;
+}
 
 // ---------------------------------------------------------------------------
 // Run options  (mirrors RunOptions from src/claude/runner.ts — single source of truth)
@@ -153,6 +190,8 @@ export interface RunOptions {
    *     yielded (claude: system/init line; codex: thread.started/thread/started).
    *   - "first_content": the first content-bearing event (answer_delta /
    *     answer_snapshot / internal_text / text_delta) is about to be yielded.
+   *   - "agent_start" (pi only, WP-0): pi's own `agent_start` line — the
+   *     agent loop began, after process + extension startup.
    * Best-effort only: a throwing callback must never break the runner —
    * see {@link createPerfMarker}, which already swallows for callers.
    * @default undefined — no perf overhead when not wired up.
@@ -161,7 +200,7 @@ export interface RunOptions {
 }
 
 /** A0 perf marker names — see {@link RunOptions.onPerfMarker}. */
-export type PerfMarkerName = "spawn" | "first_line" | "session_init" | "first_content";
+export type PerfMarkerName = "spawn" | "first_line" | "session_init" | "first_content" | "agent_start";
 
 /**
  * Build a dedup'd, swallow-on-throw marker function shared by both runners.

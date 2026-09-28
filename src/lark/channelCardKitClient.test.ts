@@ -131,7 +131,12 @@ describe("ChannelCardKitClient", () => {
       threadId: "thread_root",
     });
 
-    expect(res).toEqual({ cardId: "converted_card_entity", messageId: "card_message" });
+    expect(res).toEqual({
+      cardId: "converted_card_entity",
+      messageId: "card_message",
+      // WP-0: each round trip's wall time, for the perf sample.
+      timings: { replyMs: expect.any(Number), idConvertMs: expect.any(Number) },
+    });
     expect(calls).toEqual([
       {
         name: "message.reply",

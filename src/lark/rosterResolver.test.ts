@@ -9,6 +9,7 @@ import {
   remapPeersToLiveRoster,
   resolveChatBotRoster,
   createCachedRosterResolver,
+  type RosterLookupInfo,
 } from "./rosterResolver.js";
 import type { PeerBot } from "../claude/prompt.js";
 
@@ -134,5 +135,24 @@ describe("createCachedRosterResolver", () => {
     // A different chat is resolved independently.
     await resolver("oc_2");
     expect(execCount).toBe(3);
+  });
+
+  it("WP-0: reports cache miss / hit through the optional lookup info", async () => {
+    let clock = 1_000;
+    const resolver = createCachedRosterResolver({
+      ttlMs: 1000,
+      now: () => clock,
+      exec: async () => rosterStdout,
+    });
+    const first: RosterLookupInfo = {};
+    await resolver("oc_1", first);
+    expect(first.cache).toBe("miss");
+    const second: RosterLookupInfo = {};
+    await resolver("oc_1", second);
+    expect(second.cache).toBe("hit");
+    clock += 2000;
+    const expired: RosterLookupInfo = {};
+    await resolver("oc_1", expired);
+    expect(expired.cache).toBe("miss");
   });
 });

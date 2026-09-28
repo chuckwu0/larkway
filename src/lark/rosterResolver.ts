@@ -134,8 +134,20 @@ function defaultExec(
     });
 }
 
+/**
+ * WP-0 diagnostics out-param: how the lookup was served. Resolvers without a
+ * cache leave it unset. ("stale" is reserved for a stale-while-revalidate
+ * cache returning an expired entry.)
+ */
+export interface RosterLookupInfo {
+  cache?: "hit" | "stale" | "miss";
+}
+
 /** A per-message resolver the handler calls: chatId → live roster (or null). */
-export type LiveRosterResolver = (chatId: string) => Promise<LiveBotRoster | null>;
+export type LiveRosterResolver = (
+  chatId: string,
+  info?: RosterLookupInfo,
+) => Promise<LiveBotRoster | null>;
 
 /**
  * Build a per-chat-cached resolver for one bot. The roster is stable per (app,
@@ -152,9 +164,13 @@ export function createCachedRosterResolver(opts: {
   const ttlMs = opts.ttlMs ?? 5 * 60 * 1000;
   const now = opts.now ?? (() => Date.now());
   const cache = new Map<string, { roster: LiveBotRoster | null; at: number }>();
-  return async (chatId: string) => {
+  return async (chatId: string, info?: RosterLookupInfo) => {
     const hit = cache.get(chatId);
-    if (hit && now() - hit.at < ttlMs) return hit.roster;
+    if (hit && now() - hit.at < ttlMs) {
+      if (info) info.cache = "hit";
+      return hit.roster;
+    }
+    if (info) info.cache = "miss";
     const roster = await resolveChatBotRoster(chatId, {
       profile: opts.profile,
       larkCliPath: opts.larkCliPath,

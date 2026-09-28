@@ -21,6 +21,7 @@ import {
   _buildCommand as buildCommand,
   _buildEnv as buildEnv,
   _parseLinesMulti as parseLinesMulti,
+  newClaudeTurnUsageState,
 } from "./runner.js";
 
 // ---------------------------------------------------------------------------
@@ -421,6 +422,78 @@ describe("parseLinesMulti", () => {
     expect(events.some((e) => e.type === "tool_use")).toBe(false);
     expect(events.some((e) => e.type === "text_delta")).toBe(false);
     expect(events.some((e) => e.type === "raw")).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// WP-0: native usage on the `result` event
+// ---------------------------------------------------------------------------
+
+describe("parseLinesMulti — WP-0 turn usage", () => {
+  // Shapes as the claude CLI emits them in stream-json (usage numbers made up).
+  function assistant(id: string, usage: Record<string, number>, extra: Record<string, unknown> = {}): string {
+    return JSON.stringify({
+      type: "assistant",
+      ...extra,
+      message: { id, content: [{ type: "text", text: "..." }], usage },
+    });
+  }
+  const resultLine = JSON.stringify({
+    type: "result",
+    subtype: "success",
+    stop_reason: "end_turn",
+    usage: {
+      input_tokens: 12,
+      cache_creation_input_tokens: 300,
+      cache_read_input_tokens: 9000,
+      output_tokens: 250,
+      output_tokens_details: { thinking_tokens: 200 },
+    },
+  });
+
+  it("normalises result.usage and adds request count + last request input from assistant lines", () => {
+    const extractor = new AnswerChannelExtractor();
+    const state = newClaudeTurnUsageState();
+    const lines = [
+      // request 1 streams two content blocks → two lines, same id
+      assistant("msg_1", { input_tokens: 5, cache_creation_input_tokens: 100, cache_read_input_tokens: 4000, output_tokens: 1 }),
+      assistant("msg_1", { input_tokens: 5, cache_creation_input_tokens: 100, cache_read_input_tokens: 4000, output_tokens: 9 }),
+      // subagent traffic is not this turn's own context
+      assistant("msg_sub", { input_tokens: 1, cache_creation_input_tokens: 0, cache_read_input_tokens: 99999, output_tokens: 1 }, { parent_tool_use_id: "toolu_1" }),
+      assistant("msg_2", { input_tokens: 7, cache_creation_input_tokens: 200, cache_read_input_tokens: 5000, output_tokens: 2 }),
+      resultLine,
+    ];
+    const events = lines.flatMap((line) => [...parseLinesMulti(line, extractor, state)]);
+    const result = events.find((e) => e.type === "result");
+    expect(result).toMatchObject({
+      type: "result",
+      stopReason: "end_turn",
+      usage: {
+        inputTokens: 12,
+        cacheCreationTokens: 300,
+        cacheReadTokens: 9000,
+        outputTokens: 250,
+        reasoningTokens: 200,
+        requests: 2,
+      },
+      lastRequestInputTokens: 7 + 200 + 5000,
+    });
+  });
+
+  it("without per-turn state still reports result.usage (no request count / context size)", () => {
+    const [result] = [...parseLinesMulti(resultLine, new AnswerChannelExtractor())];
+    expect(result).toMatchObject({ type: "result", usage: { inputTokens: 12, outputTokens: 250 } });
+    expect((result as { usage?: { requests?: number } }).usage?.requests).toBeUndefined();
+    expect(result).not.toHaveProperty("lastRequestInputTokens");
+  });
+
+  it("a result line without usage keeps the old event shape", () => {
+    const [result] = [...parseLinesMulti(
+      JSON.stringify({ type: "result", stop_reason: "end_turn" }),
+      new AnswerChannelExtractor(),
+      newClaudeTurnUsageState(),
+    )];
+    expect(result).toEqual({ type: "result", stopReason: "end_turn", raw: { type: "result", stop_reason: "end_turn" } });
   });
 });
 
