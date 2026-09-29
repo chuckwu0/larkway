@@ -982,13 +982,15 @@ describe("WP-10: every exit of a model-first turn waits for its card (no orphan 
 });
 
 describe("WP-10: what a model-first runner does not wait for", () => {
-  // Slow ⏳ reaction (40ms): the lane is held, so the runner's reasoning
+  // Slow ⏳ reaction (400ms): the lane is held, so the runner's reasoning
   // arrives before the bubble's lane step even starts. Fast reaction: the
   // bubble's create starts during the setup, ahead of the runner, and is
   // still pending when the reasoning arrives. Either way it must be held for
   // the bubble, not dropped.
   it.each([
-    { addDelayMs: 40, bubbleStep: "after" },
+    // 400ms, not 40: the runner must start inside the reaction's delay even on
+    // a slow CI runner, where handleOne's local prep alone exceeded 40ms.
+    { addDelayMs: 400, bubbleStep: "after" },
     { addDelayMs: 0, bubbleStep: "before" },
   ])("the COT bubble of an existing topic still comes before the card, and gets the early reasoning (its create starts $bubbleStep run())", async ({ addDelayMs, bubbleStep }) => {
     process.env["LARKWAY_MODEL_FIRST"] = "continuation";

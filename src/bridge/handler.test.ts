@@ -1870,7 +1870,7 @@ describe("handleOne — thin-channel finalize", () => {
       events: (async function* () {
         yield { type: "system_init", sessionId: "sess_toolinflight", raw: {} };
         yield { type: "tool_use", toolName: "Bash", toolInput: { command: "slow build" }, raw: {} };
-        await new Promise((r) => setTimeout(r, 200)); // >> 30ms idle threshold, several poll cadences
+        await new Promise((r) => setTimeout(r, 800)); // >> 100ms idle threshold, several poll cadences
         yield { type: "tool_result", raw: {} };
         yield { type: "answer_snapshot", text: "build done", raw: {} };
         await writeFile(
@@ -1919,10 +1919,13 @@ describe("handleOne — thin-channel finalize", () => {
         },
       },
       cardKitClient,
-      responseSurfaceIdleTimeoutMs: 30, // tiny idle threshold — would fire many times over during the 200ms tool call if not exempted
+      // Small idle threshold — would fire many times over during the 800ms tool
+      // call if not exempted. Not smaller: the state-file write after the tool
+      // result is itself silent, and on a loaded CI runner took >30ms.
+      responseSurfaceIdleTimeoutMs: 100,
       // Kill deliberately ENABLED: proves the in-flight exemption holds even for a
       // bot that opted into automatic interrupts.
-      responseSurfaceIdleKillMs: 30,
+      responseSurfaceIdleKillMs: 100,
     });
 
     await handler.run();
