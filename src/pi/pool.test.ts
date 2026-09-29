@@ -12,6 +12,7 @@
 
 import { describe, it, expect, afterEach, beforeEach, vi } from "vitest";
 import { EventEmitter, PassThrough } from "node:stream";
+import { existsSync } from "node:fs";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -232,6 +233,15 @@ const tick = (): Promise<void> => new Promise((r) => setImmediate(r));
 async function waitFor(cond: () => boolean, max = 500): Promise<void> {
   for (let i = 0; i < max && !cond(); i++) await tick();
   if (!cond()) throw new Error("waitFor: condition not met");
+}
+
+/** Poll (wall-clock, not ticks) until the file exists or is gone: the pid file is written/removed off the event loop. */
+async function waitForFile(file: string, present: boolean, timeoutMs = 5_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (existsSync(file) !== present) {
+    if (Date.now() > deadline) throw new Error(`waitForFile: ${file} still ${present ? "missing" : "present"}`);
+    await new Promise((r) => setTimeout(r, 10));
+  }
 }
 
 async function collect(handle: RunHandle): Promise<AgentStreamEvent[]> {
@@ -884,11 +894,10 @@ describe("PiProcessPool retirement", () => {
       await runTurn(pool, { cwd, prompt: "one", threadId: "t1" });
       const pidFile = path.join(cwd, ".larkway", "runner.pid");
       await waitFor(() => rpcChildren().length === 1);
-      for (let i = 0; i < 50; i++) await tick();
+      await waitForFile(pidFile, true);
       expect(JSON.parse(await readFile(pidFile, "utf8"))).toMatchObject({ pid: rpcChildren()[0]!.pid, binPath: "pi" });
       await pool.shutdown(0);
-      for (let i = 0; i < 50; i++) await tick();
-      await expect(readFile(pidFile, "utf8")).rejects.toThrow();
+      await waitForFile(pidFile, false);
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
