@@ -23,7 +23,8 @@
 
 import { describe, it, expect, afterEach, vi } from "vitest";
 import { EventEmitter, PassThrough } from "node:stream";
-import { mkdtemp, readFile, rm, utimes, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm, symlink, unlink, utimes, writeFile } from "node:fs/promises";
+import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import {
@@ -102,6 +103,8 @@ function makeFakeChild(): FakeChild {
 
 let spawnedChildren: FakeChild[] = [];
 let spawnArgs: string[][] = [];
+/** Runs synchronously inside the mocked spawn() — i.e. between a pool's argv build and whatever it records after. */
+let __onSpawn: (() => void) | undefined;
 
 vi.mock("node:child_process", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:child_process")>();
@@ -109,6 +112,7 @@ vi.mock("node:child_process", async (importOriginal) => {
     ...actual,
     spawn: (_bin: string, args: string[]) => {
       spawnArgs.push(args);
+      __onSpawn?.();
       const child = makeFakeChild();
       spawnedChildren.push(child);
       return child;
@@ -129,6 +133,7 @@ vi.mock("node:child_process", async (importOriginal) => {
 afterEach(() => {
   spawnedChildren = [];
   spawnArgs = [];
+  __onSpawn = undefined;
   __fakeIsPidAlive = () => false;
   __fakeCommandLine = "";
   __fakeStartTimeIso = "";
@@ -257,9 +262,57 @@ describe("ClaudeProcessPool — spawn-once/reuse per thread key", () => {
 // key drift — cwd/model/effort change for the same thread
 // ---------------------------------------------------------------------------
 
+/** WP-7: only a repo shipping a non-empty `.claude/skills/<name>/SKILL.md` reaches `--add-dir`. */
+async function makeRepo(root: string, name: string, opts: { skill?: boolean } = {}): Promise<string> {
+  const repo = path.join(root, name);
+  await mkdir(repo, { recursive: true });
+  if (opts.skill) {
+    await mkdir(path.join(repo, ".claude", "skills", "deploy"), { recursive: true });
+    await writeFile(path.join(repo, ".claude", "skills", "deploy", "SKILL.md"), "---\nname: deploy\n---\n");
+  }
+  return repo;
+}
+
 describe("ClaudeProcessPool — key drift", () => {
+  let reposRoot: string | undefined;
+  afterEach(async () => {
+    if (reposRoot) await rm(reposRoot, { recursive: true, force: true });
+    reposRoot = undefined;
+  });
+
+  it("WP-7: a repo WITH skills appearing respawns; one without skills keeps the warm process", async () => {
+    reposRoot = await mkdtemp(path.join(tmpdir(), "claude-pool-repos-"));
+    const plain = await makeRepo(reposRoot, "plain");
+    const skilled = await makeRepo(reposRoot, "skilled", { skill: true });
+    const pool = new ClaudeProcessPool({ botId: "bot-a" });
+    const opts = { prompt: "first", cwd: reposRoot, threadId: "one", pidFilePath: null };
+
+    const first = pool.run(opts);
+    await flush();
+    const child = spawnedChildren[0]!;
+    child.stdout.write(resultLine("success") + "\n");
+    await first.done;
+
+    // An ordinary clone is not a native spawn input: same key, same process.
+    const second = pool.run({ ...opts, addDirs: [plain], resumeSessionId: "native-session" });
+    await flush();
+    expect(spawnedChildren).toHaveLength(1);
+    expect(child.killed).toBe(false);
+    child.stdout.write(resultLine("success") + "\n");
+    expect((await second.done).resumeMode).toBe("same-process");
+
+    // A skill-shipping repo is: retire and respawn with it on --add-dir.
+    const third = pool.run({ ...opts, addDirs: [plain, skilled], resumeSessionId: "native-session" });
+    await flush();
+    expect(child.killed).toBe(true);
+    expect(spawnedChildren).toHaveLength(2);
+    expect(spawnArgs[1]).toEqual(expect.arrayContaining(["--add-dir", skilled]));
+    expect(spawnArgs[1]).not.toContain(plain);
+    spawnedChildren[1]!.stdout.write(resultLine("success") + "\n");
+    expect((await third.done).resumeMode).toBe("cold");
+  });
+
   it.each([
-    { addDirs: ["/workspace/repos/new"] },
     { permissionMode: "ask" as const },
     { agentBinPath: "/custom/claude" },
   ])("respawns for changed native spawn options: %j", async (changed) => {
@@ -279,25 +332,183 @@ describe("ClaudeProcessPool — key drift", () => {
     expect((await second.done).resumeMode).toBe("cold");
   });
 
-  it("does not adopt a prewarm process missing a newly discovered repository", async () => {
+  it("does not adopt a prewarm process missing a newly discovered skill-shipping repository", async () => {
+    reposRoot = await mkdtemp(path.join(tmpdir(), "claude-pool-repos-"));
+    const skilled = await makeRepo(reposRoot, "new", { skill: true });
     const pool = new ClaudeProcessPool({ botId: "bot-a" });
-    const opts = { cwd: "/workspace", pidFilePath: null };
+    const opts = { cwd: reposRoot, pidFilePath: null };
     pool.prewarm(opts);
     const blank = spawnedChildren[0]!;
-    const turn = pool.run({ ...opts, prompt: "hello", threadId: "new", addDirs: ["/workspace/repos/new"] });
+    const turn = pool.run({ ...opts, prompt: "hello", threadId: "new", addDirs: [skilled] });
     await flush();
     expect(turn.pid).not.toBe(blank.pid);
-    expect(spawnArgs[1]).toEqual(expect.arrayContaining(["--add-dir", "/workspace/repos/new"]));
+    expect(spawnArgs[1]).toEqual(expect.arrayContaining(["--add-dir", skilled]));
     spawnedChildren[1]!.stdout.write(resultLine("success") + "\n");
     await turn.done;
     const standby = spawnedChildren[2]!;
     expect(blank.killed).toBe(true);
-    expect(spawnArgs[2]).toEqual(expect.arrayContaining(["--add-dir", "/workspace/repos/new"]));
-    const next = pool.run({ ...opts, prompt: "next", threadId: "next", addDirs: ["/workspace/repos/new"] });
+    expect(spawnArgs[2]).toEqual(expect.arrayContaining(["--add-dir", skilled]));
+    const next = pool.run({ ...opts, prompt: "next", threadId: "next", addDirs: [skilled] });
     await flush();
     expect(next.pid).toBe(standby.pid);
     standby.stdout.write(resultLine("success") + "\n");
     await next.done;
+  });
+
+  it("WP-7: a prewarm proto and a turn that differ only by skill-less repos share one signature — the blank is adopted", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      reposRoot = await mkdtemp(path.join(tmpdir(), "claude-pool-repos-"));
+      const plain = await makeRepo(reposRoot, "plain");
+      const skilled = await makeRepo(reposRoot, "skilled", { skill: true });
+      const pool = new ClaudeProcessPool({ botId: "bot-a" });
+      const opts = { cwd: reposRoot, pidFilePath: null };
+      pool.prewarm({ ...opts, addDirs: [skilled] });
+      const blank = spawnedChildren[0]!;
+      expect(spawnArgs[0]).toEqual(expect.arrayContaining(["--add-dir", skilled]));
+
+      // A repo cloned after boot, but without skills: still the same native spawn.
+      const turn = pool.run({ ...opts, prompt: "hello", threadId: "new", addDirs: [plain, skilled] });
+      await flush();
+      expect(turn.pid).toBe(blank.pid);
+      expect(blank.killed).toBe(false);
+      expect(warnSpy.mock.calls.some((c) => String(c[0]).includes("standby spawn options changed"))).toBe(false);
+      blank.stdout.write(resultLine("success") + "\n");
+      await turn.done;
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+
+  it.skipIf(process.platform === "win32")(
+    "WP-7: a skill-less repo linked in from outside the cwd stays on --add-dir — blank and turn agree, the blank is adopted",
+    async () => {
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+      try {
+        reposRoot = await mkdtemp(path.join(tmpdir(), "claude-pool-repos-"));
+        const ws = path.join(reposRoot, "ws");
+        const plain = await makeRepo(path.join(ws, "repos"), "plain");
+        const outside = await makeRepo(reposRoot, "elsewhere");
+        const linked = path.join(ws, "repos", "linked");
+        await symlink(outside, linked);
+        const pool = new ClaudeProcessPool({ botId: "bot-a" });
+        const opts = { cwd: ws, pidFilePath: null, addDirs: [linked, plain] };
+        pool.prewarm(opts);
+        const blank = spawnedChildren[0]!;
+        expect(spawnArgs[0]).toEqual(expect.arrayContaining(["--add-dir", linked]));
+        expect(spawnArgs[0]).not.toContain(plain);
+
+        const turn = pool.run({ ...opts, prompt: "hello", threadId: "new" });
+        await flush();
+        expect(turn.pid).toBe(blank.pid);
+        expect(warnSpy.mock.calls.some((c) => String(c[0]).includes("doesn't match"))).toBe(false);
+        blank.stdout.write(resultLine("success") + "\n");
+        await turn.done;
+      } finally {
+        warnSpy.mockRestore();
+      }
+    },
+  );
+
+  it("WP-7: a repo listed at boot that later gains a skill replaces the stale blank (proto and turn move together)", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      reposRoot = await mkdtemp(path.join(tmpdir(), "claude-pool-repos-"));
+      const repo = await makeRepo(reposRoot, "repo");
+      const pool = new ClaudeProcessPool({ botId: "bot-a" });
+      const opts = { cwd: reposRoot, pidFilePath: null, addDirs: [repo] };
+      pool.prewarm(opts);
+      const staleBlank = spawnedChildren[0]!;
+      expect(spawnArgs[0]).not.toContain("--add-dir");
+
+      await mkdir(path.join(repo, ".claude", "skills", "deploy"), { recursive: true });
+      await writeFile(path.join(repo, ".claude", "skills", "deploy", "SKILL.md"), "---\nname: deploy\n---\n");
+
+      const first = pool.run({ ...opts, prompt: "one", threadId: "t1" });
+      await flush();
+      expect(staleBlank.killed).toBe(true);
+      expect(first.pid).not.toBe(staleBlank.pid);
+      spawnedChildren[1]!.stdout.write(resultLine("success") + "\n");
+      await first.done;
+      const standby = spawnedChildren[2]!;
+      expect(spawnArgs[2]).toEqual(expect.arrayContaining(["--add-dir", repo]));
+
+      const second = pool.run({ ...opts, prompt: "two", threadId: "t2" });
+      await flush();
+      expect(second.pid).toBe(standby.pid);
+      standby.stdout.write(resultLine("success") + "\n");
+      await second.done;
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+
+  it("WP-7: a skill landing while the blank spawns is not recorded in its signature — the blank is never adopted without it", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      reposRoot = await mkdtemp(path.join(tmpdir(), "claude-pool-repos-"));
+      const repo = await makeRepo(reposRoot, "repo");
+      const pool = new ClaudeProcessPool({ botId: "bot-a" });
+      const opts = { cwd: reposRoot, pidFilePath: null, addDirs: [repo] };
+      // Another thread's clone/checkout lands the skill mid-spawn: after the
+      // blank's argv was built, before the pool records what it spawned.
+      __onSpawn = () => {
+        __onSpawn = undefined;
+        mkdirSync(path.join(repo, ".claude", "skills", "deploy"), { recursive: true });
+        writeFileSync(path.join(repo, ".claude", "skills", "deploy", "SKILL.md"), "---\nname: deploy\n---\n");
+      };
+      pool.prewarm(opts);
+      const blank = spawnedChildren[0]!;
+      expect(spawnArgs[0]).not.toContain("--add-dir");
+
+      const turn = pool.run({ ...opts, prompt: "hello", threadId: "new" });
+      await flush();
+      expect(turn.pid).not.toBe(blank.pid);
+      expect(blank.killed).toBe(true);
+      const served = spawnedChildren.findIndex((c) => c.pid === turn.pid);
+      expect(spawnArgs[served]).toEqual(expect.arrayContaining(["--add-dir", repo]));
+      spawnedChildren[served]!.stdout.write(resultLine("success") + "\n");
+      await turn.done;
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+
+  it("WP-7: a thread's key and argv come from one skills read — a skill flickering mid-run never leaves a warm process keyed for skills it lacks", async () => {
+    reposRoot = await mkdtemp(path.join(tmpdir(), "claude-pool-repos-"));
+    const repo = await makeRepo(reposRoot, "repo", { skill: true });
+    const skillFile = path.join(repo, ".claude", "skills", "deploy", "SKILL.md");
+    const pool = new ClaudeProcessPool({ botId: "bot-a" });
+    const opts = { prompt: "turn", cwd: reposRoot, threadId: "one", pidFilePath: null, addDirs: [repo] };
+
+    const first = pool.run(opts);
+    await flush();
+    const oldChild = spawnedChildren[0]!;
+    oldChild.stdout.write(resultLine("success") + "\n");
+    await first.done;
+
+    // Key drift retires the old child between run()'s key and #spawnEntry's
+    // argv; a branch switch drops the skill exactly then, and it comes back.
+    const originalKill = oldChild.kill;
+    oldChild.kill = (sig?: string) => {
+      rmSync(skillFile);
+      originalKill(sig);
+    };
+    const second = pool.run({ ...opts, permissionMode: "ask", resumeSessionId: "native-session" });
+    await flush();
+    expect(oldChild.killed).toBe(true);
+    writeFileSync(skillFile, "---\nname: deploy\n---\n");
+    const child = spawnedChildren[1]!;
+    child.stdout.write(resultLine("success") + "\n");
+    await second.done;
+
+    // Same key as turn two: served by that child, which must carry the repo.
+    const third = pool.run({ ...opts, permissionMode: "ask", resumeSessionId: "native-session" });
+    await flush();
+    expect(third.pid).toBe(child.pid);
+    expect(spawnArgs[1]).toEqual(expect.arrayContaining(["--add-dir", repo]));
+    child.stdout.write(resultLine("success") + "\n");
+    await third.done;
   });
 
   it("keeps a BYO cwd untouched during prewarm and turn execution", async () => {
@@ -536,6 +747,58 @@ describe("ClaudeProcessPool — kill()/interrupt", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+});
+
+describe("ClaudeProcessPool — answer text held back at a cut-off turn end", () => {
+  const body = "An answer cut off before its block ended, tail included.";
+  const textDelta = (text: string) =>
+    JSON.stringify({ type: "stream_event", event: { type: "content_block_delta", index: 0, delta: { type: "text_delta", text } } });
+  const answerOf = (events: AgentStreamEvent[]) => {
+    let answer = "";
+    for (const ev of events) {
+      if (ev.type === "answer_delta") answer += ev.text;
+      else if (ev.type === "answer_snapshot") answer = ev.text;
+    }
+    return answer;
+  };
+  async function startCutTurn() {
+    const pool = new ClaudeProcessPool({ botId: "bot-a" });
+    const handle = pool.run({ prompt: "long task", cwd: "/wt/thread-1", threadId: "thread-1" });
+    const events: AgentStreamEvent[] = [];
+    const collected = (async () => {
+      for await (const ev of handle.events) events.push(ev);
+    })();
+    await flush();
+    const child = spawnedChildren[0]!;
+    child.stdout.write(systemInit("s1") + "\n");
+    for (const text of ["LARKWAY_ANSWER_BEGIN\n", body.slice(0, 20), body.slice(20)]) {
+      child.stdout.write(textDelta(text) + "\n");
+    }
+    await flush();
+    return { handle, child, events, collected };
+  }
+
+  it("a /stop whose result comes without the cut block's snapshot releases the held tail", async () => {
+    const { handle, child, events, collected } = await startCutTurn();
+    handle.kill();
+    await flush();
+    const interruptReq = readOutboundLines(child).find((l) => l["type"] === "control_request");
+    child.stdout.write(controlResponse(interruptReq!["request_id"] as string) + "\n");
+    child.stdout.write(resultLine("error_during_execution") + "\n");
+    await flush();
+    await handle.done;
+    await collected;
+    expect(answerOf(events)).toBe(body);
+  });
+
+  it("a warm process that dies mid-block still delivers the held tail", async () => {
+    const { handle, child, events, collected } = await startCutTurn();
+    child.emit("exit");
+    await flush();
+    await expect(handle.done).rejects.toThrow();
+    await collected;
+    expect(answerOf(events)).toBe(body);
   });
 });
 
@@ -1178,6 +1441,98 @@ describe("ClaudeProcessPool — blank standby prewarm (批D, adversarial-review 
       warnSpy.mockRestore();
     }
   });
+
+  it("WP-7: a blank that dies unprompted after ≥6h is not counted toward the breaker and is replenished at once", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "Date"] });
+    try {
+      const pool = new ClaudeProcessPool({ botId: "bot-a" });
+      pool.prewarm(PROTO);
+      await flush();
+
+      // Two short-lived deaths: the breaker stands at 2/3.
+      spawnedChildren[0]!.emit("exit");
+      await flush();
+      await vi.advanceTimersByTimeAsync(10_100);
+      await flush();
+      spawnedChildren[1]!.emit("exit");
+      await flush();
+      await vi.advanceTimersByTimeAsync(20_100);
+      await flush();
+      expect(spawnedChildren).toHaveLength(3);
+
+      // The third standby holds for 6h, then dies: counted, it would trip the breaker.
+      await vi.advanceTimersByTimeAsync(6 * 60 * 60 * 1000);
+      spawnedChildren[2]!.emit("exit");
+      await flush();
+      expect(spawnedChildren).toHaveLength(4); // no backoff wait
+      expect(pool.blankProcessCountForTesting).toBe(1);
+      expect(warnSpy.mock.calls.some((c) => String(c[0]).includes("not counted toward the prewarm circuit breaker"))).toBe(true);
+      expect(warnSpy.mock.calls.some((c) => String(c[0]).includes("disabling prewarm"))).toBe(false);
+
+      // Still 2/3, not reset: one more short death trips it.
+      spawnedChildren[3]!.emit("exit");
+      await flush();
+      await vi.advanceTimersByTimeAsync(600_000);
+      await flush();
+      expect(spawnedChildren).toHaveLength(4);
+      expect(warnSpy.mock.calls.some((c) => String(c[0]).includes("disabling prewarm"))).toBe(true);
+    } finally {
+      vi.useRealTimers();
+      warnSpy.mockRestore();
+    }
+  });
+
+  it.skipIf(process.platform === "win32")(
+    "WP-7: the idle sweep swaps a blank whose claude binary was upgraded underneath it — a teardown, not a failure",
+    async () => {
+      const dir = await mkdtemp(path.join(tmpdir(), "claude-pool-bin-"));
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+      try {
+        // A native-installer-style launcher: a symlink repointed on self-update.
+        const v1 = path.join(dir, "v1");
+        const v2 = path.join(dir, "v2");
+        for (const file of [v1, v2]) {
+          await writeFile(file, "#!/bin/sh\n");
+          await chmod(file, 0o755);
+        }
+        const launcher = path.join(dir, "claude");
+        await symlink(v1, launcher);
+
+        vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "Date"] });
+        const pool = new ClaudeProcessPool({ botId: "bot-a", idleMs: 1_000 });
+        pool.prewarm({ ...PROTO, agentBinPath: launcher });
+        await flush();
+        const blank = spawnedChildren[0]!;
+
+        await vi.advanceTimersByTimeAsync(1_500); // one sweep, same binary
+        expect(blank.killed).toBe(false);
+        expect(spawnedChildren).toHaveLength(1);
+
+        await unlink(launcher);
+        await symlink(v2, launcher);
+        await vi.advanceTimersByTimeAsync(1_000); // next sweep sees the upgrade
+        expect(blank.killed).toBe(true);
+        expect(spawnedChildren).toHaveLength(2);
+        expect(pool.blankProcessCountForTesting).toBe(1);
+        expect(warnSpy.mock.calls.some((c) => String(c[0]).includes("claude binary changed"))).toBe(true);
+
+        blank.emit("exit");
+        await flush();
+        expect(spawnedChildren).toHaveLength(2); // the replacement already stands
+        expect(warnSpy.mock.calls.some((c) => String(c[0]).includes("died unprompted"))).toBe(false);
+
+        // The replacement recorded the new binary: later sweeps leave it be.
+        await vi.advanceTimersByTimeAsync(2_000);
+        expect(spawnedChildren[1]!.killed).toBe(false);
+        expect(spawnedChildren).toHaveLength(2);
+      } finally {
+        vi.useRealTimers();
+        warnSpy.mockRestore();
+        await rm(dir, { recursive: true, force: true });
+      }
+    },
+  );
 });
 
 // ---------------------------------------------------------------------------

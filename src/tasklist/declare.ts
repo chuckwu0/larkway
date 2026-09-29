@@ -17,7 +17,7 @@
  * makes no judgment calls — "should this be a task" was decided agent-side.
  */
 
-import type { TaskListClient, TaskMember } from "./client.js";
+import { isTaskNotFoundError, type TaskListClient, type TaskMember } from "./client.js";
 import type { TaskHandleStore } from "./store.js";
 import { formatLocalDateTime } from "./writeback.js";
 import type {
@@ -98,7 +98,25 @@ export async function applyTaskHandleDeclarations(
 
   // ── create (信号1) ────────────────────────────────────────────────────────
   if (patch.create) {
-    const existing = deps.store.get(patch.threadId);
+    let existing = deps.store.get(patch.threadId);
+    // A comment-mode claim is no longer re-read on every turn (writeback.ts,
+    // contract item 2), so a task deleted in Feishu keeps its claim until a
+    // poller notices — and a user who deleted the card and at once asked for
+    // a new one would find the create skipped. Check that claim here, only on
+    // a turn that declared create; a gone task drops the claim, as the
+    // writeback would have, and the create goes ahead.
+    if (existing?.mode === "comment") {
+      const claimed = existing;
+      const gone = await deps.client.getTask(claimed.taskGuid).then(
+        (task) => task === null,
+        (err: unknown) => isTaskNotFoundError(err),
+      );
+      if (gone) {
+        await deps.store.delete(patch.threadId);
+        outcomes.push(`已认领任务 ${claimed.taskGuid} 已不存在，解除认领后新建`);
+        existing = undefined;
+      }
+    }
     if (existing) {
       outcomes.push(`create 跳过：话题已认领任务 ${existing.taskGuid}`);
     } else {
@@ -110,17 +128,32 @@ export async function applyTaskHandleDeclarations(
         const members: TaskMember[] = patch.senderOpenId
           ? [{ id: patch.senderOpenId, type: "user", role: "follower" }]
           : [];
-        const { guid } = await deps.client.createTask({
+        const request = {
           summary: patch.create.summary,
           description: renderCreateDescription(patch, deps.botName),
           ...(due ? { due } : {}),
-          ...(members.length > 0 ? { members } : {}),
           ...(deps.tasklistGuid ? { tasklists: [{ tasklist_guid: deps.tasklistGuid }] } : {}),
-        });
+        };
+        // The sender cannot always be a follower: when another bot sent the
+        // message (a peer handoff), its open_id is not a user and the whole
+        // create is rejected (1470403 permission_denied). Retry once without
+        // the follower rather than lose the task.
+        let followerAdded = members.length > 0;
+        let guid: string;
+        try {
+          ({ guid } = await deps.client.createTask(followerAdded ? { ...request, members } : request));
+        } catch (err) {
+          if (!followerAdded) throw err;
+          // Message only: the wrapped HTTP error carries request headers (auth).
+          console.warn(`[tasklist.declare] create with the sender as follower failed; retrying without it: ${String((err as Error).message ?? err)}`);
+          ({ guid } = await deps.client.createTask(request));
+          followerAdded = false;
+        }
         createdGuid = guid;
         outcomes.push(
           `已建任务 ${guid}（${patch.create.summary.slice(0, 40)}${due ? ` · 截止 ${formatDueForComment(due)}` : ""}` +
-            `${patch.senderOpenId ? " · 发起人已加关注" : ""}${patch.topicLink ? "" : "，话题深链缺失已降级为群链接"}）`,
+            `${followerAdded ? " · 发起人已加关注" : patch.senderOpenId ? " · 发起人未能加为关注人" : ""}` +
+            `${patch.topicLink ? "" : "，话题深链缺失已降级为群链接"}）`,
         );
       } catch (err) {
         outcomes.push(`create 失败（本轮跳过，不影响交付）：${String((err as Error).message ?? err)}`);

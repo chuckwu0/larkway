@@ -13,7 +13,10 @@
  *
  * The guard is deliberately narrow — verify the guid resolves to a readable
  * task, and only on a GENUINELY new claim. Re-declaring the same guid (which a
- * maintaining agent does every turn) costs nothing.
+ * maintaining agent does every turn) costs nothing, and neither does claiming
+ * a guid the bridge just created itself (`patch.trustedGuid`, v5 `create`):
+ * the guard exists for agent-declared guids, and a createTask response is
+ * already the platform saying the task is there.
  *
  * Not a judgment call: whether to claim is still entirely the agent's; this
  * only refuses to persist a pointer the platform says isn't there.
@@ -44,6 +47,9 @@ export type VerifiedClaimOutcome =
  * so both refuse. A false refusal (a real task this bot genuinely can't read
  * yet) is the better failure: it is loud, it self-heals the moment the scope or
  * share is fixed and the agent re-declares, and it leaves no poisoned record.
+ *
+ * `verified` on a recorded outcome says whether THIS call ran the lookup —
+ * false for a same-guid re-declaration and for a bridge-created guid.
  */
 export async function applyVerifiedClaim(
   patch: TaskHandleClaimPatch,
@@ -51,9 +57,10 @@ export async function applyVerifiedClaim(
 ): Promise<VerifiedClaimOutcome> {
   const warn = deps.warn ?? ((m: string) => console.warn(m));
   const priorGuid = deps.store.get(patch.threadId)?.taskGuid;
+  const bridgeCreated = !!patch.trustedGuid && patch.trustedGuid === patch.taskGuid;
   let verified = false;
 
-  if (priorGuid !== patch.taskGuid) {
+  if (priorGuid !== patch.taskGuid && !bridgeCreated) {
     const snapshot = await deps.client.getTask(patch.taskGuid).catch(() => null);
     if (!snapshot) {
       warn(

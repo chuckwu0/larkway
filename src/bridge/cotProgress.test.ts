@@ -9,6 +9,7 @@ import {
 } from "../lark/channelCotClient.js";
 import type { AgentStreamEvent } from "../agent/runner.js";
 import {
+  COT_THREAD_REJECTED_TTL_MS,
   createCotProgressHandle,
   extractToolResultText,
   resolveCotTargets,
@@ -636,6 +637,149 @@ describe("CotProgressHandle create degradation chain (thread → chat_id)", () =
     expect(state.targets).toEqual([
       { chatId: "oc_x", threadId: undefined, originMessageId: "om_trigger" },
     ]);
+  });
+
+  it("WP-0: reports where create landed (perf cotChannel)", async () => {
+    expect((await startWithHint(selectiveClient({}).client, "omt_topic")).channel).toBe("thread");
+    expect((await startWithHint(selectiveClient({ failThread: true }).client, "omt_topic")).channel)
+      .toBe("chat-after-thread");
+    expect((await startWithHint(selectiveClient({}).client, undefined)).channel).toBe("chat");
+    expect(
+      (await startWithHint(selectiveClient({ failThread: true, failChat: true }).client, "omt_topic")).channel,
+    ).toBe("none");
+  });
+});
+
+describe("CotProgressHandle thread-channel negative cache (WP-2 (a))", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  // Records each create as "thread"/"chat" + chat id; thread rejects with the
+  // production tenant's code=10002 unless told otherwise.
+  function channelClient(opts: {
+    threadError?: string | null;
+    failChat?: boolean;
+  } = {}) {
+    const creates: string[] = [];
+    const gets: string[] = [];
+    const client: OutboundCotClient = {
+      async create(target) {
+        creates.push(`${target.threadId ? "thread" : "chat"}:${target.chatId}`);
+        const threadError = opts.threadError === undefined
+          ? "[channel.cot] create failed: code=10002 msg=Bot/User can NOT be out of the chat."
+          : opts.threadError;
+        if (target.threadId && threadError) throw new Error(threadError);
+        if (!target.threadId && opts.failChat) throw new Error("[channel.cot] create failed: code=99999 msg=x");
+        return { cotId: "cot_1", messageId: "om_1" };
+      },
+      async resolveThreadId(messageId) {
+        gets.push(messageId);
+        return "omt_resolved";
+      },
+      async update() {},
+      async complete() {},
+    };
+    return { client, creates, gets };
+  }
+
+  async function start(client: OutboundCotClient, chatId = "oc_a", threadId: string | undefined = "omt_topic") {
+    const handle = await createCotProgressHandle({
+      cotClient: client,
+      target: { chatId, threadId, originMessageId: "om_trigger" },
+      detail: "brief",
+      runId: "run1",
+      scope: "thread1",
+      inputPreview: "hi",
+      throttleMs: 10_000,
+    });
+    handle.close();
+    return handle;
+  }
+
+  it("after a 10002 + chat_id success, the next create in that chat goes straight to chat_id", async () => {
+    const { client, creates } = channelClient();
+    expect((await start(client)).channel).toBe("chat-after-thread");
+    const second = await start(client);
+    expect(second.channel).toBe("chat");
+    expect(second.disabled).toBe(false);
+    expect(creates).toEqual(["thread:oc_a", "chat:oc_a", "chat:oc_a"]);
+  });
+
+  it("also skips the om_→omt_ lookup GET while the chat remembers the rejection", async () => {
+    const { client, creates, gets } = channelClient();
+    await start(client, "oc_a", "om_reply_chain");
+    expect(gets).toEqual(["om_trigger"]);
+    await start(client, "oc_a", "om_reply_chain");
+    expect(gets).toEqual(["om_trigger"]); // no second GET
+    expect(creates).toEqual(["thread:oc_a", "chat:oc_a", "chat:oc_a"]);
+  });
+
+  it("is per chat and per client: another chat, or another bot's client, still tries the thread channel", async () => {
+    const first = channelClient();
+    await start(first.client, "oc_a");
+    await start(first.client, "oc_b");
+    const other = channelClient();
+    await start(other.client, "oc_a");
+    expect(first.creates).toEqual(["thread:oc_a", "chat:oc_a", "thread:oc_b", "chat:oc_b"]);
+    expect(other.creates).toEqual(["thread:oc_a", "chat:oc_a"]);
+  });
+
+  it("tries the thread channel again once the TTL has passed, and re-learns a new rejection", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(1_000_000);
+    const { client, creates } = channelClient();
+    await start(client);
+    vi.setSystemTime(1_000_000 + COT_THREAD_REJECTED_TTL_MS - 1);
+    await start(client);
+    vi.setSystemTime(1_000_000 + COT_THREAD_REJECTED_TTL_MS + 1);
+    expect((await start(client)).channel).toBe("chat-after-thread");
+    await start(client);
+    expect(creates).toEqual([
+      "thread:oc_a", "chat:oc_a",
+      "chat:oc_a",
+      "thread:oc_a", "chat:oc_a",
+      "chat:oc_a",
+    ]);
+  });
+
+  it("once expired, a thread success keeps using the thread channel (the tenant opened it)", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(1_000_000);
+    let threadError: string | null = "[channel.cot] create failed: code=10002 msg=x";
+    const creates: string[] = [];
+    const client: OutboundCotClient = {
+      async create(target) {
+        creates.push(target.threadId ? "thread" : "chat");
+        if (target.threadId && threadError) throw new Error(threadError);
+        return { cotId: "cot_1", messageId: "om_1" };
+      },
+      async resolveThreadId() {
+        return undefined;
+      },
+      async update() {},
+      async complete() {},
+    };
+    await start(client);
+    threadError = null;
+    vi.setSystemTime(1_000_000 + COT_THREAD_REJECTED_TTL_MS + 1);
+    expect((await start(client)).channel).toBe("thread");
+    expect((await start(client)).channel).toBe("thread");
+    expect(creates).toEqual(["thread", "chat", "thread", "thread"]);
+  });
+
+  it("records nothing when chat_id fails too (the bot may have left the chat)", async () => {
+    const { client, creates } = channelClient({ failChat: true });
+    expect((await start(client)).disabled).toBe(true);
+    await start(client);
+    expect(creates).toEqual(["thread:oc_a", "chat:oc_a", "thread:oc_a", "chat:oc_a"]);
+  });
+
+  it("records nothing for a thread failure other than code=10002", async () => {
+    const { client, creates } = channelClient({ threadError: "[channel.cot] POST /open-apis/im/v1/message_cot timed out after 8000ms" });
+    await start(client);
+    await start(client);
+    expect(creates).toEqual(["thread:oc_a", "chat:oc_a", "thread:oc_a", "chat:oc_a"]);
   });
 });
 

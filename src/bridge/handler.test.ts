@@ -455,6 +455,18 @@ function makeCardKitClient(opts: { failFinalize?: boolean; failCreate?: boolean 
   return { client, calls };
 }
 
+/**
+ * WP-4: finalize no longer streams the final markdown into final_md first —
+ * the final card (updateCardEntity) carries it — so read it from there.
+ */
+function finalCardMarkdown(calls: ReadonlyArray<{ kind: string; payload?: unknown }>): string {
+  const card = calls.filter((c) => c.kind === "updateCard").at(-1)?.payload as
+    | { body?: { elements?: Array<Record<string, unknown>> } }
+    | undefined;
+  const element = card?.body?.elements?.find((e) => e["element_id"] === "final_md");
+  return typeof element?.["content"] === "string" ? element["content"] : "";
+}
+
 async function seedPendingPostLedger(worktreePath: string, text: string): Promise<void> {
   const content = buildPostContent({ text, mentions: [] });
   const contentDigest = digestPostContent(content);
@@ -924,7 +936,11 @@ describe("handleOne — thin-channel finalize", () => {
     expect(cardKitCalls.map((c) => c.kind)).toContain("createCard");
     expect(cardKitCalls.map((c) => c.kind)).toContain("reply");
     expect(cardKitCalls.some((c) => c.kind === "stream" && c.elementId === "thinking_md")).toBe(false);
-    expect(cardKitCalls.some((c) => c.kind === "stream" && c.elementId === "final_md" && c.content?.includes("CardKit 最终正文"))).toBe(true);
+    expect(finalCardMarkdown(cardKitCalls)).toContain("CardKit 最终正文");
+    // WP-4: text that never streamed (the last_message fallback here) lands
+    // through the final card alone — no createElements + stream round trips.
+    expect(cardKitCalls.some((c) => c.kind === "stream" && c.elementId === "final_md")).toBe(false);
+    expect(cardKitCalls.some((c) => c.kind === "createElements")).toBe(false);
     const finalUpdate = cardKitCalls.find((c) => c.kind === "updateCard");
     expect(JSON.stringify(finalUpdate?.payload)).toContain("继续");
     expect(JSON.stringify(finalUpdate?.payload)).toContain("<at id=peer_test></at>");
@@ -1176,14 +1192,17 @@ describe("handleOne — thin-channel finalize", () => {
     expect(startArgs).toHaveLength(0);
     expect(finalizeArgs).toHaveLength(0);
     const statusUpdates = cardKitCalls.filter((c) => c.kind === "updateElement");
-    expect(statusUpdates).toHaveLength(2);
-    expect(statusUpdates[0]?.elementId).toBe("footer_md");
-    expect(statusUpdates[0]?.payload).toMatchObject({
-      content: "努力回答中... · 已用 1 个工具",
-    });
-    expect(statusUpdates[1]?.payload).toMatchObject({
-      content: "努力回答中... · 已用 2 个工具",
-    });
+    // WP-4 latest-wins: back-to-back tool_use events may share one footer
+    // update, and finalize drops one that has not started (the final card has
+    // no footer) — so 1 or 2 updates, each count-only.
+    expect(statusUpdates.length).toBeGreaterThanOrEqual(1);
+    expect(statusUpdates.length).toBeLessThanOrEqual(2);
+    for (const update of statusUpdates) {
+      expect(update.elementId).toBe("footer_md");
+      expect(update.payload).toMatchObject({
+        content: expect.stringMatching(/^努力回答中\.\.\. · 已用 [12] 个工具$/),
+      });
+    }
     const rendered = JSON.stringify(statusUpdates);
     expect(rendered).not.toContain("Bash");
     expect(rendered).not.toContain("Read");
@@ -1633,24 +1652,24 @@ describe("handleOne — thin-channel finalize", () => {
     expect(acked).toEqual(["om_msg"]);
     expect(startArgs).toHaveLength(0);
     expect(finalizeArgs).toHaveLength(0);
-    const stream = cardKitCalls.find((c) => c.kind === "stream" && c.elementId === "final_md");
-    expect(stream?.content).toContain("被中断");
-    expect(stream?.content).toContain("判定卡死");
-    expect(stream?.content).toContain("请重试");
+    const finalMd = finalCardMarkdown(cardKitCalls);
+    expect(finalMd).toContain("被中断");
+    expect(finalMd).toContain("判定卡死");
+    expect(finalMd).toContain("请重试");
     // BL-48: the card names the knob so an owner can fix a too-tight threshold
     // without coming to us.
-    expect(stream?.content).toContain("idle_timeout_seconds");
-    expect(stream?.content).not.toContain("请再 @ 我一次");
+    expect(finalMd).toContain("idle_timeout_seconds");
+    expect(finalMd).not.toContain("请再 @ 我一次");
     const settings = cardKitCalls.find((c) => c.kind === "settings");
     expect(JSON.stringify(settings?.payload)).toContain("本轮被中断");
     // COT-in-card: the failed (idle-interrupted) turn settles the reasoning
     // panel with the errored title — proves handler wires markCotError() on the
-    // failure path (was production-unreachable before).
-    const panelCreate = cardKitCalls.find(
-      (c) => c.kind === "createElements" && JSON.stringify(c.payload).includes("collapsible_panel"),
-    );
-    expect(panelCreate).toBeDefined();
+    // failure path (was production-unreachable before). WP-4: the mid-turn
+    // panel create may still be waiting on its patch timer when finalize runs
+    // (and is then dropped); the final card carries the panel either way.
     const finalCard = cardKitCalls.filter((c) => c.kind === "updateCard").at(-1);
+    expect(JSON.stringify(finalCard?.payload)).toContain("collapsible_panel");
+    expect(JSON.stringify(finalCard?.payload)).toContain("思考中断测试");
     expect(JSON.stringify(finalCard?.payload)).toContain("思考过程（本轮出错）");
   });
 
@@ -1738,9 +1757,9 @@ describe("handleOne — thin-channel finalize", () => {
 
     expect(killed).toBe(false);
     expect(acked).toEqual(["om_msg"]);
-    const stream = cardKitCalls.find((c) => c.kind === "stream" && c.elementId === "final_md");
-    expect(stream?.content).toContain("慢，但没死");
-    expect(stream?.content ?? "").not.toContain("判定卡死");
+    const finalMd = finalCardMarkdown(cardKitCalls);
+    expect(finalMd).toContain("慢，但没死");
+    expect(finalMd).not.toContain("判定卡死");
 
     // Stage 1 must be VISIBLE: the status line said we were still waiting…
     const statusPatches = cardKitCalls
@@ -1823,15 +1842,15 @@ describe("handleOne — thin-channel finalize", () => {
     // The recovery did not spend the grace: the kill came from the SECOND
     // stall, which had to accumulate its own 900ms after 回来了.
     expect(killed).toBe(true);
-    const stream = cardKitCalls.find((c) => c.kind === "stream" && c.elementId === "final_md");
-    expect(stream?.content).toContain("判定卡死");
+    const finalMd = finalCardMarkdown(cardKitCalls);
+    expect(finalMd).toContain("判定卡死");
     // Measured silence, rendered in seconds (~1s here) — NOT "1 分钟", which is
     // what a threshold-based or minute-rounded message would print.
-    expect(stream?.content).toMatch(/连续 \d+ 秒没有任何输出/);
+    expect(finalMd).toMatch(/连续 \d+ 秒没有任何输出/);
     // The hint quotes THIS bot's threshold (300ms → 0s after rounding is
     // meaningless, so just assert it is not the hard-coded global default).
-    expect(stream?.content).toContain("idle_timeout_seconds");
-    expect(stream?.content).not.toContain("默认 180");
+    expect(finalMd).toContain("idle_timeout_seconds");
+    expect(finalMd).not.toContain("默认 180");
   });
 
   it("A3: does not kill an idle-stuck turn while a real tool call is in flight (tool_use with no matching tool_result yet)", async () => {
@@ -1851,7 +1870,7 @@ describe("handleOne — thin-channel finalize", () => {
       events: (async function* () {
         yield { type: "system_init", sessionId: "sess_toolinflight", raw: {} };
         yield { type: "tool_use", toolName: "Bash", toolInput: { command: "slow build" }, raw: {} };
-        await new Promise((r) => setTimeout(r, 200)); // >> 30ms idle threshold, several poll cadences
+        await new Promise((r) => setTimeout(r, 800)); // >> 100ms idle threshold, several poll cadences
         yield { type: "tool_result", raw: {} };
         yield { type: "answer_snapshot", text: "build done", raw: {} };
         await writeFile(
@@ -1900,10 +1919,13 @@ describe("handleOne — thin-channel finalize", () => {
         },
       },
       cardKitClient,
-      responseSurfaceIdleTimeoutMs: 30, // tiny idle threshold — would fire many times over during the 200ms tool call if not exempted
+      // Small idle threshold — would fire many times over during the 800ms tool
+      // call if not exempted. Not smaller: the state-file write after the tool
+      // result is itself silent, and on a loaded CI runner took >30ms.
+      responseSurfaceIdleTimeoutMs: 100,
       // Kill deliberately ENABLED: proves the in-flight exemption holds even for a
       // bot that opted into automatic interrupts.
-      responseSurfaceIdleKillMs: 30,
+      responseSurfaceIdleKillMs: 100,
     });
 
     await handler.run();
@@ -1915,8 +1937,8 @@ describe("handleOne — thin-channel finalize", () => {
     expect(acked).toEqual(["om_msg"]);
     expect(startArgs).toHaveLength(0);
     expect(finalizeArgs).toHaveLength(0);
-    const stream = cardKitCalls.find((c) => c.kind === "stream" && c.elementId === "final_md");
-    expect(stream?.content).toContain("build done");
+    const finalMd = finalCardMarkdown(cardKitCalls);
+    expect(finalMd).toContain("build done");
     const settings = cardKitCalls.find((c) => c.kind === "settings");
     expect(JSON.stringify(settings?.payload)).not.toContain("本轮被中断");
   });
@@ -1995,8 +2017,8 @@ describe("handleOne — thin-channel finalize", () => {
     expect(acked).toEqual(["om_msg"]);
     expect(startArgs).toHaveLength(0);
     expect(finalizeArgs).toHaveLength(0);
-    const stream = cardKitCalls.find((c) => c.kind === "stream" && c.elementId === "final_md");
-    expect(stream?.content).toContain("被中断");
+    const finalMd = finalCardMarkdown(cardKitCalls);
+    expect(finalMd).toContain("被中断");
   });
 
   it("批C: threads botConfig.model/effort through to the runner's RunOptions", async () => {
@@ -2154,6 +2176,219 @@ describe("handleOne — thin-channel finalize", () => {
     expect(capturedSample?.spawnToFirstAnswerMs).toBeGreaterThanOrEqual(0);
     expect(capturedSample?.spawnToFirstAnswerMs).toBeLessThanOrEqual(capturedSample!.turnDurationMs);
     expect(capturedSample?.runnerError).toBeUndefined();
+  });
+
+  it("WP-0: the perf sample carries the turn timeline, segment timings, usage and wrapper size", async () => {
+    const threadId = "om_msg";
+    await seedWorktree(threadId);
+    await seedRepoCachePath();
+    const { client: cardKitClient } = makeCardKitClient();
+    let actualPrompt = "";
+    runClaudeImpl = (opts: unknown) => {
+      actualPrompt = (opts as { prompt: string }).prompt;
+      return {
+        events: (async function* () {
+          yield { type: "system_init", sessionId: "sess_wp0", raw: {} };
+          yield { type: "answer_snapshot", text: "done", raw: {} };
+          yield {
+            type: "result",
+            stopReason: "end_turn",
+            raw: {},
+            usage: { inputTokens: 12, cacheCreationTokens: 300, cacheReadTokens: 9000, outputTokens: 250, requests: 2 },
+            lastRequestInputTokens: 5207,
+          };
+        })(),
+        done: Promise.resolve({ exitCode: 0, sessionId: "sess_wp0" }),
+        kill: () => {},
+      };
+    };
+    const wsAt = Date.now();
+    const { client } = makeClient({ ...makeEvent(), ws_at: wsAt });
+    const { store } = makeSessionStore();
+    const samples: PerfSample[] = [];
+    const handler = new BridgeHandler({
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      client: client as any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      cardRenderer: makeCardRenderer().renderer as any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      sessionStore: store as any,
+      conventions: makeConventions(),
+      botConfig: {
+        id: "frontend",
+        name: "Frontend",
+        turn_taking_limit: 10,
+        backend: "claude",
+        response_surface_prototype: {
+          enabled: true,
+          allowed_chats: [],
+          allowed_threads: ["om_msg"],
+          kill_switch: false,
+          post_outbound_enabled: false,
+          cardkit_streaming_enabled: true,
+          allow_agent_mentions: true,
+          denied_mention_open_ids: [],
+          allowed_mention_open_ids: [],
+        },
+      },
+      cardKitClient,
+      recordPerfSample: async (sample) => {
+        samples.push(sample);
+      },
+    });
+
+    await handler.run();
+    await handler.whenAllTurnsSettled();
+
+    expect(samples).toHaveLength(1);
+    const s = samples[0]!;
+    expect(s).toMatchObject({
+      messageCreateAt: 1700000000000,
+      wsAt,
+      usage: { inputTokens: 12, cacheCreationTokens: 300, cacheReadTokens: 9000, outputTokens: 250, requests: 2 },
+      lastRequestInputTokens: 5207,
+      promptChars: actualPrompt.length,
+      wrapperChars: actualPrompt.length - "看下进度".length,
+      exitCode: 0,
+    });
+    expect(s.runnerError).toBeUndefined();
+    // Timeline points are monotone in handling order.
+    const order = [
+      s.wsAt, s.enqueueAt, s.handleStartAt, s.runnerRunAt, s.runnerDoneAt,
+      s.finalizeStartAt, s.finalizeEndAt, s.finishedAt,
+    ];
+    expect(order.every((t) => typeof t === "number")).toBe(true);
+    for (let i = 1; i < order.length; i++) expect(order[i]!).toBeGreaterThanOrEqual(order[i - 1]!);
+    expect(s.preRunner).toMatchObject({ rosterCache: "skip" });
+    expect(s.preRunner?.promptRenderMs).toBeGreaterThanOrEqual(0);
+    expect(s.preRunner?.receivedHookMs).toBeGreaterThanOrEqual(0);
+    expect(s.preRunner?.cardReplyMs).toBeGreaterThanOrEqual(0); // fake client: no split timings
+    expect(s.preRunner?.reactionAddMs).toBeGreaterThanOrEqual(0);
+    expect(s.preRunner?.reactionRemoveMs).toBeGreaterThanOrEqual(0);
+    expect(s.preRunner?.legacyCardMs).toBeUndefined(); // CardKit surface, no fallback
+    // finalize always sends at least the final card entity + settings.
+    expect(s.postRunner?.cardkitCalls).toBeGreaterThanOrEqual(2);
+    expect(s.postRunner?.cardkitCallMsMax).toBeGreaterThanOrEqual(s.postRunner!.cardkitCallMsP50!);
+  });
+
+  it("WP-0: a throw after the runner finished still writes the sample — without runnerError", async () => {
+    await seedWorktree("om_msg");
+    await seedRepoCachePath();
+    runClaudeImpl = () => ({
+      events: (async function* () {
+        yield { type: "system_init", sessionId: "sess_wp0b", raw: {} };
+        yield { type: "answer_snapshot", text: "done", raw: {} };
+      })(),
+      done: Promise.resolve({ exitCode: 0, sessionId: "sess_wp0b" }),
+      kill: () => {},
+    });
+    const { client } = makeClient(makeEvent());
+    const { store } = makeSessionStore();
+    const samples: PerfSample[] = [];
+    const handler = new BridgeHandler({
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      client: client as any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      cardRenderer: makeCardRenderer({ failFinalize: true }).renderer as any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      sessionStore: store as any,
+      conventions: makeConventions(),
+      botConfig: { id: "frontend", name: "Frontend", turn_taking_limit: 10, backend: "claude" },
+      recordPerfSample: async (sample) => {
+        samples.push(sample);
+      },
+    });
+
+    await handler.run();
+    await handler.whenAllTurnsSettled();
+
+    expect(samples).toHaveLength(1);
+    expect(samples[0]).toMatchObject({ exitCode: 0 });
+    expect(samples[0]?.runnerError).toBeUndefined();
+    expect(typeof samples[0]?.runnerDoneAt).toBe("number");
+    expect(typeof samples[0]?.finalizeStartAt).toBe("number");
+    expect(samples[0]?.finalizeEndAt).toBeUndefined(); // finalize threw
+    expect(samples[0]?.finishedAt).toBeUndefined();
+    // legacy (non-CardKit) surface: the card start and the reaction removal are timed
+    expect(samples[0]?.preRunner?.legacyCardMs).toBeGreaterThanOrEqual(0);
+    expect(samples[0]?.preRunner?.reactionAddMs).toBeGreaterThanOrEqual(0);
+    expect(samples[0]?.preRunner?.reactionRemoveMs).toBeGreaterThanOrEqual(0);
+  });
+
+  it("WP-0: a tail outliving the budget still writes the sample, once — without the points it never reached", async () => {
+    await seedWorktree("om_msg");
+    await seedRepoCachePath();
+    runClaudeImpl = () => ({
+      events: (async function* () {
+        yield { type: "system_init", sessionId: "sess_wp0c", raw: {} };
+        yield { type: "answer_snapshot", text: "done", raw: {} };
+        yield {
+          type: "result",
+          stopReason: "end_turn",
+          raw: {},
+          usage: { inputTokens: 3, cacheCreationTokens: 0, cacheReadTokens: 800, outputTokens: 4 },
+        };
+      })(),
+      done: Promise.resolve({ exitCode: 0, sessionId: "sess_wp0c" }),
+      kill: () => {},
+    });
+    // The legacy card's finalize (the delivery tail) hangs until released.
+    let releaseFinalize!: () => void;
+    const finalizeGate = new Promise<void>((resolve) => {
+      releaseFinalize = resolve;
+    });
+    const base = makeCardRenderer();
+    const renderer = {
+      ...base.renderer,
+      async start(messageId: string, startOpts?: { replyInThread?: boolean; threadId?: string }) {
+        const handle = await base.renderer.start(messageId, startOpts);
+        return {
+          ...handle,
+          finalize: async (a: FinalizeArgs) => {
+            await finalizeGate;
+            await handle.finalize(a);
+          },
+        };
+      },
+    };
+    const { client, acked } = makeClient(makeEvent());
+    const { store } = makeSessionStore();
+    const samples: PerfSample[] = [];
+    let resolveFirstSample!: () => void;
+    const firstSample = new Promise<void>((resolve) => {
+      resolveFirstSample = resolve;
+    });
+    const handler = new BridgeHandler({
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      client: client as any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      cardRenderer: renderer as any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      sessionStore: store as any,
+      conventions: makeConventions(),
+      botConfig: { id: "frontend", name: "Frontend", turn_taking_limit: 10, backend: "claude" },
+      perfSampleTailBudgetMs: 20,
+      recordPerfSample: async (sample) => {
+        samples.push(sample);
+        resolveFirstSample();
+      },
+    });
+
+    await handler.run();
+    await firstSample;
+    expect(samples).toHaveLength(1);
+    expect(samples[0]).toMatchObject({ exitCode: 0, usage: { cacheReadTokens: 800 } });
+    expect(samples[0]?.runnerError).toBeUndefined();
+    expect(typeof samples[0]?.runnerDoneAt).toBe("number");
+    expect(typeof samples[0]?.finalizeStartAt).toBe("number");
+    expect(samples[0]?.finalizeEndAt).toBeUndefined(); // still hanging when the budget ran out
+    expect(samples[0]?.finishedAt).toBeUndefined();
+    expect(acked).toEqual([]);
+
+    releaseFinalize();
+    await handler.whenAllTurnsSettled();
+    expect(acked).toEqual(["om_msg"]);
+    expect(samples).toHaveLength(1); // the delivered turn does not write a second row
   });
 
   it("A1 (agent_workspace): creates the CardKit placeholder card BEFORE the (local-fs-only) prewarm work", async () => {
@@ -4694,7 +4929,9 @@ describe("handleOne — provisioning decision tree (unified model)", () => {
     expect(runOpts[1]?.prompt).not.toContain("<agent-workspace>");
     expect(runOpts[1]?.prompt).toContain("<contract-anchor>");
     expect(runOpts[1]?.prompt).toContain(stateFileMod.stateFilePathOf(sessionPath));
-    expect(runOpts[1]?.prompt).toContain("is_new_thread:    false");
+    // Delta carries this message's facts; session constants stay in native history.
+    expect(runOpts[1]?.prompt).toContain("message_id:       om_reply");
+    expect(runOpts[1]?.prompt).not.toContain("is_new_thread:");
     expect(firstCard.startArgs[0]).toMatchObject({
       messageId: threadId,
       replyInThread: true,
@@ -5427,8 +5664,8 @@ describe("BL-38: poison-session self-heal", () => {
     return { cardKitCalls, acked };
   }
 
-  function finalCardText(cardKitCalls: Array<{ kind: string; elementId?: string; content?: string }>): string {
-    return cardKitCalls.find((c) => c.kind === "stream" && c.elementId === "final_md")?.content ?? "";
+  function finalCardText(cardKitCalls: Array<{ kind: string; payload?: unknown }>): string {
+    return finalCardMarkdown(cardKitCalls);
   }
 
   it("(a) increments + persists the counter on an idle-kill (below threshold → session kept, 请重试 card)", async () => {
@@ -5592,7 +5829,10 @@ describe("BL-38: poison-session self-heal", () => {
         yield { type: "system_init", sessionId: "sess_tool", raw: {} };
         // tool_use with no matching tool_result: the shape of a slow build.
         yield { type: "tool_use", toolName: "shell", toolInput: { command: "make" }, raw: {} };
-        await new Promise((r) => setTimeout(r, 130));
+        // Well past the 30ms threshold so the notice patch commits before
+        // finalize (which drops CardKit patches that have not started yet);
+        // 130ms was too tight on slow CI timers.
+        await new Promise((r) => setTimeout(r, 600));
       })(),
       done: Promise.resolve({ exitCode: 1, sessionId: "sess_tool" }),
       kill: () => {},
@@ -6280,6 +6520,27 @@ describe("canCoalesceFollowup (批D gated coalescing)", async () => {
       msg_type: "image",
     });
     expect(canCoalesceFollowup(primary as never, image as never)).toBe(false);
+  });
+
+  it("rejects a follow-up that @-mentions someone besides this bot or quotes an earlier message (those facts come from the primary only)", () => {
+    const primary = mkEvent();
+    const mention = (id: string, name: string) => ({ key: "@_user_1", id: { open_id: id }, name });
+    const withOther = mkEvent({
+      message_id: "om_f1",
+      content: textContent("@_user_1 @_user_2 please sync"),
+      mentions: [mention("ou_test_bot", "Bot"), { ...mention("ou_test_peer", "Peer"), key: "@_user_2" }],
+    });
+    expect(canCoalesceFollowup(primary as never, withOther as never, undefined, "ou_test_bot")).toBe(false);
+    const botOnly = mkEvent({
+      message_id: "om_f2",
+      content: textContent("@_user_1 also this"),
+      mentions: [mention("ou_test_bot", "Bot")],
+    });
+    expect(canCoalesceFollowup(primary as never, botOnly as never, undefined, "ou_test_bot")).toBe(true);
+    const quote = mkEvent({ message_id: "om_f3", parent_id: "om_earlier_card", content: textContent("fix item 2 here") });
+    expect(canCoalesceFollowup(primary as never, quote as never, undefined, "ou_test_bot")).toBe(false);
+    const replyToRoot = mkEvent({ message_id: "om_f4", parent_id: "om_root", content: textContent("and this") });
+    expect(canCoalesceFollowup(primary as never, replyToRoot as never, undefined, "ou_test_bot")).toBe(true);
   });
 });
 
@@ -7030,7 +7291,8 @@ describe("native session continuity defaults", () => {
     await h.handler.whenAllTurnsSettled();
     expect(captured[0]?.resumeSessionId).toBe("sess_prev");
     expect(captured[0]?.forceFreshSession).toBe(false);
-    expect(captured[0]?.prompt).toContain("session_key:      p2p-oc_chat");
+    // The sticky key routes the resumed delta turn to the p2p session's state path.
+    expect(captured[0]?.prompt).toContain(join("sessions", "p2p-oc_chat", ".larkway", "state.json"));
     expect(captured[0]?.prompt).not.toContain("<session-reseed>");
     expect(sessionStore.records.get("wsbot:p2p-oc_chat")?.sessionId).toBe("sess_prev");
   });
@@ -7559,12 +7821,9 @@ describe("批G G6 — mechanical memory-visibility card tail", () => {
     await h.handler.run();
     await h.handler.whenAllTurnsSettled();
 
-    // finalize() streams the FULL final markdown (answer + mechanical tail)
-    // as the LAST final_md write; the first one was the mid-turn snapshot.
-    const finalStreams = (h.cardKitCalls ?? []).filter(
-      (c) => c.kind === "stream" && c.elementId === "final_md",
-    );
-    const finalText = finalStreams[finalStreams.length - 1]?.content ?? "";
+    // The final card (updateCardEntity) carries the FULL final markdown
+    // (answer + mechanical tail); mid-turn writes only held the snapshot.
+    const finalText = finalCardMarkdown(h.cardKitCalls ?? []);
     expect(finalText).toContain(answer);
     expect(finalText).toContain("📝 本轮期间变更了 memory/preferences.md");
     expect(h.metrics).toContainEqual(

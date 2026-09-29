@@ -9,14 +9,31 @@ Larkway 的目标是把飞书话题接到本地 Claude Code / Codex。在相同�
 - 不要求先读历史、先建任务卡、写状态文件、导出飞书文档或整理记忆。这些操作由任务和 Agent 定义决定。需要交互卡片的 Agent 仍可按 [prompt 契约](prompt-contract.md) 使用可选状态文件。
 - `sessionReseedTurns`、`sessionReseedChars`、`p2pStickyIdleMs` 默认均为 `0`。优先沿用原生 session 和原生压缩；显式设置的重开策略、用户重置和已确认的失效会话恢复仍保留。
 - Codex 使用协议的 `phase: final_answer`，不要求输出自定义答案标记；未带 phase 的旧协议保留标记兼容。Claude 保留简短的答案标记约定。Codex 不再强制详细 reasoning summary，沿用宿主配置。
-- pi（`backend: pi`，自带模型底座）走 `pi -p --mode json --approve`，每轮冷启动、无热池；prompt 经 stdin 传入，`--session-id` 续接原生 session，`model` 直接传 `--model`（支持 `provider/id`），`effort` 传 `--thinking`。答案沿用 Claude 的标记约定。`--approve` 必带：非交互模式下 pi 不弹项目信任提示，不带它会静默跳过 workspace 的 `.agents/skills/`。pi 无权限系统，所有权限模式等价全量访问；环境变量原样透传（provider key 即登录态）。
-- Claude 热进程的复用与预热匹配包含实际启动参数，包括权限模式、可执行文件和 `addDirs`。仓库目录变化后，新进程按原 session 恢复，避免漏掉新目录的原生 skills。
-- Agent 默认使用自己的 lark-cli 配置目录。启动时在该目录配置应用 profile，不复制宿主的个人授权。显式 `lark_cli_isolated: false` 仍保留旧的共享配置兼容行为。
+- pi（`backend: pi`，自带模型底座）默认走 `pi -p --mode json --approve`，每轮冷启动；prompt 经 stdin 传入，`--session-id` 续接原生 session，`model` 直接传 `--model`（支持 `provider/id`），`effort` 传 `--thinking`。答案沿用 Claude 的标记约定。`--approve` 必带：非交互模式下 pi 不弹项目信任提示，不带它会静默跳过 workspace 的 `.agents/skills/`。pi 无权限系统，所有权限模式等价全量访问；环境变量原样透传（provider key 即登录态）。
+- pi 热进程池需显式 `warmProcess: true`（默认关；更早的版本里 pi 上的这一项只打告警、不生效，升级后会直接开池，部署前请核对 pi bot 的 yaml，见[升级](#从-v0374-及更早版本升级)；`larkway doctor` 会列出开了热池的 pi bot，只作提示，不影响退出码）：每个话题常驻一个 `pi --mode rpc --approve`，启动参数与冷启动相同（`--session-id`、`--model`、`--thinking`、`--skill`），空闲 `warmProcessIdleMs` 后回收，数量上限 `warmProcessMaxProcesses`，续轮直接在原进程里发 prompt。每轮重新下发 thinking；配置了 `model` 时，进程内模型被改动会改回启动时的模型，未配置时沿用 session 当前的模型（与冷启动续接一致）。进程在首个事件前退出，或正在执行不是 larkway 发起的 run 或压缩，则本轮改走冷启动；配置变化、换 session 或重开 session 时先等旧进程退出再起新进程（同一 session 文件只有一个写者）。与冷启动的已知差异：RPC 模式下 pi 为扩展提供 UI 通道，pi-mcp-adapter 因此向 MCP 服务声明 `sampling`、`elicitation` 能力（print 模式不声明），larkway 对扩展弹出的选择、确认、输入一律回复取消，即按拒绝处理；在 pi 的 MCP 配置里设 `settings.sampling: false` 和 `settings.elicitation: false` 可去掉这两项声明。pi 接受 prompt 之前打印的记录（如 prompt 预检触发的阈值压缩 `compaction_start` / `compaction_end`）热池不转发，冷启动会作为原始事件转发。热进程的一轮在 `agent_settled` 结束，没有冷启动那种结束后 30 秒的兜底 SIGTERM；回收时发 SIGTERM，pi 只结束仍在执行的 bash 调用。已结束的 bash 调用留在后台的进程（如 `npm run dev &`），冷热两种模式下 larkway 和 pi 都不清理。Windows 上回收不发信号（信号只会结束 cmd.exe 包装进程，pi 本体继续运行），而是关闭 stdin 让 pi 自行退出；5 秒后仍未退出，则经包装进程用 `taskkill /T /F` 结束整个进程树。旧进程以包装进程退出且 stdout 关闭为准（最多等约 7 秒）。Windows 行为尚未实测。空闲进程约占 130–150 MB 内存（n=1，只量了 pi 本体；pi-mcp-adapter 拉起的 stdio MCP 子进程不在内，开池前请按整棵进程树估算）。larkway 不加 `--offline`。RPC 模式（热池）每次起进程都会在后台刷新模型目录和 provider 可用性，print 模式（冷启动）不做，有出网白名单的主机会看到这些额外请求。在 `<LARKWAY_HOME>/.env` 设 `PI_OFFLINE=1` 对冷热两路同时关闭这类联网，同时也关闭缺失扩展包的自动安装和工具下载。
+- Claude 热进程的复用与预热匹配包含实际启动参数，包括权限模式、可执行文件和需要 `--add-dir` 的仓库目录。`addDirs` 中只有两类仓库会传 `--add-dir`：含非空 `.claude/skills/<name>/SKILL.md` 的（skills 发现），以及解析符号链接后位于 cwd 之外的（例如链接进 workspace 的外部仓库，`--add-dir` 同时是它的目录访问授权）。clone 或删除 cwd 内不带 skills 的仓库不改变启动参数，热进程照常复用。仓库开始或不再需要该参数（新 clone、切分支、新增 skill、链接改指向）后，下一轮起新进程并按原 session 恢复，避免漏掉原生 skills。
+- Agent 默认使用自己的 lark-cli 配置目录。启动时在该目录配置应用 profile，不复制宿主的个人授权。显式 `lark_cli_isolated: false` 仍保留旧的共享配置兼容行为；这类 bot 的 delta 续轮每轮带一行 `lark_cli_profile`，避免原生压缩后 lark-cli 落到宿主默认 profile。
+- 两个 opt-in 环境变量（在 `<LARKWAY_HOME>/.env` 设置，对该 bridge 的全部 bot 生效；不设即当前默认行为）：
+  - `LARKWAY_INBOUND_BATCH_DELAY_MS`：飞书 SDK 入站去抖窗口。SDK 先把同一群的入站消息攒一个窗口再派发，窗口内每来一条新消息重新计时；SDK 自己的默认是短消息 600ms、缓冲文本达到 1000 字符后 2000ms。larkway 把 SDK 攒成的一批拆回逐条、按到达顺序派发，每条保留自己的 message_id、发送者和话题，所以这个窗口只决定派发时机，不决定消息如何成轮：无论设成多少，连发的消息都不会在 SDK 这一层合成一轮，只有排在运行中轮次之后的同一 session 纯文本消息会合并进下一轮。因为这个窗口在 larkway 里只剩延迟，larkway 默认把它设为 `0`：不设、空值或非数字 = `0`（负数按 0），收到即派发，长消息的 2000ms 也一并跳过。正数只替换短消息窗口。设为 `sdk` = 沿用 SDK 自己的默认时序。每个 bot 启动时打一行 `inbound debounce …`，写明当前取值、是否为默认以及恢复 SDK 时序的写法。去抖发生在 `wsAt` 打点之前，其耗时体现在 `wsAt − messageCreateAt` 中。
+  - `LARKWAY_MODEL_FIRST`：`off`（默认；未设置或无法识别的值按 `off`，后者打一次告警）/ `continuation` / `all`。`off` 时 runner 在答案卡片建好后启动（已有 session 的话题先建 COT 气泡再建卡片；新话题的气泡在卡片之后创建、不等待，所以轮次很快或气泡创建较慢时，气泡可能在答案定稿之后才出现，并随即显示完成）。`continuation` 只对本 bot 已有 session 的话题内续轮先启动 runner，卡片与气泡按原顺序并行创建，runner 的早期事件缓冲到卡片就绪后按序回放；开新话题的轮次仍先等卡片（卡片创建话题，agent 抢先用 lark-cli 回帖会落到话题外）。`all` 对所有轮次先启动 runner，开新话题的轮次也不等卡片：卡片是在飞书建出话题的那条回复，agent 如果在卡片建出之前就用 lark-cli 回帖，帖子会落在话题外；新话题的气泡也要等卡片那一步做完才开始创建，上面「气泡晚于答案」的情况更常见。要提前启动 runner，建议用 `continuation`，它不改变开新话题的轮次。话题内续轮的根消息尚未缓存时（bridge 启动后该话题的第一轮），runner 启动前仍最多等 1 秒的根消息查询（判断话题是否挂在任务分享卡片下，并据此自动认领）；已缓存则不等。full 模式认领任务的话题，runner 启动前仍先读取一次任务（任务已勾完成时再重开一次），保证 agent 开工时任务已重开；comment 模式认领（见 [任务句柄](task-handle.md) §15.3）和未认领的话题没有这次等待。只改变调度顺序，飞书调用的内容和次数不变。
 - 跨 Agent 的共享知识仓库需显式 `sharedKnowledge: true`。默认回收归档留在 `agents/<id>/runtime/archive/`；开启后写入已有的共享知识路径。恢复时兼容两种旧归档位置。
 
 旧配置中显式写下的 `promptMode: full`、非零 reseed 阈值和身份隔离选项继续生效。要采用以上默认行为，请删除相应覆盖或将 reseed 阈值设为 `0`；共享知识必须显式开启。
 
 既有 workspace 中旧版生成的 `.claude/settings.local.json` 不会自动删除，原生 runtime 仍会加载它。升级后需要移除旧权限配置时，应先检查其中是否混有自己的设置。
+
+## 从 v0.3.74 及更早版本升级
+
+`larkway update` 装完即重启 bridge，下面第 1、2 条要在升级前核对。
+
+1. **pi bot 的 `warmProcess: true`**：以前对 pi 不生效，现在会打开热池（见上文）。常见来源是 claude 时代写下、之后在 Web 管理面切换底座时保留下来的键。核对：`grep -l '^backend: pi' <LARKWAY_HOME>/bots/*.yaml | xargs grep -H '^warmProcess'`；升级后 `larkway doctor` 也会列出。不想开就删掉这一行。
+2. **读取 prompt 字段的自定义 skill / 指南**：续轮不再带 `thread_id`、`session_key`、`is_new_thread`、`scene_type`、`chat_type`、`feishu_root_id`；`sender` 首轮也不再单列，改看 `user-message` 每行的 `ou_…:` 前缀（完整清单见 [prompt 契约](prompt-contract.md)）。`<task-handle>` 块续轮仍带 `task_handle_tasklist_guid` 行，已安装的旧版 task-handle skill 照常识别该块；仍建议重新从 `examples/skills/task-handle/SKILL.md` 拷贝（v2 时代的副本会自己调用 lark-cli 列清单，新版直接使用 prompt 里的候选和 `thread=`）。
+3. **启动时改写托管 `AGENTS.md`**（BYO workspace 不动）：只删 2 条性能类退役模板行，启动日志按标签逐条列出——`state-each-turn`（每轮结束前写 state 文件）、`memory-ritual`（开场先读 `memory/index.md`）。另外两条退役行 `perms-preread`（写入、部署、对外发消息前先读 `permissions-*.md`）和 `knowledge-discipline`（「长期知识纪律」：非 owner 提供的新知识只进本 session 的 summary.md 并标注未经确认）属于 owner 策略，启动时不动，仍与以前一样在 owner 保存配置（Web 管理面或 `larkway bot` 等 CLI 修改 Agent 定义）时移除。只删逐字相同的行；第一次改写前原文存到 `agents/<id>/AGENTS.md.pre-retired-lines.bak`（已有则保留最早那份）；只对新 session 生效，存量话题的下一轮会收到一次「AGENTS.md 被修改过」。原样加回的行下次启动会再被删，要保留请换成自己的措辞。仍有 legacy `memory/` 内容的 bot，新 session 不再被要求先读它。`LARKWAY_DRY_RUN=1` 启动时只打出 `would remove …`，不改文件。
+4. **连发消息的成轮方式**：相比 v0.3.74，SDK 攒成的一批会拆回逐条派发（#61），入站去抖又默认为 0（见上文）。先贴截图或日志、紧接着提问的两条消息不再合成一轮：同一话题里，第一条单独成轮，后面的在同一 session 里排队，第一轮结束后合并进下一轮；排队期间没有回执。单聊（p2p）默认不开 `p2pStickySession`，每条顶层消息各自是独立 session，连发的几条会各自成轮、并发执行，后一条看不到前一条；bot yaml 设 `p2pStickySession: true` 后，同一单聊的顶层消息共用一个 session，连发时与话题内相同：第一条单独成轮，排队的消息合并进下一轮。
+5. **CardKit 收尾**：终稿总是整卡替换一次，不再先把终稿流式写入；终稿与流式内容不同时（如 state.json 的 `last_message`、失败或停止文案）直接跳变，没有打字效果。整卡替换失败时，原卡补写终稿、停止流式状态，底部注明以另发的兜底卡为准。
+6. **comment 模式任务被删后**，约一个轮询周期（默认 60 秒）内话题仍显示已认领，见[任务句柄](task-handle.md)的「发现时机」。
+7. **handoff 镜像与终卡同时发出**，另一进程里的 peer 可能在本轮卡片定稿前被唤醒；终卡投递失败时交接照常发出，失败卡或兜底 post 会注明「已交接给 <peer>」，见 [prompt 契约](prompt-contract.md)。
+8. **`perf.jsonl` 单行变大**，需自行轮转（见下文「效率验证」）。
 
 ## 定义与目录
 
@@ -30,9 +47,11 @@ BYO 使用已有的绝对目录和该目录的原生配置。bridge 不向该目
 
 ## 效率验证
 
-prompt 单元测试使用相同的最小消息固定场景，限制首轮少于 2,600、续轮少于 1,100 个 Unicode 码点（`Array.from(text).length`）；同时验证必要场景指针、答案协议和可选卡片能力没有丢失。这是固定场景的注入量回归测试，不是所有真实任务的长度上限，不能换算为 token 或完成速度。
+prompt 单元测试使用相同的最小消息固定场景，限制首轮少于 2,600、续轮少于 410 个 Unicode 码点（`Array.from(text).length`）；另用生产形态固定场景（peer、repo、清单候选、owner、sticky 单聊）按 backend 限制续轮包装（总长减去用户原文），无候选时不超过 550 码点。同时验证必要场景指针、答案协议和可选卡片能力没有丢失。续轮只带本条消息的事实和一行输出提示，会话常量留在原生历史中，见 [prompt 契约](prompt-contract.md)。这是固定场景的注入量回归测试，不是所有真实任务的长度上限，不能换算为 token 或完成速度。
 
 每轮 `perf.jsonl` 记录 `promptChars`（JavaScript `text.length`，即 UTF-16 code units）、实际 `promptMode`、首个可信答案延迟、工具调用数、总耗时、进程复用方式和 runner 退出结果。流式执行失败也记录 `runnerError`。启动前准备失败及同步 runner 创建异常仍通过运行事件日志观察，不算作完成的性能样本。`pooled: true` 包含热池中新进程的首轮；判断续轮是否复用原进程，还需看 `resumeMode`。
+
+样本还带分段计时（均为可选字段，旧行照常解析）：时间点 `messageCreateAt`（飞书服务端时钟，秒级值换算为毫秒）、`wsAt`、`enqueueAt`、`handleStartAt`、`runnerRunAt`、`runnerDoneAt`、`finalizeStartAt`、`finalizeEndAt`、`finishedAt`，均为 epoch 毫秒，可直接相减；`preRunner` / `postRunner` 记录 runner 启动前各项等待（COT 气泡、卡片创建及 legacy 卡兜底、roster、根消息探测、received hook、prompt 渲染）和收尾阶段的 CardKit 调用次数与单次耗时；`preRunner.reactionAddMs` / `reactionRemoveMs` 只计发起 ⏳ reaction 添加与移除调用的耗时（约为 0，调用不等网络往返），往返耗时与失败见 bridge 日志中的 `processing reaction` 行（成功行带 `ms=`，失败行带 `after …ms`），更早版本写出的这两项含网络往返，不能直接对比；成功轮次的样本在交付后写出，收尾超过 60 秒仍未结束时提前写出（缺少尚未到达的时间点），进程在收尾中途退出的轮次没有样本；`usage` 是 runner 报告的本轮原生 token 用量（各请求合计；codex 取线程累计值的差），`lastRequestInputTokens` 是最后一次请求的输入总量；`wrapperChars` 是 prompt 中用户原文以外的字符数。`wsAt` 取自 SDK 去抖之后，入站去抖本身体现在 `wsAt − messageCreateAt` 中（含时钟偏差）。带这些字段的行约 1 KB（此前约 300 B）；`perf.jsonl` 不限大小、不自动轮转，长期运行的主机需自行轮转。离线复现 runner 启动前的串行调用用 `LW_BENCH=1 npx vitest run src/bridge/handler.latency.bench.test.ts`；真实 CLI 的多轮对照用 `scripts/bench/runner-bench.mts`（会调用模型，按 [Runtime validation](runtime-validation.md) 显式执行）。
 
 已执行独立目录下的 Web 配置闭环、真实飞书工具任务和同话题续问，以及两底座各自的桥接/直接原生六轮对照。短会话样本覆盖数值修订、指代、岔题后恢复与早先状态引用，没有观察到桥接额外的语义偏差；样本同时保留了两路共有的首轮理解错误，不能描述为模型全部答对。原生对照存在缓存、工具加载和技能目录差异，因此属于观察性比较，不足以证明普遍达到原生效率。
 
@@ -42,4 +61,4 @@ prompt 单元测试使用相同的最小消息固定场景，限制首轮少于 
 
 当前话题补充仍排队进入后续 turn；尚未完整接入 Codex `turn/steer`。原生审批和 `requestUserInput` 也尚未形成完整的飞书往返协议；现有自定义 choices 卡片不能当作原生审批响应。`ask` 模式仍需单独端到端验收。这些是明确的能力差距，精简 prompt 本身不会消除它们。
 
-短会话测试也不替代长上下文 compaction、压缩后恢复、进程重启后的连续性或冲突话题隔离测试。普通回答前的 reaction、初始卡片和进度展示仍可能增加等待；需要逐段计时与重复样本，才能判断具体优化的收益。
+短会话测试也不替代长上下文 compaction、压缩后恢复、进程重启后的连续性或冲突话题隔离测试。普通回答前的初始卡片和进度展示仍可能增加等待；需要逐段计时与重复样本，才能判断具体优化的收益。

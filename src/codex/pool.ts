@@ -74,9 +74,10 @@ import {
   CodexAppServerLineParser,
   codexApprovalPolicy,
   codexEffortFromLarkway,
-  codexThreadSandboxMode,
+  codexThreadRequest,
   codexTurnSandboxPolicy,
   extractThreadIdFromThreadResponse,
+  isExcludeTurnsRejection,
   runCodex,
 } from "./runner.js";
 
@@ -123,6 +124,8 @@ type PendingKind = "init" | "thread" | "turn" | "interrupt";
 interface PendingRequest {
   turnKey: number;
   kind: PendingKind;
+  /** WP-7: this thread/resume carried excludeTurns — see #handleRequestError's one retry. */
+  excludeTurns?: boolean;
 }
 
 export interface CodexProcessPoolOptions {
@@ -163,6 +166,8 @@ export class CodexProcessPool implements AgentRunner {
   readonly #pidFilePath: string | undefined;
 
   #child: ChildProcess | undefined;
+  /** WP-0: when the current child was spawned — for the idle-reap log line. */
+  #childSpawnedAt: number | undefined;
   #nextRequestId = 1;
   #nextTurnKey = 1;
   readonly #pending = new Map<number, PendingRequest>();
@@ -170,6 +175,12 @@ export class CodexProcessPool implements AgentRunner {
   readonly #threadOwners = new Map<string, number>();
   /** Completed thread/start|resume requests on the current app-server child. */
   readonly #loadedThreadIds = new Set<string>();
+  /**
+   * WP-7: the current child rejected thread/resume's `excludeTurns` (an
+   * app-server build older than the field) — stop sending it. Per child, not
+   * per pool: a respawn may well be running an upgraded binary.
+   */
+  #excludeTurnsUnsupported = false;
 
   /** Resolves once `initialize`'s response is observed on the current child; rejects if the child dies first. */
   #ready: Promise<void> | undefined;
@@ -332,17 +343,16 @@ export class CodexProcessPool implements AgentRunner {
 
     state.reusedProcess = state.opts.resumeSessionId != null &&
       this.#loadedThreadIds.has(state.opts.resumeSessionId);
-    const mode = state.opts.permissionMode ?? "acceptEdits";
-    const threadMethod = state.opts.resumeSessionId != null ? "thread/resume" : "thread/start";
-    const threadParams: JsonRecord = state.opts.resumeSessionId != null
-      ? { threadId: state.opts.resumeSessionId }
-      : { ephemeral: false, sessionStartSource: "startup" };
-    if (state.opts.cwd != null) threadParams["cwd"] = state.opts.cwd;
-    threadParams["approvalPolicy"] = codexApprovalPolicy(mode);
-    threadParams["sandbox"] = codexThreadSandboxMode(mode);
+    this.#sendThreadRequest(state, !this.#excludeTurnsUnsupported);
+  }
 
+  /** thread/start|resume for this turn — see codexThreadRequest for `excludeTurns`. */
+  #sendThreadRequest(state: TurnState, excludeTurns: boolean): void {
+    const [threadMethod, threadParams] = codexThreadRequest(state.opts, excludeTurns);
+    const pending: PendingRequest = { turnKey: state.turnKey, kind: "thread" };
+    if (threadParams["excludeTurns"] === true) pending.excludeTurns = true;
     try {
-      this.#send(threadMethod, threadParams, { turnKey: state.turnKey, kind: "thread" });
+      this.#send(threadMethod, threadParams, pending);
     } catch (err) {
       this.#fallbackToCold(state, err instanceof Error ? err : new Error(String(err)));
     }
@@ -506,9 +516,11 @@ export class CodexProcessPool implements AgentRunner {
     const env = buildCodexEnv(this.#botGitIdentity, this.#gitlabToken, this.#larkCliConfigDir);
     const child = spawnPiped(bin, args, { env });
     this.#child = child;
+    this.#childSpawnedAt = Date.now();
     this.#pending.clear();
     this.#threadOwners.clear();
     this.#loadedThreadIds.clear();
+    this.#excludeTurnsUnsupported = false;
     this.#currentSpawnReadyResolved = false;
 
     // A write after the child has died (e.g. a turn racing the process's own
@@ -643,6 +655,16 @@ export class CodexProcessPool implements AgentRunner {
     if (this.#idleTimer) {
       clearInterval(this.#idleTimer);
       this.#idleTimer = undefined;
+    }
+    // WP-0 (CDX-6): make reaps countable in bridge logs — whether always-on
+    // hosts actually cold-resume after idling is an open question (D5).
+    if (this.#child != null) {
+      const now = Date.now();
+      console.warn(
+        `[codex-pool] reaping idle warm app-server pid=${this.#child.pid ?? "?"} ` +
+          `childAgeMs=${this.#childSpawnedAt != null ? now - this.#childSpawnedAt : "?"} ` +
+          `idleMs=${this.#idleSince != null ? now - this.#idleSince : "?"} — the next turn cold-starts it`,
+      );
     }
     this.#killChildNow();
   }
@@ -783,6 +805,15 @@ export class CodexProcessPool implements AgentRunner {
       case "turn": {
         const state = this.#turns.get(pending.turnKey);
         if (state == null || state.settled) return;
+        if (pending.excludeTurns && isExcludeTurnsRejection(err.message)) {
+          console.warn(
+            `[codex-pool] app-server rejected thread/resume excludeTurns (${err.message}) — retrying once ` +
+              "without it; this child will not be sent the field again.",
+          );
+          this.#excludeTurnsUnsupported = true;
+          this.#sendThreadRequest(state, false);
+          return;
+        }
         if (state.threadId == null) this.#fallbackToCold(state, err);
         else this.#settleReject(state, err);
         return;

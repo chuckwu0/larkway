@@ -373,6 +373,156 @@ describe("CodexProcessPool — wire protocol", () => {
     expect(threadResume?.params).toMatchObject({ threadId: "prior-thread-id" });
   });
 
+  it("WP-7: thread/resume asks for excludeTurns; thread/start never carries it", async () => {
+    const pool = new CodexProcessPool({});
+    const fresh = pool.run({ prompt: "new topic", cwd: "/wt" });
+    await flush();
+    const child = spawnedChildren[0]!;
+    child.stdout.write(initResponse(1) + "\n");
+    await flush();
+    child.stdout.write(threadResponse(2, "thread-new") + "\n");
+    await flush();
+    child.stdout.write(turnStartResponse(3, "turn-a") + "\n");
+    child.stdout.write(turnCompleted("thread-new", "turn-a") + "\n");
+    await fresh.done;
+
+    const resumed = pool.run({ prompt: "continue", cwd: "/wt", resumeSessionId: "prior-thread-id" });
+    await flush();
+    child.stdout.write(threadResponse(4, "prior-thread-id") + "\n");
+    await flush();
+    child.stdout.write(turnStartResponse(5, "turn-b") + "\n");
+    child.stdout.write(turnCompleted("prior-thread-id", "turn-b") + "\n");
+    await expect(resumed.done).resolves.toMatchObject({ exitCode: 0, sessionId: "prior-thread-id" });
+
+    const requests = readOutboundRequests(child);
+    const threadStart = requests.find((r) => r.method === "thread/start");
+    expect(threadStart?.params).not.toHaveProperty("excludeTurns");
+    const threadResume = requests.find((r) => r.method === "thread/resume");
+    expect(threadResume?.params).toEqual({
+      threadId: "prior-thread-id",
+      excludeTurns: true,
+      cwd: "/wt",
+      approvalPolicy: "never",
+      sandbox: "danger-full-access",
+    });
+  });
+
+  it("WP-7: an app-server that rejects excludeTurns gets one retry without it — and this child never sees the field again", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const pool = new CodexProcessPool({});
+      const first = pool.run({ prompt: "continue", resumeSessionId: "thread-a" });
+      await flush();
+      const child = spawnedChildren[0]!;
+      child.stdout.write(initResponse(1) + "\n");
+      await flush();
+      child.stdout.write(
+        jsonRpcErrorResponse(2, "Invalid request: unknown field `excludeTurns`, expected one of `threadId`, `cwd`") + "\n",
+      );
+      await flush();
+      const retried = readOutboundRequests(child).filter((r) => r.method === "thread/resume");
+      expect(retried.map((r) => [r.id, r.params?.["excludeTurns"]])).toEqual([[2, true], [3, undefined]]);
+
+      child.stdout.write(threadResponse(3, "thread-a") + "\n");
+      await flush();
+      child.stdout.write(turnStartResponse(4, "turn-a") + "\n");
+      child.stdout.write(turnCompleted("thread-a", "turn-a") + "\n");
+      await expect(first.done).resolves.toMatchObject({ exitCode: 0, pooled: true });
+      expect(spawnedChildren).toHaveLength(1); // no cold fallback
+
+      const second = pool.run({ prompt: "continue other", resumeSessionId: "thread-b" });
+      await flush();
+      const next = readOutboundRequests(child).find((r) => r.method === "thread/resume");
+      expect(next?.id).toBe(5);
+      expect(next?.params).not.toHaveProperty("excludeTurns");
+      child.stdout.write(threadResponse(5, "thread-b") + "\n");
+      await flush();
+      child.stdout.write(turnStartResponse(6, "turn-b") + "\n");
+      child.stdout.write(turnCompleted("thread-b", "turn-b") + "\n");
+      await second.done;
+
+      // Per child: a respawn (maybe an upgraded binary) is asked again.
+      child.emit("exit", 0);
+      const third = pool.run({ prompt: "after restart", resumeSessionId: "thread-a" });
+      await flush();
+      const replacement = spawnedChildren[1]!;
+      replacement.stdout.write(initResponse(7) + "\n");
+      await flush();
+      const again = readOutboundRequests(replacement).find((r) => r.method === "thread/resume");
+      expect(again?.params).toMatchObject({ excludeTurns: true });
+      replacement.stdout.write(threadResponse(8, "thread-a") + "\n");
+      await flush();
+      replacement.stdout.write(turnStartResponse(9, "turn-c") + "\n");
+      replacement.stdout.write(turnCompleted("thread-a", "turn-c") + "\n");
+      await third.done;
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+
+  it("WP-7: any other thread/resume error is the turn's own failure — no excludeTurns retry", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const pool = new CodexProcessPool({});
+      const handle = pool.run({ prompt: "continue", resumeSessionId: "gone-thread" });
+      await flush();
+      const child = spawnedChildren[0]!;
+      child.stdout.write(initResponse(1) + "\n");
+      await flush();
+      child.stdout.write(jsonRpcErrorResponse(2, "thread not found: gone-thread") + "\n");
+      await flush();
+
+      expect(readOutboundRequests(child).filter((r) => r.method === "thread/resume")).toHaveLength(1);
+      // Unchanged pre-thread failure contract: transparent cold fallback.
+      expect(spawnedChildren).toHaveLength(2);
+      const cold = spawnedChildren[1]!;
+      cold.stdout.write(initResponse(1) + "\n");
+      await flush();
+      cold.stdout.write(threadResponse(2, "gone-thread") + "\n");
+      await flush();
+      cold.stdout.write(turnStartResponse(3, "turn-cold") + "\n");
+      cold.stdout.write(turnCompleted("gone-thread", "turn-cold") + "\n");
+      await expect(handle.done).resolves.toMatchObject({ pooled: false });
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+
+  it("WP-7: a ghost thread's resume (excludeTurns set) still surfaces the error the handler's stale-session recovery matches", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      // Wording from codex-cli 0.156.1 app-server for a bogus threadId — the
+      // same with and without excludeTurns (isolated CODEX_HOME probe).
+      const ghost = (id: number) => jsonRpcErrorResponse(id, "no rollout found for thread id gone-thread");
+      const pool = new CodexProcessPool({});
+      const handle = pool.run({ prompt: "continue", resumeSessionId: "gone-thread" });
+      const doneOutcome = handle.done.then(() => "resolved", (err: Error) => err.message);
+      await flush();
+      const child = spawnedChildren[0]!;
+      child.stdout.write(initResponse(1) + "\n");
+      await flush();
+      child.stdout.write(ghost(2) + "\n");
+      await flush();
+      expect(readOutboundRequests(child).filter((r) => r.method === "thread/resume")
+        .map((r) => r.params?.["excludeTurns"])).toEqual([true]);
+
+      // Pre-thread failure → cold fallback, which resumes the same way and
+      // hands the handler the app-server's own wording.
+      expect(spawnedChildren).toHaveLength(2);
+      const cold = spawnedChildren[1]!;
+      cold.stdout.write(initResponse(1) + "\n");
+      await flush();
+      cold.stdout.write(ghost(2) + "\n");
+      const message = await doneOutcome;
+      expect(message).toContain("thread/resume failed");
+      expect(message).toContain("no rollout found");
+      expect(readOutboundRequests(cold).filter((r) => r.method === "thread/resume")
+        .map((r) => r.params?.["excludeTurns"])).toEqual([true]);
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+
   it("reports same-process only for a thread already loaded by this live child", async () => {
     const pool = new CodexProcessPool({});
     const first = pool.run({ prompt: "remember this" });
@@ -673,6 +823,49 @@ describe("CodexProcessPool — concurrent turns on one process", () => {
 });
 
 // ---------------------------------------------------------------------------
+// WP-0: native usage reaches the pooled turn's result event
+// ---------------------------------------------------------------------------
+
+describe("CodexProcessPool — WP-0 turn usage", () => {
+  it("routes thread/tokenUsage/updated to the turn and attaches the difference to its result", async () => {
+    const pool = new CodexProcessPool();
+    const handle = pool.run({ prompt: "hi", resumeSessionId: "thread-a" });
+    const eventsP = collectEvents(handle.events);
+    await flush();
+    const child = spawnedChildren[0]!;
+    const usage = (turnId: string, total: number[], last: number[]) =>
+      JSON.stringify({
+        method: "thread/tokenUsage/updated",
+        params: {
+          threadId: "thread-a",
+          turnId,
+          tokenUsage: {
+            total: { totalTokens: total[0], inputTokens: total[1], cachedInputTokens: total[2], cacheWriteInputTokens: 0, outputTokens: total[3], reasoningOutputTokens: 0 },
+            last: { totalTokens: last[0], inputTokens: last[1], cachedInputTokens: last[2], cacheWriteInputTokens: 0, outputTokens: last[3], reasoningOutputTokens: 0 },
+          },
+        },
+      });
+    child.stdout.write(initResponse(1) + "\n");
+    await flush();
+    child.stdout.write(threadResponse(2, "thread-a") + "\n");
+    // cold resume: the app-server replays the restored total under the previous turn id
+    child.stdout.write(usage("turn-prev", [1000, 990, 800, 10], [600, 594, 500, 6]) + "\n");
+    await flush();
+    child.stdout.write(turnStartResponse(3, "turn-b") + "\n");
+    child.stdout.write(JSON.stringify({ method: "turn/started", params: { threadId: "thread-a", turn: { id: "turn-b" } } }) + "\n");
+    child.stdout.write(usage("turn-b", [1700, 1686, 1400, 14], [700, 696, 600, 4]) + "\n");
+    child.stdout.write(turnCompleted("thread-a", "turn-b") + "\n");
+    await flush();
+    await handle.done;
+    const result = (await eventsP).find((e) => e.type === "result");
+    expect(result).toMatchObject({
+      usage: { inputTokens: (1686 - 990) - (1400 - 800), cacheReadTokens: 600, outputTokens: 4, requests: 1 },
+      lastRequestInputTokens: 696,
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
 // idle reap
 // ---------------------------------------------------------------------------
 
@@ -704,6 +897,33 @@ describe("CodexProcessPool — idle reap", () => {
       expect(spawnedChildren).toHaveLength(2);
       expect(handle2.pid).toBe(spawnedChildren[1]!.pid);
     } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("WP-0: logs the reaped child's age and idle time", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "Date"] });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const pool = new CodexProcessPool({ idleMs: 1_000 });
+      const handle = pool.run({ prompt: "hi" });
+      await flush();
+      const child = spawnedChildren[0]!;
+      child.stdout.write(initResponse(1) + "\n");
+      await flush();
+      child.stdout.write(threadResponse(2, "thread-a") + "\n");
+      await flush();
+      child.stdout.write(turnStartResponse(3, "turn-a") + "\n");
+      child.stdout.write(turnCompleted("thread-a", "turn-a") + "\n");
+      await flush();
+      await handle.done;
+
+      await vi.advanceTimersByTimeAsync(1_100);
+      expect(child.killed).toBe(true);
+      const line = warn.mock.calls.map((c) => String(c[0])).find((m) => m.includes("reaping idle warm app-server"));
+      expect(line).toMatch(/childAgeMs=\d+ idleMs=\d+/);
+    } finally {
+      warn.mockRestore();
       vi.useRealTimers();
     }
   });

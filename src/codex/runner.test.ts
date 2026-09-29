@@ -685,6 +685,78 @@ describe("CodexAppServerLineParser — non-shell tool items", () => {
 // buildCodexCommand — unit tests
 // ---------------------------------------------------------------------------
 
+describe("CodexAppServerLineParser — WP-0 turn usage", () => {
+  // Wire shapes from codex app-server 0.156 (thread/tokenUsage/updated +
+  // turn/started/completed); numbers from captured runs.
+  const THREAD = "thread-usage-test";
+  function turnStarted(turnId: string): unknown {
+    return { method: "turn/started", params: { threadId: THREAD, turn: { id: turnId, items: [], status: "inProgress" } } };
+  }
+  function turnCompleted(turnId: string): unknown {
+    return { method: "turn/completed", params: { threadId: THREAD, turn: { id: turnId, items: [], status: "completed" } } };
+  }
+  function breakdown(totalTokens: number, inputTokens: number, cachedInputTokens: number, outputTokens: number) {
+    return { totalTokens, inputTokens, cachedInputTokens, cacheWriteInputTokens: 0, outputTokens, reasoningOutputTokens: 0 };
+  }
+  function tokenUsage(turnId: string, total: ReturnType<typeof breakdown>, last: ReturnType<typeof breakdown>): unknown {
+    return {
+      method: "thread/tokenUsage/updated",
+      params: { threadId: THREAD, turnId, tokenUsage: { total, last, modelContextWindow: 258400 } },
+    };
+  }
+  function run(parser: InstanceType<typeof CodexAppServerLineParser>, messages: unknown[]) {
+    return messages.flatMap((m) => [...parser.parseMessage(m)]);
+  }
+
+  it("first turn of a new thread: total = last → the turn's own usage", () => {
+    const events = run(new CodexAppServerLineParser(), [
+      turnStarted("t1"),
+      tokenUsage("t1", breakdown(19776, 19771, 12544, 5), breakdown(19776, 19771, 12544, 5)),
+      turnCompleted("t1"),
+    ]);
+    expect(events.find((e) => e.type === "result")).toMatchObject({
+      usage: { inputTokens: 19771 - 12544, cacheReadTokens: 12544, cacheCreationTokens: 0, outputTokens: 5, reasoningTokens: 0, requests: 1 },
+      lastRequestInputTokens: 19771,
+    });
+    // bookkeeping notifications still surface as raw (watchdog activity)
+    expect(events.filter((e) => e.type === "raw")).toHaveLength(2);
+  });
+
+  it("cold resume: a replayed pre-turn total (previous turn id) is the baseline, not usage", () => {
+    const events = run(new CodexAppServerLineParser(), [
+      tokenUsage("t-prev", breakdown(39570, 39559, 32128, 11), breakdown(19794, 19788, 19584, 6)),
+      turnStarted("t2"),
+      tokenUsage("t2", breakdown(65109, 65092, 51712, 17), breakdown(25539, 25533, 19584, 6)),
+      turnCompleted("t2"),
+    ]);
+    expect(events.find((e) => e.type === "result")).toMatchObject({
+      usage: { inputTokens: (65092 - 39559) - (51712 - 32128), cacheReadTokens: 51712 - 32128, outputTokens: 6, requests: 1 },
+      lastRequestInputTokens: 25533,
+    });
+  });
+
+  it("several requests in one turn, with a replayed update: difference of totals, replay not double-counted", () => {
+    const events = run(new CodexAppServerLineParser(), [
+      turnStarted("t1"),
+      tokenUsage("t1", breakdown(1100, 1090, 0, 10), breakdown(1100, 1090, 0, 10)),
+      tokenUsage("t1", breakdown(2300, 2270, 1000, 30), breakdown(1200, 1180, 1000, 20)),
+      tokenUsage("t1", breakdown(2300, 2270, 1000, 30), breakdown(1200, 1180, 1000, 20)), // replay
+      turnCompleted("t1"),
+    ]);
+    expect(events.find((e) => e.type === "result")).toMatchObject({
+      usage: { inputTokens: 2270 - 1000, cacheReadTokens: 1000, outputTokens: 30, requests: 2 },
+      lastRequestInputTokens: 1180,
+    });
+  });
+
+  it("no tokenUsage notification → the result event keeps its old shape", () => {
+    const events = run(new CodexAppServerLineParser(), [turnStarted("t1"), turnCompleted("t1")]);
+    const result = events.find((e) => e.type === "result");
+    expect(result).not.toHaveProperty("usage");
+    expect(result).not.toHaveProperty("lastRequestInputTokens");
+  });
+});
+
 describe("buildCodexCommand", () => {
   it("fresh session: runs codex app-server over stdio", () => {
     const [bin, args] = buildCodexCommand({ prompt: "hello" });
@@ -1269,6 +1341,137 @@ describe("runCodex() — spawn-level integration", () => {
     const stdinText = fake.child.stdin.read()?.toString("utf8") ?? "";
     expect(stdinText).toContain('"method":"thread/resume"');
     expect(stdinText).toContain('"threadId":"019eabc123def456"');
+  });
+
+  describe("WP-7: thread/resume excludeTurns", () => {
+    function outboundRequests(fake: ReturnType<typeof makeFakeCodexChild>) {
+      const text: string = fake.child.stdin.read()?.toString("utf8") ?? "";
+      return text
+        .trim()
+        .split("\n")
+        .filter(Boolean)
+        .map((line: string) => JSON.parse(line) as { id?: number; method?: string; params?: Record<string, unknown> });
+    }
+
+    function threadResponse(id: number) {
+      return JSON.stringify({ id, result: { thread: { id: APP_THREAD_ID, sessionId: APP_THREAD_ID, cwd: "/wt" } } });
+    }
+
+    function turnResponse(id: number) {
+      return JSON.stringify({ id, result: { turn: { id: "turn-1", items: [], itemsView: "notLoaded", status: "inProgress" } } });
+    }
+
+    it("a resume asks for excludeTurns; a new thread's thread/start never carries it", async () => {
+      const { runCodex } = await import("./runner.js");
+      for (const resumeSessionId of [APP_THREAD_ID, undefined]) {
+        const fake = makeFakeCodexChild();
+        __nextFakeCodexChild = fake;
+        const handle = runCodex({ prompt: "go", cwd: "/wt", resumeSessionId });
+        const eventsPromise = collectEvents(handle.events);
+        await new Promise<void>((res) => setImmediate(() => {
+          fake.stdout.write(APP_INIT_RESPONSE + "\n");
+          fake.stdout.write(APP_THREAD_RESPONSE + "\n");
+          fake.stdout.write(APP_TURN_RESPONSE + "\n");
+          fake.stdout.write(APP_TURN_COMPLETED + "\n");
+          res();
+        }));
+        await eventsPromise;
+        await expect(handle.done).resolves.toMatchObject({ exitCode: 0 });
+
+        const thread = outboundRequests(fake).find((r) => r.method === "thread/resume" || r.method === "thread/start");
+        if (resumeSessionId) {
+          expect(thread?.method).toBe("thread/resume");
+          expect(thread?.params).toEqual({
+            threadId: APP_THREAD_ID,
+            excludeTurns: true,
+            cwd: "/wt",
+            approvalPolicy: "never",
+            sandbox: "danger-full-access",
+          });
+        } else {
+          expect(thread?.method).toBe("thread/start");
+          expect(thread?.params).not.toHaveProperty("excludeTurns");
+        }
+      }
+    });
+
+    it("an app-server that rejects the field gets exactly one retry without it, then the turn runs", async () => {
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+      try {
+        const fake = makeFakeCodexChild();
+        __nextFakeCodexChild = fake;
+        const { runCodex } = await import("./runner.js");
+        const handle = runCodex({ prompt: "go", resumeSessionId: APP_THREAD_ID });
+        const eventsPromise = collectEvents(handle.events);
+        await new Promise<void>((res) => setImmediate(() => {
+          fake.stdout.write(APP_INIT_RESPONSE + "\n");
+          fake.stdout.write(JSON.stringify({
+            id: 2,
+            error: { code: -32600, message: "Invalid request: unknown field `excludeTurns`, expected one of `threadId`" },
+          }) + "\n");
+          fake.stdout.write(threadResponse(3) + "\n");
+          fake.stdout.write(turnResponse(4) + "\n");
+          fake.stdout.write(APP_TURN_COMPLETED + "\n");
+          res();
+        }));
+        const events = await eventsPromise;
+        await expect(handle.done).resolves.toMatchObject({ exitCode: 0, sessionId: APP_THREAD_ID });
+        expect(events.some((e) => e.type === "system_init")).toBe(true);
+
+        const requests = outboundRequests(fake);
+        expect(
+          requests.filter((r) => r.method === "thread/resume").map((r) => [r.id, r.params?.["excludeTurns"]]),
+        ).toEqual([[2, true], [3, undefined]]);
+        expect(requests.find((r) => r.method === "turn/start")?.id).toBe(4);
+      } finally {
+        warnSpy.mockRestore();
+      }
+    });
+
+    it("a ghost thread's error keeps the wording the handler's stale-session recovery matches", async () => {
+      // codex-cli 0.156.1 app-server, bogus threadId, isolated CODEX_HOME:
+      // thread/resume answers -32600 "no rollout found for thread id <id>"
+      // with and without excludeTurns alike. src/bridge/handler.ts marks the
+      // record fresh-start only when the error carries BOTH substrings below.
+      const fake = makeFakeCodexChild();
+      __nextFakeCodexChild = fake;
+      const { runCodex } = await import("./runner.js");
+      const handle = runCodex({ prompt: "go", resumeSessionId: APP_THREAD_ID });
+      const doneOutcome = handle.done.then(() => "resolved", (err: Error) => err.message);
+      const eventsPromise = collectEvents(handle.events);
+      await new Promise<void>((res) => setImmediate(() => {
+        fake.stdout.write(APP_INIT_RESPONSE + "\n");
+        fake.stdout.write(JSON.stringify({
+          id: 2,
+          error: { code: -32600, message: `no rollout found for thread id ${APP_THREAD_ID}` },
+        }) + "\n");
+        res();
+      }));
+      await eventsPromise;
+      const message = await doneOutcome;
+      expect(message).toContain("thread/resume failed");
+      expect(message).toContain("no rollout found");
+      // Not mistaken for an excludeTurns rejection: no retry.
+      const resumes = outboundRequests(fake).filter((r) => r.method === "thread/resume");
+      expect(resumes.map((r) => r.params?.["excludeTurns"])).toEqual([true]);
+    });
+
+    it("any other thread/resume error still fails the turn — no retry", async () => {
+      const fake = makeFakeCodexChild();
+      __nextFakeCodexChild = fake;
+      const { runCodex } = await import("./runner.js");
+      const handle = runCodex({ prompt: "go", resumeSessionId: APP_THREAD_ID });
+      const doneOutcome = handle.done.then(() => "resolved", (err: Error) => err.message);
+      const eventsPromise = collectEvents(handle.events);
+      await new Promise<void>((res) => setImmediate(() => {
+        fake.stdout.write(APP_INIT_RESPONSE + "\n");
+        fake.stdout.write(JSON.stringify({ id: 2, error: { code: -32600, message: "thread not found" } }) + "\n");
+        res();
+      }));
+      await eventsPromise;
+      expect(await doneOutcome).toContain("thread/resume failed: thread not found");
+      expect(outboundRequests(fake).filter((r) => r.method === "thread/resume")).toHaveLength(1);
+    });
   });
 
   it("done resolves even when child exits with code 1 (killed path)", async () => {

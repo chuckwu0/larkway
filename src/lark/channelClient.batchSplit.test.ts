@@ -13,7 +13,7 @@ import { createLarkChannel as realCreateLarkChannel, normalize } from "@larksuit
 import { channelMsgToLarkEvent, installInboundBatchSplit } from "./channelClient.js";
 import { parseMessage } from "./message.js";
 import { silentSdkLogger } from "./sdkLogger.js";
-import type { LarkMessageEvent } from "./transport.js";
+import { larkEpochMs, type LarkMessageEvent } from "./transport.js";
 
 // Without a `cache` option the SDK dedups against a process-global cache, so
 // every message id in this file must be unique across tests.
@@ -52,8 +52,10 @@ function groupAt(o: {
   text: string;
   rootId?: string;
   threadId?: string;
+  /** message.create_time (epoch ms string); defaults to now. */
+  createTime?: string;
 }): Promise<Normalized> {
-  const createTime = String(Date.now());
+  const createTime = o.createTime ?? String(Date.now());
   const event = {
     schema: "2.0",
     event_id: `ev_${o.id}`,
@@ -246,13 +248,22 @@ describe("installInboundBatchSplit — the SDK debounce never merges messages in
 });
 
 describe("ChannelClient — installs the inbound batch split on its SDK channel", () => {
+  const ENV_KEY = "LARKWAY_INBOUND_BATCH_DELAY_MS";
+  const original = process.env[ENV_KEY];
+
   afterEach(() => {
+    if (original === undefined) delete process.env[ENV_KEY];
+    else process.env[ENV_KEY] = original;
     vi.useRealTimers();
     vi.doUnmock("@larksuiteoapi/node-sdk");
     vi.resetModules();
   });
 
-  it("two @s in different topics of one group inside the debounce window reach the handler as two events", async () => {
+  /**
+   * A connected ChannelClient over a REAL SDK channel built from the client's
+   * own options (cache, safety), minus the network, plus the events it queues.
+   */
+  async function connectRealClient() {
     let sdkChannel: SdkInbound | undefined;
     vi.resetModules();
     vi.doMock("@larksuiteoapi/node-sdk", async (importOriginal) => {
@@ -283,13 +294,19 @@ describe("ChannelClient — installs the inbound batch split on its SDK channel"
     void (async () => {
       for await (const ev of client.events()) events.push(ev);
     })();
+    return { client, sdkChannel: sdkChannel!, events };
+  }
+
+  it("two @s in different topics of one group inside the debounce window reach the handler as two events", async () => {
+    process.env[ENV_KEY] = "sdk";
+    const { client, sdkChannel, events } = await connectRealClient();
 
     const a = await groupAt({ id: uid("e2e_a"), sender: "ou_test_user_a", text: "topic A question", rootId: "om_test_root_a", threadId: "omt_test_a" });
     const b = await groupAt({ id: uid("e2e_b"), sender: "ou_test_user_b", text: "topic B question", rootId: "om_test_root_b", threadId: "omt_test_b" });
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
-    await sdkChannel!.safety.pushMessage(a);
+    await sdkChannel.safety.pushMessage(a);
     await vi.advanceTimersByTimeAsync(200);
-    await sdkChannel!.safety.pushMessage(b);
+    await sdkChannel.safety.pushMessage(b);
     await vi.advanceTimersByTimeAsync(1_000);
     vi.useRealTimers();
 
@@ -297,6 +314,41 @@ describe("ChannelClient — installs the inbound batch split on its SDK channel"
       { message_id: a.messageId, root_id: "om_test_root_a", sender_id: "ou_test_user_a", text: "topic A question" },
       { message_id: b.messageId, root_id: "om_test_root_b", sender_id: "ou_test_user_b", text: "topic B question" },
     ]);
+    await client.close();
+  });
+
+  // LARKWAY_INBOUND_BATCH_DELAY_MS only moves WHEN each message is dispatched:
+  // with the split in place the events are the same either way. Each keeps its
+  // own create_time (the perf sample's messageCreateAt, read off the flat raw)
+  // and gets a ws_at stamped at dispatch, after the window.
+  it.each([
+    { env: "sdk", name: "sdk (SDK default 600ms)", wsAtMs: [800, 800] },
+    { env: undefined, name: "unset (larkway default 0)", wsAtMs: [0, 200] },
+    { env: "0", name: "0 (dispatch at once)", wsAtMs: [0, 200] },
+  ])("delay $name: the same two events, each with its own create_time; only ws_at moves", async ({ env, wsAtMs }) => {
+    if (env === undefined) delete process.env[ENV_KEY];
+    else process.env[ENV_KEY] = env;
+    const { client, sdkChannel, events } = await connectRealClient();
+
+    const createA = String(Date.now() - 5_000);
+    const createB = String(Date.now() - 4_000);
+    const a = await groupAt({ id: uid("delay_a"), sender: "ou_test_user_a", text: "first question", rootId: "om_test_root_a", createTime: createA });
+    const b = await groupAt({ id: uid("delay_b"), sender: "ou_test_user_a", text: "second question", rootId: "om_test_root_a", createTime: createB });
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+    const t0 = Date.now();
+    await sdkChannel.safety.pushMessage(a);
+    await vi.advanceTimersByTimeAsync(200);
+    await sdkChannel.safety.pushMessage(b);
+    await vi.advanceTimersByTimeAsync(3_000);
+    vi.useRealTimers();
+
+    expect(events.map(routing)).toEqual([
+      { message_id: a.messageId, root_id: "om_test_root_a", sender_id: "ou_test_user_a", text: "first question" },
+      { message_id: b.messageId, root_id: "om_test_root_a", sender_id: "ou_test_user_a", text: "second question" },
+    ]);
+    expect(events.map((ev) => ev.create_time)).toEqual([createA, createB]);
+    expect(events.map((ev) => larkEpochMs(ev.create_time))).toEqual([Number(createA), Number(createB)]);
+    expect(events.map((ev) => (ev.ws_at ?? Number.NaN) - t0)).toEqual(wsAtMs);
     await client.close();
   });
 });

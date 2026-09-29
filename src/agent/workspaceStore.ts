@@ -1,6 +1,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import type { BotConfig } from "../config/botLoader.js";
+import { resolveAgentWorkspacePathFromHome } from "../config/paths.js";
 import { permissionItemsFromCapabilities } from "./permissionPlan.js";
 
 export interface WorkspaceRepoPointer {
@@ -305,17 +306,141 @@ function extractCreationTaskDescription(text: string | undefined): string | unde
 export const ROLE_NOTES_START = "<!-- larkway:role-notes:start (bridge-projected from bots/<id>.memory.md — edit THAT file, not this section) -->";
 export const ROLE_NOTES_END = "<!-- larkway:role-notes:end -->";
 
-const RETIRED_CONTRACT_LINES = new Set([
-  "- Write the per-session state file path provided by the prompt before ending a turn so the Feishu card can finalize.",
+/**
+ * Retired template lines the unattended startup migration removes, each with
+ * the short label it logs (docs/native-runtime.md lists them for operators).
+ * Only the two that cost every turn work: a state-file write before each
+ * turn ends, and a memory read before each reply.
+ */
+const STARTUP_RETIRED_LINE_LABELS = new Map([
+  ["- Write the per-session state file path provided by the prompt before ending a turn so the Feishu card can finalize.", "state-each-turn"],
+  // The memory ritual line exactly as the pre-批G template wrote it.
+  ["- 开场不可跳过:回应 owner 前,先 Read `memory/index.md`,并按相关性 Read 相关 category 文件,再开始干活(防止新 session 失忆)。", "memory-ritual"],
+]);
+
+/**
+ * Every retired template line. The two policy lines (permission pre-read,
+ * non-owner knowledge discipline) are left to the projection path, so they
+ * go only when the owner saves the config.
+ */
+const RETIRED_CONTRACT_LINES: ReadonlySet<string> = new Set([
+  ...STARTUP_RETIRED_LINE_LABELS.keys(),
   "- Read `permissions-request.md` and `permissions-granted.md` before write/deploy/external-message work.",
   "- 长期知识纪律:每轮 prompt 带有 `sender_is_owner` 事实。owner 的指示可进组织知识库 inbox;非 owner 提供的新知识只写进本 session 的 summary.md 并标注 `[未经 owner 确认]`,由保养轮决定是否晋升 —— 不直接写 AGENTS.md、L2 或知识库。",
 ]);
 
+/**
+ * Projection path only (runs on an owner-initiated save): every exact retired
+ * line plus any variant of the memory ritual. The unattended startup
+ * migration matches STARTUP_RETIRED_LINE_LABELS exactly and never uses the
+ * substring rule, so an owner's own line mentioning both is left alone.
+ */
+function isRetiredContractLine(line: string): boolean {
+  return RETIRED_CONTRACT_LINES.has(line) ||
+    (line.includes("开场不可跳过") && line.includes("memory/index.md"));
+}
+
 function removeRetiredContractLines(content: string): string {
-  return content.split(/\r?\n/).filter((line) =>
-    !RETIRED_CONTRACT_LINES.has(line) &&
-    !(line.includes("开场不可跳过") && line.includes("memory/index.md")),
-  ).join("\n");
+  return content.split(/\r?\n/).filter((line) => !isRetiredContractLine(line)).join("\n");
+}
+
+/**
+ * tmp + rename next to the real file, so a symlinked AGENTS.md keeps its link
+ * and mode. rename(2) only needs a writable directory, so check the file
+ * itself first: an owner-locked (read-only) file fails with EACCES, exactly as
+ * the config-save paths' plain writeFile does.
+ */
+async function replaceFileAtomic(filePath: string, content: string): Promise<void> {
+  const target = await fs.realpath(filePath);
+  await fs.access(target, fs.constants.W_OK);
+  const { mode } = await fs.stat(target);
+  const tmp = `${target}.${process.pid}.${Date.now()}.tmp`;
+  try {
+    await fs.writeFile(tmp, content, "utf8");
+    await fs.chmod(tmp, mode & 0o7777);
+    await fs.rename(tmp, target);
+  } catch (err) {
+    await fs.rm(tmp, { force: true });
+    throw err;
+  }
+}
+
+/** One retired line the startup migration removed (or, dry-run, would remove). */
+export interface RetiredContractLineRemoval {
+  /** Short name of the retired template line, e.g. `state-each-turn`. */
+  label: string;
+  /** 1-based line number in the AGENTS.md as it was before the migration. */
+  line: number;
+}
+
+export interface RetiredContractMigrationResult {
+  /** In file order; empty = missing or already clean (nothing written). */
+  removed: RetiredContractLineRemoval[];
+  /** Where the pre-migration file was copied; set only when this call wrote the copy. */
+  backupPath?: string;
+}
+
+/**
+ * Bridge-startup migration for an existing managed AGENTS.md. The per-turn
+ * ensure only creates a missing file and only a config save re-projects it,
+ * so retired contract lines (e.g. "write the state file before ending a
+ * turn") would otherwise keep steering every new native session. Removes
+ * only lines equal to a STARTUP_RETIRED_LINE_LABELS entry; every other byte,
+ * line endings included, stays as the owner left it. A read-only AGENTS.md is
+ * left as is and the call rejects with EACCES.
+ *
+ * `dryRun` reports what would go and writes nothing. `backupPath`: before the
+ * first rewrite, the file as it was is copied there (an existing copy is kept,
+ * so it stays the earliest original); a failed copy aborts the migration.
+ */
+export async function migrateRetiredContractLines(
+  workspacePath: string,
+  opts: { dryRun?: boolean; backupPath?: string } = {},
+): Promise<RetiredContractMigrationResult> {
+  const agentsPath = path.join(workspacePath, "AGENTS.md");
+  const current = await readTextIfExists(agentsPath);
+  if (current === undefined) return { removed: [] };
+  const lines = current.split(/(?<=\n)/);
+  const removed: RetiredContractLineRemoval[] = [];
+  const kept = lines.filter((line, index) => {
+    const label = STARTUP_RETIRED_LINE_LABELS.get(line.replace(/\r?\n$/, ""));
+    if (label) removed.push({ label, line: index + 1 });
+    return label === undefined;
+  });
+  if (removed.length === 0 || opts.dryRun) return { removed };
+  let backupPath: string | undefined;
+  if (opts.backupPath) {
+    try {
+      await fs.writeFile(opts.backupPath, current, { encoding: "utf8", flag: "wx" });
+      backupPath = opts.backupPath;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
+    }
+  }
+  await replaceFileAtomic(agentsPath, kept.join(""));
+  return { removed, ...(backupPath ? { backupPath } : {}) };
+}
+
+/**
+ * Where the startup migration copies an AGENTS.md before its first rewrite:
+ * `agents/<id>/`, beside the managed workspace rather than in it, so the
+ * agent's cwd gains no stale copy of its old instructions.
+ */
+export function retiredContractBackupPath(workspacePath: string): string {
+  return path.join(path.dirname(workspacePath), "AGENTS.md.pre-retired-lines.bak");
+}
+
+/**
+ * Workspace whose AGENTS.md the startup migration may rewrite, or undefined.
+ * A BYO workspace (`bot.workspace`) is owner-owned by contract and never
+ * touched; a legacy-runtime bot has no managed AGENTS.md.
+ */
+export function retiredContractMigrationPath(
+  bot: Pick<BotConfig, "id" | "runtime" | "workspace">,
+  home: string,
+): string | undefined {
+  if (bot.runtime !== "agent_workspace" || bot.workspace) return undefined;
+  return resolveAgentWorkspacePathFromHome(home, bot.id);
 }
 
 interface SectionProjection {

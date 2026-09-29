@@ -30,9 +30,52 @@ import type {
 export type CotDetail = "brief" | "detailed";
 
 const DEFAULT_THROTTLE_MS = 600;
-const COT_TOOL_RESULT_MAX = 1200;
-const COT_TEXT_MAX = 1200;
+/** Longest tool_result text the bubble renders (detailed tier); the rest is clipped. */
+export const COT_TOOL_RESULT_MAX = 1200;
+/** Longest reasoning chunk / tool-args JSON the bubble renders per event. */
+export const COT_TEXT_MAX = 1200;
 const COT_INPUT_PREVIEW_MAX = 200;
+
+/**
+ * WP-2 (a): how long a chat remembers "the thread channel answered code=10002
+ * and chat_id then worked" — skipping the thread attempt meanwhile. Past it the
+ * next create tries the thread channel once more, so a tenant that opens the
+ * channel is picked up within one TTL.
+ */
+export const COT_THREAD_REJECTED_TTL_MS = 6 * 60 * 60 * 1000;
+
+/**
+ * WP-2 (a): per bot (its cot client instance) and chat, until when the thread
+ * channel is known to reject. Keyed by chat too, not per bot alone: the
+ * 2026-07 probe (docs/task-handle.md §17.7) suggests 10002 means the API cannot
+ * resolve reply chains of a plain group, which says nothing about a real topic
+ * group the same bot may also serve.
+ */
+const threadRejectedUntil = new WeakMap<object, Map<string, number>>();
+
+function threadChannelKnownRejected(client: object, chatId: string): boolean {
+  const byChat = threadRejectedUntil.get(client);
+  const until = byChat?.get(chatId);
+  if (until === undefined) return false;
+  if (until > Date.now()) return true;
+  byChat!.delete(chatId);
+  return false;
+}
+
+function rememberThreadChannelRejected(client: object, chatId: string): void {
+  let byChat = threadRejectedUntil.get(client);
+  if (!byChat) {
+    byChat = new Map();
+    threadRejectedUntil.set(client, byChat);
+  }
+  byChat.set(chatId, Date.now() + COT_THREAD_REJECTED_TTL_MS);
+}
+
+/** The thread channel's code=10002 refusal (see resolveCotTargets). */
+function isThreadChannelRejection(err: unknown): boolean {
+  const message = err instanceof Error ? err.message : String(err);
+  return /\bcode=10002\b/.test(message);
+}
 
 export interface CotProgressHandle {
   /** True once COT has been disabled (create/write failure) — handle is a no-op. */
@@ -45,6 +88,12 @@ export interface CotProgressHandle {
    * `Working` forever with no way to reach it.
    */
   readonly bubbleRef: CotRef | undefined;
+  /**
+   * WP-0 diagnostics: where create landed — "chat-after-thread" means the
+   * thread channel was tried and rejected first (one extra round trip).
+   * Undefined until create settles.
+   */
+  readonly channel?: CotChannel;
   /** Feed one runner event. Reasoning + tool events map to COT; others ignored. */
   handle(event: AgentStreamEvent): void;
   /** Flush + complete the bubble. `done` on normal end, `error` otherwise. */
@@ -58,6 +107,9 @@ export interface CotProgressHandle {
   /** Cancel any pending flush without completing (e.g. the run threw). */
   close(): void;
 }
+
+/** WP-0: the bubble's create outcome — see {@link CotProgressHandle.channel}. */
+export type CotChannel = "thread" | "chat" | "chat-after-thread" | "none";
 
 export interface CreateCotProgressHandleOpts {
   cotClient: OutboundCotClient;
@@ -93,16 +145,14 @@ export interface CreateCotProgressHandleOpts {
  *
  * The caller (start()) tries them in order and keeps the first that succeeds.
  * `resolveThreadId` never throws (bypass rule), so this never throws either.
+ * WP-2 (a): start() skips this entirely — straight to chat_id — while the chat
+ * remembers a recent 10002 (see COT_THREAD_REJECTED_TTL_MS).
  */
 export async function resolveCotTargets(
   client: Pick<OutboundCotClient, "resolveThreadId">,
   hint: CotTarget,
 ): Promise<CotTarget[]> {
-  const chatFallback: CotTarget = {
-    chatId: hint.chatId,
-    threadId: undefined,
-    originMessageId: hint.originMessageId,
-  };
+  const chatFallback = chatTarget(hint);
   const threadAttempt = (threadId: string): CotTarget => ({
     chatId: hint.chatId,
     threadId,
@@ -121,6 +171,11 @@ export async function resolveCotTargets(
     }
   }
   return [chatFallback];
+}
+
+/** The chat_id + origin attempt — the channel that works for our tenant. */
+function chatTarget(hint: CotTarget): CotTarget {
+  return { chatId: hint.chatId, threadId: undefined, originMessageId: hint.originMessageId };
 }
 
 function truncate(value: unknown, max: number): string {
@@ -207,6 +262,7 @@ class LiveCotProgressHandle implements CotProgressHandle {
   private readonly reasoningMessageId: string;
 
   private ref: CotRef | undefined;
+  private _channel: CotChannel | undefined;
   private _disabled = false;
   private closed = false;
   /** Whether `complete` was accepted by the platform; memoized for repeat finalizes. */
@@ -245,10 +301,17 @@ class LiveCotProgressHandle implements CotProgressHandle {
     return this.ref;
   }
 
+  get channel(): CotChannel | undefined {
+    return this._channel;
+  }
+
   async start(target: CotTarget, inputPreview: string): Promise<void> {
     try {
-      // Resolve om_/omt_ once here (run start), not per flush.
-      const attempts = await resolveCotTargets(this.cotClient, target);
+      // Resolve om_/omt_ once here (run start), not per flush — unless this
+      // chat recently rejected the thread channel (WP-2 (a)).
+      const attempts = threadChannelKnownRejected(this.cotClient, target.chatId)
+        ? [chatTarget(target)]
+        : await resolveCotTargets(this.cotClient, target);
       this.ref = await this.createWithFallback(attempts);
       if (!this.ref) {
         this._disabled = true;
@@ -271,12 +334,25 @@ class LiveCotProgressHandle implements CotProgressHandle {
    * tenant currently rejects) logs an info line and degrades to the next
    * (chat-level) channel — NOT a disable. Only when the last attempt fails do
    * we give up (caller disables). Never throws.
+   *
+   * WP-2 (a): a thread 10002 followed by a chat_id success is remembered for
+   * the chat (start() then skips the thread attempt until the TTL passes). A
+   * chat failure records nothing — the bot may simply have left the chat.
    */
   private async createWithFallback(attempts: readonly CotTarget[]): Promise<CotRef | undefined> {
+    let threadRejected = false;
     for (let i = 0; i < attempts.length; i++) {
       const attempt = attempts[i]!;
       try {
         const ref = await this.cotClient.create(attempt);
+        if (!attempt.threadId && threadRejected) {
+          rememberThreadChannelRejected(this.cotClient, attempt.chatId);
+          console.info(
+            "[cot_progress] thread channel rejected (code=10002); chat_id only for this chat for",
+            `${Math.round(COT_THREAD_REJECTED_TTL_MS / 3_600_000)}h`,
+          );
+        }
+        this._channel = attempt.threadId ? "thread" : i > 0 ? "chat-after-thread" : "chat";
         console.info(
           "[cot_progress] created",
           `cotId=${ref.cotId}`,
@@ -288,6 +364,7 @@ class LiveCotProgressHandle implements CotProgressHandle {
         );
         return ref;
       } catch (err) {
+        if (attempt.threadId && isThreadChannelRejection(err)) threadRejected = true;
         if (i < attempts.length - 1) {
           console.info(
             "[cot_progress] thread channel rejected, falling back to chat-level bubble:",
@@ -301,6 +378,7 @@ class LiveCotProgressHandle implements CotProgressHandle {
         }
       }
     }
+    this._channel = "none";
     return undefined;
   }
 

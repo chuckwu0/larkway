@@ -12,6 +12,7 @@
  *   - AsyncQueue<T>      (class)     — VALUE import; bridges events into a generator
  *   - LarkClientOptions  (interface) — inbound client construction options
  *   - ActiveThreadInfo   (interface) — per-thread catch-up high-water mark
+ *   - larkEpochMs        (function)  — s/ms epoch normalisation for `create_time`
  */
 
 // ---------------------------------------------------------------------------
@@ -63,6 +64,13 @@ export interface LarkMessageEvent {
    * real inbound event.
    */
   reply_anchor_message_id?: string;
+  /**
+   * WP-0 perf: epoch ms at which the live WS channel handed this message to
+   * larkway (after the node-sdk's own inbound debounce). Set only by
+   * ChannelClient's live `message` callback — absent on gap-fill replays and
+   * synthetic events. Diagnostics only (perf.jsonl `wsAt`).
+   */
+  ws_at?: number;
   [key: string]: unknown;
 }
 
@@ -76,12 +84,16 @@ export interface InboundClient {
   /**
    * Best-effort visual ack for an inbound message. Implementations may add a
    * temporary Feishu reaction so the operator immediately sees "the bridge got
-   * it" before a card is created.
+   * it" before a card is created. The handler awaits this on the pre-runner
+   * path, so implementations should return without waiting for the network
+   * round trip.
    */
   addProcessingReaction?(messageId: string): Promise<void>;
   /**
    * Best-effort cleanup for the temporary visual ack. Called once the bridge has
    * moved from "received" to the real processing surface (or after hard failure).
+   * Same non-blocking contract as the add; it may be called while that add is
+   * still in flight, and must then still remove the reaction once it lands.
    */
   removeProcessingReaction?(messageId: string): Promise<void>;
   acknowledgeMessage(messageId: string): void;
@@ -193,6 +205,16 @@ export interface LarkClientOptions {
    * disables it (tests / dry-run).
    */
   openChatDiscoveryMs?: number;
+}
+
+/**
+ * A Feishu epoch field (e.g. `create_time`) as epoch ms — lark surfaces both
+ * second and millisecond epochs. Undefined when absent or unparseable.
+ */
+export function larkEpochMs(raw: unknown): number | undefined {
+  const t = Number(raw);
+  if (!Number.isFinite(t) || t <= 0) return undefined;
+  return t < 1e12 ? t * 1000 : t;
 }
 
 // ---------------------------------------------------------------------------

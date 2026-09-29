@@ -12,6 +12,9 @@
 
 import { describe, it, expect, afterEach, vi } from "vitest";
 import { EventEmitter, PassThrough } from "node:stream";
+import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import {
   AnswerChannelExtractor,
   ANSWER_BEGIN_MARKER,
@@ -21,6 +24,9 @@ import {
   _buildCommand as buildCommand,
   _buildEnv as buildEnv,
   _parseLinesMulti as parseLinesMulti,
+  buildWarmCommand,
+  newClaudeTurnUsageState,
+  repoShipsClaudeSkills,
 } from "./runner.js";
 
 // ---------------------------------------------------------------------------
@@ -80,12 +86,59 @@ describe("buildEnv", () => {
   const SCRATCH_VARS = [
     "ANTHROPIC_API_KEY",
     "LARKWAY_TEST_VAR",
+    "CLAUDECODE",
+    "CLAUDE_CODE_ENTRYPOINT",
+    "CLAUDE_CODE_ENVIRONMENT_KIND",
+    "CLAUDE_CODE_SESSION_ID",
+    "CLAUDE_CODE_CHILD_SESSION",
+    "CLAUDE_CODE_HOST_SESSION_ID",
+    "CLAUDE_CODE_MESSAGING_SOCKET",
+    "CLAUDE_CODE_MESSAGING_TOKEN",
+    "CLAUDE_CODE_USE_BEDROCK",
+    "CLAUDE_CODE_MAX_OUTPUT_TOKENS",
+    "ANTHROPIC_BASE_URL",
   ] as const;
+  const saved = new Map<string, string | undefined>(SCRATCH_VARS.map((key) => [key, process.env[key]]));
 
   afterEach(() => {
+    // Restore rather than delete: this suite may itself run under a Claude
+    // Code session that exports some of these.
     for (const key of SCRATCH_VARS) {
-      delete process.env[key];
+      const value = saved.get(key);
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
     }
+  });
+
+  it("WP-7: strips a parent Claude Code session's identity (explicit list + CLAUDE_CODE_MESSAGING_*)", () => {
+    const stripped = [
+      "CLAUDECODE",
+      "CLAUDE_CODE_ENTRYPOINT",
+      "CLAUDE_CODE_ENVIRONMENT_KIND",
+      "CLAUDE_CODE_SESSION_ID",
+      "CLAUDE_CODE_CHILD_SESSION",
+      "CLAUDE_CODE_HOST_SESSION_ID",
+      "CLAUDE_CODE_MESSAGING_SOCKET",
+      "CLAUDE_CODE_MESSAGING_TOKEN",
+    ];
+    for (const key of stripped) process.env[key] = `test-${key.toLowerCase()}`;
+    const env = buildEnv();
+    expect(stripped.filter((key) => key in env)).toEqual([]);
+    expect(Object.keys(env).filter((key) => key.startsWith("CLAUDE_CODE_MESSAGING_"))).toEqual([]);
+  });
+
+  it("WP-7: keeps operator CLAUDE_CODE_* configuration and auth variables — no prefix wildcard", () => {
+    process.env["CLAUDE_CODE_USE_BEDROCK"] = "1";
+    process.env["CLAUDE_CODE_MAX_OUTPUT_TOKENS"] = "32000";
+    process.env["ANTHROPIC_BASE_URL"] = "https://gateway.example.test";
+    process.env["CLAUDE_CODE_ENTRYPOINT"] = "claude-desktop";
+    const env = buildEnv();
+    expect(env["CLAUDE_CODE_USE_BEDROCK"]).toBe("1");
+    expect(env["CLAUDE_CODE_MAX_OUTPUT_TOKENS"]).toBe("32000");
+    expect(env["ANTHROPIC_BASE_URL"]).toBe("https://gateway.example.test");
+    expect(env["CLAUDE_CODE_ENTRYPOINT"]).toBeUndefined();
+    // Only the child's copy is filtered — the bridge's own env is untouched.
+    expect(process.env["CLAUDE_CODE_ENTRYPOINT"]).toBe("claude-desktop");
   });
 
   it("BL-50: sets LARKSUITE_CLI_CONFIG_DIR only when larkCliConfigDir is given", () => {
@@ -178,10 +231,13 @@ describe("buildCommand", () => {
   });
 
   it("addDirs map to repeated --add-dir flags (repo-skills discovery)", () => {
-    const [, args] = buildCommand({
-      prompt: "go",
-      addDirs: ["/ws/repos/alpha", "/ws/repos/beta"],
-    });
+    const [, args] = buildCommand(
+      {
+        prompt: "go",
+        addDirs: ["/ws/repos/alpha", "/ws/repos/beta"],
+      },
+      () => true,
+    );
 
     const flagIdxs = args.flatMap((a, i) => (a === "--add-dir" ? [i] : []));
     expect(flagIdxs).toHaveLength(2);
@@ -190,6 +246,20 @@ describe("buildCommand", () => {
     // Omitted → no flag at all (byte-identical legacy args).
     const [, bare] = buildCommand({ prompt: "go" });
     expect(bare).not.toContain("--add-dir");
+  });
+
+  it("WP-7: only repos that ship a Claude skill reach --add-dir — cold and warm builders alike", () => {
+    const shipsSkills = (dir: string) => dir.endsWith("/with-skills");
+    const opts = {
+      prompt: "go",
+      addDirs: ["/ws/repos/plain", "/ws/repos/with-skills", "/ws/repos/other"],
+    };
+    const addDirArgs = (args: string[]) => args.flatMap((a, i) => (a === "--add-dir" ? [args[i + 1]] : []));
+
+    expect(addDirArgs(buildCommand(opts, shipsSkills)[1])).toEqual(["/ws/repos/with-skills"]);
+    expect(addDirArgs(buildWarmCommand(opts, shipsSkills)[1])).toEqual(["/ws/repos/with-skills"]);
+    // No repo ships skills → no flag at all, same argv as addDirs omitted.
+    expect(buildWarmCommand(opts, () => false)).toEqual(buildWarmCommand({ prompt: "go" }));
   });
 
   it("legacy callers can still opt into bypassPermissions explicitly", () => {
@@ -218,6 +288,92 @@ describe("buildCommand", () => {
     expect(args).not.toContain("--model");
     expect(args).not.toContain("--effort");
   });
+});
+
+describe("repoShipsClaudeSkills (WP-7)", () => {
+  let root: string;
+
+  afterEach(async () => {
+    if (root) await rm(root, { recursive: true, force: true });
+  });
+
+  async function skill(repo: string, name: string, body: string): Promise<void> {
+    await mkdir(path.join(repo, ".claude", "skills", name), { recursive: true });
+    await writeFile(path.join(repo, ".claude", "skills", name, "SKILL.md"), body);
+  }
+
+  it("is true only for a non-empty .claude/skills/<name>/SKILL.md", async () => {
+    root = await mkdtemp(path.join(tmpdir(), "larkway-claude-skills-"));
+    const withSkill = path.join(root, "with-skill");
+    await skill(withSkill, "deploy", "---\nname: deploy\n---\n");
+    const emptySkill = path.join(root, "empty-skill");
+    await skill(emptySkill, "stub", "");
+    const noSkillMd = path.join(root, "no-skill-md");
+    await mkdir(path.join(noSkillMd, ".claude", "skills", "notes"), { recursive: true });
+    await writeFile(path.join(noSkillMd, ".claude", "skills", "README.md"), "not a skill");
+    const agentsOnly = path.join(root, "agents-only");
+    await mkdir(path.join(agentsOnly, ".agents", "skills", "deploy"), { recursive: true });
+    await writeFile(path.join(agentsOnly, ".agents", "skills", "deploy", "SKILL.md"), "pi only");
+    const plain = path.join(root, "plain");
+    await mkdir(plain);
+
+    expect(repoShipsClaudeSkills(withSkill)).toBe(true);
+    expect(repoShipsClaudeSkills(emptySkill)).toBe(false);
+    expect(repoShipsClaudeSkills(noSkillMd)).toBe(false);
+    expect(repoShipsClaudeSkills(agentsOnly)).toBe(false);
+    expect(repoShipsClaudeSkills(plain)).toBe(false);
+    expect(repoShipsClaudeSkills(path.join(root, "missing"))).toBe(false);
+
+    // Default predicate in the builder: same answer, no injection needed.
+    // (cwd: root — the repos sit under the child's cwd, as in a workspace.)
+    const [, args] = buildCommand({ prompt: "go", cwd: root, addDirs: [plain, withSkill, emptySkill] });
+    expect(args.flatMap((a, i) => (a === "--add-dir" ? [args[i + 1]] : []))).toEqual([withSkill]);
+  });
+
+  it.skipIf(process.platform === "win32")(
+    "WP-7: a skill-less repo that resolves outside the cwd keeps --add-dir — its working-directory grant",
+    async () => {
+      root = await mkdtemp(path.join(tmpdir(), "larkway-claude-skills-"));
+      const ws = path.join(root, "ws");
+      const repos = path.join(ws, "repos");
+      await mkdir(repos, { recursive: true });
+      const inTree = path.join(repos, "in-tree");
+      await mkdir(inTree);
+      await mkdir(path.join(ws, "vendor", "lib"), { recursive: true });
+      const linkedInside = path.join(repos, "linked-inside");
+      await symlink(path.join(ws, "vendor", "lib"), linkedInside);
+      await mkdir(path.join(root, "elsewhere", "foo"), { recursive: true });
+      const linkedOutside = path.join(repos, "linked-outside");
+      await symlink(path.join(root, "elsewhere", "foo"), linkedOutside);
+      const gone = path.join(repos, "gone");
+      await symlink(path.join(root, "elsewhere", "missing"), gone);
+      const addDirs = [gone, inTree, linkedInside, linkedOutside];
+      const addDirArgs = (args: string[]) => args.flatMap((a, i) => (a === "--add-dir" ? [args[i + 1]] : []));
+
+      // The entry as given (the link path, as before WP-7), not its realpath.
+      expect(addDirArgs(buildCommand({ prompt: "go", cwd: ws, addDirs })[1])).toEqual([linkedOutside]);
+      expect(addDirArgs(buildWarmCommand({ prompt: "go", cwd: ws, addDirs })[1])).toEqual([linkedOutside]);
+      // A cwd reached through a symlink compares by realpath too.
+      const wsLink = path.join(root, "ws-link");
+      await symlink(ws, wsLink);
+      expect(addDirArgs(buildWarmCommand({ prompt: "go", cwd: wsLink, addDirs })[1])).toEqual([linkedOutside]);
+      // An unresolvable cwd grants nothing extra (the spawn fails on it anyway).
+      expect(addDirArgs(buildWarmCommand({ prompt: "go", cwd: path.join(root, "no-such-cwd"), addDirs })[1])).toEqual([]);
+    },
+  );
+
+  it.skipIf(process.platform === "win32")(
+    "follows a symlinked .claude/skills (the cross-backend scaffold's layout)",
+    async () => {
+      root = await mkdtemp(path.join(tmpdir(), "larkway-claude-skills-"));
+      const repo = path.join(root, "repo");
+      await mkdir(path.join(repo, ".agents", "skills", "deploy"), { recursive: true });
+      await writeFile(path.join(repo, ".agents", "skills", "deploy", "SKILL.md"), "---\nname: deploy\n---\n");
+      await mkdir(path.join(repo, ".claude"));
+      await symlink(path.join(repo, ".agents", "skills"), path.join(repo, ".claude", "skills"));
+      expect(repoShipsClaudeSkills(repo)).toBe(true);
+    },
+  );
 });
 
 describe("parseLinesMulti", () => {
@@ -421,6 +577,109 @@ describe("parseLinesMulti", () => {
     expect(events.some((e) => e.type === "tool_use")).toBe(false);
     expect(events.some((e) => e.type === "text_delta")).toBe(false);
     expect(events.some((e) => e.type === "raw")).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// WP-0: native usage on the `result` event
+// ---------------------------------------------------------------------------
+
+describe("parseLinesMulti — WP-0 turn usage", () => {
+  // Shapes as the claude CLI emits them in stream-json (usage numbers made up).
+  function assistant(id: string, usage: Record<string, number>, extra: Record<string, unknown> = {}): string {
+    return JSON.stringify({
+      type: "assistant",
+      ...extra,
+      message: { id, content: [{ type: "text", text: "..." }], usage },
+    });
+  }
+  const resultLine = JSON.stringify({
+    type: "result",
+    subtype: "success",
+    stop_reason: "end_turn",
+    usage: {
+      input_tokens: 12,
+      cache_creation_input_tokens: 300,
+      cache_read_input_tokens: 9000,
+      output_tokens: 250,
+      output_tokens_details: { thinking_tokens: 200 },
+    },
+  });
+
+  it("normalises result.usage and adds request count + last request input from assistant lines", () => {
+    const extractor = new AnswerChannelExtractor();
+    const state = newClaudeTurnUsageState();
+    const lines = [
+      // request 1 streams two content blocks → two lines, same id
+      assistant("msg_1", { input_tokens: 5, cache_creation_input_tokens: 100, cache_read_input_tokens: 4000, output_tokens: 1 }),
+      assistant("msg_1", { input_tokens: 5, cache_creation_input_tokens: 100, cache_read_input_tokens: 4000, output_tokens: 9 }),
+      // subagent traffic is not this turn's own context
+      assistant("msg_sub", { input_tokens: 1, cache_creation_input_tokens: 0, cache_read_input_tokens: 99999, output_tokens: 1 }, { parent_tool_use_id: "toolu_1" }),
+      assistant("msg_2", { input_tokens: 7, cache_creation_input_tokens: 200, cache_read_input_tokens: 5000, output_tokens: 2 }),
+      resultLine,
+    ];
+    const events = lines.flatMap((line) => [...parseLinesMulti(line, extractor, state)]);
+    const result = events.find((e) => e.type === "result");
+    expect(result).toMatchObject({
+      type: "result",
+      stopReason: "end_turn",
+      usage: {
+        inputTokens: 12,
+        cacheCreationTokens: 300,
+        cacheReadTokens: 9000,
+        outputTokens: 250,
+        reasoningTokens: 200,
+        requests: 2,
+      },
+      lastRequestInputTokens: 7 + 200 + 5000,
+    });
+  });
+
+  it("ignores the CLI's synthetic assistant messages (API-error notices: model <synthetic>, zero usage)", () => {
+    const extractor = new AnswerChannelExtractor();
+    const state = newClaudeTurnUsageState();
+    const zero = { input_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0, output_tokens: 0 };
+    const lines = [
+      assistant("msg_1", { input_tokens: 9, cache_creation_input_tokens: 150, cache_read_input_tokens: 180000, output_tokens: 3 }),
+      // Shape of the CLI's local error message (random id, parent_tool_use_id null).
+      JSON.stringify({
+        type: "assistant",
+        parent_tool_use_id: null,
+        message: {
+          id: "synthetic-uuid-1",
+          model: "<synthetic>",
+          role: "assistant",
+          stop_reason: "stop_sequence",
+          content: [{ type: "text", text: "Prompt is too long" }],
+          usage: zero,
+        },
+      }),
+      // A zero-input line without the model tag made no request either.
+      assistant("synthetic-uuid-2", zero),
+      resultLine,
+    ];
+    const events = lines.flatMap((line) => [...parseLinesMulti(line, extractor, state)]);
+    const result = events.find((e) => e.type === "result");
+    expect(result).toMatchObject({
+      usage: { requests: 1 },
+      lastRequestInputTokens: 9 + 150 + 180000,
+    });
+  });
+
+  it("without per-turn state still reports result.usage (no request count / context size)", () => {
+    const [result] = [...parseLinesMulti(resultLine, new AnswerChannelExtractor())];
+    expect(result).toMatchObject({ type: "result", usage: { inputTokens: 12, outputTokens: 250 } });
+    expect((result as { usage?: { requests?: number } }).usage?.requests).toBeUndefined();
+    expect(result).not.toHaveProperty("lastRequestInputTokens");
+  });
+
+  it("a result line without usage keeps the old event shape", () => {
+    const [result] = [...parseLinesMulti(
+      JSON.stringify({ type: "result", stop_reason: "end_turn" }),
+      new AnswerChannelExtractor(),
+      newClaudeTurnUsageState(),
+    )];
+    expect(result).toEqual({ type: "result", stopReason: "end_turn", raw: { type: "result", stop_reason: "end_turn" } });
   });
 });
 
@@ -718,4 +977,41 @@ describe("runClaude() — grandchild-holds-stdout finalize unblock", () => {
 
     vi.useRealTimers();
   }, 15_000);
+
+  it("a killed claude (stdout ends mid-block, no result) still delivers the answer's held tail", async () => {
+    const fake = makeFakeChild();
+    __nextFakeChild = fake;
+    const { runClaude } = await import("./runner.js");
+    const handle = runClaude({ prompt: "test", agentBinPath: "/fake/claude" });
+    const body = "An answer cut off before its block ended, tail included.";
+    let answer = "";
+    const eventsLoopDone = (async () => {
+      for await (const ev of handle.events) {
+        if (ev.type === "answer_delta") answer += ev.text;
+        else if (ev.type === "answer_snapshot") answer = ev.text;
+      }
+    })();
+
+    await new Promise<void>((resolve) => setImmediate(() => {
+      fake.stdout.write(JSON.stringify({ type: "system", subtype: "init", session_id: "sess_killed" }) + "\n");
+      for (const text of [`${ANSWER_BEGIN_MARKER}\n`, body.slice(0, 20), body.slice(20)]) {
+        fake.stdout.write(
+          JSON.stringify({
+            type: "stream_event",
+            event: { type: "content_block_delta", index: 0, delta: { type: "text_delta", text } },
+          }) + "\n",
+        );
+      }
+      fake.stdout.end();
+      fake.child.emit("exit", 0);
+      setImmediate(() => {
+        fake.child.emit("close", 0);
+        resolve();
+      });
+    }));
+
+    await eventsLoopDone;
+    await handle.done;
+    expect(answer).toBe(body);
+  });
 });

@@ -33,7 +33,7 @@ import {
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { run } from "./doctor.js";
+import { checkPiWarmPool, run } from "./doctor.js";
 
 // Real module namespaces — used as base, then overridden per-test.
 import * as botsStoreReal from "../botsStore.js";
@@ -795,4 +795,28 @@ describe("doctor task-handle check (v3.4 discoverability, docs/task-handle.md §
       expect(check?.message).toContain("open.feishu.cn");
     });
   }, 15000);
+});
+
+// ---------------------------------------------------------------------------
+// pi warm pool hint (informational — the key used to be ignored on pi)
+// ---------------------------------------------------------------------------
+
+describe("checkPiWarmPool", () => {
+  it("names each pi bot whose yaml turns the pool on, as an ok hint", async () => {
+    await writeBotYaml("pi-warm", `${validBotYaml("pi-warm")}\nbackend: pi\nwarmProcess: true\nwarmProcessMaxProcesses: 3\n`);
+    await writeBotYaml("pi-cold", `${validBotYaml("pi-cold")}\nbackend: pi\n`);
+    await writeBotYaml("claude-warm", `${validBotYaml("claude-warm")}\nwarmProcess: true\n`);
+    const results = await checkPiWarmPool(buildCtx({}));
+    expect(results).toHaveLength(1);
+    expect(results[0]).toMatchObject({ id: "pi-warm-pool", status: "ok" });
+    expect(results[0]!.label).toContain("pi-warm (最多 3 个进程)");
+    expect(results[0]!.label).not.toContain("pi-cold");
+    expect(results[0]!.label).not.toContain("claude-warm");
+    expect(results[0]!.message).toContain("warmProcess: true");
+  });
+
+  it("says nothing when no pi bot has the pool on", async () => {
+    await writeBotYaml("pi-cold", `${validBotYaml("pi-cold")}\nbackend: pi\n`);
+    expect(await checkPiWarmPool(buildCtx({}))).toEqual([]);
+  });
 });

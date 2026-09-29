@@ -129,14 +129,19 @@ Normal turn:
    with a pre-created CardKit `card_id`.
 3. Runner events update only the trusted answer channel:
    - The first `answer_delta` / `answer_snapshot` creates `final_md` immediately
-     before `footer_md`.
+     before `footer_md`, already holding that text.
    - `answer_delta` appends to `final_md`.
    - `answer_snapshot` replaces `final_md`.
    - `reasoning`, raw events, `tool_result`, `tool_use`, `internal_text`, and
      assistant `text_delta` are not displayed.
-4. Finalization writes canonical final markdown into `final_md`, updates the
-   card entity to remove the footer and include choices/images/content without a
-   colored header band, then calls `card.settings` with `streaming_mode=false`.
+   - CardKit calls run one at a time. Updates are latest-wins: each element
+     (answer, footer, reasoning panel) has at most one queued update, which
+     sends the newest text when it starts, and an update that would re-send
+     what the element already shows is skipped.
+4. Finalization waits for the one CardKit call in flight (queued updates are
+   dropped), updates the card entity with the canonical final markdown in
+   `final_md` — removing the footer and including choices/images/content without
+   a colored header band — then calls `card.settings` with `streaming_mode=false`.
 
 The handler persists `.larkway/cardkit.json` with `cardId`, `messageId`,
 `sequence`, stable element ids, and status. Every successful CardKit mutation

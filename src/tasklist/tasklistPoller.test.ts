@@ -6,6 +6,9 @@ import { TaskListClient, TaskRequestTimeoutError, type LarkTaskRequestConfig, ty
 import { TasklistPoller, normalizeForExactMatch, type RootTextEntry } from "./tasklistPoller.js";
 import { CandidateAlertStore } from "./candidateAlertStore.js";
 import { STATUS_SNAPSHOT_MARKER } from "./writeback.js";
+import { renderCreateDescription } from "./declare.js";
+import { buildTopicDeepLink } from "../lark/messageLookupClient.js";
+import { compactCandidateDescription } from "../claude/prompt.js";
 
 interface FakeTask {
   guid: string;
@@ -226,6 +229,38 @@ describe("TasklistPoller", () => {
     const candidate = poller.getCandidates()[0]!;
     expect(candidate.descriptionExcerpt!.length).toBeLessThanOrEqual(201);
     expect(candidate.descriptionExcerpt!.endsWith("…")).toBe(true);
+  });
+
+  // The renderer drops URLs, so they do not count toward the excerpt cap: a
+  // bridge-created description's creator line sits after a ~230-char applink.
+  it("keeps the creator line of a bridge-created description; only the text around URLs is capped", async () => {
+    const chatId = `oc_${"a".repeat(32)}`;
+    const threadId = `omt_${"1".repeat(16)}`;
+    const description = renderCreateDescription(
+      { botId: "test-bot", threadId: "om_root", chatId, topicLink: buildTopicDeepLink(chatId, threadId) },
+      "TestBot",
+    );
+    expect(description.length).toBeGreaterThan(200);
+    const long = `见 https://example.com/spec ${"说".repeat(300)}`;
+    const { requester } = makeFakeRequester({
+      tasks: [
+        { guid: "t-bridge", summary: "修复登录超时", description },
+        { guid: "t-long", summary: "长描述", description: long },
+      ],
+    });
+    const poller = new TasklistPoller({ client: new TaskListClient(requester), tasklistGuid: "guid-1", isClaimedByAnyBot: () => false });
+
+    await poller.pollOnceForTest();
+
+    const [bridge, longOne] = poller.getCandidates();
+    expect(compactCandidateDescription(bridge!.descriptionExcerpt!)).toEqual({
+      thread: threadId,
+      text: expect.stringMatching(/^话题：点击进入工作话题 由 TestBot 创建 · /),
+    });
+    // Text still capped at 200 characters, the URL kept whole beside it.
+    expect(longOne!.descriptionExcerpt!.startsWith("见 https://example.com/spec 说")).toBe(true);
+    expect(longOne!.descriptionExcerpt!.endsWith("…")).toBe(true);
+    expect(compactCandidateDescription(longOne!.descriptionExcerpt!).text.length).toBeLessThanOrEqual(201);
   });
 
   it("keeps the previous snapshot when a poll cycle fails (never blanks out on a transient error)", async () => {

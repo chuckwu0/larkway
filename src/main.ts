@@ -39,10 +39,16 @@ import { ClaudeProcessPool, reapOrphanedWarmClaudeProcesses } from "./claude/poo
 import { CodexRunner } from "./codex/runner.js";
 import { CodexProcessPool, reapOrphanedWarmProcess } from "./codex/pool.js";
 import { PiRunner } from "./pi/runner.js";
+import { PiProcessPool } from "./pi/pool.js";
 import { ensureLarkCliProfile, deriveLarkCliProfile } from "./lark/profileBootstrap.js";
 import { isSyntheticSessionKey } from "./lark/message.js";
 import { createCachedRosterResolver } from "./lark/rosterResolver.js";
 import { checkWorkspacePermissionGrant } from "./agent/permissionGate.js";
+import {
+  migrateRetiredContractLines,
+  retiredContractBackupPath,
+  retiredContractMigrationPath,
+} from "./agent/workspaceStore.js";
 import { ensureLocalBinOnPath, probeBackendReadiness } from "./agent/readiness.js";
 import { runtimeRequirementsForBots } from "./runtimeRequirements.js";
 import { registerCrashGuard } from "./crashGuard.js";
@@ -198,6 +204,35 @@ async function runV2Mode({
               `Use \`larkway perms ${bot.id} --grant-from-request --grant-note "confirmed by <host>"\` only for audit notes.`,
           );
         }
+        // Retired contract lines in an existing managed AGENTS.md are otherwise
+        // dropped only by a config save. Strip the per-turn-cost ones
+        // (state-each-turn, memory-ritual) once per boot — never on the per-turn
+        // path, where agent self-edits and web saves could race it; the policy
+        // lines still wait for a config save. retiredContractMigrationPath
+        // returns undefined for BYO workspaces. Dry-run only reports what a
+        // real start would remove.
+        const migrationPath = retiredContractMigrationPath(bot, larkwayHome());
+        if (migrationPath) {
+          try {
+            const { removed, backupPath } = await migrateRetiredContractLines(migrationPath, {
+              dryRun,
+              backupPath: retiredContractBackupPath(migrationPath),
+            });
+            if (removed.length > 0) {
+              const lines = removed.map((r) => `${r.label} (line ${r.line})`).join(", ");
+              console.log(
+                `[larkway] bot "${bot.id}": ${dryRun ? "would remove" : "removed"} ${removed.length} retired ` +
+                  `contract line(s) from workspace AGENTS.md: ${lines}` +
+                  (dryRun
+                    ? "."
+                    : `${backupPath ? `; original saved to ${backupPath}` : ""} (takes effect for new sessions; ` +
+                      "a line re-added word for word is removed again — reword it to keep it; see docs/native-runtime.md)."),
+              );
+            }
+          } catch (err) {
+            console.warn(`[larkway] bot "${bot.id}": retired contract line migration failed (continuing):`, err);
+          }
+        }
       }
     }
     healthyBots.push(bot);
@@ -256,6 +291,8 @@ async function runV2Mode({
     codexPool: CodexProcessPool | undefined;
     /** Same opt-in, claude-backend counterpart — one warm process per active thread (src/claude/pool.ts). */
     claudePool: ClaudeProcessPool | undefined;
+    /** WP-9: pi-backend counterpart, one warm `pi --mode rpc` per active thread (src/pi/pool.ts); explicit opt-in only. */
+    piPool: PiProcessPool | undefined;
     /** Task-handle comment poller (docs/task-handle.md) — undefined when the bot doesn't enable the feature. */
     taskCommentPoller: CommentPoller | undefined;
     /** Task-handle v3.1 stall detector (docs/task-handle.md §12) — undefined when the bot doesn't enable the feature or has stallDetectionDisabled set. */
@@ -544,9 +581,8 @@ async function runV2Mode({
     )
       ? client.outboundCardKitClient()
       : undefined;
-    // COT (思维链) bubble transport — 方案 B made the bubble the EXPERIMENTAL
-    // surface, so this is provisioned only when the bot opts into
-    // cotSurface="bubble" (and cot != "off"). The default "card" surface folds
+    // COT (思维链) bubble transport — provisioned for cotSurface="bubble" (the
+    // default) when cot != "off". The experimental "card" surface folds
     // reasoning into the answer card and needs no message_cot client.
     const cotClient =
       bot.cot !== "off" && bot.cotSurface === "bubble"
@@ -859,14 +895,16 @@ async function runV2Mode({
 
     // 批B Phase 1 (perf plan §4): a per-bot warm codex app-server process, or
     // (Phase 2) a per-thread warm claude process pool — opt-in via
-    // bots/*.yaml `warmProcess: true`. Only implemented for backend=codex /
-    // backend=claude (botLoader already warned at load time if warmProcess
-    // is set on any other backend). Registered under a PER-BOT registry key
-    // (not the shared "codex"/"claude" key) so two bots on the same larkway
-    // instance can independently be pooled or not — see
-    // botConfig.runnerKey's doc in bridge/handler.ts.
+    // bots/*.yaml `warmProcess: true` — or (WP-9) a per-thread warm pi RPC
+    // process pool. Only implemented for backend=codex / claude / pi
+    // (botLoader already warned at load time if warmProcess is set on any
+    // other backend). Registered under a PER-BOT registry key (not the shared
+    // backend key) so two bots on the same larkway instance can
+    // independently be pooled or not — see botConfig.runnerKey's doc in
+    // bridge/handler.ts.
     let codexPool: CodexProcessPool | undefined;
     let claudePool: ClaudeProcessPool | undefined;
+    let piPool: PiProcessPool | undefined;
     let runnerKey: string | undefined;
     // 批D: warm pooling is now DEFAULT-ON for the two supported backends
     // (effectiveWarmProcess is the single source of that rule; explicit
@@ -935,6 +973,29 @@ async function runV2Mode({
           permissionMode: configJson.permissions.mode ?? "bypassPermissions",
         });
       }
+    } else if (warmProcessOn && bot.backend === "pi") {
+      // WP-9: effectiveWarmProcess is true for pi only on an explicit
+      // `warmProcess: true`. No blank standby: pi takes the session as a spawn
+      // flag, so only brand-new threads could adopt one — out of WP-9 scope.
+      // pi exits when its stdin closes, so a hard-killed bridge leaves no
+      // warm orphan to sweep at boot.
+      piPool = new PiProcessPool({
+        botId: bot.id,
+        botGitIdentity: bot.git_identity,
+        gitlabToken: effectiveGitlabToken,
+        ...(larkCliConfigDir ? { larkCliConfigDir } : {}),
+        idleMs: bot.warmProcessIdleMs,
+        maxProcesses: bot.warmProcessMaxProcesses,
+      });
+      runnerKey = `pi-pool:${bot.id}`;
+      registerRunner(runnerKey, () => piPool!);
+      // Before WP-9 a pi `warmProcess: true` was a warned no-op; it now turns
+      // the pool on. Warn at boot, so a flag left over from an earlier backend
+      // shows up among the warnings rather than the routine boot lines.
+      console.warn(
+        `[larkway] bot "${bot.id}": pi warm process pool ON (warmProcess: true in its yaml; ` +
+          "earlier versions ignored this key for pi — remove it to keep cold starts)",
+      );
     }
 
     const handler = new BridgeHandler({
@@ -983,6 +1044,7 @@ async function runV2Mode({
         sessionReseedChars: bot.sessionReseedChars,
         p2pStickyIdleMs: bot.p2pStickyIdleMs,
         owner_open_id: bot.owner_open_id,
+        bot_open_id: bot.bot_open_id,
         cot: bot.cot,
         cotSurface: bot.cotSurface,
         lark_cli_isolated: bot.lark_cli_isolated,
@@ -1115,7 +1177,7 @@ async function runV2Mode({
 
     const inst: BotInstance = {
       bot, client, sessionStore, cardRenderer, handler, housekeeping,
-      taskCommentPoller, stallDetector, scheduler, codexPool, claudePool,
+      taskCommentPoller, stallDetector, scheduler, codexPool, claudePool, piPool,
       statusTimer: null, avatar: undefined,
     };
     instances.push(inst);
@@ -1264,7 +1326,7 @@ async function runV2Mode({
   async function shutdown(signal: string): Promise<void> {
     console.log(`\n[larkway] Received ${signal}, shutting down V2 bots…`);
     await Promise.all(
-      instances.map(async ({ bot, statusTimer, housekeeping, taskCommentPoller, stallDetector, scheduler, handler, sessionStore, client, avatar, codexPool, claudePool }) => {
+      instances.map(async ({ bot, statusTimer, housekeeping, taskCommentPoller, stallDetector, scheduler, handler, sessionStore, client, avatar, codexPool, claudePool, piPool }) => {
         if (statusTimer) clearInterval(statusTimer);
         // Await drain (M1): stop() only cancels the NEXT scheduled cycle —
         // without awaiting, a cycle already in flight would keep running
@@ -1290,6 +1352,7 @@ async function runV2Mode({
         // process(es), if this bot has any. undefined for every non-pooled bot.
         await codexPool?.shutdown();
         await claudePool?.shutdown();
+        await piPool?.shutdown();
         await handler.close();
         await sessionStore.close();
         await client.close();
@@ -1313,7 +1376,7 @@ async function runV2Mode({
   if (dryRun) {
     console.log("[dry-run] V2 mode — all bots wired OK, exiting.");
     await Promise.all(
-      instances.map(async ({ housekeeping, taskCommentPoller, stallDetector, scheduler, sessionStore, client, codexPool, claudePool }) => {
+      instances.map(async ({ housekeeping, taskCommentPoller, stallDetector, scheduler, sessionStore, client, codexPool, claudePool, piPool }) => {
         housekeeping.stop();
         await taskCommentPoller?.stop();
         await stallDetector?.stop();
@@ -1321,6 +1384,7 @@ async function runV2Mode({
         // No-op: dry-run never calls .run(), so no process was ever spawned.
         await codexPool?.shutdown();
         await claudePool?.shutdown();
+        await piPool?.shutdown();
         await sessionStore.close();
         await client.close();
       }),
@@ -1405,7 +1469,8 @@ async function runV2Mode({
 
 registerRunner("claude", () => new ClaudeRunner());
 registerRunner("codex", () => new CodexRunner());
-// pi (BYO-model backend, src/pi/runner.ts): cold spawn per turn, no warm pool.
+// pi (BYO-model backend, src/pi/runner.ts): cold spawn per turn. A bot with
+// `warmProcess: true` gets its own PiProcessPool, registered as `pi-pool:<id>` when the bot starts.
 registerRunner("pi", () => new PiRunner());
 
 async function main(): Promise<void> {

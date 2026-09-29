@@ -239,7 +239,7 @@ export function genMemoryTemplate(name: string): string {
 
 ## 工作流程（框架；细节以业务 repo skill 为准）
 
-1. 被 @ 触发后，先用 \`lark-cli\` 拉话题历史 + 首楼搞清需求。
+1. 被 @ 触发后，先读当前消息；需要时可按 prompt 的 \`<context-pointers>\` 拉历史。
 2. <你的核心步骤；门槛/gated 流程写在业务 repo skill，这里不复述>。
 3. 需要别的能力时：@ 对应 peer（见注入的 \`<peer-bots>\` 清单），说清诉求，等它 @ 回。
 

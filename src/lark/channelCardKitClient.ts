@@ -114,12 +114,18 @@ export interface CardKitElementMutationOpts {
   uuid?: string;
 }
 
+/** WP-0: wall time of each round trip inside createCardReply (retries included). */
+export interface CardKitCreateTimings {
+  replyMs: number;
+  idConvertMs: number;
+}
+
 export interface OutboundCardKitClient {
   createCardReply?(
     replyToMessageId: string,
     card: object,
     opts: { replyInThread: boolean; idempotencyKey: string; threadId?: string },
-  ): Promise<{ cardId: string; messageId: string }>;
+  ): Promise<{ cardId: string; messageId: string; timings?: CardKitCreateTimings }>;
   createCardEntity(card: object): Promise<{ cardId: string }>;
   replyCardEntity(
     replyToMessageId: string,
@@ -267,7 +273,8 @@ export class ChannelCardKitClient implements OutboundCardKitClient {
     replyToMessageId: string,
     card: object,
     opts: { replyInThread: boolean; idempotencyKey: string; threadId?: string },
-  ): Promise<{ cardId: string; messageId: string }> {
+  ): Promise<{ cardId: string; messageId: string; timings: CardKitCreateTimings }> {
+    const replyStartedAt = Date.now();
     const res = await withCardKitRetry(
       "createCardReply",
       () =>
@@ -289,6 +296,8 @@ export class ChannelCardKitClient implements OutboundCardKitClient {
           `(replyTo=${replyToMessageId})`,
       );
     }
+    const replyMs = Date.now() - replyStartedAt;
+    const idConvertStartedAt = Date.now();
     const converted = await withCardKitRetry(
       "idConvert",
       async () => {
@@ -305,7 +314,7 @@ export class ChannelCardKitClient implements OutboundCardKitClient {
     const cardId = converted.data?.card_id;
     if (!cardId) throw new CardKitReplyConversionError(messageId);
     this.cardThreads.set(messageId, opts.threadId ?? replyToMessageId);
-    return { cardId, messageId };
+    return { cardId, messageId, timings: { replyMs, idConvertMs: Date.now() - idConvertStartedAt } };
   }
 
   async replyCardEntity(

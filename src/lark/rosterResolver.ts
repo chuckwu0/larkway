@@ -134,17 +134,37 @@ function defaultExec(
     });
 }
 
+/**
+ * WP-0 diagnostics out-param: how the lookup was served. Resolvers without a
+ * cache leave it unset. "stale" = an expired roster returned while a background
+ * lookup refreshes it (createCachedRosterResolver; never an expired failure).
+ * Set before the returned promise settles.
+ */
+export interface RosterLookupInfo {
+  cache?: "hit" | "stale" | "miss";
+}
+
 /** A per-message resolver the handler calls: chatId → live roster (or null). */
-export type LiveRosterResolver = (chatId: string) => Promise<LiveBotRoster | null>;
+export type LiveRosterResolver = (
+  chatId: string,
+  info?: RosterLookupInfo,
+) => Promise<LiveBotRoster | null>;
 
 /**
  * Build a per-chat-cached resolver for one bot. The roster is stable per (app,
  * chat) so a short TTL cache keeps the prompt-build path from spawning lark-cli
  * on every message. main.ts wires one of these per bot with that bot's profile.
+ *
+ * WP-2 (b): stale-while-revalidate — an expired roster is returned at once
+ * ("stale") while one background lookup refreshes it; a chat never seen, or
+ * whose cached lookup failed (null) and expired, waits for lark-cli ("miss").
+ * Concurrent lookups of one chat share a single in-flight spawn.
  */
 export function createCachedRosterResolver(opts: {
   profile?: string;
   larkCliPath?: string;
+  /** BL-50: the bot's private lark-cli config dir (LARKSUITE_CLI_CONFIG_DIR). */
+  larkCliConfigDir?: string;
   ttlMs?: number;
   now?: () => number;
   exec?: ResolveRosterOpts["exec"];
@@ -152,17 +172,45 @@ export function createCachedRosterResolver(opts: {
   const ttlMs = opts.ttlMs ?? 5 * 60 * 1000;
   const now = opts.now ?? (() => Date.now());
   const cache = new Map<string, { roster: LiveBotRoster | null; at: number }>();
-  return async (chatId: string) => {
+  const inflight = new Map<string, Promise<LiveBotRoster | null>>();
+  const refresh = (chatId: string): Promise<LiveBotRoster | null> => {
+    let pending = inflight.get(chatId);
+    if (!pending) {
+      pending = resolveChatBotRoster(chatId, {
+        profile: opts.profile,
+        larkCliPath: opts.larkCliPath,
+        larkCliConfigDir: opts.larkCliConfigDir,
+        exec: opts.exec,
+      })
+        .then((roster) => {
+          // Cache both hits and misses (a miss is brief per TTL) so a flaky chat
+          // does not spawn lark-cli on every message; a null just means "kept
+          // static ids".
+          cache.set(chatId, { roster, at: now() });
+          return roster;
+        })
+        .finally(() => inflight.delete(chatId));
+      inflight.set(chatId, pending);
+    }
+    return pending;
+  };
+  return async (chatId: string, info?: RosterLookupInfo) => {
     const hit = cache.get(chatId);
-    if (hit && now() - hit.at < ttlMs) return hit.roster;
-    const roster = await resolveChatBotRoster(chatId, {
-      profile: opts.profile,
-      larkCliPath: opts.larkCliPath,
-      exec: opts.exec,
-    });
-    // Cache both hits and misses (a miss is brief per TTL) so a flaky chat does
-    // not spawn lark-cli on every message; a null just means "kept static ids".
-    cache.set(chatId, { roster, at: now() });
-    return roster;
+    if (hit && now() - hit.at < ttlMs) {
+      if (info) info.cache = "hit";
+      return hit.roster;
+    }
+    // An expired failure (null) is not worth serving: a peer @ built from it
+    // falls back to static ids that may not wake anyone. Wait for the lookup,
+    // as for a chat never seen.
+    if (hit && hit.roster !== null) {
+      if (info) info.cache = "stale";
+      // resolveChatBotRoster never rejects; the catch only keeps a surprise
+      // from becoming an unhandled rejection.
+      void refresh(chatId).catch(() => {});
+      return hit.roster;
+    }
+    if (info) info.cache = "miss";
+    return refresh(chatId);
   };
 }
