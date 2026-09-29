@@ -128,17 +128,31 @@ export async function applyTaskHandleDeclarations(
         const members: TaskMember[] = patch.senderOpenId
           ? [{ id: patch.senderOpenId, type: "user", role: "follower" }]
           : [];
-        const { guid } = await deps.client.createTask({
+        const request = {
           summary: patch.create.summary,
           description: renderCreateDescription(patch, deps.botName),
           ...(due ? { due } : {}),
-          ...(members.length > 0 ? { members } : {}),
           ...(deps.tasklistGuid ? { tasklists: [{ tasklist_guid: deps.tasklistGuid }] } : {}),
-        });
+        };
+        // The sender cannot always be a follower: when another bot sent the
+        // message (a peer handoff), its open_id is not a user and the whole
+        // create is rejected (1470403 permission_denied). Retry once without
+        // the follower rather than lose the task.
+        let followerAdded = members.length > 0;
+        let guid: string;
+        try {
+          ({ guid } = await deps.client.createTask(followerAdded ? { ...request, members } : request));
+        } catch (err) {
+          if (!followerAdded) throw err;
+          console.warn(`[tasklist.declare] create with the sender as follower failed; retrying without it:`, err);
+          ({ guid } = await deps.client.createTask(request));
+          followerAdded = false;
+        }
         createdGuid = guid;
         outcomes.push(
           `已建任务 ${guid}（${patch.create.summary.slice(0, 40)}${due ? ` · 截止 ${formatDueForComment(due)}` : ""}` +
-            `${patch.senderOpenId ? " · 发起人已加关注" : ""}${patch.topicLink ? "" : "，话题深链缺失已降级为群链接"}）`,
+            `${followerAdded ? " · 发起人已加关注" : patch.senderOpenId ? " · 发起人未能加为关注人" : ""}` +
+            `${patch.topicLink ? "" : "，话题深链缺失已降级为群链接"}）`,
         );
       } catch (err) {
         outcomes.push(`create 失败（本轮跳过，不影响交付）：${String((err as Error).message ?? err)}`);

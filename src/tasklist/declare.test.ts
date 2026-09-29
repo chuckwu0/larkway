@@ -15,7 +15,7 @@ import { TaskListClient, type LarkTaskRequestConfig, type LarkTaskRequester } fr
 import { TaskHandleStore } from "./store.js";
 import type { TaskHandleDeclarationPatch } from "./types.js";
 
-function makeFakeRequester(opts?: { failCreate?: boolean }): {
+function makeFakeRequester(opts?: { failCreate?: boolean; failCreateWithMembers?: boolean }): {
   requester: LarkTaskRequester;
   calls: LarkTaskRequestConfig[];
 } {
@@ -24,6 +24,9 @@ function makeFakeRequester(opts?: { failCreate?: boolean }): {
     calls.push(config);
     if (config.method === "POST" && config.url.endsWith("/tasks")) {
       if (opts?.failCreate) throw new Error("boom");
+      if (opts?.failCreateWithMembers && (config.data as { members?: unknown[] } | undefined)?.members) {
+        throw new Error("user lacks permission for the requested resource");
+      }
       return { data: { task: { guid: "guid-new" } } };
     }
     return { data: {} };
@@ -187,6 +190,36 @@ describe("applyTaskHandleDeclarations — create (信号1)", () => {
       { store, client: new TaskListClient(requester) },
     );
     expect(result.createdGuid).toBeUndefined();
+    expect(result.outcomes[0]).toContain("create 失败");
+  });
+
+  it("retries without the follower when the sender cannot be one (a peer bot sent the message)", async () => {
+    const store = await TaskHandleStore.load(join(dir, "task-handles.json"));
+    const { requester, calls } = makeFakeRequester({ failCreateWithMembers: true });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const result = await applyTaskHandleDeclarations(
+      basePatch({ senderOpenId: "ou_peer_bot", create: { summary: "对端 bot 请求的卡" } }),
+      { store, client: new TaskListClient(requester) },
+    );
+    warn.mockRestore();
+    const creates = calls.filter((c) => c.method === "POST" && c.url.endsWith("/tasks"));
+    expect(creates).toHaveLength(2);
+    expect((creates[0]!.data as { members?: unknown[] }).members).toHaveLength(1);
+    expect((creates[1]!.data as { members?: unknown[] }).members).toBeUndefined();
+    expect(result.createdGuid).toBe("guid-new");
+    expect(result.outcomes[0]).toContain("已建任务 guid-new");
+    expect(result.outcomes[0]).toContain("发起人未能加为关注人");
+    expect(result.outcomes[0]).not.toContain("发起人已加关注");
+  });
+
+  it("does not retry when there is no follower to drop", async () => {
+    const store = await TaskHandleStore.load(join(dir, "task-handles.json"));
+    const { requester, calls } = makeFakeRequester({ failCreate: true });
+    const result = await applyTaskHandleDeclarations(
+      basePatch({ senderOpenId: undefined, create: { summary: "无发起人" } }),
+      { store, client: new TaskListClient(requester) },
+    );
+    expect(calls.filter((c) => c.method === "POST" && c.url.endsWith("/tasks"))).toHaveLength(1);
     expect(result.outcomes[0]).toContain("create 失败");
   });
 });
