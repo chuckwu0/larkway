@@ -5826,7 +5826,10 @@ describe("BL-38: poison-session self-heal", () => {
         yield { type: "system_init", sessionId: "sess_tool", raw: {} };
         // tool_use with no matching tool_result: the shape of a slow build.
         yield { type: "tool_use", toolName: "shell", toolInput: { command: "make" }, raw: {} };
-        await new Promise((r) => setTimeout(r, 130));
+        // Well past the 30ms threshold so the notice patch commits before
+        // finalize (which drops CardKit patches that have not started yet);
+        // 130ms was too tight on slow CI timers.
+        await new Promise((r) => setTimeout(r, 600));
       })(),
       done: Promise.resolve({ exitCode: 1, sessionId: "sess_tool" }),
       kill: () => {},
@@ -7286,7 +7289,7 @@ describe("native session continuity defaults", () => {
     expect(captured[0]?.resumeSessionId).toBe("sess_prev");
     expect(captured[0]?.forceFreshSession).toBe(false);
     // The sticky key routes the resumed delta turn to the p2p session's state path.
-    expect(captured[0]?.prompt).toContain("sessions/p2p-oc_chat/.larkway/state.json");
+    expect(captured[0]?.prompt).toContain(join("sessions", "p2p-oc_chat", ".larkway", "state.json"));
     expect(captured[0]?.prompt).not.toContain("<session-reseed>");
     expect(sessionStore.records.get("wsbot:p2p-oc_chat")?.sessionId).toBe("sess_prev");
   });
