@@ -52,6 +52,7 @@ import {
 import { ensureLocalBinOnPath, probeBackendReadiness } from "./agent/readiness.js";
 import { runtimeRequirementsForBots } from "./runtimeRequirements.js";
 import { registerCrashGuard } from "./crashGuard.js";
+import { installLogRedaction, registerLogSecret } from "./logRedaction.js";
 import {
   shouldProvideResponseSurfaceCardKitClient,
   shouldProvideResponseSurfacePostClient,
@@ -389,6 +390,10 @@ async function runV2Mode({
     const gitlabToken = tokenEnvName != null
       ? process.env[tokenEnvName]
       : undefined;
+    // Env-var names are free-form, so the name-based env scan in
+    // installLogRedaction may miss these — register the resolved values.
+    registerLogSecret(appSecret);
+    registerLogSecret(gitlabToken);
     if (tokenEnvName != null && (gitlabToken == null || gitlabToken === "")) {
       console.warn(
         `[larkway] bot "${bot.id}" declares token env "${tokenEnvName}" ` +
@@ -1474,6 +1479,12 @@ registerRunner("codex", () => new CodexRunner());
 registerRunner("pi", () => new PiRunner());
 
 async function main(): Promise<void> {
+  // Log redaction FIRST — before anything can log. Wraps the global console so
+  // an axios/node-sdk error dumped by any call site (or by the SDK's own
+  // logger) never writes its Authorization header / app secret / access token
+  // to the bridge log. See logRedaction.ts.
+  installLogRedaction();
+
   const dryRun = process.env["LARKWAY_DRY_RUN"] === "1";
 
   // PATH augmentation FIRST — before any CLI resolution. Supervisors
