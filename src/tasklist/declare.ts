@@ -144,7 +144,8 @@ export async function applyTaskHandleDeclarations(
           ({ guid } = await deps.client.createTask(followerAdded ? { ...request, members } : request));
         } catch (err) {
           if (!followerAdded) throw err;
-          console.warn(`[tasklist.declare] create with the sender as follower failed; retrying without it:`, err);
+          // Message only: the wrapped HTTP error carries request headers (auth).
+          console.warn(`[tasklist.declare] create with the sender as follower failed; retrying without it: ${String((err as Error).message ?? err)}`);
           ({ guid } = await deps.client.createTask(request));
           followerAdded = false;
         }
