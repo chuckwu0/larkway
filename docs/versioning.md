@@ -78,7 +78,8 @@
 | v0.3.71 | v0.3.71 | patch / 已发布 | idle 看门狗改分级处置(撞阈值只标记 suspect + 卡片可见等待,3 倍且封顶 15min 才中断;中断卡片给出实测静默时长与 idle_timeout_seconds 提示) |
 | v0.3.72 | v0.3.72 | patch / 已发布 | gap-fill: anchor the recovery window at the last confirmed-healthy moment (sleep/suspend no longer silently drops every @) and paginate the history pull (an asc single page kept the OLDEST 50 and dropped the recent @) |
 | v0.3.73 | v0.3.73 | patch / 已发布 | align native workspaces, slim transport prompts, preserve native sessions, and isolate bot identities |
-| v0.3.74 | v0.3.74 | 当前 patch / 已发布 | add pi coding agent as a third backend (backend: pi, BYO-model via ~/.pi/agent/models.json) |
+| v0.3.74 | v0.3.74 | patch / 已发布 | add pi coding agent as a third backend (backend: pi, BYO-model via ~/.pi/agent/models.json) |
+| v0.3.75 | v0.3.75 | 当前 patch / 已发布 | perf: native-parity pass — delta prompt wrapper about -55% tokens, reply surfaces off the runner's critical path, inbound debounce 0 by default, opt-in pi warm pool and model-first lane (#63); ships #61/#62 |
 
 ## 使用原则
 
@@ -164,4 +165,5 @@ v0.3.71       = idle 看门狗改分级处置(撞阈值只标记 suspect + 卡�
 v0.3.72       = gap-fill: anchor the recovery window at the last confirmed-healthy moment (sleep/suspend no longer silently drops every @) and paginate the history pull (an asc single page kept the OLDEST 50 and dropped the recent @)
 v0.3.73       = align native workspaces, slim transport prompts, preserve native sessions, and isolate bot identities
 v0.3.74       = add pi coding agent as a third backend (backend: pi, BYO-model via ~/.pi/agent/models.json)
+v0.3.75       = perf: native-parity pass — delta prompt wrapper about -55% tokens, reply surfaces off the runner's critical path, inbound debounce 0 by default, opt-in pi warm pool and model-first lane (#63); ships #61/#62
 ```
