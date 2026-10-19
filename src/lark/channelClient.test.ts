@@ -3820,7 +3820,12 @@ describe("ChannelClient — gap-fill window + paging (BL-55)", () => {
           token === "p2"
             ? { ok: true, data: { messages: [gapMsg(page2Id)], has_more: false, page_token: "" } }
             : { ok: true, data: { messages: [gapMsg("om_on_page_1")], has_more: true, page_token: "p2" } };
-        cb(null, { stdout: JSON.stringify(body), stderr: "" });
+        // CLI 1.0.98 retains data cursors and adds authoritative meta.pagination.
+        const envelope = { ...body, meta: { pagination: {
+          complete: token === "p2", pages: 1, items: 1,
+          ...(token === "p2" ? {} : { next_token: "p2" }),
+        } } };
+        cb(null, { stdout: JSON.stringify(envelope), stderr: "" });
       },
     }));
     const chObj = makeFakeChannelWithHandlers();

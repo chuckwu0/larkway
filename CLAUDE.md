@@ -65,7 +65,7 @@ Things Larkway must NOT do:
 Spawn `lark-cli`, `claude`, `codex`, `glab`, `git` as child processes rather
 than importing their SDK packages. This keeps deps minimal and avoids auth
 surface duplication. Existing exception: the inbound WS channel uses the
-version-pinned `@larksuiteoapi/node-sdk@1.67.0` (`lark/channelClient.ts`,
+version-pinned `@larksuiteoapi/node-sdk@1.76.0` (`lark/channelClient.ts`,
 `main.ts`) because the lark-cli subscribe subprocess was unrecoverably flaky —
 that swap is settled; don't "fix" it back. Do not add NEW SDK dependencies
 without the same level of justification.

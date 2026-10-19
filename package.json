@@ -33,7 +33,7 @@
   },
   "dependencies": {},
   "devDependencies": {
-    "@larksuiteoapi/node-sdk": "1.67.0",
+    "@larksuiteoapi/node-sdk": "1.76.0",
     "@types/cross-spawn": "^6.0.6",
     "@types/js-yaml": "^4.0.9",
     "@types/node": "^20.0.0",
