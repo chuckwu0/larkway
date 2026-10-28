@@ -80,6 +80,7 @@ import type {
 import { createPerfMarker, markPerfForEventType } from "../agent/runner.js";
 import { TurnEventQueue } from "../agent/turnEventQueue.js";
 import { AnswerChannelExtractor } from "../agent/answerChannel.js";
+import { resolveRunTimeoutMs } from "../agent/runTimeout.js";
 import {
   type ClaudeAddDirProbe,
   type ClaudeTurnUsageState,
@@ -91,7 +92,7 @@ import {
   runClaude,
 } from "./runner.js";
 
-type DoneResult = { exitCode: number; sessionId?: string; pooled?: boolean; resumeMode?: "same-process" | "cold" };
+type DoneResult = { exitCode: number; sessionId?: string; interrupted?: boolean; interruptionReason?: "cancel" | "timeout"; pooled?: boolean; resumeMode?: "same-process" | "cold" };
 
 /** @default 10 min — same idle-reap horizon as CodexProcessPool (src/codex/pool.ts). */
 export const DEFAULT_WARM_PROCESS_IDLE_MS = 10 * 60 * 1000;
@@ -102,8 +103,6 @@ export const DEFAULT_MAX_PROCESSES = 6;
 const SIGKILL_GRACE_MS = 5_000;
 /** How long #sendInterruptAndEscalate waits for the interrupt round-trip before SIGTERM. */
 const INTERRUPT_GRACE_MS = 3_000;
-/** Same default as the cold runner (src/claude/runner.ts) when a turn's caller doesn't set one. */
-const DEFAULT_TURN_TIMEOUT_MS = 15 * 60 * 1000;
 /** shutdown()'s bounded wait for each destroyed entry's real exit — longer than SIGKILL_GRACE_MS so that backstop gets a chance to fire first. */
 const SHUTDOWN_EXIT_WAIT_MS = SIGKILL_GRACE_MS + 2_000;
 /** Diagnostic-only cap on a warm entry's buffered stderr (#appendStderrChunk) — only the tail ever matters for the died-before-first-output warning, so this bounds an otherwise-unbounded buffer over a long-lived process's life. */
@@ -129,6 +128,7 @@ interface TurnState {
   reachedWire: boolean;
   /** Set by kill()/timeout/abortSignal — see #fallbackToCold's early-out for why this matters. */
   killRequested: boolean;
+  interruptionReason?: "cancel" | "timeout";
   sessionId: string | undefined;
   answerExtractor: AnswerChannelExtractor;
   /** WP-0: per-turn usage extraction state for parseLinesMulti. */
@@ -145,8 +145,18 @@ interface TurnState {
   /** Set only when this specific turn fell back to a cold one-shot runner. */
   coldHandle?: RunHandle;
   timeoutHandle?: ReturnType<typeof setTimeout>;
+  abortListener?: () => void;
   /** Armed by #sendInterruptAndEscalate; cleared whenever the turn settles by any path. */
   interruptEscalateTimer?: ReturnType<typeof setTimeout>;
+  /** Bounded turn settlement after a retired child fails to report its exit. */
+  interruptFinalizeTimer?: ReturnType<typeof setTimeout>;
+}
+
+interface ColdWriter {
+  readonly handle: RunHandle;
+  readonly state: TurnState;
+  readonly threadId: string | undefined;
+  sessionId: string | undefined;
 }
 
 interface PoolEntry {
@@ -333,6 +343,11 @@ export class ClaudeProcessPool implements AgentRunner {
    * -killed while that child still lives. Removed in `#onEntryExit`.
    */
   readonly #dying = new Set<PoolEntry>();
+  /** Card settlement after an interrupt is not permission for a second writer. */
+  readonly #interruptedExits = new Map<PoolEntry, Promise<void>>();
+  readonly #waitingForExit = new Set<TurnState>();
+  /** Removed only on cold handle.processExited, never just handle.done. */
+  readonly #coldWriters = new Set<ColdWriter>();
 
   // -- 批D blank-standby prewarm state ----------------------------------------
   /** Set by prewarm(); undefined = prewarm never requested (no blank maintenance). */
@@ -384,6 +399,7 @@ export class ClaudeProcessPool implements AgentRunner {
   }
 
   run(opts: RunOptions): RunHandle {
+    const timeoutMs = resolveRunTimeoutMs(opts.timeoutMs);
     const queue = new TurnEventQueue();
     const markPerf = createPerfMarker(opts.onPerfMarker);
     // M4-style baseline (perf plan, mirrored from CodexProcessPool): mark t0
@@ -415,18 +431,25 @@ export class ClaudeProcessPool implements AgentRunner {
       entry: undefined,
     };
 
-    const timeoutMs = opts.timeoutMs ?? DEFAULT_TURN_TIMEOUT_MS;
-    state.timeoutHandle = setTimeout(() => this.#interruptTurn(state), timeoutMs);
-    state.timeoutHandle.unref?.();
+    if (timeoutMs !== undefined) {
+      state.timeoutHandle = setTimeout(() => this.#interruptTurn(state, "timeout"), timeoutMs);
+      state.timeoutHandle.unref?.();
+    }
     if (opts.abortSignal != null) {
       if (opts.abortSignal.aborted) {
         this.#interruptTurn(state);
       } else {
-        opts.abortSignal.addEventListener("abort", () => this.#interruptTurn(state), { once: true });
+        state.abortListener = () => this.#interruptTurn(state);
+        opts.abortSignal.addEventListener("abort", state.abortListener, { once: true });
       }
     }
 
     const kill = (): void => this.#interruptTurn(state);
+
+    if (this.#hasUnexitedColdWriter(opts)) {
+      this.#settleReject(state, this.#coldWriterError());
+      return { events: queue, done, kill, pid: undefined };
+    }
 
     if (this.#shuttingDown) {
       this.#settleReject(state, new Error("[claude-pool] pool is shutting down — rejecting new turn"));
@@ -438,6 +461,53 @@ export class ClaudeProcessPool implements AgentRunner {
     // that degrades to "every turn gets its own process" rather than
     // accidentally aliasing unrelated callers onto the same warm child.
     const threadId = opts.threadId ?? `__unkeyed-${this.#nextUnkeyedId++}__`;
+    const place = (): RunHandle | undefined => {
+      if (state.settled) return;
+      if (this.#waitForInterruptedExit(state, threadId, place)) return;
+      return this.#placeTurn(state, threadId);
+    };
+    return place() ?? { events: queue, done, kill, pid: undefined };
+  }
+
+  #hasUnexitedColdWriter(opts: RunOptions, threadId = opts.threadId): boolean {
+    return [...this.#coldWriters].some((writer) =>
+      (threadId !== undefined && writer.threadId === threadId) ||
+      (opts.resumeSessionId !== undefined && writer.sessionId === opts.resumeSessionId),
+    );
+  }
+
+  #coldWriterError(): Error {
+    return new Error("[claude-pool] previous cold process exit is unconfirmed for this thread/session; refusing a second writer");
+  }
+
+  /** Wait for actual exit, not the bounded card/shutdown cleanup grace. */
+  #waitForInterruptedExit(state: TurnState, threadId: string, resume: () => unknown): boolean {
+    const exits = [...this.#interruptedExits].filter(([entry]) => entry.threadId === threadId).map(([, exit]) => exit);
+    if (exits.length === 0) return false;
+    if (this.#waitingForExit.has(state)) return true;
+    this.#waitingForExit.add(state);
+    void Promise.race([Promise.all(exits), state.done.catch(() => undefined)]).then(() => {
+      this.#waitingForExit.delete(state);
+      if (state.settled) return;
+      if (this.#shuttingDown) {
+        this.#settleReject(state, new Error("[claude-pool] pool is shutting down — rejecting waiting turn"));
+        return;
+      }
+      resume();
+    }).catch((err: unknown) => {
+      this.#waitingForExit.delete(state);
+      this.#settleReject(state, err instanceof Error ? err : new Error(String(err)));
+    });
+    return true;
+  }
+
+  #placeTurn(state: TurnState, threadId: string): RunHandle {
+    const { opts, queue, done } = state;
+    const kill = (): void => this.#interruptTurn(state);
+    if (this.#hasUnexitedColdWriter(opts, threadId)) {
+      this.#settleReject(state, this.#coldWriterError());
+      return { events: queue, done, kill, pid: undefined };
+    }
     const needsAddDir = snapshotAddDirProbe();
     const key = this.#computeKey(threadId, opts, needsAddDir);
 
@@ -532,6 +602,9 @@ export class ClaudeProcessPool implements AgentRunner {
   /** Graceful drain + shutdown — call from the owning bot's process shutdown path. */
   async shutdown(drainTimeoutMs = 30_000): Promise<void> {
     this.#shuttingDown = true;
+    for (const state of this.#waitingForExit) {
+      this.#settleReject(state, new Error("[claude-pool] pool is shutting down — rejecting waiting turn"));
+    }
     if (this.#idleSweepTimer) {
       clearInterval(this.#idleSweepTimer);
       this.#idleSweepTimer = undefined;
@@ -540,9 +613,14 @@ export class ClaudeProcessPool implements AgentRunner {
       clearTimeout(this.#prewarmRespawnTimer);
       this.#prewarmRespawnTimer = undefined;
     }
-    const inFlight = [...this.#entries.values()]
-      .map((e) => e.current?.done.catch(() => undefined))
-      .filter((p): p is Promise<DoneResult | undefined> => p != null);
+    const coldWriters = [...this.#coldWriters];
+    for (const writer of coldWriters) this.#interruptTurn(writer.state);
+    const inFlight = [
+      ...[...this.#entries.values()]
+        .map((e) => e.current?.done.catch(() => undefined))
+        .filter((p): p is Promise<DoneResult | undefined> => p != null),
+      ...coldWriters.map((writer) => writer.handle.done.catch(() => undefined)),
+    ];
     await Promise.race([
       Promise.all(inFlight),
       new Promise<void>((resolve) => {
@@ -552,6 +630,10 @@ export class ClaudeProcessPool implements AgentRunner {
     ]);
     const entries = [...this.#entries.values()];
     for (const entry of entries) {
+      if (entry.current && !entry.current.settled) {
+        entry.current.killRequested = true;
+        entry.current.interruptionReason ??= "cancel";
+      }
       this.#destroyEntry(entry, "pool shutdown");
     }
     // Bounded wait for each child's REAL exit — not just the SIGTERM send.
@@ -565,7 +647,19 @@ export class ClaudeProcessPool implements AgentRunner {
     // after the wait is simply left running with its pid still recorded on
     // disk — the next boot's reapOrphanedWarmClaudeProcesses sweep picks it
     // up; we never force-remove it from the list on a timeout.
-    await Promise.all(entries.map((entry) => this.#waitForEntryExit(entry, SHUTDOWN_EXIT_WAIT_MS)));
+    await Promise.all([
+      ...entries.map((entry) => this.#waitForEntryExit(entry, SHUTDOWN_EXIT_WAIT_MS)),
+      ...coldWriters.map((writer) => new Promise<void>((resolve) => {
+        const timer = setTimeout(resolve, SHUTDOWN_EXIT_WAIT_MS);
+        timer.unref?.();
+        void writer.handle.processExited?.then(() => {
+          clearTimeout(timer);
+          resolve();
+        });
+      })),
+    ]);
+    // A bounded shutdown is not evidence of child death: #coldWriters and
+    // its PID remain owned until processExited actually resolves.
     // Ensure the post-exit pid-list rewrite(s) #onEntryExit just queued above
     // have actually landed on disk before returning.
     await this.#pidListWriteChain;
@@ -666,7 +760,7 @@ export class ClaudeProcessPool implements AgentRunner {
     // `subtype` is this runner's best proxy for the exitCode contract
     // handler.ts already relies on (`result.exitCode === 0` as a
     // state.json-absent success fallback — see bridge/handler.ts).
-    const exitCode = subtype === "success" ? 0 : 1;
+    const exitCode = subtype === "success" && !state.killRequested ? 0 : 1;
     this.#settleResolve(state, {
       exitCode,
       sessionId: state.sessionId,
@@ -699,14 +793,25 @@ export class ClaudeProcessPool implements AgentRunner {
       return;
     }
 
+    const threadId = state.opts.threadId ?? state.entry?.threadId;
+    if (this.#hasUnexitedColdWriter(state.opts, threadId)) {
+      this.#settleReject(state, this.#coldWriterError());
+      return;
+    }
+    if (threadId !== undefined && this.#waitForInterruptedExit(state, threadId, () => this.#fallbackToCold(state, causeErr))) return;
+
     console.warn(
       `[claude-pool] pool unavailable for this turn (${causeErr.message}) — falling back to a cold one-shot start.`,
     );
     const cold = runClaude(state.opts);
     state.coldHandle = cold;
+    const writer: ColdWriter = { handle: cold, state, threadId, sessionId: state.opts.resumeSessionId };
+    this.#coldWriters.add(writer);
+    void cold.processExited?.then(() => this.#coldWriters.delete(writer));
     void (async () => {
       try {
         for await (const ev of cold.events) {
+          if (ev.type === "system_init") writer.sessionId = ev.sessionId;
           markPerfForEventType(state.markPerf, ev.type);
           state.queue.push(ev);
         }
@@ -725,9 +830,10 @@ export class ClaudeProcessPool implements AgentRunner {
     );
   }
 
-  #interruptTurn(state: TurnState): void {
-    if (state.settled) return;
+  #interruptTurn(state: TurnState, reason: "cancel" | "timeout" = "cancel"): void {
+    if (state.settled || state.killRequested) return;
     state.killRequested = true;
+    state.interruptionReason = reason;
 
     if (state.coldHandle) {
       state.coldHandle.kill();
@@ -769,10 +875,24 @@ export class ClaudeProcessPool implements AgentRunner {
         `[claude-pool] interrupt for key=${entry.key} did not complete within ${INTERRUPT_GRACE_MS}ms — ` +
           "escalating to SIGTERM/SIGKILL.",
       );
-      // #destroyEntry's kill sequence eventually fires #onEntryExit, which
-      // rejects `state` (reachedWire is true for a turn that was actually
-      // live on the wire) — THAT is the settle path for this escalated case.
+      // Retire before settling: this process is never reusable, even if it
+      // does not acknowledge SIGKILL. Keep its PID in #dying until an actual
+      // exit; completing a cancelled card is not evidence the process exited.
+      if (!this.#interruptedExits.has(entry)) {
+        this.#interruptedExits.set(entry, new Promise<void>((resolve) => {
+          entry.child.once("exit", () => {
+            this.#interruptedExits.delete(entry);
+            resolve();
+          });
+        }));
+      }
       this.#destroyEntry(entry, "interrupt escalation timeout");
+      if (state.settled) return;
+      state.interruptFinalizeTimer = setTimeout(() => {
+        if (state.settled) return;
+        this.#settleResolve(state, { exitCode: 1, sessionId: state.sessionId, pooled: true });
+      }, SIGKILL_GRACE_MS + 2_000);
+      state.interruptFinalizeTimer.unref?.();
     }, INTERRUPT_GRACE_MS);
     escalate.unref?.();
     state.interruptEscalateTimer = escalate;
@@ -788,7 +908,10 @@ export class ClaudeProcessPool implements AgentRunner {
       state.entry.current = undefined;
       state.entry.lastUsedAt = Date.now();
     }
-    state.resolveDone(result);
+    state.resolveDone({
+      ...result,
+      ...(state.killRequested ? { exitCode: 1, interrupted: true, interruptionReason: state.interruptionReason } : {}),
+    });
   }
 
   #settleReject(state: TurnState, err: Error): void {
@@ -820,6 +943,8 @@ export class ClaudeProcessPool implements AgentRunner {
   #clearStateTimers(state: TurnState): void {
     if (state.timeoutHandle) clearTimeout(state.timeoutHandle);
     if (state.interruptEscalateTimer) clearTimeout(state.interruptEscalateTimer);
+    if (state.interruptFinalizeTimer) clearTimeout(state.interruptFinalizeTimer);
+    if (state.abortListener) state.opts.abortSignal?.removeEventListener("abort", state.abortListener);
   }
 
   // -- process lifecycle -------------------------------------------------------
@@ -1108,6 +1233,10 @@ export class ClaudeProcessPool implements AgentRunner {
     entry.current = undefined;
     if (state == null || state.settled) return;
 
+    if (state.killRequested) {
+      this.#settleResolve(state, { exitCode: 1, sessionId: state.sessionId, pooled: true });
+      return;
+    }
     if (!state.reachedWire) {
       if (!wasAlreadyMarkedDestroyed) {
         const stderr = Buffer.concat(entry.stderrChunks).toString("utf8").trim();
@@ -1129,8 +1258,8 @@ export class ClaudeProcessPool implements AgentRunner {
    * its child (SIGTERM → grace → SIGKILL). Used for LRU eviction, key-drift
    * supersession, interrupt escalation, idle reaping, and shutdown alike.
    * Never settles `entry.current` itself — the child's own 'exit'/'error'
-   * event (#onEntryExit) is the single place that happens, so this method is
-   * safe to call regardless of whether the entry is currently busy.
+   * event normally does that. Interrupts additionally bound card settlement
+   * without treating that fallback as evidence of process exit.
    */
   #destroyEntry(entry: PoolEntry, reason: string): void {
     if (entry.destroyed) return;

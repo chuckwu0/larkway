@@ -720,6 +720,167 @@ describe("CodexProcessPool — kill() semantics", () => {
     await expect(handle.done).resolves.toMatchObject({ pooled: false, resumeMode: undefined });
   });
 
+  it.each(["kill", "abort", "timeout"])("%s before turn/start response interrupts the late turn and gates only that native session", async (action) => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "Date"] });
+    const pool = new CodexProcessPool({});
+    try {
+      const controller = new AbortController();
+      const first = pool.run({ prompt: "first", abortSignal: controller.signal, ...(action === "timeout" ? { timeoutMs: 1_000 } : {}) });
+      await flush();
+      const child = spawnedChildren[0]!;
+      child.stdout.write(initResponse(1) + "\n");
+      await flush();
+      child.stdout.write(threadResponse(2, "thread-a") + "\n");
+      await flush();
+      // Request 3 (turn/start) reached the server, but its response has not.
+      readOutboundRequests(child);
+      if (action === "kill") first.kill();
+      else if (action === "abort") controller.abort();
+      else await vi.advanceTimersByTimeAsync(1_000);
+      await expect(first.done).resolves.toMatchObject({ exitCode: 1, interrupted: true, interruptionReason: action === "timeout" ? "timeout" : "cancel" });
+      await collectEvents(first.events);
+      expect(readOutboundRequests(child)).toEqual([]); // turnId not invented
+
+      const next = pool.run({ prompt: "successor", resumeSessionId: "thread-a" });
+      await flush();
+      await vi.advanceTimersByTimeAsync(3 * 60 * 60_000);
+      expect(readOutboundRequests(child)).toEqual([]); // no implicit unlock/deadline
+      expect(child.killed).toBe(false);
+
+      const other = pool.run({ prompt: "other topic" });
+      await flush();
+      const otherThread = readOutboundRequests(child).find((r) => r.method === "thread/start")!;
+      child.stdout.write(threadResponse(otherThread.id!, "thread-b") + "\n");
+      await flush();
+      const otherTurn = readOutboundRequests(child).find((r) => r.method === "turn/start")!;
+      child.stdout.write(turnStartResponse(otherTurn.id!, "turn-b") + "\n");
+      child.stdout.write(turnCompleted("thread-b", "turn-b") + "\n");
+      await expect(other.done).resolves.toMatchObject({ exitCode: 0 });
+
+      child.stdout.write(turnStartResponse(3, "turn-a") + "\n");
+      await flush();
+      const interrupt = readOutboundRequests(child);
+      expect(interrupt).toHaveLength(1);
+      expect(interrupt[0]).toMatchObject({ method: "turn/interrupt", params: { threadId: "thread-a", turnId: "turn-a" } });
+      child.stdout.write(JSON.stringify({ id: interrupt[0]!.id, result: {} }) + "\n");
+      await flush();
+      expect(readOutboundRequests(child)).toEqual([]); // interrupt ACK is not turn completion
+
+      child.stdout.write(turnCompleted("thread-a", "turn-a") + "\n");
+      await flush();
+      const resume = readOutboundRequests(child).find((r) => r.method === "thread/resume")!;
+      expect(resume).toBeDefined();
+      child.stdout.write(threadResponse(resume.id!, "thread-a") + "\n");
+      await flush();
+      const nextTurn = readOutboundRequests(child).find((r) => r.method === "turn/start")!;
+      child.stdout.write(turnStartResponse(nextTurn.id!, "turn-a2") + "\n");
+      child.stdout.write(turnCompleted("thread-a", "turn-a2") + "\n");
+      await expect(next.done).resolves.toMatchObject({ exitCode: 0 });
+      expect(child.killed).toBe(false);
+      child.emit("exit", 0);
+      child.stdout.end();
+    } finally {
+      await pool.shutdown(0);
+      vi.useRealTimers();
+    }
+  });
+
+  it("learns a late turn/started ID once, and shutdown closes waiters without releasing the native-stop gate", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "Date"] });
+    const pool = new CodexProcessPool({});
+    const first = pool.run({ prompt: "first" });
+    await flush();
+    const child = spawnedChildren[0]!;
+    child.stdout.write(initResponse(1) + "\n");
+    await flush();
+    child.stdout.write(threadResponse(2, "thread-a") + "\n");
+    await flush();
+    first.kill();
+    await first.done;
+    readOutboundRequests(child);
+    child.stdout.write(JSON.stringify({ method: "turn/started", params: { threadId: "thread-a", turn: { id: "turn-a" } } }) + "\n");
+    await flush();
+    expect(readOutboundRequests(child)).toEqual([expect.objectContaining({ method: "turn/interrupt", params: { threadId: "thread-a", turnId: "turn-a" } })]);
+    child.stdout.write(turnStartResponse(3, "turn-a") + "\n");
+    await flush();
+    expect(readOutboundRequests(child)).toEqual([]); // response cannot double-send
+
+    const stoppedWaiter = pool.run({ prompt: "cancel queued", resumeSessionId: "thread-a" });
+    await flush();
+    stoppedWaiter.kill();
+    await expect(stoppedWaiter.done).resolves.toMatchObject({ exitCode: 1, interrupted: true, interruptionReason: "cancel" });
+    const boundedWaiter = pool.run({ prompt: "budget queued", resumeSessionId: "thread-a", timeoutMs: 1_000 });
+    await flush();
+    await vi.advanceTimersByTimeAsync(1_000);
+    await expect(boundedWaiter.done).resolves.toMatchObject({ exitCode: 1, interrupted: true, interruptionReason: "timeout" });
+    const shutdownWaiter = pool.run({ prompt: "shutdown queued", resumeSessionId: "thread-a" });
+    const events = collectEvents(shutdownWaiter.events);
+    const rejects = expect(shutdownWaiter.done).rejects.toThrow(/shutting down/);
+    await flush();
+    await pool.shutdown(0);
+    await rejects;
+    await events;
+    expect(readOutboundRequests(child)).toEqual([]);
+    child.emit("exit", 0);
+    child.stdout.end();
+    await flush();
+    expect(spawnedChildren).toHaveLength(1);
+    vi.useRealTimers();
+  });
+
+  it("a child error cannot cold-fallback a waiting session before the cancelled writer actually exits", async () => {
+    const pool = new CodexProcessPool({});
+    const first = pool.run({ prompt: "first" });
+    await flush();
+    const child = spawnedChildren[0]!;
+    child.stdout.write(initResponse(1) + "\n");
+    await flush();
+    child.stdout.write(threadResponse(2, "thread-a") + "\n");
+    await flush();
+    first.kill();
+    await first.done;
+    const next = pool.run({ prompt: "waiting", resumeSessionId: "thread-a" });
+    await flush();
+    child.emit("error", new Error("write failed, process exit unknown"));
+    await flush();
+    expect(spawnedChildren).toHaveLength(1);
+    next.kill();
+    await expect(next.done).resolves.toMatchObject({ exitCode: 1, interrupted: true });
+    await collectEvents(next.events);
+    child.emit("exit", 1);
+    child.stdout.end();
+    await flush();
+    expect(spawnedChildren).toHaveLength(1);
+    await pool.shutdown(0);
+  });
+
+  it("a late rejected turn/start releases the cancelled session without starting or interrupting that rejected turn", async () => {
+    const pool = new CodexProcessPool({});
+    const first = pool.run({ prompt: "first" });
+    await flush();
+    const child = spawnedChildren[0]!;
+    child.stdout.write(initResponse(1) + "\n");
+    await flush();
+    child.stdout.write(threadResponse(2, "thread-a") + "\n");
+    await flush();
+    first.kill();
+    await first.done;
+    readOutboundRequests(child);
+    const next = pool.run({ prompt: "next", resumeSessionId: "thread-a" });
+    await flush();
+    expect(readOutboundRequests(child)).toEqual([]);
+    child.stdout.write(jsonRpcErrorResponse(3, "turn was not started") + "\n");
+    await flush();
+    const requests = readOutboundRequests(child);
+    expect(requests).toHaveLength(1);
+    expect(requests[0]!.method).toBe("thread/resume");
+    next.kill(); // no turn/start for this successor yet
+    await next.done;
+    child.emit("exit", 0);
+    child.stdout.end();
+    await pool.shutdown(0);
+  });
+
   it("interrupting one turn does not affect a concurrent turn on the same process", async () => {
     const pool = new CodexProcessPool({});
     const handleA = pool.run({ prompt: "first", cwd: "/wt/a" });
@@ -1131,6 +1292,178 @@ describe("CodexProcessPool — M5: no cold fallback after system_init was alread
 // ---------------------------------------------------------------------------
 
 describe("CodexProcessPool — B3: timeoutMs/abortSignal", () => {
+  // Fake elapsed time exercises the pool itself, not a mocked RunHandle.
+  it.each([undefined, 0])("keeps active and silent tool turns for 3h (timeoutMs=%s), with scoped cancel", async (timeoutMs) => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "Date"] });
+    const pool = new CodexProcessPool({ idleMs: 10 * 60_000 });
+    try {
+      const handleA = pool.run({ prompt: "active work", timeoutMs });
+      const handleB = pool.run({ prompt: "long tool", timeoutMs });
+      let settledA = false;
+      let settledB = false;
+      void handleA.done.then(() => { settledA = true; });
+      void handleB.done.then(() => { settledB = true; });
+      await flush();
+      const child = spawnedChildren[0]!;
+      child.stdout.write(initResponse(1) + "\n");
+      await flush();
+      child.stdout.write(threadResponse(2, "thread-a") + "\n");
+      child.stdout.write(threadResponse(3, "thread-b") + "\n");
+      await flush();
+      child.stdout.write(turnStartResponse(4, "turn-a") + "\n");
+      child.stdout.write(turnStartResponse(5, "turn-b") + "\n");
+      child.stdout.write(agentStarted("thread-a", "turn-a") + "\n");
+      const tool = { type: "mcpToolCall", id: "long-tool", server: "test", tool: "wait", arguments: {}, status: "inProgress" };
+      child.stdout.write(JSON.stringify({ method: "item/started", params: { threadId: "thread-b", turnId: "turn-b", item: tool } }) + "\n");
+      await flush();
+      for (let step = 0; step < 6; step++) {
+        child.stdout.write(agentDelta("thread-a", "turn-a", `step ${step} `) + "\n");
+        await flush();
+        await vi.advanceTimersByTimeAsync(30 * 60_000);
+        expect(settledA).toBe(false);
+        expect(settledB).toBe(false);
+        expect(child.killed).toBe(false); // idle sweep must not reclaim a busy process
+      }
+      readOutboundRequests(child);
+      handleA.kill();
+      await expect(handleA.done).resolves.toMatchObject({ exitCode: 1 });
+      expect(readOutboundRequests(child)).toContainEqual(expect.objectContaining({ method: "turn/interrupt", params: { threadId: "thread-a", turnId: "turn-a" } }));
+      expect(settledB).toBe(false);
+      expect(child.killed).toBe(false);
+      child.stdout.write(JSON.stringify({ method: "item/completed", params: { threadId: "thread-b", turnId: "turn-b", item: { ...tool, status: "completed" } } }) + "\n");
+      child.stdout.write(turnCompleted("thread-b", "turn-b") + "\n");
+      const seenB = await collectEvents(handleB.events);
+      expect(seenB.filter((event) => event.type === "tool_use")).toHaveLength(1);
+      expect(seenB.filter((event) => event.type === "tool_result")).toHaveLength(1);
+      await expect(handleB.done).resolves.toMatchObject({ exitCode: 0 });
+      child.stdout.write(turnCompleted("thread-a", "turn-a") + "\n"); // native cancellation acknowledged
+      await flush();
+      await vi.advanceTimersByTimeAsync(10 * 60_000);
+      expect(child.killSignals).toEqual(["SIGTERM"]); // normal idle reclamation still works
+      child.emit("exit", 0);
+      child.stdout.end();
+    } finally {
+      await pool.shutdown(0);
+      vi.useRealTimers();
+    }
+  });
+
+  it("fails closed for an unexited cold fallback writer, without blocking unrelated topics", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "Date"] });
+    const pool = new CodexProcessPool({});
+    try {
+      const first = pool.run({ prompt: "fallback", threadId: "topic-a" });
+      const firstEvents = collectEvents(first.events);
+      await flush();
+      spawnedChildren[0]!.emit("exit", 1); // cold fallback, not a model/business retry
+      await flush();
+      const cold = spawnedChildren[1]!;
+      expect(first.processExited).toBeDefined(); // late fallback lifetime is visible to the handler
+      cold.stdout.write(initResponse(1) + "\n");
+      cold.stdout.write(threadResponse(2, "cold-native-session") + "\n");
+      cold.stdout.write(turnStartResponse(3, "cold-turn") + "\n");
+      await flush();
+      first.kill();
+      await vi.advanceTimersByTimeAsync(7_000);
+      await expect(first.done).resolves.toMatchObject({ exitCode: 1, interrupted: true, sessionId: "cold-native-session", pooled: false });
+      await firstEvents;
+      expect(cold.killSignals).toEqual(["SIGTERM", "SIGKILL"]);
+
+      for (const options of [{ threadId: "topic-a" }, { threadId: "other-topic", resumeSessionId: "cold-native-session" }]) {
+        const blocked = pool.run({ prompt: "must not duplicate writer", ...options });
+        await expect(blocked.done).rejects.toThrow(/not confirmed exit/);
+        await collectEvents(blocked.events);
+      }
+      expect(spawnedChildren).toHaveLength(2);
+
+      const other = pool.run({ prompt: "unrelated", threadId: "topic-b" });
+      await flush();
+      const warm = spawnedChildren[2]!;
+      const init = readOutboundRequests(warm).find((r) => r.method === "initialize")!;
+      warm.stdout.write(initResponse(init.id!) + "\n");
+      await flush();
+      const thread = readOutboundRequests(warm).find((r) => r.method === "thread/start")!;
+      warm.stdout.write(threadResponse(thread.id!, "native-b") + "\n");
+      await flush();
+      const turn = readOutboundRequests(warm).find((r) => r.method === "turn/start")!;
+      warm.stdout.write(turnStartResponse(turn.id!, "turn-b") + "\n");
+      warm.stdout.write(turnCompleted("native-b", "turn-b") + "\n");
+      await expect(other.done).resolves.toMatchObject({ exitCode: 0 });
+      expect(warm.killed).toBe(false);
+
+      cold.emit("exit", 1);
+      cold.stdout.end();
+      await flush();
+      const resumed = pool.run({ prompt: "safe after real exit", threadId: "topic-a", resumeSessionId: "cold-native-session" });
+      await flush();
+      const resume = readOutboundRequests(warm).find((r) => r.method === "thread/resume")!;
+      expect(resume).toBeDefined();
+      warm.stdout.write(threadResponse(resume.id!, "cold-native-session") + "\n");
+      await flush();
+      const resumedTurn = readOutboundRequests(warm).find((r) => r.method === "turn/start")!;
+      warm.stdout.write(turnStartResponse(resumedTurn.id!, "resumed-turn") + "\n");
+      warm.stdout.write(turnCompleted("cold-native-session", "resumed-turn") + "\n");
+      await expect(resumed.done).resolves.toMatchObject({ exitCode: 0 });
+      warm.emit("exit", 0);
+      warm.stdout.end();
+    } finally {
+      await pool.shutdown(0);
+      vi.useRealTimers();
+    }
+  });
+
+  it("preserves the outer explicit budget when startup falls back to cold", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "Date"] });
+    const pool = new CodexProcessPool({});
+    try {
+      const handle = pool.run({ prompt: "fallback", timeoutMs: 5_000 });
+      await flush();
+      await vi.advanceTimersByTimeAsync(4_000);
+      spawnedChildren[0]!.emit("exit", 1);
+      await flush();
+      const cold = spawnedChildren[1]!;
+      expect(cold).toBeDefined();
+      await vi.advanceTimersByTimeAsync(999);
+      expect(cold.killed).toBe(false);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(cold.killSignals).toEqual(["SIGTERM"]); // original deadline, not fallback + 5s
+      await vi.advanceTimersByTimeAsync(7_000);
+      await expect(handle.done).resolves.toMatchObject({ exitCode: 1, pooled: false, interrupted: true, interruptionReason: "timeout" });
+      await collectEvents(handle.events);
+    } finally {
+      await pool.shutdown(0);
+      vi.useRealTimers();
+    }
+  });
+
+  it("a user cancel during cold fallback wins over a later outer budget expiry", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "Date"] });
+    const pool = new CodexProcessPool({});
+    try {
+      const handle = pool.run({ prompt: "fallback", timeoutMs: 5_000 });
+      await flush();
+      await vi.advanceTimersByTimeAsync(4_000);
+      spawnedChildren[0]!.emit("exit", 1);
+      await flush();
+      handle.kill(); // cancel at 4s, before the original 5s budget
+      await vi.advanceTimersByTimeAsync(7_000);
+      await expect(handle.done).resolves.toMatchObject({ exitCode: 1, interrupted: true, interruptionReason: "cancel", pooled: false });
+      await collectEvents(handle.events);
+      spawnedChildren[1]!.emit("exit", 1);
+      spawnedChildren[1]!.stdout.end();
+    } finally {
+      await pool.shutdown(0);
+      vi.useRealTimers();
+    }
+  });
+
+  it.each([-1, Infinity, NaN, 2_147_483_648])("rejects invalid budget %s before pool allocation/spawn", async (timeoutMs) => {
+    const pool = new CodexProcessPool({});
+    expect(() => pool.run({ prompt: "invalid", timeoutMs })).toThrow(RangeError);
+    expect(spawnedChildren).toHaveLength(0);
+    await pool.shutdown(0);
+  });
+
   it("a turn that never completes is interrupted after opts.timeoutMs", async () => {
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "Date"] });
     try {
@@ -1144,9 +1477,12 @@ describe("CodexProcessPool — B3: timeoutMs/abortSignal", () => {
       await flush();
       child.stdout.write(turnStartResponse(3, "turn-a") + "\n");
       await flush();
-      // Turn never completes — app-server wedged.
-
-      await vi.advanceTimersByTimeAsync(5_100);
+      // Activity never renews an explicitly configured wall-clock budget.
+      await vi.advanceTimersByTimeAsync(4_000);
+      child.stdout.write(agentStarted("thread-a", "turn-a") + "\n");
+      child.stdout.write(agentDelta("thread-a", "turn-a", "still working") + "\n");
+      await flush();
+      await vi.advanceTimersByTimeAsync(1_100);
 
       const result = await handle.done;
       expect(result.exitCode).toBe(1); // abandoned, same contract as kill()
@@ -1280,6 +1616,57 @@ describe("CodexProcessPool — B4: SIGKILL escalation uses the real exit event",
 // ---------------------------------------------------------------------------
 
 describe("CodexProcessPool — M1: no spawn during shutdown", () => {
+  it("shutdown labels a still-active warm turn as cancel rather than timeout", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "Date"] });
+    const pool = new CodexProcessPool({});
+    const handle = pool.run({ prompt: "warm shutdown", timeoutMs: 60_000 });
+    const events = collectEvents(handle.events);
+    await flush();
+    const child = spawnedChildren[0]!;
+    child.stdout.write(initResponse(1) + "\n");
+    await flush();
+    child.stdout.write(threadResponse(2, "thread-a") + "\n");
+    await flush();
+    child.stdout.write(turnStartResponse(3, "turn-a") + "\n");
+    await flush();
+    const shutdown = pool.shutdown(0);
+    await vi.advanceTimersByTimeAsync(1);
+    await shutdown;
+    await expect(handle.done).resolves.toMatchObject({ exitCode: 1, interrupted: true, interruptionReason: "cancel" });
+    await events;
+    child.emit("exit", 0);
+    child.stdout.end();
+    vi.useRealTimers();
+  });
+
+  it("shutdown cancels its live cold fallback within a bounded grace without pretending the process died", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "Date"] });
+    const pool = new CodexProcessPool({});
+    const handle = pool.run({ prompt: "cold fallback", threadId: "topic-a" });
+    const events = collectEvents(handle.events);
+    await flush();
+    spawnedChildren[0]!.emit("exit", 1);
+    await flush();
+    const cold = spawnedChildren[1]!;
+    let processExited = false;
+    void handle.processExited!.then(() => { processExited = true; });
+    const shutdown = pool.shutdown(0);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(cold.killSignals).toEqual(["SIGTERM"]);
+    await vi.advanceTimersByTimeAsync(7_000);
+    await shutdown;
+    await expect(handle.done).resolves.toMatchObject({ exitCode: 1, interrupted: true, interruptionReason: "cancel", pooled: false });
+    await events;
+    expect(cold.killSignals).toEqual(["SIGTERM", "SIGKILL"]);
+    expect(processExited).toBe(false);
+    expect(spawnedChildren).toHaveLength(2);
+    cold.emit("exit", 1);
+    cold.stdout.end();
+    await handle.processExited;
+    expect(processExited).toBe(true);
+    vi.useRealTimers();
+  });
+
   it("a run() call during shutdown fails fast without spawning anything", async () => {
     const pool = new CodexProcessPool({});
     const shutdownPromise = pool.shutdown(100);

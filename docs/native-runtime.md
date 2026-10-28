@@ -4,13 +4,14 @@ Larkway 的目标是把飞书话题接到本地 Claude Code / Codex。在相同�
 
 ## 当前默认行为
 
+- 原生长任务默认没有 bridge 强加的总时限：Claude、Codex、pi 的冷启动和热池六条路径一致，不会仅因运行超过 60 分钟而结束当前 turn。需要自动总预算时显式设置 `subprocess_timeout_seconds`，详见下文「长任务与时间预算」。
 - `agent_workspace` 首轮提供完整但精简的场景契约，续轮默认 `promptMode: delta`。新会话、目录或 backend 切换时重新发送完整契约；配置切换还携带可用的旧摘要和记录摘录，并明确原生上下文已经重开。
 - 身份与职责由原生 `AGENTS.md` 加载；Claude 的 `CLAUDE.md` 指向同一内容。bridge 不再逐轮复制工作方式。旧 runtime 保留兼容注入。
 - 不要求先读历史、先建任务卡、写状态文件、导出飞书文档或整理记忆。这些操作由任务和 Agent 定义决定。需要交互卡片的 Agent 仍可按 [prompt 契约](prompt-contract.md) 使用可选状态文件。
 - `sessionReseedTurns`、`sessionReseedChars`、`p2pStickyIdleMs` 默认均为 `0`。优先沿用原生 session 和原生压缩；显式设置的重开策略、用户重置和已确认的失效会话恢复仍保留。
 - Codex 使用协议的 `phase: final_answer`，不要求输出自定义答案标记；未带 phase 的旧协议保留标记兼容。Claude 保留简短的答案标记约定。Codex 不再强制详细 reasoning summary，沿用宿主配置。
 - pi（`backend: pi`，自带模型底座）默认走 `pi -p --mode json --approve`，每轮冷启动；prompt 经 stdin 传入，`--session-id` 续接原生 session，`model` 直接传 `--model`（支持 `provider/id`），`effort` 传 `--thinking`。答案沿用 Claude 的标记约定。`--approve` 必带：非交互模式下 pi 不弹项目信任提示，不带它会静默跳过 workspace 的 `.agents/skills/`。pi 无权限系统，所有权限模式等价全量访问；环境变量原样透传（provider key 即登录态）。
-- pi 热进程池需显式 `warmProcess: true`（默认关；更早的版本里 pi 上的这一项只打告警、不生效，升级后会直接开池，部署前请核对 pi bot 的 yaml，见[升级](#从-v0374-及更早版本升级)；`larkway doctor` 会列出开了热池的 pi bot，只作提示，不影响退出码）：每个话题常驻一个 `pi --mode rpc --approve`，启动参数与冷启动相同（`--session-id`、`--model`、`--thinking`、`--skill`），空闲 `warmProcessIdleMs` 后回收，数量上限 `warmProcessMaxProcesses`，续轮直接在原进程里发 prompt。每轮重新下发 thinking；配置了 `model` 时，进程内模型被改动会改回启动时的模型，未配置时沿用 session 当前的模型（与冷启动续接一致）。进程在首个事件前退出，或正在执行不是 larkway 发起的 run 或压缩，则本轮改走冷启动；配置变化、换 session 或重开 session 时先等旧进程退出再起新进程（同一 session 文件只有一个写者）。与冷启动的已知差异：RPC 模式下 pi 为扩展提供 UI 通道，pi-mcp-adapter 因此向 MCP 服务声明 `sampling`、`elicitation` 能力（print 模式不声明），larkway 对扩展弹出的选择、确认、输入一律回复取消，即按拒绝处理；在 pi 的 MCP 配置里设 `settings.sampling: false` 和 `settings.elicitation: false` 可去掉这两项声明。pi 接受 prompt 之前打印的记录（如 prompt 预检触发的阈值压缩 `compaction_start` / `compaction_end`）热池不转发，冷启动会作为原始事件转发。热进程的一轮在 `agent_settled` 结束，没有冷启动那种结束后 30 秒的兜底 SIGTERM；回收时发 SIGTERM，pi 只结束仍在执行的 bash 调用。已结束的 bash 调用留在后台的进程（如 `npm run dev &`），冷热两种模式下 larkway 和 pi 都不清理。Windows 上回收不发信号（信号只会结束 cmd.exe 包装进程，pi 本体继续运行），而是关闭 stdin 让 pi 自行退出；5 秒后仍未退出，则经包装进程用 `taskkill /T /F` 结束整个进程树。旧进程以包装进程退出且 stdout 关闭为准（最多等约 7 秒）。Windows 行为尚未实测。空闲进程约占 130–150 MB 内存（n=1，只量了 pi 本体；pi-mcp-adapter 拉起的 stdio MCP 子进程不在内，开池前请按整棵进程树估算）。larkway 不加 `--offline`。RPC 模式（热池）每次起进程都会在后台刷新模型目录和 provider 可用性，print 模式（冷启动）不做，有出网白名单的主机会看到这些额外请求。在 `<LARKWAY_HOME>/.env` 设 `PI_OFFLINE=1` 对冷热两路同时关闭这类联网，同时也关闭缺失扩展包的自动安装和工具下载。
+- pi 热进程池需显式 `warmProcess: true`（默认关；更早的版本里 pi 上的这一项只打告警、不生效，升级后会直接开池，部署前请核对 pi bot 的 yaml，见[升级](#从-v0374-及更早版本升级)；`larkway doctor` 会列出开了热池的 pi bot，只作提示，不影响退出码）：每个话题常驻一个 `pi --mode rpc --approve`，启动参数与冷启动相同（`--session-id`、`--model`、`--thinking`、`--skill`），空闲 `warmProcessIdleMs` 后回收，数量上限 `warmProcessMaxProcesses`，续轮直接在原进程里发 prompt。每轮重新下发 thinking；配置了 `model` 时，进程内模型被改动会改回启动时的模型，未配置时沿用 session 当前的模型（与冷启动续接一致）。进程在首个事件前退出，或正在执行不是 larkway 发起的 run 或压缩，则本轮改走冷启动；配置变化、换 session 或重开 session 时先等旧进程退出再起新进程（同一 session 文件只有一个写者）。与冷启动的已知差异：RPC 模式下 pi 为扩展提供 UI 通道，pi-mcp-adapter 因此向 MCP 服务声明 `sampling`、`elicitation` 能力（print 模式不声明），larkway 对扩展弹出的选择、确认、输入一律回复取消，即按拒绝处理；在 pi 的 MCP 配置里设 `settings.sampling: false` 和 `settings.elicitation: false` 可去掉这两项声明。pi 接受 prompt 之前打印的记录（如 prompt 预检触发的阈值压缩 `compaction_start` / `compaction_end`）热池不转发，冷启动会作为原始事件转发。热进程的一轮在 `agent_settled` 结束，没有冷启动那种结束后 30 秒的兜底 SIGTERM；回收时发 SIGTERM，pi 只结束仍在执行的 bash 调用。已结束的 bash 调用留在后台的进程（如 `npm run dev &`），冷热两种模式下 larkway 和 pi 都不清理。Windows 上回收不发信号（信号只会结束 cmd.exe 包装进程，pi 本体继续运行），而是关闭 stdin 让 pi 自行退出；5 秒后仍未退出，则经包装进程用 `taskkill /T /F` 结束整个进程树。旧进程以包装进程退出且 stdout 关闭为准；同一 session 的替代写者须等待真实退出，关闭池时的有界等待不代表旧进程已死。Windows 行为尚未实测。空闲进程约占 130–150 MB 内存（n=1，只量了 pi 本体；pi-mcp-adapter 拉起的 stdio MCP 子进程不在内，开池前请按整棵进程树估算）。larkway 不加 `--offline`。RPC 模式（热池）每次起进程都会在后台刷新模型目录和 provider 可用性，print 模式（冷启动）不做，有出网白名单的主机会看到这些额外请求。在 `<LARKWAY_HOME>/.env` 设 `PI_OFFLINE=1` 对冷热两路同时关闭这类联网，同时也关闭缺失扩展包的自动安装和工具下载。
 - Claude 热进程的复用与预热匹配包含实际启动参数，包括权限模式、可执行文件和需要 `--add-dir` 的仓库目录。`addDirs` 中只有两类仓库会传 `--add-dir`：含非空 `.claude/skills/<name>/SKILL.md` 的（skills 发现），以及解析符号链接后位于 cwd 之外的（例如链接进 workspace 的外部仓库，`--add-dir` 同时是它的目录访问授权）。clone 或删除 cwd 内不带 skills 的仓库不改变启动参数，热进程照常复用。仓库开始或不再需要该参数（新 clone、切分支、新增 skill、链接改指向）后，下一轮起新进程并按原 session 恢复，避免漏掉原生 skills。
 - Agent 默认使用自己的 lark-cli 配置目录。启动时在该目录配置应用 profile，不复制宿主的个人授权。显式 `lark_cli_isolated: false` 仍保留旧的共享配置兼容行为；这类 bot 的 delta 续轮每轮带一行 `lark_cli_profile`，避免原生压缩后 lark-cli 落到宿主默认 profile。
 - 两个 opt-in 环境变量（在 `<LARKWAY_HOME>/.env` 设置，对该 bridge 的全部 bot 生效；不设即当前默认行为）：
@@ -21,6 +22,60 @@ Larkway 的目标是把飞书话题接到本地 Claude Code / Codex。在相同�
 旧配置中显式写下的 `promptMode: full`、非零 reseed 阈值和身份隔离选项继续生效。要采用以上默认行为，请删除相应覆盖或将 reseed 阈值设为 `0`；共享知识必须显式开启。
 
 既有 workspace 中旧版生成的 `.claude/settings.local.json` 不会自动删除，原生 runtime 仍会加载它。升级后需要移除旧权限配置时，应先检查其中是否混有自己的设置。
+
+## 长任务与时间预算
+
+两三个小时的工作可以留在同一原生 turn / session 中继续执行，不需要反复 `@`、
+自动拆轮或 bridge 接管任务编排。默认不设总时限，也不因静默而自动杀进程。
+正常完成、原生错误、用户的 ⏹ / `/stop` 仍按现有路径收尾。
+取消与显式预算的资源收尾不依赖另一个总时限：子进程拒绝回应时可有界结束
+当前 turn 的等待，但不会据此假装进程已退出或可复用。退役进程仍按真实退出
+跟踪，同一 session 的替代写者不得因为取消卡片已收尾而提前启动。
+冷进程（包括热池回退的冷进程）未确认退出时，同话题或同原生 session 的新调用
+会明确拒绝启动，而不是自动重试或创建新 session；实际退出后才可再次调用。
+热进程退役或 Codex 原生 turn 的停止尚待确认时，同 session 等待者仍可取消、
+受其显式预算约束，并在关闭池时收尾；其他话题不因此被中断。
+
+以下设置互相独立，适用于 Claude、Codex、pi 的冷启动与热进程池：
+
+| 设置 | 默认值与含义 |
+|---|---|
+| `subprocess_timeout_seconds` | 省略或 `0`：无总 wall-clock 时限。正整数：从每次 `runner.run()` 调用开始计算的总预算，包括启动、推理、工具调用和等待；任何活动都不会重置它。范围 `0–2147483` 秒，超出或非整数拒绝加载，避免 Node 定时器溢出成近乎立即中断。 |
+| `idle_timeout_seconds` | 默认 180 秒：连续无事件时显示等待提醒，不是总时限，也不默认中断。CardKit 之外的降级展示仍存在无等待提醒的已知差距。 |
+| `idle_kill_seconds` | 默认不设置：不自动 idle-kill。显式设置仍沿用现有 `min(max(idle_timeout_seconds, idle_kill_seconds), 900)` 秒静默中断语义；在途工具豁免不变。 |
+| `warmProcessIdleMs` | 只回收没有运行 turn 的空闲热进程，不是活跃任务的时间预算。正在运行或等待工具的 turn 不会因为这个值被回收。 |
+
+例如，无额外总预算是默认行为，也可明确写出：
+
+```yaml
+subprocess_timeout_seconds: 0
+# idle_kill_seconds 不设置：静默仅提醒，用户仍可 /stop。
+```
+
+需要最多四小时的单次 runner 调用预算时：
+
+```yaml
+subprocess_timeout_seconds: 14400
+```
+
+这是主动选择的强制中断预算，长工具调用也计入；不是闲置超时或“完成保证”。
+预算耗尽的终态明确显示「预算耗尽」，与用户 `/stop`、静默中断和原生错误分开；
+首次中断原因保留，收尾期间晚到的 `/stop` 或定时器不改写原因。Agent 写下的
+`ready` 不能把显式中断改判成功；正常完成后的进程清理则不被误标为中断。
+池内启动失败后已有的冷启动回退不重置池外层预算。handler 启动前准备、结束后
+卡片投递，以及已有的失效 session 恢复所发起的新 `run()` 调用不计入同一个预算；
+该设置不是跨重试、跨多轮的端到端任务 SLA。
+
+**升级差异：**旧版普通交互路径隐含的 60 分钟总时限，以及直接调用 runner 时
+15 分钟的默认值都已移除。如果部署依赖旧的一小时强制终止行为，显式设置
+`subprocess_timeout_seconds: 3600`。仅提高 `idle_timeout_seconds` 从来不等于
+延长总预算。没有总预算的任务可能一直占用并发槽位；使用 `/stop`，或按业务需要
+显式选择预算，不要把“无输出”推断为已失败。
+
+这只去掉 bridge 自己的隐式总时限，不绕过原生权限、上游模型限制或工具自带
+timeout；不提供 bridge/主机重启后的持久执行，不新增自动业务重跑、续轮或任务
+引擎，也不保证任务一定完成。定时器回归使用真实 runner/pool 代码、模拟子进程和
+假时钟验证三小时边界，不是三小时真机 CLI / 飞书实跑验收。
 
 ## 从 v0.3.74 及更早版本升级
 

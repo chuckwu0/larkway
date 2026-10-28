@@ -10,6 +10,9 @@
 
 import { describe, it, expect, afterEach, vi } from "vitest";
 import { join } from "node:path";
+import { existsSync } from "node:fs";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { EventEmitter, PassThrough } from "node:stream";
 import { AnswerChannelExtractor } from "../agent/answerChannel.js";
 import {
@@ -58,6 +61,9 @@ function makeFakeChild() {
     },
   };
 }
+
+// Keep filesystem polling on wall-clock timers even in simulated-runtime tests.
+const realSetTimeout = globalThis.setTimeout;
 
 let __nextFakeChild: ReturnType<typeof makeFakeChild> | null = null;
 let __lastSpawnArgs: unknown[] = [];
@@ -330,6 +336,201 @@ describe("runPi()", () => {
   afterEach(() => {
     __nextFakeChild = null;
     __lastSpawnArgs = [];
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+  });
+
+  // Fake clock + mocked CLI transport: these are not three-hour live-model runs.
+  it.each([undefined, 0])("no budget (%s): active work and a silent tool wait survive three hours", async (timeoutMs) => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+    const fake = makeFakeChild();
+    __nextFakeChild = fake;
+    const { runPi } = await import("./runner.js");
+    const handle = runPi({ prompt: "long task", timeoutMs, pidFilePath: null });
+    const seen: string[] = [];
+    const loop = (async () => { for await (const ev of handle.events) seen.push(ev.type); })();
+    let settled = false;
+    void handle.done.then(() => { settled = true; });
+    fake.stdout.write('{"type":"session","version":3,"id":"long-session"}\n');
+    // Active model work first, then a tool which produces no output for 3h.
+    for (let hour = 0; hour < 3; hour++) {
+      fake.stdout.write(thinkingDelta("still working") + "\n");
+      await new Promise<void>((r) => setImmediate(r));
+      await vi.advanceTimersByTimeAsync(60 * 60 * 1000);
+      expect(settled).toBe(false);
+      expect(fake.child.killed).toBe(false);
+    }
+    fake.stdout.write(JSON.stringify({ type: "tool_execution_start", toolCallId: "long", toolName: "bash", args: { command: "long job" } }) + "\n");
+    await new Promise<void>((r) => setImmediate(r));
+    await vi.advanceTimersByTimeAsync(3 * 60 * 60 * 1000);
+    expect(seen).toContain("tool_use");
+    expect(settled).toBe(false);
+    expect(fake.child.killed).toBe(false);
+    fake.stdout.write('{"type":"tool_execution_end","toolCallId":"long","toolName":"bash","result":{"content":[]}}\n');
+    fake.stdout.write('{"type":"agent_settled"}\n');
+    await new Promise<void>((r) => setImmediate(r));
+    fake.triggerClose(0);
+    await loop;
+    await expect(handle.done).resolves.toMatchObject({ exitCode: 0, sessionId: "long-session" });
+  });
+
+  it("an explicit wall-clock budget interrupts and cannot become success on graceful exit 0", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    const fake = makeFakeChild();
+    __nextFakeChild = fake;
+    const { runPi } = await import("./runner.js");
+    const handle = runPi({ prompt: "long task", timeoutMs: 1000, pidFilePath: null });
+    await vi.advanceTimersByTimeAsync(999);
+    expect(fake.child.killed).toBe(false);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(fake.child.killed).toBe(true);
+    fake.triggerClose(0);
+    await expect(handle.done).resolves.toMatchObject({ exitCode: 1, interrupted: true, interruptionReason: "timeout" });
+  });
+
+  it.each(["cancel", "timeout"] as const)("the first interruption reason wins (%s first)", async (firstReason) => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    const fake = makeFakeChild();
+    __nextFakeChild = fake;
+    const { runPi } = await import("./runner.js");
+    const handle = runPi({ prompt: "x", timeoutMs: 1000, pidFilePath: null });
+    if (firstReason === "cancel") handle.kill();
+    await vi.advanceTimersByTimeAsync(1000);
+    if (firstReason === "timeout") handle.kill();
+    await vi.advanceTimersByTimeAsync(7000);
+    await expect(handle.done).resolves.toMatchObject({ interrupted: true, interruptionReason: firstReason });
+    fake.triggerClose(0);
+  });
+
+  it.each(["kill", "abort"] as const)("%s without a budget settles a silent child after escalation, without affecting another run", async (method) => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    const first = makeFakeChild();
+    const kill = vi.spyOn(first.child, "kill");
+    __nextFakeChild = first;
+    const { runPi } = await import("./runner.js");
+    const ac = new AbortController();
+    const handle = runPi({ prompt: "cancel me", abortSignal: ac.signal, pidFilePath: null });
+    const loop = (async () => { for await (const _ of handle.events) { /* drain */ } })();
+    const second = makeFakeChild();
+    __nextFakeChild = second;
+    const other = runPi({ prompt: "unrelated", pidFilePath: null });
+    if (method === "kill") { handle.kill(); handle.kill(); }
+    else ac.abort();
+    await vi.advanceTimersByTimeAsync(7000);
+    await expect(handle.done).resolves.toMatchObject({ exitCode: 1, interrupted: true, interruptionReason: "cancel" });
+    await loop;
+    expect(kill.mock.calls.map(([signal]) => signal)).toEqual(["SIGTERM", "SIGKILL"]);
+    expect(second.child.killed).toBe(false);
+    second.triggerClose(0);
+    await expect(other.done).resolves.toMatchObject({ exitCode: 0 });
+  });
+
+  it.each(["forced done", "child error"] as const)("%s is not process-exit evidence and retains the PID until real exit", async (termination) => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    const dir = await mkdtemp(join(tmpdir(), "larkway-pi-exit-"));
+    const pidFile = join(dir, "runner.pid");
+    const fake = makeFakeChild();
+    __nextFakeChild = fake;
+    const { runPi } = await import("./runner.js");
+    const handle = runPi({ prompt: "long", pidFilePath: pidFile });
+    let exited = false;
+    void handle.processExited!.then(() => { exited = true; });
+    const waitForPid = async (present: boolean): Promise<void> => {
+      const deadline = Date.now() + 5_000;
+      while (existsSync(pidFile) !== present && Date.now() < deadline) {
+        await new Promise<void>((r) => realSetTimeout(r, 5));
+      }
+      expect(existsSync(pidFile)).toBe(present);
+    };
+    try {
+      await waitForPid(true);
+      expect(JSON.parse(await readFile(pidFile, "utf8")).pid).toBe(fake.child.pid);
+      if (termination === "forced done") {
+        handle.kill();
+        await vi.advanceTimersByTimeAsync(7_000);
+        await expect(handle.done).resolves.toMatchObject({ exitCode: 1, interrupted: true, interruptionReason: "cancel" });
+      } else {
+        const failure = expect(handle.done).rejects.toThrow("signal failed");
+        fake.child.emit("error", new Error("signal failed"));
+        await failure;
+      }
+      expect(exited).toBe(false);
+      expect(existsSync(pidFile)).toBe(true);
+      fake.triggerClose(0);
+      await handle.processExited;
+      expect(exited).toBe(true);
+      // processExited releases only after this runner's PID cleanup, so a
+      // subsequent writer cannot race the old read/unlink sequence.
+      expect(existsSync(pidFile)).toBe(false);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("a confirmed spawn failure with no PID releases processExited", async () => {
+    const fake = makeFakeChild();
+    Object.defineProperty(fake.child, "pid", { value: undefined });
+    __nextFakeChild = fake;
+    const { runPi } = await import("./runner.js");
+    const handle = runPi({ prompt: "x", pidFilePath: null });
+    const failure = expect(handle.done).rejects.toThrow(/pi CLI not found/);
+    fake.child.emit("error", Object.assign(new Error("spawn failed"), { code: "ENOENT" }));
+    await failure;
+    await expect(handle.processExited).resolves.toBeUndefined();
+  });
+
+  it("completion clears the budget, exit fallback and AbortSignal listener", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    const fake = makeFakeChild();
+    __nextFakeChild = fake;
+    const { runPi } = await import("./runner.js");
+    const ac = new AbortController();
+    const removed = vi.spyOn(ac.signal, "removeEventListener");
+    const handle = runPi({ prompt: "done", timeoutMs: 1000, abortSignal: ac.signal, pidFilePath: null });
+    fake.triggerClose(0);
+    await expect(handle.done).resolves.toMatchObject({ exitCode: 0 });
+    expect(await handle.done).not.toHaveProperty("interrupted");
+    expect(await handle.done).not.toHaveProperty("interruptionReason");
+    expect(removed).toHaveBeenCalledWith("abort", expect.any(Function));
+    expect(vi.getTimerCount()).toBe(0);
+    ac.abort();
+    handle.kill();
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(fake.child.killed).toBe(false);
+  });
+
+  it.each([false, true])("post-result silent-child cleanup preserves the provider outcome (error=%s)", async (providerError) => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    const fake = makeFakeChild();
+    __nextFakeChild = fake;
+    const { runPi } = await import("./runner.js");
+    const handle = runPi({ prompt: "finished", pidFilePath: null });
+    const outcome = providerError
+      ? expect(handle.done).rejects.toThrow(/pi provider error: unavailable/)
+      : expect(handle.done).resolves.toMatchObject({ exitCode: 0 });
+    const loop = (async () => { for await (const _ of handle.events) { /* drain */ } })();
+    if (providerError) fake.stdout.write(JSON.stringify({ type: "message_end", message: { role: "assistant", content: [], stopReason: "error", errorMessage: "unavailable" } }) + "\n");
+    fake.stdout.write('{"type":"agent_settled"}\n');
+    await new Promise<void>((r) => setImmediate(r));
+    await vi.advanceTimersByTimeAsync(37_000);
+    await outcome;
+    await loop;
+    if (!providerError) {
+      expect(await handle.done).not.toHaveProperty("interrupted");
+      expect(await handle.done).not.toHaveProperty("interruptionReason");
+    }
+    expect(fake.child.killed).toBe(true);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("rejects an invalid timer budget before spawning", async () => {
+    const { runPi } = await import("./runner.js");
+    expect(() => runPi({ prompt: "x", timeoutMs: Infinity })).toThrow();
+    expect(__lastSpawnArgs).toEqual([]);
   });
 
   it("a killed pi (stdout ends mid-block, no agent_settled) still delivers the answer's held tail", async () => {

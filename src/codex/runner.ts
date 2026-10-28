@@ -17,6 +17,7 @@
 
 import { spawn } from "node:child_process";
 import { spawnPiped } from "../platform/spawn.js";
+import { resolveRunTimeoutMs } from "../agent/runTimeout.js";
 import { createInterface } from "node:readline";
 import type { AgentRunner } from "../agent/runner.js";
 import {
@@ -404,11 +405,11 @@ class CodexLineParser {
  * Excluded types still degrade to `raw`, which pokes the watchdog at both item
  * boundaries — strictly better than the old silence.
  *
- * Accepted trade-off (F6): an MCP tool that truly hangs now holds its exemption
- * for the whole turn, so detection moves from the idle threshold to the 60-min
- * subprocess runaway guard in handler.ts. That is the same deal commandExecution
- * has had since A3, now extended to the tool class most likely to hang on the
- * network. Bounding a single exemption is BL-48 territory.
+ * Accepted trade-off (F6): an MCP tool that truly hangs holds its idle-kill
+ * exemption for the whole turn, just like commandExecution. There is no
+ * default total deadline: stopping it requires user cancellation or an
+ * explicitly configured wall-clock budget. The idle notice still works;
+ * bounding a single tool exemption is a separate policy, not a hidden timer.
  */
 const CODEX_TOOL_ITEM_TYPES = new Set([
   "mcpToolCall",
@@ -871,7 +872,7 @@ export function* parseCodexLine(line: string): Generator<AgentStreamEvent> {
 // ---------------------------------------------------------------------------
 
 export function runCodex(opts: RunOptions, codexBinPath = "codex"): RunHandle {
-  const timeoutMs = opts.timeoutMs ?? 15 * 60 * 1000;
+  const timeoutMs = resolveRunTimeoutMs(opts.timeoutMs);
   const [bin, args] = buildCodexCommand(opts, codexBinPath);
   const env = buildCodexEnv(opts.botGitIdentity, opts.gitlabToken, opts.larkCliConfigDir);
   const mode = opts.permissionMode ?? "acceptEdits";
@@ -893,6 +894,16 @@ export function runCodex(opts: RunOptions, codexBinPath = "codex"): RunHandle {
   });
   markPerf("spawn");
 
+  // done may be forced after cancellation; that is not evidence the native
+  // writer has exited. Expose actual process lifetime separately to callers.
+  let confirmProcessExited!: () => void;
+  const processExited = new Promise<void>((resolve) => { confirmProcessExited = resolve; });
+  child.once("exit", confirmProcessExited);
+  child.once("close", confirmProcessExited);
+  child.once("error", () => {
+    if (child.pid == null) confirmProcessExited(); // confirmed spawn failure, no writer
+  });
+
   // A write after the child has died (e.g. app-server exits during startup)
   // would otherwise surface as an unhandled 'error' on the stdin stream and
   // crash the whole bridge process (same guard as claude/pool.ts).
@@ -911,11 +922,18 @@ export function runCodex(opts: RunOptions, codexBinPath = "codex"): RunHandle {
   let discoveredSessionId: string | undefined;
 
   // ── kill helper (SIGTERM → grace → SIGKILL) ───────────────────────────────
+  let settled = false;
   let killScheduled = false;
+  let interruptionReason: "cancel" | "timeout" | undefined;
   let killTimer: ReturnType<typeof setTimeout> | undefined;
+  let exitFallbackHandle: ReturnType<typeof setTimeout> | undefined;
+  const KILL_FINALIZE_GRACE_MS = SIGKILL_GRACE_MS + 2_000;
+  let killFallbackHandle: ReturnType<typeof setTimeout> | undefined;
+  let forceFinalizeAfterKill: () => void = () => { /* bound before abort can fire */ };
 
-  function doKill(): void {
-    if (child.killed || killScheduled) return;
+  function doKill(reason: "cancel" | "timeout" = "cancel"): void {
+    if (settled || child.killed || killScheduled) return;
+    interruptionReason = reason; // first accepted stop wins
     killScheduled = true;
     // `child.killed` flips true synchronously the instant .kill() is called
     // (it means "a signal was sent", not "the process exited"), so it cannot
@@ -930,48 +948,23 @@ export function runCodex(opts: RunOptions, codexBinPath = "codex"): RunHandle {
       if (!exited) child.kill("SIGKILL");
     }, SIGKILL_GRACE_MS);
     killTimer.unref();
+    // Cancellation must release done/the event stream even without a total
+    // budget, including a silent child that never emits exit after SIGKILL.
+    killFallbackHandle = setTimeout(() => forceFinalizeAfterKill(), KILL_FINALIZE_GRACE_MS);
+    killFallbackHandle.unref();
   }
+
+  const onAbort = (): void => doKill();
 
   function stopAppServerAfterTurn(): void {
     if (child.killed || killScheduled) return;
     child.kill("SIGTERM");
   }
 
-  // ── timeout ───────────────────────────────────────────────────────────────
-  //
-  // Two-stage timeout guarantee (mirrors ClaudeRunner BL-9 fix):
-  //
-  //  Stage 1 (timeoutMs):   doKill() → SIGTERM the child process.
-  //  Stage 2 (timeoutMs + SIGKILL_GRACE_MS + 2s): If the child process is
-  //    still silent after SIGKILL, force-resolve done so the card can finalize.
-  //
-  // Without Stage 2, a zombie / completely silent child would leave
-  // done hanging forever (BL-9 total-timeout fallback).
-  const TOTAL_TIMEOUT_EXTRA_MS = SIGKILL_GRACE_MS + 2_000;
-
-  let totalTimeoutFallbackHandle: ReturnType<typeof setTimeout> | undefined;
-
-  // Placeholder; overwritten inside the done Promise constructor below.
-  let _forceFinalizeForTimeout: () => void = () => { /* no-op until done is constructed */ };
-
-  const timeoutHandle = setTimeout(() => {
-    doKill();
-    // Arm Stage 2: force-resolve done if the process stays silent after SIGKILL.
-    totalTimeoutFallbackHandle = setTimeout(() => {
-      _forceFinalizeForTimeout();
-    }, TOTAL_TIMEOUT_EXTRA_MS);
-    totalTimeoutFallbackHandle.unref();
-  }, timeoutMs);
-  timeoutHandle.unref();
-
-  // ── abortSignal ───────────────────────────────────────────────────────────
-  if (opts.abortSignal != null) {
-    if (opts.abortSignal.aborted) {
-      doKill();
-    } else {
-      opts.abortSignal.addEventListener("abort", doKill, { once: true });
-    }
-  }
+  // Optional wall-clock budget. Undefined/0 means no deadline, not a zero-
+  // delay timer. Explicit expiry uses the same bounded shutdown as kill().
+  const timeoutHandle = timeoutMs === undefined ? undefined : setTimeout(() => doKill("timeout"), timeoutMs);
+  timeoutHandle?.unref();
 
   // ── stderr collection ─────────────────────────────────────────────────────
   const stderrChunks: Buffer[] = [];
@@ -986,16 +979,16 @@ export function runCodex(opts: RunOptions, codexBinPath = "codex"): RunHandle {
   let failAppServerTurn: ((err: Error) => void) | undefined;
 
   // ── done promise ──────────────────────────────────────────────────────────
-  const done = new Promise<{ exitCode: number; sessionId?: string }>(
+  const done = new Promise<{ exitCode: number; sessionId?: string; interrupted?: boolean; interruptionReason?: "cancel" | "timeout" }>(
     (resolve, reject) => {
-      let settled = false;
-
       const finalizeResolve = (exitCode: number): void => {
         if (settled) return;
         settled = true;
         clearTimeout(timeoutHandle);
         clearTimeout(killTimer);
-        clearTimeout(totalTimeoutFallbackHandle);
+        clearTimeout(exitFallbackHandle);
+        clearTimeout(killFallbackHandle);
+        opts.abortSignal?.removeEventListener("abort", onAbort);
         // Abort readline so generateEvents() exits immediately — same contract
         // as ClaudeRunner. Without this, done resolves but handler never reaches
         // card.finalize() when a grandchild is holding stdout open.
@@ -1018,7 +1011,9 @@ export function runCodex(opts: RunOptions, codexBinPath = "codex"): RunHandle {
           );
           return;
         }
-        resolve({ exitCode, sessionId: discoveredSessionId });
+        // A cooperative child may exit 0 after SIGTERM; an interrupted turn
+        // is still not a successfully completed task.
+        resolve({ exitCode: killScheduled ? 1 : exitCode, sessionId: discoveredSessionId, ...(killScheduled ? { interrupted: true, interruptionReason } : {}) });
       };
 
       const finalizeReject = (err: Error): void => {
@@ -1026,7 +1021,9 @@ export function runCodex(opts: RunOptions, codexBinPath = "codex"): RunHandle {
         settled = true;
         clearTimeout(timeoutHandle);
         clearTimeout(killTimer);
-        clearTimeout(totalTimeoutFallbackHandle);
+        clearTimeout(exitFallbackHandle);
+        clearTimeout(killFallbackHandle);
+        opts.abortSignal?.removeEventListener("abort", onAbort);
         rlAbortController.abort();
         reject(err);
       };
@@ -1034,14 +1031,11 @@ export function runCodex(opts: RunOptions, codexBinPath = "codex"): RunHandle {
       finishAppServerTurn = finalizeResolve;
       failAppServerTurn = finalizeReject;
 
-      // Wire the Stage-2 total-timeout fallback.  Called by the setTimeout above
-      // (after the full kill grace) to force-resolve done when the child is silent.
-      _forceFinalizeForTimeout = () => {
+      forceFinalizeAfterKill = () => {
         if (settled) return;
         console.warn(
           `[codex-runner] child pid=${child.pid} did not exit within ` +
-            `${timeoutMs + TOTAL_TIMEOUT_EXTRA_MS}ms total (timeoutMs=${timeoutMs}` +
-            ` + SIGKILL grace + slack). Force-resolving done. (BL-9 total-timeout fallback)`
+            `${KILL_FINALIZE_GRACE_MS}ms after stop. Force-resolving done.`,
         );
         finalizeResolve(1);
       };
@@ -1051,7 +1045,9 @@ export function runCodex(opts: RunOptions, codexBinPath = "codex"): RunHandle {
         settled = true;
         clearTimeout(timeoutHandle);
         clearTimeout(killTimer);
-        clearTimeout(totalTimeoutFallbackHandle);
+        clearTimeout(exitFallbackHandle);
+        clearTimeout(killFallbackHandle);
+        opts.abortSignal?.removeEventListener("abort", onAbort);
         rlAbortController.abort();
         if (err.code === "ENOENT") {
           reject(
@@ -1075,7 +1071,7 @@ export function runCodex(opts: RunOptions, codexBinPath = "codex"): RunHandle {
       child.on("exit", (code: number | null) => {
         if (settled) return;
         const EXIT_TO_CLOSE_GRACE_MS = 5_000;
-        const exitFallback = setTimeout(() => {
+        exitFallbackHandle = setTimeout(() => {
           if (settled) return;
           console.warn(
             `[codex-runner] child pid=${child.pid} exited (code=${code ?? "signal"}) ` +
@@ -1084,10 +1080,19 @@ export function runCodex(opts: RunOptions, codexBinPath = "codex"): RunHandle {
           );
           finalizeResolve(code ?? 1);
         }, EXIT_TO_CLOSE_GRACE_MS);
-        exitFallback.unref();
+        exitFallbackHandle.unref();
       });
     }
   );
+
+  // ── abortSignal ───────────────────────────────────────────────────────────
+  if (opts.abortSignal != null) {
+    if (opts.abortSignal.aborted) {
+      doKill();
+    } else {
+      opts.abortSignal.addEventListener("abort", onAbort, { once: true });
+    }
+  }
 
   // ── async generator for events ────────────────────────────────────────────
   async function* generateEvents(): AsyncGenerator<AgentStreamEvent> {
@@ -1216,8 +1221,9 @@ export function runCodex(opts: RunOptions, codexBinPath = "codex"): RunHandle {
   return {
     events: generateEvents(),
     done,
-    kill: doKill,
+    kill: () => doKill(),
     pid: child.pid ?? undefined,
+    processExited,
   };
 }
 

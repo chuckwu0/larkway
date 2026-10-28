@@ -24,7 +24,7 @@
  * JSON-RPC method (confirmed present in the installed codex-cli's generated
  * protocol bindings as of this writing) instead of SIGTERM/SIGKILL. Every
  * turn still honors `opts.timeoutMs`/`opts.abortSignal` exactly like the cold
- * runner does — a wedged turn must not occupy a MAX_CONCURRENT slot forever.
+ * runner does. Total budgets are opt-in; explicit cancellation always works.
  *
  * Crash/init-failure scope decision (recorded, not a gap): "transparent cold
  * fallback" only applies to a turn that has not yet received its thread/start
@@ -54,6 +54,7 @@
 
 import { execFile, spawn, type ChildProcess } from "node:child_process";
 import { spawnPiped } from "../platform/spawn.js";
+import { resolveRunTimeoutMs } from "../agent/runTimeout.js";
 import { mkdir, readFile, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { createInterface } from "node:readline";
@@ -82,14 +83,12 @@ import {
 } from "./runner.js";
 
 type JsonRecord = Record<string, unknown>;
-type DoneResult = { exitCode: number; sessionId?: string; pooled?: boolean; resumeMode?: "same-process" | "cold" };
+type DoneResult = { exitCode: number; interrupted?: boolean; interruptionReason?: "cancel" | "timeout"; sessionId?: string; pooled?: boolean; resumeMode?: "same-process" | "cold" };
 
 /** @default 10 min — perf plan §4: "进程 10min 无在途 turn 则 SIGTERM". */
 export const DEFAULT_WARM_PROCESS_IDLE_MS = 10 * 60 * 1000;
 
 const SIGKILL_GRACE_MS = 5_000;
-/** Same default as the cold runner (src/codex/runner.ts) when a turn's caller doesn't set one. */
-const DEFAULT_TURN_TIMEOUT_MS = 15 * 60 * 1000;
 
 // ---------------------------------------------------------------------------
 // Per-turn state
@@ -116,16 +115,37 @@ interface TurnState {
   reusedProcess?: boolean;
   /** Set only when this specific turn fell back to a cold one-shot runner. */
   coldHandle?: RunHandle;
-  /** B3: per-turn runaway guard, mirrors the cold runner's timeoutMs contract. */
+  /** Optional wall-clock budget, independent of idle process reclamation. */
   timeoutHandle?: ReturnType<typeof setTimeout>;
+  abortListener?: () => void;
+  waitingForCancellation?: boolean;
+  interruptionReason?: "cancel" | "timeout";
 }
 
 type PendingKind = "init" | "thread" | "turn" | "interrupt";
 interface PendingRequest {
   turnKey: number;
   kind: PendingKind;
+  threadId?: string;
   /** WP-7: this thread/resume carried excludeTurns — see #handleRequestError's one retry. */
   excludeTurns?: boolean;
+}
+
+interface ColdWriter {
+  threadId?: string;
+  sessionIds: Set<string>;
+  settled: boolean;
+}
+
+/** A locally settled stop is not proof that the native turn has stopped. */
+interface CancelledTurn {
+  threadId: string;
+  turnKey: number;
+  turnId?: string;
+  child: ChildProcess;
+  interruptSent: boolean;
+  released: Promise<void>;
+  release: () => void;
 }
 
 export interface CodexProcessPoolOptions {
@@ -173,6 +193,8 @@ export class CodexProcessPool implements AgentRunner {
   readonly #pending = new Map<number, PendingRequest>();
   readonly #turns = new Map<number, TurnState>();
   readonly #threadOwners = new Map<string, number>();
+  readonly #cancelledThreads = new Map<string, CancelledTurn>();
+  readonly #coldWriters = new Set<ColdWriter>();
   /** Completed thread/start|resume requests on the current app-server child. */
   readonly #loadedThreadIds = new Set<string>();
   /**
@@ -230,6 +252,12 @@ export class CodexProcessPool implements AgentRunner {
   }
 
   run(opts: RunOptions): RunHandle {
+    const timeoutMs = resolveRunTimeoutMs(opts.timeoutMs);
+    if (this.#hasUnexitedColdWriter(opts)) {
+      const queue = new TurnEventQueue();
+      queue.end();
+      return { events: queue, done: Promise.reject(this.#unexitedColdWriterError()), kill: () => {}, pid: undefined };
+    }
     const turnKey = this.#nextTurnKey++;
     const queue = new TurnEventQueue();
     const markPerf = createPerfMarker(opts.onPerfMarker);
@@ -259,20 +287,18 @@ export class CodexProcessPool implements AgentRunner {
     this.#turns.set(turnKey, state);
     this.#idleSince = undefined; // at least one in-flight turn now
 
-    // B3: honor the same timeout/abort contract the cold runner gives every
-    // turn. Without this, a wedged pooled turn (app-server hung, no response
-    // ever) would occupy a MAX_CONCURRENT slot forever — 5 such turns and the
-    // bot goes permanently deaf. Treated exactly like an external kill().
-    const timeoutMs = opts.timeoutMs ?? DEFAULT_TURN_TIMEOUT_MS;
-    state.timeoutHandle = setTimeout(() => {
-      this.#interruptTurn(turnKey);
-    }, timeoutMs);
-    state.timeoutHandle.unref?.();
+    // Only an explicit total budget interrupts an otherwise live turn.
+    // Pool-idle reclamation is separately suppressed while any turn is active.
+    if (timeoutMs !== undefined) {
+      state.timeoutHandle = setTimeout(() => this.#interruptTurn(turnKey, "timeout"), timeoutMs);
+      state.timeoutHandle.unref?.();
+    }
     if (opts.abortSignal != null) {
       if (opts.abortSignal.aborted) {
         this.#interruptTurn(turnKey);
       } else {
-        opts.abortSignal.addEventListener("abort", () => this.#interruptTurn(turnKey), { once: true });
+        state.abortListener = () => this.#interruptTurn(turnKey);
+        opts.abortSignal.addEventListener("abort", state.abortListener, { once: true });
       }
     }
 
@@ -282,7 +308,7 @@ export class CodexProcessPool implements AgentRunner {
     // fail this turn fast instead of racing a brand-new orphan into being.
     if (this.#shuttingDown) {
       this.#settleReject(state, new Error("[codex-pool] pool is shutting down — rejecting new turn"));
-      return { events: queue, done, kill, pid: undefined };
+      return { events: queue, done, kill, pid: undefined, get processExited() { return state.coldHandle?.processExited; } };
     }
 
     // M6: a pool that keeps failing to even boot shouldn't keep trying —
@@ -292,7 +318,7 @@ export class CodexProcessPool implements AgentRunner {
         state,
         new Error("[codex-pool] warm pool disabled after repeated spawn failures — using cold start"),
       );
-      return { events: queue, done, kill, pid: undefined };
+      return { events: queue, done, kill, pid: undefined, get processExited() { return state.coldHandle?.processExited; } };
     }
 
     if (this.#child == null) {
@@ -307,12 +333,16 @@ export class CodexProcessPool implements AgentRunner {
 
     void this.#startTurn(state);
 
-    return { events: queue, done, kill, pid: pidAtReturn };
+    return { events: queue, done, kill, pid: pidAtReturn, get processExited() { return state.coldHandle?.processExited; } };
   }
 
   /** Graceful drain + shutdown — call from the owning bot's process shutdown path. */
   async shutdown(drainTimeoutMs = 30_000): Promise<void> {
     this.#shuttingDown = true;
+    // Native-stop gates never hold a locally queued handle open on shutdown.
+    for (const state of this.#turns.values()) {
+      if (state.waitingForCancellation) this.#settleReject(state, new Error("[codex-pool] pool is shutting down while waiting for a cancelled turn"));
+    }
     if (this.#idleTimer) {
       clearInterval(this.#idleTimer);
       this.#idleTimer = undefined;
@@ -327,7 +357,27 @@ export class CodexProcessPool implements AgentRunner {
         t.unref?.();
       }),
     ]);
+    // A startup fallback is owned by this pool too, even though it is not the
+    // shared child. With no implicit total deadline, shutdown must explicitly
+    // stop those live handles rather than leave them running indefinitely.
+    const activeStates = [...this.#turns.values()].filter((state) => !state.settled);
+    const coldHandles = activeStates.filter((state) => state.coldHandle != null).map((state) => state.coldHandle!);
+    // A shutdown is an explicit cancellation, not a successful completion or
+    // an exhausted wall-clock budget, for both warm turns and owned fallbacks.
+    for (const state of activeStates) this.#interruptTurn(state.turnKey);
     this.#killChildNow();
+    if (coldHandles.length > 0) {
+      let grace: ReturnType<typeof setTimeout> | undefined;
+      await Promise.race([
+        Promise.all(coldHandles.map((cold) => cold.done.catch(() => undefined))),
+        new Promise<void>((resolve) => {
+          grace = setTimeout(resolve, SIGKILL_GRACE_MS + 2_000);
+          grace.unref?.();
+        }),
+      ]);
+      clearTimeout(grace);
+      // processExited, not this bounded wait, releases cold writer records.
+    }
   }
 
   // -- turn lifecycle ---------------------------------------------------------
@@ -339,7 +389,8 @@ export class CodexProcessPool implements AgentRunner {
       this.#fallbackToCold(state, err instanceof Error ? err : new Error(String(err)));
       return;
     }
-    if (state.settled) return; // e.g. killed/timed-out before it ever got going
+    if (state.settled || state.coldHandle) return; // cancelled or already sent cold after child exit
+    if (state.opts.resumeSessionId && this.#deferUntilCancelledTurnEnds(state, state.opts.resumeSessionId, () => void this.#startTurn(state))) return;
 
     state.reusedProcess = state.opts.resumeSessionId != null &&
       this.#loadedThreadIds.has(state.opts.resumeSessionId);
@@ -359,6 +410,7 @@ export class CodexProcessPool implements AgentRunner {
   }
 
   #sendTurnStart(state: TurnState, threadId: string): void {
+    if (this.#deferUntilCancelledTurnEnds(state, threadId, () => this.#sendTurnStart(state, threadId))) return;
     const mode = state.opts.permissionMode ?? "acceptEdits";
     const turnParams: JsonRecord = {
       threadId,
@@ -370,7 +422,7 @@ export class CodexProcessPool implements AgentRunner {
     if (state.opts.model) turnParams["model"] = state.opts.model;
     if (state.opts.effort) turnParams["effort"] = codexEffortFromLarkway(state.opts.effort);
     try {
-      this.#send("turn/start", turnParams, { turnKey: state.turnKey, kind: "turn" });
+      this.#send("turn/start", turnParams, { turnKey: state.turnKey, kind: "turn", threadId });
     } catch (err) {
       // M5 fix: threadId is already set at this point (system_init already
       // pushed to the caller) — #fallbackToCold's own defensive guard now
@@ -378,6 +430,17 @@ export class CodexProcessPool implements AgentRunner {
       // process into an already-live queue.
       this.#fallbackToCold(state, err instanceof Error ? err : new Error(String(err)));
     }
+  }
+
+  #hasUnexitedColdWriter(opts: RunOptions): boolean {
+    return [...this.#coldWriters].some((writer) => writer.settled && (
+      (opts.threadId != null && writer.threadId === opts.threadId) ||
+      (opts.resumeSessionId != null && writer.sessionIds.has(opts.resumeSessionId))
+    ));
+  }
+
+  #unexitedColdWriterError(): Error {
+    return new Error("[codex-pool] previous cold process has not confirmed exit for this thread/session; refusing to start another native writer");
   }
 
   /**
@@ -406,14 +469,31 @@ export class CodexProcessPool implements AgentRunner {
       return;
     }
 
+    if (this.#hasUnexitedColdWriter(state.opts)) {
+      this.#settleReject(state, this.#unexitedColdWriterError());
+      return;
+    }
+    // A child 'error' may precede its real exit. Even the cold fallback must
+    // honor a cancelled native writer's session gate until exit is confirmed.
+    if (state.opts.resumeSessionId && this.#deferUntilCancelledTurnEnds(state, state.opts.resumeSessionId, () => this.#fallbackToCold(state, causeErr))) return;
     console.warn(
       `[codex-pool] pool unavailable for this turn (${causeErr.message}) — falling back to a cold one-shot start.`,
     );
     const cold = runCodex(state.opts, this.#codexBinPath);
     state.coldHandle = cold;
+    const writer: ColdWriter = {
+      threadId: state.opts.threadId,
+      sessionIds: new Set(state.opts.resumeSessionId ? [state.opts.resumeSessionId] : []),
+      settled: false,
+    };
+    if (cold.processExited) {
+      this.#coldWriters.add(writer);
+      void cold.processExited.then(() => { this.#coldWriters.delete(writer); });
+    }
     void (async () => {
       try {
         for await (const ev of cold.events) {
+          if (ev.type === "system_init") writer.sessionIds.add(ev.sessionId);
           markPerfForEventType(state.markPerf, ev.type);
           state.queue.push(ev);
         }
@@ -422,52 +502,78 @@ export class CodexProcessPool implements AgentRunner {
       }
     })();
     cold.done.then(
-      (result) => this.#settleResolve(state, {
-        ...result,
-        pooled: false,
-        // M4 fix: "cold" only means something for a resume attempt that
-        // didn't get the same-process win — a brand-new turn was never going
-        // to resume anything, so it has no resumeMode at all.
-        resumeMode: state.opts.resumeSessionId != null ? "cold" : undefined,
-      }),
-      (err) => this.#settleReject(state, err instanceof Error ? err : new Error(String(err))),
+      (result) => {
+        writer.settled = true;
+        if (result.sessionId) writer.sessionIds.add(result.sessionId);
+        this.#settleResolve(state, {
+          ...result,
+          pooled: false,
+          // M4 fix: "cold" only means something for a resume attempt that
+          // didn't get the same-process win — a brand-new turn was never going
+          // to resume anything, so it has no resumeMode at all.
+          resumeMode: state.opts.resumeSessionId != null ? "cold" : undefined,
+        });
+      },
+      (err) => {
+        writer.settled = true;
+        this.#settleReject(state, err instanceof Error ? err : new Error(String(err)));
+      },
     );
   }
 
-  #interruptTurn(turnKey: number): void {
+  #interruptTurn(turnKey: number, reason: "cancel" | "timeout" = "cancel"): void {
     const state = this.#turns.get(turnKey);
     if (state == null || state.settled) return;
+    state.interruptionReason ??= reason;
 
     if (state.coldHandle) {
       state.coldHandle.kill();
       return;
     }
 
-    if (state.threadId == null || state.turnId == null || this.#child == null) {
-      // Never got far enough onto the wire to have a live turn to cancel
-      // server-side (or turnId not yet observed). Abandon the STREAM only —
-      // never the process; every other thread this pool serves keeps running.
-      this.#abandonTurn(state);
-      return;
+    if (state.threadId != null && this.#child != null && !state.waitingForCancellation) {
+      let release!: () => void;
+      const released = new Promise<void>((resolve) => { release = resolve; });
+      const cancelled: CancelledTurn = {
+        threadId: state.threadId, turnKey, turnId: state.turnId,
+        child: this.#child, interruptSent: false, released, release,
+      };
+      this.#cancelledThreads.set(state.threadId, cancelled);
+      this.#sendCancelledTurnInterrupt(cancelled);
     }
-
-    try {
-      this.#send(
-        "turn/interrupt",
-        { threadId: state.threadId, turnId: state.turnId },
-        { turnKey, kind: "interrupt" },
-      );
-    } catch {
-      // Fall through — abandon locally regardless of whether the wire write
-      // itself failed.
-    }
-    // Fire-and-forget: the caller (handler.ts's idle watchdog / timeout /
-    // abortSignal) doesn't wait for app-server's confirmation before treating
-    // the turn as over. Abandon now; if a late "turn/interrupt"
-    // response/error arrives afterward, #handleLine's pending-request lookup
-    // will already find nothing (turn removed from #turns) and no-ops
-    // harmlessly.
+    // The caller can finalize immediately, but a pending turn/start response
+    // must still be observed and its eventual turnId interrupted specifically.
     this.#abandonTurn(state);
+  }
+
+  #sendCancelledTurnInterrupt(cancelled: CancelledTurn): void {
+    if (cancelled.interruptSent || cancelled.turnId == null || cancelled.child !== this.#child) return;
+    try {
+      this.#send("turn/interrupt", { threadId: cancelled.threadId, turnId: cancelled.turnId }, {
+        turnKey: cancelled.turnKey, kind: "interrupt", threadId: cancelled.threadId,
+      });
+      cancelled.interruptSent = true;
+    } catch {
+      // Do not unlock the session on a failed write: the turn may still run.
+    }
+  }
+
+  #releaseCancelledTurn(cancelled: CancelledTurn): void {
+    if (this.#cancelledThreads.get(cancelled.threadId) !== cancelled) return;
+    this.#cancelledThreads.delete(cancelled.threadId);
+    cancelled.release();
+    if (this.#turns.size === 0) this.#idleSince = Date.now();
+  }
+
+  #deferUntilCancelledTurnEnds(state: TurnState, threadId: string, resume: () => void): boolean {
+    const cancelled = this.#cancelledThreads.get(threadId);
+    if (!cancelled) return false;
+    state.waitingForCancellation = true;
+    void cancelled.released.then(() => {
+      state.waitingForCancellation = false;
+      if (!state.settled && !state.coldHandle) resume();
+    });
+    return true;
   }
 
   #abandonTurn(state: TurnState): void {
@@ -481,6 +587,7 @@ export class CodexProcessPool implements AgentRunner {
     // doKill()): a deliberate kill resolves `done`, it does not reject.
     this.#settleResolve(state, {
       exitCode: 1,
+      interrupted: true,
       sessionId: state.threadId,
       pooled: reachedPool,
       resumeMode: reachedPool && state.opts.resumeSessionId != null
@@ -493,16 +600,22 @@ export class CodexProcessPool implements AgentRunner {
     if (state.settled) return;
     state.settled = true;
     if (state.timeoutHandle) clearTimeout(state.timeoutHandle);
+    if (state.abortListener) state.opts.abortSignal?.removeEventListener("abort", state.abortListener);
     state.queue.end();
     this.#turns.delete(state.turnKey);
     if (this.#turns.size === 0) this.#idleSince = Date.now();
-    state.resolveDone(result);
+    // The outer budget includes startup/fallback; a cold.kill() reports
+    // cancel locally, but must not overwrite the pool's original timeout.
+    state.resolveDone(state.interruptionReason
+      ? { ...result, interrupted: true, interruptionReason: state.interruptionReason }
+      : result);
   }
 
   #settleReject(state: TurnState, err: Error): void {
     if (state.settled) return;
     state.settled = true;
     if (state.timeoutHandle) clearTimeout(state.timeoutHandle);
+    if (state.abortListener) state.opts.abortSignal?.removeEventListener("abort", state.abortListener);
     state.queue.end();
     this.#turns.delete(state.turnKey);
     if (this.#turns.size === 0) this.#idleSince = Date.now();
@@ -557,6 +670,9 @@ export class CodexProcessPool implements AgentRunner {
     // considers it "current" (a respawn may already have replaced it).
     child.once("exit", () => {
       void this.#deletePidFileIfMine(child.pid);
+      for (const cancelled of this.#cancelledThreads.values()) {
+        if (cancelled.child === child) this.#releaseCancelledTurn(cancelled);
+      }
     });
 
     const rl = createInterface({ input: child.stdout, crlfDelay: Infinity });
@@ -642,7 +758,7 @@ export class CodexProcessPool implements AgentRunner {
     const cadenceMs = Math.max(1_000, Math.min(Math.floor(this.#idleMs / 4), 60_000));
     this.#idleTimer = setInterval(() => {
       if (this.#shuttingDown) return;
-      if (this.#turns.size > 0) return;
+      if (this.#turns.size > 0 || this.#cancelledThreads.size > 0) return;
       if (this.#idleSince == null) return;
       if (Date.now() - this.#idleSince >= this.#idleMs) {
         this.#reapIdleChild();
@@ -754,8 +870,12 @@ export class CodexProcessPool implements AgentRunner {
     this.#pending.delete(id);
     if (pending == null) return;
 
+    const cancelled = pending.threadId ? this.#cancelledThreads.get(pending.threadId) : undefined;
+    const cancelledStart = pending.kind === "turn" && cancelled?.turnKey === pending.turnKey ? cancelled : undefined;
     const error = asRecord(record["error"]);
     if (error) {
+      // A rejected turn/start cannot leave a native turn running.
+      if (cancelledStart) { this.#releaseCancelledTurn(cancelledStart); return; }
       const message = typeof error["message"] === "string" ? error["message"] : JSON.stringify(error);
       this.#handleRequestError(pending, new Error(`codex app-server request failed: ${message}`));
       return;
@@ -783,11 +903,16 @@ export class CodexProcessPool implements AgentRunner {
         return;
       }
       case "turn": {
-        const state = this.#turns.get(pending.turnKey);
-        if (state == null || state.settled) return;
         const result = asRecord(record["result"]);
         const turn = asRecord(result?.["turn"]);
         const turnId = turn?.["id"];
+        if (cancelledStart) {
+          if (typeof turnId === "string") cancelledStart.turnId = turnId;
+          this.#sendCancelledTurnInterrupt(cancelledStart);
+          return;
+        }
+        const state = this.#turns.get(pending.turnKey);
+        if (state == null || state.settled) return;
         if (typeof turnId === "string") state.turnId = turnId;
         return;
       }
@@ -827,10 +952,27 @@ export class CodexProcessPool implements AgentRunner {
     const params = asRecord(record["params"]);
     const threadId = typeof params?.["threadId"] === "string" ? params["threadId"] : undefined;
     if (threadId == null) return; // nothing to route it to — spike confirms turn-scoped events always carry threadId
+    const cancelled = this.#cancelledThreads.get(threadId);
+    if (cancelled) {
+      const turnId = asRecord(params?.["turn"])?.["id"];
+      if (typeof turnId === "string" && (cancelled.turnId === undefined || cancelled.turnId === turnId)) {
+        if (record["method"] === "turn/started") {
+          cancelled.turnId = turnId;
+          this.#sendCancelledTurnInterrupt(cancelled);
+        } else if (record["method"] === "turn/completed") {
+          this.#releaseCancelledTurn(cancelled);
+        }
+      }
+      return; // stopped turn's late output never leaks into its successor
+    }
     const turnKey = this.#threadOwners.get(threadId);
     if (turnKey == null) return; // abandoned/settled turn's stray late notification — drop
     const state = this.#turns.get(turnKey);
     if (state == null || state.settled) return;
+    if (record["method"] === "turn/started") {
+      const turnId = asRecord(params?.["turn"])?.["id"];
+      if (typeof turnId === "string") state.turnId = turnId;
+    }
 
     for (const ev of state.parser.parseMessage(raw)) {
       markPerfForEventType(state.markPerf, ev.type);

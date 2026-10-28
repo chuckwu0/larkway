@@ -678,6 +678,295 @@ describe("ClaudeProcessPool — LRU eviction", () => {
   });
 });
 
+// Fake time + mocked subprocesses exercise the actual pool, not a mocked
+// handler. This is lifecycle coverage, not a three-hour live Claude run.
+describe("ClaudeProcessPool — native long turns", () => {
+  it.each([undefined, 0])("timeoutMs=%s has no active-turn ceiling and idle reaping waits for completion", async (timeoutMs) => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "Date"] });
+    const pool = new ClaudeProcessPool({ botId: "long", idleMs: 60_000 });
+    const handle = pool.run({ prompt: "long task", threadId: "topic", pidFilePath: null, timeoutMs });
+    const eventsPromise = collectEvents(handle.events);
+    let settled = false;
+    void handle.done.then(() => { settled = true; });
+    await flush();
+    const child = spawnedChildren[0]!;
+    child.stdout.write(systemInit("long-session") + "\n");
+    await flush();
+    for (let hour = 0; hour < 3; hour++) {
+      child.stdout.write(assistantText(`working ${hour}`) + "\n");
+      await flush();
+      await vi.advanceTimersByTimeAsync(60 * 60 * 1_000);
+      expect(settled).toBe(false);
+      expect(child.killed).toBe(false);
+    }
+    child.stdout.write(JSON.stringify({ type: "assistant", message: { content: [{ type: "tool_use", id: "long-tool", name: "Bash", input: { command: "long task" } }] } }) + "\n");
+    await flush();
+    await vi.advanceTimersByTimeAsync(3 * 60 * 60 * 1_000);
+    expect(settled).toBe(false);
+    expect(child.killed).toBe(false);
+    expect(readOutboundLines(child).some((line) => line["type"] === "control_request")).toBe(false);
+    expect(pool.activeProcessCount).toBe(1);
+
+    child.stdout.write(resultLine("success") + "\n");
+    await flush();
+    await expect(handle.done).resolves.toMatchObject({ exitCode: 0, sessionId: "long-session", pooled: true });
+    expect((await eventsPromise).some((event) => event.type === "tool_use")).toBe(true);
+    // Only a genuinely idle entry can now be reclaimed.
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(child.killed).toBe(true);
+    child.emit("exit", 0);
+    await pool.shutdown();
+  });
+
+  it("an explicit wall-clock budget interrupts its turn, not a concurrent topic", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "Date"] });
+    const pool = new ClaudeProcessPool({ botId: "budget" });
+    const bounded = pool.run({ prompt: "budget", threadId: "bounded", pidFilePath: null, timeoutMs: 1_000 });
+    const peer = pool.run({ prompt: "unbounded", threadId: "peer", pidFilePath: null });
+    await flush();
+    const child = spawnedChildren[0]!;
+    const other = spawnedChildren[1]!;
+    child.stdout.write(systemInit("bounded-session") + "\n");
+    other.stdout.write(systemInit("peer-session") + "\n");
+    await flush();
+    await vi.advanceTimersByTimeAsync(999);
+    expect(readOutboundLines(child).some((line) => line["type"] === "control_request")).toBe(false);
+    await vi.advanceTimersByTimeAsync(1);
+    const request = readOutboundLines(child).find((line) => line["type"] === "control_request");
+    expect(request?.["request"]).toEqual({ subtype: "interrupt" });
+    expect(readOutboundLines(other).some((line) => line["type"] === "control_request")).toBe(false);
+    // A late success response must not undo an already expired budget.
+    child.stdout.write(resultLine("success") + "\n");
+    await flush();
+    await expect(bounded.done).resolves.toMatchObject({ exitCode: 1, interrupted: true, interruptionReason: "timeout" });
+    await vi.advanceTimersByTimeAsync(3 * 60 * 60 * 1_000);
+    expect(other.killed).toBe(false);
+    other.stdout.write(resultLine("success") + "\n");
+    await flush();
+    await expect(peer.done).resolves.toMatchObject({ exitCode: 0 });
+    for (const entry of spawnedChildren) entry.emit("exit", 0);
+    await pool.shutdown();
+  });
+
+  it.each(["kill", "timeout"])("%s settles a silent child after escalation without reusing it or killing another topic", async (stop) => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "Date"] });
+    const pool = new ClaudeProcessPool({ botId: "silent" });
+    const stopped = pool.run({ prompt: "stuck", threadId: "stuck", pidFilePath: null, ...(stop === "timeout" ? { timeoutMs: 1_000 } : {}) });
+    const peer = pool.run({ prompt: "keep working", threadId: "peer", pidFilePath: null });
+    const drain = collectEvents(stopped.events);
+    let settled = false;
+    void stopped.done.then(() => { settled = true; });
+    await flush();
+    const child = spawnedChildren[0]!;
+    const other = spawnedChildren[1]!;
+    child.stdout.write(systemInit("stuck-session") + "\n");
+    other.stdout.write(systemInit("peer-session") + "\n");
+    await flush();
+    if (stop === "timeout") await vi.advanceTimersByTimeAsync(1_000);
+    else { stopped.kill(); stopped.kill(); }
+    expect(readOutboundLines(child).filter((line) => line["type"] === "control_request")).toHaveLength(1);
+    await vi.advanceTimersByTimeAsync(3_000);
+    expect(child.killSignals).toEqual(["SIGTERM"]);
+    expect(settled).toBe(false);
+    expect(pool.pidsForTesting).toEqual([other.pid]);
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(child.killSignals).toEqual(["SIGTERM", "SIGKILL"]);
+    expect(settled).toBe(false);
+    await vi.advanceTimersByTimeAsync(2_000);
+    await expect(stopped.done).resolves.toMatchObject({ interrupted: true, exitCode: 1, sessionId: "stuck-session" });
+    await drain;
+    expect(other.killed).toBe(false);
+    expect(readOutboundLines(other).some((line) => line["type"] === "control_request")).toBe(false);
+    expect(spawnedChildren).toHaveLength(2); // never resurrect or retry stopped work
+    // Even after the card settled, a same-session replacement must wait
+    // for the old writer's real exit. Waiting remains cancellable/budgeted.
+    const replacement = pool.run({ prompt: "next", threadId: "stuck", resumeSessionId: "stuck-session", pidFilePath: null });
+    const waitingStop = pool.run({ prompt: "cancel waiting", threadId: "stuck", resumeSessionId: "stuck-session", pidFilePath: null });
+    const waitingBudget = pool.run({ prompt: "bounded waiting", threadId: "stuck", resumeSessionId: "stuck-session", pidFilePath: null, timeoutMs: 1_000 });
+    waitingStop.kill();
+    await expect(waitingStop.done).resolves.toMatchObject({ exitCode: 1, interrupted: true });
+    await vi.advanceTimersByTimeAsync(60_000);
+    await expect(waitingBudget.done).resolves.toMatchObject({ exitCode: 1, interrupted: true });
+    expect(spawnedChildren).toHaveLength(2);
+    // The actual exit still owns process bookkeeping; a late success cannot
+    // change the cancelled turn's terminal result.
+    child.stdout.write(resultLine("success") + "\n");
+    child.emit("exit", 0);
+    await flush();
+    expect(spawnedChildren).toHaveLength(3);
+    expect(spawnArgs[2]).toContain("--resume");
+    const next = spawnedChildren[2]!;
+    next.stdout.write(resultLine("success") + "\n");
+    await flush();
+    await expect(replacement.done).resolves.toMatchObject({ exitCode: 0 });
+    next.emit("exit", 0);
+    other.stdout.write(resultLine("success") + "\n");
+    await flush();
+    await expect(stopped.done).resolves.toMatchObject({ interrupted: true, exitCode: 1 });
+    await expect(peer.done).resolves.toMatchObject({ exitCode: 0 });
+    other.emit("exit", 0);
+    await pool.shutdown();
+  });
+
+  it("a turn already queued on an interrupted child also waits for its real exit before cold fallback", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "Date"] });
+    const pool = new ClaudeProcessPool({ botId: "queued" });
+    const opts = { threadId: "topic", pidFilePath: null };
+    const stopped = pool.run({ ...opts, prompt: "stuck" });
+    const queued = pool.run({ ...opts, prompt: "queued", resumeSessionId: "same-session" });
+    await flush();
+    const child = spawnedChildren[0]!;
+    child.stdout.write(systemInit("same-session") + "\n");
+    await flush();
+    stopped.kill();
+    await vi.advanceTimersByTimeAsync(10_000);
+    await expect(stopped.done).resolves.toMatchObject({ interrupted: true, exitCode: 1 });
+    await flush();
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(spawnedChildren).toHaveLength(1);
+    child.emit("exit", 0);
+    await flush();
+    expect(spawnedChildren).toHaveLength(2);
+    const cold = spawnedChildren[1]!;
+    cold.stdout.end();
+    cold.emit("exit", 0);
+    cold.emit("close", 0);
+    await expect(queued.done).resolves.toMatchObject({ exitCode: 0, pooled: false });
+    await pool.shutdown();
+  });
+
+  it("cold fallback cannot start a second thread/session writer after done but before real process exit", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "Date"] });
+    const pool = new ClaudeProcessPool({ botId: "cold-writer" });
+    const handle = pool.run({ prompt: "stuck cold fallback", threadId: "topic", pidFilePath: null });
+    await flush();
+    spawnedChildren[0]!.emit("exit", 1); // existing pre-output startup fallback
+    await flush();
+    const cold = spawnedChildren[1]!;
+    cold.stdout.write(systemInit("native-session") + "\n");
+    await flush();
+    handle.kill();
+    await vi.advanceTimersByTimeAsync(7_000);
+    await expect(handle.done).resolves.toMatchObject({ exitCode: 1, interrupted: true, pooled: false });
+    cold.emit("error", new Error("cannot signal writer")); // not proof of exit
+    for (const opts of [
+      { threadId: "topic" },
+      { threadId: "different-topic", resumeSessionId: "native-session" },
+      { threadId: "topic", forceFreshSession: true },
+    ]) {
+      const refused = pool.run({ prompt: "must not run", pidFilePath: null, ...opts });
+      await expect(refused.done).rejects.toThrow("previous cold process exit is unconfirmed");
+    }
+    expect(spawnedChildren).toHaveLength(2);
+    // A genuinely unrelated topic is not blocked by this writer.
+    const peer = pool.run({ prompt: "unrelated", threadId: "unrelated", pidFilePath: null });
+    await flush();
+    expect(spawnedChildren).toHaveLength(3);
+    spawnedChildren[2]!.stdout.write(resultLine("success") + "\n");
+    await peer.done;
+    spawnedChildren[2]!.emit("exit", 0);
+    cold.emit("exit", 1);
+    await flush();
+    const next = pool.run({ prompt: "continue", threadId: "topic", resumeSessionId: "native-session", pidFilePath: null });
+    await flush();
+    expect(spawnedChildren).toHaveLength(4);
+    spawnedChildren[3]!.stdout.write(resultLine("success") + "\n");
+    await expect(next.done).resolves.toMatchObject({ exitCode: 0 });
+    spawnedChildren[3]!.emit("exit", 0);
+    await pool.shutdown();
+  });
+
+  it("forced warm shutdown reports cancel, not a later timeout", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "Date"] });
+    const pool = new ClaudeProcessPool({ botId: "shutdown-reason" });
+    const handle = pool.run({ prompt: "active", threadId: "topic", pidFilePath: null, timeoutMs: 1_000 });
+    await flush();
+    const child = spawnedChildren[0]!;
+    child.stdout.write(systemInit("session") + "\n");
+    await flush();
+    const shutdown = pool.shutdown(0);
+    await vi.advanceTimersByTimeAsync(1_000);
+    child.emit("exit", 0);
+    await expect(handle.done).resolves.toMatchObject({ exitCode: 1, interrupted: true, interruptionReason: "cancel" });
+    await shutdown;
+  });
+
+  it("shutdown cancels an active cold fallback and waits only a bounded time for real exit", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "Date"] });
+    const pool = new ClaudeProcessPool({ botId: "shutdown-cold" });
+    const handle = pool.run({ prompt: "stuck cold", threadId: "topic", pidFilePath: null, timeoutMs: 1_000 });
+    await flush();
+    spawnedChildren[0]!.emit("exit", 1);
+    await flush();
+    const cold = spawnedChildren[1]!;
+    let shutdownDone = false;
+    const shutdown = pool.shutdown().then(() => { shutdownDone = true; });
+    expect(cold.killSignals).toEqual(["SIGTERM"]);
+    await vi.advanceTimersByTimeAsync(7_000);
+    await expect(handle.done).resolves.toMatchObject({ exitCode: 1, interrupted: true, pooled: false, interruptionReason: "cancel" });
+    expect(cold.killSignals).toEqual(["SIGTERM", "SIGKILL"]);
+    expect(shutdownDone).toBe(false); // done is not an exit acknowledgement
+    await vi.advanceTimersByTimeAsync(7_000);
+    await shutdown;
+    expect(spawnedChildren).toHaveLength(2); // no business retry on shutdown
+    cold.emit("exit", 1); // actual cleanup can still arrive after bounded shutdown
+    await flush();
+  });
+
+  it("cold fallback retains the original explicit budget instead of restarting its clock", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "Date"] });
+    const pool = new ClaudeProcessPool({ botId: "fallback-budget" });
+    const handle = pool.run({ prompt: "budget", threadId: "topic", pidFilePath: null, timeoutMs: 1_000 });
+    const events = collectEvents(handle.events);
+    await flush();
+    await vi.advanceTimersByTimeAsync(400);
+    // A startup failure before any output is the existing cold-fallback case.
+    spawnedChildren[0]!.emit("exit", 1);
+    await flush();
+    expect(spawnedChildren).toHaveLength(2);
+    const cold = spawnedChildren[1]!;
+    await vi.advanceTimersByTimeAsync(599);
+    expect(cold.killed).toBe(false);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(cold.killSignals).toEqual(["SIGTERM"]);
+    handle.kill(); // a later explicit cancel cannot overwrite the pool deadline
+    await vi.advanceTimersByTimeAsync(7_000);
+    await expect(handle.done).resolves.toMatchObject({ exitCode: 1, pooled: false, interrupted: true, interruptionReason: "timeout" });
+    await events;
+    expect(cold.killSignals).toEqual(["SIGTERM", "SIGKILL"]);
+    expect(spawnedChildren).toHaveLength(2);
+    cold.emit("exit", 1);
+    await pool.shutdown();
+  });
+
+  it("AbortSignal without a budget stops only its own topic and preserves failed-result status", async () => {
+    const pool = new ClaudeProcessPool({ botId: "cancel" });
+    const controller = new AbortController();
+    const stopped = pool.run({ prompt: "stop me", threadId: "stop", pidFilePath: null, abortSignal: controller.signal });
+    const peer = pool.run({ prompt: "keep running", threadId: "peer", pidFilePath: null });
+    await flush();
+    const child = spawnedChildren[0]!;
+    const other = spawnedChildren[1]!;
+    child.stdout.write(systemInit("stopped-session") + "\n");
+    other.stdout.write(systemInit("peer-session") + "\n");
+    await flush();
+    controller.abort();
+    expect(readOutboundLines(child).some((line) => line["type"] === "control_request")).toBe(true);
+    expect(readOutboundLines(other).some((line) => line["type"] === "control_request")).toBe(false);
+    child.stdout.write(resultLine("error_during_execution") + "\n");
+    await flush();
+    await expect(stopped.done).resolves.toMatchObject({ interrupted: true, exitCode: 1, interruptionReason: "cancel" });
+    expect(other.killed).toBe(false);
+    other.stdout.write(resultLine("error_during_execution") + "\n");
+    await flush();
+    const failed = await peer.done;
+    expect(failed.exitCode).toBe(1);
+    expect(failed.interrupted).toBeUndefined();
+    for (const entry of spawnedChildren) entry.emit("exit", 0);
+    await pool.shutdown();
+  });
+});
+
 // ---------------------------------------------------------------------------
 // kill() / interrupt protocol
 // ---------------------------------------------------------------------------
@@ -740,10 +1029,10 @@ describe("ClaudeProcessPool — kill()/interrupt", () => {
       expect(child.killed).toBe(true);
       expect(child.killSignals[0]).toBe("SIGTERM");
 
-      // The abandoned turn still settles (rejects — it reached the wire).
+      // An intentional interruption is terminal metadata, not a fresh runtime failure.
       child.emit("exit");
       await flush();
-      await expect(handle.done).rejects.toThrow();
+      await expect(handle.done).resolves.toMatchObject({ exitCode: 1, interrupted: true });
     } finally {
       vi.useRealTimers();
     }
