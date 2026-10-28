@@ -56,7 +56,8 @@
  * Session single-writer rule: a pi session file must never be open in two
  * processes. A thread's replacement process (changed options, a different
  * session, a forced fresh start) and a cold fallback therefore wait until the
- * thread's retiring process has actually exited (bounded by EXIT_WAIT_MS).
+ * thread's retiring process has actually exited. Turn cancellation and shutdown
+ * remain bounded, but a stopped writer is never presumed dead after a timer.
  * On Windows the child is cross-spawn's cmd.exe wrapper, which a signal
  * would kill without reaching pi: retirement closes stdin instead and the
  * backstop kills the whole tree (#destroyEntry). Not yet exercised on a
@@ -77,9 +78,10 @@ import { spawnPiped, spawnProcess } from "../platform/spawn.js";
 import type { AgentRunner, AgentStreamEvent, PerfMarkerName, RunHandle, RunOptions } from "../agent/runner.js";
 import { createPerfMarker, markPerfForEventType } from "../agent/runner.js";
 import { TurnEventQueue } from "../agent/turnEventQueue.js";
+import { resolveRunTimeoutMs } from "../agent/runTimeout.js";
 import { PiTurnDecoder, buildPiConfigArgs, buildPiEnv, piThinkingFromLarkway, runPi } from "./runner.js";
 
-type DoneResult = { exitCode: number; sessionId?: string; pooled?: boolean; resumeMode?: "same-process" | "cold" };
+type DoneResult = { exitCode: number; sessionId?: string; interrupted?: boolean; interruptionReason?: "cancel" | "timeout"; pooled?: boolean; resumeMode?: "same-process" | "cold" };
 
 /** @default 10 min — same idle-reap horizon as the claude and codex pools. */
 export const DEFAULT_WARM_PROCESS_IDLE_MS = 10 * 60 * 1000;
@@ -90,11 +92,9 @@ export const DEFAULT_MAX_PROCESSES = 6;
 const SIGKILL_GRACE_MS = 5_000;
 /** How long an aborted turn may take to settle before its process is torn down. */
 const ABORT_GRACE_MS = 3_000;
-/** Same default as the cold runner when a turn's caller doesn't set one. */
-const DEFAULT_TURN_TIMEOUT_MS = 15 * 60 * 1000;
 /** After 'exit', how long to wait for stdout to drain before settling on the exit. */
 const EXIT_DRAIN_GRACE_MS = 2_000;
-/** Bounded wait for a retiring process's exit (single-writer rule) and for shutdown(). */
+/** Bounded post-kill turn finalization and shutdown wait; not a writer-exit guarantee. */
 const EXIT_WAIT_MS = SIGKILL_GRACE_MS + 2_000;
 /** Cap on buffered stderr, per process and per turn — only the tail is ever reported. */
 const STDERR_BUFFER_CAP_BYTES = 64 * 1024;
@@ -185,6 +185,7 @@ interface TurnState {
   /** True once ANY event was pushed — past this a process death rejects instead of falling back. */
   reachedWire: boolean;
   killRequested: boolean;
+  interruptionReason?: "cancel" | "timeout";
   /** Whether the entry had already served a turn when this one started (resumeMode). */
   reusedProcess: boolean;
   /** The warm process this turn was placed on; undefined until placed (or forever for a cold-only turn). */
@@ -196,6 +197,15 @@ interface TurnState {
   readonly stderrChunks: Buffer[];
   timeoutHandle?: ReturnType<typeof setTimeout>;
   abortEscalateTimer?: ReturnType<typeof setTimeout>;
+  abortFinalizeTimer?: ReturnType<typeof setTimeout>;
+  abortListener?: () => void;
+}
+
+interface ColdWriter {
+  readonly state: TurnState;
+  readonly handle: RunHandle;
+  readonly threadId: string | undefined;
+  readonly sessionIds: Set<string>;
 }
 
 interface PoolEntry {
@@ -293,6 +303,9 @@ export class PiProcessPool implements AgentRunner {
   readonly #entries = new Map<string, PoolEntry>();
   /** Entries torn down whose exit the OS has not confirmed yet (single-writer waits). */
   readonly #dying = new Set<PoolEntry>();
+  readonly #waitingForExit = new Set<TurnState>();
+  /** Cold fallback writers remain owned until real process exit, not done. */
+  readonly #coldWriters = new Set<ColdWriter>();
   #nextUnkeyedId = 1;
   #shuttingDown = false;
   #idleSweepTimer: ReturnType<typeof setInterval> | undefined;
@@ -318,6 +331,7 @@ export class PiProcessPool implements AgentRunner {
   }
 
   run(opts: RunOptions): RunHandle {
+    const timeoutMs = resolveRunTimeoutMs(opts.timeoutMs);
     const queue = new TurnEventQueue();
     const markPerf = createPerfMarker(opts.onPerfMarker);
     // The turn's baseline, whether or not an OS-level spawn happens under it.
@@ -348,14 +362,21 @@ export class PiProcessPool implements AgentRunner {
       stderrChunks: [],
     };
 
-    const timeoutMs = opts.timeoutMs ?? DEFAULT_TURN_TIMEOUT_MS;
-    state.timeoutHandle = setTimeout(() => this.#interruptTurn(state), timeoutMs);
-    state.timeoutHandle.unref?.();
+    if (this.#hasColdWriter(opts)) {
+      this.#settleReject(state, this.#coldWriterError());
+      return { events: queue, done, kill: () => {}, pid: undefined };
+    }
+
+    if (timeoutMs !== undefined) {
+      state.timeoutHandle = setTimeout(() => this.#interruptTurn(state, "timeout"), timeoutMs);
+      state.timeoutHandle.unref?.();
+    }
     if (opts.abortSignal != null) {
       if (opts.abortSignal.aborted) {
         this.#interruptTurn(state);
       } else {
-        opts.abortSignal.addEventListener("abort", () => this.#interruptTurn(state), { once: true });
+        state.abortListener = () => this.#interruptTurn(state);
+        opts.abortSignal.addEventListener("abort", state.abortListener, { once: true });
       }
     }
     const kill = (): void => this.#interruptTurn(state);
@@ -394,21 +415,33 @@ export class PiProcessPool implements AgentRunner {
     // changed, session reseeded); the handle then carries no pid.
     const retiring = this.#exitsOfThread(threadId);
     if (retiring) {
-      void retiring.then(() => {
-        if (!state.settled) this.#place(state, key, threadId);
-      });
-      return { events: queue, done, kill, pid: undefined };
+      this.#deferUntilExit(state, retiring, () => this.#place(state, key, threadId));
+      return { events: queue, done, kill, pid: undefined, get processExited() { return state.coldHandle?.processExited; } };
     }
     const entry = this.#place(state, key, threadId);
     // A turn #place sent cold at once (pool full and busy) reports the cold
     // child's pid: the bridge writes it into the session's pid file, the GC
     // liveness gate for the session dir while that run lasts.
-    return { events: queue, done, kill, pid: entry?.child.pid ?? state.coldHandle?.pid };
+    return {
+      events: queue, done, kill, pid: entry?.child.pid ?? state.coldHandle?.pid,
+      get processExited() { return state.coldHandle?.processExited; },
+    };
   }
 
   /** Graceful drain + shutdown — call from the owning bot's shutdown path. */
   async shutdown(drainTimeoutMs = 30_000): Promise<void> {
     this.#shuttingDown = true;
+    // Cold fallbacks are not #entries, but this pool still owns their active
+    // turns. Stop only those handles; keep their writer/PID guards until
+    // processExited confirms death, even if shutdown's bounded wait expires.
+    const coldWriters = [...this.#coldWriters];
+    for (const writer of coldWriters) this.#interruptTurn(writer.state);
+    // These turns own no running process and cannot progress while the old
+    // writer's death is unconfirmed. Close their queues now; shutdown must
+    // not leave their done promises waiting on an unbounded writer barrier.
+    for (const state of this.#waitingForExit) {
+      this.#settleReject(state, new Error("[pi-pool] pool is shutting down — canceling turn waiting for a session writer to exit"));
+    }
     if (this.#idleSweepTimer) {
       clearInterval(this.#idleSweepTimer);
       this.#idleSweepTimer = undefined;
@@ -424,8 +457,21 @@ export class PiProcessPool implements AgentRunner {
       }),
     ]);
     const entries = [...this.#entries.values()];
-    for (const entry of entries) this.#destroyEntry(entry, "pool shutdown");
-    await Promise.all([...entries, ...this.#dying].map((e) => this.#waitForExit(e)));
+    for (const entry of entries) {
+      if (entry.current) this.#interruptTurn(entry.current);
+      this.#destroyEntry(entry, "pool shutdown");
+    }
+    await Promise.all([
+      ...[...entries, ...this.#dying].map((e) => this.#waitForExit(e)),
+      ...coldWriters.map((writer) => new Promise<void>((resolve) => {
+        const timer = setTimeout(resolve, EXIT_WAIT_MS);
+        timer.unref?.();
+        void writer.handle.processExited?.then(() => {
+          clearTimeout(timer);
+          resolve();
+        });
+      })),
+    ]);
   }
 
   // -- placement ---------------------------------------------------------------
@@ -454,20 +500,61 @@ export class PiProcessPool implements AgentRunner {
   #exitsOfThread(threadId: string): Promise<void> | undefined {
     const dying = [...this.#dying].filter((e) => e.threadId === threadId);
     if (dying.length === 0) return undefined;
-    return Promise.all(dying.map((e) => this.#waitForExit(e))).then(() => undefined);
+    // A timeout may finalize the old turn, but it cannot establish that pi
+    // released the session file. A waiting turn remains cancellable and its
+    // own optional budget still applies; only a real exit releases this gate.
+    return Promise.all(dying.map((e) => e.exited)).then(() => undefined);
+  }
+
+  #hasColdWriter(opts: RunOptions): boolean {
+    return [...this.#coldWriters].some((writer) =>
+      (opts.threadId != null && opts.threadId === writer.threadId) ||
+      (opts.resumeSessionId != null && writer.sessionIds.has(opts.resumeSessionId)),
+    );
+  }
+
+  #coldWriterError(): Error {
+    return new Error("[pi-pool] previous cold process for this thread/session has not exited — refusing another session writer");
+  }
+
+  /** Track writer-gated turns so cancellation and shutdown can settle them independently. */
+  #deferUntilExit(state: TurnState, exiting: Promise<void>, resume: () => void): void {
+    if (state.settled) return;
+    if (this.#shuttingDown) {
+      this.#settleReject(state, new Error("[pi-pool] pool is shutting down — rejecting waiting turn"));
+      return;
+    }
+    this.#waitingForExit.add(state);
+    void exiting.then(() => {
+      this.#waitingForExit.delete(state);
+      if (!state.settled) resume();
+    });
   }
 
   /** Put the turn on this key's entry (spawning one if needed) or fall back cold. */
   #place(state: TurnState, key: string, threadId: string): PoolEntry | undefined {
+    if (this.#hasColdWriter(state.opts)) {
+      this.#settleReject(state, this.#coldWriterError());
+      return undefined;
+    }
     if (this.#shuttingDown) {
       this.#settleReject(state, new Error("[pi-pool] pool is shutting down — rejecting new turn"));
+      return undefined;
+    }
+    const retiring = this.#exitsOfThread(threadId);
+    if (retiring) {
+      this.#deferUntilExit(state, retiring, () => this.#place(state, key, threadId));
       return undefined;
     }
     let entry = this.#entries.get(key);
     if (entry != null && !this.#canContinue(entry, state.opts)) {
       // Only reachable on the deferred path (another turn used the entry meanwhile).
       this.#destroyEntry(entry, "session changed while this turn waited");
-      entry = undefined;
+      // The deferred placement raced another queued turn. Retiring that
+      // replacement does not release its session file: wait just as run()
+      // does, rather than spawning another writer immediately.
+      this.#deferUntilExit(state, entry.exited, () => this.#place(state, key, threadId));
+      return undefined;
     }
     if (entry == null) {
       if (this.#entries.size >= this.#maxProcesses) {
@@ -670,15 +757,28 @@ export class PiProcessPool implements AgentRunner {
     const threadId = state.entry?.threadId ?? state.opts.threadId;
     const start = (): void => {
       if (state.settled || state.coldHandle) return;
+      if (this.#hasColdWriter(state.opts)) {
+        this.#settleReject(state, this.#coldWriterError());
+        return;
+      }
       // Only run()'s synchronous capacity fallback hands this child's pid to
       // the bridge. Here the handle already went out with the warm pid, or
       // none, and RunHandle cannot announce a later one (the claude pool's
       // async fallback has the same gap).
       const cold = runPi(state.opts);
       state.coldHandle = cold;
+      const writer: ColdWriter = {
+        state,
+        handle: cold,
+        threadId,
+        sessionIds: new Set(state.opts.resumeSessionId != null ? [state.opts.resumeSessionId] : []),
+      };
+      this.#coldWriters.add(writer);
+      void cold.processExited?.then(() => this.#coldWriters.delete(writer));
       void (async () => {
         try {
           for await (const ev of cold.events) {
+            if (ev.type === "system_init") writer.sessionIds.add(ev.sessionId);
             markPerfForEventType(state.markPerf, ev.type);
             state.queue.push(ev);
           }
@@ -687,18 +787,22 @@ export class PiProcessPool implements AgentRunner {
         }
       })();
       cold.done.then(
-        (result) => this.#settleResult(state, { ...result, pooled: false, resumeMode: state.opts.resumeSessionId != null ? "cold" : undefined }),
+        (result) => {
+          if (result.sessionId != null) writer.sessionIds.add(result.sessionId);
+          this.#settleResult(state, { ...result, pooled: false, resumeMode: state.opts.resumeSessionId != null ? "cold" : undefined });
+        },
         (err) => this.#settleReject(state, err instanceof Error ? err : new Error(String(err))),
       );
     };
     const retiring = threadId != null ? this.#exitsOfThread(threadId) : undefined;
-    if (retiring) void retiring.then(start);
+    if (retiring) this.#deferUntilExit(state, retiring, start);
     else start();
   }
 
-  #interruptTurn(state: TurnState): void {
-    if (state.settled) return;
+  #interruptTurn(state: TurnState, reason: "cancel" | "timeout" = "cancel"): void {
+    if (state.settled || state.killRequested) return;
     state.killRequested = true;
+    state.interruptionReason = reason;
     if (state.coldHandle) {
       state.coldHandle.kill();
       return;
@@ -721,8 +825,17 @@ export class PiProcessPool implements AgentRunner {
     const escalate = setTimeout(() => {
       if (state.settled) return;
       console.warn(`[pi-pool] abort for key=${entry.key} did not settle within ${ABORT_GRACE_MS}ms — escalating to SIGTERM/SIGKILL.`);
-      // #onEntryExit settles the killed turn once the process is gone.
       this.#destroyEntry(entry, "abort escalation timeout");
+      if (state.settled) return;
+      // If even SIGKILL produces no exit, finish only the interrupted turn.
+      // Keep the entry/PID in #dying until actual exit: no reuse or second
+      // writer to its session, and unrelated topics remain available.
+      state.abortFinalizeTimer = setTimeout(() => {
+        if (state.settled) return;
+        console.warn(`[pi-pool] terminated process pid=${entry.child.pid ?? "?"} has not exited — finalizing interrupted turn while retaining its session writer gate.`);
+        this.#settleResolve(state, 1);
+      }, EXIT_WAIT_MS);
+      state.abortFinalizeTimer.unref?.();
     }, ABORT_GRACE_MS);
     escalate.unref?.();
     state.abortEscalateTimer = escalate;
@@ -745,7 +858,10 @@ export class PiProcessPool implements AgentRunner {
   #settleResult(state: TurnState, result: DoneResult): void {
     if (state.settled) return;
     this.#finishTurn(state);
-    state.resolveDone(result);
+    state.resolveDone({
+      ...result,
+      ...(state.killRequested ? { exitCode: 1, interrupted: true, interruptionReason: state.interruptionReason } : {}),
+    });
   }
 
   #settleReject(state: TurnState, err: Error): void {
@@ -756,8 +872,11 @@ export class PiProcessPool implements AgentRunner {
 
   #finishTurn(state: TurnState): void {
     state.settled = true;
+    this.#waitingForExit.delete(state);
+    if (state.abortListener) state.opts.abortSignal?.removeEventListener("abort", state.abortListener);
     if (state.timeoutHandle) clearTimeout(state.timeoutHandle);
     if (state.abortEscalateTimer) clearTimeout(state.abortEscalateTimer);
+    if (state.abortFinalizeTimer) clearTimeout(state.abortFinalizeTimer);
     // A warm turn that ends without agent_settled (the process died or was
     // killed mid-turn) still delivers the answer text the extractor holds.
     if (!state.coldHandle) {
@@ -837,11 +956,14 @@ export class PiProcessPool implements AgentRunner {
       }
       // Windows: this 'exit' is cross-spawn's cmd.exe wrapper. A process we
       // retired counts as gone once the wrapper exited and stdout closed,
-      // whichever comes last: the single-writer waits key off #onEntryExit,
-      // so wait for stdout for as long as those waits are bounded anyway.
-      const graceMs = process.platform === "win32" && entry.destroyed ? EXIT_WAIT_MS : EXIT_DRAIN_GRACE_MS;
+      // whichever comes last. A grace timer cannot establish pi itself died;
+      // cancellation/shutdown are bounded separately from writer ownership.
+      if (process.platform === "win32" && entry.destroyed) {
+        void stdoutDone.then(() => this.#onEntryExit(entry, err));
+        return;
+      }
       const grace = new Promise<void>((resolve) => {
-        const t = setTimeout(resolve, graceMs);
+        const t = setTimeout(resolve, EXIT_DRAIN_GRACE_MS);
         t.unref?.();
       });
       void Promise.race([stdoutDone, grace]).then(() => this.#onEntryExit(entry, err));
@@ -993,7 +1115,7 @@ export class PiProcessPool implements AgentRunner {
     killTimer.unref?.();
   }
 
-  /** Resolves once the entry's process has exited, or after EXIT_WAIT_MS — never rejects. */
+  /** Bounded shutdown wait only; never use it to authorize a new session writer. */
   #waitForExit(entry: PoolEntry): Promise<void> {
     if (entry.exitHandled) return Promise.resolve();
     return Promise.race([

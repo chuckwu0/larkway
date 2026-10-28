@@ -12,7 +12,7 @@
 
 import { describe, it, expect, afterEach, vi } from "vitest";
 import { EventEmitter, PassThrough } from "node:stream";
-import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import {
@@ -722,6 +722,180 @@ vi.mock("node:child_process", async (importOriginal) => {
       return c;
     },
   };
+});
+
+// Fake-clock regression tests of the actual runner lifecycle; these do not
+// invoke Claude or claim a three-hour live-runtime acceptance run.
+describe("runClaude() — native long turns", () => {
+  afterEach(() => {
+    __nextFakeChild = null;
+    vi.useRealTimers();
+  });
+
+  it.each([undefined, 0])("timeoutMs=%s keeps active work and long tool waits alive", async (timeoutMs) => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+    const fake = makeFakeChild();
+    __nextFakeChild = fake;
+    const killSpy = vi.spyOn(fake.child, "kill");
+    const { runClaude } = await import("./runner.js");
+    const handle = runClaude({ prompt: "long task", timeoutMs });
+    const types: string[] = [];
+    const drain = (async () => {
+      for await (const event of handle.events) types.push(event.type);
+    })();
+    let settled = false;
+    void handle.done.then(() => { settled = true; });
+    fake.stdout.write(JSON.stringify({ type: "system", subtype: "init", session_id: "long-session" }) + "\n");
+    const flush = () => new Promise<void>((resolve) => setImmediate(resolve));
+    await flush();
+
+    for (let hour = 0; hour < 3; hour++) {
+      fake.stdout.write(JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text: `working ${hour}` }] } }) + "\n");
+      await flush();
+      await vi.advanceTimersByTimeAsync(60 * 60 * 1_000);
+      expect(settled).toBe(false);
+      expect(killSpy).not.toHaveBeenCalled();
+    }
+    fake.stdout.write(JSON.stringify({ type: "assistant", message: { content: [{ type: "tool_use", id: "long-tool", name: "Bash", input: { command: "long task" } }] } }) + "\n");
+    await flush();
+    expect(types).toContain("tool_use");
+    await vi.advanceTimersByTimeAsync(3 * 60 * 60 * 1_000);
+    expect(settled).toBe(false);
+    expect(killSpy).not.toHaveBeenCalled();
+
+    fake.stdout.write(JSON.stringify({ type: "user", message: { content: [{ type: "tool_result", tool_use_id: "long-tool", content: "done" }] } }) + "\n");
+    fake.stdout.write(JSON.stringify({ type: "result", subtype: "success", stop_reason: "end_turn" }) + "\n");
+    await flush();
+    fake.triggerClose();
+    await drain;
+    await expect(handle.done).resolves.toEqual({ exitCode: 0, sessionId: "long-session" });
+    expect(types).toContain("tool_result");
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it.each(["kill", "timeout", "post-result cleanup"])("%s does not confuse interrupted work with normal cleanup", async (reason) => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+    const fake = makeFakeChild();
+    __nextFakeChild = fake;
+    const { runClaude } = await import("./runner.js");
+    const handle = runClaude({ prompt: "race", ...(reason === "timeout" ? { timeoutMs: 1_000 } : {}) });
+    const drain = (async () => { for await (const _event of handle.events) { /* drain */ } })();
+    if (reason === "post-result cleanup") {
+      fake.stdout.write(JSON.stringify({ type: "result", subtype: "success", stop_reason: "end_turn" }) + "\n");
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      await vi.advanceTimersByTimeAsync(30_000);
+    } else if (reason === "timeout") await vi.advanceTimersByTimeAsync(1_000);
+    else handle.kill();
+    expect(fake.child.killed).toBe(true);
+    // A process may handle SIGTERM and return code 0. It cannot turn an
+    // already interrupted user turn into success, but normal cleanup can.
+    fake.triggerClose(0);
+    await drain;
+    const result = await handle.done;
+    expect(result.exitCode).toBe(reason === "post-result cleanup" ? 0 : 1);
+    expect(result.interrupted).toBe(reason === "post-result cleanup" ? undefined : true);
+    expect(result.interruptionReason).toBe(reason === "post-result cleanup" ? undefined : reason === "timeout" ? "timeout" : "cancel");
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it.each(["cancel", "timeout"])("the first interruption reason wins: %s", async (firstReason) => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+    const fake = makeFakeChild();
+    __nextFakeChild = fake;
+    const controller = new AbortController();
+    const { runClaude } = await import("./runner.js");
+    const handle = runClaude({ prompt: "race", timeoutMs: 1_000, abortSignal: controller.signal });
+    if (firstReason === "cancel") handle.kill();
+    await vi.advanceTimersByTimeAsync(1_000);
+    controller.abort();
+    handle.kill();
+    fake.triggerClose(0);
+    await expect(handle.done).resolves.toMatchObject({ exitCode: 1, interrupted: true, interruptionReason: firstReason });
+  });
+
+  it("bounded stop keeps processExited pending and the PID until actual exit, not a signal error", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+    const dir = await mkdtemp(path.join(tmpdir(), "claude-cold-exit-"));
+    try {
+      const pidFilePath = path.join(dir, "runner.pid");
+      const fake = makeFakeChild();
+      __nextFakeChild = fake;
+      const { runClaude } = await import("./runner.js");
+      const handle = runClaude({ prompt: "stuck writer", pidFilePath });
+      let exited = false;
+      void handle.processExited?.then(() => { exited = true; });
+      const drain = (async () => { for await (const _event of handle.events) { /* drain */ } })();
+      // Wait for the asynchronous initial PID write without using fake timers.
+      for (let i = 0; i < 20; i++) {
+        try { await readFile(pidFilePath, "utf8"); break; }
+        catch { await new Promise<void>((resolve) => setImmediate(resolve)); }
+      }
+      expect(JSON.parse(await readFile(pidFilePath, "utf8")).pid).toBe(fake.child.pid);
+      handle.kill();
+      await vi.advanceTimersByTimeAsync(7_000);
+      await expect(handle.done).resolves.toMatchObject({ exitCode: 1, interrupted: true });
+      await drain;
+      fake.child.emit("error", new Error("signal delivery failed"));
+      await Promise.resolve();
+      expect(exited).toBe(false);
+      expect(JSON.parse(await readFile(pidFilePath, "utf8")).pid).toBe(fake.child.pid);
+      fake.triggerExit(1);
+      await handle.processExited;
+      expect(exited).toBe(true);
+      await expect(readFile(pidFilePath, "utf8")).rejects.toThrow();
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("a spawn error with no PID confirms no child writer exists", async () => {
+    const fake = makeFakeChild();
+    fake.child.pid = undefined as unknown as number;
+    __nextFakeChild = fake;
+    const { runClaude } = await import("./runner.js");
+    const handle = runClaude({ prompt: "missing executable" });
+    const failure = expect(handle.done).rejects.toThrow("Claude CLI not found");
+    fake.child.emit("error", Object.assign(new Error("missing"), { code: "ENOENT" }));
+    await failure;
+    await expect(handle.processExited).resolves.toBeUndefined();
+  });
+
+  it("a child error after an explicit stop retains interruption metadata", async () => {
+    const fake = makeFakeChild();
+    __nextFakeChild = fake;
+    const { runClaude } = await import("./runner.js");
+    const handle = runClaude({ prompt: "stop then error" });
+    handle.kill();
+    fake.child.emit("error", new Error("process disappeared during termination"));
+    await expect(handle.done).resolves.toMatchObject({ exitCode: 1, interrupted: true });
+  });
+
+  it.each(["kill", "abort"])("%s without a budget settles a silent child without stopping another topic", async (stop) => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+    const { runClaude } = await import("./runner.js");
+    const controller = new AbortController();
+    const stopped = makeFakeChild();
+    __nextFakeChild = stopped;
+    const killSpy = vi.spyOn(stopped.child, "kill");
+    const first = runClaude({ prompt: "first", abortSignal: controller.signal });
+    const drain = (async () => { for await (const _event of first.events) { /* drain */ } })();
+    const peer = makeFakeChild();
+    __nextFakeChild = peer;
+    const second = runClaude({ prompt: "other topic" });
+    if (stop === "kill") first.kill();
+    else controller.abort();
+    expect(killSpy).toHaveBeenCalledWith("SIGTERM");
+    await vi.advanceTimersByTimeAsync(7_000);
+    await drain;
+    await expect(first.done).resolves.toMatchObject({ exitCode: 1, interrupted: true, interruptionReason: "cancel" });
+    expect(killSpy).toHaveBeenCalledWith("SIGKILL");
+    expect(peer.child.killed).toBe(false);
+    // Repeated stop after finalization is harmless and installs no new timer.
+    first.kill();
+    peer.triggerClose();
+    await expect(second.done).resolves.toMatchObject({ exitCode: 0 });
+    expect(vi.getTimerCount()).toBe(0);
+  });
 });
 
 describe("runClaude() — grandchild-holds-stdout finalize unblock", () => {

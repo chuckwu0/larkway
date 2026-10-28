@@ -1539,6 +1539,46 @@ turn_taking_limit: 10
     expect((getRes.json as { bot: Record<string, unknown> }).bot.backend).toBe("codex");
   });
 
+  it("PUT /api/bot/:id preserves, updates, and explicitly disables the total budget", async () => {
+    const dir = await makeLocalBotsDir();
+    const ctx = makeCtx(dir);
+    const put = (body: Record<string, unknown>) => call(ctx, "PUT /api/bot/:id", {
+      params: { id: "test-bot" }, body,
+    });
+    const budget = async () => {
+      const res = await call(ctx, "GET /api/bot/:id", { params: { id: "test-bot" } });
+      return (res.json as { bot: Record<string, unknown> }).bot.subprocess_timeout_seconds;
+    };
+    expect((await put({ ...SAMPLE_BOT, subprocess_timeout_seconds: 14_400 })).status).toBe(200);
+    expect(await budget()).toBe(14_400);
+    // The existing UI omits advanced YAML settings during unrelated saves.
+    expect((await put({ ...SAMPLE_BOT, name: "Renamed" })).status).toBe(200);
+    expect(await budget()).toBe(14_400);
+    expect((await put({ subprocess_timeout_seconds: 0 })).status).toBe(200);
+    expect(await budget()).toBe(0);
+    expect((await put({ name: "Renamed again" })).status).toBe(200);
+    expect(await budget()).toBe(0);
+    expect((await put({ subprocess_timeout_seconds: 3600 })).status).toBe(200);
+    expect(await budget()).toBe(3600);
+  });
+
+  it("PUT /api/bot/:id rejects invalid total budgets without changing the saved budget", async () => {
+    const dir = await makeLocalBotsDir();
+    const ctx = makeCtx(dir);
+    await call(ctx, "PUT /api/bot/:id", {
+      params: { id: "test-bot" }, body: { ...SAMPLE_BOT, subprocess_timeout_seconds: 14_400 },
+    });
+    for (const value of [-1, 0.5, 2_147_484, null, "3600"]) {
+      const rejected = await call(ctx, "PUT /api/bot/:id", {
+        params: { id: "test-bot" }, body: { subprocess_timeout_seconds: value },
+      });
+      expect(rejected.status).toBe(400);
+      expect(JSON.stringify(rejected.json)).toContain("subprocess_timeout_seconds");
+    }
+    const get = await call(ctx, "GET /api/bot/:id", { params: { id: "test-bot" } });
+    expect((get.json as { bot: Record<string, unknown> }).bot.subprocess_timeout_seconds).toBe(14_400);
+  });
+
   it("PUT /api/bot/:id sets model/effort overrides", async () => {
     const dir = await makeLocalBotsDir();
     const ctx = makeCtx(dir);

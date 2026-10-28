@@ -22,7 +22,7 @@
  *     `typeof import("./ui.js")` but in tests we substitute a compatible object.
  */
 
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import {
   mkdtemp,
   writeFile,
@@ -41,6 +41,28 @@ import * as hostConfigReal from "../hostConfig.js";
 import * as uiReal from "../ui.js";
 import type { CliContext, CliFlags } from "../types.js";
 
+// Probe-policy tests must fail locally, not send fake credentials to Feishu.
+// Keep the real cache type used by ChannelClient, but replace both transports
+// before their lazy imports. No production probe behavior is changed.
+const sdkProbeMocks = vi.hoisted(() => ({
+  connect: vi.fn(),
+  request: vi.fn(),
+}));
+vi.mock("@larksuiteoapi/node-sdk", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@larksuiteoapi/node-sdk")>();
+  return {
+    ...actual,
+    createLarkChannel: () => ({
+      on() {},
+      connect: sdkProbeMocks.connect,
+      async disconnect() {},
+    }),
+    Client: class {
+      request = sdkProbeMocks.request;
+    },
+  };
+});
+
 // ---------------------------------------------------------------------------
 // Per-test temp dir management
 // ---------------------------------------------------------------------------
@@ -51,6 +73,8 @@ let larkwayDir: string;
 let envPath: string;
 
 beforeEach(async () => {
+  sdkProbeMocks.connect.mockReset().mockRejectedValue(new Error("simulated offline WS failure"));
+  sdkProbeMocks.request.mockReset().mockRejectedValue(new Error("simulated offline task request failure"));
   tmpRoot = await mkdtemp(path.join(tmpdir(), "larkway-doctor-test-"));
   botsDir = path.join(tmpRoot, "bots");
   larkwayDir = path.join(tmpRoot, "larkway");
@@ -638,25 +662,27 @@ describe("doctor ws-connectivity probe", () => {
    * --lint 模式下探测失败(超时/网络错误)应降级为 warn,不把 exit code 抬到 2。
    * 策略:用 LARKWAY_SKIP_WS_PROBE=1 已在 beforeEach 全局 skip,但这个 test
    * 专门验证:有凭据但探测失败时 --lint 不报 error。
-   * 用假凭据 + 极短超时来模拟超时场景,验证 warn 降级行为。
+   * SDK transport 在本文件中 stub 为确定性失败,不靠假凭据发真实网络请求。
    */
   it("--lint mode: probe timeout/failure → warn not error (CI stays green)", async () => {
     await withFakeHome(async () => {
       await writeBotYaml("test-bot", validBotYaml("test-bot"));
       await writeEnvFile({ TEST_APP_SECRET: "fake-secret-for-probe-test" });
       await writeFakeClaude();
-      // Disable skip so the real probe path runs (it will fail with fake creds)
+      // Exercise the real policy path with the SDK transport stubbed offline.
       delete process.env.LARKWAY_SKIP_WS_PROBE;
 
       const output: unknown[] = [];
       const ctx = buildCtx({ json: true, nonInteractive: true }, { captureJson: output });
-      // Run in lint mode — probe will fail (fake creds) but must not produce exit 2
+      // Run in lint mode — the stubbed failure must not produce exit 2.
       const code = await run(ctx, ["--lint"]);
 
       const result = output[0] as { exitCode: number; checks: Array<{ id: string; status: string }> };
       const wsCheck = result.checks.find((c) => c.id === "ws-connectivity");
 
-      // Probe fails with fake creds — in lint mode, this must be warn (not error)
+      // The SDK stub, not an accidental network failure, drives this case.
+      expect(sdkProbeMocks.connect).toHaveBeenCalledTimes(1);
+      expect(sdkProbeMocks.request).not.toHaveBeenCalled();
       expect(wsCheck?.status).toBe("warn");
       // Exit code must NOT be 2 (error) — CI should not be flaky on network issues
       expect(code).not.toBe(2);
@@ -764,7 +790,7 @@ describe("doctor task-handle check (v3.4 discoverability, docs/task-handle.md §
       await writeBotYaml("test-bot", botYamlWithTaskHandle("test-bot"));
       await writeEnvFile({ TEST_APP_SECRET: "fake-secret-for-probe-test" });
       await writeFakeClaude();
-      delete process.env.LARKWAY_SKIP_WS_PROBE; // let the real probe run (will fail — fake creds)
+      delete process.env.LARKWAY_SKIP_WS_PROBE; // run policy against the offline SDK stubs
 
       const output: unknown[] = [];
       const ctx = buildCtx({ json: true, nonInteractive: true }, { captureJson: output });
@@ -772,6 +798,9 @@ describe("doctor task-handle check (v3.4 discoverability, docs/task-handle.md §
 
       const result = output[0] as { checks: Array<{ id: string; status: string; message?: string }> };
       const check = result.checks.find((c) => c.id === "task-handle-test-bot");
+      expect(sdkProbeMocks.connect).toHaveBeenCalledTimes(1);
+      expect(sdkProbeMocks.request).toHaveBeenCalledTimes(1);
+      expect(check?.message).toContain("simulated offline task request failure");
       expect(check?.status).toBe("warn");
       expect(code).not.toBe(2);
     });
@@ -790,6 +819,9 @@ describe("doctor task-handle check (v3.4 discoverability, docs/task-handle.md §
 
       const result = output[0] as { checks: Array<{ id: string; status: string; message?: string }> };
       const check = result.checks.find((c) => c.id === "task-handle-test-bot");
+      expect(sdkProbeMocks.connect).toHaveBeenCalledTimes(1);
+      expect(sdkProbeMocks.request).toHaveBeenCalledTimes(1);
+      expect(check?.message).toContain("simulated offline task request failure");
       expect(check?.status).toBe("error");
       expect(check?.message).toContain("task:tasklist:read");
       expect(check?.message).toContain("open.feishu.cn");

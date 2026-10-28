@@ -34,6 +34,7 @@ import {
 import { reconcileOrphanedCards } from "./bridge/reconcile.js";
 import { writeStatusFile } from "./bridge/statusFile.js";
 import { registerRunner } from "./agent/runner.js";
+import { botRunLimits } from "./config/runLimits.js";
 import { ClaudeRunner } from "./claude/runner.js";
 import { ClaudeProcessPool, reapOrphanedWarmClaudeProcesses } from "./claude/pool.js";
 import { CodexRunner } from "./codex/runner.js";
@@ -1012,18 +1013,9 @@ async function runV2Mode({
       // Unset → handler defaults to bypassPermissions (aligns Claude with Codex
       // full-host posture); set to acceptEdits/ask to tighten via config.
       permissionMode: configJson.permissions.mode,
-      // Per-bot idle-watchdog override (bot yaml idle_timeout_seconds). Unset →
-      // handler's 3-min default. Raise for bots whose turns legitimately go
-      // silent for minutes (huge tool results → long prefill emits nothing).
-      ...(bot.idle_timeout_seconds !== undefined
-        ? { responseSurfaceIdleTimeoutMs: bot.idle_timeout_seconds * 1000 }
-        : {}),
-      // BL-48 修订: automatic interrupt is OPT-IN. Unset → the handler never
-      // idle-kills (the card shows ⏳ and the turn runs on). Only set for
-      // unattended bots — see botLoader's idle_kill_seconds doc.
-      ...(bot.idle_kill_seconds !== undefined
-        ? { responseSurfaceIdleKillMs: bot.idle_kill_seconds * 1000 }
-        : {}),
+      // Total wall-clock and idle-kill budgets are independent opt-ins; idle
+      // notices retain their 3-minute default without imposing a deadline.
+      ...botRunLimits(bot),
       peers: resolvedPeers,
       taskHandleMentionRoster,
       localHandoffRegistry,

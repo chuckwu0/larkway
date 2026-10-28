@@ -7,9 +7,9 @@
  *   → readStateFile → sessionStore.put/touch → card.finalize
  *
  * Thin channel: NO dev_url probe, NO stage state-machine, NO demotion. The
- * handler trusts the bot-reported `status` verbatim (the bot is responsible for
- * self-verifying a dev_url before claiming `ready`) and does NOT scan agent text
- * for keywords or URLs.
+ * handler trusts bot-reported `status` except that an explicit interruption
+ * cannot be turned into success by `ready`. The bot self-verifies its work;
+ * the bridge does NOT scan agent text for keywords or URLs.
  *
  * Design constraints:
  *  - No external service calls — all I/O via injected deps
@@ -42,6 +42,7 @@ import {
 } from "../lark/rosterResolver.js";
 import type { PeerBot, RepoRef } from "../claude/prompt.js";
 import { createRunner } from "../agent/runner.js";
+import { resolveRunTimeoutMs } from "../agent/runTimeout.js";
 import type { AgentStreamEvent, PerfMarkerName } from "../agent/runner.js";
 import type { BotConfig } from "../config/botLoader.js";
 import {
@@ -123,69 +124,13 @@ import { buildPostContent } from "../lark/postContent.js";
 import { derivePostIdempotencyKey, digestPostContent } from "../lark/idempotency.js";
 
 /**
- * @deprecated PRB-9 (§12): the fixed wall-clock response-surface cut is retired
- * as the primary interrupt criterion — it mis-killed legitimately long tasks
- * ("复杂任务本来就会花很久"). Kept only so an old override doesn't break; the
- * primary interrupt is now the idle watchdog below.
- */
-const DEFAULT_CARDKIT_RESPONSE_SURFACE_TIMEOUT_MS = 20 * 60 * 1000;
-
-/**
- * PRB-9 (§12) idle-stuck threshold. The interrupt criterion is ACTIVITY, not
- * total wall-clock: a turn is cut only when it emits NO runner activity (token /
- * tool / any stream event) for this long — a real hang signal — never merely for
- * taking a long time. A turn that keeps streaming tokens or driving tools runs to
- * completion no matter the total duration. 3 min default (boss-approved),
- * overridable per bot via bot yaml `idle_timeout_seconds` (wired through
- * HandlerDeps.responseSurfaceIdleTimeoutMs in main.ts).
- *
- * NOTE (批A scope): activity here = runner output events (§12.1). The refined
- * "存活型活性" (process alive but silent — pure inference / awaiting upstream API,
- * §12.5) is 批B; and a coarse 60-min subprocess runaway guard still backstops a
- * silent hang that also stops emitting — the proper budget soft-net is 批B (§12.7).
+ * Idle notice threshold, not a total runtime deadline or a default kill.
+ * Any runner event refreshes activity; an in-flight tool is exempt from idle
+ * interruption (not the waiting notice). A quiet turn keeps running unless the operator opts into
+ * idle_kill_seconds, the user stops it, or an explicit total budget expires.
+ * Default 3 minutes, overridable by bot yaml idle_timeout_seconds.
  */
 const DEFAULT_CARDKIT_IDLE_TIMEOUT_MS = 3 * 60 * 1000;
-
-/**
- * BL-48 分级处置: crossing the idle threshold marks the turn SUSPECT (logged,
- * turn keeps running); the runner is only interrupted after the silence reaches
- * `idleTimeoutMs × this`.
- *
- * Why grading beats one hard threshold. The judged quantity is "no events" —
- * and silence has several causes, only one of which deserves a kill: a genuine
- * hang, versus a long prefill on a large context, versus upstream throttling /
- * retry backoff, versus a phase the runner simply does not report. The bridge
- * cannot tell them apart from the event stream alone, and the costs are wildly
- * asymmetric: killing a working turn destroys minutes of real work and reads as
- * a product defect (2026-07, an MCP-heavy adopter lost turn after turn this
- * way), while waiting longer on a truly hung one costs only time that the
- * 60-min subprocess runaway guard already bounds. Same asymmetry the task
- * patrol is designed around: false alarms are absorbable, structural
- * misjudgment is not.
- *
- * 3× is deliberately blunt, and uniform. BL-48 also specced a phase split —
- * wide grace while awaiting a response, TIGHT once tokens have started, on the
- * theory that a mid-generation stall is the strongest hang signal available.
- * That split is rejected here on the evidence: the 2026-07 field failure this
- * grading exists for was killed mid-turn, after 38 tool calls and 22 minutes of
- * real work, and a "tight once streaming" rule would have killed it again. The
- * bridge cannot distinguish "stopped mid-answer because it hung" from "stopped
- * mid-answer because the next model request is slow", and guessing wrong is the
- * expensive direction. If a split is ever revisited it belongs here, but it
- * needs data on recovery times first — which the resume log now records.
- *
- * Operators who need a different budget move `idle_timeout_seconds`; both the
- * suspect mark and the kill scale with it.
- */
-// Retired with the owner's 2026-07-28 decision (idle-kill is opt-in now, so there is
-// no multiplier to apply to a default that no longer kills). Kept only as the
-// documented history of what the graded default used to be.
-// const IDLE_SUSPECT_TO_KILL_MULTIPLIER = 3;
-// RETIRED as a behavior knob (BL-48 修订 2026-07-28): the kill is no longer
-// derived from the suspect threshold at all — it is opt-in via
-// `idle_kill_seconds` (see resolveIdleKillAfterMs). Kept only because the v0.3.71
-// grading doc above records why a phase-aware split was rejected, which is still
-// the standing decision. Nothing reads it.
 
 /**
  * BL-48 修订 (2026-07-28, owner decision): **the idle watchdog no longer
@@ -210,10 +155,10 @@ const DEFAULT_CARDKIT_IDLE_TIMEOUT_MS = 3 * 60 * 1000;
  *    redundant with a control they had all along. And it actively shortened it:
  *    killing the turn completes the bubble, which removes the ⏹.
  *
- * 3. **The card can still reach a terminal state without it.** What finalizes a
- *    card is the run ending, and the 60-min subprocess runaway guard
- *    (subprocessTimeoutMs) already guarantees that unconditionally. The 3-min
- *    kill only made it terminal *sooner*, at the price of destroying the work.
+ * 3. **Finishing and stopping remain explicit.** The runner's completion or
+ *    failure, the user's stop, or an operator-configured total budget finalizes
+ *    the card. With no budget and no stop, a silent turn may remain pending;
+ *    a notice is not evidence that the work should be destroyed.
  *
  * 4. **It defended the cheap failure and was blind to the expensive one.** A
  *    silent hang costs a concurrency slot and zero tokens; a livelock (looping
@@ -222,7 +167,7 @@ const DEFAULT_CARDKIT_IDLE_TIMEOUT_MS = 3 * 60 * 1000;
  *    tracked separately.
  *
  * What still terminates a turn: the runner finishing, the user's ⏹ / `/stop`,
- * the 60-min runaway guard, and `idle_kill_seconds` where an operator asks for
+ * an explicit total wall-clock budget, and `idle_kill_seconds` where an operator asks for
  * it — unattended fleets (cron, batch dispatch) have nobody reading the bubble,
  * so they can still opt into a shorter automatic cut.
  *
@@ -235,37 +180,22 @@ export function resolveIdleKillAfterMs(
   suspectAfterMs: number,
 ): number | undefined {
   if (configuredKillMs === undefined) return undefined;
-  // The ceiling is absolute — it is the one thing that keeps an opted-in kill
-  // strictly inside the 60-min runaway guard. `max(suspect, …)` runs INSIDE it,
-  // not around it: an operator who sets a suspect threshold past the ceiling
-  // (idle_timeout_seconds has no upper bound) would otherwise push the kill past
-  // the guard and silently lose both the 已中断 card and BL-38's counting
-  // (independent review 2026-07-28). Past the ceiling the interrupt can land
-  // before the ⏳ notice — accepted, and strictly better than crossing the guard.
+  // Preserve the opt-in idle-kill ceiling independently of total budgets.
+  // A notice threshold above the ceiling must not disable the opted-in kill;
+  // in that case interruption can occur before the notice is due.
   return Math.min(Math.max(suspectAfterMs, configuredKillMs), IDLE_KILL_CEILING_MS);
 }
 
 /**
- * Absolute ceiling on the graded grace, independent of `idle_timeout_seconds`.
- *
- * Two things break if the kill point drifts past the 60-min subprocess runaway
- * guard: the interrupt card degrades to the generic 进程异常退出 wording, and
- * BL-38's consecutive-idle-kill session reset stops counting (it only counts
- * confirmed idle-kills). `idle_timeout_seconds: 1200` — a plausible value, and
- * bigger than the 600 we hand out as a stopgap — would cross that line with a
- * bare 3×. The ceiling also bounds how long one wedged turn can hold a pooled
- * concurrency slot.
+ * Existing ceiling on opt-in continuous-silence kills, independent of the
+ * notice threshold and any total wall-clock budget. Never enabled by default.
  */
 const IDLE_KILL_CEILING_MS = 15 * 60 * 1000;
 
 /**
- * How often the ⏳ waiting notice re-states the elapsed silence.
- *
- * With idle-kill off by default a stall can legitimately last until the 60-min
- * runaway guard, and this line is the only thing telling the operator how long
- * it has been — so it has to keep counting. 60 s keeps a worst-case stall at
- * ~60 card patches instead of one per watchdog tick (cadence can be as tight as
- * idle/4).
+ * Refresh the elapsed-silence notice once a minute while a turn remains quiet.
+ * With neither idle-kill nor a total budget, waiting is unbounded; the notice
+ * must keep counting rather than implying a frozen status or deadline.
  */
 const IDLE_NOTICE_REFRESH_MS = 60_000;
 
@@ -1083,16 +1013,12 @@ export interface BridgeHandlerDeps {
   permissionsAllowExtra?: string[];
   /** @default 'bypassPermissions' (aligns Claude with Codex full-host posture). */
   permissionMode?: "acceptEdits" | "ask" | "bypassPermissions";
-  /** @default 60 * 60 * 1000 (60 min — real D1-D3 with Agent subagent easily exceeds 15min) */
+  /** Optional per-run wall-clock budget in ms; undefined or 0 disables it. */
   subprocessTimeoutMs?: number;
   /**
-   * CardKit running-card watchdog. CardKit has a visible response surface, so
-   * it gets a shorter cap than long-running backend subprocesses: if the
-   * agent has not produced a fresh terminal state before this cap, the same
-   * CardKit card finalizes as a clean timeout instead of hanging forever.
-   *
-   * @default 20 * 60 * 1000
-   * @deprecated PRB-9: no longer the primary interrupt. Use responseSurfaceIdleTimeoutMs.
+   * @deprecated Ignored compatibility field: the fixed CardKit response-surface
+   * deadline is retired. Use responseSurfaceIdleTimeoutMs for a notice or
+   * subprocessTimeoutMs for an explicit total wall-clock budget.
    */
   responseSurfaceTimeoutMs?: number;
   /**
@@ -1105,10 +1031,10 @@ export interface BridgeHandlerDeps {
   /**
    * BL-48 修订: opt-in automatic interrupt, in ms of continuous silence. Unset →
    * **no idle-kill at all** (see resolveIdleKillAfterMs for the
-   * full rationale); the turn ends via the runner, the user's ⏹ / `/stop`, or the
-   * 60-min runaway guard. Set it for unattended fleets where nobody is watching
-   * the bubble. Clamped to IDLE_KILL_CEILING_MS and to at least the suspect
-   * threshold. Wired from bot yaml `idle_kill_seconds`.
+   * full rationale); the turn ends via the runner, the user's ⏹ / `/stop`, or an
+   * explicit total wall-clock budget. Set it for unattended fleets where nobody is watching
+   * the bubble. At least the suspect threshold unless the absolute
+   * IDLE_KILL_CEILING_MS is lower. Wired from bot yaml `idle_kill_seconds`.
    */
   responseSurfaceIdleKillMs?: number;
   /**
@@ -1420,6 +1346,14 @@ export class BridgeHandler {
    * per key, and register/delete never interleave across turns.
    */
   private readonly activeTurnStops = new Map<string, () => void>();
+  /** Finished cold turns whose process death has not yet been confirmed. */
+  private readonly coldProcessLifetimes = new Set<{
+    threadId: string;
+    backend: string;
+    cwd: string;
+    sessionId?: string;
+    done: boolean;
+  }>();
 
   /**
    * v3.2 交接断链检测 (docs/task-handle.md §13, revision 2): per-thread "most
@@ -1786,14 +1720,16 @@ export class BridgeHandler {
     // raw event (== parsed.messageId) so it's available even before parsing.
     const settleMessageId = event.message_id;
     let settled = false;
-    // Set once the agent subprocess has finished a full run (handle.done
-    // resolved). A failure AFTER this point (finalize/render/teardown blips)
+    // Set once a runner returns a terminal result (handle.done resolved), not
+    // proof of process death. A failure AFTER this point (render/teardown blips)
     // must NOT trigger the proactive gap-fill replay: the agent already did
     // the work (possibly with side effects — commits, MRs, messages), and
     // re-running the whole turn up to the poison cap multiplies those side
     // effects. Such messages stay re-dispatchable only via a reconnect
     // gap-fill window (pre-existing behavior), not the steady-state replay.
     let agentRunCompleted = false;
+    // A fail-closed process-liveness refusal is terminal, not a replay request.
+    let processLivenessRefused = false;
     // COT (思维链) side channel — declared at function scope so the finally
     // safety net below can see it on any exit path. Created once per turn
     // inside the try, fed every event, finalized on success/error; the
@@ -1866,7 +1802,7 @@ export class BridgeHandler {
       // success, all released for replay on failure (their content rode this
       // turn's prompt, so a replayed primary re-absorbs them via gap-fill).
       for (const id of [settleMessageId, ...followups.map((f) => f.message_id)]) {
-        if (ok) this.deps.client.markHandled?.(id);
+        if (ok || processLivenessRefused) this.deps.client.markHandled?.(id);
         else this.deps.client.markUnhandled?.(id, { replay: !agentRunCompleted });
       }
     };
@@ -3470,15 +3406,9 @@ export class BridgeHandler {
         // every bot that doesn't opt into pooling (see botConfig.runnerKey doc).
         const runnerKey = this.deps.botConfig?.runnerKey ?? backend;
         const permissionMode = this.deps.permissionMode ?? "bypassPermissions";
-        // Default 60min — real-business prompts (D1-D3 multi-file write +
-        // Agent-tool subagent spawn) easily exceed 15min. Per-spawn timeout
-        // is just a runaway guard, not a UX choice.
-        // PRB-9 (§12): the runner gets only the coarse subprocess runaway guard
-        // (default 60 min) — NOT the retired 20-min response-surface cut. The
-        // primary interrupt is the idle watchdog below, so a turn that keeps
-        // producing activity runs to completion regardless of total duration.
-        const baseTimeoutMs = this.deps.subprocessTimeoutMs ?? 60 * 60 * 1000;
-        const timeoutMs = baseTimeoutMs;
+        // Native long tasks have no implicit total deadline. A configured
+        // budget is wall-clock time, not idle time; activity never renews it.
+        const timeoutMs = resolveRunTimeoutMs(this.deps.subprocessTimeoutMs);
         const idleTimeoutMs =
           this.deps.responseSurfaceIdleTimeoutMs ?? DEFAULT_CARDKIT_IDLE_TIMEOUT_MS;
         const runnerStartedAt = Date.now();
@@ -3510,6 +3440,15 @@ export class BridgeHandler {
           );
         }
 
+        const resumeSessionId = forceFreshSession || incompatibleSession
+          ? undefined : currentExisting?.sessionId || undefined;
+        if ([...this.coldProcessLifetimes].some((prior) => prior.done && (
+          prior.threadId === threadId ||
+          (prior.backend === backend && prior.cwd === runCwd && resumeSessionId !== undefined && prior.sessionId === resumeSessionId)
+        ))) {
+          processLivenessRefused = true;
+          throw new Error("上一个 runner 进程尚未确认退出，本轮未启动；为避免同一 session 出现两个写者，请等待进程退出后再发送。不会自动重试或新建 session。");
+        }
         turnPerf.mark("runnerRunAt");
         const handle = createRunner(runnerKey).run({
           prompt,
@@ -3519,9 +3458,7 @@ export class BridgeHandler {
           // delete). `|| undefined`: a fresh-start-marked record carries
           // sessionId "" (批H H1) — an empty string must never reach the
           // runner as a resume target.
-          resumeSessionId: forceFreshSession || incompatibleSession
-            ? undefined
-            : currentExisting?.sessionId || undefined,
+          resumeSessionId,
           // 批F (F2): tells ClaudeProcessPool to retire this thread's live warm
           // process first — the pool key excludes sessionId, so without this a
           // warm entry would silently continue the OLD session. Cold runners
@@ -3548,13 +3485,30 @@ export class BridgeHandler {
             if (!(marker in perfMarkers)) perfMarkers[marker] = atMs;
           },
         });
+        const coldLifetime = handle.processExited ? {
+          threadId, backend, cwd: runCwd, sessionId: resumeSessionId, done: false,
+        } : undefined;
+        let coldPidCleanup: Promise<unknown> = Promise.resolve();
+        if (coldLifetime) {
+          this.coldProcessLifetimes.add(coldLifetime);
+          void handle.done.then((result) => {
+            coldLifetime.done = true;
+            coldLifetime.sessionId = result.sessionId ?? coldLifetime.sessionId;
+          }, () => { coldLifetime.done = true; });
+          void handle.processExited!.then(async () => {
+            // Keep replacement blocked through this session's PID cleanup;
+            // otherwise an old read-then-remove could erase the new PID.
+            await coldPidCleanup;
+            this.coldProcessLifetimes.delete(coldLifetime);
+          }, () => {
+            // No death confirmation means fail closed, never assume success.
+          });
+        }
 
-        // PRB-9 idle watchdog: interrupt only on a real hang (no runner activity
-        // for idleTimeoutMs), never on total wall-clock. Any stream event pokes
-        // lastActivityAt; if the gap exceeds the threshold we kill the runner and
-        // route to the unified explicit-failure sink (§12.2). Only armed for the
-        // CardKit streaming surface. Check cadence = idle/4 (bounded 50ms–15s) so
-        // prod polls ~every 15s and tests with a tiny threshold fire promptly.
+        // Idle watchdog: any stream event refreshes lastActivityAt. Silence
+        // produces a notice; interruption is a separate operator opt-in. This
+        // never imposes a default wall-clock limit on active or quiet work.
+        // Check cadence = idle/4 (bounded 50ms–15s).
         //
         // A3 (perf plan): a single long tool call (e.g. a slow build, a subagent
         // spawn) emits no stream events between its tool_use and matching
@@ -3562,8 +3516,8 @@ export class BridgeHandler {
         // in-flight tool calls from the actual tool_use/tool_result events (NOT
         // a synthetic timer that fakes activity — that would blind the watchdog
         // to genuine hangs) and exempt the idle judgment while any are pending.
-        // The 60-min subprocess runaway guard (timeoutMs above) is untouched —
-        // it still backstops a tool call that never returns at all.
+        // An explicitly configured total budget still includes tool waits;
+        // without one the user's /stop remains the way to end a stuck tool.
         let lastActivityAt = Date.now();
         let interruptedByIdle = false;
         // BL-48 分级处置 state: `idleSuspected` flips when silence first crosses
@@ -3646,20 +3600,14 @@ export class BridgeHandler {
         // KNOWN GAP (BL-48 修订): the ⏳ notice can only be rendered on the
         // CardKit status line (`cardKitProgress?.markIdleWaiting`). On the
         // legacy-card / post fallback paths a stall is therefore silent — the
-        // card keeps saying 努力回答中 until the turn ends (worst case the 60-min
-        // guard) unless the bot opted into `idle_kill_seconds`. Those paths are
+        // card keeps saying 努力回答中 until the turn ends; there is no implicit
+        // deadline unless the bot opts into a budget. Those paths are
         // already the degraded ones, and `/stop` still works there; a visible
         // stall notice for them needs a status affordance those surfaces don't
         // have yet, so it stays a gap rather than a reason to keep killing.
         {
           const cadenceMs = Math.max(50, Math.min(Math.floor(idleTimeoutMs / 4), 15_000));
-          // Grace is capped, and never below the threshold itself: past
-          // IDLE_KILL_CEILING_MS the multiplier would push the kill beyond the
-          // 60-min subprocess runaway guard, which silently costs BOTH the idle
-          // card (the generic 进程异常退出 card would win) and BL-38's
-          // consecutive-idle-kill session reset (it only counts confirmed
-          // idle-kills). An operator raising idle_timeout_seconds must not
-          // disable either by accident.
+          // The existing idle-kill ceiling is independent of any total budget.
           //
           // BL-48 修订: this is now opt-in. `undefined` = never kill on idle
           // (the default — see resolveIdleKillAfterMs). An operator who sets
@@ -3674,7 +3622,7 @@ export class BridgeHandler {
             // A3's exemption applies to the INTERRUPT only. It used to sit here as a
             // bare `return`, which also suppressed the ⏳ notice and the hang
             // evidence: a turn wedged mid-tool (tool_use with a tool_result that
-            // never comes) showed the user nothing for the full hour and fed BL-38
+            // never comes) showed the user nothing for the entire wait and fed BL-38
             // nothing either, so its session could never self-heal (independent
             // review, round 4). "No output for X minutes" is TRUE during a long
             // tool call, and worth saying.
@@ -3723,7 +3671,7 @@ export class BridgeHandler {
                     `(idle threshold ${Math.round(idleTimeoutMs / 1000)}s) — suspect, not dead; ` +
                     (idleKillAfterMs === undefined
                       ? `no idle-kill configured, the turn keeps running ` +
-                        `(ends on the runner, the user's ⏹ / /stop, or the runaway guard)`
+                        `(ends on the runner, the user's ⏹ / /stop, or an explicit total budget)`
                       : `will interrupt at ${Math.round(idleKillAfterMs / 1000)}s of continuous silence`) +
                     (this.deps.botConfig?.id ? ` [bot ${this.deps.botConfig.id}]` : ""),
                 );
@@ -3751,12 +3699,11 @@ export class BridgeHandler {
             //   - IDLE_KILL_CEILING_MS still binds. Sitting behind the early
             //     return alone, a suspect threshold past the ceiling made the real
             //     interrupt point the THRESHOLD, not the clamp — so a bot with
-            //     `idle_timeout_seconds > 3600` could push its interrupt past the
-            //     60-min runaway guard the ceiling exists to stay inside, which
-            //     silently costs the 已中断 card and BL-38's counting.
+            //     a very large idle_timeout_seconds could silently override the
+            //     operator's existing capped idle-kill behavior.
             // When the clamp puts the kill below the suspect threshold, the
             // interrupt lands without a notice — unavoidable (the notice is not due
-            // yet) and strictly better than crossing the guard.
+            // yet) and preserves the existing opted-in ceiling.
             if (!toolExemptsKill && idleKillAfterMs !== undefined && silentMs >= idleKillAfterMs) {
               interruptedByIdle = true;
               idleKilledAfterMs = silentMs;
@@ -3825,6 +3772,17 @@ export class BridgeHandler {
             .catch(() => {
               /* best-effort GC hint — never fail the turn on pid-file write */
             });
+          if (handle.processExited) {
+            coldPidCleanup = handle.processExited.then(async () => {
+              await pidFileWriteSettled;
+              try {
+                // A later turn may already have replaced this hint. Never
+                // remove its PID while cleaning up the earlier process.
+                const recorded = JSON.parse(await fs.readFile(sessionPidFile, "utf8")) as { pid?: number };
+                if (recorded.pid === handle.pid) await fs.rm(sessionPidFile, { force: true });
+              } catch { /* best-effort liveness hint cleanup */ }
+            }, () => { /* unknown death keeps the hint */ });
+          }
         }
 
         // Step 4d: stream events
@@ -3917,6 +3875,7 @@ export class BridgeHandler {
             if (cotSink) cotSink.handle(ev);
             if (ev.type === "system_init") {
               sessionId = ev.sessionId;
+              if (coldLifetime) coldLifetime.sessionId = ev.sessionId;
             }
             if (ev.type === "result") resultEvent = ev;
             if ((ev.type === "answer_delta" || ev.type === "answer_snapshot") && ev.text.trim()) {
@@ -4177,10 +4136,9 @@ export class BridgeHandler {
             console.warn("[bridge.handler] task signal chain failed (continuing):", err);
           });
 
-          // Thin-channel: NO dev_url HTTP probe, NO stage state-machine, NO
-          // demotion. The finalize truth-ordering below reduces to status/exitCode
-          // only (status=failed → fail; status=ready → success; exitCode 0 →
-          // success; else → fail).
+          // Thin-channel: no dev_url HTTP probe or business-state decisions.
+          // Finalization uses runtime interruption, reported status and exit
+          // result; a ready file cannot erase an explicit stop.
 
           // Step 4e-pre: finalize outcome + BL-38 poison-session self-heal.
           // The success/failure truth-ordering is decided HERE (moved up from
@@ -4189,21 +4147,20 @@ export class BridgeHandler {
           // reuses `success` / `failureReason` / `cardKitTimeoutFailure` — it
           // does not recompute them.
           //
-          // Truth ordering (most authoritative first):
-          //   1. bot wrote status=failed → fail (use bot's error)
-          //   2. bot wrote status=ready → success (regardless of exitCode — the
-          //      runner grace-timer may SIGTERM claude when a non-detached
-          //      grandchild blocks exit, an OS quirk, not a real failure)
-          //   3. idle watchdog fired (real hang) → fail (已中断)
-          //   4. exitCode === 0 → success (clean exit, bot wrote no status)
-          //   5. else → fail (real crash)
+          // Explicit interruption cannot be overridden by a ready state file.
+          // Normal post-result process cleanup is NOT `interrupted`, so its
+          // historical ready + nonzero-exit success behavior remains intact.
           const reportedStatus = reportedState?.status;
           const reportedError = reportedState?.error;
+          const budgetExhausted = result.interruptionReason === "timeout";
+          const budgetFailureReason = "本轮已达到显式运行总预算" +
+            (timeoutMs !== undefined ? `（${timeoutMs / 1000} 秒）` : "") +
+            "，已中断，未正常完成；不是用户 /stop 或静默超时。";
           // stoppedByUser outranks the idle judgment: if both fired, the user
           // explicitly cancelled — finalize as 已停止, don't feed BL-38.
           const cardKitTimeoutFailure =
             !stoppedByUser &&
-            interruptedByIdle && reportedStatus !== "ready" && reportedStatus !== "failed";
+            interruptedByIdle && reportedStatus !== "failed";
 
           /**
            * BL-38 evidence, decoupled from the kill (BL-48 修订).
@@ -4211,8 +4168,8 @@ export class BridgeHandler {
            * BL-38's poison-session self-heal used to be fed by `interruptedByIdle`
            * — i.e. by the watchdog's own kill. With idle-kill now opt-in, that
            * wiring would have made the self-heal DEAD for every default bot: a
-           * thread whose resumed session reproducibly hangs would burn the full
-           * 60-min runaway guard on every @, forever, without ever reseeding
+           * thread whose resumed session reproducibly hangs could fail again
+           * on every @ without ever reseeding
            * (independent review, 2026-07-28 — the first draft of this change got
            * this wrong).
            *
@@ -4316,11 +4273,12 @@ export class BridgeHandler {
             reportedStatus !== "ready";
           let success: boolean;
           let failureReason: string | undefined;
-          if (reportedStatus === "failed") {
+          if (budgetExhausted) {
+            // A later /stop during bounded teardown must not rewrite the
+            // runner's first cause from budget exhaustion to user cancel.
             success = false;
-            failureReason = reportedError ?? "bot 报告 failed (无 error 字段)";
-          } else if (reportedStatus === "ready") {
-            success = true;
+            failureReason = budgetFailureReason;
+            await recordEvent({ status: "running", appendPath: "运行总预算耗尽", reason: failureReason });
           } else if (stoppedByUser) {
             success = false;
             failureReason = "已被用户 /stop 停止";
@@ -4329,6 +4287,9 @@ export class BridgeHandler {
               appendPath: "用户停止",
               reason: failureReason,
             });
+          } else if (reportedStatus === "failed") {
+            success = false;
+            failureReason = reportedError ?? "bot 报告 failed (无 error 字段)";
           } else if (cardKitTimeoutFailure) {
             success = false;
             failureReason =
@@ -4339,6 +4300,12 @@ export class BridgeHandler {
               appendPath: "Agent 卡死中断",
               reason: failureReason,
             });
+          } else if (result.interrupted) {
+            success = false;
+            failureReason = "本轮已中断（显式停止或运行预算），未正常完成";
+            await recordEvent({ status: "running", appendPath: "Agent 运行中断", reason: failureReason });
+          } else if (reportedStatus === "ready") {
+            success = true;
           } else if (result.exitCode === 0 && !idleHangObserved) {
             //
             // KNOWN PRE-EXISTING INCOHERENCE, deliberately left alone: a turn that
@@ -4414,11 +4381,11 @@ export class BridgeHandler {
           // for the finally's late-adoption finalize (a background-adopted
           // bubble may not exist as cotPublisher yet here).
           cotTurnOutcome = success ? "done" : "error";
-          cotTurnMessage = stoppedByUser
+          cotTurnMessage = budgetExhausted ? "wall-clock budget exhausted" : stoppedByUser
             ? "stopped by user"
             : interruptedByIdle
               ? "idle timeout"
-              : undefined;
+              : result.interrupted ? "run interrupted" : undefined;
           if (cotPublisher) {
             const publisher = cotPublisher;
             const ledgerAt = cotFileAt;
@@ -4628,6 +4595,7 @@ export class BridgeHandler {
           //     this expression self-evidently safe).
           const untrustedAnswerFallback =
             !stoppedByUser &&
+            !result.interrupted &&
             !cardKitTimeoutFailure &&
             result.exitCode === 0 &&
             reportedState?.last_message == null &&
@@ -4662,7 +4630,9 @@ export class BridgeHandler {
               : "") +
             "下一步：换个说法重试，或新开一个话题继续；若反复如此，请让维护者查看该 session 日志。";
           const cardBody =
-            stoppedByUser
+            budgetExhausted
+              ? `⚠️ ${budgetFailureReason}本话题 session 保留；是否继续由用户决定。`
+              : stoppedByUser
               // BL-42: user-initiated stop — neutral wording, session kept.
               ? "⏹ 已按 /stop 停止本轮。本话题 session 保留，需要继续时再 @ 我。"
               : stuckResetTriggered
@@ -4694,6 +4664,8 @@ export class BridgeHandler {
                 // latter without asking us.
                 ? `⚠️ 本轮被中断（连续 ${formatSilence(idleKilledAfterMs)}没有任何输出，判定卡死），未完成。请重试。\n` +
                   idleThresholdHint(idleTimeoutMs, idleKillAfterMs)
+                : result.interrupted
+                  ? "⚠️ 本轮已中断（显式停止或运行预算），未正常完成。本话题 session 保留；是否继续由用户决定。"
                 : idleHangObserved
                   // BL-48 修订: silent, produced nothing, and NOBODY interrupted it
                   // — the ending this change makes the common one. It used to fall
@@ -4810,11 +4782,11 @@ export class BridgeHandler {
             success,
             failureReason,
             titleOverride:
-              reportedState?.card_title ??
-              (stoppedByUser ? "已停止" : cardKitTimeoutFailure ? "已中断" : neutralTitle),
+              budgetExhausted ? "预算耗尽" : stoppedByUser ? "已停止" : result.interrupted || cardKitTimeoutFailure ? "已中断" :
+                reportedState?.card_title ?? neutralTitle,
             colorOverride:
-              reportedState?.card_color ??
-              (stoppedByUser || neutralTitle ? "neutral" : undefined),
+              budgetExhausted ? undefined : stoppedByUser ? "neutral" : result.interrupted || cardKitTimeoutFailure ? undefined :
+                reportedState?.card_color ?? (neutralTitle ? "neutral" : undefined),
             // V2 dynamic-choice buttons — agent-declared, rendered verbatim.
             // reportedState is null when state.json wasn't freshly written
             // (stale-guard), so stale leftover choices never reappear.

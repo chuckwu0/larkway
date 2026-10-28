@@ -142,7 +142,12 @@ export interface RunOptions {
    * @default undefined
    */
   threadId?: string;
-  /** @default 15 * 60 * 1000 (15 min) */
+  /**
+   * Optional per-turn wall-clock budget, including startup and tool waits.
+   * Undefined or 0 disables it (default); activity does not renew a positive
+   * budget. Positive integers must fit Node's timer range (<= 2_147_483_647).
+   * Cancellation and process cleanup remain active without a budget.
+   */
   timeoutMs?: number;
   abortSignal?: AbortSignal;
   /** @default 'claude' */
@@ -258,6 +263,12 @@ export function markPerfForEventType(
 export interface RunHandle {
   events: AsyncIterable<AgentStreamEvent>;
   /**
+   * Cold one-shot process liveness, independent of bounded turn settlement.
+   * Resolves only on actual process exit/close or confirmed spawn failure.
+   * Warm shared processes omit it. A settled done does not imply this resolved.
+   */
+  processExited?: Promise<void>;
+  /**
    * Set by pooled runners; absent for one-shot runners. `pooled` means this
    * turn ran in a pool-managed child, including that child's first turn;
    * false means the pool fell back to a one-shot child or never dispatched.
@@ -269,6 +280,10 @@ export interface RunHandle {
    */
   done: Promise<{
     exitCode: number;
+    /** Explicit kill/abort/budget expiry, never normal post-result cleanup. */
+    interrupted?: boolean;
+    /** First explicit stop cause; absent for normal completion/cleanup. */
+    interruptionReason?: "cancel" | "timeout";
     sessionId?: string;
     pooled?: boolean;
     resumeMode?: "same-process" | "cold";

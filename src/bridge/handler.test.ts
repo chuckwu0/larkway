@@ -8,6 +8,7 @@
  */
 import { describe, it, expect, vi, beforeEach, afterEach, beforeAll } from "vitest";
 import { mkdtemp, rm, mkdir, writeFile, readFile, readdir, stat, utimes } from "node:fs/promises";
+import fsPromises from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -27,6 +28,8 @@ import type { OutboundCotClient } from "../lark/channelCotClient.js";
 import type { PerfSample } from "./perfLog.js";
 import { _parseLinesMulti } from "../claude/runner.js";
 import { AnswerChannelExtractor } from "../agent/answerChannel.js";
+import { BotConfigSchema } from "../config/botLoader.js";
+import { botRunLimits } from "../config/runLimits.js";
 
 // ---------------------------------------------------------------------------
 // handler.ts calls createRunner("claude").run(...) from agent/runner.
@@ -36,7 +39,9 @@ import { AnswerChannelExtractor } from "../agent/answerChannel.js";
 
 let runClaudeImpl: (opts: unknown) => {
   events: AsyncIterable<unknown>;
-  done: Promise<{ exitCode: number; sessionId?: string }>;
+  processExited?: Promise<void>;
+  pid?: number;
+  done: Promise<{ exitCode: number; sessionId?: string; interrupted?: boolean; interruptionReason?: "cancel" | "timeout" }>;
   kill: () => void;
 };
 let runnerBackends: string[] = [];
@@ -568,6 +573,226 @@ async function seedRepoCachePath(): Promise<void> {
 }
 
 describe("handleOne — thin-channel finalize", () => {
+  it.each([false, true])("refuses cold replacement until real exit and PID cleanup (managed=%s), without replay or cross-topic blocking", async (managed) => {
+    await seedRepoCachePath();
+    let confirmExit!: () => void;
+    const processExited = new Promise<void>((resolve) => { confirmExit = resolve; });
+    const runs: Array<{ resumeSessionId?: string; threadId?: string }> = [];
+    const paths = workspacePaths();
+    const sessionPidFile = join(paths.sessionsDir, "om_guard", ".larkway", "runner.pid");
+    let releaseCleanup!: () => void;
+    const allowCleanup = new Promise<void>((resolve) => { releaseCleanup = resolve; });
+    let enteredCleanup!: () => void;
+    const cleanupEntered = new Promise<void>((resolve) => { enteredCleanup = resolve; });
+    if (managed) {
+      const originalRm = fsPromises.rm;
+      vi.spyOn(fsPromises, "rm").mockImplementation(async (file, options) => {
+        if (String(file) === sessionPidFile) {
+          enteredCleanup();
+          await allowCleanup;
+        }
+        return originalRm(file, options);
+      });
+    }
+    runClaudeImpl = (opts) => {
+      runs.push(opts as { resumeSessionId?: string; threadId?: string });
+      const first = runs.length === 1;
+      return {
+        processExited: first ? processExited : Promise.resolve(),
+        ...(managed ? { pid: 90_000 + runs.length } : {}),
+        events: (async function* () {
+          yield { type: "system_init", sessionId: first ? "sess_guard" : "sess_other", raw: {} };
+          yield { type: "answer_snapshot", text: "partial work", raw: {} };
+        })(),
+        done: Promise.resolve({ exitCode: first ? 1 : 0, sessionId: first ? "sess_guard" : "sess_other", ...(first ? { interrupted: true } : {}) }),
+        kill: () => {},
+      };
+    };
+    const { renderer, finalizeArgs } = makeCardRenderer();
+    const { store } = makePersistentSessionStore();
+    const acked: string[] = [];
+    const unhandled: string[] = [];
+    let handler!: InstanceType<typeof BridgeHandler>;
+    const waitTurn = async (count: number) => {
+      for (let i = 0; i < 100 && finalizeArgs.length < count; i++) await new Promise((r) => setTimeout(r, 10));
+      expect(finalizeArgs).toHaveLength(count);
+      await handler.whenAllTurnsSettled();
+    };
+    const message = (id: string, root?: string) => ({ ...makeEvent(), message_id: id, thread_id: root ?? id, ...(root ? { root_id: root } : {}) });
+    const client = {
+      async *events() {
+        yield message("om_guard");
+        await waitTurn(1);
+        yield message("om_blocked", "om_guard");
+        await waitTurn(2);
+        expect(runs).toHaveLength(1);
+        expect(finalizeArgs[1]?.failureReason).toContain("进程尚未确认退出");
+        yield message("om_peer");
+        await waitTurn(3);
+        expect(runs).toHaveLength(2);
+        confirmExit();
+        if (managed) {
+          await cleanupEntered; // deliberately hold old read→remove in flight
+          yield message("om_cleanup_blocked", "om_guard");
+          await waitTurn(4);
+          expect(runs).toHaveLength(2); // no writer while old PID cleanup can erase its hint
+          releaseCleanup();
+          for (let i = 0; i < 100; i++) {
+            if (!(await fsPromises.stat(sessionPidFile).then(() => true, () => false))) break;
+            await new Promise((r) => setTimeout(r, 5));
+          }
+        }
+        await new Promise<void>((r) => setImmediate(r));
+        yield message("om_after_exit", "om_guard");
+      },
+      addProcessingReaction: async () => {}, removeProcessingReaction: async () => {},
+      markHandled: (id: string) => acked.push(id),
+      markUnhandled: (id: string) => unhandled.push(id),
+    };
+    handler = new BridgeHandler({
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      client: client as any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      cardRenderer: renderer as any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      sessionStore: store as any,
+      conventions: managed ? {
+        ...makeConventions(), runtime: "agent_workspace", agentWorkspacePath: paths.workspacePath,
+        workspaceSessionsDir: paths.sessionsDir, workspaceReposPath: paths.reposDir,
+      } : makeConventions(),
+      ...(managed ? { botConfig: { id: "wsbot", name: "WS Bot", turn_taking_limit: 10, backend: "claude", runtime: "agent_workspace" } } : {}),
+    });
+    await handler.run();
+    await waitTurn(managed ? 5 : 4);
+    expect(runs).toHaveLength(3);
+    expect(runs[2]?.resumeSessionId).toBe("sess_guard");
+    expect(acked).toContain("om_blocked");
+    expect(unhandled).toEqual([]);
+  });
+
+  it.each(["ready", "failed"])("records explicit budget exhaustion separately from stop/idle even with reported %s", async (status) => {
+    const wt = await seedWorktree("om_msg");
+    await seedRepoCachePath();
+    runClaudeImpl = () => ({
+      events: (async function* () {
+        yield { type: "system_init", sessionId: "sess_budget_reason", raw: {} };
+        await writeFile(stateFileMod.stateFilePathOf(wt), JSON.stringify({
+          status, last_message: "Agent state", error: status === "failed" ? "stale error claim" : undefined,
+          card_title: "Agent title", card_color: "green", updated_at: new Date().toISOString(),
+        }));
+      })(),
+      done: Promise.resolve({ exitCode: 1, sessionId: "sess_budget_reason", interrupted: true, interruptionReason: "timeout" }),
+      kill: () => {},
+    });
+    const { renderer, finalizeArgs, whenFinalized } = makeCardRenderer();
+    const { store } = makeSessionStore();
+    const { client } = makeClient(makeEvent());
+    const handler = new BridgeHandler({
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      client: client as any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      cardRenderer: renderer as any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      sessionStore: store as any,
+      conventions: makeConventions(), subprocessTimeoutMs: 10_800_000,
+    });
+    await handler.run();
+    await whenFinalized;
+    await handler.whenAllTurnsSettled();
+    const final = finalizeArgs[0];
+    expect(final?.success).toBe(false);
+    expect(final?.failureReason).toContain("显式运行总预算（10800 秒）");
+    expect(final?.failureReason).toContain("不是用户 /stop 或静默超时");
+    expect(final?.titleOverride).toBe("预算耗尽");
+    expect(final?.colorOverride).toBeUndefined();
+    expect(final?.finalText).toContain("显式运行总预算");
+    expect(final?.finalText).not.toContain("Agent state");
+  });
+
+  it.each([true, false])("ready state only wins non-interrupted process cleanup (interrupted=%s)", async (interrupted) => {
+    const wt = await seedWorktree("om_msg");
+    await seedRepoCachePath();
+    runClaudeImpl = () => ({
+      events: (async function* () {
+        yield { type: "system_init", sessionId: "sess_terminal", raw: {} };
+        await writeFile(stateFileMod.stateFilePathOf(wt), JSON.stringify({
+          status: "ready", last_message: "Agent claimed completion",
+          card_title: "Agent success title", card_color: "green", updated_at: new Date().toISOString(),
+        }));
+      })(),
+      done: Promise.resolve({ exitCode: 1, sessionId: "sess_terminal", ...(interrupted ? { interrupted: true } : {}) }),
+      kill: () => {},
+    });
+    const { renderer, finalizeArgs, whenFinalized } = makeCardRenderer();
+    const { store } = makeSessionStore();
+    const { client } = makeClient(makeEvent());
+    const handler = new BridgeHandler({
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      client: client as any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      cardRenderer: renderer as any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      sessionStore: store as any,
+      conventions: makeConventions(),
+    });
+    await handler.run();
+    await whenFinalized;
+    await handler.whenAllTurnsSettled();
+    expect(finalizeArgs).toHaveLength(1);
+    expect(finalizeArgs[0]?.success).toBe(!interrupted);
+    if (interrupted) {
+      expect(finalizeArgs[0]?.finalText).toContain("本轮已中断");
+      expect(finalizeArgs[0]?.finalText).not.toContain("Agent claimed completion");
+      expect(finalizeArgs[0]?.failureReason).toContain("未正常完成");
+      expect(finalizeArgs[0]?.titleOverride).toBe("已中断");
+      expect(finalizeArgs[0]?.colorOverride).toBeUndefined();
+    } else {
+      expect(finalizeArgs[0]?.finalText).toBe("Agent claimed completion");
+    }
+  });
+
+  it.each([undefined, 0, 10_800])("passes configured wall-clock seconds %s through the production config mapping to the runner", async (seconds) => {
+    let runOpts: { timeoutMs?: number } | undefined;
+    runClaudeImpl = (opts: unknown) => {
+      runOpts = opts as { timeoutMs?: number };
+      return {
+        events: (async function* () {
+          yield { type: "system_init", sessionId: "sess_budget", raw: {} };
+          yield { type: "answer_snapshot", text: "Task complete", raw: {} };
+        })(),
+        done: Promise.resolve({ exitCode: 0, sessionId: "sess_budget" }),
+        kill: () => {},
+      };
+    };
+    const bot = BotConfigSchema.parse({
+      id: "budget", name: "Budget", description: "Budget fixture",
+      app_id: "cli_fixture", app_secret_env: "FIXTURE_SECRET", bot_open_id: "ou_fixture",
+      ...(seconds === undefined ? {} : { subprocess_timeout_seconds: seconds }),
+    });
+    const { renderer, whenFinalized } = makeCardRenderer();
+    const { store } = makeSessionStore();
+    const { client, acked } = makeClient(makeEvent());
+    await seedRepoCachePath();
+    const handler = new BridgeHandler({
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      client: client as any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      cardRenderer: renderer as any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      sessionStore: store as any,
+      conventions: makeConventions(),
+      ...botRunLimits(bot),
+    });
+    await handler.run();
+    await whenFinalized;
+    for (let i = 0; i < 100 && acked.length === 0; i++) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    expect(runOpts).toBeDefined();
+    expect(runOpts?.timeoutMs).toBe(seconds ? seconds * 1000 : undefined);
+    expect(acked).toEqual(["om_msg"]);
+  });
+
   it("passes missing lark-cli as an advisory runtime warning without blocking the agent", async () => {
     let runOpts: { prompt?: string } | undefined;
     runClaudeImpl = (opts: unknown) => {
@@ -1482,7 +1707,7 @@ describe("handleOne — thin-channel finalize", () => {
   });
 
   // The ⏳ line must keep COUNTING, not be stamped once: with no automatic kill a
-  // stall can legitimately run until the 60-min guard, and a frozen "已 3 分钟"
+  // stall can legitimately continue without a deadline, and a frozen "已 3 分钟"
   // reading makes a 55-minute wedge look identical to a brief pause (independent
   // review 2026-07-28). Refresh cadence is rate-limited (IDLE_NOTICE_REFRESH_MS),
   // so this drives it with a threshold small enough for several refreshes.
@@ -1645,8 +1870,8 @@ describe("handleOne — thin-channel finalize", () => {
       await new Promise((r) => setTimeout(r, 10));
     }
 
-    // Runner got the coarse runaway guard (≥60s), NOT the retired 20-min cut.
-    expect(runOpts?.timeoutMs ?? 0).toBeGreaterThan(60_000);
+    // Idle-kill opt-in does not invent a separate total wall-clock deadline.
+    expect(runOpts?.timeoutMs).toBeUndefined();
     // The idle watchdog killed the stalled runner.
     expect(killed).toBe(true);
     expect(acked).toEqual(["om_msg"]);
@@ -5952,8 +6177,8 @@ describe("BL-38: poison-session self-heal", () => {
     expect(text).not.toContain("可能崩溃");
   });
 
-  // The shape that MUST count: quiet, and it had to be ended for it (the 60-min
-  // runaway guard reaping a wedged turn is the flagship ending of this change).
+  // The shape that MUST count: quiet, then ended externally with no reported
+  // body. A configured budget is one possible ending; there is no default one.
   it("(a6) a quiet turn ended externally with nothing reported counts as a wedge", async () => {
     const { store, records } = seedStore(1);
     await seedWorktree(threadId);
@@ -6081,8 +6306,8 @@ describe("BL-38: poison-session self-heal", () => {
   // BL-48 修订 regression (independent review 2026-07-28): the counter used to be
   // fed by `interruptedByIdle`, i.e. by the KILL. With idle-kill opt-in, wiring it
   // that way made this self-heal dead on every default bot — a thread whose
-  // resumed session reproducibly hangs would burn the 60-min runaway guard on
-  // every @ forever and never reseed. The evidence is the observed SILENCE, not
+  // resumed session repeatedly ends after silence could fail on every @
+  // forever and never reseed. The evidence is the observed SILENCE, not
   // the kill, so a default-config bot must still count.
   it("(a2) counts a silent hang even with NO idle_kill_seconds — the self-heal cannot depend on the kill", async () => {
     const { store, records } = seedStore(0);
@@ -6926,6 +7151,71 @@ describe("run() /stop — kill in-flight turn, drop queue, keep session (BL-42)"
     expect(unhandled).toHaveLength(0);
     // Session record kept (a later @ resumes the thread).
     expect(puts.some((r) => r.sessionId === "sess_stop")).toBe(true);
+  });
+
+  it("a late /stop during teardown cannot overwrite the runner's budget-exhaustion cause", async () => {
+    await seedRepoCachePath();
+    const { firstRunStarted } = stoppableRunner();
+    const original = runClaudeImpl;
+    runClaudeImpl = (opts) => {
+      const handle = original(opts);
+      return { ...handle, done: handle.done.then((result) => ({
+        ...result, interrupted: true, interruptionReason: "timeout" as const,
+      })) };
+    };
+    const { renderer, finalizeArgs, whenFinalized } = makeCardRenderer();
+    const { store } = makeSessionStore();
+    const { client } = makeStopClient(async function* () {
+      yield topicEvent("om_budget_late_stop", undefined, "long task");
+      await firstRunStarted;
+      // Simulate the user clicking stop after a runner budget expired but
+      // before bounded process teardown delivered its terminal result.
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      yield topicEvent("om_late_stop", "om_budget_late_stop", "@_user_1 /stop");
+    }, firstRunStarted);
+    const handler = makeHandler(client, renderer, store);
+    await handler.run();
+    await whenFinalized;
+    await handler.whenAllTurnsSettled();
+    expect(finalizeArgs[0]?.success).toBe(false);
+    expect(finalizeArgs[0]?.titleOverride).toBe("预算耗尽");
+    expect(finalizeArgs[0]?.colorOverride).toBeUndefined();
+    expect(finalizeArgs[0]?.failureReason).toContain("显式运行总预算");
+  });
+
+  it("/stop outranks a fresh ready state even from a runner without interruption metadata", async () => {
+    const wt = await seedWorktree("om_ready_stop");
+    await seedRepoCachePath();
+    const { firstRunStarted } = stoppableRunner();
+    const original = runClaudeImpl;
+    let markReady!: () => void;
+    const ready = new Promise<void>((resolve) => { markReady = resolve; });
+    runClaudeImpl = (opts) => {
+      const handle = original(opts);
+      return { ...handle, events: (async function* () {
+        for await (const event of handle.events) yield event;
+        await writeFile(stateFileMod.stateFilePathOf(wt), JSON.stringify({
+          status: "ready", last_message: "Premature complete", card_title: "Complete", card_color: "green",
+          updated_at: new Date().toISOString(),
+        }));
+        markReady();
+      })() };
+    };
+    const { renderer, finalizeArgs, whenFinalized } = makeCardRenderer();
+    const { store } = makeSessionStore();
+    const { client } = makeStopClient(async function* () {
+      yield topicEvent("om_ready_stop", undefined, "long task");
+      await ready;
+      yield topicEvent("om_stop_ready", "om_ready_stop", "@_user_1 /stop");
+    }, firstRunStarted);
+    const handler = makeHandler(client, renderer, store);
+    await handler.run();
+    await whenFinalized;
+    await handler.whenAllTurnsSettled();
+    expect(finalizeArgs[0]?.success).toBe(false);
+    expect(finalizeArgs[0]?.titleOverride).toBe("已停止");
+    expect(finalizeArgs[0]?.colorOverride).toBe("neutral");
+    expect(finalizeArgs[0]?.finalText).toContain("已按 /stop 停止");
   });
 
   it("drops messages queued behind the killed turn and acks them — a /stop also cancels the backlog", async () => {
@@ -8258,9 +8548,7 @@ describe("resolveIdleKillAfterMs (BL-48 修订: idle-kill is opt-in)", () => {
     expect(resolveIdleKillAfterMs(600_000, 180_000)).toBe(600_000);
   });
 
-  // The ceiling exists so an opted-in kill can never drift past the 60-min
-  // subprocess runaway guard: beyond it the generic 进程异常退出 card would win
-  // and BL-38's consecutive-idle-kill reset would stop counting.
+  // Preserve the existing opt-in ceiling independently of total budgets.
   it("clamps a huge budget to the 15-min ceiling", () => {
     expect(resolveIdleKillAfterMs(60 * 60_000, 180_000)).toBe(15 * 60_000);
   });
@@ -8272,10 +8560,8 @@ describe("resolveIdleKillAfterMs (BL-48 修订: idle-kill is opt-in)", () => {
   });
 
   // …unless honoring that would cross the ceiling. `idle_timeout_seconds` has no
-  // upper bound, so a huge suspect threshold must NOT drag the kill past the
-  // 60-min runaway guard — beyond it the 已中断 card degrades to the generic
-  // crash card and BL-38 stops counting. The notice arriving after the interrupt
-  // is the lesser evil.
+  // upper bound, so a huge suspect threshold must NOT override the operator's
+  // capped idle-kill choice. The notice may consequently arrive after the kill.
   it("keeps the ceiling absolute even when the suspect threshold exceeds it", () => {
     expect(resolveIdleKillAfterMs(60_000, 40 * 60_000)).toBe(15 * 60_000);
   });

@@ -972,6 +972,183 @@ describe("runCodex() — spawn-level integration", () => {
     return result;
   }
 
+  // These advance a fake clock through real runner code with mocked pipes;
+  // they do not claim a three-hour live model/subprocess run.
+  it.each([undefined, 0])("has no implicit deadline across 3h of activity (timeoutMs=%s)", async (timeoutMs) => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+    try {
+      const fake = makeFakeCodexChild({ initialLines: [APP_INIT_RESPONSE, APP_THREAD_RESPONSE, APP_TURN_RESPONSE, appAgentStarted()] });
+      __nextFakeCodexChild = fake;
+      const { runCodex } = await import("./runner.js");
+      const handle = runCodex({ prompt: "long task", timeoutMs });
+      const events = collectEvents(handle.events);
+      let settled = false;
+      void handle.done.then(() => { settled = true; });
+      for (let step = 0; step < 6; step++) {
+        fake.stdout.write(appAgentDelta(`step ${step} `) + "\n");
+        await vi.advanceTimersByTimeAsync(30 * 60_000);
+        expect(settled).toBe(false);
+        expect(fake.child.killed).toBe(false);
+      }
+      fake.stdout.write(APP_TURN_COMPLETED + "\n");
+      const seen = await events;
+      expect(seen.filter((event) => event.type === "answer_delta")).toHaveLength(6);
+      await expect(handle.done).resolves.toMatchObject({ exitCode: 0, sessionId: APP_THREAD_ID });
+      expect((await handle.done).interrupted).toBeUndefined();
+      expect((await handle.done).interruptionReason).toBeUndefined();
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps a silent in-flight tool alive for 3h by default", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+    try {
+      const tool = { type: "mcpToolCall", id: "long-tool", server: "test", tool: "wait", arguments: {}, status: "inProgress" };
+      const fake = makeFakeCodexChild({ initialLines: [APP_INIT_RESPONSE, APP_THREAD_RESPONSE, APP_TURN_RESPONSE, appToolItem("item/started", tool)] });
+      __nextFakeCodexChild = fake;
+      const { runCodex } = await import("./runner.js");
+      const handle = runCodex({ prompt: "long tool" });
+      const events = collectEvents(handle.events);
+      await vi.advanceTimersByTimeAsync(3 * 60 * 60_000);
+      expect(fake.child.killed).toBe(false);
+      fake.stdout.write(appToolItem("item/completed", { ...tool, status: "completed" }) + "\n");
+      fake.stdout.write(APP_TURN_COMPLETED + "\n");
+      const seen = await events;
+      expect(seen.filter((event) => event.type === "tool_use")).toHaveLength(1);
+      expect(seen.filter((event) => event.type === "tool_result")).toHaveLength(1);
+      await expect(handle.done).resolves.toMatchObject({ exitCode: 0 });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it.each(["kill", "abort"])("%s without a deadline settles a silent child and clears resources", async (action) => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+    try {
+      const fake = makeFakeCodexChild();
+      __nextFakeCodexChild = fake;
+      const killSpy = vi.spyOn(fake.child, "kill");
+      const controller = new AbortController();
+      const removeListener = vi.spyOn(controller.signal, "removeEventListener");
+      const { runCodex } = await import("./runner.js");
+      const handle = runCodex({ prompt: "cancel me", abortSignal: controller.signal });
+      const events = collectEvents(handle.events);
+      if (action === "kill") handle.kill();
+      else controller.abort();
+      expect(killSpy).toHaveBeenCalledWith("SIGTERM");
+      await vi.advanceTimersByTimeAsync(7_000);
+      expect(killSpy).toHaveBeenCalledWith("SIGKILL");
+      await expect(handle.done).resolves.toMatchObject({ exitCode: 1, interrupted: true, interruptionReason: "cancel" });
+      await events;
+      expect(removeListener).toHaveBeenCalledWith("abort", expect.any(Function));
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it.each(["cancel", "timeout"] as const)("preserves the first cold interruption reason: %s", async (firstReason) => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+    try {
+      const fake = makeFakeCodexChild();
+      __nextFakeCodexChild = fake;
+      const { runCodex } = await import("./runner.js");
+      const handle = runCodex({ prompt: "reason", timeoutMs: 1_000 });
+      const events = collectEvents(handle.events);
+      if (firstReason === "cancel") handle.kill();
+      await vi.advanceTimersByTimeAsync(1_000);
+      handle.kill(); // cannot relabel a timeout (or reset an earlier cancel)
+      await vi.advanceTimersByTimeAsync(7_000);
+      await expect(handle.done).resolves.toMatchObject({ exitCode: 1, interrupted: true, interruptionReason: firstReason });
+      await events;
+      fake.triggerClose(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("forced done after cancellation does not claim the native process exited", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+    try {
+      const fake = makeFakeCodexChild();
+      __nextFakeCodexChild = fake;
+      const { runCodex } = await import("./runner.js");
+      const handle = runCodex({ prompt: "stubborn writer" });
+      const events = collectEvents(handle.events);
+      expect(handle.processExited).toBeDefined();
+      let exited = false;
+      void handle.processExited!.then(() => { exited = true; });
+      handle.kill();
+      await vi.advanceTimersByTimeAsync(7_000);
+      await expect(handle.done).resolves.toMatchObject({ exitCode: 1, interrupted: true, interruptionReason: "cancel" });
+      await events;
+      expect(exited).toBe(false);
+      fake.triggerExit(1); // stdout can remain open; the actual writer is gone
+      await handle.processExited;
+      expect(exited).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("an error with a live pid does not certify process exit", async () => {
+    const fake = makeFakeCodexChild();
+    __nextFakeCodexChild = fake;
+    const { runCodex } = await import("./runner.js");
+    const handle = runCodex({ prompt: "writer" });
+    let exited = false;
+    void handle.processExited!.then(() => { exited = true; });
+    const rejects = expect(handle.done).rejects.toThrow("signal failed");
+    fake.child.emit("error", new Error("signal failed"));
+    await rejects;
+    expect(exited).toBe(false);
+    fake.triggerClose(1);
+    await handle.processExited;
+    expect(exited).toBe(true);
+  });
+
+  it("does not report cancellation as success when the child exits cleanly", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+    try {
+      const fake = makeFakeCodexChild();
+      __nextFakeCodexChild = fake;
+      const { runCodex } = await import("./runner.js");
+      const handle = runCodex({ prompt: "cancel me" });
+      handle.kill();
+      fake.triggerClose(0);
+      await expect(handle.done).resolves.toMatchObject({ exitCode: 1, interrupted: true, interruptionReason: "cancel" });
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps a completed terminal state and creates no timers on a late kill", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+    try {
+      const fake = makeFakeCodexChild();
+      __nextFakeCodexChild = fake;
+      const killSpy = vi.spyOn(fake.child, "kill");
+      const { runCodex } = await import("./runner.js");
+      const handle = runCodex({ prompt: "done" });
+      fake.triggerClose(0);
+      await expect(handle.done).resolves.toMatchObject({ exitCode: 0 });
+      handle.kill();
+      expect(killSpy).not.toHaveBeenCalled();
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it.each([-1, Infinity, NaN, 2_147_483_648])("rejects invalid budget %s before spawning", async (timeoutMs) => {
+    const { runCodex } = await import("./runner.js");
+    expect(() => runCodex({ prompt: "invalid budget", timeoutMs })).toThrow(RangeError);
+    expect(__lastSpawnArgs).toBeNull();
+  });
+
   it("full happy path: app-server agentMessage deltas stream through answer_delta", async () => {
     const fake = makeFakeCodexChild();
     __nextFakeCodexChild = fake;
