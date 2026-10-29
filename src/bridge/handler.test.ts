@@ -8241,6 +8241,111 @@ describe("handleOne — untrusted-text rescue (answer outside markers)", () => {
 });
 
 // ---------------------------------------------------------------------------
+// Work still running at turn end — a pooled claude turn whose child still runs
+// background tasks (done.backgroundTasksPending), or an agent-declared
+// status:"in_progress", must not be finalized under "✅ 完成".
+// ---------------------------------------------------------------------------
+
+describe("handleOne — work still running when the turn ends", () => {
+  async function runTurn(
+    done: { exitCode: number; backgroundTasksPending?: number; stateFreshAfter?: number },
+    freshState?: Record<string, unknown>,
+  ): Promise<{ finalizeArgs: FinalizeArgs[] }> {
+    const wt = freshState ? await seedWorktree("om_msg") : undefined;
+    runClaudeImpl = () => ({
+      events: (async function* () {
+        yield { type: "system_init", sessionId: "sess_bg", raw: {} };
+        yield { type: "answer_delta", text: "修复已提交，真机验证还在后台跑。", raw: {} };
+        if (wt && freshState) {
+          await writeFile(
+            stateFileMod.stateFilePathOf(wt),
+            JSON.stringify(freshState, null, 2),
+            "utf8",
+          );
+        }
+      })(),
+      done: Promise.resolve({ ...done, sessionId: "sess_bg" }),
+      kill: () => {},
+    });
+    const { renderer, finalizeArgs, whenFinalized } = makeCardRenderer();
+    const { store } = makeSessionStore();
+    const { client, acked } = makeClient(makeEvent());
+    await seedRepoCachePath();
+    const handler = new BridgeHandler({
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      client: client as any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      cardRenderer: renderer as any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      sessionStore: store as any,
+      conventions: makeConventions(),
+      botConfig: { id: "frontend", name: "Frontend", turn_taking_limit: 10, backend: "claude" },
+    });
+    await handler.run();
+    await whenFinalized;
+    for (let i = 0; i < 100 && acked.length === 0; i++) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    return { finalizeArgs };
+  }
+
+  it("background tasks still running → ⏳ 后台任务进行中 (neutral), not ✅ 完成", async () => {
+    const { finalizeArgs } = await runTurn({ exitCode: 0, backgroundTasksPending: 2 });
+    expect(finalizeArgs).toHaveLength(1);
+    expect(finalizeArgs[0]?.success).toBe(true);
+    expect(finalizeArgs[0]?.finalText).toBe("修复已提交，真机验证还在后台跑。");
+    expect(finalizeArgs[0]?.titleOverride).toBe("⏳ 后台任务进行中");
+    expect(finalizeArgs[0]?.colorOverride).toBe("neutral");
+  });
+
+  it("agent-declared status:in_progress → ⏳ 进行中", async () => {
+    const { finalizeArgs } = await runTurn(
+      { exitCode: 0 },
+      { status: "in_progress", last_message: "还在做", updated_at: "2026-10-29T10:00:00.000Z" },
+    );
+    expect(finalizeArgs).toHaveLength(1);
+    expect(finalizeArgs[0]?.titleOverride).toBe("⏳ 进行中");
+    expect(finalizeArgs[0]?.colorOverride).toBe("neutral");
+  });
+
+  it("agent-declared status:ready wins over pending background tasks", async () => {
+    const { finalizeArgs } = await runTurn(
+      { exitCode: 0, backgroundTasksPending: 1 },
+      { status: "ready", last_message: "做完了", updated_at: "2026-10-29T10:00:00.000Z" },
+    );
+    expect(finalizeArgs).toHaveLength(1);
+    expect(finalizeArgs[0]?.titleOverride).toBeUndefined();
+  });
+
+  it("agent card_title still wins over the in-progress title", async () => {
+    const { finalizeArgs } = await runTurn(
+      { exitCode: 0, backgroundTasksPending: 1 },
+      { status: "in_progress", card_title: "验证中", last_message: "x", updated_at: "2026-10-29T10:00:00.000Z" },
+    );
+    expect(finalizeArgs[0]?.titleOverride).toBe("验证中");
+  });
+
+  it("a provisional report before the background yield cannot replace the final answer or re-display old choices", async () => {
+    const { finalizeArgs } = await runTurn(
+      { exitCode: 0, stateFreshAfter: Date.parse("2026-10-29T11:00:00.000Z") },
+      { status: "in_progress", last_message: "旧进度", updated_at: "2026-10-29T10:00:00.000Z",
+        choice_prompt: "旧选择", choices: [{ label: "旧选择", value: "old" }] },
+    );
+    expect(finalizeArgs[0]?.finalText).toBe("修复已提交，真机验证还在后台跑。");
+    expect(finalizeArgs[0]?.choices).toBeUndefined();
+    expect(finalizeArgs[0]?.titleOverride).toBe("💬 已回复");
+  });
+
+  it("a report written in the final background continuation remains authoritative", async () => {
+    const { finalizeArgs } = await runTurn(
+      { exitCode: 0, stateFreshAfter: Date.parse("2026-10-29T09:00:00.000Z") },
+      { status: "ready", last_message: "最终结果", updated_at: "2026-10-29T10:00:00.000Z" },
+    );
+    expect(finalizeArgs[0]?.finalText).toBe("最终结果");
+  });
+});
+
+// ---------------------------------------------------------------------------
 // BL-48 修订 — resolveIdleKillAfterMs (pure)
 // ---------------------------------------------------------------------------
 

@@ -60,6 +60,13 @@
  * `maxProcesses` (default {@link DEFAULT_MAX_PROCESSES}) live `claude`
  * children at once — heavier, so a size cap + LRU eviction of idle entries is
  * mandatory (never evicts an entry with an in-flight turn).
+ *
+ * Background tasks: a turn can end while work it started keeps running
+ * inside the child (Bash `run_in_background`, background Agent forks). The
+ * CLI reports the live set via `system/background_tasks_changed`; while it
+ * is non-empty the original turn keeps its consumer and deadline, including
+ * the CLI's autonomous follow-up answers. Neither idle reaping nor LRU can
+ * interrupt it. Between-turn work is protected for a bounded interval too.
  */
 
 import { execFile, spawn, type ChildProcess } from "node:child_process";
@@ -76,6 +83,7 @@ import type {
   PerfMarkerName,
   RunHandle,
   RunOptions,
+  TurnUsage,
 } from "../agent/runner.js";
 import { createPerfMarker, markPerfForEventType } from "../agent/runner.js";
 import { TurnEventQueue } from "../agent/turnEventQueue.js";
@@ -91,10 +99,27 @@ import {
   runClaude,
 } from "./runner.js";
 
-type DoneResult = { exitCode: number; sessionId?: string; pooled?: boolean; resumeMode?: "same-process" | "cold" };
+type DoneResult = {
+  exitCode: number;
+  sessionId?: string;
+  pooled?: boolean;
+  resumeMode?: "same-process" | "cold";
+  backgroundTasksPending?: number;
+  stateFreshAfter?: number;
+};
 
 /** @default 10 min — same idle-reap horizon as CodexProcessPool (src/codex/pool.ts). */
 export const DEFAULT_WARM_PROCESS_IDLE_MS = 10 * 60 * 1000;
+
+/**
+ * Upper bound on how long an entry that still reports live background tasks
+ * (see PoolEntry.backgroundTaskIds) is shielded from the idle sweep, counted
+ * from the first non-empty task list. Background agents and shells the CLI
+ * started in a finished turn live inside this child, so reaping it on the
+ * normal idle horizon kills them mid-run; the ceiling only exists so a task
+ * list that never empties (a CLI bug, a hung task) can't pin a slot forever.
+ */
+export const BACKGROUND_TASK_KEEPALIVE_MAX_MS = 2 * 60 * 60 * 1000;
 
 /** @default 6 — a size cap is mandatory here (see module doc's resource note). */
 export const DEFAULT_MAX_PROCESSES = 6;
@@ -114,6 +139,12 @@ const STDERR_BUFFER_CAP_BYTES = 64 * 1024;
 // ---------------------------------------------------------------------------
 
 interface TurnState {
+  readonly promptUuid: string;
+  /** Keep the original consumer attached through autonomous background follow-ups. */
+  waitingForBackground: boolean;
+  resetAnswerOnContent: boolean;
+  usageTotals?: TurnUsage;
+  stateFreshAfter?: number;
   readonly opts: RunOptions;
   readonly queue: TurnEventQueue;
   readonly markPerf: (marker: PerfMarkerName) => void;
@@ -181,8 +212,26 @@ interface PoolEntry {
   readonly binRealpath: string | undefined;
   readonly child: ChildProcess;
   readonly spawnedAt: number;
-  /** Bumped whenever a turn starts or ends on this entry — LRU eviction picks the smallest among idle entries. */
+  /**
+   * Bumped whenever a turn starts or ends on this entry, and on any child
+   * output between turns (e.g. the CLI's own follow-up turn after a
+   * background task finishes) — LRU eviction picks the smallest among idle
+   * entries.
+   */
   lastUsedAt: number;
+  /**
+   * Live background tasks (Bash run_in_background, background Agent forks…)
+   * as last reported by the CLI's `system/background_tasks_changed` event,
+   * which carries the full current list. They run inside this child and
+   * outlive the turn that started them, so a non-empty set keeps the entry
+   * out of idle reaping and LRU eviction (bounded by
+   * BACKGROUND_TASK_KEEPALIVE_MAX_MS).
+   */
+  backgroundTaskIds: Set<string>;
+  backgroundWorkStartedAt: number | undefined;
+  /** Native ScheduleWakeup metadata; it is not included in the CLI task list. */
+  scheduledWakeupAt: number | undefined;
+  readonly wakeupToolIds: Set<string>;
   /** The turn currently occupying this entry's single stdin/stdout wire, if any. */
   current: TurnState | undefined;
   /** A blank or newly spawned --resume child has not served a turn yet. */
@@ -399,6 +448,9 @@ export class ClaudeProcessPool implements AgentRunner {
     });
 
     const state: TurnState = {
+      promptUuid: randomUUID(),
+      waitingForBackground: false,
+      resetAnswerOnContent: false,
       opts,
       queue,
       markPerf,
@@ -507,7 +559,8 @@ export class ClaudeProcessPool implements AgentRunner {
         if (victim) {
           this.#destroyEntry(victim, "LRU eviction (pool at capacity)");
         } else {
-          // Every slot is busy with an in-flight turn — never evict those,
+          // Every slot is busy with an in-flight turn or live background
+          // tasks — never evict those,
           // and never grow past the cap either. This ONE turn cold-starts
           // instead; it simply doesn't get pooling this time.
           this.#fallbackToCold(
@@ -608,8 +661,11 @@ export class ClaudeProcessPool implements AgentRunner {
       if (entry.current == null && entry.blank) return entry;
     }
     let victim: PoolEntry | undefined;
+    const now = Date.now();
     for (const entry of this.#entries.values()) {
       if (entry.current != null) continue; // in-flight turn — never evict
+      // Background tasks still running in this child — evicting it kills them.
+      if (this.#holdsBackgroundWork(entry, now)) continue;
       if (victim == null || entry.lastUsedAt < victim.lastUsedAt) victim = entry;
     }
     return victim;
@@ -632,6 +688,7 @@ export class ClaudeProcessPool implements AgentRunner {
     const line =
       JSON.stringify({
         type: "user",
+        uuid: state.promptUuid,
         message: { role: "user", content: [{ type: "text", text: state.opts.prompt }] },
       }) + "\n";
 
@@ -666,7 +723,9 @@ export class ClaudeProcessPool implements AgentRunner {
     // `subtype` is this runner's best proxy for the exitCode contract
     // handler.ts already relies on (`result.exitCode === 0` as a
     // state.json-absent success fallback — see bridge/handler.ts).
-    const exitCode = subtype === "success" ? 0 : 1;
+    const exitCode = subtype === "success" && raw?.["is_error"] !== true && !state.killRequested ? 0 : 1;
+    const backgroundTasksPending = (state.entry?.backgroundTaskIds.size ?? 0) +
+      (state.entry?.scheduledWakeupAt !== undefined ? 1 : 0);
     this.#settleResolve(state, {
       exitCode,
       sessionId: state.sessionId,
@@ -674,6 +733,8 @@ export class ClaudeProcessPool implements AgentRunner {
       resumeMode: state.opts.resumeSessionId != null
         ? state.reusedProcess ? "same-process" : "cold"
         : undefined,
+      ...(backgroundTasksPending > 0 ? { backgroundTasksPending } : {}),
+      ...(state.stateFreshAfter !== undefined ? { stateFreshAfter: state.stateFreshAfter } : {}),
     });
   }
 
@@ -744,6 +805,14 @@ export class ClaudeProcessPool implements AgentRunner {
       return;
     }
 
+    if (state.waitingForBackground) {
+      // An interrupt only stops the foreground model turn. Background tools
+      // and native wake-ups belong to this child too: cancel the owned child
+      // when the caller stops a run that is waiting on them.
+      this.#destroyEntry(entry, "cancelled while waiting for background work");
+      this.#settleResolve(state, { exitCode: 1, sessionId: state.sessionId, pooled: false });
+      return;
+    }
     this.#sendInterruptAndEscalate(entry, state);
   }
 
@@ -959,6 +1028,10 @@ export class ClaudeProcessPool implements AgentRunner {
       child,
       spawnedAt: Date.now(),
       lastUsedAt: Date.now(),
+      backgroundTaskIds: new Set(),
+      backgroundWorkStartedAt: undefined,
+      scheduledWakeupAt: undefined,
+      wakeupToolIds: new Set(),
       current: undefined,
       hasRunTurn: false,
       queueChain: Promise.resolve(),
@@ -993,9 +1066,6 @@ export class ClaudeProcessPool implements AgentRunner {
   }
 
   #handleEntryLine(entry: PoolEntry, line: string): void {
-    const state = entry.current;
-    if (state == null || state.settled) return; // stray output between turns — nothing to route it to
-
     const trimmed = line.trim();
     if (!trimmed) return;
 
@@ -1007,6 +1077,21 @@ export class ClaudeProcessPool implements AgentRunner {
     }
     const record = obj != null && typeof obj === "object" ? (obj as Record<string, unknown>) : undefined;
 
+    // Tracked whether or not a turn is in flight: the list usually changes
+    // AFTER the turn that started the task has ended.
+    if (record?.["type"] === "system" && record["subtype"] === "background_tasks_changed") {
+      this.#updateBackgroundTasks(entry, record["tasks"]);
+    }
+    if (record) this.#trackScheduledWakeup(entry, record);
+
+    const state = entry.current;
+    if (state == null || state.settled) {
+      // Stray output between turns — nothing to route it to, but the child is
+      // demonstrably doing work, so it doesn't count as idle.
+      entry.lastUsedAt = Date.now();
+      return;
+    }
+
     if (record?.["type"] === "control_response") {
       // Bookkeeping only — the interrupt handshake's real completion signal
       // is the subsequent `result` line (below), not this ack. See
@@ -1014,15 +1099,116 @@ export class ClaudeProcessPool implements AgentRunner {
       return;
     }
 
+    if (record?.["type"] === "result" && !state.killRequested) {
+      const origin = record["origin"] as { kind?: unknown } | undefined;
+      const autonomous = origin?.kind === "task-notification";
+      const ids = [record["user_message_uuid"], ...(Array.isArray(record["user_message_uuids"]) ? record["user_message_uuids"] : [])]
+        .filter((id): id is string => typeof id === "string");
+      // Claude can emit an empty task-notification result during --resume,
+      // BEFORE it executes the user message. It is not this request's result.
+      // Native background follow-ups are owned only after our user turn has
+      // explicitly yielded to background work. Legacy CLIs without attribution
+      // retain their serial result behavior.
+      if (autonomous ? !state.waitingForBackground : ids.length > 0 && !ids.includes(state.promptUuid)) {
+        state.answerExtractor = new AnswerChannelExtractor();
+        state.resetAnswerOnContent = true;
+        return;
+      }
+      // In 2.1.312 a scheduled wake-up's result has neither input UUIDs nor
+      // origin. A task-notification does carry origin, and must not consume
+      // a timer that is still waiting for its own native follow-up.
+      if (entry.scheduledWakeupAt !== undefined && Date.now() >= entry.scheduledWakeupAt &&
+          ids.length === 0 && origin === undefined) {
+        entry.scheduledWakeupAt = undefined;
+        if (entry.backgroundTaskIds.size === 0) entry.backgroundWorkStartedAt = undefined;
+      }
+    }
+
     state.markPerf("first_line");
     for (const ev of parseLinesMulti(line, state.answerExtractor, state.usageState)) {
       state.reachedWire = true;
       if (ev.type === "system_init") state.sessionId = ev.sessionId;
       markPerfForEventType(state.markPerf, ev.type);
-      state.queue.push(ev);
+      if (state.resetAnswerOnContent &&
+          (ev.type === "answer_delta" || ev.type === "answer_snapshot" || ev.type === "internal_text")) {
+        state.resetAnswerOnContent = false;
+        state.queue.push({ type: "answer_snapshot", text: "", raw: ev.raw });
+      }
       if (ev.type === "result") {
+        const raw = ev.raw as Record<string, unknown>;
+        if (ev.usage) {
+          const prior = state.usageTotals;
+          state.usageTotals = {
+            inputTokens: (prior?.inputTokens ?? 0) + ev.usage.inputTokens,
+            outputTokens: (prior?.outputTokens ?? 0) + ev.usage.outputTokens,
+            cacheCreationTokens: (prior?.cacheCreationTokens ?? 0) + (ev.usage.cacheCreationTokens ?? 0),
+            cacheReadTokens: (prior?.cacheReadTokens ?? 0) + (ev.usage.cacheReadTokens ?? 0),
+            ...((prior?.reasoningTokens !== undefined || ev.usage.reasoningTokens !== undefined)
+              ? { reasoningTokens: (prior?.reasoningTokens ?? 0) + (ev.usage.reasoningTokens ?? 0) } : {}),
+            // The parser's request count already spans this whole run.
+            ...(ev.usage.requests !== undefined ? { requests: ev.usage.requests } : {}),
+          };
+          ev.usage = state.usageTotals;
+        }
+        if (!state.killRequested && raw["subtype"] === "success" && raw["is_error"] !== true &&
+            (this.#hasPendingBackgroundWork(entry) || (typeof raw["queued_turn_count"] === "number" && raw["queued_turn_count"] > 0))) {
+          // The first result is a yield, not completion. Keep the event queue,
+          // deadline and thread ownership alive until the CLI's final follow-up.
+          state.waitingForBackground = true;
+          state.stateFreshAfter = Date.now();
+          state.answerExtractor = new AnswerChannelExtractor();
+          state.resetAnswerOnContent = true;
+          return;
+        }
+        state.queue.push(ev);
         this.#onTurnResult(state, ev);
+        if ((raw["subtype"] !== "success" || raw["is_error"] === true) && this.#hasPendingBackgroundWork(entry)) {
+          this.#destroyEntry(entry, "failed turn with background work still running");
+        }
         return;
+      }
+      state.queue.push(ev);
+    }
+  }
+
+  #updateBackgroundTasks(entry: PoolEntry, tasks: unknown): void {
+    if (!Array.isArray(tasks)) return;
+    const ids = new Set<string>();
+    for (const task of tasks) {
+      const id = task != null && typeof task === "object" ? (task as Record<string, unknown>)["task_id"] : undefined;
+      if (typeof id === "string") ids.add(id);
+    }
+    if (ids.size === 0 && entry.scheduledWakeupAt === undefined) entry.backgroundWorkStartedAt = undefined;
+    else if (entry.backgroundWorkStartedAt === undefined) entry.backgroundWorkStartedAt = Date.now();
+    entry.backgroundTaskIds = ids;
+    entry.lastUsedAt = Date.now();
+  }
+
+  /** Whether the idle sweep / LRU eviction must leave this entry's background work alone. */
+  #holdsBackgroundWork(entry: PoolEntry, now: number): boolean {
+    return this.#hasPendingBackgroundWork(entry) && entry.backgroundWorkStartedAt !== undefined &&
+      now - entry.backgroundWorkStartedAt < BACKGROUND_TASK_KEEPALIVE_MAX_MS;
+  }
+
+  #hasPendingBackgroundWork(entry: PoolEntry): boolean {
+    return entry.backgroundTaskIds.size > 0 || entry.scheduledWakeupAt !== undefined;
+  }
+
+  #trackScheduledWakeup(entry: PoolEntry, record: Record<string, unknown>): void {
+    if (record["parent_tool_use_id"] != null) return;
+    const message = record["message"] as { content?: unknown } | undefined;
+    if (!Array.isArray(message?.content)) return;
+    for (const block of message.content) {
+      if (block?.type === "tool_use" && block.name === "ScheduleWakeup" && typeof block.id === "string") {
+        entry.wakeupToolIds.add(block.id);
+      }
+      if (block?.type !== "tool_result" || !entry.wakeupToolIds.delete(block.tool_use_id) || block.is_error) continue;
+      const result = record["tool_use_result"] as { scheduledFor?: unknown } | undefined;
+      // Use native structured metadata, never the localized tool-result prose
+      // or the requested delay (the CLI clamps and rounds the actual deadline).
+      if (typeof result?.scheduledFor === "number" && Number.isFinite(result.scheduledFor) && result.scheduledFor > 0) {
+        entry.scheduledWakeupAt = result.scheduledFor;
+        entry.backgroundWorkStartedAt ??= Date.now();
       }
     }
   }
@@ -1186,8 +1372,20 @@ export class ClaudeProcessPool implements AgentRunner {
           }
           continue;
         }
+        if (this.#hasPendingBackgroundWork(entry) && entry.backgroundWorkStartedAt !== undefined &&
+            now - entry.backgroundWorkStartedAt >= BACKGROUND_TASK_KEEPALIVE_MAX_MS) {
+          this.#destroyEntry(entry, "background work exceeded the between-turn keep-alive ceiling");
+          continue;
+        }
         if (now - entry.lastUsedAt >= this.#idleMs) {
-          this.#destroyEntry(entry, "idle timeout");
+          if (this.#holdsBackgroundWork(entry, now)) continue;
+          this.#destroyEntry(
+            entry,
+            entry.backgroundTaskIds.size > 0
+              ? `idle timeout (${entry.backgroundTaskIds.size} background task(s) still listed after ` +
+                `${BACKGROUND_TASK_KEEPALIVE_MAX_MS / 60_000} min keep-alive ceiling)`
+              : "idle timeout",
+          );
         }
       }
     }, cadenceMs);
