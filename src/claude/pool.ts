@@ -723,7 +723,7 @@ export class ClaudeProcessPool implements AgentRunner {
     // `subtype` is this runner's best proxy for the exitCode contract
     // handler.ts already relies on (`result.exitCode === 0` as a
     // state.json-absent success fallback — see bridge/handler.ts).
-    const exitCode = subtype === "success" && !state.killRequested ? 0 : 1;
+    const exitCode = subtype === "success" && raw?.["is_error"] !== true && !state.killRequested ? 0 : 1;
     const backgroundTasksPending = (state.entry?.backgroundTaskIds.size ?? 0) +
       (state.entry?.scheduledWakeupAt !== undefined ? 1 : 0);
     this.#settleResolve(state, {
@@ -1150,7 +1150,7 @@ export class ClaudeProcessPool implements AgentRunner {
           };
           ev.usage = state.usageTotals;
         }
-        if (!state.killRequested && raw["subtype"] === "success" &&
+        if (!state.killRequested && raw["subtype"] === "success" && raw["is_error"] !== true &&
             (this.#hasPendingBackgroundWork(entry) || (typeof raw["queued_turn_count"] === "number" && raw["queued_turn_count"] > 0))) {
           // The first result is a yield, not completion. Keep the event queue,
           // deadline and thread ownership alive until the CLI's final follow-up.
@@ -1162,7 +1162,7 @@ export class ClaudeProcessPool implements AgentRunner {
         }
         state.queue.push(ev);
         this.#onTurnResult(state, ev);
-        if (raw["subtype"] !== "success" && this.#hasPendingBackgroundWork(entry)) {
+        if ((raw["subtype"] !== "success" || raw["is_error"] === true) && this.#hasPendingBackgroundWork(entry)) {
           this.#destroyEntry(entry, "failed turn with background work still running");
         }
         return;

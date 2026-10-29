@@ -1839,4 +1839,15 @@ describe("ClaudeProcessPool — background task lifecycle", () => {
     expect(results).toHaveLength(1);
     expect(results[0]?.usage).toMatchObject({ inputTokens: 7, outputTokens: 10 });
   });
+
+  it("treats is_error as failure even when the CLI labels the result subtype success", async () => {
+    const pool = new ClaudeProcessPool({ botId: "bot-a" });
+    const handle = pool.run({ prompt: "x", threadId: "error" });
+    await flush();
+    const child = spawnedChildren[0]!;
+    child.stdout.write(backgroundTasksChanged(["work"]) + "\n");
+    child.stdout.write(JSON.stringify({ type: "result", subtype: "success", is_error: true, terminal_reason: "api_error" }) + "\n");
+    expect((await handle.done).exitCode).toBe(1);
+    expect(child.killed).toBe(true);
+  });
 });
