@@ -4033,7 +4033,12 @@ export class BridgeHandler {
           // last_message must not be re-rendered as if it were this turn's reply.
           const reportedState =
             rawReportedState?.updated_at != null &&
-            rawReportedState.updated_at !== preRunUpdatedAt
+            rawReportedState.updated_at !== preRunUpdatedAt &&
+            // A background continuation shares this bridge turn. Its final
+            // answer must not be replaced by a provisional state written
+            // before the CLI yielded to background work.
+            (result.stateFreshAfter === undefined ||
+              Date.parse(rawReportedState.updated_at) > result.stateFreshAfter)
               ? rawReportedState
               : null;
 
@@ -4800,8 +4805,20 @@ export class BridgeHandler {
           // success is misleading. Show a neutral title/color; the fresh body
           // text tells the real story. (On a real failure we keep failure style.)
           const noReportThisTurn = reportedState === null;
-          const neutralTitle =
-            noReportThisTurn && success && !failureReason
+          // The turn ended but work it kicked off is still running in the
+          // agent process (pooled claude: background shells / Agent forks), or
+          // the agent itself said it isn't done. "✅ 完成" would be a false
+          // claim; ready/failed from the agent still win.
+          const workStillRunning =
+            success &&
+            !failureReason &&
+            reportedStatus !== "ready" &&
+            ((result.backgroundTasksPending ?? 0) > 0 || reportedStatus === "in_progress");
+          const neutralTitle = workStillRunning
+            ? (result.backgroundTasksPending ?? 0) > 0
+              ? "⏳ 后台任务进行中"
+              : "⏳ 进行中"
+            : noReportThisTurn && success && !failureReason
               ? "💬 已回复"
               : undefined;
 

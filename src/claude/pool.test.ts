@@ -28,6 +28,7 @@ import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import {
+  BACKGROUND_TASK_KEEPALIVE_MAX_MS,
   ClaudeProcessPool,
   DEFAULT_WARM_PROCESS_IDLE_MS,
   DEFAULT_MAX_PROCESSES,
@@ -64,6 +65,14 @@ function assistantText(text: string) {
 
 function resultLine(subtype: "success" | "error_during_execution", stopReason = "end_turn") {
   return JSON.stringify({ type: "result", subtype, stop_reason: stopReason });
+}
+
+function backgroundTasksChanged(taskIds: string[]) {
+  return JSON.stringify({
+    type: "system",
+    subtype: "background_tasks_changed",
+    tasks: taskIds.map((task_id) => ({ task_id, task_type: "local_agent", description: task_id })),
+  });
 }
 
 function controlResponse(requestId: string) {
@@ -1596,5 +1605,238 @@ describe("ClaudeProcessPool — forceFreshSession (批F F2 session reseed)", () 
     // only stamped on resumeSessionId turns (bridge continuation), not here.
     expect(r.pooled).toBe(true);
     expect(spawnedChildren).toHaveLength(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Background tasks outliving their turn
+// ---------------------------------------------------------------------------
+
+describe("ClaudeProcessPool — background task lifecycle", () => {
+  async function start(pool: ClaudeProcessPool, threadId = "t1", taskIds = ["fork"]) {
+    const handle = pool.run({ prompt: "x", cwd: `/wt/${threadId}`, threadId });
+    await flush();
+    const child = spawnedChildren.at(-1)!;
+    child.stdout.write(systemInit(`s-${threadId}`) + "\n");
+    child.stdout.write(backgroundTasksChanged(taskIds) + "\n");
+    child.stdout.write(assistantText("LARKWAY_ANSWER_BEGIN\nSTARTED\nLARKWAY_ANSWER_END") + "\n");
+    child.stdout.write(resultLine("success") + "\n");
+    await flush();
+    return { child, handle };
+  }
+
+  function complete(child: FakeChild, text = "FINAL") {
+    child.stdout.write(backgroundTasksChanged([]) + "\n");
+    child.stdout.write(assistantText(`LARKWAY_ANSWER_BEGIN\n${text}\nLARKWAY_ANSWER_END`) + "\n");
+    child.stdout.write(JSON.stringify({ type: "result", subtype: "success", origin: { kind: "task-notification" } }) + "\n");
+  }
+
+  it("keeps done and the answer consumer open until the background follow-up finishes", async () => {
+    const pool = new ClaudeProcessPool({ botId: "bot-a" });
+    const { child, handle } = await start(pool);
+    let settled = false;
+    void handle.done.then(() => { settled = true; });
+    await flush();
+    expect(settled).toBe(false);
+    complete(child);
+    const events = await collectEvents(handle.events);
+    expect((await handle.done).exitCode).toBe(0);
+    expect(events.filter(e => e.type === "result")).toHaveLength(1);
+    let answer = "";
+    for (const e of events) {
+      if (e.type === "answer_delta") answer += e.text;
+      if (e.type === "answer_snapshot") answer = e.text;
+    }
+    expect(answer).toBe("FINAL");
+  });
+
+  it("ignores a restored task-notification result and a previous user result before executing the current prompt", async () => {
+    const pool = new ClaudeProcessPool({ botId: "bot-a" });
+    const handle = pool.run({ prompt: "continue", threadId: "t1", resumeSessionId: "prior" });
+    await flush();
+    const child = spawnedChildren[0]!;
+    const promptId = readOutboundLines(child)[0]!.uuid;
+    expect(typeof promptId).toBe("string");
+    let settled = false;
+    void handle.done.then(() => { settled = true; });
+    child.stdout.write(systemInit("prior") + "\n");
+    child.stdout.write(JSON.stringify({ type: "result", subtype: "success", origin: { kind: "task-notification" }, result: "", num_turns: 0 }) + "\n");
+    child.stdout.write(JSON.stringify({ type: "result", subtype: "success", user_message_uuid: "previous-user" }) + "\n");
+    await flush();
+    expect(settled).toBe(false);
+    child.stdout.write(assistantText("LARKWAY_ANSWER_BEGIN\nRESUMED\nLARKWAY_ANSWER_END") + "\n");
+    child.stdout.write(JSON.stringify({ type: "result", subtype: "success", user_message_uuid: promptId }) + "\n");
+    expect((await handle.done).exitCode).toBe(0);
+    const events = await collectEvents(handle.events);
+    expect(events.filter(e => e.type === "result")).toHaveLength(1);
+    expect(events.filter(e => e.type === "answer_delta" || e.type === "answer_snapshot").map(e => e.text).join("")).toContain("RESUMED");
+  });
+
+  it("does not deliver a queued prompt until the previous background work is done", async () => {
+    const pool = new ClaudeProcessPool({ botId: "bot-a" });
+    const { child, handle } = await start(pool);
+    readOutboundLines(child);
+    const next = pool.run({ prompt: "next", threadId: "t1", cwd: "/wt/t1" });
+    await flush();
+    expect(readOutboundLines(child)).toEqual([]);
+    complete(child);
+    await handle.done;
+    await flush();
+    expect(readOutboundLines(child)[0]?.message).toMatchObject({ content: [{ text: "next" }] });
+    child.stdout.write(resultLine("success") + "\n");
+    await next.done;
+  });
+
+  it("an intermediate result is not completion even after the task list clears, until the follow-up result", async () => {
+    const pool = new ClaudeProcessPool({ botId: "bot-a" });
+    const { child, handle } = await start(pool);
+    let settled = false;
+    void handle.done.then(() => { settled = true; });
+    child.stdout.write(backgroundTasksChanged([]) + "\n");
+    await flush();
+    expect(settled).toBe(false);
+    complete(child);
+    await handle.done;
+  });
+
+  it("queued native follow-ups keep the consumer alive even if the task list has already emptied", async () => {
+    const pool = new ClaudeProcessPool({ botId: "bot-a" });
+    const handle = pool.run({ prompt: "x", threadId: "t1" });
+    await flush();
+    const child = spawnedChildren[0]!;
+    child.stdout.write(JSON.stringify({ type: "result", subtype: "success", queued_turn_count: 1 }) + "\n");
+    let settled = false;
+    void handle.done.then(() => { settled = true; });
+    await flush();
+    expect(settled).toBe(false);
+    complete(child);
+    await handle.done;
+  });
+
+  it("never reaps a turn waiting for background work, then reaps it after final completion and idle", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "Date"] });
+    try {
+      const pool = new ClaudeProcessPool({ botId: "bot-a", idleMs: 1_000 });
+      const { child, handle } = await start(pool);
+      await vi.advanceTimersByTimeAsync(5_000);
+      expect(child.killed).toBe(false);
+      complete(child);
+      await handle.done;
+      await vi.advanceTimersByTimeAsync(2_000);
+      expect(child.killed).toBe(true);
+    } finally { vi.useRealTimers(); }
+  });
+
+  it("the original deadline cancels the owned child and its background tools", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "Date"] });
+    try {
+      const pool = new ClaudeProcessPool({ botId: "bot-a", idleMs: 1_000 });
+      const handle = pool.run({ prompt: "x", threadId: "t1", timeoutMs: 3_000 });
+      await flush();
+      const child = spawnedChildren[0]!;
+      child.stdout.write(backgroundTasksChanged(["fork"]) + "\n");
+      child.stdout.write(resultLine("success") + "\n");
+      await flush();
+      await vi.advanceTimersByTimeAsync(3_100);
+      expect((await handle.done).exitCode).toBe(1);
+      expect(child.killed).toBe(true);
+    } finally { vi.useRealTimers(); }
+  });
+
+  it("stop cancels waiting background work without affecting another thread", async () => {
+    const pool = new ClaudeProcessPool({ botId: "bot-a" });
+    const first = await start(pool, "first");
+    const second = await start(pool, "second");
+    first.handle.kill();
+    expect((await first.handle.done).exitCode).toBe(1);
+    expect(first.child.killed).toBe(true);
+    expect(second.child.killed).toBe(false);
+    complete(second.child);
+    await second.handle.done;
+  });
+
+  it("LRU skips background work and evicts a truly idle entry", async () => {
+    const pool = new ClaudeProcessPool({ botId: "bot-a", maxProcesses: 2 });
+    const active = await start(pool, "old");
+    const idle = await start(pool, "new", []);
+    await idle.handle.done;
+    const third = pool.run({ prompt: "x", threadId: "third" });
+    await flush();
+    expect(active.child.killed).toBe(false);
+    expect(idle.child.killed).toBe(true);
+    complete(active.child);
+    await active.handle.done;
+    spawnedChildren.at(-1)!.stdout.write(resultLine("success") + "\n");
+    await third.done;
+  });
+
+  it("between-turn task tracking has a fixed ceiling that output noise cannot extend", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "Date"] });
+    try {
+      const pool = new ClaudeProcessPool({ botId: "bot-a", idleMs: 1_000 });
+      const { child, handle } = await start(pool, "idle", []);
+      await handle.done;
+      child.stdout.write(backgroundTasksChanged(["orphan"]) + "\n");
+      await vi.advanceTimersByTimeAsync(BACKGROUND_TASK_KEEPALIVE_MAX_MS - 500);
+      expect(child.killed).toBe(false);
+      child.stdout.write(JSON.stringify({ type: "system", subtype: "status" }) + "\n");
+      await vi.advanceTimersByTimeAsync(2_000);
+      expect(child.killed).toBe(true);
+    } finally { vi.useRealTimers(); }
+  });
+
+  it("tracks ScheduleWakeup from its successful structured receipt through the due native follow-up", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "Date"] });
+    try {
+      const pool = new ClaudeProcessPool({ botId: "bot-a", idleMs: 1_000 });
+      const handle = pool.run({ prompt: "schedule", threadId: "wakeup" });
+      await flush();
+      const child = spawnedChildren[0]!;
+      const uuid = readOutboundLines(child)[0]!.uuid;
+      child.stdout.write(JSON.stringify({ type: "assistant", message: { content: [{ type: "tool_use", name: "ScheduleWakeup", id: "wake-tool", input: { delaySeconds: 1 } }] } }) + "\n");
+      child.stdout.write(JSON.stringify({ type: "user", message: { content: [{ type: "tool_result", tool_use_id: "wake-tool", content: "localized receipt" }] }, tool_use_result: { scheduledFor: Date.now() + 60_000 } }) + "\n");
+      child.stdout.write(JSON.stringify({ type: "result", subtype: "success", user_message_uuid: uuid }) + "\n");
+      let settled = false;
+      void handle.done.then(() => { settled = true; });
+      await vi.advanceTimersByTimeAsync(59_000);
+      expect(settled).toBe(false);
+      expect(child.killed).toBe(false);
+      child.stdout.write(backgroundTasksChanged([]) + "\n");
+      await vi.advanceTimersByTimeAsync(2_000);
+      // Another background completion cannot consume the scheduled wake.
+      child.stdout.write(JSON.stringify({ type: "result", subtype: "success", origin: { kind: "task-notification" } }) + "\n");
+      await flush();
+      expect(settled).toBe(false);
+      child.stdout.write(assistantText("LARKWAY_ANSWER_BEGIN\nWAKE_FINAL\nLARKWAY_ANSWER_END") + "\n");
+      child.stdout.write(resultLine("success") + "\n");
+      expect((await handle.done).exitCode).toBe(0);
+      expect((await collectEvents(handle.events)).filter(e => e.type === "result")).toHaveLength(1);
+    } finally { vi.useRealTimers(); }
+  });
+
+  it.each(["failed", "unrelated", "prose-only"])("does not pin a process for a %s wake-up receipt", async (kind) => {
+    const pool = new ClaudeProcessPool({ botId: "bot-a" });
+    const handle = pool.run({ prompt: "schedule", threadId: "wakeup" });
+    await flush();
+    const child = spawnedChildren[0]!;
+    child.stdout.write(JSON.stringify({ type: "assistant", message: { content: [{ type: "tool_use", name: "ScheduleWakeup", id: "wake-tool", input: {} }] } }) + "\n");
+    child.stdout.write(JSON.stringify({ type: "user", message: { content: [{ type: "tool_result", tool_use_id: kind === "unrelated" ? "other-tool" : "wake-tool", is_error: kind === "failed", content: "Next wakeup scheduled" }] }, tool_use_result: kind === "prose-only" ? undefined : { scheduledFor: Date.now() + 60_000 } }) + "\n");
+    child.stdout.write(resultLine("success") + "\n");
+    expect((await handle.done).exitCode).toBe(0);
+  });
+
+  it("aggregates usage across the user segment and the final native follow-up", async () => {
+    const pool = new ClaudeProcessPool({ botId: "bot-a" });
+    const handle = pool.run({ prompt: "x", threadId: "usage" });
+    await flush();
+    const child = spawnedChildren[0]!;
+    child.stdout.write(backgroundTasksChanged(["work"]) + "\n");
+    child.stdout.write(JSON.stringify({ type: "result", subtype: "success", usage: { input_tokens: 2, output_tokens: 3 } }) + "\n");
+    child.stdout.write(backgroundTasksChanged([]) + "\n");
+    child.stdout.write(JSON.stringify({ type: "result", subtype: "success", origin: { kind: "task-notification" }, usage: { input_tokens: 5, output_tokens: 7 } }) + "\n");
+    await handle.done;
+    const results = (await collectEvents(handle.events)).filter(e => e.type === "result");
+    expect(results).toHaveLength(1);
+    expect(results[0]?.usage).toMatchObject({ inputTokens: 7, outputTokens: 10 });
   });
 });

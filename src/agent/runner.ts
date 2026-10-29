@@ -266,12 +266,18 @@ export interface RunHandle {
    * current child; "cold" means its history had to be loaded into that
    * child, including a new pool child or one-shot fallback. Thus a pooled
    * resume may still be cold. A new native session has no resumeMode.
+   * `backgroundTasksPending` is set (> 0) by a pooled runner whose child
+   * still runs background tasks when the turn ended — the
+   * agent's work continues after `done`.
    */
   done: Promise<{
     exitCode: number;
     sessionId?: string;
     pooled?: boolean;
     resumeMode?: "same-process" | "cold";
+    backgroundTasksPending?: number;
+    /** Ignore state reports written before the last native background yield (epoch ms). */
+    stateFreshAfter?: number;
   }>;
   kill(): void;
   /**
