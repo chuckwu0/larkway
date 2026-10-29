@@ -81,7 +81,8 @@
 | v0.3.74 | v0.3.74 | patch / 已发布 | add pi coding agent as a third backend (backend: pi, BYO-model via ~/.pi/agent/models.json) |
 | v0.3.75 | v0.3.75 | patch / 已发布 | perf: native-parity pass — delta prompt wrapper about -55% tokens, reply surfaces off the runner's critical path, inbound debounce 0 by default, opt-in pi warm pool and model-first lane (#63); ships #61/#62 |
 | v0.3.76 | v0.3.76 | patch / 已发布 | Redact credentials across bridge console logs; make pi pool PID-file tests wait by wall clock |
-| v0.3.77 | v0.3.77 | 当前 patch / 已发布 | Upgrade Feishu SDK to 1.76.0; verify WebSocket shutdown races and CLI 1.0.98 pagination compatibility |
+| v0.3.77 | v0.3.77 | patch / 已发布 | Upgrade Feishu SDK to 1.76.0; verify WebSocket shutdown races and CLI 1.0.98 pagination compatibility |
+| v0.3.78 | v0.3.78 | 当前 patch / 已发布 | Preserve Claude background work and scheduled wakeups; correlate resumed results and deliver final answers |
 
 ## 使用原则
 
@@ -170,4 +171,5 @@ v0.3.74       = add pi coding agent as a third backend (backend: pi, BYO-model v
 v0.3.75       = perf: native-parity pass — delta prompt wrapper about -55% tokens, reply surfaces off the runner's critical path, inbound debounce 0 by default, opt-in pi warm pool and model-first lane (#63); ships #61/#62
 v0.3.76       = Redact credentials across bridge console logs; make pi pool PID-file tests wait by wall clock
 v0.3.77       = Upgrade Feishu SDK to 1.76.0; verify WebSocket shutdown races and CLI 1.0.98 pagination compatibility
+v0.3.78       = Preserve Claude background work and scheduled wakeups; correlate resumed results and deliver final answers
 ```
