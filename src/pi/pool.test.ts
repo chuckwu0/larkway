@@ -52,6 +52,7 @@ type FakeChild = EventEmitter & {
   exitOnSigterm: boolean;
   ignoreAbort: boolean;
   holdGetState: boolean;
+  holdCold: boolean;
   heldGetState?: Cmd;
   dieOnGetState: boolean;
   promptError?: string;
@@ -115,6 +116,7 @@ function makeFakeChild(args: string[]): FakeChild {
   c.exitOnSigterm = true;
   c.ignoreAbort = false;
   c.holdGetState = false;
+  c.holdCold = false;
   c.dieOnGetState = false;
   c.onPrompt = (child) => standardTurn(child);
   c.send = (record) => {
@@ -197,6 +199,11 @@ function makeFakeChild(args: string[]): FakeChild {
     c.stdin.on("end", () =>
       setImmediate(() => {
         c.send({ type: "session", version: 3, id: argValue(args, "--session-id") ?? "cold-sess", cwd: "/w" });
+        if (c.holdCold) {
+          c.running = true;
+          c.send({ type: "agent_start" });
+          return;
+        }
         standardTurn(c, "Cold answer text that is long enough to stream through the channel.");
         c.exit(0);
       }),
@@ -229,6 +236,7 @@ vi.mock("node:child_process", async (importOriginal) => {
 // ---------------------------------------------------------------------------
 
 const tick = (): Promise<void> => new Promise((r) => setImmediate(r));
+const realSetTimeout = globalThis.setTimeout;
 
 async function waitFor(cond: () => boolean, max = 500): Promise<void> {
   for (let i = 0; i < max && !cond(); i++) await tick();
@@ -237,10 +245,10 @@ async function waitFor(cond: () => boolean, max = 500): Promise<void> {
 
 /** Poll (wall-clock, not ticks) until the file exists or is gone: the pid file is written/removed off the event loop. */
 async function waitForFile(file: string, present: boolean, timeoutMs = 5_000): Promise<void> {
-  const deadline = Date.now() + timeoutMs;
+  const deadline = vi.getRealSystemTime() + timeoutMs;
   while (existsSync(file) !== present) {
-    if (Date.now() > deadline) throw new Error(`waitForFile: ${file} still ${present ? "missing" : "present"}`);
-    await new Promise((r) => setTimeout(r, 10));
+    if (vi.getRealSystemTime() > deadline) throw new Error(`waitForFile: ${file} still ${present ? "missing" : "present"}`);
+    await new Promise<void>((r) => realSetTimeout(r, 10));
   }
 }
 
@@ -510,7 +518,7 @@ describe("PiProcessPool kill", () => {
 
     const child = rpcChildren()[0]!;
     expect(cmdTypes(child)).toContain("abort");
-    expect(result).toMatchObject({ exitCode: 1, pooled: true });
+    expect(result).toMatchObject({ exitCode: 1, interrupted: true, interruptionReason: "cancel", pooled: true });
     expect(child.killSignals).toEqual([]);
     expect(pool.activeProcessCount).toBe(1);
   });
@@ -535,7 +543,155 @@ describe("PiProcessPool kill", () => {
     await vi.advanceTimersByTimeAsync(3_000);
     await waitFor(() => rpcChildren()[0]!.exited);
     expect(rpcChildren()[0]!.killSignals).toEqual(["SIGTERM"]);
-    await expect(handle.done).resolves.toMatchObject({ exitCode: 1, pooled: true });
+    await expect(handle.done).resolves.toMatchObject({ exitCode: 1, interrupted: true, interruptionReason: "cancel", pooled: true });
+  });
+
+  it("a process silent after SIGKILL settles only its canceled turn and keeps its writer/PID gate until real exit", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval"] });
+    const dir = await mkdtemp(path.join(tmpdir(), "larkway-pi-cancel-"));
+    const pidFile = path.join(dir, "runner.pid");
+    const pool = newPool();
+    setupChild = (c) => {
+      if (rpcChildren().length === 0) {
+        c.exitOnSigterm = false;
+        c.ignoreAbort = true;
+        c.onPrompt = (child) => { child.running = true; child.send({ type: "agent_start" }); };
+      }
+    };
+    try {
+      const stopped = pool.run({ ...BASE, pidFilePath: pidFile, prompt: "stuck", threadId: "stuck" });
+      const events = collect(stopped);
+      await waitFor(() => rpcChildren()[0]?.running === true);
+      await waitForFile(pidFile, true);
+      const old = rpcChildren()[0]!;
+      let stoppedDone = false;
+      void stopped.done.then(() => { stoppedDone = true; });
+      stopped.kill();
+      stopped.kill(); // repeated /stop cannot reset the grace period
+      await vi.advanceTimersByTimeAsync(9_999);
+      expect(stoppedDone).toBe(false);
+      await vi.advanceTimersByTimeAsync(1);
+      await expect(stopped.done).resolves.toMatchObject({ exitCode: 1, interrupted: true, interruptionReason: "cancel", pooled: true });
+      await events;
+      expect(old.killSignals).toEqual(["SIGTERM", "SIGKILL"]);
+      expect(old.exited).toBe(false);
+      expect(JSON.parse(await readFile(pidFile, "utf8")).pid).toBe(old.pid);
+      expect(pool.activeProcessCount).toBe(0); // retired, not reusable
+
+      const queued = pool.run({ ...BASE, prompt: "queued", threadId: "stuck", resumeSessionId: old.sessionId });
+      const queuedEvents = collect(queued);
+      await vi.advanceTimersByTimeAsync(60 * 60 * 1000);
+      expect(rpcChildren()).toHaveLength(1); // no timer may authorize another writer
+      queued.kill();
+      await expect(queued.done).resolves.toMatchObject({ exitCode: 1, interrupted: true, interruptionReason: "cancel", pooled: false });
+      await queuedEvents;
+
+      // Other topics are independent even while this writer has not exited.
+      await expect(runTurn(pool, { ...BASE, prompt: "unrelated", threadId: "other" })).resolves.toMatchObject({ result: { exitCode: 0 } });
+      const resumed = pool.run({ ...BASE, prompt: "resume", threadId: "stuck", resumeSessionId: old.sessionId });
+      const resumedEvents = collect(resumed);
+      await vi.advanceTimersByTimeAsync(8_000);
+      expect(rpcChildren()).toHaveLength(2);
+      old.exit(null, "SIGKILL");
+      await expect(resumed.done).resolves.toMatchObject({ exitCode: 0, sessionId: old.sessionId });
+      await resumedEvents;
+      expect(rpcChildren()).toHaveLength(3); // canceled queued turn never spawned
+      await waitForFile(pidFile, false);
+    } finally {
+      // Also safe on failed assertions: do not leave a fake writer hanging in
+      // the common shutdown hook (which intentionally uses a bounded wait).
+      for (const child of rpcChildren()) if (!child.exited) child.exit(0);
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("shutdown closes a no-budget turn queued behind a canceled writer with no exit", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval"] });
+    const pool = newPool();
+    setupChild = (c) => {
+      c.exitOnSigterm = false;
+      c.ignoreAbort = true;
+      c.onPrompt = (child) => { child.running = true; child.send({ type: "agent_start" }); };
+    };
+    const active = pool.run({ ...BASE, prompt: "stuck", threadId: "t1" });
+    const activeEvents = collect(active);
+    await waitFor(() => rpcChildren()[0]?.running === true);
+    active.kill();
+    await vi.advanceTimersByTimeAsync(10_000);
+    await expect(active.done).resolves.toMatchObject({ exitCode: 1 });
+    await activeEvents;
+    const writer = rpcChildren()[0]!;
+    const queued = pool.run({ ...BASE, prompt: "waiting", threadId: "t1", resumeSessionId: writer.sessionId });
+    const queuedEvents = collect(queued);
+    const rejection = expect(queued.done).rejects.toThrow(/shutting down/);
+    const shutdown = pool.shutdown(0);
+    await rejection;
+    await queuedEvents;
+    await vi.advanceTimersByTimeAsync(7_001);
+    await shutdown;
+    expect(rpcChildren()).toHaveLength(1);
+    expect(writer.exited).toBe(false); // shutdown did not invent writer death
+    writer.exit(0);
+    await tick();
+    expect(rpcChildren()).toHaveLength(1); // settled queued turn never resumes
+  });
+
+  it("shutdown marks an active warm turn as canceled, not timed out", async () => {
+    const pool = newPool();
+    setupChild = (c) => {
+      c.onPrompt = (child) => { child.running = true; child.send({ type: "agent_start" }); };
+    };
+    const handle = pool.run({ ...BASE, prompt: "warm task", threadId: "shutdown" });
+    const events = collect(handle);
+    await waitFor(() => rpcChildren()[0]?.running === true);
+    await pool.shutdown(0);
+    await expect(handle.done).resolves.toMatchObject({ exitCode: 1, interrupted: true, interruptionReason: "cancel", pooled: true });
+    await events;
+  });
+
+  it("shutdown cancels its active cold fallback with a bounded wait and retains real-exit ownership", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval"] });
+    const pool = newPool({ maxProcesses: 0 });
+    const otherPool = newPool({ botId: "other-bot", maxProcesses: 0 });
+    setupChild = (c) => { c.holdCold = true; c.exitOnSigterm = false; };
+    const handle = pool.run({ ...BASE, prompt: "cold task", threadId: "t1" });
+    const events = collect(handle);
+    const other = otherPool.run({ ...BASE, prompt: "other bot task", threadId: "other" });
+    const otherEvents = collect(other);
+    await waitFor(() => coldChildren().length === 2 && coldChildren().every((c) => c.running));
+    const [owned, independent] = coldChildren();
+    let exited = false;
+    void handle.processExited!.then(() => { exited = true; });
+    const shutdown = pool.shutdown(0);
+    await vi.advanceTimersByTimeAsync(7_001);
+    await shutdown;
+    await expect(handle.done).resolves.toMatchObject({ exitCode: 1, interrupted: true, interruptionReason: "cancel", pooled: false });
+    await events;
+    expect(owned!.killSignals).toEqual(["SIGTERM", "SIGKILL"]);
+    expect(owned!.exited).toBe(false);
+    expect(exited).toBe(false); // bounded shutdown is not a process-exit claim
+    expect(independent!.killSignals).toEqual([]);
+    expect(independent!.running).toBe(true);
+    owned!.exit(0);
+    independent!.exit(0);
+    await handle.processExited;
+    await expect(other.done).resolves.toMatchObject({ exitCode: 0 });
+    await otherEvents;
+  });
+
+  it("shutdown stays bounded when a retired process never emits exit", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval"] });
+    const pool = newPool();
+    await runTurn(pool, { ...BASE, prompt: "one", threadId: "t1" });
+    const child = rpcChildren()[0]!;
+    child.exitOnSigterm = false;
+    const shutdown = pool.shutdown(0);
+    await vi.advanceTimersByTimeAsync(7_001);
+    await shutdown;
+    expect(child.exited).toBe(false);
+    expect(child.killSignals).toEqual(["SIGTERM", "SIGKILL"]);
+    child.exit(0); // release the retained writer for test teardown
+    await tick();
   });
 
   it("a turn whose abortSignal already fired spawns nothing and resolves killed", async () => {
@@ -543,7 +699,7 @@ describe("PiProcessPool kill", () => {
     const ac = new AbortController();
     ac.abort();
     const handle = pool.run({ ...BASE, prompt: "p", threadId: "t1", abortSignal: ac.signal });
-    await expect(handle.done).resolves.toMatchObject({ exitCode: 1, pooled: false });
+    await expect(handle.done).resolves.toMatchObject({ exitCode: 1, interrupted: true, interruptionReason: "cancel", pooled: false });
     expect(spawned).toHaveLength(0);
   });
 
@@ -556,7 +712,7 @@ describe("PiProcessPool kill", () => {
     void collect(handle);
     await waitFor(() => rpcChildren()[0]?.heldGetState !== undefined);
     handle.kill();
-    await expect(handle.done).resolves.toMatchObject({ exitCode: 1, pooled: true });
+    await expect(handle.done).resolves.toMatchObject({ exitCode: 1, interrupted: true, interruptionReason: "cancel", pooled: true });
     const child = rpcChildren()[0]!;
     child.send({ id: child.heldGetState!.id, type: "response", command: "get_state", success: true, data: { sessionId: child.sessionId, isStreaming: false } });
     for (let i = 0; i < 20; i++) await tick();
@@ -573,7 +729,7 @@ describe("PiProcessPool kill", () => {
     const stuck = rpcChildren()[0]!;
     await waitFor(() => stuck.heldGetState !== undefined);
     h1.kill();
-    await expect(h1.done).resolves.toMatchObject({ exitCode: 1, pooled: true });
+    await expect(h1.done).resolves.toMatchObject({ exitCode: 1, interrupted: true, interruptionReason: "cancel", pooled: true });
     expect(stuck.killSignals).toEqual(["SIGTERM"]);
 
     const second = await runTurn(pool, { ...BASE, prompt: "again", threadId: "t1" });
@@ -593,11 +749,220 @@ describe("PiProcessPool kill", () => {
     };
     handle = pool.run({ ...BASE, prompt: "p", threadId: "t1" });
     void collect(handle);
-    await expect(handle.done).resolves.toMatchObject({ exitCode: 1, pooled: true });
+    await expect(handle.done).resolves.toMatchObject({ exitCode: 1, interrupted: true, interruptionReason: "cancel", pooled: true });
     const child = rpcChildren()[0]!;
     await waitFor(() => cmdTypes(child).includes("abort"));
     expect(cmdTypes(child)).toEqual(["get_state", "set_thinking_level", "prompt", "abort"]);
     expect(child.killSignals).toEqual([]);
+  });
+});
+
+// Fake-clock coverage drives the actual pool and RPC adapter, not a mocked
+// AgentRunner. It does not claim live pi/model execution for three hours.
+describe("PiProcessPool optional wall-clock budget", () => {
+  it.each([undefined, 0])("no budget (%s): active work and silent tool waits survive 3h; cancellation isolates topics", async (timeoutMs) => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "Date"] });
+    const pool = newPool();
+    setupChild = (c) => {
+      c.onPrompt = (child) => {
+        child.running = true;
+        child.send({ type: "agent_start" });
+        child.send({ type: "tool_execution_start", toolCallId: "long", toolName: "bash", args: { command: "long job" } });
+      };
+    };
+    const ac = new AbortController();
+    const active = pool.run({ ...BASE, prompt: "active", threadId: "active", timeoutMs, abortSignal: ac.signal });
+    const waiting = pool.run({ ...BASE, prompt: "tool wait", threadId: "waiting", timeoutMs });
+    const activeEvents = collect(active);
+    const waitingEvents = collect(waiting);
+    let activeDone = false;
+    let waitingDone = false;
+    void active.done.then(() => { activeDone = true; });
+    void waiting.done.then(() => { waitingDone = true; });
+    await waitFor(() => rpcChildren().length === 2 && rpcChildren().every((c) => c.running));
+    const [a, b] = rpcChildren();
+    for (let hour = 0; hour < 3; hour++) {
+      a!.send({ type: "message_update", assistantMessageEvent: { type: "thinking_delta", delta: "progress" } });
+      await vi.advanceTimersByTimeAsync(60 * 60 * 1000);
+      expect(activeDone).toBe(false);
+      expect(waitingDone).toBe(false);
+      expect(a!.killSignals).toEqual([]);
+      expect(b!.killSignals).toEqual([]);
+      expect(cmdTypes(a!)).not.toContain("abort");
+      expect(cmdTypes(b!)).not.toContain("abort");
+    }
+    // The 10min idle pool reap must never treat either busy process as idle.
+    expect(pool.activeProcessCount).toBe(2);
+    ac.abort();
+    await expect(active.done).resolves.toMatchObject({ exitCode: 1, interrupted: true, interruptionReason: "cancel", pooled: true });
+    expect((await activeEvents).some((e) => e.type === "tool_use")).toBe(true);
+    expect(waitingDone).toBe(false);
+    expect(cmdTypes(b!)).not.toContain("abort");
+    standardTurn(b!);
+    await expect(waiting.done).resolves.toMatchObject({ exitCode: 0, pooled: true });
+    expect((await waitingEvents).some((e) => e.type === "tool_use")).toBe(true);
+    expect(a!.killSignals).toEqual([]);
+    expect(b!.killSignals).toEqual([]);
+    // A settled turn releases its deadline/listener; the warm process can run
+    // the next turn in the same native session without being killed later.
+    a!.onPrompt = (child) => standardTurn(child);
+    await expect(runTurn(pool, { ...BASE, prompt: "next", threadId: "active", resumeSessionId: a!.sessionId })).resolves.toMatchObject({ result: { exitCode: 0, resumeMode: "same-process" } });
+  });
+
+  it("a positive budget interrupts only its own turn, and the process remains reusable", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval"] });
+    const pool = newPool();
+    setupChild = (c) => {
+      c.onPrompt = (child) => { child.running = true; child.send({ type: "agent_start" }); };
+    };
+    const limited = pool.run({ ...BASE, prompt: "bounded", threadId: "limited", timeoutMs: 1000 });
+    const other = pool.run({ ...BASE, prompt: "unbounded", threadId: "other" });
+    const limitedEvents = collect(limited);
+    const otherEvents = collect(other);
+    await waitFor(() => rpcChildren().length === 2 && rpcChildren().every((c) => c.running));
+    const [a, b] = rpcChildren();
+    await vi.advanceTimersByTimeAsync(999);
+    expect(cmdTypes(a!)).not.toContain("abort");
+    await vi.advanceTimersByTimeAsync(1);
+    await expect(limited.done).resolves.toMatchObject({ exitCode: 1, interrupted: true, interruptionReason: "timeout", pooled: true });
+    await limitedEvents;
+    expect(cmdTypes(a!).filter((t) => t === "abort")).toHaveLength(1);
+    expect(cmdTypes(b!)).not.toContain("abort");
+    standardTurn(b!);
+    await expect(other.done).resolves.toMatchObject({ exitCode: 0 });
+    expect(await other.done).not.toHaveProperty("interrupted");
+    expect(await other.done).not.toHaveProperty("interruptionReason");
+    await otherEvents;
+    a!.onPrompt = (child) => standardTurn(child);
+    await expect(runTurn(pool, { ...BASE, prompt: "next", threadId: "limited", resumeSessionId: a!.sessionId })).resolves.toMatchObject({ result: { exitCode: 0, resumeMode: "same-process" } });
+  });
+
+  it.each(["cancel", "timeout"] as const)("warm interruption keeps the first reason (%s first)", async (firstReason) => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval"] });
+    const pool = newPool();
+    setupChild = (c) => {
+      c.ignoreAbort = true;
+      c.onPrompt = (child) => { child.running = true; child.send({ type: "agent_start" }); };
+    };
+    const handle = pool.run({ ...BASE, prompt: "long", threadId: "first-reason", timeoutMs: 1000 });
+    const events = collect(handle);
+    await waitFor(() => rpcChildren()[0]?.running === true);
+    if (firstReason === "cancel") handle.kill();
+    await vi.advanceTimersByTimeAsync(1000);
+    if (firstReason === "timeout") handle.kill();
+    await vi.advanceTimersByTimeAsync(4000);
+    await expect(handle.done).resolves.toMatchObject({ interrupted: true, interruptionReason: firstReason });
+    await events;
+  });
+
+  it("the pool wall-clock timeout overrides its cold fallback's internal cancel reason", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval"] });
+    const pool = newPool({ maxProcesses: 0 });
+    setupChild = (c) => { c.holdCold = true; };
+    const handle = pool.run({ ...BASE, prompt: "cold", threadId: "timeout-fallback", timeoutMs: 1000 });
+    const events = collect(handle);
+    await waitFor(() => coldChildren()[0]?.running === true);
+    await vi.advanceTimersByTimeAsync(1000);
+    await expect(handle.done).resolves.toMatchObject({ interrupted: true, interruptionReason: "timeout", pooled: false });
+    await events;
+  });
+
+  it("cold fallback preserves the explicit-interruption outcome", async () => {
+    const pool = newPool({ maxProcesses: 0 });
+    const handle = pool.run({ ...BASE, prompt: "fallback", threadId: "fallback" });
+    const events = collect(handle);
+    expect(coldChildren()).toHaveLength(1);
+    handle.kill();
+    await expect(handle.done).resolves.toMatchObject({ exitCode: 1, interrupted: true, interruptionReason: "cancel", pooled: false });
+    await events;
+  });
+
+  it("a force-settled cold fallback blocks same-thread and native-session writers until real exit", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval"] });
+    const pool = newPool({ maxProcesses: 0 });
+    setupChild = (c) => {
+      if (coldChildren().length === 0) { c.holdCold = true; c.exitOnSigterm = false; }
+    };
+    const first = pool.run({ ...BASE, prompt: "long cold", threadId: "t1" });
+    const firstEvents = collect(first);
+    await waitFor(() => coldChildren()[0]?.running === true);
+    const writer = coldChildren()[0]!;
+    let processExited = false;
+    expect(first.processExited).toBeDefined();
+    void first.processExited!.then(() => { processExited = true; });
+    first.kill();
+    await vi.advanceTimersByTimeAsync(7_000);
+    await expect(first.done).resolves.toMatchObject({ exitCode: 1, interrupted: true, interruptionReason: "cancel", sessionId: "cold-sess" });
+    await firstEvents;
+    expect(processExited).toBe(false);
+    expect(writer.exited).toBe(false);
+    expect(writer.killSignals).toEqual(["SIGTERM", "SIGKILL"]);
+    for (const options of [
+      { threadId: "t1" },
+      { threadId: "different-topic", resumeSessionId: "cold-sess" },
+    ]) {
+      const blocked = pool.run({ ...BASE, prompt: "must not spawn", ...options });
+      await expect(blocked.done).rejects.toThrow(/previous cold process.*has not exited/);
+      expect(await collect(blocked)).toEqual([]);
+    }
+    expect(coldChildren()).toHaveLength(1);
+    await expect(runTurn(pool, { ...BASE, prompt: "unrelated", threadId: "t2" })).resolves.toMatchObject({ result: { exitCode: 0 } });
+    expect(coldChildren()).toHaveLength(2);
+    writer.exit(null, "SIGKILL");
+    await first.processExited;
+    await tick();
+    expect(processExited).toBe(true);
+    await expect(runTurn(pool, { ...BASE, prompt: "resume", threadId: "t1", resumeSessionId: "cold-sess" })).resolves.toMatchObject({ result: { exitCode: 0 } });
+    expect(coldChildren()).toHaveLength(3);
+  });
+
+  it("an asynchronous cold fallback exposes its real process-exit signal on the original handle", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval"] });
+    const pool = newPool();
+    setupChild = (c) => {
+      if (c.args.includes("rpc")) c.dieOnGetState = true;
+      else { c.holdCold = true; c.exitOnSigterm = false; }
+    };
+    const handle = pool.run({ ...BASE, prompt: "fallback later", threadId: "async", resumeSessionId: "native-session" });
+    expect(handle.processExited).toBeUndefined();
+    const events = collect(handle);
+    await waitFor(() => coldChildren()[0]?.running === true);
+    expect(handle.processExited).toBeDefined();
+    let exited = false;
+    void handle.processExited!.then(() => { exited = true; });
+    handle.kill();
+    await vi.advanceTimersByTimeAsync(7_000);
+    await expect(handle.done).resolves.toMatchObject({ exitCode: 1, interrupted: true, interruptionReason: "cancel", pooled: false });
+    await events;
+    expect(exited).toBe(false);
+    const blocked = pool.run({ ...BASE, prompt: "must not restart", threadId: "async", resumeSessionId: "native-session" });
+    await expect(blocked.done).rejects.toThrow(/previous cold process.*has not exited/);
+    await collect(blocked);
+    expect(coldChildren()).toHaveLength(1);
+    coldChildren()[0]!.exit(0);
+    await handle.processExited;
+    expect(exited).toBe(true);
+  });
+
+  it("a provider failure after three simulated hours remains a failure", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "Date"] });
+    const pool = newPool();
+    setupChild = (c) => { c.onPrompt = (child) => { child.running = true; child.send({ type: "agent_start" }); }; };
+    const handle = pool.run({ ...BASE, prompt: "long", threadId: "failure" });
+    const events = collect(handle);
+    const failure = expect(handle.done).rejects.toThrow(/pi provider error: provider unavailable/);
+    await waitFor(() => rpcChildren()[0]?.running === true);
+    await vi.advanceTimersByTimeAsync(3 * 60 * 60 * 1000);
+    rpcChildren()[0]!.send({ type: "message_end", message: { role: "assistant", content: [], stopReason: "error", errorMessage: "provider unavailable" } });
+    rpcChildren()[0]!.send({ type: "agent_settled" });
+    await failure;
+    await events;
+  });
+
+  it("rejects an invalid timer budget before creating a process", () => {
+    const pool = newPool();
+    expect(() => pool.run({ ...BASE, prompt: "x", timeoutMs: Infinity })).toThrow();
+    expect(spawned).toHaveLength(0);
   });
 });
 
@@ -769,6 +1134,37 @@ describe("PiProcessPool retirement", () => {
     expect(result).toMatchObject({ exitCode: 0, sessionId: "sess-new-1", pooled: true, resumeMode: "cold" });
   });
 
+  it("deferred placements cannot spawn past a replacement writer retired by another queued turn", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval"] });
+    const pool = newPool();
+    const first = await runTurn(pool, { ...BASE, prompt: "one", threadId: "t1" });
+    const old = rpcChildren()[0]!;
+    old.exitOnSigterm = false;
+    setupChild = (child) => { child.exitOnSigterm = false; child.holdGetState = true; };
+    const fresh = pool.run({ ...BASE, prompt: "fresh", threadId: "t1", forceFreshSession: true });
+    const resumed = pool.run({ ...BASE, prompt: "resumed", threadId: "t1", resumeSessionId: first.result.sessionId });
+    const freshEvents = collect(fresh);
+    const resumedEvents = collect(resumed);
+    try {
+      old.exit(0);
+      await waitFor(() => rpcChildren().length >= 2);
+      for (let i = 0; i < 20; i++) await tick();
+      await vi.advanceTimersByTimeAsync(60 * 60 * 1000);
+      expect(rpcChildren()).toHaveLength(2);
+      expect(coldChildren()).toHaveLength(0);
+      expect(rpcChildren()[1]!.exited).toBe(false);
+      expect(rpcChildren()[1]!.killSignals).toEqual(["SIGTERM", "SIGKILL"]);
+      fresh.kill();
+      resumed.kill();
+      await expect(fresh.done).resolves.toMatchObject({ exitCode: 1 });
+      await expect(resumed.done).resolves.toMatchObject({ exitCode: 1 });
+      await Promise.all([freshEvents, resumedEvents]);
+    } finally {
+      for (const child of rpcChildren()) if (!child.exited) child.exit(0);
+      await tick();
+    }
+  });
+
   it("win32: retirement closes stdin without signalling the cmd.exe wrapper; the process counts as gone once the wrapper exited and stdout closed", async () => {
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval"] });
     const pool = newPool();
@@ -790,7 +1186,8 @@ describe("PiProcessPool retirement", () => {
     const eventsP = collect(handle);
     await vi.advanceTimersByTimeAsync(2_500);
     expect(rpcChildren()).toHaveLength(1); // no second writer on the session yet
-    await vi.advanceTimersByTimeAsync(3_000);
+    await vi.advanceTimersByTimeAsync(60 * 60 * 1000);
+    expect(rpcChildren()).toHaveLength(1); // no timer can stand in for pi's stdout closing
     expect(taskkills()).toHaveLength(0); // the wrapper's pid may already be another process's
 
     old.stdout.end();

@@ -18,6 +18,7 @@ import path from "node:path";
 import { z } from "zod";
 import yaml from "js-yaml";
 import { ResponseSurfacePrototypeConfigSchema } from "../responseSurface.js";
+import { MAX_RUN_TIMEOUT_SECONDS } from "../agent/runTimeout.js";
 
 // ---------------------------------------------------------------------------
 // Zod schema
@@ -413,8 +414,17 @@ export const BotConfigSchema = z.object({
   idle_timeout_seconds: z.number().int().min(30).optional(),
 
   /**
+   * Optional total wall-clock budget for one native turn, from runner startup
+   * through completion (including tool waits). Unset or 0 = no total deadline.
+   * Positive values interrupt even an active turn; activity does not reset it.
+   * Separate from idle notices, opt-in idle kills, and warm-pool idle eviction.
+   * Bound to Node's safe timer range so large values cannot become 1 ms kills.
+   */
+  subprocess_timeout_seconds: z.number().int().min(0).max(MAX_RUN_TIMEOUT_SECONDS).optional(),
+
+  /**
    * Automatic-interrupt budget, in seconds of continuous silence. **Unset (the
-   * default) = the bridge never interrupts a silent turn.**
+   * default) = the bridge never interrupts for silence alone.**
    *
    * The bridge cannot tell a hung turn from a legitimately slow one — silence
    * looks identical for a real hang, a long prefill, upstream backoff, and any
@@ -422,16 +432,15 @@ export const BotConfigSchema = z.object({
    * using the agent for, so it does not decide. A silent turn instead says so on
    * the card (⏳ …, threshold = `idle_timeout_seconds`) and keeps running; it
    * ends when the runner finishes, when the user clicks the 思考气泡's ⏹ (or
-   * sends `/stop`), or at the 60-min subprocess runaway guard.
+   * sends `/stop`), or an explicit `subprocess_timeout_seconds` budget expires.
    *
    * Set this only where nobody is watching the card — cron / batch dispatch /
-   * unattended fleets — and a wedged turn would otherwise sit for the full hour.
+   * unattended fleets — and a wedged turn would otherwise remain pending.
    * Effective value = `min(max(idle_timeout_seconds, this), 15min)`
    * (handler.ts IDLE_KILL_CEILING_MS). The 15-min clamp is absolute, so on a bot
    * with a very large `idle_timeout_seconds` the interrupt CAN land before the ⏳
-   * notice is due — the clamp wins, because letting the interrupt drift past the
-   * 60-min subprocess runaway guard costs both the 已中断 card and BL-38's
-   * self-heal counting.
+   * notice is due. This existing opt-in ceiling is independent of the optional
+   * total wall-clock budget and never enables idle killing on a default bot.
    */
   idle_kill_seconds: z.number().int().min(30).optional(),
 

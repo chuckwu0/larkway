@@ -19,9 +19,9 @@
  *   Cards already had this covered (see cardFile.ts + reconcile.ts); the bubble
  *   surface simply never got the same treatment. It matters more now that the
  *   idle watchdog no longer kills a silent turn by default (BL-48 修订): the
- *   legitimate `Working` window is now bounded by the 60-min runaway guard
- *   rather than by a 3-min kill, so any crash window it spans is that much
- *   wider.
+ *   legitimate `Working` window has no implicit total deadline. Persisting
+ *   the handle is therefore necessary for reconciliation after a crash, not
+ *   evidence that an ongoing long turn should be interrupted.
  *
  * Scope: the handler's bubble-adopt path writes it, the handler's finalize path
  *   deletes it, and reconcile.ts's boot sweep completes + deletes leftovers.

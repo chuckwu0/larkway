@@ -1032,7 +1032,7 @@ const putBot: ApiHandler = async (req) => {
     }
     if (existing) {
       const merged: Record<string, unknown> = { ...existing };
-      for (const k of ["name", "description", "chats", "repos", "turn_taking_limit", "backend"]) {
+      for (const k of ["name", "description", "chats", "repos", "turn_taking_limit", "backend", "subprocess_timeout_seconds"]) {
         if (k in bodyWithoutTokenFields) merged[k] = bodyWithoutTokenFields[k];
       }
       if (hasWorkspace) {

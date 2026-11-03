@@ -53,6 +53,15 @@ describe("resolveBotsDir", () => {
 });
 
 describe("write/read round-trip", () => {
+  it.each([undefined, 0, 14_400])("preserves optional native turn budget %s through CLI YAML writes", async (seconds) => {
+    await store.writeBot({ ...sampleBot(), subprocess_timeout_seconds: seconds });
+    const got = await store.readBot("test-bot");
+    expect(got.subprocess_timeout_seconds).toBe(seconds);
+    // An unrelated later edit must not drop a configured budget (including 0).
+    await store.writeBot({ ...got, name: "Renamed" });
+    expect((await store.readBot("test-bot")).subprocess_timeout_seconds).toBe(seconds);
+  });
+
   it("writes a bot and reads back an equivalent config", async () => {
     const bot = sampleBot();
     await store.writeBot(bot);

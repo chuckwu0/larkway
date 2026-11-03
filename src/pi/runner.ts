@@ -41,7 +41,7 @@
  */
 
 import { existsSync } from "node:fs";
-import { writeFile, unlink, mkdir } from "node:fs/promises";
+import { writeFile, readFile, unlink, mkdir } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { createInterface } from "node:readline";
 import { spawnPiped } from "../platform/spawn.js";
@@ -56,6 +56,7 @@ import {
   markPerfForEventType,
 } from "../agent/runner.js";
 import { AnswerChannelExtractor } from "../agent/answerChannel.js";
+import { resolveRunTimeoutMs } from "../agent/runTimeout.js";
 
 // ---------------------------------------------------------------------------
 // Internal constants
@@ -529,7 +530,7 @@ export class PiTurnDecoder {
 // ---------------------------------------------------------------------------
 
 export function runPi(opts: RunOptions, piBinPath = "pi"): RunHandle {
-  const timeoutMs = opts.timeoutMs ?? 15 * 60 * 1000;
+  const timeoutMs = resolveRunTimeoutMs(opts.timeoutMs);
   const [bin, args] = buildPiCommand(opts, piBinPath);
   const env = buildPiEnv(opts.botGitIdentity, opts.gitlabToken, opts.larkCliConfigDir);
 
@@ -555,18 +556,49 @@ export function runPi(opts: RunOptions, piBinPath = "pi"): RunHandle {
     opts.pidFilePath !== undefined ? opts.pidFilePath :
       opts.cwd != null ? join(opts.cwd, ".larkway", "runner.pid") : null;
 
+  let pidWrite: Promise<void> = Promise.resolve();
   if (pidFilePath !== null && child.pid != null) {
     const pidPayload = JSON.stringify({
       pid: child.pid,
       spawnedAt: new Date().toISOString(),
       binPath: bin,
     });
-    void mkdir(dirname(pidFilePath), { recursive: true })
+    pidWrite = mkdir(dirname(pidFilePath), { recursive: true })
       .then(() => writeFile(pidFilePath, pidPayload, "utf8"))
       .catch((err: unknown) => {
         console.warn("[pi-runner] failed to write pid file:", err);
       });
   }
+
+  // `done` can be force-settled after cancellation. That is not evidence
+  // the process released its native session file or its PID liveness guard.
+  let exited = false;
+  let resolveProcessExited!: () => void;
+  const processExited = new Promise<void>((resolve) => { resolveProcessExited = resolve; });
+  const confirmProcessExit = (): void => {
+    if (exited) return;
+    exited = true;
+    if (pidFilePath !== null && child.pid != null) {
+      void pidWrite.then(async () => {
+        try {
+          const payload = JSON.parse(await readFile(pidFilePath, "utf8")) as { pid?: number };
+          // A later writer may already own the shared path. Never remove it.
+          if (payload.pid === child.pid) await unlink(pidFilePath);
+        } catch { /* missing or replaced PID hint */ }
+      }).then(resolveProcessExited, resolveProcessExited);
+      // Release the writer gate only after its PID cleanup completes. This
+      // keeps a same-session replacement from writing between read/unlink.
+    } else {
+      resolveProcessExited();
+    }
+  };
+  child.once("exit", confirmProcessExit);
+  child.once("close", confirmProcessExit);
+  child.on("error", () => {
+    // Only a missing PID proves spawn failed. An error on an existing child
+    // (e.g. a failed signal/write) must not release its writer ownership.
+    if (child.pid == null) confirmProcessExit();
+  });
 
   /** Session id, last assistant outcome and usage of this (only) turn. */
   const decoder = new PiTurnDecoder(markPerf);
@@ -582,14 +614,24 @@ export function runPi(opts: RunOptions, piBinPath = "pi"): RunHandle {
   let generatorState: "idle" | "running" | "finished" = "idle";
   let deferredExitCode: number | undefined;
   let closeDrainTimer: ReturnType<typeof setTimeout> | undefined;
+  let exitFallbackTimer: ReturnType<typeof setTimeout> | undefined;
   const CLOSE_DRAIN_GRACE_MS = 5_000;
 
   // ── kill helper (SIGTERM → grace → SIGKILL) ───────────────────────────────
+  let settled = false;
+  let interrupted = false;
+  let interruptionReason: "cancel" | "timeout" | undefined;
   let killScheduled = false;
+  // Cancellation must remain bounded even when there is no wall-clock budget.
+  const POST_KILL_SETTLE_MS = SIGKILL_GRACE_MS + 2_000;
+  let totalTimeoutFallbackHandle: ReturnType<typeof setTimeout> | undefined;
+  let forceFinalizeAfterKill: () => void = () => { /* bound below */ };
   let killTimer: ReturnType<typeof setTimeout> | undefined;
 
-  function doKill(): void {
-    if (child.killed || killScheduled) return;
+  function doKill(interrupt = true, reason: "cancel" | "timeout" = "cancel"): void {
+    if (settled || killScheduled) return;
+    interrupted = interrupt;
+    if (interrupt) interruptionReason = reason;
     killScheduled = true;
     let exited = false;
     child.once("exit", () => {
@@ -600,7 +642,11 @@ export function runPi(opts: RunOptions, piBinPath = "pi"): RunHandle {
       if (!exited) child.kill("SIGKILL");
     }, SIGKILL_GRACE_MS);
     killTimer.unref();
+    totalTimeoutFallbackHandle = setTimeout(() => forceFinalizeAfterKill(), POST_KILL_SETTLE_MS);
+    totalTimeoutFallbackHandle.unref();
   }
+
+  const onAbort = (): void => doKill();
 
   // ── grandchild-block workaround: force-kill after result seen ─────────────
   let grandchildGraceTimer: ReturnType<typeof setTimeout> | undefined;
@@ -615,34 +661,22 @@ export function runPi(opts: RunOptions, piBinPath = "pi"): RunHandle {
           "[pi-runner] pi still running 30 s after agent_settled — " +
             "likely blocked by a non-detached grandchild process (e.g. dev server). Sending SIGTERM.",
         );
-        doKill();
+        doKill(false);
       }
     }, GRANDCHILD_GRACE_MS);
     grandchildGraceTimer.unref();
   }
 
-  // ── timeout (two-stage, see ClaudeRunner) ─────────────────────────────────
-  const TOTAL_TIMEOUT_EXTRA_MS = SIGKILL_GRACE_MS + 2_000;
-  let totalTimeoutFallbackHandle: ReturnType<typeof setTimeout> | undefined;
-  let _forceFinalizeForTimeout: () => void = () => { /* bound below */ };
+  // ── optional wall-clock budget ───────────────────────────────────────────
+  // Omitted/0 means no deadline; never pass a disabled value to setTimeout.
   let _finalizeAfterDrain: () => void = () => { /* bound below */ };
-
-  const timeoutHandle = setTimeout(() => {
-    doKill();
-    totalTimeoutFallbackHandle = setTimeout(() => {
-      _forceFinalizeForTimeout();
-    }, TOTAL_TIMEOUT_EXTRA_MS);
-    totalTimeoutFallbackHandle.unref();
-  }, timeoutMs);
-  timeoutHandle.unref();
+  const timeoutHandle = timeoutMs === undefined ? undefined : setTimeout(() => doKill(true, "timeout"), timeoutMs);
+  timeoutHandle?.unref();
 
   // ── abortSignal ───────────────────────────────────────────────────────────
   if (opts.abortSignal != null) {
-    if (opts.abortSignal.aborted) {
-      doKill();
-    } else {
-      opts.abortSignal.addEventListener("abort", doKill, { once: true });
-    }
+    if (opts.abortSignal.aborted) doKill();
+    else opts.abortSignal.addEventListener("abort", onAbort, { once: true });
   }
 
   // ── stderr collection ──────────────────────────────────────────────────────
@@ -652,22 +686,19 @@ export function runPi(opts: RunOptions, piBinPath = "pi"): RunHandle {
   const rlAbortController = new AbortController();
 
   // ── done promise ──────────────────────────────────────────────────────────
-  const done = new Promise<{ exitCode: number; sessionId?: string }>(
+  const done = new Promise<{ exitCode: number; sessionId?: string; interrupted?: boolean; interruptionReason?: "cancel" | "timeout" }>(
     (resolve, reject) => {
-      let settled = false;
-
       const finalizeResolve = (exitCode: number): void => {
         if (settled) return;
         settled = true;
+        opts.abortSignal?.removeEventListener("abort", onAbort);
         clearTimeout(timeoutHandle);
         clearTimeout(killTimer);
         clearTimeout(grandchildGraceTimer);
         clearTimeout(totalTimeoutFallbackHandle);
         clearTimeout(closeDrainTimer);
+        clearTimeout(exitFallbackTimer);
         rlAbortController.abort();
-        if (pidFilePath !== null) {
-          void unlink(pidFilePath).catch(() => { /* may already be gone */ });
-        }
         if (exitCode !== 0 && !killScheduled) {
           const stderr = Buffer.concat(stderrChunks).toString("utf8").trim();
           reject(
@@ -681,7 +712,7 @@ export function runPi(opts: RunOptions, piBinPath = "pi"): RunHandle {
         // pi exits 0 even when the provider call itself failed (the failure
         // is an assistant message with stopReason "error"). Surface it as a
         // runner error so the card shows the cause instead of "no answer".
-        if (decoder.assistantError !== undefined && !killScheduled) {
+        if (decoder.assistantError !== undefined && !interrupted) {
           const stderr = Buffer.concat(stderrChunks).toString("utf8").trim();
           reject(
             new Error(
@@ -691,28 +722,33 @@ export function runPi(opts: RunOptions, piBinPath = "pi"): RunHandle {
           );
           return;
         }
-        resolve({ exitCode, sessionId: decoder.sessionId });
+        resolve({
+          exitCode: interrupted ? 1 : exitCode,
+          sessionId: decoder.sessionId,
+          ...(interrupted ? { interrupted: true, interruptionReason } : {}),
+        });
       };
 
-      _forceFinalizeForTimeout = () => {
+      forceFinalizeAfterKill = () => {
         if (settled) return;
         console.warn(
           `[pi-runner] child pid=${child.pid} did not exit within ` +
-            `${timeoutMs + TOTAL_TIMEOUT_EXTRA_MS}ms total. Force-resolving done.`,
+            `${POST_KILL_SETTLE_MS}ms after termination. Force-resolving done.`,
         );
-        finalizeResolve(1);
+        finalizeResolve(interrupted ? 1 : 0);
       };
 
       child.on("error", (err: NodeJS.ErrnoException) => {
         if (settled) return;
         settled = true;
+        opts.abortSignal?.removeEventListener("abort", onAbort);
         clearTimeout(timeoutHandle);
         clearTimeout(killTimer);
+        clearTimeout(grandchildGraceTimer);
+        clearTimeout(closeDrainTimer);
+        clearTimeout(exitFallbackTimer);
         clearTimeout(totalTimeoutFallbackHandle);
         rlAbortController.abort();
-        if (pidFilePath !== null) {
-          void unlink(pidFilePath).catch(() => { /* absent is OK */ });
-        }
         if (err.code === "ENOENT") {
           reject(
             new Error(
@@ -755,7 +791,7 @@ export function runPi(opts: RunOptions, piBinPath = "pi"): RunHandle {
       child.on("exit", (code: number | null) => {
         if (settled) return;
         const EXIT_TO_CLOSE_GRACE_MS = 5_000;
-        const exitFallback = setTimeout(() => {
+        exitFallbackTimer = setTimeout(() => {
           // 'close' DID fire and parked its exit code for the events drain:
           // this fallback exists only for the no-close (grandchild holding
           // stdio) case, and closeDrainTimer already bounds the drain.
@@ -767,7 +803,7 @@ export function runPi(opts: RunOptions, piBinPath = "pi"): RunHandle {
           );
           finalizeResolve(code ?? 1);
         }, EXIT_TO_CLOSE_GRACE_MS);
-        exitFallback.unref();
+        exitFallbackTimer.unref();
       });
     },
   );
@@ -806,7 +842,8 @@ export function runPi(opts: RunOptions, piBinPath = "pi"): RunHandle {
   return {
     events: generateEvents(),
     done,
-    kill: doKill,
+    processExited,
+    kill: () => doKill(),
     pid: child.pid ?? undefined,
   };
 }

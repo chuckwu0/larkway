@@ -27,6 +27,7 @@ import {
   markPerfForEventType,
 } from "../agent/runner.js";
 import { AnswerChannelExtractor } from "../agent/answerChannel.js";
+import { resolveRunTimeoutMs } from "../agent/runTimeout.js";
 
 // ---------------------------------------------------------------------------
 // Public types — re-exported for backward compatibility
@@ -545,7 +546,7 @@ function* parseLinesMulti(
 // ---------------------------------------------------------------------------
 
 export function runClaude(opts: RunOptions): RunHandle {
-  const timeoutMs = opts.timeoutMs ?? 15 * 60 * 1000;
+  const timeoutMs = resolveRunTimeoutMs(opts.timeoutMs);
   const [bin, args] = buildCommand(opts);
   const env = buildEnv(opts.botGitIdentity, opts.gitlabToken, opts.larkCliConfigDir);
 
@@ -573,13 +574,14 @@ export function runClaude(opts: RunOptions): RunHandle {
     opts.pidFilePath !== undefined ? opts.pidFilePath :
       opts.cwd != null ? join(opts.cwd, ".larkway", "runner.pid") : null;
 
+  let pidWrite: Promise<void> = Promise.resolve();
   if (pidFilePath !== null && child.pid != null) {
     const pidPayload = JSON.stringify({
       pid: child.pid,
       spawnedAt: new Date().toISOString(),
       binPath: bin,
     });
-    void mkdir(dirname(pidFilePath), { recursive: true })
+    pidWrite = mkdir(dirname(pidFilePath), { recursive: true })
       .then(() => writeFile(pidFilePath, pidPayload, "utf8"))
       .catch((err: unknown) => {
         console.warn("[runner] failed to write pid file:", err);
@@ -588,14 +590,52 @@ export function runClaude(opts: RunOptions): RunHandle {
     console.debug("[runner] opts.cwd is undefined — skipping pid file write");
   }
 
+  // Run completion and process death are different facts. A bounded stop
+  // can settle `done` while the OS still has not confirmed the writer exited.
+  let confirmProcessExit!: () => void;
+  const processExited = new Promise<void>((resolve) => {
+    let confirmed = false;
+    confirmProcessExit = () => {
+      if (confirmed) return;
+      confirmed = true;
+      if (pidFilePath !== null && child.pid != null) {
+        // A fast exit must not race an in-flight PID write and leave it stale.
+        // Finish cleanup before allowing a guarded replacement to write its PID.
+        void pidWrite.then(() => unlink(pidFilePath)).catch(() => { /* absent is OK */ }).then(resolve);
+      } else {
+        resolve();
+      }
+    };
+  });
+  child.once("exit", confirmProcessExit);
+  child.once("close", confirmProcessExit);
+  child.on("error", () => {
+    // An error sending a signal to a process with a PID is NOT proof of death.
+    if (child.pid == null) confirmProcessExit();
+  });
+
   // Track discovered sessionId for the done promise
   let discoveredSessionId: string | undefined;
 
   // ── kill helper (SIGTERM → grace → SIGKILL) ───────────────────────────────
   let killScheduled = false;
+  let interrupted = false;
+  let interruptionReason: "cancel" | "timeout" | undefined;
+  let settled = false;
   let killTimer: ReturnType<typeof setTimeout> | undefined;
+  let killFallbackHandle: ReturnType<typeof setTimeout> | undefined;
+  let exitFallbackHandle: ReturnType<typeof setTimeout> | undefined;
+  // A stop must finish even without a wall-clock budget and even if the child
+  // never acknowledges SIGKILL. Bound teardown, not the running native turn.
+  const KILL_FALLBACK_MS = SIGKILL_GRACE_MS + 2_000;
+  let forceFinalizeForKill: () => void = () => { /* set by the done constructor */ };
 
-  function doKill(): void {
+  function doKill(interrupt = true, reason: "cancel" | "timeout" = "cancel"): void {
+    if (settled) return;
+    if (interrupt) {
+      interrupted = true;
+      interruptionReason ??= reason;
+    }
     if (child.killed || killScheduled) return;
     killScheduled = true;
     // `child.killed` flips true synchronously the instant .kill() is called
@@ -612,6 +652,8 @@ export function runClaude(opts: RunOptions): RunHandle {
     }, SIGKILL_GRACE_MS);
     // Unref so the timer does not prevent Node from exiting if nothing else holds
     killTimer.unref();
+    killFallbackHandle = setTimeout(() => forceFinalizeForKill(), KILL_FALLBACK_MS);
+    killFallbackHandle.unref();
   }
 
   // ── grandchild-block workaround: force-kill after result seen ─────────────
@@ -640,54 +682,25 @@ export function runClaude(opts: RunOptions): RunHandle {
             "likely blocked by a non-detached grandchild process (e.g. dev server). " +
             "Sending SIGTERM. Fix: use start_new_session=True when spawning dev servers."
         );
-        doKill();
+        doKill(false);
       }
     }, GRANDCHILD_GRACE_MS);
     grandchildGraceTimer.unref();
   }
 
-  // ── timeout ───────────────────────────────────────────────────────────────
-  //
-  // Two-stage timeout guarantee:
-  //
-  //  Stage 1 (timeoutMs):   doKill() → SIGTERM the child process.
-  //  Stage 2 (timeoutMs + SIGKILL_GRACE_MS + 2s): If the child process is
-  //    still not dead after SIGKILL (zombie / kernel hold), force-resolve done
-  //    so the card can still finalize.  2s extra slack lets the SIGKILL handler
-  //    and exit/close events propagate normally before we override.
-  //
-  // Without Stage 2, a completely silent child after SIGKILL would leave
-  // done hanging forever — this is the BL-9 total-timeout fallback.
-  const TOTAL_TIMEOUT_EXTRA_MS = SIGKILL_GRACE_MS + 2_000;
-
-  let totalTimeoutFallbackHandle: ReturnType<typeof setTimeout> | undefined;
-
-  const timeoutHandle = setTimeout(() => {
-    doKill();
-    // Arm Stage 2: if close/exit still don't fire after the full kill sequence,
-    // force-resolve done.  finalizeResolve is idempotent (settled guard) so this
-    // is safe even when the process exits normally right after SIGTERM.
-    totalTimeoutFallbackHandle = setTimeout(() => {
-      // Access finalizeResolve via closure — it's defined inside the done
-      // Promise constructor below.  We call the externally-visible wrapper
-      // instead (see _forceFinalizeForTimeout below).
-      _forceFinalizeForTimeout();
-    }, TOTAL_TIMEOUT_EXTRA_MS);
-    totalTimeoutFallbackHandle.unref();
-  }, timeoutMs);
-  timeoutHandle.unref();
-
-  // Placeholder; overwritten by the done Promise constructor below once
-  // finalizeResolve is in scope.  Using a late-binding closure avoids
-  // splitting the Promise constructor or forward-declaring resolve/reject.
-  let _forceFinalizeForTimeout: () => void = () => { /* no-op until done is constructed */ };
+  // ── optional wall-clock budget ──────────────────────────────────────────
+  // Unset / zero means no deadline. Never pass a disabled value to setTimeout:
+  // Node turns zero and overflowing values into an immediate timer.
+  const interrupt = (): void => doKill();
+  const timeoutHandle = timeoutMs === undefined ? undefined : setTimeout(() => doKill(true, "timeout"), timeoutMs);
+  timeoutHandle?.unref();
 
   // ── abortSignal ───────────────────────────────────────────────────────────
   if (opts.abortSignal != null) {
     if (opts.abortSignal.aborted) {
       doKill();
     } else {
-      opts.abortSignal.addEventListener("abort", doKill, { once: true });
+      opts.abortSignal.addEventListener("abort", interrupt, { once: true });
     }
   }
 
@@ -709,30 +722,25 @@ export function runClaude(opts: RunOptions): RunHandle {
   const rlAbortController = new AbortController();
 
   // ── done promise ──────────────────────────────────────────────────────────
-  const done = new Promise<{ exitCode: number; sessionId?: string }>(
+  const done = new Promise<{ exitCode: number; sessionId?: string; interrupted?: boolean; interruptionReason?: "cancel" | "timeout" }>(
     (resolve, reject) => {
       // Guard so 'close' and 'exit' don't double-resolve. Whichever fires first
       // and finishes processing flips this to true.
-      let settled = false;
-
       const finalizeResolve = (exitCode: number): void => {
         if (settled) return;
         settled = true;
         clearTimeout(timeoutHandle);
         clearTimeout(killTimer);
         clearTimeout(grandchildGraceTimer);
-        clearTimeout(totalTimeoutFallbackHandle);
+        clearTimeout(killFallbackHandle);
+        clearTimeout(exitFallbackHandle);
+        opts.abortSignal?.removeEventListener("abort", interrupt);
         // Abort the readline interface so the generateEvents() `for await`
         // loop receives an AbortError and exits — this unblocks handler.ts's
         // `for await (ev of handle.events)` even when child.stdout hasn't
         // closed yet (grandchild holding stdio). Without this, done resolves
         // but handler never reaches card.finalize(), card stays at 🔧 处理中.
         rlAbortController.abort();
-        // Clean up pid file so a future spawn into the same worktree doesn't
-        // leave gc.ts pointing at this (now-dead) pid — kernel may recycle it.
-        if (pidFilePath !== null) {
-          void unlink(pidFilePath).catch(() => {/* file may already be gone */});
-        }
         if (exitCode !== 0 && !killScheduled) {
           const stderr = Buffer.concat(stderrChunks).toString("utf8").trim();
           reject(
@@ -743,36 +751,40 @@ export function runClaude(opts: RunOptions): RunHandle {
           );
           return;
         }
-        resolve({ exitCode, sessionId: discoveredSessionId });
+        resolve({
+          exitCode: interrupted ? 1 : exitCode,
+          sessionId: discoveredSessionId,
+          ...(interrupted ? { interrupted: true, interruptionReason } : {}),
+        });
       };
 
-      // Wire the Stage-2 total-timeout fallback.  Called by the setTimeout
-      // above (after the full kill grace period) to force-resolve done even
-      // when the child process remains completely silent after SIGKILL.
-      _forceFinalizeForTimeout = () => {
+      // Shared by explicit budget expiry, kill(), AbortSignal and the
+      // post-result grace path; never armed while an ordinary turn is running.
+      forceFinalizeForKill = () => {
         if (settled) return;
         console.warn(
-          `[runner] child pid=${child.pid} did not exit within ` +
-            `${timeoutMs + TOTAL_TIMEOUT_EXTRA_MS}ms total (timeoutMs=${timeoutMs}` +
-            ` + SIGKILL grace + slack). Force-resolving done. (BL-9 total-timeout fallback)`
+          `[runner] child pid=${child.pid} did not exit within ${KILL_FALLBACK_MS}ms ` +
+            `after termination was requested. Force-resolving done.`,
         );
         finalizeResolve(1);
       };
 
       child.on("error", (err: NodeJS.ErrnoException) => {
         if (settled) return;
+        if (interrupted) {
+          finalizeResolve(1);
+          return;
+        }
         settled = true;
         clearTimeout(timeoutHandle);
         clearTimeout(killTimer);
-        clearTimeout(totalTimeoutFallbackHandle);
+        clearTimeout(grandchildGraceTimer);
+        clearTimeout(killFallbackHandle);
+        clearTimeout(exitFallbackHandle);
+        opts.abortSignal?.removeEventListener("abort", interrupt);
         // Abort readline so generateEvents() exits — same contract as
         // finalizeResolve(). The error path must also unblock the events loop.
         rlAbortController.abort();
-        // Same pid-file cleanup contract as close handler — defensive in case
-        // error fires without a subsequent close event.
-        if (pidFilePath !== null) {
-          void unlink(pidFilePath).catch(() => {/* absent is OK */});
-        }
         if (err.code === "ENOENT") {
           reject(
             new Error(
@@ -804,7 +816,7 @@ export function runClaude(opts: RunOptions): RunHandle {
       child.on("exit", (code: number | null) => {
         if (settled) return;
         const EXIT_TO_CLOSE_GRACE_MS = 5_000;
-        const exitFallback = setTimeout(() => {
+        exitFallbackHandle = setTimeout(() => {
           if (settled) return;
           console.warn(
             `[runner] child pid=${child.pid} exited (code=${code ?? "signal"}) ` +
@@ -814,7 +826,7 @@ export function runClaude(opts: RunOptions): RunHandle {
           );
           finalizeResolve(code ?? 1);
         }, EXIT_TO_CLOSE_GRACE_MS);
-        exitFallback.unref();
+        exitFallbackHandle.unref();
       });
     }
   );
@@ -887,7 +899,8 @@ export function runClaude(opts: RunOptions): RunHandle {
   return {
     events: generateEvents(),
     done,
-    kill: doKill,
+    processExited,
+    kill: interrupt,
     pid: child.pid ?? undefined,
   };
 }
