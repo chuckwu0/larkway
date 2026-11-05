@@ -825,12 +825,10 @@ describe("runClaude() — native long turns", () => {
       let exited = false;
       void handle.processExited?.then(() => { exited = true; });
       const drain = (async () => { for await (const _event of handle.events) { /* drain */ } })();
-      // Wait for the asynchronous initial PID write without using fake timers.
-      for (let i = 0; i < 20; i++) {
-        try { await readFile(pidFilePath, "utf8"); break; }
-        catch { await new Promise<void>((resolve) => setImmediate(resolve)); }
-      }
-      expect(JSON.parse(await readFile(pidFilePath, "utf8")).pid).toBe(fake.child.pid);
+      // File existence precedes completion of writeFile; wait for valid content.
+      await vi.waitFor(async () => {
+        expect(JSON.parse(await readFile(pidFilePath, "utf8")).pid).toBe(fake.child.pid);
+      });
       handle.kill();
       await vi.advanceTimersByTimeAsync(7_000);
       await expect(handle.done).resolves.toMatchObject({ exitCode: 1, interrupted: true });

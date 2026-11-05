@@ -173,7 +173,7 @@ function inboundClient(
   log: string[],
   first: LarkMessageEvent,
   then?: { after: Promise<unknown>; event: LarkMessageEvent },
-  reactions: { addDelayMs?: number; removeFails?: boolean } = {},
+  reactions: { addDelayMs?: number; addGate?: Promise<void>; removeFails?: boolean } = {},
 ) {
   const outcomes: Outcome[] = [];
   const client: InboundClient = {
@@ -187,6 +187,7 @@ function inboundClient(
     addProcessingReaction: async () => {
       log.push("reaction:add");
       if (reactions.addDelayMs) await sleep(reactions.addDelayMs);
+      await reactions.addGate;
     },
     removeProcessingReaction: async () => {
       log.push("reaction:remove");
@@ -982,20 +983,16 @@ describe("WP-10: every exit of a model-first turn waits for its card (no orphan 
 });
 
 describe("WP-10: what a model-first runner does not wait for", () => {
-  // Slow ⏳ reaction (400ms): the lane is held, so the runner's reasoning
+  // Gated ⏳ reaction: the lane is held, so the runner's reasoning
   // arrives before the bubble's lane step even starts. Fast reaction: the
   // bubble's create starts during the setup, ahead of the runner, and is
   // still pending when the reasoning arrives. Either way it must be held for
   // the bubble, not dropped.
-  it.each([
-    // 400ms, not 40: the runner must start inside the reaction's delay even on
-    // a slow CI runner, where handleOne's local prep alone exceeded 40ms.
-    { addDelayMs: 400, bubbleStep: "after" },
-    { addDelayMs: 0, bubbleStep: "before" },
-  ])("the COT bubble of an existing topic still comes before the card, and gets the early reasoning (its create starts $bubbleStep run())", async ({ addDelayMs, bubbleStep }) => {
+  it.each(["after", "before"])("the COT bubble of an existing topic still comes before the card, and gets the early reasoning (its create starts %s run())", async (bubbleStep) => {
     process.env["LARKWAY_MODEL_FIRST"] = "continuation";
     const log: string[] = [];
     const gate = deferred();
+    const reactionGate = bubbleStep === "after" ? deferred() : undefined;
     const cot = recordingCot(log, gate.promise);
     const { captured } = registerScript(
       [{
@@ -1008,7 +1005,7 @@ describe("WP-10: what a model-first runner does not wait for", () => {
       }],
       log,
     );
-    const { client } = inboundClient(log, continuationEvent(), undefined, { addDelayMs });
+    const { client } = inboundClient(log, continuationEvent(), undefined, { addGate: reactionGate?.promise });
     const { handler } = makeHandler({
       log,
       client,
@@ -1017,6 +1014,7 @@ describe("WP-10: what a model-first runner does not wait for", () => {
     });
     const running = runAll(handler);
     await vi.waitFor(() => expect(captured).toHaveLength(1), CI_WAIT);
+    reactionGate?.resolve();
     await vi.waitFor(() => expect(log).toContain("cot:create:start"), CI_WAIT);
     gate.resolve();
     await running;
