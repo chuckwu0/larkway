@@ -912,9 +912,7 @@ class LiveCardKitProgressHandle implements CardKitProgressHandle {
   }
 
   private visibleText(): string {
-    return this.progressBuffer
-      ? `**过程回复**\n\n${this.progressBuffer}${this.answerBuffer ? `\n\n---\n\n**本轮回复**\n\n${this.answerBuffer}` : ""}`
-      : this.answerBuffer;
+    return this.answerBuffer || this.progressBuffer;
   }
 
   private async withAnswerElement(initialContent: string): Promise<void> {

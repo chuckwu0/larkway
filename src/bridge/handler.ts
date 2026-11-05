@@ -1423,7 +1423,7 @@ export class BridgeHandler {
     const previous = await this.inputDeliveries.get(event.message_id);
     if (previous && previous.status !== "rejected") {
       this.deps.client.markHandled?.(event.message_id);
-      await this.inputReceipt(event, previous.status === "accepted" ? "此补充消息已交给执行轮次，不会重复提交。" : "此补充消息的交付结果待核对，未自动重发；请维护者核对原生记录。");
+      if (previous.status !== "accepted") await this.inputReceipt(event, "这条补充尚未确认送达，请联系维护者核对。");
       return true;
     }
     // Rollback switch still honours durable accepted/uncertain deliveries above.
@@ -1474,10 +1474,9 @@ export class BridgeHandler {
     }).catch((err: unknown) => console.warn("[bridge.handler] input event record failed:", err));
     if (result.status === "rejected") return false;
     this.deps.client.markHandled?.(event.message_id);
+    if (result.status === "accepted") return true;
     const reply = active.replyMessageId();
-    const receipt = this.inputReceipt(event, result.status === "accepted"
-      ? "补充消息已交给当前执行；接收不代表已经处理。"
-      : "补充消息交付结果待核对，未自动重发；请维护者核对原生记录。", reply)
+    const receipt = this.inputReceipt(event, "这条补充尚未确认送达，请联系维护者核对。", reply)
       .finally(() => this.inFlightTurns.delete(receipt));
     this.inFlightTurns.add(receipt);
     return true;
@@ -1732,14 +1731,13 @@ export class BridgeHandler {
         if (epoch !== (stopEpoch.get(key) ?? 0)) { this.deps.client.markHandled?.(event.message_id); return; }
         if (threadQueues.has(key)) {
           void this.deps.client.addProcessingReaction?.(event.message_id).catch((err: unknown) => console.warn("[bridge.handler] input reaction failed:", err));
-          void this.inputReceipt(event, "已收到补充，等待当前轮次结束后处理。");
         }
         enqueue(event, key, keyOpts);
       }).catch(async (err: unknown) => {
         console.error("[bridge.handler] input routing failed; held for reconciliation:", err);
         // Fail closed: a durable send might already have happened.
         this.deps.client.markHandled?.(event.message_id);
-        await this.inputReceipt(event, "补充消息交付待核对，未自动重发；请维护者检查输入交付记录。");
+        await this.inputReceipt(event, "这条补充尚未确认送达，请联系维护者核对。");
       }).finally(() => {
         if (routing.get(key) === route) routing.delete(key);
         this.inFlightTurns.delete(route);
@@ -3264,7 +3262,7 @@ export class BridgeHandler {
         clearIdleWaiting: () => cardKitProgress?.clearIdleWaiting(),
       });
       if (progressReplies) progressReplies.onChange = () => {
-        if (progressReplies) surface.handle({ type: "progress_snapshot", text: progressReplies.render(), raw: null });
+        if (progressReplies) surface.handle({ type: "progress_snapshot", text: progressReplies.latestText, raw: null });
       };
       if (!modelFirst) {
         surface.attach();
@@ -4018,7 +4016,7 @@ export class BridgeHandler {
             // or held until the model-first lane has the card.
             if (ev.type === "progress_message" && progressReplies) {
               progressReplies.add(ev.itemId, ev.text);
-              surface.handle({ type: "progress_snapshot", text: progressReplies.render(), raw: ev.raw });
+              surface.handle({ type: "progress_snapshot", text: progressReplies.latestText, raw: ev.raw });
             } else {
               surface.handle(ev);
             }
@@ -4048,7 +4046,7 @@ export class BridgeHandler {
           const runnerDoneAt = Date.now();
           progressDrain = progressReplies?.drain();
           await progressDrain;
-          if (progressReplies?.hasMessages) surface.handle({ type: "progress_snapshot", text: progressReplies.render(), raw: null });
+          if (progressReplies?.hasMessages) surface.handle({ type: "progress_snapshot", text: progressReplies.latestText, raw: null });
           // A model-first card may not exist yet: then all of its calls (the
           // replay of the early events included) land in the tail below.
           turnPerf.markRunnerDone(cardKitProgress?.callDurationsMs, runnerDoneAt);
@@ -4839,7 +4837,7 @@ export class BridgeHandler {
                   ? `⚠️ 本轮长时间没有输出（静默 ${formatSilence(idleObservedSilenceMs)}）后结束，没有产出正文。\n` +
                     idleThresholdHint(idleTimeoutMs, idleKillAfterMs)
                 : reportedState?.last_message ??
-                  (fallbackAnswer ? fallbackAnswer : progressReplies?.hasMessages ? "本轮已结束，未提供最终结论；以上过程回复不代表需求已验收。" : noOutputFallback);
+                  (fallbackAnswer ? fallbackAnswer : progressReplies?.hasMessages ? progressReplies.latestText : noOutputFallback);
 
           // 批F (F2): persist this turn's user-facing answer into the session
           // transcript so a future reseed seed carries BOTH sides of the
@@ -4930,12 +4928,6 @@ export class BridgeHandler {
                 ]
               : declaredContentBlocks;
 
-          // When the agent didn't report status this turn (reportedState null,
-          // per stale-guard) but exited cleanly, don't let the card default to
-          // "✅ 完成" — the agent just produced text without a status, claiming
-          // success is misleading. Show a neutral title/color; the fresh body
-          // text tells the real story. (On a real failure we keep failure style.)
-          const noReportThisTurn = reportedState === null;
           // The turn ended but work it kicked off is still running in the
           // agent process (pooled claude: background shells / Agent forks), or
           // the agent itself said it isn't done. "✅ 完成" would be a false
@@ -4945,22 +4937,16 @@ export class BridgeHandler {
             !failureReason &&
             reportedStatus !== "ready" &&
             ((result.backgroundTasksPending ?? 0) > 0 || reportedStatus === "in_progress");
-          const neutralTitle = workStillRunning
-            ? (result.backgroundTasksPending ?? 0) > 0
-              ? "⏳ 后台任务进行中"
-              : "⏳ 进行中"
-            : noReportThisTurn && success && !failureReason
-              ? "💬 本轮已结束"
-              : success && !failureReason ? "本轮已结束" : undefined;
+          const neutralTitle = workStillRunning ? "⏳ 进行中" : undefined;
 
           await fs.mkdir(path.join(worktreePath, ".larkway"), { recursive: true });
           await fs.writeFile(path.join(worktreePath, ".larkway", "decision.json"), JSON.stringify({
             version: reportedState?.choices?.length ? decisionVersion(reportedState.choices, reportedState.choice_prompt) : null,
           }));
           const baseCardPayload = {
-            finalText: progressReplies?.hasMessages
-              ? `**过程回复**\n\n${progressReplies.render()}\n\n---\n\n**本轮结果**\n\n${cardBodyWithTail}`
-              : cardBodyWithTail,
+            finalText: cardBodyWithTail,
+            historyText: progressReplies?.hasMessages && progressReplies.render().trim() !== cardBodyWithTail.trim()
+              ? progressReplies.render() : undefined,
             success,
             failureReason,
             titleOverride:
@@ -4975,9 +4961,7 @@ export class BridgeHandler {
             choices: reportedState?.choices,
             choicePrompt: reportedState?.choice_prompt,
             imageBlocks: reportedState?.image_blocks,
-            contentBlocks: progressReplies?.hasMessages && contentBlocksWithTail?.length
-              ? [{ type: "markdown" as const, content: `**过程回复**\n\n${progressReplies.render()}\n\n---\n\n**本轮结果**` }, ...contentBlocksWithTail]
-              : contentBlocksWithTail,
+            contentBlocks: contentBlocksWithTail,
           };
 
           turnPerf.mark("finalizeStartAt");
@@ -5026,6 +5010,7 @@ export class BridgeHandler {
                   executionStatus: stoppedByUser ? "本轮已停止" : budgetExhausted ? "本轮预算耗尽" : result.interrupted ? "本轮已中断" : success ? "本轮已结束" : "本轮执行失败",
                   title: baseCardPayload.titleOverride,
                   finalText: baseCardPayload.finalText,
+                  historyText: baseCardPayload.historyText,
                   mentions,
                   choices: baseCardPayload.choices,
                   choicePrompt: baseCardPayload.choicePrompt,
@@ -5499,8 +5484,7 @@ export class BridgeHandler {
       // (runner, setup) names none.
       await progressReplies?.drain();
       const failureText = withHandoffSentNote(`执行失败: ${String(err)}`, handoffsSentTo);
-      const hardFailureText = progressReplies?.hasMessages
-        ? `**过程回复**\n\n${progressReplies.render()}\n\n---\n\n${failureText}` : failureText;
+      const hardFailureText = failureText;
       const createHardFailurePostFallback = async (failureReason: string) => {
         const fallback = await createOnlyPostFallback({
           postClient: this.deps.postClient,
@@ -5528,6 +5512,7 @@ export class BridgeHandler {
           await cardKitProgress.finalize({
             executionStatus: "本轮执行失败",
             finalText: hardFailureText,
+            historyText: progressReplies?.hasMessages ? progressReplies.render() : undefined,
           });
           await deleteCardKitFile(wtPath);
         } catch (cardKitFinalizeErr) {

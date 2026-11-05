@@ -62,6 +62,8 @@ describe("CardKitProgressHandle", () => {
     handle.handle({ type: "answer_snapshot", text: "Final result", raw: {} });
     await handle.drain();
     expect(JSON.stringify(calls.at(-1))).toContain("Final result");
+    expect(JSON.stringify(calls.at(-1))).not.toContain("A hides after loading");
+    expect(JSON.stringify(calls)).not.toContain("过程回复");
     expect(handle.answerText).toBe("Final result");
     handle.close();
   });

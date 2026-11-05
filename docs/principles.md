@@ -134,7 +134,7 @@ Agent 只使用 Agent 自己的身份(飞书应用/bot 身份,tenant token),**�
 | 层 | Larkway bridge | Agent |
 |---|---|---|
 | 外壳 | 创建卡片、PATCH、节流、失败兜底、崩溃恢复 | 不直接 PATCH 卡片 |
-| 头部 | 默认 CardKit 不渲染顶部标题色条;legacy/fallback 卡片保留可见状态语义 | `card_title` / `card_color` 仅作兼容字段 |
+| 头部 | 普通最终卡不添加执行状态标题;legacy 仅保留明确业务标题 | `card_title` / `card_color` 仅作兼容字段 |
 | 正文 | 安全渲染 markdown、分片、展示 runtime 可信答案通道 | 直接回答；自定义卡片时可选 `last_message` |
 | 内部诊断 | 记录工具/runner 事件,但运行中不展示工具 dump 或思考 | 不依赖工具摘要表达业务阶段 |
 | 底部动作 | 把 `choices` 渲染成按钮并回传 value | 只在单个离散选择时声明 `choices` |

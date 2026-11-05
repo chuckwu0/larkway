@@ -156,6 +156,7 @@ afterEach(async () => {
 });
 
 interface FinalizeArgs {
+  historyText?: string;
   finalText?: string;
   success: boolean;
   failureReason?: string;
@@ -8403,8 +8404,8 @@ describe("handleOne — untrusted-text rescue (answer outside markers)", () => {
     expect(finalizeArgs).toHaveLength(1);
     expect(finalizeArgs[0]?.success).toBe(true);
     expect(finalizeArgs[0]?.finalText).toBe("这里是写在 marker 外的完整答案。");
-    expect(finalizeArgs[0]?.titleOverride).toBe("💬 本轮已结束");
-    expect(finalizeArgs[0]?.colorOverride).toBe("neutral");
+    expect(finalizeArgs[0]?.titleOverride).toBeUndefined();
+    expect(finalizeArgs[0]?.colorOverride).toBeUndefined();
   });
 
   // 2026-07-19 第二轮排障: the claude STREAMING path (stream_event deltas +
@@ -8449,8 +8450,8 @@ describe("handleOne — untrusted-text rescue (answer outside markers)", () => {
     expect(finalizeArgs).toHaveLength(1);
     expect(finalizeArgs[0]?.success).toBe(true);
     expect(finalizeArgs[0]?.finalText).toBe(answer);
-    expect(finalizeArgs[0]?.titleOverride).toBe("💬 本轮已结束");
-    expect(finalizeArgs[0]?.colorOverride).toBe("neutral");
+    expect(finalizeArgs[0]?.titleOverride).toBeUndefined();
+    expect(finalizeArgs[0]?.colorOverride).toBeUndefined();
   });
 
   it("trusted answer channel always wins over internal_text (marker semantics unchanged)", async () => {
@@ -8511,7 +8512,7 @@ describe("handleOne — untrusted-text rescue (answer outside markers)", () => {
     expect(finalizeArgs[0]?.choices).toEqual([{ label: "继续", value: "继续处理" }]);
     // A fresh report exists, so the agent's own status drives the title —
     // no neutral "💬 已回复" override.
-    expect(finalizeArgs[0]?.titleOverride).toBe("本轮已结束");
+    expect(finalizeArgs[0]?.titleOverride).toBeUndefined();
   });
 
   it("fresh state.json WITH last_message still wins over internal_text (rescue stays a fallback)", async () => {
@@ -8586,7 +8587,7 @@ describe("handleOne — work still running when the turn ends", () => {
     expect(finalizeArgs).toHaveLength(1);
     expect(finalizeArgs[0]?.success).toBe(true);
     expect(finalizeArgs[0]?.finalText).toBe("修复已提交，真机验证还在后台跑。");
-    expect(finalizeArgs[0]?.titleOverride).toBe("⏳ 后台任务进行中");
+    expect(finalizeArgs[0]?.titleOverride).toBe("⏳ 进行中");
     expect(finalizeArgs[0]?.colorOverride).toBe("neutral");
   });
 
@@ -8606,7 +8607,7 @@ describe("handleOne — work still running when the turn ends", () => {
       { status: "ready", last_message: "做完了", updated_at: "2026-10-29T10:00:00.000Z" },
     );
     expect(finalizeArgs).toHaveLength(1);
-    expect(finalizeArgs[0]?.titleOverride).toBe("本轮已结束");
+    expect(finalizeArgs[0]?.titleOverride).toBeUndefined();
   });
 
   it("agent card_title still wins over the in-progress title", async () => {
@@ -8625,7 +8626,7 @@ describe("handleOne — work still running when the turn ends", () => {
     );
     expect(finalizeArgs[0]?.finalText).toBe("修复已提交，真机验证还在后台跑。");
     expect(finalizeArgs[0]?.choices).toBeUndefined();
-    expect(finalizeArgs[0]?.titleOverride).toBe("💬 本轮已结束");
+    expect(finalizeArgs[0]?.titleOverride).toBeUndefined();
   });
 
   it("a report written in the final background continuation remains authoritative", async () => {
@@ -8675,6 +8676,19 @@ describe("resolveIdleKillAfterMs (BL-48 修订: idle-kill is opt-in)", () => {
 });
 
 describe("live topic input and progress", () => {
+  it("shows the latest reply without lifecycle scaffolding when no final answer is provided", async () => {
+    await seedRepoCachePath();
+    runClaudeImpl = () => ({ events: (async function* () {
+      yield { type: "progress_message", itemId: "first", text: "我先核对资料。", raw: {} };
+      yield { type: "progress_message", itemId: "second", text: "需要确认业务模块后才能继续。", raw: {} };
+    })(), done: Promise.resolve({ exitCode: 0 }), kill: () => {} });
+    const { client } = makeClient(makeEvent()), cards = makeCardRenderer(), { store } = makeSessionStore();
+    const handler = new BridgeHandler({ client: client as never, cardRenderer: cards.renderer as never,
+      sessionStore: store as never, conventions: makeConventions() });
+    await handler.run(); await handler.whenAllTurnsSettled();
+    expect(cards.finalizeArgs[0]?.finalText).toBe("需要确认业务模块后才能继续。");
+    expect(cards.finalizeArgs[0]?.historyText).toContain("我先核对资料。");
+  });
   it("does not start queued input after an out-of-band stop races routing", async () => {
     await seedRepoCachePath();
     let started!: () => void, finish!: () => void;
@@ -8751,14 +8765,15 @@ describe("live topic input and progress", () => {
     expect(steer.mock.calls[0]![0]).toContain("Permission for this test only");
     expect(steer.mock.calls[0]![0]).toContain("om_followup");
     expect(runs).toBe(outcome === "rejected" ? 2 : 1);
-    expect(cards.finalizeArgs[0]!.finalText).toContain("A waits for loading");
-    expect(cards.finalizeArgs[0]!.finalText).toContain("本轮结果");
+    expect(cards.finalizeArgs[0]!.finalText).toBe("This turn ended; acceptance is still pending.");
+    expect(cards.finalizeArgs[0]?.historyText).toContain("A waits for loading");
+    if (outcome === "accepted") expect(post.calls).toEqual([]);
     expect(handled).toContain("om_followup");
     const journalDir = join(root, "_input-deliveries", "test-bot");
     const journals = await readdir(journalDir);
     const journal = JSON.parse(await readFile(join(journalDir, journals[0]!), "utf8"));
     expect(journal.status).toBe(outcome);
-    if (outcome !== "rejected") expect(JSON.stringify(post.calls)).toContain(outcome === "accepted" ? "已交给当前执行" : "待核对");
+    if (outcome === "unknown") expect(JSON.stringify(post.calls)).toContain("尚未确认送达");
     if (outcome !== "rejected") {
       const beforeReplay = runs;
       const replay = { ...client, async *events() {

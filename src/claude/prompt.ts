@@ -162,6 +162,7 @@ function renderStateContract(input: RenderPromptInput, full: boolean): string[] 
     // pointer left once native compaction drops the first turn, so the line
     // names every use of it (cards, task_handle, handoffs), not cards alone.
     return block("contract-anchor", [
+      "勿播报内部步骤。",
       backend === "codex"
         ? `卡片/任务/交接声明写 ${target}。`
         : `正文放独立行 ${ANSWER_BEGIN_MARKER} / ${ANSWER_END_MARKER} 之间;卡片/任务/交接声明写 ${target}。`,
@@ -169,6 +170,7 @@ function renderStateContract(input: RenderPromptInput, full: boolean): string[] 
   }
   return block("state-contract", [
     answerContract(backend),
+    "面向用户直接回答或说明实质进展；不要播报例行工具/技能调用或内部轮次状态。需要用户行动时说明原因和下一步。",
     `纯文字回答不用写 state.json。需要结构化卡片时可写 ${target}。`,
     "state.json: {status:\"ready\"|\"in_progress\"|\"failed\", last_message?:正文, error?:错误, updated_at?:当前ISO时间};原子替换,显式时间勿沿用旧值。status 描述任务结果,单次工具错误不等于任务失败。",
     "可选字段: choices:[{label,value}](最多5个,单选按钮,value逐字回传;多项信息可直接文字提问),choice_prompt;content_blocks:[{type:\"markdown\",content}|{type:\"image\",img_key,alt?}](最多12块/4图,非空时覆盖正文,img_key须已上传)。",

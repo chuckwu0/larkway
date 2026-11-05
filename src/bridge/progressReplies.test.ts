@@ -19,6 +19,7 @@ describe("completed progress replies", () => {
     expect(createPostReply).toHaveBeenCalledTimes(1);
     expect(history.render()).toContain("archived-reply");
     expect(history.render()).toContain("Still testing");
+    expect(history.latestText).toBe("Still testing");
     const full = JSON.parse(await readFile(path.join(dir, "progress.json"), "utf8"));
     expect(full).toHaveLength(2);
     expect(full[0][1]).toContain("Visible explanation");
@@ -29,7 +30,7 @@ describe("completed progress replies", () => {
     const history = new ProgressReplies({ file: path.join(dir, "progress.json"), replyTo: "input", replyInThread: false,
       postClient: { createPostReply: async () => { throw new Error("offline"); } } as unknown as OutboundPostClient });
     history.add("first", "界".repeat(2_100)); await history.drain();
-    expect(history.render()).toContain("尚未投递");
+    expect(history.render()).toContain("暂未能显示");
     expect(await readFile(path.join(dir, "progress.json"), "utf8")).toContain("first");
   });
 });

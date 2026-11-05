@@ -98,8 +98,24 @@ describe("cardkitSurface", () => {
   it("renders final card without a trailing divider when no tail content exists", () => {
     const card = buildCardKitFinalCard({ finalText: "最终结论" });
     const tags = elements(card).map((e) => e["tag"]);
-    expect(tags).toEqual(["markdown", "markdown"]);
-    expect(elements(card)[0]).toMatchObject({ element_id: "execution_status", content: "**本轮已结束**" });
+    expect(tags).toEqual(["markdown"]);
+    expect(elements(card)[0]).toMatchObject({ element_id: CARDKIT_FINAL_ELEMENT_ID, content: "最终结论" });
+    expect(JSON.stringify(card)).not.toContain("execution_status");
+  });
+
+  it("keeps earlier replies collapsed below the current answer", () => {
+    const card = buildCardKitFinalCard({ finalText: "需要确认业务模块。", historyText: "较早的解释", executionStatus: "本轮已结束" });
+    expect(elements(card)[0]).toMatchObject({ element_id: CARDKIT_FINAL_ELEMENT_ID, content: "需要确认业务模块。" });
+    expect(elements(card)[1]).toMatchObject({ tag: "collapsible_panel", expanded: false, element_id: "reply_history" });
+    expect(JSON.stringify(card)).not.toContain("本轮已结束");
+  });
+
+  it("preserves a current answer that fits on its own before reducing optional history", () => {
+    const answer = "正".repeat(9_000);
+    const card = buildCardKitFinalCard({ finalText: answer, historyText: "旧".repeat(2_000) });
+    expect(elements(card)[0]).toMatchObject({ content: answer });
+    expect(Buffer.byteLength(JSON.stringify(card))).toBeLessThanOrEqual(30 * 1024);
+    expect(JSON.stringify(card)).toContain("较早回复较长，暂未展示。");
   });
 
   it("buildCotPanelElement wraps an inner markdown in a collapsible_panel", () => {
