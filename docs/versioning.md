@@ -84,7 +84,8 @@
 | v0.3.77 | v0.3.77 | patch / 已发布 | Upgrade Feishu SDK to 1.76.0; verify WebSocket shutdown races and CLI 1.0.98 pagination compatibility |
 | v0.3.78 | v0.3.78 | patch / 已发布 | Preserve Claude background work and scheduled wakeups; correlate resumed results and deliver final answers |
 | v0.3.79 | v0.3.79 | patch / 已发布 | native long-running turns without an implicit deadline; preserve explicit budgets and background continuation |
-| v0.3.80 | v0.3.80 | 当前 patch / 已发布 | live topic input, visible progress replies, and explicit execution status |
+| v0.3.80 | v0.3.80 | patch / 已发布 | live topic input, visible progress replies, and explicit execution status |
+| v0.3.81 | v0.3.81 | 当前 patch / 已发布 | clean reply cards, collapse earlier replies, and reduce status noise |
 
 ## 使用原则
 
@@ -176,4 +177,5 @@ v0.3.77       = Upgrade Feishu SDK to 1.76.0; verify WebSocket shutdown races an
 v0.3.78       = Preserve Claude background work and scheduled wakeups; correlate resumed results and deliver final answers
 v0.3.79       = native long-running turns without an implicit deadline; preserve explicit budgets and background continuation
 v0.3.80       = live topic input, visible progress replies, and explicit execution status
+v0.3.81       = clean reply cards, collapse earlier replies, and reduce status noise
 ```
