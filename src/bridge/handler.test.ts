@@ -573,6 +573,64 @@ async function seedRepoCachePath(): Promise<void> {
   await mkdir(join(root, "__repo_cache__", ".git"), { recursive: true });
 }
 
+describe("per-bot turn concurrency", () => {
+  it.each([undefined, 10])("caps independent topics while keeping the same session serial (configured=%s)", async (configured) => {
+    const limit = configured ?? 5;
+    const message = (id: string, topic: string) => ({ ...makeEvent(), message_id: id, root_id: topic });
+    const messages = [
+      ...Array.from({ length: limit + 1 }, (_, i) => message(`slot-${i}`, `topic-${i}`)),
+      message("same-session-followup", "topic-0"),
+    ];
+    const { client } = makeClient(makeEvent());
+    client.events = async function* () { for (const event of messages) yield event; };
+    const { renderer } = makeCardRenderer();
+    const { store } = makeSessionStore();
+    const handler = new BridgeHandler({
+      client: client as unknown as import("../lark/transport.js").InboundClient,
+      cardRenderer: renderer as unknown as import("../lark/card.js").CardRenderer,
+      sessionStore: store as unknown as import("../claude/sessionStore.js").SessionStore,
+      conventions: makeConventions(),
+      botConfig: { id: "concurrency-test", max_concurrent_turns: configured },
+    });
+    const started: string[] = [];
+    const activeTopics = new Set<string>();
+    const releases = new Map<string, () => void>();
+    let releaseAll = false;
+    let peak = 0;
+    // Exercise the real queue/semaphore while replacing only the turn body.
+    const body = handler as unknown as { handleOne(event: { message_id: string; root_id: string }): Promise<void> };
+    vi.spyOn(body, "handleOne").mockImplementation(async (event) => {
+      expect(activeTopics.has(event.root_id)).toBe(false);
+      activeTopics.add(event.root_id);
+      peak = Math.max(peak, activeTopics.size);
+      started.push(event.message_id);
+      try {
+        if (!releaseAll) await new Promise<void>((resolve) => releases.set(event.message_id, resolve));
+        if (event.message_id === "slot-1") throw new Error("synthetic turn failure");
+      } finally { activeTopics.delete(event.root_id); }
+    });
+    try {
+      await handler.run();
+      await vi.waitFor(() => expect(started).toHaveLength(limit));
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(started).not.toContain(`slot-${limit}`);
+      expect(started).not.toContain("same-session-followup");
+      releases.get("slot-1")!(); // failures must return their slot too
+      await vi.waitFor(() => expect(started).toContain(`slot-${limit}`));
+      expect(started).not.toContain("same-session-followup");
+      releases.get("slot-0")!();
+      await vi.waitFor(() => expect(started).toContain("same-session-followup"));
+    } finally {
+      releaseAll = true;
+      for (const release of releases.values()) release();
+      await handler.whenAllTurnsSettled();
+    }
+    expect(started).toHaveLength(messages.length);
+    expect(peak).toBe(limit);
+    expect(activeTopics.size).toBe(0);
+  });
+});
+
 describe("handleOne — thin-channel finalize", () => {
   it.each([false, true])("refuses cold replacement until real exit and PID cleanup (managed=%s), without replay or cross-topic blocking", async (managed) => {
     await seedRepoCachePath();

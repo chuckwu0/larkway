@@ -378,7 +378,7 @@ function summarizeMentionPolicyRules(rules: string[]): string {
  * indefinitely, and these run BEFORE the runner spawns — outside both the
  * idle watchdog and the subprocess timeout — so an un-bounded hang here
  * permanently occupied the thread's serial queue AND one of the
- * MAX_CONCURRENT slots (5 such threads = the whole bot stalls until
+ * concurrent turn slots (at the configured limit the bot stalls until
  * restart). Generous: a cold clone of a large repo legitimately takes
  * minutes; this only cuts true black holes.
  */
@@ -1107,6 +1107,8 @@ export interface BridgeHandlerDeps {
     turn_taking_limit?: number;
     git_identity?: BotConfig["git_identity"];
     backend?: string;
+    /** Per-bot turn slots; defaults to 5. Same-session serialization is unchanged. */
+    max_concurrent_turns?: BotConfig["max_concurrent_turns"];
     /**
      * 批B Phase 1 (perf plan §4): registry key actually passed to
      * `createRunner()`, when it needs to differ from the display/prompt-
@@ -1368,7 +1370,7 @@ export class BridgeHandler {
    * i.e. the moment an event is pulled off client.events() and enqueued,
    * BEFORE acquire()/handleOne() ever run. This is deliberately NOT "turn
    * started" or "turn finished": run() is cross-thread-concurrent but
-   * same-thread-serial with a global MAX_CONCURRENT=5 semaphore, and a single
+   * same-thread-serial with a per-bot semaphore (default 5), and a single
    * turn can take 5-15 min, so an event can sit queued for well over a
    * plausible handoff threshold even though it unambiguously arrived. Using
    * dispatch-start as the signal would misjudge "received but queued" as a
@@ -1583,7 +1585,8 @@ export class BridgeHandler {
     const pendingByKey = new Map<string, import("../lark/transport.js").LarkMessageEvent[]>();
 
     // Semaphore: cap concurrent handleOne() calls across all threads.
-    const MAX_CONCURRENT = 5;
+    const MAX_CONCURRENT = this.deps.botConfig?.max_concurrent_turns ?? 5;
+    console.log(`[bridge.handler] bot ${this.deps.botConfig?.id ?? "default"}: max_concurrent_turns=${MAX_CONCURRENT}`);
     let running = 0;
     const waiters: Array<() => void> = [];
 

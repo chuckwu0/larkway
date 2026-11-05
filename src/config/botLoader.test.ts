@@ -6,7 +6,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { mkdtemp, writeFile, mkdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { loadBots, loadBotsDetailed } from "./botLoader.js";
+import { BotConfigSchema, loadBots, loadBotsDetailed } from "./botLoader.js";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -1480,5 +1480,21 @@ schedules:
     await writeYaml("other.yaml", MINIMAL.replace("id: my-bot", "id: other-bot"));
     const reload = createScheduleConfigReloader(botsDir(), "my-bot");
     expect(await reload()).toBeNull();
+  });
+});
+
+
+describe("max_concurrent_turns", () => {
+  const minimal = {
+    id: "concurrency-test", name: "Concurrency test", description: "Synthetic bot",
+    app_id: "test-app", app_secret_env: "TEST_SECRET", bot_open_id: "test-bot",
+  };
+  it("preserves an omitted setting and accepts a per-bot positive integer", () => {
+    expect(BotConfigSchema.parse(minimal).max_concurrent_turns).toBeUndefined();
+    expect(BotConfigSchema.parse({ ...minimal, max_concurrent_turns: 10 }).max_concurrent_turns).toBe(10);
+    expect(BotConfigSchema.parse({ ...minimal, max_concurrent_turns: 1 }).max_concurrent_turns).toBe(1);
+  });
+  it.each([0, -1, 1.5, "10", null, Infinity, NaN])("rejects invalid concurrency %s", (value) => {
+    expect(BotConfigSchema.safeParse({ ...minimal, max_concurrent_turns: value }).success).toBe(false);
   });
 });
