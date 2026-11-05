@@ -60,8 +60,12 @@ the transport path. A bot-origin message tests a different identity path from
 a user-origin message: record which one was used. Resolve mention IDs using
 the sender application's chat roster rather than copying an ID from another
 application. Use structured mentions and stable idempotency keys. Keep replies
-on the first message's root, and wait for one turn to complete before sending
-the next. A failed or uncertain send must retain its original request identity.
+on the first message's root. For ordinary continuation tests, wait for one turn
+to complete before sending the next. For [live input](live-collaboration.md)
+tests, deliberately send the correction during an active waiting tool, record
+its native acknowledgement, and independently verify that the model adopted
+it before the same turn ended. A failed or uncertain send must retain its
+original request identity.
 
 Do not run competing WebSocket subscribers for the same app. When an authorized
 test temporarily replaces a deployment, prepare restoration before stopping it,
