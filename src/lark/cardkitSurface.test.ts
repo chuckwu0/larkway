@@ -110,6 +110,14 @@ describe("cardkitSurface", () => {
     expect(JSON.stringify(card)).not.toContain("本轮已结束");
   });
 
+  it("preserves a current answer that fits on its own before reducing optional history", () => {
+    const answer = "正".repeat(9_000);
+    const card = buildCardKitFinalCard({ finalText: answer, historyText: "旧".repeat(2_000) });
+    expect(elements(card)[0]).toMatchObject({ content: answer });
+    expect(Buffer.byteLength(JSON.stringify(card))).toBeLessThanOrEqual(30 * 1024);
+    expect(JSON.stringify(card)).toContain("较早回复较长，暂未展示。");
+  });
+
   it("buildCotPanelElement wraps an inner markdown in a collapsible_panel", () => {
     const panel = buildCotPanelElement({ expanded: true, title: "思考中…", content: "推理" }) as Record<string, unknown>;
     expect(panel["tag"]).toBe("collapsible_panel");

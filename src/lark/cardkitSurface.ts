@@ -109,6 +109,12 @@ function truncateCardToBudget(card: Record<string, unknown>): Record<string, unk
     string,
     unknown
   >[];
+  // Optional history must not consume the current answer's capacity.
+  const history = elements.find((element) => element["element_id"] === "reply_history");
+  if (history) {
+    history["elements"] = [markdown("较早回复较长，暂未展示。", "reply_history_md")];
+    if (Buffer.byteLength(JSON.stringify(cloned), "utf8") <= MAX_CARD_BYTES) return cloned;
+  }
   for (const element of elements) {
     if (element["element_id"] === CARDKIT_FINAL_ELEMENT_ID && typeof element["content"] === "string") {
       element["content"] = truncateChars(
