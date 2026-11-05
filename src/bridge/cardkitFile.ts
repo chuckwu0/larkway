@@ -34,6 +34,7 @@ export const CardKitFileSchema = z.object({
   sequence: z.number().int().nonnegative().default(0),
   live: z
     .object({
+      firstVisibleReplyAt: z.string().optional(),
       answerDeltaCount: z.number().int().nonnegative().default(0),
       answerSnapshotCount: z.number().int().nonnegative().default(0),
       firstAnswerAt: z.string().min(1).nullable().default(null),

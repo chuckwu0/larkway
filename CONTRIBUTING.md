@@ -170,6 +170,8 @@ that capability from a configuration enum or a custom choice card.
 ```ts
 export interface RunHandle {
   events: AsyncIterable<AgentStreamEvent>;
+  // Optional backend capability; explicit rejection may queue, unknown must not replay.
+  steer?: (prompt: string) => Promise<SteerResult>;
   done: Promise<{
     exitCode: number;
     sessionId?: string;
@@ -183,8 +185,9 @@ export interface RunHandle {
 
 - `events` — yield `AgentStreamEvent` values as they arrive from the
   subprocess stdout. The bridge uses `system_init` to capture the session ID,
-  treats raw backend prose as `internal_text`, and renders only the explicit
-  answer channel (`answer_delta` / `answer_snapshot`).
+  treats raw backend prose as `internal_text`, and renders explicit final-answer
+  events (`answer_delta` / `answer_snapshot`) separately from completed native
+  user-facing commentary (`progress_message`). See [live collaboration](docs/live-collaboration.md).
 - `done` — settles when this turn finishes, returning its exit status or
   rejecting on a runner failure. **Must always settle**; pooled children may
   remain alive. `pooled` alone does not prove a warm continuation: use
@@ -200,6 +203,8 @@ export interface RunHandle {
 ```ts
 export type AgentStreamEvent =
   | { type: "system_init"; sessionId: string; raw: unknown }
+  | { type: "progress_message"; itemId: string; text: string; raw: unknown }
+  | { type: "progress_snapshot"; text: string; raw: unknown }
   | { type: "internal_text"; text: string; raw: unknown }
   | { type: "answer_delta"; text: string; raw: unknown; seq?: number }
   | { type: "answer_snapshot"; text: string; raw: unknown; seq?: number }

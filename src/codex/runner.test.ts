@@ -395,7 +395,7 @@ describe("CodexAppServerLineParser", () => {
     expect(completed).toContainEqual({ type: "answer_snapshot", text: "Part of the result plus the rest", raw: expect.anything() });
   });
 
-  it.each([true, false])("never surfaces commentary markers, even with start missing=%s", (missingStart) => {
+  it.each([true, false])("keeps commentary separate from final answers, even with start missing=%s", (missingStart) => {
     const parser = new CodexAppServerLineParser();
     const commentary = "LARKWAY_ANSWER_BEGIN\nINTERNAL_SENTINEL\nLARKWAY_ANSWER_END";
     const events = [
@@ -403,8 +403,10 @@ describe("CodexAppServerLineParser", () => {
       ...parser.parseMessage(JSON.parse(appAgentDelta(commentary))),
       ...parser.parseMessage(JSON.parse(appAgentCompleted(commentary, "commentary"))),
     ];
-    // internal_text also feeds the handler's legacy final-answer rescue.
-    expect(events.every((event) => event.type === "raw")).toBe(true);
+    expect(events.filter((event) => event.type === "progress_message")).toEqual([
+      { type: "progress_message", itemId: expect.any(String), text: commentary, raw: expect.anything() },
+    ]);
+    expect(events.some((event) => ["answer_delta", "answer_snapshot", "internal_text"].includes(event.type))).toBe(false);
   });
 
   it("does not let commentary contaminate a following native final item", () => {
@@ -441,7 +443,7 @@ describe("CodexAppServerLineParser", () => {
     const parser = new CodexAppServerLineParser();
     [...parser.parseMessage(JSON.parse(appAgentStarted("commentary")))];
     const events = [...parser.parseMessage(JSON.parse(appAgentCompleted("LARKWAY_ANSWER_BEGIN\nHidden\nLARKWAY_ANSWER_END", null)))];
-    expect(events.every((event) => event.type === "raw")).toBe(true);
+    expect(events).toContainEqual({ type: "progress_message", itemId: expect.any(String), text: expect.stringContaining("Hidden"), raw: expect.anything() });
   });
 
   it("maps reasoning summaryTextDelta to thinking_delta (not the answer channel)", () => {
@@ -958,6 +960,23 @@ vi.mock("node:child_process", async (importOriginal) => {
 });
 
 describe("runCodex() — spawn-level integration", () => {
+  it("accepts live input on a cold app-server while the event stream continues", async () => {
+    const fake = makeFakeCodexChild({ initialLines: [APP_INIT_RESPONSE, APP_THREAD_RESPONSE, APP_TURN_RESPONSE] });
+    __nextFakeCodexChild = fake;
+    const { runCodex } = await import("./runner.js");
+    const handle = runCodex({ prompt: "work" });
+    const events = collectEvents(handle.events);
+    await new Promise<void>((r) => setImmediate(r));
+    const delivery = handle.steer!("Updated requirement");
+    const writes = fake.child.stdin.read()?.toString().trim().split("\n").map((s: string) => JSON.parse(s));
+    const steer = writes.find((x: { method: string }) => x.method === "turn/steer");
+    expect(steer.params).toMatchObject({ threadId: APP_THREAD_ID, expectedTurnId: "turn-1" });
+    fake.stdout.write(JSON.stringify({ id: steer.id, result: { turnId: "turn-1" } }) + "\n");
+    expect((await delivery).status).toBe("accepted");
+    fake.stdout.write(APP_TURN_COMPLETED + "\n");
+    await events; expect((await handle.done).exitCode).toBe(0);
+    fake.triggerClose();
+  });
   afterEach(() => {
     __nextFakeCodexChild = null;
     __lastSpawnArgs = null;

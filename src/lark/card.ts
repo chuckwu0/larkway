@@ -12,6 +12,7 @@
  *  - Subprocess cleanup: SIGTERM → 5 s grace → SIGKILL
  */
 
+import { decisionVersion } from "./decisionVersion.js";
 import type { AgentStreamEvent as ClaudeStreamEvent } from "../agent/runner.js";
 import type { OutboundCardClient } from "./outboundCardClient.js";
 
@@ -163,7 +164,7 @@ function choiceMarker(i: number): string {
  * recover the agent-declared value and feed it back as a new turn — the marker
  * is display-only, the agent never sees it. Pure — no I/O, no business semantics.
  */
-function buildChoiceRow(choices: Choice[]): unknown {
+function buildChoiceRow(choices: Choice[], prompt?: string): unknown {
   return {
     tag: "column_set",
     columns: choices.map((c, i) => ({
@@ -174,7 +175,7 @@ function buildChoiceRow(choices: Choice[]): unknown {
           text: { tag: "plain_text", content: choiceMarker(i) },
           type: "primary",
           behaviors: [
-            { type: "callback", value: { larkway_choice: c.value } },
+            { type: "callback", value: { larkway_choice: c.value, larkway_decision_version: decisionVersion(choices, prompt) } },
           ],
         },
       ],
@@ -479,7 +480,7 @@ function buildCardJson(opts: {
     // Legend (A. <label> / B. <label> …) above short-marker buttons so a long
     // label never truncates inside a narrow column. See buildChoiceRow.
     pushElement(elements, { tag: "markdown", content: buildChoiceLegend(opts.choices) });
-    pushElement(elements, buildChoiceRow(opts.choices));
+    pushElement(elements, buildChoiceRow(opts.choices, opts.choicePrompt));
   }
 
   const headerColor =
@@ -553,6 +554,7 @@ interface RenderState {
 // ---------------------------------------------------------------------------
 
 class CardHandleImpl implements CardHandle {
+  private progressBuffer = "";
   readonly messageId: string;
 
   /** Transport for the leaf PATCH network call (default = lark-cli). */
@@ -677,7 +679,10 @@ class CardHandleImpl implements CardHandle {
   // ── Private: accumulate ───────────────────────────────────────────────────
 
   private accumulate(event: ClaudeStreamEvent): boolean {
-    if (event.type === "answer_delta") {
+    if (event.type === "progress_snapshot") {
+      this.progressBuffer = event.text;
+      return true;
+    } else if (event.type === "answer_delta") {
       this.state.textBuffer += event.text;
       return true;
     } else if (event.type === "answer_snapshot") {
@@ -766,7 +771,9 @@ class CardHandleImpl implements CardHandle {
   private async doLivePatch(): Promise<void> {
     this.state.lastPatchAt = Date.now();
     const cardJsonStr = buildCardJson({
-      bodyText: this.state.textBuffer,
+      bodyText: this.progressBuffer
+        ? `**过程回复**\n\n${this.progressBuffer}${this.state.textBuffer ? `\n\n---\n\n**本轮回复**\n\n${this.state.textBuffer}` : ""}`
+        : this.state.textBuffer,
       toolLines: this.state.toolStatusLines,
       showToolSummary: this.showToolSummary,
       status: this.state.textBuffer ? "streaming" : "thinking",

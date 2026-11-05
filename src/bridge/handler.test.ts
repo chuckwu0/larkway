@@ -4116,7 +4116,7 @@ describe("handleOne — thin-channel finalize", () => {
     // run() is fire-and-forget; the turn settles in the queue's .finally. Yield
     // a few microtask turns so the dispatched promise chain (and our settle
     // guard's finally) has run.
-    for (let i = 0; i < 10; i++) await Promise.resolve();
+    await handler.whenAllTurnsSettled();
 
     // The runner must never have started.
     expect(runnerBackends).toHaveLength(0);
@@ -6336,7 +6336,9 @@ describe("BL-38: poison-session self-heal", () => {
     await seedRepoCachePath();
     configureSuccessRunner(wt);
 
-    await runTurn(store);
+    // This checks successful completion, not idle interruption. Disk writes on
+    // a loaded CI worker may exceed this suite's synthetic 30ms kill threshold.
+    await runTurn(store, { noIdleKill: true });
 
     expect(records.has(key)).toBe(true);
     // Handler writes 0 on success; the real SessionStore then omits the field
@@ -8401,7 +8403,7 @@ describe("handleOne — untrusted-text rescue (answer outside markers)", () => {
     expect(finalizeArgs).toHaveLength(1);
     expect(finalizeArgs[0]?.success).toBe(true);
     expect(finalizeArgs[0]?.finalText).toBe("这里是写在 marker 外的完整答案。");
-    expect(finalizeArgs[0]?.titleOverride).toBe("💬 已回复");
+    expect(finalizeArgs[0]?.titleOverride).toBe("💬 本轮已结束");
     expect(finalizeArgs[0]?.colorOverride).toBe("neutral");
   });
 
@@ -8447,7 +8449,7 @@ describe("handleOne — untrusted-text rescue (answer outside markers)", () => {
     expect(finalizeArgs).toHaveLength(1);
     expect(finalizeArgs[0]?.success).toBe(true);
     expect(finalizeArgs[0]?.finalText).toBe(answer);
-    expect(finalizeArgs[0]?.titleOverride).toBe("💬 已回复");
+    expect(finalizeArgs[0]?.titleOverride).toBe("💬 本轮已结束");
     expect(finalizeArgs[0]?.colorOverride).toBe("neutral");
   });
 
@@ -8509,7 +8511,7 @@ describe("handleOne — untrusted-text rescue (answer outside markers)", () => {
     expect(finalizeArgs[0]?.choices).toEqual([{ label: "继续", value: "继续处理" }]);
     // A fresh report exists, so the agent's own status drives the title —
     // no neutral "💬 已回复" override.
-    expect(finalizeArgs[0]?.titleOverride).toBeUndefined();
+    expect(finalizeArgs[0]?.titleOverride).toBe("本轮已结束");
   });
 
   it("fresh state.json WITH last_message still wins over internal_text (rescue stays a fallback)", async () => {
@@ -8604,7 +8606,7 @@ describe("handleOne — work still running when the turn ends", () => {
       { status: "ready", last_message: "做完了", updated_at: "2026-10-29T10:00:00.000Z" },
     );
     expect(finalizeArgs).toHaveLength(1);
-    expect(finalizeArgs[0]?.titleOverride).toBeUndefined();
+    expect(finalizeArgs[0]?.titleOverride).toBe("本轮已结束");
   });
 
   it("agent card_title still wins over the in-progress title", async () => {
@@ -8623,7 +8625,7 @@ describe("handleOne — work still running when the turn ends", () => {
     );
     expect(finalizeArgs[0]?.finalText).toBe("修复已提交，真机验证还在后台跑。");
     expect(finalizeArgs[0]?.choices).toBeUndefined();
-    expect(finalizeArgs[0]?.titleOverride).toBe("💬 已回复");
+    expect(finalizeArgs[0]?.titleOverride).toBe("💬 本轮已结束");
   });
 
   it("a report written in the final background continuation remains authoritative", async () => {
@@ -8669,5 +8671,105 @@ describe("resolveIdleKillAfterMs (BL-48 修订: idle-kill is opt-in)", () => {
   // capped idle-kill choice. The notice may consequently arrive after the kill.
   it("keeps the ceiling absolute even when the suspect threshold exceeds it", () => {
     expect(resolveIdleKillAfterMs(60_000, 40 * 60_000)).toBe(15 * 60_000);
+  });
+});
+
+describe("live topic input and progress", () => {
+  it("does not start queued input after an out-of-band stop races routing", async () => {
+    await seedRepoCachePath();
+    let started!: () => void, finish!: () => void;
+    const hasStarted = new Promise<void>((r) => started = r), gate = new Promise<void>((r) => finish = r);
+    const steer = vi.fn(async () => ({ status: "accepted" as const, threadId: "native", turnId: "turn" }));
+    let runs = 0;
+    runClaudeImpl = () => {
+      runs++;
+      return { events: (async function* () { started(); yield { type: "system_init", sessionId: "native", raw: {} }; await gate; })(),
+        done: gate.then(() => ({ exitCode: 1, interrupted: true })), kill: finish, steer };
+    };
+    const client = { async *events() {
+      yield makeEvent(); await hasStarted;
+      yield { ...makeEvent(), message_id: "om_queued", root_id: "om_msg" };
+      yield { ...makeEvent(), message_id: "om_stop", root_id: "om_msg", content: JSON.stringify({ text: "/stop" }) };
+    }, markHandled: () => {}, acknowledgeMessage: () => {}, close: async () => {} };
+    const { renderer } = makeCardRenderer(), { store } = makeSessionStore();
+    const handler = new BridgeHandler({ client: client as never, cardRenderer: renderer as never, sessionStore: store as never,
+      conventions: makeConventions(), botConfig: { id: "test-bot", name: "Test", turn_taking_limit: 10, backend: "codex" } });
+    await handler.run(); await handler.whenAllTurnsSettled();
+    expect(runs).toBe(1); expect(steer).not.toHaveBeenCalled();
+  });
+  it("rejects an expired decision button before any model work starts", async () => {
+    const dir = join(root, "om_msg", ".larkway"); await mkdir(dir, { recursive: true });
+    await writeFile(join(dir, "decision.json"), JSON.stringify({ version: null }));
+    const event = { ...makeEvent(), root_id: "om_msg", larkway_trigger_type: "card_action", larkway_decision_version: "obsolete" };
+    const { client } = makeClient(event), { renderer } = makeCardRenderer(), { store } = makeSessionStore(), post = makePostClient();
+    const handler = new BridgeHandler({ client: client as never, cardRenderer: renderer as never, sessionStore: store as never,
+      conventions: makeConventions(), postClient: post.client });
+    await handler.run(); await handler.whenAllTurnsSettled();
+    expect(runnerBackends).toHaveLength(0); expect(JSON.stringify(post.calls)).toContain("已失效");
+  });
+  it.each(["accepted", "rejected", "unknown"] as const)("routes %s input without duplicating uncertain work", async (outcome) => {
+    await seedRepoCachePath();
+    let started!: () => void, delivered!: () => void, finish!: () => void;
+    const hasStarted = new Promise<void>((r) => started = r);
+    const hasDelivered = new Promise<void>((r) => delivered = r);
+    const finishWork = new Promise<void>((r) => finish = r);
+    const steer = vi.fn(async (_prompt: string) => {
+      delivered();
+      return outcome === "accepted"
+        ? { status: "accepted" as const, threadId: "native-thread", turnId: "native-turn" }
+        : { status: outcome, reason: "fixture" };
+    });
+    let runs = 0;
+    runClaudeImpl = () => {
+      runs++; const first = runs === 1;
+      return {
+        events: (async function* () {
+          yield { type: "system_init", sessionId: "native-thread", raw: {} };
+          if (first) {
+            started();
+            yield { type: "progress_message", itemId: "early-reply", text: "A waits for loading; B hides on the home screen.", raw: {} };
+            await finishWork;
+          }
+          yield { type: "answer_snapshot", text: "This turn ended; acceptance is still pending.", raw: {} };
+        })(),
+        done: (first ? finishWork : Promise.resolve()).then(() => ({ exitCode: 0, sessionId: "native-thread" })),
+        kill: finish, steer,
+      };
+    };
+    const handled: string[] = [];
+    const client = { async *events() {
+      yield makeEvent(); await hasStarted;
+      yield { ...makeEvent(), message_id: "om_followup", root_id: "om_msg", content: JSON.stringify({ text: "Permission for this test only" }) };
+      await hasDelivered; finish();
+    }, markHandled: (id: string) => handled.push(id), acknowledgeMessage: () => {}, close: async () => {} };
+    const cards = makeCardRenderer(), post = makePostClient(), { store } = makeSessionStore();
+    const handler = new BridgeHandler({ client: client as never, cardRenderer: cards.renderer as never, sessionStore: store as never,
+      conventions: makeConventions(), postClient: post.client,
+      botConfig: { id: "test-bot", name: "Test", turn_taking_limit: 10, backend: "codex" } });
+    await handler.run(); await handler.whenAllTurnsSettled();
+    expect(steer).toHaveBeenCalledTimes(1);
+    expect(steer.mock.calls[0]![0]).toContain("Permission for this test only");
+    expect(steer.mock.calls[0]![0]).toContain("om_followup");
+    expect(runs).toBe(outcome === "rejected" ? 2 : 1);
+    expect(cards.finalizeArgs[0]!.finalText).toContain("A waits for loading");
+    expect(cards.finalizeArgs[0]!.finalText).toContain("本轮结果");
+    expect(handled).toContain("om_followup");
+    const journalDir = join(root, "_input-deliveries", "test-bot");
+    const journals = await readdir(journalDir);
+    const journal = JSON.parse(await readFile(join(journalDir, journals[0]!), "utf8"));
+    expect(journal.status).toBe(outcome);
+    if (outcome !== "rejected") expect(JSON.stringify(post.calls)).toContain(outcome === "accepted" ? "已交给当前执行" : "待核对");
+    if (outcome !== "rejected") {
+      const beforeReplay = runs;
+      const replay = { ...client, async *events() {
+        yield { ...makeEvent(), message_id: "om_followup", root_id: "om_msg" };
+      } };
+      const restarted = new BridgeHandler({ client: replay as never, cardRenderer: cards.renderer as never, sessionStore: store as never,
+        conventions: makeConventions(), postClient: post.client,
+        botConfig: { id: "test-bot", name: "Test", turn_taking_limit: 10, backend: "codex" } });
+      await restarted.run(); await restarted.whenAllTurnsSettled();
+      expect(runs).toBe(beforeReplay);
+      expect(steer).toHaveBeenCalledTimes(1);
+    }
   });
 });

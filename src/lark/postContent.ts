@@ -5,6 +5,7 @@ export interface PostMentionTarget {
 
 export interface BuildPostContentInput {
   text: string;
+  links?: Array<{ text: string; href: string }>;
   mentions?: PostMentionTarget[];
   title?: string;
   locale?: "zh_cn" | "en_us";
@@ -21,7 +22,7 @@ export interface FeishuPostAtSegment {
   user_name: string;
 }
 
-export type FeishuPostSegment = FeishuPostTextSegment | FeishuPostAtSegment;
+export type FeishuPostSegment = FeishuPostTextSegment | FeishuPostAtSegment | { tag: "a"; text: string; href: string };
 
 function assertSafeUserId(userId: string): void {
   if (!/^[A-Za-z0-9_:-]+$/.test(userId)) {
@@ -50,6 +51,10 @@ export function buildPostContent(input: BuildPostContentInput): string {
   const segments: FeishuPostSegment[] = [];
   if (text) {
     segments.push({ tag: "text", text });
+  }
+  for (const link of input.links ?? []) {
+    if (!/^https?:\/\//.test(link.href)) throw new Error("post link must use http or https");
+    segments.push({ tag: "text", text: "\n" }, { tag: "a", text: link.text, href: link.href });
   }
 
   for (const mention of mentions) {

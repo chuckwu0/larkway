@@ -22,6 +22,8 @@
 import type { OutboundCotLarkChannel, RawCotRequestOptions } from "./channelCotClient.js";
 
 export interface MessageInfo {
+  /** Platform-provided deep link; do not invent a message URL from an ID. */
+  messageLink?: string;
   msgType?: string;
   /** Raw body.content JSON string, exactly as the API returned it. */
   content?: string;
@@ -128,6 +130,8 @@ export class ChannelMessageLookupClient implements MessageLookupClient {
       const item = items[0] as Record<string, unknown>;
       const body = item["body"];
       const info: MessageInfo = {
+        ...(typeof item["message_app_link"] === "string" && /^https:\/\/(?:applink\.feishu\.cn|applink\.larksuite\.com)\//.test(item["message_app_link"])
+          ? { messageLink: item["message_app_link"] } : {}),
         msgType: typeof item["msg_type"] === "string" ? (item["msg_type"] as string) : undefined,
         content:
           body && typeof body === "object" && typeof (body as Record<string, unknown>)["content"] === "string"

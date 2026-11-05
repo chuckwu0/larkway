@@ -55,6 +55,7 @@
 import { execFile, spawn, type ChildProcess } from "node:child_process";
 import { spawnPiped } from "../platform/spawn.js";
 import { resolveRunTimeoutMs } from "../agent/runTimeout.js";
+import { CodexSteering } from "./steering.js";
 import { mkdir, readFile, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { createInterface } from "node:readline";
@@ -122,7 +123,7 @@ interface TurnState {
   interruptionReason?: "cancel" | "timeout";
 }
 
-type PendingKind = "init" | "thread" | "turn" | "interrupt";
+type PendingKind = "init" | "thread" | "turn" | "interrupt" | "steer";
 interface PendingRequest {
   turnKey: number;
   kind: PendingKind;
@@ -178,6 +179,7 @@ export interface CodexProcessPoolOptions {
  * instead of the shared "codex" key.
  */
 export class CodexProcessPool implements AgentRunner {
+  #steering = new CodexSteering((params) => this.#send("turn/steer", params, { kind: "steer", turnKey: -1 }), 15_000, (id) => this.#pending.delete(id));
   readonly #codexBinPath: string | undefined;
   readonly #botGitIdentity?: { name: string; email: string };
   readonly #gitlabToken?: string;
@@ -303,12 +305,17 @@ export class CodexProcessPool implements AgentRunner {
     }
 
     const kill = (): void => this.#interruptTurn(turnKey);
+    const steer: NonNullable<RunHandle["steer"]> = (prompt) => {
+      if (state.settled || state.interruptionReason) return Promise.resolve({ status: "rejected", reason: "Native turn has ended or is stopping" });
+      if (state.coldHandle) return state.coldHandle.steer?.(prompt) ?? Promise.resolve({ status: "rejected", reason: "Cold runner does not support steering" });
+      return this.#steering.steer(state.threadId, state.turnId, prompt);
+    };
 
     // M1: never spawn or fall back to cold while the pool is shutting down —
     // fail this turn fast instead of racing a brand-new orphan into being.
     if (this.#shuttingDown) {
       this.#settleReject(state, new Error("[codex-pool] pool is shutting down — rejecting new turn"));
-      return { events: queue, done, kill, pid: undefined, get processExited() { return state.coldHandle?.processExited; } };
+      return { events: queue, done, kill, steer, pid: undefined, get processExited() { return state.coldHandle?.processExited; } };
     }
 
     // M6: a pool that keeps failing to even boot shouldn't keep trying —
@@ -318,7 +325,7 @@ export class CodexProcessPool implements AgentRunner {
         state,
         new Error("[codex-pool] warm pool disabled after repeated spawn failures — using cold start"),
       );
-      return { events: queue, done, kill, pid: undefined, get processExited() { return state.coldHandle?.processExited; } };
+      return { events: queue, done, kill, steer, pid: undefined, get processExited() { return state.coldHandle?.processExited; } };
     }
 
     if (this.#child == null) {
@@ -333,7 +340,7 @@ export class CodexProcessPool implements AgentRunner {
 
     void this.#startTurn(state);
 
-    return { events: queue, done, kill, pid: pidAtReturn, get processExited() { return state.coldHandle?.processExited; } };
+    return { events: queue, done, kill, steer, pid: pidAtReturn, get processExited() { return state.coldHandle?.processExited; } };
   }
 
   /** Graceful drain + shutdown — call from the owning bot's process shutdown path. */
@@ -703,6 +710,7 @@ export class CodexProcessPool implements AgentRunner {
       this.#idleTimer = undefined;
     }
     this.#child = undefined;
+    this.#steering.disconnected();
     this.#pending.clear();
     this.#loadedThreadIds.clear();
     this.#readyReject?.(err);
@@ -834,7 +842,7 @@ export class CodexProcessPool implements AgentRunner {
 
   // -- wire protocol ------------------------------------------------------------
 
-  #send(method: string, params: unknown, pending: PendingRequest): void {
+  #send(method: string, params: unknown, pending: PendingRequest): number {
     const stdin = this.#child?.stdin;
     if (stdin == null) {
       throw new Error(`[codex-pool] cannot send ${method}: no live child stdin`);
@@ -842,6 +850,7 @@ export class CodexProcessPool implements AgentRunner {
     const id = this.#nextRequestId++;
     this.#pending.set(id, pending);
     stdin.write(JSON.stringify({ jsonrpc: "2.0", id, method, params }) + "\n");
+    return id;
   }
 
   #handleLine(line: string): void {
@@ -869,6 +878,7 @@ export class CodexProcessPool implements AgentRunner {
     const pending = this.#pending.get(id);
     this.#pending.delete(id);
     if (pending == null) return;
+    if (pending.kind === "steer") { this.#steering.response(id, record); return; }
 
     const cancelled = pending.threadId ? this.#cancelledThreads.get(pending.threadId) : undefined;
     const cancelledStart = pending.kind === "turn" && cancelled?.turnKey === pending.turnKey ? cancelled : undefined;
@@ -923,6 +933,7 @@ export class CodexProcessPool implements AgentRunner {
 
   #handleRequestError(pending: PendingRequest, err: Error): void {
     switch (pending.kind) {
+      case "steer": return;
       case "init":
         this.#readyReject?.(err);
         return;
@@ -969,6 +980,8 @@ export class CodexProcessPool implements AgentRunner {
     if (turnKey == null) return; // abandoned/settled turn's stray late notification — drop
     const state = this.#turns.get(turnKey);
     if (state == null || state.settled) return;
+    const eventTurnId = typeof params?.["turnId"] === "string" ? params["turnId"] : asRecord(params?.["turn"])?.["id"];
+    if (state.turnId && typeof eventTurnId === "string" && state.turnId !== eventTurnId) return;
     if (record["method"] === "turn/started") {
       const turnId = asRecord(params?.["turn"])?.["id"];
       if (typeof turnId === "string") state.turnId = turnId;

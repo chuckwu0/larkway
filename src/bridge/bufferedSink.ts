@@ -231,7 +231,7 @@ function isCotEvent(ev: AgentStreamEvent): boolean {
 }
 
 function isAnswerEvent(ev: AgentStreamEvent): boolean {
-  return ev.type === "answer_delta" || ev.type === "answer_snapshot";
+  return ev.type === "answer_delta" || ev.type === "answer_snapshot" || ev.type === "progress_snapshot";
 }
 
 /** What a reasoning / tool event renders to, clipped as cotProgress clips it. */
@@ -263,12 +263,13 @@ export function createSurfaceEventBuffer(): BufferedSink<AgentStreamEvent> {
   return new BufferedSink<AgentStreamEvent>({
     accept: (ev) => isAnswerEvent(ev) || isCotEvent(ev),
     sizeOf: (ev) =>
-      ev.type === "answer_delta" || ev.type === "answer_snapshot" ? ev.text.length : cotRenderedSize(ev),
+      ev.type === "answer_delta" || ev.type === "answer_snapshot" || ev.type === "progress_snapshot" ? ev.text.length : cotRenderedSize(ev),
     evictFirst: isReasoningEvent,
     keep: isAnswerEvent,
     pairRole: toolPairRole,
     coalesce: (earlier, later) => {
-      if (later.type === "answer_snapshot" && isAnswerEvent(earlier)) return later;
+      if (later.type === "progress_snapshot" && earlier.type === "progress_snapshot") return later;
+      if (later.type === "answer_snapshot" && (earlier.type === "answer_delta" || earlier.type === "answer_snapshot")) return later;
       if (later.type === "answer_delta") {
         if (earlier.type === "answer_delta") return { ...later, text: earlier.text + later.text };
         if (earlier.type === "answer_snapshot") return { ...earlier, text: earlier.text + later.text };

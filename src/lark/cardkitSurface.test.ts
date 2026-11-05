@@ -85,7 +85,7 @@ describe("cardkitSurface", () => {
 
     expect(card).not.toHaveProperty("header");
     const bodyElements = elements(card);
-    expect(bodyElements[0]).toMatchObject({
+    expect(bodyElements.find((e) => e["element_id"] === CARDKIT_FINAL_ELEMENT_ID)).toMatchObject({
       tag: "markdown",
       element_id: CARDKIT_FINAL_ELEMENT_ID,
       content: "第一段\n\n第二段",
@@ -98,7 +98,8 @@ describe("cardkitSurface", () => {
   it("renders final card without a trailing divider when no tail content exists", () => {
     const card = buildCardKitFinalCard({ finalText: "最终结论" });
     const tags = elements(card).map((e) => e["tag"]);
-    expect(tags).toEqual(["markdown"]);
+    expect(tags).toEqual(["markdown", "markdown"]);
+    expect(elements(card)[0]).toMatchObject({ element_id: "execution_status", content: "**本轮已结束**" });
   });
 
   it("buildCotPanelElement wraps an inner markdown in a collapsible_panel", () => {

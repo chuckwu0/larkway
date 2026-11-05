@@ -49,6 +49,22 @@ function fakeCardKitClient(opts?: { initialElements?: string[] }) {
 }
 
 describe("CardKitProgressHandle", () => {
+  it("shows progress before completion without treating it as a final answer", async () => {
+    const { client, calls } = fakeCardKitClient();
+    const handle = await createCardKitProgressHandle({ cardKitClient: client, replyToMessageId: "input", replyInThread: false,
+      facts: { botId: "bot", threadId: "thread", triggerMessageId: "input" } });
+    handle.handle({ type: "progress_snapshot", text: "A hides after loading; B hides on the home screen.", raw: {} });
+    await handle.drain();
+    expect(JSON.stringify(calls)).toContain("A hides after loading");
+    expect(handle.answerText).toBe("");
+    expect(handle.liveMetrics.firstAnswerAt).toBeNull();
+    expect(handle.liveMetrics.firstVisibleReplyAt).toBeDefined();
+    handle.handle({ type: "answer_snapshot", text: "Final result", raw: {} });
+    await handle.drain();
+    expect(JSON.stringify(calls.at(-1))).toContain("Final result");
+    expect(handle.answerText).toBe("Final result");
+    handle.close();
+  });
   it("creates a CardKit card entity and replies by reference", async () => {
     const { client, calls } = fakeCardKitClient();
 

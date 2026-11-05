@@ -22,6 +22,7 @@ import child_process from "node:child_process";
 import fs from "node:fs/promises";
 import path from "node:path";
 import type { InboundClient } from "../lark/transport.js";
+import { larkEpochMs } from "../lark/transport.js";
 import type { CardRenderer } from "../lark/card.js";
 import type { SessionStore } from "../claude/sessionStore.js";
 import {
@@ -43,7 +44,7 @@ import {
 import type { PeerBot, RepoRef } from "../claude/prompt.js";
 import { createRunner } from "../agent/runner.js";
 import { resolveRunTimeoutMs } from "../agent/runTimeout.js";
-import type { AgentStreamEvent, PerfMarkerName } from "../agent/runner.js";
+import type { AgentStreamEvent, PerfMarkerName, RunHandle } from "../agent/runner.js";
 import type { BotConfig } from "../config/botLoader.js";
 import {
   appendTranscriptAnswer,
@@ -101,6 +102,10 @@ import {
 } from "./cotProgress.js";
 import type { OutboundCotClient } from "../lark/channelCotClient.js";
 import type { RuntimeEventPatch } from "./eventLog.js";
+import { decisionVersion } from "../lark/decisionVersion.js";
+import { InputDeliveryStore, renderSteeringInput, type InputDeliveryRecord } from "./inputDelivery.js";
+import { ProgressReplies } from "./progressReplies.js";
+import { safeIdempotencyKey } from "../lark/outboundPostClient.js";
 import { TurnPerfRecorder, type PerfSample } from "./perfLog.js";
 import type { RuntimeRequirement } from "../runtimeRequirements.js";
 import type {
@@ -1345,6 +1350,8 @@ export class BridgeHandler {
    * teardown path. Serial-per-key dispatch guarantees at most one live entry
    * per key, and register/delete never interleave across turns.
    */
+  private readonly activeInputs = new Map<string, { handle: RunHandle; chatId: string; sessionPath: string; replyMessageId: () => string | undefined }>();
+  private readonly inputDeliveries: InputDeliveryStore;
   private readonly activeTurnStops = new Map<string, () => void>();
   /** Finished cold turns whose process death has not yet been confirmed. */
   private readonly coldProcessLifetimes = new Set<{
@@ -1391,6 +1398,89 @@ export class BridgeHandler {
 
   constructor(deps: BridgeHandlerDeps) {
     this.deps = deps;
+    this.inputDeliveries = new InputDeliveryStore(path.join(
+      deps.conventions.workspaceSessionsDir ?? deps.conventions.worktreesDir, "_input-deliveries", deps.botConfig?.id ?? "default",
+    ));
+  }
+
+  private async inputReceipt(event: import("../lark/transport.js").LarkMessageEvent, text: string, replyMessageId?: string): Promise<void> {
+    try {
+      const info = replyMessageId ? await this.deps.messageLookup?.get(replyMessageId, { refresh: true }) : undefined;
+      const topic = realTopicThreadId(event.thread_id);
+      const link = info?.messageLink ?? (topic ? buildTopicDeepLink(event.chat_id, topic) : undefined);
+      await this.deps.postClient?.createPostReply(event.message_id, buildPostContent({ text, mentions: [],
+        links: link ? [{ text: info?.messageLink ? "查看当前回复" : "查看当前话题", href: link }] : [],
+      }), {
+        replyInThread: false,
+        idempotencyKey: safeIdempotencyKey(`input-receipt:${this.deps.botConfig?.id}:${event.message_id}:${text}`),
+      });
+    } catch (err) { console.warn("[bridge.handler] input receipt failed:", err); }
+  }
+
+  /** Runs outside the work semaphore; only an exact canonical session can receive input. */
+  private async deliverToActiveTurn(event: import("../lark/transport.js").LarkMessageEvent, sessionKey: string): Promise<boolean> {
+    if ((event.larkway_trigger_type != null && event.larkway_trigger_type !== "card_action") || event.reply_anchor_message_id != null) return false;
+    const previous = await this.inputDeliveries.get(event.message_id);
+    if (previous && previous.status !== "rejected") {
+      this.deps.client.markHandled?.(event.message_id);
+      await this.inputReceipt(event, previous.status === "accepted" ? "此补充消息已交给执行轮次，不会重复提交。" : "此补充消息的交付结果待核对，未自动重发；请维护者核对原生记录。");
+      return true;
+    }
+    // Rollback switch still honours durable accepted/uncertain deliveries above.
+    if (process.env["LARKWAY_LIVE_INPUT"] === "off") return false;
+    const active = this.activeInputs.get(sessionKey);
+    if (!active?.handle.steer || active.chatId !== event.chat_id) return false;
+    const parsed = parseMessage(event);
+    const record: InputDeliveryRecord = {
+      messageId: event.message_id, sessionKey, chatId: event.chat_id,
+      receivedAt: new Date(this.perfEnqueueAt.get(event) ?? Date.now()).toISOString(),
+      messageCreateAt: larkEpochMs(event.create_time), wsAt: event.ws_at,
+      status: "sending", prompt: renderSteeringInput(parsed, this.deps.botConfig?.bot_open_id, this.deps.larkCliProfile, this.deps.botConfig?.owner_open_id),
+    };
+    // The durable sending record precedes any native side effects.
+    await this.inputDeliveries.put(record);
+    let result: import("../agent/runner.js").SteerResult;
+    try {
+      if (this.deps.conventions.runtime === "agent_workspace") {
+        await ensureSessionArtifacts({ sessionPath: active.sessionPath, parsed, isNewThread: false, larkCliProfile: this.deps.larkCliProfile });
+      }
+    } catch (err) {
+      record.status = "rejected"; record.reason = "Input preparation failed before native delivery";
+      await this.inputDeliveries.put(record);
+      throw err;
+    }
+    void this.deps.client.addProcessingReaction?.(event.message_id).catch(() => {});
+    record.sentAt = new Date().toISOString();
+    await this.inputDeliveries.put(record);
+    try { result = await active.handle.steer(record.prompt); }
+    catch { result = { status: "unknown", reason: "Native input delivery threw without a confirmed acknowledgement" }; }
+    void this.deps.client.removeProcessingReaction?.(event.message_id).catch(() => {});
+    record.status = result.status; record.settledAt = new Date().toISOString();
+    if (result.status === "accepted") { record.threadId = result.threadId; record.turnId = result.turnId; }
+    else record.reason = result.reason;
+    try { await this.inputDeliveries.put(record); }
+    catch (err) {
+      // `sending` still blocks restart replay even if persisting the acknowledgement failed.
+      console.error("[bridge.handler] input acknowledgement journal failed:", err);
+      if (result.status === "rejected") throw err;
+    }
+    await this.deps.recordRuntimeEvent?.({
+      id: event.message_id, messageId: event.message_id, threadId: sessionKey, chatId: event.chat_id,
+      botId: this.deps.botConfig?.id, triggerType: "thread_reply", receivedAt: record.receivedAt,
+      status: result.status === "rejected" ? "received" : "completed", deliveryStatus: result.status,
+      nativeThreadId: record.threadId, nativeTurnId: record.turnId, inputSettledAt: record.settledAt,
+      reason: result.status === "accepted" ? "补充输入已交给当前执行，尚不代表已处理。" : record.reason,
+      statusPath: ["已收到补充", result.status === "accepted" ? "原生轮次已接收" : result.status === "unknown" ? "交付待核对" : "转入队列"],
+    }).catch((err: unknown) => console.warn("[bridge.handler] input event record failed:", err));
+    if (result.status === "rejected") return false;
+    this.deps.client.markHandled?.(event.message_id);
+    const reply = active.replyMessageId();
+    const receipt = this.inputReceipt(event, result.status === "accepted"
+      ? "补充消息已交给当前执行；接收不代表已经处理。"
+      : "补充消息交付结果待核对，未自动重发；请维护者核对原生记录。", reply)
+      .finally(() => this.inFlightTurns.delete(receipt));
+    this.inFlightTurns.add(receipt);
+    return true;
   }
 
   /**
@@ -1514,70 +1604,9 @@ export class BridgeHandler {
       }
     };
 
-    for await (const event of this.deps.client.events()) {
-      if (this.closed) break;
-      if (signal?.aborted) break;
-
-      // Queue key must SERIALIZE every event that can end up on the same
-      // session. Base rule: session key = deriveSessionKey (message.ts —
-      // `root_id ?? [p2p sticky] ?? message_id`). v4 任务派单 addition: a
-      // quote reply on a task-share card gets REKEYED inside handleOne to the
-      // card's id (root_id ?? parent_id) — so parent_id joins the queue key
-      // here to keep that rekeyed turn and the card-topic follow-ups on one
-      // serial chain. For an ORDINARY quote reply this makes the queue key a
-      // superset of the session key (several distinct sessions serialized
-      // under the quoted chain's root) — the safe direction: less
-      // parallelism, never the concurrent-same-session hazard the original
-      // invariant guarded against (fresh session instead of --resume,
-      // interleaved state.json). 批F (F1): the sticky p2p key only ever
-      // applies when BOTH root_id and parent_id are absent (deriveSessionKey
-      // excludes parent_id-bearing events), so queue key ⊇ session key holds:
-      // every event of one sticky session shares the `p2p-<chat>` queue key.
-      const keyOpts: SessionKeyOptions = {
-        p2pStickySession: this.deps.botConfig?.p2pStickySession === true,
-      };
-      const sessionKey = deriveSessionKey(event, keyOpts);
-      const key =
-        (typeof event.root_id === "string" && event.root_id)
-          ? event.root_id
-          : (typeof event.parent_id === "string" && event.parent_id)
-            ? event.parent_id
-            : sessionKey;
-      // BL-42 /stop: a bare "/stop" is a channel-level control command (the
-      // Feishu COT card's ⏹ button auto-sends `@bot /stop`), NOT a prompt for
-      // the agent. Handled here, out of band: kill the in-flight turn on this
-      // key (if any), drop this key's queued messages, keep the session so a
-      // later @ resumes it. Deliberately BEFORE the threadReceivedAt stamp —
-      // a stop request is not a work request and must not refresh receipt.
-      if (isStopCommand(event)) {
-        this.handleStopCommand(key, event, pendingByKey);
-        continue;
-      }
-      // Stamp "received" here — synchronously, before acquire()/handleOne()
-      // — so this reflects arrival, not dispatch. See threadReceivedAt above.
-      // Stamped under BOTH the queue key and the session key: an ordinary
-      // quote reply's session stays keyed by its own message_id, and its
-      // receipt lookup must still hit. (批F: sessionKey may be the sticky
-      // `p2p-<chat>` key — handleOne's turnReceivedAt lookup uses the same
-      // derivation, so it keeps hitting.)
-      const receivedAt = Date.now();
-      this.threadReceivedAt.set(key, receivedAt);
-      if (sessionKey !== key) this.threadReceivedAt.set(sessionKey, receivedAt);
-      this.perfEnqueueAt.set(event, receivedAt);
-
-      // Housekeeping only sees lastActiveTs, which is normally written when a
-      // turn finishes. Refresh existing records at receipt time as well so a
-      // queued or in-flight legacy turn cannot look idle long enough for GC to
-      // reclaim its worktree. The optional call keeps lightweight test doubles
-      // and older embedders compatible with the SessionStore contract.
-      const touch = this.deps.sessionStore.touch;
-      if (typeof touch === "function") {
-        for (const touchedKey of new Set([key, sessionKey])) {
-          void touch.call(this.deps.sessionStore, touchedKey, this.deps.botConfig?.id).catch((err: unknown) => {
-            console.warn(`[bridge.handler] session touch failed for ${touchedKey} (continuing):`, err);
-          });
-        }
-      }
+    const routing = new Map<string, Promise<void>>();
+    const stopEpoch = new Map<string, number>();
+    const enqueue = (event: import("../lark/transport.js").LarkMessageEvent, key: string, keyOpts: SessionKeyOptions): void => {
       let pendingList = pendingByKey.get(key);
       if (pendingList == null) {
         pendingList = [];
@@ -1616,6 +1645,107 @@ export class BridgeHandler {
       // whenAllTurnsSettled() can await it.
       this.inFlightTurns.add(next);
       threadQueues.set(key, next);
+    };
+
+    for await (const event of this.deps.client.events()) {
+      if (this.closed) break;
+      if (signal?.aborted) break;
+
+      // Queue key must SERIALIZE every event that can end up on the same
+      // session. Base rule: session key = deriveSessionKey (message.ts —
+      // `root_id ?? [p2p sticky] ?? message_id`). v4 任务派单 addition: a
+      // quote reply on a task-share card gets REKEYED inside handleOne to the
+      // card's id (root_id ?? parent_id) — so parent_id joins the queue key
+      // here to keep that rekeyed turn and the card-topic follow-ups on one
+      // serial chain. For an ORDINARY quote reply this makes the queue key a
+      // superset of the session key (several distinct sessions serialized
+      // under the quoted chain's root) — the safe direction: less
+      // parallelism, never the concurrent-same-session hazard the original
+      // invariant guarded against (fresh session instead of --resume,
+      // interleaved state.json). 批F (F1): the sticky p2p key only ever
+      // applies when BOTH root_id and parent_id are absent (deriveSessionKey
+      // excludes parent_id-bearing events), so queue key ⊇ session key holds:
+      // every event of one sticky session shares the `p2p-<chat>` queue key.
+      const keyOpts: SessionKeyOptions = {
+        p2pStickySession: this.deps.botConfig?.p2pStickySession === true,
+      };
+      const sessionKey = deriveSessionKey(event, keyOpts);
+      const key =
+        (typeof event.root_id === "string" && event.root_id)
+          ? event.root_id
+          : (typeof event.parent_id === "string" && event.parent_id)
+            ? event.parent_id
+            : sessionKey;
+      // BL-42 /stop: a bare "/stop" is a channel-level control command (the
+      // Feishu COT card's ⏹ button auto-sends `@bot /stop`), NOT a prompt for
+      // the agent. Handled here, out of band: kill the in-flight turn on this
+      // key (if any), drop this key's queued messages, keep the session so a
+      // later @ resumes it. Deliberately BEFORE the threadReceivedAt stamp —
+      // a stop request is not a work request and must not refresh receipt.
+      if (isStopCommand(event)) {
+        stopEpoch.set(key, (stopEpoch.get(key) ?? 0) + 1);
+        this.handleStopCommand(key, event, pendingByKey);
+        continue;
+      }
+      // Stamp "received" here — synchronously, before acquire()/handleOne()
+      // — so this reflects arrival, not dispatch. See threadReceivedAt above.
+      // Stamped under BOTH the queue key and the session key: an ordinary
+      // quote reply's session stays keyed by its own message_id, and its
+      // receipt lookup must still hit. (批F: sessionKey may be the sticky
+      // `p2p-<chat>` key — handleOne's turnReceivedAt lookup uses the same
+      // derivation, so it keeps hitting.)
+      const receivedAt = Date.now();
+      this.threadReceivedAt.set(key, receivedAt);
+      if (sessionKey !== key) this.threadReceivedAt.set(sessionKey, receivedAt);
+      this.perfEnqueueAt.set(event, receivedAt);
+
+      // Housekeeping only sees lastActiveTs, which is normally written when a
+      // turn finishes. Refresh existing records at receipt time as well so a
+      // queued or in-flight legacy turn cannot look idle long enough for GC to
+      // reclaim its worktree. The optional call keeps lightweight test doubles
+      // and older embedders compatible with the SessionStore contract.
+      const touch = this.deps.sessionStore.touch;
+      if (typeof touch === "function") {
+        for (const touchedKey of new Set([key, sessionKey])) {
+          void touch.call(this.deps.sessionStore, touchedKey, this.deps.botConfig?.id).catch((err: unknown) => {
+            console.warn(`[bridge.handler] session touch failed for ${touchedKey} (continuing):`, err);
+          });
+        }
+      }
+      const epoch = stopEpoch.get(key) ?? 0;
+      const prevRouting = routing.get(key) ?? Promise.resolve();
+      const route = prevRouting.catch(() => {}).then(async () => {
+        if (epoch !== (stopEpoch.get(key) ?? 0)) { this.deps.client.markHandled?.(event.message_id); return; }
+        if (event.larkway_trigger_type === "card_action") {
+          const dir = path.join(this.deps.conventions.workspaceSessionsDir ?? this.deps.conventions.worktreesDir, sessionKey, ".larkway");
+          let current: { version: string | null } | undefined;
+          try { current = JSON.parse(await fs.readFile(path.join(dir, "decision.json"), "utf8")) as { version: string | null }; }
+          catch (err) { if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err; }
+          if (current && (!current.version || event.larkway_decision_version !== current.version)) {
+            this.deps.client.markHandled?.(event.message_id);
+            await this.inputReceipt(event, "这个选择按钮已失效，请查看最新回复中的选择，或直接在话题中说明决定。");
+            return;
+          }
+        }
+        const consumed = await this.deliverToActiveTurn(event, sessionKey);
+        if (consumed) return;
+        if (epoch !== (stopEpoch.get(key) ?? 0)) { this.deps.client.markHandled?.(event.message_id); return; }
+        if (threadQueues.has(key)) {
+          void this.deps.client.addProcessingReaction?.(event.message_id).catch((err: unknown) => console.warn("[bridge.handler] input reaction failed:", err));
+          void this.inputReceipt(event, "已收到补充，等待当前轮次结束后处理。");
+        }
+        enqueue(event, key, keyOpts);
+      }).catch(async (err: unknown) => {
+        console.error("[bridge.handler] input routing failed; held for reconciliation:", err);
+        // Fail closed: a durable send might already have happened.
+        this.deps.client.markHandled?.(event.message_id);
+        await this.inputReceipt(event, "补充消息交付待核对，未自动重发；请维护者检查输入交付记录。");
+      }).finally(() => {
+        if (routing.get(key) === route) routing.delete(key);
+        this.inFlightTurns.delete(route);
+      });
+      routing.set(key, route);
+      this.inFlightTurns.add(route);
     }
   }
 
@@ -1667,7 +1797,10 @@ export class BridgeHandler {
       const pending = pendingByKey.get(candidate);
       if (pending) {
         droppedCount += pending.length;
-        for (const dropped of pending) this.deps.client.acknowledgeMessage(dropped.message_id);
+        for (const dropped of pending) {
+          this.deps.client.acknowledgeMessage(dropped.message_id);
+          void this.deps.client.removeProcessingReaction?.(dropped.message_id).catch(() => {});
+        }
         pendingByKey.delete(candidate);
       }
     }
@@ -1728,6 +1861,8 @@ export class BridgeHandler {
     // effects. Such messages stay re-dispatchable only via a reconnect
     // gap-fill window (pre-existing behavior), not the steady-state replay.
     let agentRunCompleted = false;
+    let progressReplies: ProgressReplies | undefined;
+    let progressDrain: Promise<void> | undefined;
     // A fail-closed process-liveness refusal is terminal, not a replay request.
     let processLivenessRefused = false;
     // COT (思维链) side channel — declared at function scope so the finally
@@ -2063,7 +2198,7 @@ export class BridgeHandler {
       triggerType,
       textPreview: parsed.text.slice(0, 120),
       status: "received",
-      receivedAt: new Date(eventStartedAt).toISOString(),
+      receivedAt: new Date(this.perfEnqueueAt.get(event) ?? eventStartedAt).toISOString(),
       statusPath: ["已收到"],
       reason: "已进入 bridge，准备创建处理卡片。",
     });
@@ -2098,7 +2233,7 @@ export class BridgeHandler {
           senderId: typeof f.sender_id === "string" ? f.sender_id : undefined,
           triggerType,
           status: "received",
-          receivedAt: new Date(eventStartedAt).toISOString(),
+          receivedAt: new Date(this.perfEnqueueAt.get(event) ?? eventStartedAt).toISOString(),
           statusPath: ["已收到", "合并进同轮"],
           reason: `排队期间到达,已合并进 ${messageId} 的同一轮处理。`,
         });
@@ -2938,6 +3073,12 @@ export class BridgeHandler {
         });
       }
 
+      progressReplies = process.env["LARKWAY_PROGRESS_REPLIES"] === "off" ? undefined : new ProgressReplies({
+        file: path.join(worktreePath, ".larkway", `progress-${messageId.replace(/[^a-zA-Z0-9_-]/g, "_")}.json`),
+        replyTo: replyAnchorId, replyInThread, postClient: this.deps.postClient,
+        messageLink: async (id) => (await this.deps.messageLookup?.get(id, { refresh: true }))?.messageLink,
+      });
+
       // Legacy worktrees retain their generated permission file. Managed and
       // BYO workspaces inherit native configuration without bridge writes.
       if (!isAgentWorkspace) {
@@ -3122,6 +3263,9 @@ export class BridgeHandler {
         markIdleWaiting: (silentMs, idleOpts) => cardKitProgress?.markIdleWaiting(silentMs, idleOpts),
         clearIdleWaiting: () => cardKitProgress?.clearIdleWaiting(),
       });
+      if (progressReplies) progressReplies.onChange = () => {
+        if (progressReplies) surface.handle({ type: "progress_snapshot", text: progressReplies.render(), raw: null });
+      };
       if (!modelFirst) {
         surface.attach();
         createDeferredBubble();
@@ -3731,11 +3875,15 @@ export class BridgeHandler {
           idleWatchdog.unref?.();
         }
 
+        this.activeInputs.set(threadId, { handle, chatId: parsed.chatId, sessionPath: worktreePath,
+          replyMessageId: () => cardKitProgress?.messageId ?? card?.messageId });
+
         // BL-42 /stop: expose this turn's kill switch to run()'s intercept.
         // Cleared on both watchdog-teardown paths + handleOne's outer finally.
         if (queueKey) {
           const stopTurn = (): void => {
             stoppedByUser = true;
+            this.activeInputs.delete(threadId);
             try {
               handle.kill();
             } catch {
@@ -3868,7 +4016,12 @@ export class BridgeHandler {
             }
             // Through `surface` (WP-10): straight to the live card handle,
             // or held until the model-first lane has the card.
-            surface.handle(ev);
+            if (ev.type === "progress_message" && progressReplies) {
+              progressReplies.add(ev.itemId, ev.text);
+              surface.handle({ type: "progress_snapshot", text: progressReplies.render(), raw: ev.raw });
+            } else {
+              surface.handle(ev);
+            }
             // COT is a parallel channel, not an either/or with the card: feed
             // it every event regardless of which primary surface is live
             // (through cotSink, which holds them until the handle is adopted).
@@ -3891,7 +4044,11 @@ export class BridgeHandler {
           }
 
           const result = await handle.done;
+          if (this.activeInputs.get(threadId)?.handle === handle) this.activeInputs.delete(threadId);
           const runnerDoneAt = Date.now();
+          progressDrain = progressReplies?.drain();
+          await progressDrain;
+          if (progressReplies?.hasMessages) surface.handle({ type: "progress_snapshot", text: progressReplies.render(), raw: null });
           // A model-first card may not exist yet: then all of its calls (the
           // replay of the early events included) land in the tail below.
           turnPerf.markRunnerDone(cardKitProgress?.callDurationsMs, runnerDoneAt);
@@ -3903,6 +4060,7 @@ export class BridgeHandler {
             idleWatchdog = undefined;
           }
           if (queueKey) this.activeTurnStops.delete(queueKey);
+          if (this.activeInputs.get(threadId)?.handle === handle) this.activeInputs.delete(threadId);
           // WP-10: everything below reads or finalizes the surfaces — a
           // model-first turn waits for its lane (the card, and the early events
           // replayed into it) here, a /stop'd one included.
@@ -4018,7 +4176,7 @@ export class BridgeHandler {
           const hasFreshAnswerText =
             trustedAnswerText.trim().length > 0 ||
             (cardKitProgress?.answerText.trim().length ?? 0) > 0;
-          if (reportedState === null && !hasFreshAnswerText) {
+          if (reportedState === null && !hasFreshAnswerText && !progressReplies?.hasMessages) {
             await recordEvent({
               status: "running",
               appendPath: "未更新 state.json",
@@ -4252,6 +4410,7 @@ export class BridgeHandler {
           // delivered, and the hang card must not overwrite what it delivered.
           // Splitting these two readers is what let round 5's over-count through.
           const willShowBodyText =
+            progressReplies?.hasMessages === true ||
             (
               trustedAnswerText.trim() ||
               cardKitProgress?.answerText.trim() ||
@@ -4680,7 +4839,7 @@ export class BridgeHandler {
                   ? `⚠️ 本轮长时间没有输出（静默 ${formatSilence(idleObservedSilenceMs)}）后结束，没有产出正文。\n` +
                     idleThresholdHint(idleTimeoutMs, idleKillAfterMs)
                 : reportedState?.last_message ??
-                  (fallbackAnswer ? fallbackAnswer : noOutputFallback);
+                  (fallbackAnswer ? fallbackAnswer : progressReplies?.hasMessages ? "本轮已结束，未提供最终结论；以上过程回复不代表需求已验收。" : noOutputFallback);
 
           // 批F (F2): persist this turn's user-facing answer into the session
           // transcript so a future reseed seed carries BOTH sides of the
@@ -4791,11 +4950,17 @@ export class BridgeHandler {
               ? "⏳ 后台任务进行中"
               : "⏳ 进行中"
             : noReportThisTurn && success && !failureReason
-              ? "💬 已回复"
-              : undefined;
+              ? "💬 本轮已结束"
+              : success && !failureReason ? "本轮已结束" : undefined;
 
+          await fs.mkdir(path.join(worktreePath, ".larkway"), { recursive: true });
+          await fs.writeFile(path.join(worktreePath, ".larkway", "decision.json"), JSON.stringify({
+            version: reportedState?.choices?.length ? decisionVersion(reportedState.choices, reportedState.choice_prompt) : null,
+          }));
           const baseCardPayload = {
-            finalText: cardBodyWithTail,
+            finalText: progressReplies?.hasMessages
+              ? `**过程回复**\n\n${progressReplies.render()}\n\n---\n\n**本轮结果**\n\n${cardBodyWithTail}`
+              : cardBodyWithTail,
             success,
             failureReason,
             titleOverride:
@@ -4810,7 +4975,9 @@ export class BridgeHandler {
             choices: reportedState?.choices,
             choicePrompt: reportedState?.choice_prompt,
             imageBlocks: reportedState?.image_blocks,
-            contentBlocks: contentBlocksWithTail,
+            contentBlocks: progressReplies?.hasMessages && contentBlocksWithTail?.length
+              ? [{ type: "markdown" as const, content: `**过程回复**\n\n${progressReplies.render()}\n\n---\n\n**本轮结果**` }, ...contentBlocksWithTail]
+              : contentBlocksWithTail,
           };
 
           turnPerf.mark("finalizeStartAt");
@@ -4856,6 +5023,7 @@ export class BridgeHandler {
                 // with the errored title. No-op when no panel was created.
                 if (!success) cardKitProgress.markCotError();
                 await cardKitProgress.finalize({
+                  executionStatus: stoppedByUser ? "本轮已停止" : budgetExhausted ? "本轮预算耗尽" : result.interrupted ? "本轮已中断" : success ? "本轮已结束" : "本轮执行失败",
                   title: baseCardPayload.titleOverride,
                   finalText: baseCardPayload.finalText,
                   mentions,
@@ -5168,6 +5336,7 @@ export class BridgeHandler {
             idleWatchdog = undefined;
           }
           if (queueKey) this.activeTurnStops.delete(queueKey);
+          if (this.activeInputs.get(threadId)?.handle === handle) this.activeInputs.delete(threadId);
           // Stale-session fallback: if the backend rejected --resume/thread
           // resume with a ghost session, purge the record and retry once
           // without resume (fresh session).
@@ -5328,7 +5497,10 @@ export class BridgeHandler {
       // A card delivery that failed is thrown only after the handoffs settled,
       // so every mirror already sent is named here; a failure before them
       // (runner, setup) names none.
-      const hardFailureText = withHandoffSentNote(`执行失败: ${String(err)}`, handoffsSentTo);
+      await progressReplies?.drain();
+      const failureText = withHandoffSentNote(`执行失败: ${String(err)}`, handoffsSentTo);
+      const hardFailureText = progressReplies?.hasMessages
+        ? `**过程回复**\n\n${progressReplies.render()}\n\n---\n\n${failureText}` : failureText;
       const createHardFailurePostFallback = async (failureReason: string) => {
         const fallback = await createOnlyPostFallback({
           postClient: this.deps.postClient,
@@ -5354,6 +5526,7 @@ export class BridgeHandler {
           // panel with the errored title. No-op when no panel was created.
           cardKitProgress.markCotError();
           await cardKitProgress.finalize({
+            executionStatus: "本轮执行失败",
             finalText: hardFailureText,
           });
           await deleteCardKitFile(wtPath);
