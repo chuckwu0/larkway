@@ -104,7 +104,8 @@ import type { OutboundCotClient } from "../lark/channelCotClient.js";
 import type { RuntimeEventPatch } from "./eventLog.js";
 import { decisionVersion } from "../lark/decisionVersion.js";
 import { InputDeliveryStore, renderSteeringInput, type InputDeliveryRecord } from "./inputDelivery.js";
-import { ProgressReplies } from "./progressReplies.js";
+import { TaskCardProgress } from "./taskCardProgress.js";
+import { COMMUNICATION_CONTRACT_VERSION } from "../agent/communication.js";
 import { safeIdempotencyKey } from "../lark/outboundPostClient.js";
 import { TurnPerfRecorder, type PerfSample } from "./perfLog.js";
 import type { RuntimeRequirement } from "../runtimeRequirements.js";
@@ -1352,7 +1353,7 @@ export class BridgeHandler {
    * teardown path. Serial-per-key dispatch guarantees at most one live entry
    * per key, and register/delete never interleave across turns.
    */
-  private readonly activeInputs = new Map<string, { handle: RunHandle; chatId: string; sessionPath: string; replyMessageId: () => string | undefined }>();
+  private readonly activeInputs = new Map<string, { handle: RunHandle; chatId: string; sessionPath: string; taskMessageId: string; replyMessageId: () => string | undefined }>();
   private readonly inputDeliveries: InputDeliveryStore;
   private readonly activeTurnStops = new Map<string, () => void>();
   /** Finished cold turns whose process death has not yet been confirmed. */
@@ -1437,7 +1438,7 @@ export class BridgeHandler {
       messageId: event.message_id, sessionKey, chatId: event.chat_id,
       receivedAt: new Date(this.perfEnqueueAt.get(event) ?? Date.now()).toISOString(),
       messageCreateAt: larkEpochMs(event.create_time), wsAt: event.ws_at,
-      status: "sending", prompt: renderSteeringInput(parsed, this.deps.botConfig?.bot_open_id, this.deps.larkCliProfile, this.deps.botConfig?.owner_open_id),
+      status: "sending", prompt: renderSteeringInput(parsed, this.deps.botConfig?.bot_open_id, this.deps.larkCliProfile, this.deps.botConfig?.owner_open_id, active.taskMessageId),
     };
     // The durable sending record precedes any native side effects.
     await this.inputDeliveries.put(record);
@@ -1862,7 +1863,7 @@ export class BridgeHandler {
     // effects. Such messages stay re-dispatchable only via a reconnect
     // gap-fill window (pre-existing behavior), not the steady-state replay.
     let agentRunCompleted = false;
-    let progressReplies: ProgressReplies | undefined;
+    let taskCardProgress: TaskCardProgress | undefined;
     let progressDrain: Promise<void> | undefined;
     // A fail-closed process-liveness refusal is terminal, not a replay request.
     let processLivenessRefused = false;
@@ -3074,10 +3075,8 @@ export class BridgeHandler {
         });
       }
 
-      progressReplies = process.env["LARKWAY_PROGRESS_REPLIES"] === "off" ? undefined : new ProgressReplies({
-        file: path.join(worktreePath, ".larkway", `progress-${messageId.replace(/[^a-zA-Z0-9_-]/g, "_")}.json`),
-        replyTo: replyAnchorId, replyInThread, postClient: this.deps.postClient,
-        messageLink: async (id) => (await this.deps.messageLookup?.get(id, { refresh: true }))?.messageLink,
+      taskCardProgress = process.env["LARKWAY_PROGRESS_REPLIES"] === "off" ? undefined : new TaskCardProgress({
+        stateFile: path.join(worktreePath, ".larkway", "state.json"), messageId,
       });
 
       // Legacy worktrees retain their generated permission file. Managed and
@@ -3264,9 +3263,7 @@ export class BridgeHandler {
         markIdleWaiting: (silentMs, idleOpts) => cardKitProgress?.markIdleWaiting(silentMs, idleOpts),
         clearIdleWaiting: () => cardKitProgress?.clearIdleWaiting(),
       });
-      if (progressReplies) progressReplies.onChange = () => {
-        if (progressReplies) surface.handle({ type: "progress_snapshot", text: progressReplies.latestText, raw: null });
-      };
+      taskCardProgress?.start((text) => surface.handle({ type: "progress_snapshot", text, raw: null }));
       if (!modelFirst) {
         surface.attach();
         createDeferredBubble();
@@ -3479,6 +3476,7 @@ export class BridgeHandler {
           botOpenId: this.deps.botConfig?.bot_open_id,
           backend: this.deps.botConfig?.backend,
           promptMode,
+          communicationContractChanged: currentExisting?.communicationContractVersion !== COMMUNICATION_CONTRACT_VERSION,
           // 批G G1 (P1): pre-reseed handover warning (one line, bounded
           // window). `&& !forceFreshSession`: the ghost-purge retry flips
           // forceFreshSession mid-loop — without the guard, a warned record
@@ -3876,7 +3874,7 @@ export class BridgeHandler {
           idleWatchdog.unref?.();
         }
 
-        this.activeInputs.set(threadId, { handle, chatId: parsed.chatId, sessionPath: worktreePath,
+        this.activeInputs.set(threadId, { handle, chatId: parsed.chatId, sessionPath: worktreePath, taskMessageId: messageId,
           replyMessageId: () => cardKitProgress?.messageId ?? card?.messageId });
 
         // BL-42 /stop: expose this turn's kill switch to run()'s intercept.
@@ -4017,12 +4015,9 @@ export class BridgeHandler {
             }
             // Through `surface` (WP-10): straight to the live card handle,
             // or held until the model-first lane has the card.
-            if (ev.type === "progress_message" && progressReplies) {
-              progressReplies.add(ev.itemId, ev.text);
-              surface.handle({ type: "progress_snapshot", text: progressReplies.latestText, raw: ev.raw });
-            } else {
-              surface.handle(ev);
-            }
+            // Unaddressed native commentary is diagnostic output. Only an
+            // explicit card_progress declaration updates this task card.
+            surface.handle(ev);
             // COT is a parallel channel, not an either/or with the card: feed
             // it every event regardless of which primary surface is live
             // (through cotSink, which holds them until the handle is adopted).
@@ -4047,9 +4042,9 @@ export class BridgeHandler {
           const result = await handle.done;
           if (this.activeInputs.get(threadId)?.handle === handle) this.activeInputs.delete(threadId);
           const runnerDoneAt = Date.now();
-          progressDrain = progressReplies?.drain();
+          progressDrain = taskCardProgress?.finish();
           await progressDrain;
-          if (progressReplies?.hasMessages) surface.handle({ type: "progress_snapshot", text: progressReplies.latestText, raw: null });
+
           // A model-first card may not exist yet: then all of its calls (the
           // replay of the early events included) land in the tail below.
           turnPerf.markRunnerDone(cardKitProgress?.callDurationsMs, runnerDoneAt);
@@ -4177,7 +4172,7 @@ export class BridgeHandler {
           const hasFreshAnswerText =
             trustedAnswerText.trim().length > 0 ||
             (cardKitProgress?.answerText.trim().length ?? 0) > 0;
-          if (reportedState === null && !hasFreshAnswerText && !progressReplies?.hasMessages) {
+          if (reportedState === null && !hasFreshAnswerText && !taskCardProgress?.hasProgress) {
             await recordEvent({
               status: "running",
               appendPath: "未更新 state.json",
@@ -4411,7 +4406,7 @@ export class BridgeHandler {
           // delivered, and the hang card must not overwrite what it delivered.
           // Splitting these two readers is what let round 5's over-count through.
           const willShowBodyText =
-            progressReplies?.hasMessages === true ||
+            taskCardProgress?.hasProgress === true ||
             (
               trustedAnswerText.trim() ||
               cardKitProgress?.answerText.trim() ||
@@ -4639,6 +4634,7 @@ export class BridgeHandler {
               // Resume gate stamp: the cwd this sessionId was created under.
               workspacePath: runCwd,
               backend,
+              communicationContractVersion: COMMUNICATION_CONTRACT_VERSION,
               // BL-38: a brand-new thread that idle-killed on its very first turn
               // starts the counter at 1 (0 when clean; only persisted when > 0).
               consecutiveStuckCount: nextStuckCount,
@@ -4679,6 +4675,7 @@ export class BridgeHandler {
               // to it — re-stamp rather than preserve.
               workspacePath: runCwd,
               backend,
+              communicationContractVersion: COMMUNICATION_CONTRACT_VERSION,
               // BL-38: +1 on an idle-stuck turn, 0 (cleared) on any clean turn.
               consecutiveStuckCount: nextStuckCount,
               // 批F (F2): a reseed turn restarts the count at 1 (this turn ran
@@ -4840,7 +4837,7 @@ export class BridgeHandler {
                   ? `⚠️ 本轮长时间没有输出（静默 ${formatSilence(idleObservedSilenceMs)}）后结束，没有产出正文。\n` +
                     idleThresholdHint(idleTimeoutMs, idleKillAfterMs)
                 : reportedState?.last_message ??
-                  (fallbackAnswer ? fallbackAnswer : progressReplies?.hasMessages ? progressReplies.latestText : noOutputFallback);
+                  (fallbackAnswer ? fallbackAnswer : taskCardProgress?.hasProgress ? taskCardProgress.latestText : noOutputFallback);
 
           // 批F (F2): persist this turn's user-facing answer into the session
           // transcript so a future reseed seed carries BOTH sides of the
@@ -4948,8 +4945,6 @@ export class BridgeHandler {
           }));
           const baseCardPayload = {
             finalText: cardBodyWithTail,
-            historyText: progressReplies?.hasMessages && progressReplies.render().trim() !== cardBodyWithTail.trim()
-              ? progressReplies.render() : undefined,
             success,
             failureReason,
             titleOverride:
@@ -5013,7 +5008,6 @@ export class BridgeHandler {
                   executionStatus: stoppedByUser ? "本轮已停止" : budgetExhausted ? "本轮预算耗尽" : result.interrupted ? "本轮已中断" : success ? "本轮已结束" : "本轮执行失败",
                   title: baseCardPayload.titleOverride,
                   finalText: baseCardPayload.finalText,
-                  historyText: baseCardPayload.historyText,
                   mentions,
                   choices: baseCardPayload.choices,
                   choicePrompt: baseCardPayload.choicePrompt,
@@ -5485,7 +5479,7 @@ export class BridgeHandler {
       // A card delivery that failed is thrown only after the handoffs settled,
       // so every mirror already sent is named here; a failure before them
       // (runner, setup) names none.
-      await progressReplies?.drain();
+      await taskCardProgress?.finish();
       const failureText = withHandoffSentNote(`执行失败: ${String(err)}`, handoffsSentTo);
       const hardFailureText = failureText;
       const createHardFailurePostFallback = async (failureReason: string) => {
@@ -5515,7 +5509,6 @@ export class BridgeHandler {
           await cardKitProgress.finalize({
             executionStatus: "本轮执行失败",
             finalText: hardFailureText,
-            historyText: progressReplies?.hasMessages ? progressReplies.render() : undefined,
           });
           await deleteCardKitFile(wtPath);
         } catch (cardKitFinalizeErr) {
@@ -5564,6 +5557,7 @@ export class BridgeHandler {
       }
     }
     } finally {
+      await taskCardProgress?.finish();
       // COT safety net. There is deliberately no close() here any more (WP-2):
       // every bubble this turn created goes through the idempotent finalize
       // chained below, which also clears its throttle timer. A close() here

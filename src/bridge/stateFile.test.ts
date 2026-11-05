@@ -12,6 +12,16 @@ import { join } from "node:path";
 import { StateFileSchema, readStateFileDetailed, stateFilePathOf } from "./stateFile.js";
 
 describe("StateFileSchema — thin-channel URL leniency", () => {
+  it("preserves explicit card progress without rejecting a final state for invalid optional progress", () => {
+    expect(StateFileSchema.parse({ status: "in_progress", card_progress: { message_id: "current", text: "Waiting for the owner" } }).card_progress)
+      .toEqual({ message_id: "current", text: "Waiting for the owner" });
+    for (const card_progress of [null, { text: "Missing target" }, { message_id: "current", text: "x".repeat(2_001) }]) {
+      const result = StateFileSchema.parse({ status: "ready", last_message: "Delivered", card_progress });
+      expect(result.status).toBe("ready");
+      expect(result.last_message).toBe("Delivered");
+      expect(result.card_progress).toBeUndefined();
+    }
+  });
   it("accepts a relative mr_url and still surfaces status (the bridge's only hard need)", () => {
     const r = StateFileSchema.safeParse({
       status: "ready",

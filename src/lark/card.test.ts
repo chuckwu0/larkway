@@ -62,13 +62,14 @@ function lastPatchedCard(fake: FakeOutbound): CardJson | null {
 // ---------------------------------------------------------------------------
 
 describe("CardRenderer — V2 mode (botName set)", () => {
-  it("keeps earlier replies folded below the answer without adding a completion header", async () => {
+  it("never renders process history even through the compatibility argument", async () => {
     const { _buildCardJson } = await import("./card.js");
     const card = JSON.parse(_buildCardJson({ bodyText: "现在的答复", historyText: "之前的答复", toolLines: [],
       showToolSummary: false, status: "success", hideTools: true }));
     expect(card.header).toBeUndefined();
     expect(card.body.elements[0].content).toBe("现在的答复");
-    expect(card.body.elements.at(-1)).toMatchObject({ tag: "collapsible_panel", expanded: false });
+    expect(JSON.stringify(card)).not.toContain("之前的答复");
+    expect(JSON.stringify(card)).not.toContain("reply_history");
   });
   it("ordinary final answers have no automatic completion title", async () => {
     const { CardRenderer } = await import("./card.js");
@@ -833,7 +834,7 @@ describe("CardRenderer — finalize lands after in-flight live PATCH (issue #3)"
     expect(landed[landed.length - 1]).toBe("final");
   });
 
-  it("finalize ✅ PATCH waits for older live PATCHes, not just the latest one", async () => {
+  it("finalize waits for the started PATCH and drops queued summaries before writing the result", async () => {
     const { CardRenderer } = await import("./card.js");
     const landed: string[] = [];
     let livePatchCount = 0;
@@ -864,10 +865,11 @@ describe("CardRenderer — finalize lands after in-flight live PATCH (issue #3)"
     const handle = await renderer.start("om_user_msg");
 
     handle.handle({ type: "answer_delta", text: "第一段进度…", raw: {} });
+    await vi.waitFor(() => expect(livePatchCount).toBe(1));
     handle.handle({ type: "answer_delta", text: "第二段进度…", raw: {} });
     await handle.finalize({ success: true, finalText: "Delivered answer" });
 
-    expect(landed).toEqual(["live2", "live1", "final"]);
+    expect(landed).toEqual(["live1", "final"]);
   });
 });
 

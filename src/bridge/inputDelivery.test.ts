@@ -20,11 +20,14 @@ describe("input delivery journal", () => {
   it("keeps the current sender's owner status, identity and resource pointers", () => {
     const parsed = parseMessage({ message_id: "input", chat_id: "chat", chat_type: "group", root_id: "root", sender_id: "guest",
       parent_id: "quoted", content: JSON.stringify({ text: "Use the corrected URL https://example.feishu.cn/wiki/test" }), create_time: "0" });
-    const prompt = renderSteeringInput(parsed, "bot", "profile", "owner");
+    const prompt = renderSteeringInput(parsed, "bot", "profile", "owner", "original-task");
     expect(prompt).toContain("sender_is_owner: false");
     expect(prompt).toContain("guest: Use the corrected URL");
     expect(prompt).toContain("quoted");
-    expect(prompt).toContain("--profile profile");
+    expect(prompt).toContain("--profile 'profile' --as bot --reply-in-thread");
+    expect(prompt).toContain("--message-id 'input'");
+    expect(prompt).toContain("task_card_message_id: original-task");
+    expect(prompt).toContain("不把追问答复写入主任务卡");
     expect(prompt).toContain("message_id: input");
   });
 });

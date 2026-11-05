@@ -105,7 +105,7 @@ describe("answer and optional card transport", () => {
     expect(first).toContain("旧版 runtime 可兼容");
     expect(first).not.toContain("marker 外为内部过程");
     const resumed = await renderPrompt(makeInput({ backend: "codex", isNewThread: false }));
-    expect(between(resumed, "contract-anchor").trim()).toBe(`勿播报内部步骤。\n卡片/任务/交接声明写 ${STATE}。`);
+    expect(between(resumed, "contract-anchor").trim()).toBe(`进展与补充分开。\n卡片/任务/交接声明写 ${STATE}。`);
     expect(resumed).not.toContain("LARKWAY_ANSWER_BEGIN");
   });
 
@@ -115,7 +115,7 @@ describe("answer and optional card transport", () => {
     expect(prompt).toContain("独立行");
     const resumed = await renderPrompt(makeInput({ backend, isNewThread: false }));
     expect(between(resumed, "contract-anchor").trim()).toBe(
-      `勿播报内部步骤。\n正文放独立行 LARKWAY_ANSWER_BEGIN / LARKWAY_ANSWER_END 之间;卡片/任务/交接声明写 ${STATE}。`,
+      `进展与补充分开。\n正文放独立行 LARKWAY_ANSWER_BEGIN / LARKWAY_ANSWER_END 之间;卡片/任务/交接声明写 ${STATE}。`,
     );
   });
 

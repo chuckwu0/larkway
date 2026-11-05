@@ -92,6 +92,7 @@ Codex 使用原生 `final_answer` 通道：已知 final phase 的消息直接流
 | `last_message` / `error` | 可选正文覆盖 / 错误说明；业务链接直接写在正文里 |
 | `choices` / `choice_prompt` | 最多 5 个 `{label,value}` 单选按钮，点击后 `value` 逐字回传；多项信息可以文字提问 |
 | `content_blocks` | 有序 markdown/image 块，最多 12 块、其中最多 4 图；非空时为主正文，图片 `img_key` 由 Agent 取得 |
+| `card_progress` | 可选 `{message_id,text}`，当前主卡的简短进展，文本最多 2,000 字符；不改变业务状态 |
 | `response_surface.post.mentions` | `{user_id}` 数组，仅用于视觉 @ |
 | `handoffs` | 最多 3 个 `{to,text}`；bridge 发带真实 at 标签的 post 并直递本地 peer，`text` 自包含 |
 | `task_handle` | 按需声明 `{create:{summary,due?}}`、`guid`、`note`、`due`/`due_reason`、`blocked`、`done`；不因聊天轮数自动要求使用 |
@@ -103,6 +104,14 @@ tasklist 候选行形如 `guid=… | summary=… | thread=omt_…`：`thread` �
 peer 卡片正文并非可靠的 peer 输入通道。需要交接时使用自包含的 `handoffs` 文本或真实 post + at 标签；不强制增加 ack、台账或 deadline 流程。
 
 bridge 发本轮终卡的同时发出 `handoffs` 镜像 post：另一个 bridge 进程里的 peer 可能在本轮卡片定稿之前被唤醒（CardKit 定稿失败时，也可能早于兜底卡出现）；同一进程内的 peer 等终卡投递结束、本轮任务认领落地之后才收到。终卡投递失败时，已声明的 handoff 照常发出，本轮随后记为失败；bridge 生成的失败卡或兜底 post 追加一行「已交接给 <peer 显示名>」（多个用顿号分隔），只列生成那张卡时镜像 post 已经发出的 peer（CardKit 定稿失败后立即补发的兜底卡不含同一进程内的 peer：它的镜像要等终卡投递结束才发），没有已发出的交接则不加这一行；用户重新 @ 后重跑的一轮，或断线重连补抓（gap-fill）把这条消息重新投递后重跑的一轮，如果再次声明 handoff，peer 会再收到一次（agent 已跑完的轮次不走稳态自动重投）。
+
+## 运行中沟通与卡片进展
+
+主任务卡只显示显式 `card_progress:{message_id,text}`；`message_id` 必须是该活跃主卡的触发消息，摘要在实质变化时原子更新。普通 commentary 不自动展示，也不折叠或分段补发。
+
+运行中追加输入带 `task_card_message_id`（主卡触发 ID）及 `ordinary_reply`（以当前输入为目标的 lark-cli bot 回复命令指针）。追问答复、主动重要补充和需要真实 @ 人的沟通由 Agent 使用原生工具发新普通消息；该指针不由 bridge 执行，不改变 Agent 权限或既有任务工作流。最终答案仍用于主任务的交付结论。
+
+已有 native session 的输出契约版本变更时，仅补发一次完整 `state-contract`，不重复 workspace/peer 指针、不重开原生会话；版本随 session 记录保存。稳定续轮仍只发短 anchor。
 
 ## 连续性与预算
 

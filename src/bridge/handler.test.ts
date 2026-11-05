@@ -268,6 +268,7 @@ function makePersistentSessionStore() {
     needsFreshStart?: { reason: string; at: number };
     workspacePath?: string;
     backend?: string;
+    communicationContractVersion?: number;
   };
   const records = new Map<string, Rec>();
   const puts: Rec[] = [];
@@ -7594,6 +7595,21 @@ function ghostThenIdleRunner(retrySessionId: string): CapturedRunOpts[] {
 }
 
 describe("native session continuity defaults", () => {
+  it("refreshes only the output contract once for an older native session, without reseeding", async () => {
+    const sessionStore = makePersistentSessionStore();
+    const { workspacePath } = workspacePaths();
+    seedWsRecord(sessionStore, { workspacePath, backend: "codex" });
+    const captured = captureWorkspaceRunner("sess_prev");
+    const h = makeWorkspaceHandler({ store: sessionStore.store });
+    await h.handler.run(); await h.handler.whenAllTurnsSettled();
+    expect(captured[0]?.resumeSessionId).toBe("sess_prev");
+    expect(captured[0]?.prompt).toContain("<state-contract>");
+    expect(captured[0]?.prompt).toContain("card_progress");
+    expect(captured[0]?.prompt).not.toContain("<agent-workspace>");
+    expect(captured[0]?.prompt).not.toContain("<session-reseed>");
+    expect(sessionStore.records.get("wsbot:om_msg")?.communicationContractVersion).toBe(2);
+  });
+
   it.each([
     { turnCount: 1000, approxChars: 0 },
     { turnCount: 1, approxChars: 5_000_000 },
@@ -7601,7 +7617,7 @@ describe("native session continuity defaults", () => {
   ])("preserves long native history without opt-in reseeding (%j)", async (volume) => {
     const sessionStore = makePersistentSessionStore();
     const { workspacePath } = workspacePaths();
-    seedWsRecord(sessionStore, { ...volume, workspacePath, backend: "codex" });
+    seedWsRecord(sessionStore, { ...volume, workspacePath, backend: "codex", communicationContractVersion: 2 });
     const captured = captureWorkspaceRunner("sess_prev");
     const h = makeWorkspaceHandler({ store: sessionStore.store });
     await h.handler.run();
@@ -8734,18 +8750,20 @@ describe("resolveIdleKillAfterMs (BL-48 修订: idle-kill is opt-in)", () => {
 });
 
 describe("live topic input and progress", () => {
-  it("shows the latest reply without lifecycle scaffolding when no final answer is provided", async () => {
+  it("keeps unaddressed commentary out of the task card and never posts historical pages", async () => {
     await seedRepoCachePath();
     runClaudeImpl = () => ({ events: (async function* () {
-      yield { type: "progress_message", itemId: "first", text: "我先核对资料。", raw: {} };
-      yield { type: "progress_message", itemId: "second", text: "需要确认业务模块后才能继续。", raw: {} };
+      for (let i = 0; i < 75; i++) {
+        yield { type: "progress_message", itemId: `comment-${i}`, text: "我先核对资料，完成后继续验证。".repeat(20), raw: {} };
+      }
     })(), done: Promise.resolve({ exitCode: 0 }), kill: () => {} });
-    const { client } = makeClient(makeEvent()), cards = makeCardRenderer(), { store } = makeSessionStore();
+    const { client } = makeClient(makeEvent()), cards = makeCardRenderer(), post = makePostClient(), { store } = makeSessionStore();
     const handler = new BridgeHandler({ client: client as never, cardRenderer: cards.renderer as never,
-      sessionStore: store as never, conventions: makeConventions() });
+      sessionStore: store as never, postClient: post.client, conventions: makeConventions() });
     await handler.run(); await handler.whenAllTurnsSettled();
-    expect(cards.finalizeArgs[0]?.finalText).toBe("需要确认业务模块后才能继续。");
-    expect(cards.finalizeArgs[0]?.historyText).toContain("我先核对资料。");
+    expect(cards.finalizeArgs[0]?.finalText).not.toContain("我先核对资料");
+    expect(cards.finalizeArgs[0]?.historyText).toBeUndefined();
+    expect(post.calls).toEqual([]);
   });
   it("does not start queued input after an out-of-band stop races routing", async () => {
     await seedRepoCachePath();
@@ -8824,7 +8842,9 @@ describe("live topic input and progress", () => {
     expect(steer.mock.calls[0]![0]).toContain("om_followup");
     expect(runs).toBe(outcome === "rejected" ? 2 : 1);
     expect(cards.finalizeArgs[0]!.finalText).toBe("This turn ended; acceptance is still pending.");
-    expect(cards.finalizeArgs[0]?.historyText).toContain("A waits for loading");
+    expect(cards.finalizeArgs[0]?.historyText).toBeUndefined();
+    expect(steer.mock.calls[0]![0]).toContain("--message-id 'om_followup'");
+    expect(steer.mock.calls[0]![0]).toContain("task_card_message_id: om_msg");
     if (outcome === "accepted") expect(post.calls).toEqual([]);
     expect(handled).toContain("om_followup");
     const journalDir = join(root, "_input-deliveries", "test-bot");

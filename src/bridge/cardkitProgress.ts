@@ -374,6 +374,7 @@ class LiveCardKitProgressHandle implements CardKitProgressHandle {
   handle(event: AgentStreamEvent): void {
     if (this.closed) return;
     if (event.type === "progress_snapshot") {
+      if (event.text === this.progressBuffer) return;
       this.progressBuffer = event.text;
       this.schedulePatch({ immediate: !this.immediatePatchStarted });
       return;
@@ -879,12 +880,21 @@ class LiveCardKitProgressHandle implements CardKitProgressHandle {
       const content = this.visibleText();
       // closed: finalize arrived during the create above and waits for it only.
       if (this.closed || !content || content === this.lastCommittedAnswer) return;
-      await this.next((sequence) =>
-        this.cardKitClient.streamElementContent(this.cardId, CARDKIT_FINAL_ELEMENT_ID, content, {
-          sequence,
-          uuid: sequenceUuid(this.cardId, "answer", sequence),
-        }),
-      );
+      if (this.answerBuffer) {
+        await this.next((sequence) =>
+          this.cardKitClient.streamElementContent(this.cardId, CARDKIT_FINAL_ELEMENT_ID, content, {
+            sequence, uuid: sequenceUuid(this.cardId, "answer", sequence),
+          }),
+        );
+      } else {
+        // A completed summary is an atomic replacement, not a new typing
+        // animation replayed from the beginning of the same paragraph.
+        await this.next((sequence) =>
+          this.cardKitClient.updateElement(this.cardId, CARDKIT_FINAL_ELEMENT_ID, {
+            tag: "markdown", element_id: CARDKIT_FINAL_ELEMENT_ID, content,
+          }, { sequence, uuid: sequenceUuid(this.cardId, "progress", sequence) }),
+        );
+      }
       this.noteAnswerCommitted(content);
     } catch (err) {
       // A snapshot can move the text back to an earlier value.

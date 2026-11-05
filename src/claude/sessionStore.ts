@@ -71,6 +71,8 @@ export interface SessionRecord {
   workspacePath?: string;
   /** Backend that created sessionId. A backend change must start a new session. */
   backend?: string;
+  /** Last output transport contract delivered to this native session. */
+  communicationContractVersion?: number;
   /**
    * v3 task-handle dispatch-time capture (docs/task-handle.md §5.2/§9.9
    * "dispatch 时捕获根消息文本"): the thread's ROOT message text, truncated
@@ -195,6 +197,7 @@ interface StoredRecord {
   senderOpenId?: string;
   workspacePath?: string;
   backend?: string;
+  communicationContractVersion?: number;
   rootText?: string;
   chatId?: string;
   chatType?: string;
@@ -459,6 +462,7 @@ export class SessionStore {
       ...(record.senderOpenId !== undefined ? { senderOpenId: record.senderOpenId } : {}),
       ...(record.workspacePath !== undefined ? { workspacePath: record.workspacePath } : {}),
       ...(record.backend !== undefined ? { backend: record.backend } : {}),
+      ...(record.communicationContractVersion !== undefined ? { communicationContractVersion: record.communicationContractVersion } : {}),
       ...(record.rootText !== undefined ? { rootText: record.rootText } : {}),
       ...(record.chatId !== undefined ? { chatId: record.chatId } : {}),
       ...(record.chatType !== undefined ? { chatType: record.chatType } : {}),

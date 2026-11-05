@@ -49,6 +49,28 @@ function fakeCardKitClient(opts?: { initialElements?: string[] }) {
 }
 
 describe("CardKitProgressHandle", () => {
+  it("replaces completed task progress atomically while keeping the tool footer and final answer stream independent", async () => {
+    const { client, calls } = fakeCardKitClient();
+    const handle = await createCardKitProgressHandle({ cardKitClient: client, replyToMessageId: "input", replyInThread: true,
+      facts: { botId: "bot", threadId: "topic", triggerMessageId: "input" }, patchIntervalMs: 0 });
+    handle.handle({ type: "progress_snapshot", text: "Checking search return", raw: {} });
+    await handle.drain();
+    handle.handle({ type: "progress_snapshot", text: "Waiting for confirmation; other checks continue", raw: {} });
+    await handle.drain();
+    expect(calls.filter(c => c.name === "streamElementContent")).toHaveLength(0);
+    const updates = calls.filter(c => c.name === "updateElement" && c.args[1] === "final_md");
+    expect(updates).toHaveLength(1);
+    expect(updates[0]?.args[2]).toMatchObject({ content: "Waiting for confirmation; other checks continue" });
+    handle.handle({ type: "progress_snapshot", text: "Waiting for confirmation; other checks continue", raw: {} });
+    handle.handle({ type: "tool_use", toolName: "shell", toolInput: {}, raw: {} });
+    await handle.drain();
+    expect(calls.filter(c => c.name === "updateElement" && c.args[1] === "final_md")).toHaveLength(1);
+    expect(calls.filter(c => c.name === "updateElement" && c.args[1] === "footer_md")).toHaveLength(1);
+    handle.handle({ type: "answer_delta", text: "Final result", raw: {} });
+    await handle.drain();
+    expect(calls.filter(c => c.name === "streamElementContent").at(-1)?.args[2]).toBe("Final result");
+    handle.close();
+  });
   it("shows progress before completion without treating it as a final answer", async () => {
     const { client, calls } = fakeCardKitClient();
     const handle = await createCardKitProgressHandle({ cardKitClient: client, replyToMessageId: "input", replyInThread: false,
