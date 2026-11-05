@@ -13,7 +13,6 @@
  */
 
 import { decisionVersion } from "./decisionVersion.js";
-import { buildReplyHistoryElement } from "./cardkitSurface.js";
 import type { AgentStreamEvent as ClaudeStreamEvent } from "../agent/runner.js";
 import type { OutboundCardClient } from "./outboundCardClient.js";
 
@@ -389,7 +388,7 @@ function buildCardJson(opts: {
     !hasContentBlocks && opts.imageBlocks?.length
       ? opts.imageBlocks.length + 1
       : 0;
-  const tailReserve = failureReserve + choicesReserve + legacyImagesReserve + (opts.historyText ? 1 : 0);
+  const tailReserve = failureReserve + choicesReserve + legacyImagesReserve;
 
   // ── Tool-use summary ───────────────────────────────────────────────────────
   // Position above the body so operator's reading flow is:
@@ -511,7 +510,6 @@ function buildCardJson(opts: {
   // Card JSON 2.0 envelope: schema + header + body.elements.
   // `config` is not part of the 2.0 spec (joewongjc omits it); `header` is
   // supported at top level in 2.0 alongside `body`.
-  if (opts.historyText?.trim()) pushElement(elements, buildReplyHistoryElement(opts.historyText));
   const card = {
     schema: "2.0",
     ...(!(opts.hideTools && !opts.titleOverride) ? { header: {
@@ -584,6 +582,8 @@ class CardHandleImpl implements CardHandle {
    * flip the Feishu card back to the in-progress render.
    */
   private livePatchesInFlight = new Set<Promise<void>>();
+  private livePatchTail: Promise<void> = Promise.resolve();
+  private livePatchQueued = false;
 
   constructor(opts: {
     messageId: string;
@@ -686,6 +686,7 @@ class CardHandleImpl implements CardHandle {
 
   private accumulate(event: ClaudeStreamEvent): boolean {
     if (event.type === "progress_snapshot") {
+      if (event.text === this.progressBuffer) return false;
       this.progressBuffer = event.text;
       return true;
     } else if (event.type === "answer_delta") {
@@ -708,14 +709,14 @@ class CardHandleImpl implements CardHandle {
 
     if (elapsed >= this.patchIntervalMs) {
       // Enough time has passed — patch immediately
-      this.trackLivePatch(this.doLivePatch());
+      this.queueLivePatch();
     } else if (this.state.pendingPatch === null) {
       // Schedule a patch for the remaining interval
       const remaining = this.patchIntervalMs - elapsed;
       this.state.pendingPatch = setTimeout(() => {
         this.state.pendingPatch = null;
         if (!this.finalized) {
-          this.trackLivePatch(this.doLivePatch());
+          this.queueLivePatch();
         }
       }, remaining);
       // Unref so this timer won't hold Node alive if nothing else is running
@@ -760,10 +761,16 @@ class CardHandleImpl implements CardHandle {
     if (throwOnFinalFail && lastErr) throw lastErr;
   }
 
-  private trackLivePatch(promise: Promise<void>): void {
-    const tracked = promise.finally(() => {
-      this.livePatchesInFlight.delete(tracked);
-    });
+  private queueLivePatch(): void {
+    if (this.livePatchQueued) return;
+    this.livePatchQueued = true;
+    // Serialize retries and read the latest buffers only when the queued
+    // patch starts. An older slow PATCH cannot land after a newer summary.
+    const tracked = this.livePatchTail.then(async () => {
+      this.livePatchQueued = false;
+      if (!this.finalized) await this.doLivePatch();
+    }).finally(() => { this.livePatchesInFlight.delete(tracked); });
+    this.livePatchTail = tracked.catch((err: unknown) => { console.warn("[lark.card] live patch failed:", err); });
     this.livePatchesInFlight.add(tracked);
   }
 

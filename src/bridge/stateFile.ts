@@ -16,6 +16,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { z } from "zod";
+import { CardProgressSchema } from "./taskCardProgress.js";
 import {
   ResponseSurfaceStateSchema,
   parseResponseSurfaceState,
@@ -100,6 +101,11 @@ export const StateFileSchema = z.object({
   // unknown keys, so a bad/extra field never discards the status the bridge
   // needs.
   status: z.enum(["in_progress", "ready", "failed"]),
+  // Invalid optional presentation data cannot discard a valid final result.
+  card_progress: z.preprocess((value) => {
+    const parsed = CardProgressSchema.safeParse(value);
+    return parsed.success ? parsed.data : undefined;
+  }, CardProgressSchema.optional()),
   dev_url: optionalUrl,
   /**
    * Grey-environment URL operator can preview after stage=internal_test.

@@ -130,6 +130,8 @@ export interface RenderPromptInput {
   knowledgeDir?: string;
   /** Bounded manifest supplied by the handler; knowledge bodies stay on disk. */
   knowledgeMap?: string;
+  /** Resend only the output contract when an existing native session upgrades. */
+  communicationContractChanged?: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -156,13 +158,13 @@ function answerContract(backend: string): string {
 function renderStateContract(input: RenderPromptInput, full: boolean): string[] {
   const target = input.conventions.stateFilePath ?? `${input.conventions.worktreePath}/.larkway/state.json`;
   const backend = input.backend ?? "claude";
-  if (!full) {
+  if (!full && !input.communicationContractChanged) {
     // The full contract already sits in native history. One line keeps the
     // marker habit alive; the state path stays because it is the only state
     // pointer left once native compaction drops the first turn, so the line
     // names every use of it (cards, task_handle, handoffs), not cards alone.
     return block("contract-anchor", [
-      "勿播报内部步骤。",
+      "进展与补充分开。",
       backend === "codex"
         ? `卡片/任务/交接声明写 ${target}。`
         : `正文放独立行 ${ANSWER_BEGIN_MARKER} / ${ANSWER_END_MARKER} 之间;卡片/任务/交接声明写 ${target}。`,
@@ -171,6 +173,8 @@ function renderStateContract(input: RenderPromptInput, full: boolean): string[] 
   return block("state-contract", [
     answerContract(backend),
     "面向用户直接回答或说明实质进展；不要播报例行工具/技能调用或内部轮次状态。需要用户行动时说明原因和下一步。",
+    "主卡展示当前进展与交付结论。进展写card_progress:{message_id:主卡触发message_id,text:摘要}，仅实质变化时更新。普通commentary不展示，不提供过程历史。",
+    "收到运行中追加输入时，以lark-cli的bot身份发新普通消息回复该message_id。主动重要补充、需要@人时也可发普通消息；带 --reply-in-thread 和稳定 --idempotency-key，真实@用at标签；不把这些答复重复写进主卡。发送不确定先核对，不换键盲发。",
     `纯文字回答不用写 state.json。需要结构化卡片时可写 ${target}。`,
     "state.json: {status:\"ready\"|\"in_progress\"|\"failed\", last_message?:正文, error?:错误, updated_at?:当前ISO时间};原子替换,显式时间勿沿用旧值。status 描述任务结果,单次工具错误不等于任务失败。",
     "可选字段: choices:[{label,value}](最多5个,单选按钮,value逐字回传;多项信息可直接文字提问),choice_prompt;content_blocks:[{type:\"markdown\",content}|{type:\"image\",img_key,alt?}](最多12块/4图,非空时覆盖正文,img_key须已上传)。",

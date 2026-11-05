@@ -46,7 +46,7 @@ describe("runtime session identity", () => {
     const record = {
       threadId: "om_runtime", botId: "demo", sessionId: "native-session",
       createdTs: 1000, lastActiveTs: 2000,
-      workspacePath: path.join(tmpDir, "project"), backend: "claude",
+      workspacePath: path.join(tmpDir, "project"), backend: "claude", communicationContractVersion: 2,
     };
     await store.put(record);
     expect(store.get("om_runtime", "demo")).toEqual(record);

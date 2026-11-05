@@ -3,6 +3,7 @@ import path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 import type { ParsedMessage } from "../lark/message.js";
 import { deriveTriggerFacts, mentionedOthers, quotedMessageId } from "../agent/triggerFacts.js";
+import { ordinaryReplyCommand } from "../agent/communication.js";
 
 export interface InputDeliveryRecord {
   messageId: string;
@@ -37,11 +38,12 @@ export class InputDeliveryStore {
 }
 
 /** Preserve message identity and resource pointers without classifying business intent. */
-export function renderSteeringInput(parsed: ParsedMessage, selfOpenId?: string, profile?: string, ownerOpenId?: string): string {
+export function renderSteeringInput(parsed: ParsedMessage, selfOpenId?: string, profile?: string, ownerOpenId?: string, taskMessageId?: string): string {
   const trigger = deriveTriggerFacts(parsed, false, profile);
   return [
     "<thread-context>",
     `message_id: ${parsed.messageId}`,
+    ...(taskMessageId ? [`task_card_message_id: ${taskMessageId}`] : []),
     `chat_id: ${parsed.chatId}`,
     ...(ownerOpenId ? [`sender_is_owner: ${parsed.senderOpenId === ownerOpenId}`] : []),
     ...(parsed.raw.thread_id ? [`feishu_thread_id: ${parsed.raw.thread_id}`] : []),
@@ -52,7 +54,11 @@ export function renderSteeringInput(parsed: ParsedMessage, selfOpenId?: string, 
     `attachments: ${JSON.stringify(parsed.attachments)}`,
     `feishu_doc_links: ${JSON.stringify(parsed.feishuDocLinks)}`,
     `mentioned_others: ${JSON.stringify(mentionedOthers(parsed, selfOpenId))}`,
-    "</thread-context>", "", "<user-message>",
+    "</thread-context>", "<communication>",
+    "请用新的普通消息回应这条输入；不把追问答复写入主任务卡。需要强调信息或@人时也可主动发普通消息；不要重复播报过程。",
+    `ordinary_reply: ${ordinaryReplyCommand(parsed.messageId, profile)}`,
+    "主卡进展用 state.json 的 card_progress:{message_id:task_card_message_id,text:简短当前进展}，原子替换；final_answer 用于主任务交付。",
+    "</communication>", "", "<user-message>",
     `${parsed.senderOpenId}: ${parsed.text}`, "</user-message>",
   ].join("\n");
 }
