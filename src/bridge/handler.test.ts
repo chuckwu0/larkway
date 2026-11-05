@@ -156,6 +156,7 @@ afterEach(async () => {
 });
 
 interface FinalizeArgs {
+  historyText?: string;
   finalText?: string;
   success: boolean;
   failureReason?: string;
@@ -8686,7 +8687,7 @@ describe("live topic input and progress", () => {
       sessionStore: store as never, conventions: makeConventions() });
     await handler.run(); await handler.whenAllTurnsSettled();
     expect(cards.finalizeArgs[0]?.finalText).toBe("需要确认业务模块后才能继续。");
-    expect((cards.finalizeArgs[0] as Record<string, unknown>).historyText).toContain("我先核对资料。");
+    expect(cards.finalizeArgs[0]?.historyText).toContain("我先核对资料。");
   });
   it("does not start queued input after an out-of-band stop races routing", async () => {
     await seedRepoCachePath();
@@ -8765,7 +8766,7 @@ describe("live topic input and progress", () => {
     expect(steer.mock.calls[0]![0]).toContain("om_followup");
     expect(runs).toBe(outcome === "rejected" ? 2 : 1);
     expect(cards.finalizeArgs[0]!.finalText).toBe("This turn ended; acceptance is still pending.");
-    expect((cards.finalizeArgs[0] as Record<string, unknown>).historyText).toContain("A waits for loading");
+    expect(cards.finalizeArgs[0]?.historyText).toContain("A waits for loading");
     if (outcome === "accepted") expect(post.calls).toEqual([]);
     expect(handled).toContain("om_followup");
     const journalDir = join(root, "_input-deliveries", "test-bot");
