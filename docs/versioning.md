@@ -85,7 +85,8 @@
 | v0.3.78 | v0.3.78 | patch / 已发布 | Preserve Claude background work and scheduled wakeups; correlate resumed results and deliver final answers |
 | v0.3.79 | v0.3.79 | patch / 已发布 | native long-running turns without an implicit deadline; preserve explicit budgets and background continuation |
 | v0.3.80 | v0.3.80 | patch / 已发布 | live topic input, visible progress replies, and explicit execution status |
-| v0.3.81 | v0.3.81 | 当前 patch / 已发布 | clean reply cards, collapse earlier replies, and reduce status noise |
+| v0.3.81 | v0.3.81 | patch / 已发布 | clean reply cards, collapse earlier replies, and reduce status noise |
+| v0.3.82 | v0.3.82 | 当前 patch / 已发布 | configure per-bot concurrent turn slots; retain focused replies and collapsed earlier messages |
 
 ## 使用原则
 
@@ -178,4 +179,5 @@ v0.3.78       = Preserve Claude background work and scheduled wakeups; correlate
 v0.3.79       = native long-running turns without an implicit deadline; preserve explicit budgets and background continuation
 v0.3.80       = live topic input, visible progress replies, and explicit execution status
 v0.3.81       = clean reply cards, collapse earlier replies, and reduce status noise
+v0.3.82       = configure per-bot concurrent turn slots; retain focused replies and collapsed earlier messages
 ```
