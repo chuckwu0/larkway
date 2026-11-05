@@ -64,6 +64,8 @@ delta 续轮的 `thread-context` 只列会变化的事实，会话常量已在�
 
 ## 输出：原生答案与可选 state
 
+显式原生 `commentary` 的完成段落通过独立过程回复通道立即显示；它不是 final，不结束轮次，也不写任务评论。原生 final 仍按下文处理。运行中追加消息保留各自消息 ID、发送者、引用与资源指针，由 backend 的输入协议送入同一轮次；详见 [实时协作](live-collaboration.md)。
+
 Codex 使用原生 `final_answer` 通道：已知 final phase 的消息直接流式显示；phase 尚未确定时等待完成项，避免把 commentary 因 marker 误当答案。旧版无 phase 的 runtime 仍可在完成项中使用独立行 `LARKWAY_ANSWER_BEGIN` / `LARKWAY_ANSWER_END` marker。Claude 及暂未提供原生答案 phase 的 adapter 使用该 marker；marker 外文本不作为流式答案。
 
 纯文字回答无需写 `state.json`、创建任务卡或维护摘要。完成原生 turn 即可；热进程可以继续驻留，不要求 Agent 退出其 runtime 进程。bridge 负责流式卡片、节流、finalize 和网络恢复，Agent 不自行 PATCH/PUT bridge 管理的卡片。

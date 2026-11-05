@@ -1,4 +1,5 @@
 import type { Choice, ContentBlock, ImageBlock } from "./card.js";
+import { decisionVersion } from "./decisionVersion.js";
 
 export const CARDKIT_FINAL_ELEMENT_ID = "final_md";
 export const CARDKIT_FOOTER_ELEMENT_ID = "footer_md";
@@ -24,6 +25,8 @@ export interface BuildCardKitInitialCardOpts {
 
 export interface BuildCardKitFinalCardOpts {
   title?: string;
+  /** Runtime lifecycle label, not the Agent's business title. */
+  executionStatus?: string;
   finalText: string;
   mentions?: CardKitMentionTarget[];
   choices?: Choice[];
@@ -150,7 +153,7 @@ function buildChoiceLegend(choices: Choice[]): string {
   return choices.map((choice, i) => `**${choiceMarker(i)}.** ${choice.label}`).join("\n");
 }
 
-function buildChoiceRow(choices: Choice[]): Record<string, unknown> {
+function buildChoiceRow(choices: Choice[], prompt?: string): Record<string, unknown> {
   return {
     tag: "column_set",
     element_id: CARDKIT_CHOICES_ELEMENT_ID,
@@ -162,7 +165,7 @@ function buildChoiceRow(choices: Choice[]): Record<string, unknown> {
           text: plainText(choiceMarker(i)),
           type: "primary",
           behaviors: [
-            { type: "callback", value: { larkway_choice: choice.value } },
+            { type: "callback", value: { larkway_choice: choice.value, larkway_decision_version: decisionVersion(choices, prompt) } },
           ],
         },
       ],
@@ -195,6 +198,7 @@ export function buildCardKitFinalCard(
   opts: BuildCardKitFinalCardOpts,
 ): Record<string, unknown> {
   const elements: unknown[] = [];
+  elements.push(markdown(`**${opts.executionStatus ?? "本轮已结束"}**`, "execution_status"));
   // Collapsed reasoning panel sits ABOVE the answer (matches its streaming
   // position). Embedded here so the full-card rebuild keeps it (collapsed).
   if (opts.cotPanel) {
@@ -223,7 +227,7 @@ export function buildCardKitFinalCard(
     elements.push({ tag: "hr" });
     if (opts.choicePrompt) elements.push(markdown(opts.choicePrompt));
     elements.push(markdown(buildChoiceLegend(opts.choices)));
-    elements.push(buildChoiceRow(opts.choices));
+    elements.push(buildChoiceRow(opts.choices, opts.choicePrompt));
   }
   return truncateCardToBudget({
     schema: "2.0",

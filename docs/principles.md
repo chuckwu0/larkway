@@ -123,6 +123,12 @@ Agent 只使用 Agent 自己的身份(飞书应用/bot 身份,tenant token),**�
 
 ## 飞书卡片契约
 
+### 实时协作与长期任务
+
+话题负责提问、解释、授权、纠正与验收讨论；飞书任务负责长期跟踪、里程碑、阻塞与人工结案；原生 turn 只表示一次执行。消息已送入模型、本轮已结束、需求已验收是三种独立事实。
+
+运行中补充通过 backend 明确支持的输入协议交付同一 session；没有能力时明确排队。结果不确定不得自动重发。明确 user-facing commentary 可以作为过程回复展示，最终答案单独收尾，不能混入 reasoning 或工具原始输出。任务更新时机与内容仍由 Agent 决定，bridge 不从过程文字提取里程碑，不自动关闭业务任务。完整行为见 [实时协作](live-collaboration.md)。
+
 飞书卡片也是 thin channel:
 
 | 层 | Larkway bridge | Agent |

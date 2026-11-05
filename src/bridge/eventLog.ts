@@ -24,6 +24,11 @@ export type RuntimeEventTrigger =
   | "unknown";
 
 export interface RuntimeEventRecord {
+  /** Input transport outcome, independent of native work completion. */
+  deliveryStatus?: "accepted" | "rejected" | "unknown";
+  nativeThreadId?: string;
+  nativeTurnId?: string;
+  inputSettledAt?: string;
   id: string;
   botId?: string;
   botName?: string;
@@ -55,6 +60,10 @@ export interface RuntimeEventSummary {
 }
 
 export interface RuntimeEventPatch {
+  deliveryStatus?: "accepted" | "rejected" | "unknown";
+  nativeThreadId?: string;
+  nativeTurnId?: string;
+  inputSettledAt?: string;
   id: string;
   botId?: string;
   botName?: string;
@@ -129,6 +138,10 @@ async function upsertRuntimeEventUnlocked(
   const statusPath = mergeStatusPath(prev?.statusPath, patch.statusPath, patch.appendPath);
   const record: RuntimeEventRecord = {
     id: patch.id,
+    deliveryStatus: patch.deliveryStatus ?? prev?.deliveryStatus,
+    nativeThreadId: patch.nativeThreadId ?? prev?.nativeThreadId,
+    nativeTurnId: patch.nativeTurnId ?? prev?.nativeTurnId,
+    inputSettledAt: patch.inputSettledAt ?? prev?.inputSettledAt,
     botId: patch.botId ?? prev?.botId ?? botId,
     botName: patch.botName ?? prev?.botName,
     messageId: patch.messageId ?? prev?.messageId,

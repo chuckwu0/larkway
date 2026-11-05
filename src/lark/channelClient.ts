@@ -573,6 +573,8 @@ export function synthesizeCardActionEvent(
     thread_id: threadId,
     root_id: threadId,
     larkway_trigger_type: "card_action",
+    ...(evt.action.value && typeof evt.action.value === "object" && typeof (evt.action.value as Record<string, unknown>).larkway_decision_version === "string"
+      ? { larkway_decision_version: (evt.action.value as Record<string, unknown>).larkway_decision_version } : {}),
     sender_id: evt.operator.openId,
     content: JSON.stringify({ text: choice }),
     create_time: String(Date.now()),

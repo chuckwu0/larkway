@@ -17,6 +17,10 @@
 
 export type AgentStreamEvent =
   | { type: "system_init"; sessionId: string; raw: unknown }
+  /** Completed, explicitly user-facing native commentary; never reasoning or a final result. */
+  | { type: "progress_message"; itemId: string; text: string; raw: unknown }
+  /** Presentation snapshot of completed progress messages; distinct from the final answer buffer. */
+  | { type: "progress_snapshot"; text: string; raw: unknown }
   /**
    * Untrusted assistant/progress prose from the backend. This can include
    * thinking narration, tool-adjacent notes, or final text without channel
@@ -249,6 +253,7 @@ export function markPerfForEventType(
   } else if (
     eventType === "answer_delta" ||
     eventType === "answer_snapshot" ||
+    eventType === "progress_message" ||
     eventType === "internal_text" ||
     eventType === "text_delta"
   ) {
@@ -260,8 +265,15 @@ export function markPerfForEventType(
 // Run handle  (what AgentRunner.run() returns)
 // ---------------------------------------------------------------------------
 
+export type SteerResult =
+  | { status: "accepted"; threadId: string; turnId: string }
+  | { status: "rejected"; reason: string }
+  | { status: "unknown"; reason: string };
+
 export interface RunHandle {
   events: AsyncIterable<AgentStreamEvent>;
+  /** Append input to THIS native turn. Rejected is safe to queue; unknown must never auto-replay. */
+  steer?: (prompt: string) => Promise<SteerResult>;
   /**
    * Cold one-shot process liveness, independent of bounded turn settlement.
    * Resolves only on actual process exit/close or confirmed spawn failure.

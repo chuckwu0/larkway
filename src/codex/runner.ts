@@ -19,6 +19,7 @@ import { spawn } from "node:child_process";
 import { spawnPiped } from "../platform/spawn.js";
 import { resolveRunTimeoutMs } from "../agent/runTimeout.js";
 import { createInterface } from "node:readline";
+import { CodexSteering } from "./steering.js";
 import type { AgentRunner } from "../agent/runner.js";
 import {
   type AgentStreamEvent,
@@ -785,6 +786,8 @@ class CodexAppServerLineParser {
         if (itemId) this.messagePhases.delete(itemId);
         if (phase === "final_answer") {
           yield* this.nativeFinalSnapshot(item["text"], itemId, obj);
+        } else if (phase === "commentary" && itemId) {
+          yield { type: "progress_message", itemId, text: item["text"], raw: obj };
         } else if (phase !== undefined) {
           // Keep commentary out of internal_text too: the handler's legacy
           // last-text rescue must never surface an explicitly non-final item.
@@ -920,6 +923,10 @@ export function runCodex(opts: RunOptions, codexBinPath = "codex"): RunHandle {
 
   // Track discovered sessionId for done promise
   let discoveredSessionId: string | undefined;
+  let activeTurnId: string | undefined;
+  const steering = new CodexSteering((params) => sendRequest("turn/steer", params), 15_000, (id) => requestById.delete(id));
+  child.once("close", () => steering.disconnected());
+  child.once("error", () => steering.disconnected());
 
   // ── kill helper (SIGTERM → grace → SIGKILL) ───────────────────────────────
   let settled = false;
@@ -1130,6 +1137,8 @@ export function runCodex(opts: RunOptions, codexBinPath = "codex"): RunHandle {
           const id = response["id"];
           const method = requestById.get(id);
           requestById.delete(id);
+          if (method === undefined) continue;
+          if (method === "turn/steer") { steering.response(id, response); continue; }
 
           const carriedExcludeTurns = id === excludeTurnsRequestId;
           if (carriedExcludeTurns) excludeTurnsRequestId = undefined;
@@ -1183,7 +1192,21 @@ export function runCodex(opts: RunOptions, codexBinPath = "codex"): RunHandle {
             continue;
           }
 
+          if (method === "turn/start") {
+            const turn = asRecord(asRecord(response["result"])?.["turn"]);
+            if (typeof turn?.["id"] === "string") activeTurnId = turn["id"];
+          }
           continue;
+        }
+
+        const notificationParams = asRecord(response?.["params"]);
+        const notificationThread = notificationParams?.["threadId"];
+        if (discoveredSessionId && typeof notificationThread === "string" && notificationThread !== discoveredSessionId) continue;
+        const notificationTurn = notificationParams?.["turnId"] ?? asRecord(notificationParams?.["turn"])?.["id"];
+        if (activeTurnId && typeof notificationTurn === "string" && notificationTurn !== activeTurnId) continue;
+        if (response?.["method"] === "turn/started") {
+          const turn = asRecord(asRecord(response["params"])?.["turn"]);
+          if (typeof turn?.["id"] === "string") activeTurnId = turn["id"];
         }
 
         for (const event of parser.parseMessage(obj)) {
@@ -1220,6 +1243,9 @@ export function runCodex(opts: RunOptions, codexBinPath = "codex"): RunHandle {
 
   return {
     events: generateEvents(),
+    steer: (prompt) => settled || killScheduled
+      ? Promise.resolve({ status: "rejected", reason: "Native turn has ended or is stopping" })
+      : steering.steer(discoveredSessionId, activeTurnId, prompt),
     done,
     kill: () => doKill(),
     pid: child.pid ?? undefined,

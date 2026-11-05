@@ -214,6 +214,45 @@ describe("DEFAULT_WARM_PROCESS_IDLE_MS", () => {
   });
 });
 
+describe("CodexProcessPool live input", () => {
+  it("steers the active turn without starting another turn or stopping its work", async () => {
+    const pool = new CodexProcessPool({});
+    const handle = pool.run({ prompt: "work", cwd: "/wt" });
+    const events = collectEvents(handle.events);
+    await flush(); const child = spawnedChildren[0]!;
+    child.stdout.write(initResponse(1) + "\n"); await flush();
+    child.stdout.write(threadResponse(2, "live-thread") + "\n"); await flush();
+    child.stdout.write(turnStartResponse(3, "live-turn") + "\n"); await flush();
+    readOutboundRequests(child);
+    const input = handle.steer!("Clarification from the user"); await flush();
+    const requests = readOutboundRequests(child);
+    expect(requests).toHaveLength(1);
+    expect(requests[0]).toMatchObject({ method: "turn/steer", params: { threadId: "live-thread", expectedTurnId: "live-turn" } });
+    child.stdout.write(JSON.stringify({ id: requests[0]!.id, result: { turnId: "live-turn" } }) + "\n");
+    expect(await input).toEqual({ status: "accepted", threadId: "live-thread", turnId: "live-turn" });
+    expect(child.killSignals).toHaveLength(0);
+    child.stdout.write(turnCompleted("live-thread", "live-turn") + "\n");
+    await handle.done; await events;
+    expect((await handle.steer!("Too late")).status).toBe("rejected");
+    await pool.shutdown(0);
+  });
+  it("does not terminate the active turn when an old runtime rejects steering", async () => {
+    const pool = new CodexProcessPool({}); const handle = pool.run({ prompt: "work" });
+    const events = collectEvents(handle.events);
+    await flush(); const child = spawnedChildren[0]!;
+    child.stdout.write(initResponse(1) + "\n"); await flush();
+    child.stdout.write(threadResponse(2, "t") + "\n"); await flush();
+    child.stdout.write(turnStartResponse(3, "u") + "\n"); await flush();
+    readOutboundRequests(child);
+    const delivery = handle.steer!("input"); await flush();
+    const request = readOutboundRequests(child)[0]!;
+    child.stdout.write(jsonRpcErrorResponse(request.id!, "Unknown method") + "\n");
+    expect((await delivery).status).toBe("rejected");
+    child.stdout.write(turnCompleted("t", "u") + "\n");
+    expect((await handle.done).exitCode).toBe(0); await events; await pool.shutdown(0);
+  });
+});
+
 // ---------------------------------------------------------------------------
 // spawn-once / reuse
 // ---------------------------------------------------------------------------

@@ -47,6 +47,7 @@ const COT_TOOL_ARGS_MAX = 200;
 const COT_TOOL_RESULT_MAX = 1_200;
 
 export interface CardKitLiveMetrics {
+  firstVisibleReplyAt?: string;
   answerDeltaCount: number;
   answerSnapshotCount: number;
   firstAnswerAt: string | null;
@@ -269,6 +270,7 @@ class LiveCardKitProgressHandle implements CardKitProgressHandle {
   ) => void;
   private readonly finalFailureSalvageBudgetMs: number;
   private answerBuffer = "";
+  private progressBuffer = "";
   /**
    * WP-4: the answer text the card is known to show — what the last successful
    * createElements / streamElementContent carried. A patch whose buffer still
@@ -371,6 +373,11 @@ class LiveCardKitProgressHandle implements CardKitProgressHandle {
 
   handle(event: AgentStreamEvent): void {
     if (this.closed) return;
+    if (event.type === "progress_snapshot") {
+      this.progressBuffer = event.text;
+      this.schedulePatch({ immediate: !this.immediatePatchStarted });
+      return;
+    }
     // COT-in-card panel (方案 B): reasoning + tool activity into the collapsible
     // panel, in parallel with the status/answer handling below. No-op unless
     // cotDetail is set. Best-effort — a panel error never touches the answer.
@@ -847,10 +854,10 @@ class LiveCardKitProgressHandle implements CardKitProgressHandle {
 
   private async patchProgress(): Promise<void> {
     if (this.closed) return;
-    if (!this.answerBuffer) return;
+    if (!this.visibleText()) return;
     // WP-4: nothing new since the last commit, or an answer node is already
     // queued and will send the latest buffer when it starts.
-    if (this.answerBuffer !== this.lastCommittedAnswer && !this.answerQueued) {
+    if (this.visibleText() !== this.lastCommittedAnswer && !this.answerQueued) {
       this.answerQueued = true;
       this.enqueue(() => this.commitAnswer());
     }
@@ -864,12 +871,12 @@ class LiveCardKitProgressHandle implements CardKitProgressHandle {
       if (!this.answerElementCreated) {
         // The element is created WITH the current text, so that text is
         // already on the card — no identical stream right behind it.
-        const initial = this.answerBuffer;
+        const initial = this.visibleText();
         if (!initial) return;
         await this.withAnswerElement(initial);
         this.noteAnswerCommitted(initial);
       }
-      const content = this.answerBuffer;
+      const content = this.visibleText();
       // closed: finalize arrived during the create above and waits for it only.
       if (this.closed || !content || content === this.lastCommittedAnswer) return;
       await this.next((sequence) =>
@@ -890,6 +897,7 @@ class LiveCardKitProgressHandle implements CardKitProgressHandle {
 
   private noteAnswerCommitted(content: string): void {
     this.lastCommittedAnswer = content;
+    this.metrics.firstVisibleReplyAt ??= new Date().toISOString();
     this.metrics.progressUpdateCount += 1;
     this.metrics.visibleAnswerLength = content.length;
     this.metrics.lastProgressPatchAt = new Date().toISOString();
@@ -901,6 +909,12 @@ class LiveCardKitProgressHandle implements CardKitProgressHandle {
       `visible_length=${this.metrics.visibleAnswerLength}`,
       `sequence=${this.sequence}`,
     );
+  }
+
+  private visibleText(): string {
+    return this.progressBuffer
+      ? `**过程回复**\n\n${this.progressBuffer}${this.answerBuffer ? `\n\n---\n\n**本轮回复**\n\n${this.answerBuffer}` : ""}`
+      : this.answerBuffer;
   }
 
   private async withAnswerElement(initialContent: string): Promise<void> {

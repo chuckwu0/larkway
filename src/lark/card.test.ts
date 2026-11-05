@@ -274,12 +274,12 @@ describe("buildChoiceRow / dynamic choice card (V2)", () => {
     expect(btn0.text).toEqual({ tag: "plain_text", content: "A" });
     // The full value still round-trips back to the agent verbatim.
     expect(btn0.behaviors).toEqual([
-      { type: "callback", value: { larkway_choice: "采用方案A,重构这个组件" } },
+      { type: "callback", value: { larkway_choice: "采用方案A,重构这个组件", larkway_decision_version: expect.any(String) } },
     ]);
 
     const btn1 = cs!.columns[1]!.elements[0]!;
     expect(btn1.text!.content).toBe("B");
-    expect(btn1.behaviors![0]!.value).toEqual({ larkway_choice: "采用方案B,只调整样式" });
+    expect(btn1.behaviors![0]!.value).toEqual({ larkway_choice: "采用方案B,只调整样式", larkway_decision_version: expect.any(String) });
   });
 
   it("finalize WITHOUT choices renders NO column_set / action element (clean card preserved)", async () => {
