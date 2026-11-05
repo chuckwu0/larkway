@@ -6336,7 +6336,9 @@ describe("BL-38: poison-session self-heal", () => {
     await seedRepoCachePath();
     configureSuccessRunner(wt);
 
-    await runTurn(store);
+    // This checks successful completion, not idle interruption. Disk writes on
+    // a loaded CI worker may exceed this suite's synthetic 30ms kill threshold.
+    await runTurn(store, { noIdleKill: true });
 
     expect(records.has(key)).toBe(true);
     // Handler writes 0 on success; the real SessionStore then omits the field
