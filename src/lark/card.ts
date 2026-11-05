@@ -13,6 +13,7 @@
  */
 
 import { decisionVersion } from "./decisionVersion.js";
+import { buildReplyHistoryElement } from "./cardkitSurface.js";
 import type { AgentStreamEvent as ClaudeStreamEvent } from "../agent/runner.js";
 import type { OutboundCardClient } from "./outboundCardClient.js";
 
@@ -68,6 +69,7 @@ export interface CardHandle {
    */
   finalize(opts: {
     finalText?: string;
+    historyText?: string;
     success: boolean;
     failureReason?: string;
     /** Feishu open_id/user_id to @-mention in the finalized card body. */
@@ -352,6 +354,7 @@ function chunkMarkdown(text: string, maxLen = 2800): string[] {
  */
 function buildCardJson(opts: {
   bodyText: string;
+  historyText?: string;
   toolLines: string[];
   showToolSummary: boolean;
   status: "thinking" | "streaming" | "success" | "failure";
@@ -386,7 +389,7 @@ function buildCardJson(opts: {
     !hasContentBlocks && opts.imageBlocks?.length
       ? opts.imageBlocks.length + 1
       : 0;
-  const tailReserve = failureReserve + choicesReserve + legacyImagesReserve;
+  const tailReserve = failureReserve + choicesReserve + legacyImagesReserve + (opts.historyText ? 1 : 0);
 
   // ── Tool-use summary ───────────────────────────────────────────────────────
   // Position above the body so operator's reading flow is:
@@ -508,12 +511,13 @@ function buildCardJson(opts: {
   // Card JSON 2.0 envelope: schema + header + body.elements.
   // `config` is not part of the 2.0 spec (joewongjc omits it); `header` is
   // supported at top level in 2.0 alongside `body`.
+  if (opts.historyText?.trim()) pushElement(elements, buildReplyHistoryElement(opts.historyText));
   const card = {
     schema: "2.0",
-    header: {
+    ...(!(opts.hideTools && !opts.titleOverride) ? { header: {
       title: { tag: "plain_text", content: headerTitle },
       template: headerColor,
-    },
+    } } : {}),
     body: { elements },
   };
 
@@ -607,6 +611,7 @@ class CardHandleImpl implements CardHandle {
 
   async finalize(opts: {
     finalText?: string;
+    historyText?: string;
     success: boolean;
     failureReason?: string;
     mentionOpenId?: string;
@@ -649,6 +654,7 @@ class CardHandleImpl implements CardHandle {
 
     const cardJsonStr = buildCardJson({
       bodyText,
+      historyText: opts.historyText,
       toolLines: this.state.toolStatusLines,
       showToolSummary: this.showToolSummary,
       status: cardStatus,
@@ -771,9 +777,7 @@ class CardHandleImpl implements CardHandle {
   private async doLivePatch(): Promise<void> {
     this.state.lastPatchAt = Date.now();
     const cardJsonStr = buildCardJson({
-      bodyText: this.progressBuffer
-        ? `**过程回复**\n\n${this.progressBuffer}${this.state.textBuffer ? `\n\n---\n\n**本轮回复**\n\n${this.state.textBuffer}` : ""}`
-        : this.state.textBuffer,
+      bodyText: this.state.textBuffer || this.progressBuffer,
       toolLines: this.state.toolStatusLines,
       showToolSummary: this.showToolSummary,
       status: this.state.textBuffer ? "streaming" : "thinking",

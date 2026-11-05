@@ -14,6 +14,7 @@ export class ProgressReplies {
   private tail: Promise<void> = Promise.resolve();
   private archiveFailed = false;
   private cachedPages?: string[];
+  private latest = "";
   onChange?: () => void;
   constructor(private readonly opts: { file: string; replyTo: string; postClient?: OutboundPostClient; replyInThread: boolean;
     messageLink?: (messageId: string) => Promise<string | undefined> }) {}
@@ -21,6 +22,7 @@ export class ProgressReplies {
   add(itemId: string, text: string): void {
     if (!text.trim() || this.messages.has(itemId)) return;
     this.messages.set(itemId, text);
+    this.latest = text;
     this.cachedPages = undefined;
     this.tail = this.tail.then(async () => {
       // Keep the full record even when a platform card reaches its size budget.
@@ -33,8 +35,8 @@ export class ProgressReplies {
         if (this.links.has(i) || !this.opts.postClient) continue;
         const digest = createHash("sha256").update(pages[i]!).digest("hex");
         const sent = await this.opts.postClient.createPostReply(this.opts.replyTo, buildPostContent({
-          text: `较早的过程回复 · 第 ${i + 1} 段\n\n${pages[i]}`, mentions: [],
-          links: i > 0 && this.links.get(i - 1) ? [{ text: "更早的过程回复", href: this.links.get(i - 1)! }] : [],
+          text: `较早回复 · 第 ${i + 1} 段\n\n${pages[i]}`, mentions: [],
+          links: i > 0 && this.links.get(i - 1) ? [{ text: "更早回复", href: this.links.get(i - 1)! }] : [],
         }), { replyInThread: this.opts.replyInThread, idempotencyKey: safeIdempotencyKey(this.opts.file + digest) });
         // Record the successful post BEFORE resolving its optional deep link.
         this.links.set(i, undefined);
@@ -60,14 +62,17 @@ export class ProgressReplies {
     return pages;
   }
   get hasMessages(): boolean { return this.messages.size > 0; }
+  get latestText(): string {
+    return Buffer.byteLength(this.latest) <= PAGE_BYTES ? this.latest : "…\n\n" + Array.from(this.latest).slice(-1_400).join("");
+  }
   render(): string {
     const pages = this.pages();
     if (!pages.length) return "";
     const links = [...this.links].slice(-5).filter(([, link]) => !!link).map(([i, link]) => `[第 ${i + 1} 段](${link})`).join(" · ");
     const unlinked = [...this.links.values()].filter((link) => !link).length;
     const pending = pages.length - 1 - this.links.size;
-    const note = pending > 0 ? `\n\n_${pending} 段较早回复${this.archiveFailed || !this.opts.postClient ? "尚未投递，完整记录已保留在 session 产物" : "正在分段归档"}。_` : "";
-    return `${links ? `较早回复：${links}\n\n` : ""}${unlinked ? `${unlinked} 段较早回复已分段发到本话题；平台未返回直接跳转链接，可在话题内查看。\n\n` : ""}${pages.at(-1)}${note}`;
+    const note = pending > 0 && (this.archiveFailed || !this.opts.postClient) ? `\n\n_${pending} 段较早回复暂未能显示。_` : "";
+    return `${links ? `较早回复：${links}\n\n` : ""}${unlinked ? `${unlinked} 段较早回复已发在本话题。\n\n` : ""}${pages.at(-1)}${note}`;
   }
   async drain(): Promise<void> { await this.tail; }
 }

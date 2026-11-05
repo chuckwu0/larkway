@@ -62,7 +62,15 @@ function lastPatchedCard(fake: FakeOutbound): CardJson | null {
 // ---------------------------------------------------------------------------
 
 describe("CardRenderer — V2 mode (botName set)", () => {
-  it("V2 success title is '✅ 完成' (no [botName] prefix — Feishu shows avatar)", async () => {
+  it("keeps earlier replies folded below the answer without adding a completion header", async () => {
+    const { _buildCardJson } = await import("./card.js");
+    const card = JSON.parse(_buildCardJson({ bodyText: "现在的答复", historyText: "之前的答复", toolLines: [],
+      showToolSummary: false, status: "success", hideTools: true }));
+    expect(card.header).toBeUndefined();
+    expect(card.body.elements[0].content).toBe("现在的答复");
+    expect(card.body.elements.at(-1)).toMatchObject({ tag: "collapsible_panel", expanded: false });
+  });
+  it("ordinary final answers have no automatic completion title", async () => {
     const { CardRenderer } = await import("./card.js");
     const fake = new FakeOutbound();
     const renderer = new CardRenderer({
@@ -74,10 +82,10 @@ describe("CardRenderer — V2 mode (botName set)", () => {
     await handle.finalize({ success: true });
 
     const card = lastPatchedCard(fake);
-    expect(card?.header?.title?.content).toBe("✅ 完成");
+    expect(card?.header).toBeUndefined();
   });
 
-  it("V2 failure title is '❌ 出错了' (no [botName] prefix)", async () => {
+  it("failure details remain in the answer without an automatic title", async () => {
     const { CardRenderer } = await import("./card.js");
     const fake = new FakeOutbound();
     const renderer = new CardRenderer({
@@ -89,7 +97,7 @@ describe("CardRenderer — V2 mode (botName set)", () => {
     await handle.finalize({ success: false });
 
     const card = lastPatchedCard(fake);
-    expect(card?.header?.title?.content).toBe("❌ 出错了");
+    expect(card?.header).toBeUndefined();
   });
 
   it("does NOT render a stages timeline or next-step hint", async () => {
@@ -718,8 +726,7 @@ describe("CardRenderer — injected OutboundCardClient (throttle + finalize)", (
       header: { title: { content: string }; template: string };
       body: { elements: Array<{ tag: string; content?: string }> };
     };
-    expect(patched.header.title.content).toBe("✅ 完成");
-    expect(patched.header.template).toBe("green");
+    expect(patched.header).toBeUndefined();
     // Final text rendered in a markdown body element.
     const hasBody = patched.body.elements.some(
       (el) => el.tag === "markdown" && el.content === "all done",
@@ -804,7 +811,7 @@ describe("CardRenderer — finalize lands after in-flight live PATCH (issue #3)"
         return { messageId: "om_test123" };
       },
       async patchCard(_messageId: string, cardJson: string) {
-        const isFinalSuccess = cardJson.includes("✅");
+        const isFinalSuccess = cardJson.includes("Delivered answer");
         if (!isFinalSuccess) await new Promise((r) => setTimeout(r, 50));
         landed.push(isFinalSuccess ? "final" : "live");
         this.patchCalls.push({ messageId: _messageId, cardJson });
@@ -819,7 +826,7 @@ describe("CardRenderer — finalize lands after in-flight live PATCH (issue #3)"
     const handle = await renderer.start("om_user_msg");
     // Fire a live PATCH (immediate), then finalize while it's still in its 50ms delay.
     handle.handle({ type: "answer_delta", text: "干活中…", raw: {} });
-    await handle.finalize({ success: true });
+    await handle.finalize({ success: true, finalText: "Delivered answer" });
     // Without the fix, the slow live PATCH would land AFTER finalize → last="live"
     // (ready overwritten back to 处理中). With finalize awaiting the in-flight
     // patch, the ✅ finalize is guaranteed last.
@@ -836,7 +843,7 @@ describe("CardRenderer — finalize lands after in-flight live PATCH (issue #3)"
         return { messageId: "om_test123" };
       },
       async patchCard(_messageId: string, cardJson: string) {
-        const isFinalSuccess = cardJson.includes("✅");
+        const isFinalSuccess = cardJson.includes("Delivered answer");
         if (!isFinalSuccess) {
           livePatchCount += 1;
           const thisLivePatch = livePatchCount;
@@ -858,7 +865,7 @@ describe("CardRenderer — finalize lands after in-flight live PATCH (issue #3)"
 
     handle.handle({ type: "answer_delta", text: "第一段进度…", raw: {} });
     handle.handle({ type: "answer_delta", text: "第二段进度…", raw: {} });
-    await handle.finalize({ success: true });
+    await handle.finalize({ success: true, finalText: "Delivered answer" });
 
     expect(landed).toEqual(["live2", "live1", "final"]);
   });

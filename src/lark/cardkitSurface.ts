@@ -25,8 +25,9 @@ export interface BuildCardKitInitialCardOpts {
 
 export interface BuildCardKitFinalCardOpts {
   title?: string;
-  /** Runtime lifecycle label, not the Agent's business title. */
+  /** Deprecated: lifecycle is logged, never added to the answer body. */
   executionStatus?: string;
+  historyText?: string;
   finalText: string;
   mentions?: CardKitMentionTarget[];
   choices?: Choice[];
@@ -76,6 +77,14 @@ export function buildCotPanelElement(opts: {
     expanded: opts.expanded,
     header: { title: { tag: "markdown", content: opts.title } },
     elements: [markdown(opts.content || "…", CARDKIT_COT_INNER_ELEMENT_ID)],
+  };
+}
+
+export function buildReplyHistoryElement(text: string): Record<string, unknown> {
+  return {
+    tag: "collapsible_panel", element_id: "reply_history", expanded: false,
+    header: { title: { tag: "plain_text", content: "较早回复" } },
+    elements: [markdown(text, "reply_history_md")],
   };
 }
 
@@ -198,7 +207,6 @@ export function buildCardKitFinalCard(
   opts: BuildCardKitFinalCardOpts,
 ): Record<string, unknown> {
   const elements: unknown[] = [];
-  elements.push(markdown(`**${opts.executionStatus ?? "本轮已结束"}**`, "execution_status"));
   // Collapsed reasoning panel sits ABOVE the answer (matches its streaming
   // position). Embedded here so the full-card rebuild keeps it (collapsed).
   if (opts.cotPanel) {
@@ -229,6 +237,7 @@ export function buildCardKitFinalCard(
     elements.push(markdown(buildChoiceLegend(opts.choices)));
     elements.push(buildChoiceRow(opts.choices, opts.choicePrompt));
   }
+  if (opts.historyText?.trim()) elements.push(buildReplyHistoryElement(opts.historyText));
   return truncateCardToBudget({
     schema: "2.0",
     config: {
