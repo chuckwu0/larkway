@@ -389,6 +389,10 @@ export const BotConfigSchema = z.object({
    */
   backend: z.string().min(1).default("claude"),
 
+  /** Per-bot concurrent turns across topics. Same-session turns remain serial.
+   * Defaults to 5; changes take effect after restarting the bridge. */
+  max_concurrent_turns: z.number().int().positive().optional(),
+
   /**
    * When a silent turn starts SAYING it is silent, in seconds.
    *

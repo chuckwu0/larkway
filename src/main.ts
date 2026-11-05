@@ -1026,6 +1026,7 @@ async function runV2Mode({
         turn_taking_limit: bot.turn_taking_limit,
         git_identity: bot.git_identity,
         backend: bot.backend,
+        max_concurrent_turns: bot.max_concurrent_turns,
         runnerKey,
         runtime: bot.runtime,
         git_token_env: bot.git_token_env,
