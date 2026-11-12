@@ -18,6 +18,7 @@
  * business workflow state (that's <worktree>/.larkway/state.json).
  */
 
+import type { LiveCodexStatus } from "../codex/liveRunner.js";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { resolveLarkwayDir } from "../config/paths.js";
@@ -57,6 +58,7 @@ export interface StatusFile {
    * treats absence as "unknown" so a stale old bridge cannot masquerade as v0.3.
    */
   runtime?: "legacy" | "agent_workspace";
+  codexRuntime?: LiveCodexStatus;
 }
 
 /** What the bridge supplies per write; updatedAt + pid are filled in here. */
@@ -76,6 +78,7 @@ export interface StatusWrite {
    * Omitted only for legacy/backward-compatible callers.
    */
   runtime?: "legacy" | "agent_workspace";
+  codexRuntime?: LiveCodexStatus;
 }
 
 /** The 3-state classification surfaced to the Web 管理面. */
@@ -128,6 +131,7 @@ export async function writeStatusFile(botId: string | undefined, w: StatusWrite)
     // to older versions when fields are absent (old readers stay happy).
     ...(w.avatar !== undefined ? { avatar: w.avatar } : {}),
     ...(w.backend !== undefined ? { backend: w.backend } : {}),
+    ...(w.codexRuntime !== undefined ? { codexRuntime: w.codexRuntime } : {}),
     ...(w.runtime !== undefined ? { runtime: w.runtime } : {}),
   };
   await fs.mkdir(dir, { recursive: true });

@@ -38,7 +38,8 @@ import { botRunLimits } from "./config/runLimits.js";
 import { ClaudeRunner } from "./claude/runner.js";
 import { ClaudeProcessPool, reapOrphanedWarmClaudeProcesses } from "./claude/pool.js";
 import { CodexRunner } from "./codex/runner.js";
-import { CodexProcessPool, reapOrphanedWarmProcess } from "./codex/pool.js";
+import { LiveCodexRunner, reapCodexGenerations } from "./codex/liveRunner.js";
+import { createCodexConfigReader } from "./codex/liveConfig.js";
 import { PiRunner } from "./pi/runner.js";
 import { PiProcessPool } from "./pi/pool.js";
 import { ensureLarkCliProfile, deriveLarkCliProfile } from "./lark/profileBootstrap.js";
@@ -290,7 +291,7 @@ async function runV2Mode({
      * when `warmProcess: true` in its yaml. undefined for every other bot —
      * the overwhelming common case stays byte-identical to pre-Phase-1.
      */
-    codexPool: CodexProcessPool | undefined;
+    codexPool: LiveCodexRunner | undefined;
     /** Same opt-in, claude-backend counterpart — one warm process per active thread (src/claude/pool.ts). */
     claudePool: ClaudeProcessPool | undefined;
     /** WP-9: pi-backend counterpart, one warm `pi --mode rpc` per active thread (src/pi/pool.ts); explicit opt-in only. */
@@ -908,7 +909,7 @@ async function runV2Mode({
     // backend key) so two bots on the same larkway instance can
     // independently be pooled or not — see botConfig.runnerKey's doc in
     // bridge/handler.ts.
-    let codexPool: CodexProcessPool | undefined;
+    let codexPool: LiveCodexRunner | undefined;
     let claudePool: ClaudeProcessPool | undefined;
     let piPool: PiProcessPool | undefined;
     let runnerKey: string | undefined;
@@ -924,11 +925,14 @@ async function runV2Mode({
       // still-running codex app-server process. Sweep it before constructing
       // this bot's (fresh) pool. Best-effort — never blocks bot startup.
       try {
-        await reapOrphanedWarmProcess(pidFilePath);
+        await reapCodexGenerations(pidFilePath);
       } catch (err) {
         console.warn(`[larkway] bot "${bot.id}": orphaned warm-process sweep failed (continuing):`, err);
       }
-      codexPool = new CodexProcessPool({
+      codexPool = new LiveCodexRunner(createCodexConfigReader(
+        process.env["LARKWAY_BOTS_DIR"] ? path.resolve(process.env["LARKWAY_BOTS_DIR"]) : path.join(larkwayHome(), "bots"),
+        bot.id,
+      ), {
         botGitIdentity: bot.git_identity,
         gitlabToken: effectiveGitlabToken,
         ...(larkCliConfigDir ? { larkCliConfigDir } : {}),
@@ -1117,8 +1121,8 @@ async function runV2Mode({
       schedules: bot.schedules,
       defaultChatId: bot.schedule_chat_id,
       // Hot-reload: edits to the bot yaml's schedules:/schedule_chat_id go
-      // live within one tick (≤30s) — no bridge restart. Every other yaml
-      // field still needs a restart (loaded once at boot).
+      // live within one tick (≤30s). Pooled Codex model/effort also reload
+      // at turn admission; other fields still require a restart.
       reloadConfig: createScheduleConfigReloader(
         process.env["LARKWAY_BOTS_DIR"]
           ? path.resolve(process.env["LARKWAY_BOTS_DIR"])
@@ -1311,6 +1315,7 @@ async function runV2Mode({
         // V0.3 dogfood send/reply must prove the running bridge is the same
         // runtime declared in the bot yaml, not merely "some process has WS=true".
         runtime: inst.bot.runtime ?? "legacy",
+        ...(inst.codexPool ? { codexRuntime: inst.codexPool.status } : {}),
       }).catch((err: unknown) => {
         console.warn(`[larkway] bot "${inst.bot.id}" status.json write failed:`, err);
       });

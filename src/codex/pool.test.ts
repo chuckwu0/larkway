@@ -1919,3 +1919,58 @@ describe("CodexProcessPool — prewarm (批D)", () => {
     expect(spawnedChildren).toHaveLength(1);
   });
 });
+
+describe("Codex pool runtime inspection and drain safety", () => {
+  it("reads settings and account on its own connection without starting a turn", async () => {
+    const pool = new CodexProcessPool({});
+    const settings = pool.runtimeSettings("/wt");
+    const child = spawnedChildren[0]!;
+    readOutboundRequests(child);
+    child.stdout.write(initResponse(1) + "\n"); await flush();
+    const config = readOutboundRequests(child)[0]!;
+    expect(config).toMatchObject({ method: "config/read", params: { cwd: "/wt", includeLayers: false } });
+    child.stdout.write(JSON.stringify({ id: config.id, result: { config: { model: "model-new", model_reasoning_effort: "high" } } }) + "\n"); await flush();
+    const account = readOutboundRequests(child)[0]!;
+    expect(account).toMatchObject({ method: "account/read", params: { refreshToken: false } });
+    child.stdout.write(JSON.stringify({ id: account.id, result: { account: { type: "chatgpt", email: "example@example.test" } } }) + "\n");
+    expect(await settings).toEqual({ model: "model-new", effort: "high", account: "example@example.test" });
+    expect(readOutboundRequests(child)).toHaveLength(0);
+    await pool.shutdown(0);
+  });
+
+  it("retains an unowned native child turn and an unconfirmed cancellation", async () => {
+    const pool = new CodexProcessPool({}); pool.prewarm();
+    const child = spawnedChildren[0]!;
+    child.stdout.write(initResponse(1) + "\n"); await flush();
+    child.stdout.write(JSON.stringify({ method: "turn/started", params: { threadId: "native-child", turn: { id: "child-turn" } } }) + "\n"); await flush();
+    expect(pool.hasLiveWork).toBe(true);
+    child.stdout.write(turnCompleted("native-child", "child-turn") + "\n"); await flush();
+    expect(pool.hasLiveWork).toBe(false);
+    child.stdout.write(JSON.stringify({ method: "thread/status/changed", params: { threadId: "native-child", status: { type: "active", activeFlags: [] } } }) + "\n"); await flush();
+    expect(pool.hasLiveWork).toBe(true);
+    child.stdout.write(JSON.stringify({ method: "thread/status/changed", params: { threadId: "native-child", status: { type: "idle" } } }) + "\n"); await flush();
+    expect(pool.hasLiveWork).toBe(false);
+    child.stdout.write(JSON.stringify({ method: "thread/started", params: { thread: { id: "parent", parentThreadId: null, status: { type: "idle" } } } }) + "\n");
+    child.stdout.write(JSON.stringify({ method: "item/completed", params: { threadId: "parent", item: { type: "subAgentActivity", kind: "started", agentThreadId: "child" } } }) + "\n"); await flush();
+    expect(pool.hasLiveWork).toBe(true);
+    expect(pool.hasSessionWork("parent")).toBe(true);
+    expect(pool.hasSessionWork("unrelated")).toBe(false);
+    child.stdout.write(JSON.stringify({ method: "item/completed", params: { threadId: "parent", item: { type: "subAgentActivity", kind: "completed", agentThreadId: "child" } } }) + "\n"); await flush();
+    expect(pool.hasSessionWork("parent")).toBe(false);
+    child.emit("error", new Error("pipe failed"));
+    expect(pool.hasLiveWork).toBe(true); // error is not exit confirmation
+    child.emit("exit", 1);
+    expect(pool.hasLiveWork).toBe(false);
+    await pool.shutdown(0);
+  });
+
+  it("does not fall back into the current login after a rotating generation fails", async () => {
+    const pool = new CodexProcessPool({ allowColdFallback: false });
+    const handle = pool.run({ prompt: "work" });
+    const failure = expect(handle.done).rejects.toThrow("process exited");
+    spawnedChildren[0]!.emit("exit", 1);
+    await failure;
+    expect(spawnedChildren).toHaveLength(1);
+    await pool.shutdown(0);
+  });
+});

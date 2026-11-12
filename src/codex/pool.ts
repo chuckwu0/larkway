@@ -151,6 +151,8 @@ interface CancelledTurn {
 
 export interface CodexProcessPoolOptions {
   codexBinPath?: string;
+  /** Rotating pools must never silently cold-start under a different login. */
+  allowColdFallback?: boolean;
   botGitIdentity?: { name: string; email: string };
   gitlabToken?: string;
   /** BL-50: per-bot LARKSUITE_CLI_CONFIG_DIR for identity isolation. */
@@ -186,6 +188,92 @@ export class CodexProcessPool implements AgentRunner {
   readonly #larkCliConfigDir?: string;
   readonly #idleMs: number;
   readonly #pidFilePath: string | undefined;
+
+  readonly #allowColdFallback: boolean;
+  readonly #nativeActive = new Set<string>();
+  readonly #ownedSessionIds = new Set<string>();
+  readonly #nativeParents = new Map<string, string | null>();
+  readonly #unexitedChildren = new Set<ChildProcess>();
+  readonly #diagnostics = new Map<number, { resolve: (v: JsonRecord) => void; reject: (e: Error) => void }>();
+
+  /** Includes unowned native child-agent turns and pending cancellations. */
+  get hasLiveWork(): boolean {
+    return this.#turns.size > 0 || this.#cancelledThreads.size > 0 || this.#diagnostics.size > 0 ||
+      this.#coldWriters.size > 0 || this.#nativeActive.size > 0 ||
+      [...this.#unexitedChildren].some((child) => child !== this.#child);
+  }
+
+  ownsSession(id: string): boolean { return this.#ownedSessionIds.has(id); }
+
+  hasSessionWork(id: string): boolean {
+    if (!this.ownsSession(id)) return false;
+    if ([...this.#unexitedChildren].some((child) => child !== this.#child)) return true;
+    if (this.#cancelledThreads.has(id)) return true;
+    if ([...this.#turns.values()].some((turn) => turn.threadId === id || turn.opts.resumeSessionId === id)) return true;
+    if ([...this.#coldWriters].some((writer) => writer.sessionIds.has(id))) return true;
+    for (const active of this.#nativeActive) {
+      let ancestor: string | null = active;
+      const visited = new Set<string>();
+      while (ancestor !== null) {
+        if (ancestor === id) return true;
+        // Unknown ancestry/cycles: keep the old process as the sole writer.
+        if (visited.has(ancestor) || !this.#nativeParents.has(ancestor)) return true;
+        visited.add(ancestor);
+        ancestor = this.#nativeParents.get(ancestor)!;
+      }
+    }
+    return false;
+  }
+
+  /** Read only the effective settings and account from this actual process. */
+  async runtimeSettings(cwd?: string): Promise<{ model?: string; effort?: string; account: string | null }> {
+    this.prewarm();
+    const request = async (method: string, params: JsonRecord): Promise<JsonRecord> => {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      let id: number | undefined;
+      let expired = false;
+      try {
+        return await Promise.race([
+          (async () => {
+            await this.#ready;
+            if (expired) throw new Error("Codex runtime settings timed out");
+            id = this.#nextRequestId++;
+            return await new Promise<JsonRecord>((resolve, reject) => {
+              this.#diagnostics.set(id!, { resolve, reject });
+              const stdin = this.#child?.stdin;
+              if (!stdin || stdin.destroyed) { reject(new Error("Codex runtime disconnected")); return; }
+              stdin.write(JSON.stringify({ id, method, params }) + "\n");
+            });
+          })(),
+          new Promise<never>((_, reject) => {
+            timer = setTimeout(() => reject(new Error("Codex runtime settings timed out")), 15_000);
+            timer.unref?.();
+          }),
+        ]);
+      } finally {
+        expired = true;
+        clearTimeout(timer);
+        if (id !== undefined) this.#diagnostics.delete(id);
+      }
+    };
+    const configResult = await request("config/read", { includeLayers: false, ...(cwd ? { cwd } : {}) });
+    const accountResult = await request("account/read", { refreshToken: false });
+    const config = asRecord(configResult["config"]);
+    const account = asRecord(accountResult["account"]);
+    let model = typeof config?.["model"] === "string" ? config["model"] : undefined;
+    let effort = typeof config?.["model_reasoning_effort"] === "string" ? config["model_reasoning_effort"] : undefined;
+    if (!model || !effort) {
+      const catalog = await request("model/list", {});
+      const models = Array.isArray(catalog["data"]) ? catalog["data"].map(asRecord) : [];
+      const selected = models.find((m) => model ? m?.["id"] === model || m?.["model"] === model : m?.["isDefault"] === true);
+      if (!model && typeof selected?.["model"] === "string") model = selected["model"];
+      if (!effort && typeof selected?.["defaultReasoningEffort"] === "string") effort = selected["defaultReasoningEffort"];
+    }
+    return {
+      model, effort,
+      account: typeof account?.["email"] === "string" ? account["email"] : null,
+    };
+  }
 
   #child: ChildProcess | undefined;
   /** WP-0: when the current child was spawned — for the idle-reap log line. */
@@ -227,6 +315,7 @@ export class CodexProcessPool implements AgentRunner {
 
   constructor(opts: CodexProcessPoolOptions = {}) {
     this.#codexBinPath = opts.codexBinPath;
+    this.#allowColdFallback = opts.allowColdFallback !== false;
     this.#botGitIdentity = opts.botGitIdentity;
     this.#gitlabToken = opts.gitlabToken;
     this.#larkCliConfigDir = opts.larkCliConfigDir;
@@ -458,6 +547,7 @@ export class CodexProcessPool implements AgentRunner {
    */
   #fallbackToCold(state: TurnState, causeErr: Error): void {
     if (state.settled || state.coldHandle) return;
+    if (!this.#allowColdFallback) { this.#settleReject(state, causeErr); return; }
 
     if (state.threadId != null) {
       // This turn already reached the wire — its system_init was already
@@ -636,6 +726,7 @@ export class CodexProcessPool implements AgentRunner {
     const env = buildCodexEnv(this.#botGitIdentity, this.#gitlabToken, this.#larkCliConfigDir);
     const child = spawnPiped(bin, args, { env });
     this.#child = child;
+    if (child.pid !== undefined) this.#unexitedChildren.add(child);
     this.#childSpawnedAt = Date.now();
     this.#pending.clear();
     this.#threadOwners.clear();
@@ -676,6 +767,7 @@ export class CodexProcessPool implements AgentRunner {
     // pid-file entry when it exits, regardless of whether the pool still
     // considers it "current" (a respawn may already have replaced it).
     child.once("exit", () => {
+      this.#unexitedChildren.delete(child);
       void this.#deletePidFileIfMine(child.pid);
       for (const cancelled of this.#cancelledThreads.values()) {
         if (cancelled.child === child) this.#releaseCancelledTurn(cancelled);
@@ -711,6 +803,9 @@ export class CodexProcessPool implements AgentRunner {
     }
     this.#child = undefined;
     this.#steering.disconnected();
+    this.#nativeActive.clear();
+    for (const request of this.#diagnostics.values()) request.reject(err);
+    this.#diagnostics.clear();
     this.#pending.clear();
     this.#loadedThreadIds.clear();
     this.#readyReject?.(err);
@@ -766,7 +861,7 @@ export class CodexProcessPool implements AgentRunner {
     const cadenceMs = Math.max(1_000, Math.min(Math.floor(this.#idleMs / 4), 60_000));
     this.#idleTimer = setInterval(() => {
       if (this.#shuttingDown) return;
-      if (this.#turns.size > 0 || this.#cancelledThreads.size > 0) return;
+      if (this.hasLiveWork) return;
       if (this.#idleSince == null) return;
       if (Date.now() - this.#idleSince >= this.#idleMs) {
         this.#reapIdleChild();
@@ -875,6 +970,13 @@ export class CodexProcessPool implements AgentRunner {
   }
 
   #handleResponse(id: number, record: JsonRecord, raw: unknown): void {
+    const diagnostic = this.#diagnostics.get(id);
+    if (diagnostic) {
+      this.#diagnostics.delete(id);
+      if (record["error"]) diagnostic.reject(new Error("Codex runtime settings request rejected"));
+      else diagnostic.resolve(asRecord(record["result"]) ?? {});
+      return;
+    }
     const pending = this.#pending.get(id);
     this.#pending.delete(id);
     if (pending == null) return;
@@ -906,6 +1008,8 @@ export class CodexProcessPool implements AgentRunner {
         }
         state.threadId = threadId;
         this.#loadedThreadIds.add(threadId);
+        this.#ownedSessionIds.add(threadId);
+        if (!this.#nativeParents.has(threadId)) this.#nativeParents.set(threadId, null);
         this.#threadOwners.set(threadId, state.turnKey);
         markPerfForEventType(state.markPerf, "system_init");
         state.queue.push({ type: "system_init", sessionId: threadId, raw });
@@ -961,8 +1065,47 @@ export class CodexProcessPool implements AgentRunner {
 
   #handleNotification(record: JsonRecord, raw: unknown): void {
     const params = asRecord(record["params"]);
+    if (record["method"] === "thread/started") {
+      const thread = asRecord(params?.["thread"]);
+      if (typeof thread?.["id"] === "string") {
+        const id = thread["id"];
+        this.#ownedSessionIds.add(id);
+        // Missing metadata on old runtimes remains unknown (conservative).
+        if (thread["parentThreadId"] === null || typeof thread["parentThreadId"] === "string") {
+          this.#nativeParents.set(id, thread["parentThreadId"]);
+        }
+        if (asRecord(thread["status"])?.["type"] === "active") this.#nativeActive.add(id);
+      }
+    }
     const threadId = typeof params?.["threadId"] === "string" ? params["threadId"] : undefined;
     if (threadId == null) return; // nothing to route it to — spike confirms turn-scoped events always carry threadId
+    if (record["method"] === "turn/started") this.#nativeActive.add(threadId);
+    if (record["method"] === "turn/completed" || record["method"] === "thread/closed") this.#nativeActive.delete(threadId);
+    if (record["method"] === "thread/status/changed") {
+      const status = asRecord(params?.["status"]);
+      if (status?.["type"] === "active") this.#nativeActive.add(threadId);
+      else this.#nativeActive.delete(threadId);
+    }
+    // Recent runtimes report child lifecycle on the parent's subscription,
+    // without necessarily subscribing this client to the child thread itself.
+    const item = asRecord(params?.["item"]);
+    if (item?.["type"] === "subAgentActivity" && typeof item["agentThreadId"] === "string") {
+      const childId = item["agentThreadId"];
+      this.#ownedSessionIds.add(childId);
+      this.#nativeParents.set(childId, threadId);
+      if (item["kind"] === "started" || item["kind"] === "interacted") this.#nativeActive.add(childId);
+      if (item["kind"] === "completed") this.#nativeActive.delete(childId);
+    }
+    if (item?.["type"] === "collabAgentToolCall") {
+      const states = asRecord(item["agentsStates"]);
+      for (const [childId, value] of Object.entries(states ?? {})) {
+        const status = asRecord(value)?.["status"];
+        this.#ownedSessionIds.add(childId);
+        if (!this.#nativeParents.has(childId)) this.#nativeParents.set(childId, threadId);
+        if (status === "running" || status === "pendingInit") this.#nativeActive.add(childId);
+        if (status === "completed" || status === "errored" || status === "shutdown") this.#nativeActive.delete(childId);
+      }
+    }
     const cancelled = this.#cancelledThreads.get(threadId);
     if (cancelled) {
       const turnId = asRecord(params?.["turn"])?.["id"];
