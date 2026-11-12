@@ -75,7 +75,12 @@ Use the CLI's existing local subscription login. The Claude runner strips
 `ANTHROPIC_API_KEY`; the Codex runner strips both `OPENAI_API_KEY` and
 `ANTHROPIC_API_KEY`. Do not reintroduce billing-key overrides or copy account
 credentials into configuration or test evidence.
-The one deliberate exception is the **pi** backend (`src/pi/runner.ts`): pi is
+Codex may also use an existing API-key login managed by its native CLI in
+`auth.json`. The bridge reads only a private in-memory fingerprint to detect
+changes; it never injects keys into argv/environment or exposes them in status.
+Native file-managed API-key logins support the same graceful generation drain
+as subscription logins. This does not enable environment-key overrides.
+The other deliberate exception is the **pi** backend (`src/pi/runner.ts`): pi is
 the bring-your-own-model runtime and has no subscription login — provider API
 keys (in `~/.pi/agent/models.json` or the provider's env var) *are* its auth,
 so the pi runner passes the bridge's environment through unchanged. It still

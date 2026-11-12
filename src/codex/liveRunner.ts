@@ -7,7 +7,7 @@ import { TurnEventQueue } from "../agent/turnEventQueue.js";
 import { CodexProcessPool, reapOrphanedWarmProcess, type CodexProcessPoolOptions } from "./pool.js";
 import type { CodexConfigSnapshot } from "./liveConfig.js";
 
-export type RuntimeSettings = { model?: string; effort?: string; account: string | null };
+export type RuntimeSettings = { model?: string; effort?: string; account: string | null; authMode?: "chatgpt" | "apiKey" | null };
 export interface LivePool extends AgentRunner {
   readonly childPid: number | undefined;
   readonly hasLiveWork: boolean;
@@ -27,7 +27,7 @@ export interface LiveCodexStatus {
   state: "not-started" | "ready" | "draining" | "error";
   /** Last verified admission, not a claim about a file edited afterwards. */
   next?: RuntimeSettings;
-  generations: Array<{ pid?: number; account: string | null; draining: boolean; active: boolean }>;
+  generations: Array<{ pid?: number; account: string | null; authMode?: "chatgpt" | "apiKey" | null; draining: boolean; active: boolean }>;
   activeTurns: Array<{ threadId?: string; model?: string; effort?: string; account: string | null }>;
   error?: string;
 }
@@ -60,7 +60,7 @@ export class LiveCodexRunner implements AgentRunner {
         [...this.#generations].some((g) => g !== this.#current) ? "draining" : "ready",
       next: this.#next,
       generations: [...this.#generations].map((g) => ({
-        pid: g.pool.childPid, account: g.settings?.account ?? null,
+        pid: g.pool.childPid, account: g.settings?.account ?? null, authMode: g.settings?.authMode,
         draining: g !== this.#current, active: g.reservations > 0 || g.pool.hasLiveWork,
       })),
       activeTurns: [...this.#active],
@@ -97,6 +97,9 @@ export class LiveCodexRunner implements AgentRunner {
       }
       const native = await generation.pool.runtimeSettings(cwd);
       const verifiedPid = generation.pool.childPid;
+      if (snapshot.authMode !== undefined && native.authMode !== snapshot.authMode) {
+        throw new Error("Codex process authentication mode differs from the selected login");
+      }
       if (snapshot.account !== null && native.account !== snapshot.account) {
         throw new Error("Codex process account differs from the selected subscription");
       }

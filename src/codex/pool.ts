@@ -226,7 +226,7 @@ export class CodexProcessPool implements AgentRunner {
   }
 
   /** Read only the effective settings and account from this actual process. */
-  async runtimeSettings(cwd?: string): Promise<{ model?: string; effort?: string; account: string | null }> {
+  async runtimeSettings(cwd?: string): Promise<{ model?: string; effort?: string; account: string | null; authMode: "chatgpt" | "apiKey" | null }> {
     this.prewarm();
     const request = async (method: string, params: JsonRecord): Promise<JsonRecord> => {
       let timer: ReturnType<typeof setTimeout> | undefined;
@@ -271,6 +271,7 @@ export class CodexProcessPool implements AgentRunner {
     }
     return {
       model, effort,
+      authMode: account?.["type"] === "apiKey" ? "apiKey" : account?.["type"] === "chatgpt" ? "chatgpt" : null,
       account: typeof account?.["email"] === "string" ? account["email"] : null,
     };
   }
