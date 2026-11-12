@@ -131,3 +131,27 @@ Codex 的话题补充通过 `turn/steer` 交给同 session 活跃轮次；无活
 ## Codex 在线运行配置
 
 常驻 Codex 的订阅账号、模型和 effort 支持在后续轮次生效，保留当前执行。模型/effort 每轮从 bot YAML 与原生配置解析；订阅变更采用新旧原生进程接力，状态记录实际进程账号。能力边界、首次部署要求与验证见 [在线配置](live-codex-config.md)。
+
+
+### Online Codex authentication and settings
+
+With `warmProcess: true`, changes to the bot YAML `model` and `effort` apply
+at the next turn admission, including continuations. Already running turns
+and native children keep their original process and settings. Enable pooling
+with a one-time idle service restart; `prewarmProcess: true` optionally verifies
+the runtime at startup without submitting a prompt.
+
+Both native ChatGPT subscription logins and existing file-managed API-key
+logins in Codex `auth.json` are supported. API-key or native `config.toml`
+changes create a fresh process for subsequent turns; older generations drain
+without replaying work. The bridge still strips environment billing-key
+overrides and never logs credentials or their fingerprints. Account inspection
+checks native authentication mode; for API keys it cannot prove provider-side
+key validity until an actual request succeeds. Invalid configuration blocks new
+admissions without canceling existing work. Provider revocation or expiry of
+old credentials can still cause provider errors in an existing task.
+
+Native provider settings remain owned by Codex. Other backend configurations,
+environment variables, and changes to bot identity or backend are not covered
+by this online update mechanism. Explicit YAML model/effort values take
+precedence over native defaults.

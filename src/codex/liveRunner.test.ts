@@ -58,6 +58,22 @@ describe("live Codex configuration", () => {
     f.pools[1]!.finish(); await next.done;
   });
 
+  it("rotates API credentials while retaining old turns and rejects a different native auth mode", async () => {
+    const f = fixture((p) => { p.settings.authMode = "apiKey"; });
+    f.set({ generation: "key-one", account: null, authMode: "apiKey" });
+    const a = f.runner.run({ prompt: "old" }); await tick();
+    f.set({ generation: "key-two", model: "next-model", effort: "medium" });
+    const b = f.runner.run({ prompt: "new" }); await tick();
+    expect(f.pools).toHaveLength(2);
+    expect(f.pools[0]!.shutdown).not.toHaveBeenCalled();
+    expect(f.pools[0]!.kill).not.toHaveBeenCalled();
+    expect(f.pools[1]!.calls[0]).toMatchObject({ model: "next-model", effort: "medium" });
+    f.pools[1]!.settings.authMode = "chatgpt";
+    await expect(f.runner.run({ prompt: "must not submit" }).done).rejects.toThrow("could not be verified");
+    expect(f.pools[1]!.calls).toHaveLength(1);
+    f.pools[0]!.finish(); f.pools[1]!.finish(); await Promise.all([a.done, b.done]);
+  });
+
   it("overrides old session settings each round and restores host defaults after removing yaml overrides", async () => {
     const f = fixture(); f.set({ model: "override", effort: "high" });
     const a = f.runner.run({ prompt: "first", model: "stale-boot-model" }); await tick();

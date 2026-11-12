@@ -1921,7 +1921,11 @@ describe("CodexProcessPool — prewarm (批D)", () => {
 });
 
 describe("Codex pool runtime inspection and drain safety", () => {
-  it("reads settings and account on its own connection without starting a turn", async () => {
+  it.each([
+    { account: { type: "chatgpt", email: "example@example.test" }, authMode: "chatgpt", email: "example@example.test" },
+    { account: { type: "apiKey" }, authMode: "apiKey", email: null },
+    { account: null, authMode: null, email: null },
+  ])("reads native auth $authMode and settings without starting a turn", async ({ account: nativeAccount, authMode, email }) => {
     const pool = new CodexProcessPool({});
     const settings = pool.runtimeSettings("/wt");
     const child = spawnedChildren[0]!;
@@ -1932,8 +1936,8 @@ describe("Codex pool runtime inspection and drain safety", () => {
     child.stdout.write(JSON.stringify({ id: config.id, result: { config: { model: "model-new", model_reasoning_effort: "high" } } }) + "\n"); await flush();
     const account = readOutboundRequests(child)[0]!;
     expect(account).toMatchObject({ method: "account/read", params: { refreshToken: false } });
-    child.stdout.write(JSON.stringify({ id: account.id, result: { account: { type: "chatgpt", email: "example@example.test" } } }) + "\n");
-    expect(await settings).toEqual({ model: "model-new", effort: "high", account: "example@example.test" });
+    child.stdout.write(JSON.stringify({ id: account.id, result: { account: nativeAccount } }) + "\n");
+    expect(await settings).toEqual({ model: "model-new", effort: "high", account: email, authMode });
     expect(readOutboundRequests(child)).toHaveLength(0);
     await pool.shutdown(0);
   });
