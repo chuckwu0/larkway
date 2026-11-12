@@ -1420,6 +1420,7 @@ interface BotStatusRow {
    * mismatch badge to avoid false positives on legacy files.
    */
   runningBackend: string | null;
+  codexRuntime?: import("../codex/liveRunner.js").LiveCodexStatus;
 }
 
 /**
@@ -1486,6 +1487,7 @@ const getStatus: ApiHandler = async (req) => {
         // null when status.json is absent OR was written by an older bridge (no
         // backend field) — UI suppresses mismatch badge in that case (no false positives).
         runningBackend: status?.backend ?? null,
+        ...(status?.codexRuntime ? { codexRuntime: status.codexRuntime } : {}),
       };
     }),
   );

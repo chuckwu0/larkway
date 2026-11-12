@@ -408,6 +408,7 @@ const state = {
    * @type {Record<string, string|null>}
    */
   runningBackends: {},
+  codexRuntimes: {},
   /** 最近事件面板筛选状态,按 bot id 索引。 */
   eventFilters: {},
   /** 最近事件面板是否展开全部,按 bot id 索引。 */
@@ -1534,6 +1535,22 @@ function backendMismatchBadgeHTML(runningBackend, configuredBackend, size = "sm"
 }
 
 /** 取某个 bot 的 liveness key(serving/degraded/offline/unknown)。 */
+function codexRuntimeHTML(id) {
+  const runtime = state.codexRuntimes?.[id];
+  if (!runtime) return "";
+  if (state.liveness?.[id] === "offline") return `<p class="ac-layer-role">运行信息已过期，不能确认当前账号。</p>`;
+  const next = runtime.next;
+  const heading = runtime.state === "error" ? "新配置尚未验证，已有任务继续运行" :
+    runtime.state === "draining" ? "新账号已接单，旧账号任务仍在收尾" :
+    runtime.state === "ready" ? "在线更新已启用" : "等待首次运行校验";
+  const checked = next ? `<p>最近请求配置：${esc(next.account || "账号未知")} · ${esc(next.model || "默认模型")} · ${esc(next.effort || "默认强度")}</p>` : "";
+  const active = Array.isArray(runtime.activeTurns) ? runtime.activeTurns : [];
+  const rows = active.map((turn) => `<li>${esc(turn.account || "账号未知")} · ${esc(turn.model || "默认模型")} · ${esc(turn.effort || "默认强度")}</li>`).join("");
+  return `<div class="ac-layer-role"><strong>${heading}</strong>${checked}` +
+    `<p>当前执行 ${active.length} 轮；保存后，后续轮次会重新读取配置。</p>` +
+    (rows ? `<ul>${rows}</ul>` : "") + `</div>`;
+}
+
 function botLiveness(id) {
   if (!state.livenessKnown) return "unknown";
   return state.liveness[id] ?? "offline";
@@ -1996,6 +2013,7 @@ function renderStatus(status) {
   const map = {};
   const seenMap = {};
   const runningBkMap = {};
+  const codexMap = {};
   let servingCount = 0;
   for (const b of Array.isArray(status.bots) ? status.bots : []) {
     if (b && typeof b.id === "string") {
@@ -2005,11 +2023,15 @@ function renderStatus(status) {
       if (b.avatar) state.avatars[b.id] = b.avatar;
       // BL-17: runningBackend — null means unknown (old bridge / no status.json)
       runningBkMap[b.id] = typeof b.runningBackend === "string" ? b.runningBackend : null;
+      if (b.codexRuntime) codexMap[b.id] = b.codexRuntime;
     }
   }
   state.liveness = map;
   state.lastSeenMs = seenMap;
   state.runningBackends = runningBkMap;
+  state.codexRuntimes = codexMap;
+  const runtimeSlot = document.getElementById("codex-runtime-state");
+  if (runtimeSlot) runtimeSlot.innerHTML = codexRuntimeHTML(state.selected);
   state.livenessKnown = true;
 
   // 存 pendingRestart(新增/已删 bot 待重启生效),驱动顶栏 amber 提示。
@@ -3949,10 +3971,11 @@ function buildDetailHTML(id, bot, memContent) {
     `<div class="ac-layer-head"><span class="ac-index">一</span>` +
     `<div class="ac-layer-meta"><div class="ac-layer-title-row">` +
     `<h3 class="ac-layer-title">用哪个底座驱动它</h3></div>` +
-    `<p class="ac-layer-role">决定它拿哪家模型思考与干活。默认 Codex；改动保存后要重启服务才生效。</p></div></div>` +
+    `<p class="ac-layer-role">决定它拿哪家模型思考与干活。默认 Codex；更换底座需要重启。常驻 Codex 的模型与推理强度在下一轮生效，当前执行不变。</p></div></div>` +
     `<div class="ac-layer-body">` +
     lkBackendSelectHTML(_configuredBk4, `bk-edit-${id}`) +
     buildModelEffortHTML(bot) +
+    `<div id="codex-runtime-state">${codexRuntimeHTML(id)}</div>` +
     `<div id="bk2-pending-slot">${pendingBar}</div>` +
     `</div></section>`;
 
