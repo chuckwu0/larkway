@@ -88,7 +88,8 @@
 | v0.3.81 | v0.3.81 | patch / 已发布 | clean reply cards, collapse earlier replies, and reduce status noise |
 | v0.3.82 | v0.3.82 | patch / 已发布 | configure per-bot concurrent turn slots; retain focused replies and collapsed earlier messages |
 | v0.3.83 | v0.3.83 | patch / 已发布 | Keep task progress stable; answer live follow-ups and important supplements in ordinary messages |
-| v0.3.84 | v0.3.84 | 当前 patch / 已发布 | apply Codex subscription, model and effort changes without interrupting active turns |
+| v0.3.84 | v0.3.84 | patch / 已发布 | apply Codex subscription, model and effort changes without interrupting active turns |
+| v0.3.85 | v0.3.85 | 当前 patch / 已发布 | support native API-key logins with live Codex configuration and graceful process rotation |
 
 ## 使用原则
 
@@ -184,4 +185,5 @@ v0.3.81       = clean reply cards, collapse earlier replies, and reduce status n
 v0.3.82       = configure per-bot concurrent turn slots; retain focused replies and collapsed earlier messages
 v0.3.83       = Keep task progress stable; answer live follow-ups and important supplements in ordinary messages
 v0.3.84       = apply Codex subscription, model and effort changes without interrupting active turns
+v0.3.85       = support native API-key logins with live Codex configuration and graceful process rotation
 ```
