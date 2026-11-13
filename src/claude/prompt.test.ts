@@ -82,10 +82,9 @@ describe("native prompt budget and optional work", () => {
 
   it.each([true, false])("keeps task count informational even after multiple turns (first turn: %s)", async (isNewThread) => {
     const prompt = await renderPrompt(makeInput({ isNewThread, threadTurnCount: 3, threadHasTaskCard: false }));
-    // Both facts ride every turn; self-built task cards read them.
-    expect(prompt).toContain("thread_turn_count:   3");
-    expect(prompt).toContain("thread_has_task_card: no");
-    if (isNewThread) expect(prompt).toContain("轮数不构成建卡要求");
+    expect(prompt).not.toContain("thread_turn_count:");
+    expect(prompt).not.toContain("thread_has_task_card:");
+    expect(prompt).not.toContain("task_handle:");
     expect(prompt).not.toMatch(/跨轮.*建|≥ 2|拿不准.*建/);
   });
 
@@ -128,7 +127,7 @@ describe("answer and optional card transport", () => {
   });
 
   it("documents rich output without requiring a state write for plain replies", async () => {
-    const prompt = await renderPrompt(makeInput());
+    const prompt = await renderPrompt(makeInput({ taskHandleTasklistGuid: "list_one" }));
     const contract = between(prompt, "state-contract");
     for (const capability of ["status", "last_message", "error", "updated_at", "choices", "content_blocks", "handoffs", "task_handle"]) {
       expect(contract).toContain(capability);
@@ -146,6 +145,27 @@ describe("answer and optional card transport", () => {
     const input = makeInput();
     delete input.conventions.stateFilePath;
     expect(await renderPrompt(input)).toContain(STATE);
+  });
+});
+
+describe("thin channel boundaries", () => {
+  it("does not inject workflow policy even when old count/turn-taking inputs exist", async () => {
+    const prompt = await renderPrompt(makeInput({ threadTurnCount: 99, threadHasTaskCard: false, turn_taking_limit: 10 }));
+    expect(prompt).not.toMatch(/thread_turn_count|thread_has_task_card|turn-taking|task_handle:/);
+    expect(prompt).toContain("需要单独回复运行中追加输入时，可用");
+    expect(prompt).not.toContain("收到运行中追加输入时，以");
+  });
+  it("does not infer a self mention from channel arrival", async () => {
+    const prompt = await renderPrompt(makeInput({ parsed: makeParsed({ raw: { chat_type: "group", mentions: [{ name: "Colleague", id: { open_id: "ou_test_colleague" } }] } as unknown as ParsedMessage["raw"] }) }));
+    expect(prompt).toContain("mentioned_others: Colleague (ou_test_colleague)");
+    expect(prompt).toContain("trigger_type:     top_level_message");
+    expect(prompt).not.toContain("group_mention_opens_topic");
+  });
+  it("a task share without an existing integration is only a resource pointer", async () => {
+    const prompt = await renderPrompt(makeInput({ taskRoot: { guid: "task_test", summary: "Shared task", claimed: false } }));
+    expect(prompt).toContain("task_guid: task_test");
+    expect(prompt).not.toContain("task_handle:");
+    expect(prompt).not.toContain("任务分享入口采用评论模式");
   });
 });
 
@@ -274,7 +294,7 @@ describe("optional collaboration and task facts", () => {
     const prompt = await renderPrompt(makeInput({ peers, turn_taking_limit: 8 }));
     expect(prompt).toContain("Reviewer (open_id: ou_peer): Reviews code");
     expect(prompt).toContain("真实post+at标签");
-    expect(prompt).toContain("configured_turn_taking_limit: 8");
+    expect(prompt).not.toContain("configured_turn_taking_limit:");
     expect(prompt).not.toMatch(/必须.*ack|先.*ack|deadline.*15|台账记录/);
   });
 
@@ -529,7 +549,7 @@ describe("mentions and quotes the parsed text drops", () => {
   });
 
   it("says nothing extra when the bot is the only one @-mentioned", async () => {
-    for (const botOpenId of ["ou_test_bot", undefined]) {
+    for (const botOpenId of ["ou_test_bot"]) {
       const facts = between(await resumed({ parsed: withRaw({ mentions: [bot] }), botOpenId }), "thread-context");
       expect(facts).not.toContain("mentioned_others");
       expect(facts).not.toContain("raw_pointer");

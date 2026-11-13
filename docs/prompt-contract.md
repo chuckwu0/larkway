@@ -17,7 +17,7 @@ Larkway 传递飞书触发事实、可选资源指针和最小输出协议。任
 | `state-contract` | 输出通道和可选卡片字段概要 | 完整 prompt |
 | `contract-anchor` | 一行：答案 marker 提示（Codex 省略）及 state 路径（卡片、任务、交接声明都写在这里） | delta 续轮 |
 | `agent-workspace` / `workspace` | workspace/session/repo/知识库位置 | 完整 prompt |
-| `peer-bots` / `turn-taking` | peer 名册、配置的协作参数 | 完整 prompt，且有配置 |
+| `peer-bots` | peer 名册与交接接口 | 完整 prompt，且有配置；不注入 turn-taking 工作流参数 |
 | `workspace-file-changes` | 工作区文件变化事实 | 有变化时，包括 delta |
 | `task-root` / `task-handle` | 任务分享入口或关联/候选任务事实 | 有相关任务时，包括 delta（清单 guid 行照带；候选只带 guid、summary、话题 id；指向本话题的候选另带描述） |
 | `session-reseed` | 明确重开会话的原因、摘要和转录摘录、完整转录路径 | 显式恢复时 |
@@ -38,14 +38,16 @@ Larkway 传递飞书触发事实、可选资源指针和最小输出协议。任
 - `raw_pointer`：读取当前原始消息的命令。
 - `mentioned_others`：消息里本 bot 以外被 @ 的人（`姓名 (open_id)`，不含 @所有人）；`quoted_message`：话题内引用回复某条消息（被引用的不是话题首楼）时，读取被引用消息的命令。解析文本会去掉所有 @，引用回复的正文也不含被引用内容，这两行是唯一线索；有值时首轮和续轮都给。
 - `attachments`、`images`、`feishu_doc_links`：资源指针。
-- 可选 `thread_turn_count`、`thread_has_task_card`：观察事实，不触发建卡规则。
+- 不注入 `thread_turn_count`、`thread_has_task_card` 或 `turn_taking_limit`；这些不属于当前消息必要事实。
 
 delta 续轮的 `thread-context` 只列会变化的事实，会话常量已在原生历史中：
 
-- 每轮：`message_id`、`chat_id`，以及 `thread_turn_count`、`thread_has_task_card`（如有）。`chat_id` 在原生压缩后仍是回帖和取历史的锚点。
+- 每轮：`message_id`、`chat_id`。`chat_id` 在原生压缩后仍是回帖和取历史的锚点。
 - 有值时：真实 `omt_` 话题的 `feishu_thread_id`；bot 使用宿主共享 lark-cli 配置（`lark_cli_isolated: false`）时的 `lark_cli_profile`（共享配置里靠 profile 选定本 bot 身份，原生压缩后首轮指针可能不在上下文中；独立配置目录只有本 bot 的 profile，不重复）；配置了 owner 时的 `sender_is_owner`；非空的 `attachments`、`images`、`feishu_doc_links`；`mentioned_others`、`quoted_message`；原始消息含解析文本之外的内容时附 `raw_pointer`（有附件、正文里有资源标记如 `![image]` 后接资源地址 / `<file key=…/>`、没有可读文本，或有上述 @ / 引用）。
 - 偏离常态时：`trigger_type`（常态为 `topic_continuation`）、`mention_type`（`bot_or_user_mention` 与 `no_mention_metadata` 都算常态：是否带 mention 元数据取决于送达路径，不反映用户行为）。
 - 只在完整 prompt 出现：`thread_id`、`session_key`、`is_new_thread`、`scene_type`、`chat_type`、`feishu_root_id`。
+
+无法确认 bot 自身 open_id 时，保留全部实际 mention，不把唯一 mention 猜成 bot 自己。`top_level_message` / `group_message_opens_topic` 描述入口，不声称用户实际 @。
 
 所有命令只是可选指针。当前用户消息和原生会话历史足够时，可以直接回答，不要求任何工具调用。
 
@@ -95,7 +97,7 @@ Codex 使用原生 `final_answer` 通道：已知 final phase 的消息直接流
 | `card_progress` | 可选 `{message_id,text}`，当前主卡的简短进展，文本最多 2,000 字符；不改变业务状态 |
 | `response_surface.post.mentions` | `{user_id}` 数组，仅用于视觉 @ |
 | `handoffs` | 最多 3 个 `{to,text}`；bridge 发带真实 at 标签的 post 并直递本地 peer，`text` 自包含 |
-| `task_handle` | 按需声明 `{create:{summary,due?}}`、`guid`、`note`、`due`/`due_reason`、`blocked`、`done`；不因聊天轮数自动要求使用 |
+| `task_handle` | 仅已配置清单或已有任务关联时，在契约中介绍兼容接口；按需声明 `{create:{summary,due?}}`、`guid`、`note`、`due`/`due_reason`、`blocked`、`done`；不因聊天轮数自动要求使用 |
 
 tasklist 候选行形如 `guid=… | summary=… | thread=omt_…`：`thread` 由 bridge 从描述里的 applink 机械提取（被摘录截断的 id 不提取；描述指向多个话题时不给出），是与本话题 `feishu_thread_id` 精确对照的信号；URL 本身不注入。完整 prompt 另附去掉 URL 的描述摘录。清单 guid 行 `task_handle_tasklist_guid` 与块同条件出现（有候选或已认领），首轮和续轮都带：认领只需要任务 guid，这一行是为已安装的旧版 task-handle skill 保留的块识别标志。delta 续轮的描述摘录只留给 `thread` 等于本话题 `feishu_thread_id` 的候选：候选随轮询变化，续轮才出现的候选此前没有注入过描述，而指向本话题的那一条正是认领会作用的对象，描述里的「由 X 创建」是区分同话题其他 bot 自建任务的依据（摘录的 200 字符上限只计链接以外的文字，链接保持完整、渲染时再去掉，所以 bridge 自建任务在长链接之后的这一行能看到）。已知取舍：续轮才出现、描述里没有话题链接的候选只带 guid 和 summary，agent 只能按 summary 判断。
 
@@ -109,7 +111,7 @@ bridge 发本轮终卡的同时发出 `handoffs` 镜像 post：另一个 bridge 
 
 主任务卡只显示显式 `card_progress:{message_id,text}`；`message_id` 必须是该活跃主卡的触发消息，摘要在实质变化时原子更新。普通 commentary 不自动展示，也不折叠或分段补发。
 
-运行中追加输入带 `task_card_message_id`（主卡触发 ID）及 `ordinary_reply`（以当前输入为目标的 lark-cli bot 回复命令指针）。追问答复、主动重要补充和需要真实 @ 人的沟通由 Agent 使用原生工具发新普通消息；该指针不由 bridge 执行，不改变 Agent 权限或既有任务工作流。最终答案仍用于主任务的交付结论。
+运行中追加输入带 `task_card_message_id`（主卡触发 ID）及 `ordinary_reply`（以当前输入为目标的 lark-cli bot 回复命令指针）。是否需要单独回应由 Agent 判断；需要时，追问答复、主动重要补充和需要真实 @ 人的沟通可由 Agent 使用原生工具发新普通消息；该指针不由 bridge 执行，不改变 Agent 权限或既有任务工作流。最终答案仍用于主任务的交付结论。
 
 已有 native session 的输出契约版本变更时，仅补发一次完整 `state-contract`，不重复 workspace/peer 指针、不重开原生会话；版本随 session 记录保存。稳定续轮仍只发短 anchor。
 
@@ -120,3 +122,9 @@ bridge 发本轮终卡的同时发出 `handoffs` 镜像 post：另一个 bridge 
 renderer 为纯函数式转换：不读文件、不取飞书历史、不调用模型。行为测试约束最小 agent-workspace 问答：完整 prompt 少于 2,600 字符，delta 少于 410 字符。该预算不包含用户额外材料、peer 名册、repo 指针和知识地图。另有生产形态固定场景（3 个 peer、repo、4 条带 applink 描述的候选、已配置 owner，另含 sticky 单聊变体）按 backend 约束包装码点数（总长减去用户原文）：无候选 delta 不超过 550（Codex 532），每条候选行 delta 不超过 121、完整不超过 140。这些是字符预算，不冒充 tokenizer 统计或耗时测量。
 
 新增 prompt 内容前先检查：它是必需通道协议、当前触发事实，还是 Agent 可以按任务自行决定的流程？后者应放在工作区指南或 skill，避免所有任务持续支付无关提示和工具成本。
+
+## 契约 v3 的迁移边界
+
+任务分享仅提供来源事实，不在 Agent 启动前自动认领，不附带任务关闭/评论流程。显式 state 声明、既有任务关联与输出 API 保留；原有自动认领行为不再作为新输入的默认。其他已启用的历史任务扩展不在本次重构范围内，不能据此声称已移除全部任务子系统。
+
+契约升级只在下一次正常输入时重发输出协议，不启动新 turn、不更换 native session、不主动通知运行中的 Agent 重读规则。旧运行上下文中的指令不会被后台擦除。既有用户角色里要求通知或验收的规则仍由该角色管理。
