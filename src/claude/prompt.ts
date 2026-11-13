@@ -174,12 +174,14 @@ function renderStateContract(input: RenderPromptInput, full: boolean): string[] 
     answerContract(backend),
     "面向用户直接回答或说明实质进展；不要播报例行工具/技能调用或内部轮次状态。需要用户行动时说明原因和下一步。",
     "主卡展示当前进展与交付结论。进展写card_progress:{message_id:主卡触发message_id,text:摘要}，仅实质变化时更新。普通commentary不展示，不提供过程历史。",
-    "收到运行中追加输入时，以lark-cli的bot身份发新普通消息回复该message_id。主动重要补充、需要@人时也可发普通消息；带 --reply-in-thread 和稳定 --idempotency-key，真实@用at标签；不把这些答复重复写进主卡。发送不确定先核对，不换键盲发。",
+    "需要单独回复运行中追加输入时，可用lark-cli的bot身份发新普通消息回复该message_id。主动重要补充、需要@人时也可发普通消息；带 --reply-in-thread 和稳定 --idempotency-key，真实@用at标签；不把这些答复重复写进主卡。发送不确定先核对，不换键盲发。",
     `纯文字回答不用写 state.json。需要结构化卡片时可写 ${target}。`,
     "state.json: {status:\"ready\"|\"in_progress\"|\"failed\", last_message?:正文, error?:错误, updated_at?:当前ISO时间};原子替换,显式时间勿沿用旧值。status 描述任务结果,单次工具错误不等于任务失败。",
     "可选字段: choices:[{label,value}](最多5个,单选按钮,value逐字回传;多项信息可直接文字提问),choice_prompt;content_blocks:[{type:\"markdown\",content}|{type:\"image\",img_key,alt?}](最多12块/4图,非空时覆盖正文,img_key须已上传)。",
     "可选交互: response_surface:{post:{mentions:[{user_id}]}} 仅视觉@;handoffs:[{to,text}](最多3条,to为peer名,text自包含)由bridge发真实post并直递本地peer。",
-    "可选任务投影: task_handle:{create?:{summary,due?},guid?,note?,due?,due_reason?,blocked?,done?};只在任务需要追踪时声明,轮数不构成建卡要求。done 表示交付,非本轮结束。",
+    ...(input.taskHandleTasklistGuid || input.taskHandleClaimed || input.taskRoot?.claimed ? [
+      "兼容任务投影: task_handle:{create?:{summary,due?},guid?,note?,due?,due_reason?,blocked?,done?};仅显式使用既有任务投影时声明。done 表示交付,非本轮结束。",
+    ] : []),
     "bridge 管理卡片更新,不要自行 PATCH/PUT。业务链接直接放正文;无需固定格式、任务卡或文档导出。",
   ]);
 }
@@ -252,7 +254,6 @@ function renderTaskContext(input: RenderPromptInput, full: boolean, topicId: str
       ...(root.topicLink ? [`topic_link: ${root.topicLink}`] : []),
       `task_root_claimed: ${root.claimed ? "yes" : "no"}`,
       ...(root.justClaimed ? ["task_root_just_claimed: yes"] : []),
-      "任务分享入口采用评论模式;完成由用户在任务中心确认。需要认领/交付投影时可用 task_handle.guid / done,沟通可用任务评论;不要求额外认领评论。",
     ]);
   }
   if (!input.taskHandleTasklistGuid) return [];
@@ -336,7 +337,7 @@ function renderMentioned(person: { name?: string; openId?: string }): string {
 
 function sceneFacts(parsed: ParsedMessage, isNewThread: boolean): string {
   if (parsed.raw.chat_type === "p2p") return "p2p_direct_message";
-  return !parsed.raw.root_id && isNewThread ? "group_mention_opens_topic" : "topic_continuation";
+  return !parsed.raw.root_id && isNewThread ? "group_message_opens_topic" : "topic_continuation";
 }
 
 /** Native history carries static context; continuation turns need only fresh facts. */
@@ -357,10 +358,7 @@ export async function renderPrompt(input: RenderPromptInput): Promise<string> {
     ...(others.length > 0 ? [`mentioned_others: ${others.map(renderMentioned).join(", ")}`] : []),
     ...(quoted ? [`quoted_message:   lark-cli api GET /open-apis/im/v1/messages/${quoted}${profile} --as bot`] : []),
   ];
-  const threadFacts = input.threadTurnCount !== undefined ? [
-    `thread_turn_count:   ${input.threadTurnCount}`,
-    `thread_has_task_card: ${input.threadHasTaskCard ? "yes" : "no"}`,
-  ] : [];
+
   // The sender is the `ou_…:` prefix of every user-message line, never a separate fact.
   const facts = full ? [
     `thread_id:        ${parsed.threadId}`,
@@ -380,7 +378,6 @@ export async function renderPrompt(input: RenderPromptInput): Promise<string> {
     `attachments:      ${csv(attachments)}`,
     `feishu_doc_links: ${csv(parsed.feishuDocLinks)}`,
     `images:           ${csv(images)}`,
-    ...threadFacts,
   ] : [
     // Delta: session constants already sit in native history, so only this
     // message's facts and deviations from an ordinary continuation. chat_id
@@ -399,7 +396,6 @@ export async function renderPrompt(input: RenderPromptInput): Promise<string> {
     ...(attachments.length > 0 ? [`attachments:      ${csv(attachments)}`] : []),
     ...(parsed.feishuDocLinks.length > 0 ? [`feishu_doc_links: ${csv(parsed.feishuDocLinks)}`] : []),
     ...(images.length > 0 ? [`images:           ${csv(images)}`] : []),
-    ...threadFacts,
   ];
   const pointers = [
     "以下上下文按需获取;当前消息足够时可直接回答。",
@@ -441,9 +437,6 @@ export async function renderPrompt(input: RenderPromptInput): Promise<string> {
     ...(full ? [block("context-pointers", pointers)] : []),
     renderStateContract(input, full),
     ...(full ? [renderWorkspace(input), renderPeers(input.peers)] : []),
-    ...(full && input.turn_taking_limit && input.turn_taking_limit > 0 ? [
-      block("turn-taking", [`configured_turn_taking_limit: ${input.turn_taking_limit} (工作区协作策略参数)`]),
-    ] : []),
     block("workspace-file-changes", input.mtimeFacts ?? []),
     renderTaskContext(input, full, trigger.feishuThreadId),
     renderReseed(input.sessionReseed),

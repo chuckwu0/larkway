@@ -28,6 +28,8 @@ describe("input delivery journal", () => {
     expect(prompt).toContain("--message-id 'input'");
     expect(prompt).toContain("task_card_message_id: original-task");
     expect(prompt).toContain("不把追问答复写入主任务卡");
+    expect(prompt).toContain("是否需要单独回应这条输入由你判断");
+    expect(prompt).not.toContain("请用新的普通消息回应");
     expect(prompt).toContain("message_id: input");
   });
 });

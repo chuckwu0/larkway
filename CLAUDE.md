@@ -61,6 +61,12 @@ Things Larkway must NOT do:
   protocol and documented answer channels for presentation
 - Make multi-step workflow decisions
 
+For prompt or input-adapter changes, follow the hard context boundaries in
+[principles.md](docs/principles.md): facts and optional pointers only; no mandatory
+history reads, extra replies, task claims, or bridge-managed context compression.
+Cover first-turn, continuation, steering, unknown mention identity, and explicit
+legacy task declarations in regression tests.
+
 **2. Reuse CLIs, not SDKs — with one deliberate exception.**
 Spawn `lark-cli`, `claude`, `codex`, `glab`, `git` as child processes rather
 than importing their SDK packages. This keeps deps minimal and avoids auth

@@ -6625,14 +6625,14 @@ describe("handleOne — v4 task-share root probe", () => {
     expect(runOpts?.prompt ?? "").toContain("task_root_claimed: no");
   });
 
-  it("v4.2 auto-claim: the bridge claims (mode=comment) BEFORE the agent runs; prompt says justClaimed", async () => {
+  it("task recognition supplies facts without claiming before the agent runs", async () => {
     let runOpts: { prompt?: string } | undefined;
     const claimCalls: Array<Record<string, unknown>> = [];
     let claimed = false;
     runClaudeImpl = (opts: unknown) => {
       runOpts = opts as { prompt?: string };
-      // the claim must ALREADY be recorded when the runner spawns
-      expect(claimCalls.length).toBe(1);
+      // Recognition alone must not mutate task ownership.
+      expect(claimCalls.length).toBe(0);
       return {
         events: (async function* () {
           yield { type: "system_init", sessionId: "sess_ac", raw: {} };
@@ -6666,10 +6666,9 @@ describe("handleOne — v4 task-share root probe", () => {
     await handler.run();
     await whenFinalized;
 
-    expect(claimCalls.length).toBe(1);
-    expect(claimCalls[0]).toMatchObject({ taskGuid: "g-42", threadId: "om_root", mode: "comment" });
-    expect(runOpts?.prompt ?? "").toContain("task_root_claimed: yes");
-    expect(runOpts?.prompt ?? "").toContain("task_root_just_claimed: yes");
+    expect(claimCalls.length).toBe(0);
+    expect(runOpts?.prompt ?? "").toContain("task_root_claimed: no");
+    expect(runOpts?.prompt ?? "").not.toContain("task_root_just_claimed: yes");
   });
 
   it("in-thread turn carries the topic deep link built from the event's own thread_id (not the probe cache)", async () => {
@@ -7607,7 +7606,7 @@ describe("native session continuity defaults", () => {
     expect(captured[0]?.prompt).toContain("card_progress");
     expect(captured[0]?.prompt).not.toContain("<agent-workspace>");
     expect(captured[0]?.prompt).not.toContain("<session-reseed>");
-    expect(sessionStore.records.get("wsbot:om_msg")?.communicationContractVersion).toBe(2);
+    expect(sessionStore.records.get("wsbot:om_msg")?.communicationContractVersion).toBe(3);
   });
 
   it.each([
@@ -7617,7 +7616,7 @@ describe("native session continuity defaults", () => {
   ])("preserves long native history without opt-in reseeding (%j)", async (volume) => {
     const sessionStore = makePersistentSessionStore();
     const { workspacePath } = workspacePaths();
-    seedWsRecord(sessionStore, { ...volume, workspacePath, backend: "codex", communicationContractVersion: 2 });
+    seedWsRecord(sessionStore, { ...volume, workspacePath, backend: "codex", communicationContractVersion: 3 });
     const captured = captureWorkspaceRunner("sess_prev");
     const h = makeWorkspaceHandler({ store: sessionStore.store });
     await h.handler.run();

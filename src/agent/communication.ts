@@ -1,4 +1,4 @@
-export const COMMUNICATION_CONTRACT_VERSION = 2;
+export const COMMUNICATION_CONTRACT_VERSION = 3;
 
 function shellWord(value: string): string {
   return "'" + value.replace(/'/g, "'\\''") + "'";

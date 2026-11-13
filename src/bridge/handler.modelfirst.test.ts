@@ -1149,7 +1149,7 @@ describe("WP-10: what a model-first runner does not wait for", () => {
       expect(claims).toEqual([]);
     });
 
-    it("an answer inside the budget renders <task-root> and auto-claims, as before", async () => {
+    it("an answer inside the budget renders task facts without auto-claiming", async () => {
       const log: string[] = [];
       const claims: TaskHandleClaimPatch[] = [];
       const { captured } = registerScript([{}], log);
@@ -1168,7 +1168,7 @@ describe("WP-10: what a model-first runner does not wait for", () => {
       await runAll(handler);
       expect(captured[0]?.prompt).toContain("task-root");
       expect(captured[0]?.prompt).toContain("guid_test_task");
-      expect(claims.map((c) => c.taskGuid)).toEqual(["guid_test_task"]);
+      expect(claims).toEqual([]);
     });
   });
 });

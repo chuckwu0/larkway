@@ -1,7 +1,7 @@
 import type { ParsedMessage } from "../lark/message.js";
 
 export interface TriggerFacts {
-  triggerType: "top_level_mention" | "topic_continuation" | "card_action";
+  triggerType: "top_level_message" | "topic_continuation" | "card_action";
   mentionType: "bot_or_user_mention" | "all_mention" | "card_choice" | "no_mention_metadata";
   chatType: string;
   feishuThreadId?: string;
@@ -61,9 +61,8 @@ function mentionOpenId(record: Record<string, unknown>): string | undefined {
  * path's `<at>` markup and the replayed `@_user_N` placeholders alike), so
  * without this "你和 @同事 对一下" reaches the agent as "你和 对一下".
  * Excludes this bot (its own open_id) and @all (`mention_type` states that).
- * Without a known own open_id, a lone mention is taken to be this bot — a
- * group message reaches a bot only when it @-mentions it — and two or more
- * are all listed, this bot included.
+ * Without a known own open_id, retain every observed mention. Delivery
+ * through this channel is not evidence that a particular mention is this bot.
  */
 export function mentionedOthers(parsed: ParsedMessage, selfOpenId?: string): MentionedOther[] {
   const mentions = (parsed.raw as Record<string, unknown>)["mentions"];
@@ -77,7 +76,7 @@ export function mentionedOthers(parsed: ParsedMessage, selfOpenId?: string): Men
     return name || openId ? [{ ...(name ? { name } : {}), ...(openId ? { openId } : {}) }] : [];
   });
   if (selfOpenId) return people.filter((person) => person.openId !== selfOpenId);
-  return people.length > 1 ? people : [];
+  return people;
 }
 
 /**
@@ -119,7 +118,7 @@ export function deriveTriggerFacts(
       ? "card_action"
       : feishuRootId || !isNewThread
         ? "topic_continuation"
-        : "top_level_mention";
+        : "top_level_message";
   const profileFlag = larkCliProfile ? ` --profile ${larkCliProfile}` : "";
 
   return {

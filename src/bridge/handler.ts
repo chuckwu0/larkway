@@ -1990,50 +1990,10 @@ export class BridgeHandler {
     // already includes parent_id, so the rekeyed turn stays serialized.
     let taskRootInfo: { guid: string; summary: string; topicLink?: string } | undefined;
     let taskCardAnchorId: string | undefined;
-    // v4.2: true when the bridge auto-claim below CREATED the claim this very
-    // turn — drives the prompt's "post the claim comment now" instruction.
-    let taskRootJustClaimed = false;
     let deferredTaskRootProbe: Promise<import("../lark/messageLookupClient.js").MessageInfo | undefined> | undefined;
-    // v4.2 bridge auto-claim (docs/task-handle.md §15.3 修订): the main-path
-    // binding is mechanically CERTAIN once the probe matches the task card,
-    // so the bridge claims here — BEFORE the agent runs. Previously the claim
-    // waited for the agent's state.json declaration, so a crashed first turn
-    // left the task invisible to stall patrol forever (the completion-rate
-    // goal's biggest blind spot). Deterministic match = mechanical action —
-    // same charter as the v3 exact-match auto-bind, not a judgment call.
-    // Best-effort: a rejected claim (guid already claimed by another thread)
-    // is logged by the hook and simply leaves justClaimed false.
-    const autoClaimTaskRoot = async (guid: string): Promise<void> => {
-      if (!this.deps.taskHandleClaim || !botId) return;
-      const alreadyThis = this.deps.taskHandleClaimGuidLookup?.(threadId) === guid;
-      if (alreadyThis) return;
-      // Round-2 blocker fix: another bot in this process already owns the
-      // claim (standard A→B handoff — B is @-ed INSIDE the task topic).
-      // B must not double-claim; the <task-root> fallback branch tells it to
-      // cooperate without claiming.
-      if (this.deps.taskGuidClaimedByOtherBot?.(guid)) return;
-      try {
-        await this.deps.taskHandleClaim({
-          botId,
-          threadId,
-          chatId: parsed.chatId,
-          taskGuid: guid,
-          mode: "comment",
-          // Round-2 fix: the mechanical auto-claim must never REPLACE an
-          // existing different-guid claim on this thread (same charter as the
-          // v3 auto-bind guard) — only the agent's own re-declaration may.
-          onlyIfThreadUnclaimed: true,
-          // Round-2 fix: persist "claim comment still owed" so a first-turn
-          // crash after the claim doesn't lose the task→topic backlink.
-          claimCommentPending: true,
-        });
-        taskRootJustClaimed = this.deps.taskHandleClaimGuidLookup
-          ? this.deps.taskHandleClaimGuidLookup(threadId) === guid
-          : true;
-      } catch (err) {
-        console.warn("[bridge.handler] task-root auto-claim failed (continuing):", err);
-      }
-    };
+    // Task-share lookup supplies source facts only. Recognition must not claim
+    // work on the agent's behalf; explicit state declarations retain that API.
+
     {
       const realTopic = realTopicThreadId(parsed.raw.thread_id);
       const rootCandidate =
@@ -2056,7 +2016,6 @@ export class BridgeHandler {
               };
               taskCardAnchorId = rootCandidate;
               threadId = rootCandidate; // rekey: session/claim live on the task card
-              await autoClaimTaskRoot(todo.taskGuid);
             }
           }
         }
@@ -3374,9 +3333,6 @@ export class BridgeHandler {
                     ? buildTopicDeepLink(parsed.chatId, probeThreadId)
                     : undefined,
               };
-              // v4.2 auto-claim, in-thread shape (see the dispatch-site
-              // closure's doc) — session key is already the topic root here.
-              await autoClaimTaskRoot(todo.taskGuid);
             }
           }
         }
@@ -3528,7 +3484,7 @@ export class BridgeHandler {
                   ? this.deps.taskHandleClaimGuidLookup(threadId) === taskRootInfo.guid
                   : (this.deps.taskHandleClaimedLookup?.(threadId) ?? false),
                 justClaimed:
-                  taskRootJustClaimed || this.deps.taskHandleClaimCommentPending?.(threadId) || undefined,
+                  this.deps.taskHandleClaimCommentPending?.(threadId) || undefined,
               }
             : undefined,
           mtimeFacts,
