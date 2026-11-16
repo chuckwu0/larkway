@@ -1187,6 +1187,11 @@ export function runCodex(opts: RunOptions, codexBinPath = "codex"): RunHandle {
               // + how this was confirmed against the live model catalog).
               if (opts.model) turnParams["model"] = opts.model;
               if (opts.effort) turnParams["effort"] = codexEffortFromLarkway(opts.effort);
+              if (opts.serviceTier !== undefined) {
+                turnParams["serviceTier"] = opts.serviceTier;
+                // Newer native runtimes distinguish this turn from the thread default.
+                turnParams["serviceTierForTurn"] = opts.serviceTier ?? "default";
+              }
               sendRequest("turn/start", turnParams);
             }
             continue;

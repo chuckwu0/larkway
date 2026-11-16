@@ -7,7 +7,7 @@ import { TurnEventQueue } from "../agent/turnEventQueue.js";
 import { CodexProcessPool, reapOrphanedWarmProcess, type CodexProcessPoolOptions } from "./pool.js";
 import type { CodexConfigSnapshot } from "./liveConfig.js";
 
-export type RuntimeSettings = { model?: string; effort?: string; account: string | null; authMode?: "chatgpt" | "apiKey" | null };
+export type RuntimeSettings = { model?: string; effort?: string; serviceTier?: string | null; account: string | null; authMode?: "chatgpt" | "apiKey" | null };
 export interface LivePool extends AgentRunner {
   readonly childPid: number | undefined;
   readonly hasLiveWork: boolean;
@@ -28,7 +28,7 @@ export interface LiveCodexStatus {
   /** Last verified admission, not a claim about a file edited afterwards. */
   next?: RuntimeSettings;
   generations: Array<{ pid?: number; account: string | null; authMode?: "chatgpt" | "apiKey" | null; draining: boolean; active: boolean }>;
-  activeTurns: Array<{ threadId?: string; model?: string; effort?: string; account: string | null }>;
+  activeTurns: Array<{ threadId?: string; model?: string; effort?: string; serviceTier?: string | null; account: string | null }>;
   error?: string;
 }
 
@@ -165,6 +165,7 @@ export class LiveCodexRunner implements AgentRunner {
             this.#active.add(active);
             const remaining = budget === undefined ? undefined : Math.max(1, budget - (Date.now() - started));
             inner = selected.pool.run({ ...opts, model: prepared.settings.model, effort: prepared.settings.effort,
+              serviceTier: prepared.settings.serviceTier,
               timeoutMs: remaining, abortSignal: controller.signal });
           });
           if (!waiting) break;

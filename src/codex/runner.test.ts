@@ -1449,6 +1449,40 @@ describe("runCodex() — spawn-level integration", () => {
     expect(turnStart?.params).toMatchObject({ effort: "xhigh" });
   });
 
+  it.each(["priority", null, undefined])("passes tier %s through cold resumed turns", async (serviceTier) => {
+    const fake = makeFakeCodexChild();
+    __nextFakeCodexChild = fake;
+
+    const { runCodex } = await import("./runner.js");
+    const handle = runCodex({ prompt: "continue the task", resumeSessionId: "thread-a", serviceTier });
+
+    const eventsPromise = collectEvents(handle.events);
+    await new Promise<void>((res) => setImmediate(() => {
+      fake.stdout.write(APP_INIT_RESPONSE + "\n");
+      fake.stdout.write(APP_THREAD_RESPONSE + "\n");
+      fake.stdout.write(APP_TURN_RESPONSE + "\n");
+      fake.stdout.write(APP_TURN_COMPLETED + "\n");
+      res();
+    }));
+
+    await eventsPromise;
+    await handle.done;
+
+    const stdinText: string = fake.child.stdin.read()?.toString("utf8") ?? "";
+    const requests: Array<{ method?: string; params?: Record<string, unknown> }> = stdinText
+      .trim()
+      .split("\n")
+      .filter(Boolean)
+      .map((line: string) => JSON.parse(line) as { method?: string; params?: Record<string, unknown> });
+
+    const turnStart = requests.find((request) => request.method === "turn/start");
+    if (serviceTier === undefined) expect(turnStart?.params).not.toHaveProperty("serviceTier");
+    else {
+      expect(turnStart?.params).toHaveProperty("serviceTier", serviceTier);
+      expect(turnStart?.params).toHaveProperty("serviceTierForTurn", serviceTier ?? "default");
+    }
+  });
+
   it("omits turn/start.effort when opts.effort is unset — byte-identical to pre-existing behavior", async () => {
     const fake = makeFakeCodexChild();
     __nextFakeCodexChild = fake;

@@ -43,6 +43,25 @@ function fixture(onCreate?: (pool: Pool, index: number) => void) {
 }
 
 describe("live Codex configuration", () => {
+  it("refreshes service tier on resumed turns without rotating or interrupting the process", async () => {
+    const f = fixture();
+    const a = f.runner.run({ prompt: "first" }); await tick();
+    f.pools[0]!.settings.serviceTier = "priority";
+    expect(f.pools[0]!.calls[0]!.serviceTier).toBeUndefined();
+    expect(f.pools[0]!.kill).not.toHaveBeenCalled();
+    f.pools[0]!.finish(); await a.done;
+    const b = f.runner.run({ prompt: "continue", resumeSessionId: "session-a" }); await tick();
+    expect(f.pools[0]!.calls[1]!.serviceTier).toBe("priority");
+    expect(f.runner.status.activeTurns[0]!.serviceTier).toBe("priority");
+    f.pools[0]!.finish(); await b.done;
+    f.pools[0]!.settings.serviceTier = null;
+    const c = f.runner.run({ prompt: "standard", resumeSessionId: "session-a" }); await tick();
+    expect(f.pools[0]!.calls[2]!.serviceTier).toBeNull();
+    expect(f.pools).toHaveLength(1);
+    expect(f.pools[0]!.shutdown).not.toHaveBeenCalled();
+    f.pools[0]!.finish(); await c.done;
+  });
+
   it("rotates accounts without killing the running turn; steering stays on the old handle", async () => {
     const f = fixture(); const old = f.runner.run({ prompt: "old" }); await tick();
     f.set({ generation: "b", account: "b@example.test" });

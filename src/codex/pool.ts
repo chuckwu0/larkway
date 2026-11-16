@@ -226,7 +226,7 @@ export class CodexProcessPool implements AgentRunner {
   }
 
   /** Read only the effective settings and account from this actual process. */
-  async runtimeSettings(cwd?: string): Promise<{ model?: string; effort?: string; account: string | null; authMode: "chatgpt" | "apiKey" | null }> {
+  async runtimeSettings(cwd?: string): Promise<{ model?: string; effort?: string; serviceTier: string | null; account: string | null; authMode: "chatgpt" | "apiKey" | null }> {
     this.prewarm();
     const request = async (method: string, params: JsonRecord): Promise<JsonRecord> => {
       let timer: ReturnType<typeof setTimeout> | undefined;
@@ -271,6 +271,10 @@ export class CodexProcessPool implements AgentRunner {
     }
     return {
       model, effort,
+      // Native config calls priority processing "fast"; turn/start uses "priority".
+      // Explicit null resets a resumed session when the host removes its tier.
+      serviceTier: config?.["service_tier"] === "fast" ? "priority" :
+        typeof config?.["service_tier"] === "string" ? config["service_tier"] : null,
       authMode: account?.["type"] === "apiKey" ? "apiKey" : account?.["type"] === "chatgpt" ? "chatgpt" : null,
       account: typeof account?.["email"] === "string" ? account["email"] : null,
     };
@@ -518,6 +522,11 @@ export class CodexProcessPool implements AgentRunner {
     if (state.opts.cwd != null) turnParams["cwd"] = state.opts.cwd;
     if (state.opts.model) turnParams["model"] = state.opts.model;
     if (state.opts.effort) turnParams["effort"] = codexEffortFromLarkway(state.opts.effort);
+    if (state.opts.serviceTier !== undefined) {
+      turnParams["serviceTier"] = state.opts.serviceTier;
+      // Newer native runtimes distinguish this turn from the thread default.
+      turnParams["serviceTierForTurn"] = state.opts.serviceTier ?? "default";
+    }
     try {
       this.#send("turn/start", turnParams, { turnKey: state.turnKey, kind: "turn", threadId });
     } catch (err) {

@@ -1,7 +1,8 @@
 # Codex runtime configuration without interrupting turns
 
 With the default warm Codex runner, edits to the bot YAML `model` / `effort`
-and the host Codex `config.toml` take effect at the next runner admission,
+and the host Codex `config.toml` (including `service_tier`) take effect at the
+next runner admission,
 including subsequent turns in an existing Feishu topic. Already-running turns
 retain their request settings. Steering and cancellation remain attached to the
 original turn's process.
@@ -9,8 +10,17 @@ original turn's process.
 The bot YAML overrides host defaults. Removing a YAML override restores the
 current native default: the runner calls `config/read` with the actual cwd and
 passes the resolved model and effort explicitly to the new turn, rather than
-inheriting a resumed thread's old selection. Other bot settings, provider changes,
-and backend changes are not part of this hot-update contract.
+inheriting a resumed thread's old selection.
+
+The native service tier is also passed explicitly on every `turn/start`: `fast`
+is mapped to `priority`, and removing the configured tier clears a resumed
+thread's prior selection with explicit null. Newer runtimes also receive
+`serviceTierForTurn` (`priority` for Fast, `default` for standard speed).
+This applies to new and resumed
+turns, including cold fallback; running turns and steering keep their original
+settings. Runtime status includes the tier observed at admission.
+
+Other bot settings, provider changes, and backend changes are not part of this hot-update contract.
 
 ## Subscription changes
 

@@ -308,6 +308,27 @@ describe("CodexProcessPool — spawn-once/reuse", () => {
 // ---------------------------------------------------------------------------
 
 describe("CodexProcessPool — wire protocol", () => {
+  it.each(["priority", "flex", null, undefined])("passes tier %s on a resumed turn without changing thread setup", async (serviceTier) => {
+    const pool = new CodexProcessPool({});
+    const handle = pool.run({ prompt: "continue", resumeSessionId: "thread-a", serviceTier });
+    await flush();
+    const child = spawnedChildren[0]!;
+    child.stdout.write(initResponse(1) + "\n"); await flush();
+    child.stdout.write(threadResponse(2, "thread-a") + "\n"); await flush();
+    const requests = readOutboundRequests(child);
+    expect(requests.find((r) => r.method === "thread/resume")?.params).not.toHaveProperty("serviceTier");
+    const turn = requests.find((r) => r.method === "turn/start")!;
+    if (serviceTier === undefined) expect(turn.params).not.toHaveProperty("serviceTier");
+    else {
+      expect(turn.params).toHaveProperty("serviceTier", serviceTier);
+      expect(turn.params).toHaveProperty("serviceTierForTurn", serviceTier ?? "default");
+    }
+    child.stdout.write(turnStartResponse(3, "turn-a") + "\n");
+    child.stdout.write(turnCompleted("thread-a", "turn-a") + "\n");
+    await handle.done;
+    await pool.shutdown(0);
+  });
+
   it("sends cwd/approvalPolicy through thread/start and turn/start params", async () => {
     const pool = new CodexProcessPool({});
     const handle = pool.run({ prompt: "hi", cwd: "/repo/wt", permissionMode: "ask" });
@@ -1925,7 +1946,7 @@ describe("Codex pool runtime inspection and drain safety", () => {
     { account: { type: "chatgpt", email: "example@example.test" }, authMode: "chatgpt", email: "example@example.test" },
     { account: { type: "apiKey" }, authMode: "apiKey", email: null },
     { account: null, authMode: null, email: null },
-  ])("reads native auth $authMode and settings without starting a turn", async ({ account: nativeAccount, authMode, email }) => {
+  ].flatMap((entry) => [undefined, "fast", "flex"].map((tier) => ({ ...entry, tier }))))("reads native auth $authMode and tier $tier without starting a turn", async ({ account: nativeAccount, authMode, email, tier }) => {
     const pool = new CodexProcessPool({});
     const settings = pool.runtimeSettings("/wt");
     const child = spawnedChildren[0]!;
@@ -1933,11 +1954,11 @@ describe("Codex pool runtime inspection and drain safety", () => {
     child.stdout.write(initResponse(1) + "\n"); await flush();
     const config = readOutboundRequests(child)[0]!;
     expect(config).toMatchObject({ method: "config/read", params: { cwd: "/wt", includeLayers: false } });
-    child.stdout.write(JSON.stringify({ id: config.id, result: { config: { model: "model-new", model_reasoning_effort: "high" } } }) + "\n"); await flush();
+    child.stdout.write(JSON.stringify({ id: config.id, result: { config: { model: "model-new", model_reasoning_effort: "high", service_tier: tier } } }) + "\n"); await flush();
     const account = readOutboundRequests(child)[0]!;
     expect(account).toMatchObject({ method: "account/read", params: { refreshToken: false } });
     child.stdout.write(JSON.stringify({ id: account.id, result: { account: nativeAccount } }) + "\n");
-    expect(await settings).toEqual({ model: "model-new", effort: "high", account: email, authMode });
+    expect(await settings).toEqual({ model: "model-new", effort: "high", serviceTier: tier === "fast" ? "priority" : tier ?? null, account: email, authMode });
     expect(readOutboundRequests(child)).toHaveLength(0);
     await pool.shutdown(0);
   });
