@@ -7,12 +7,13 @@ import { TurnEventQueue } from "../agent/turnEventQueue.js";
 import { CodexProcessPool, reapOrphanedWarmProcess, type CodexProcessPoolOptions } from "./pool.js";
 import type { CodexConfigSnapshot } from "./liveConfig.js";
 
-export type RuntimeSettings = { model?: string; effort?: string; account: string | null; authMode?: "chatgpt" | "apiKey" | null };
+export type RuntimeSettings = { model?: string; effort?: string; serviceTier?: string | null; account: string | null; authMode?: "chatgpt" | "apiKey" | null };
 export interface LivePool extends AgentRunner {
   readonly childPid: number | undefined;
   readonly hasLiveWork: boolean;
   ownsSession(id: string): boolean;
   hasSessionWork(id: string): boolean;
+  prepareSessionHandoff(id: string): Promise<boolean>;
   runtimeSettings(cwd?: string): Promise<RuntimeSettings>;
   shutdown(timeout?: number): Promise<void>;
 }
@@ -28,7 +29,7 @@ export interface LiveCodexStatus {
   /** Last verified admission, not a claim about a file edited afterwards. */
   next?: RuntimeSettings;
   generations: Array<{ pid?: number; account: string | null; authMode?: "chatgpt" | "apiKey" | null; draining: boolean; active: boolean }>;
-  activeTurns: Array<{ threadId?: string; model?: string; effort?: string; account: string | null }>;
+  activeTurns: Array<{ threadId?: string; model?: string; effort?: string; serviceTier?: string | null; account: string | null }>;
   error?: string;
 }
 
@@ -155,7 +156,7 @@ export class LiveCodexRunner implements AgentRunner {
             const prepared = await this.#prepare(opts.cwd);
             if (controller.signal.aborted) return;
             if (opts.resumeSessionId && [...this.#generations].some((g) =>
-              g !== prepared.generation && g.pool.hasSessionWork(opts.resumeSessionId!))) {
+              g !== prepared.generation && g.pool.ownsSession(opts.resumeSessionId!))) {
               waiting = true;
               return;
             }
@@ -165,14 +166,37 @@ export class LiveCodexRunner implements AgentRunner {
             this.#active.add(active);
             const remaining = budget === undefined ? undefined : Math.max(1, budget - (Date.now() - started));
             inner = selected.pool.run({ ...opts, model: prepared.settings.model, effort: prepared.settings.effort,
+              serviceTier: prepared.settings.serviceTier,
               timeoutMs: remaining, abortSignal: controller.signal });
           });
           if (!waiting) break;
           // Parent turns can finish while native children continue. Wait for
           // that generation to drain rather than create a second session writer.
-          while (!controller.signal.aborted && !this.#closed && opts.resumeSessionId &&
-            [...this.#generations].some((g) => g !== this.#current && g.pool.hasSessionWork(opts.resumeSessionId!))) {
-            await new Promise<void>((resolve) => setTimeout(resolve, 100));
+          while (!controller.signal.aborted && !this.#closed && opts.resumeSessionId) {
+            const owners = [...this.#generations].filter((g) => g !== this.#current && g.pool.ownsSession(opts.resumeSessionId!));
+            if (!owners.length) break;
+            for (const generation of owners) {
+              // Pin the old process until release is confirmed; unrelated turns
+              // remain free to enter the current generation during native I/O.
+              generation.reservations++;
+              const releasing = generation.pool.prepareSessionHandoff(opts.resumeSessionId)
+                .finally(() => { generation.reservations--; });
+              await new Promise<void>((resolve, reject) => {
+                const stopped = () => { controller.signal.removeEventListener("abort", stopped); resolve(); };
+                controller.signal.addEventListener("abort", stopped, { once: true });
+                void releasing.then(() => { controller.signal.removeEventListener("abort", stopped); resolve(); },
+                  (error) => { controller.signal.removeEventListener("abort", stopped); reject(error); });
+                if (controller.signal.aborted) stopped();
+              });
+              if (controller.signal.aborted || this.#closed) break;
+            }
+            if (!owners.some((g) => g.pool.ownsSession(opts.resumeSessionId!))) break;
+            await new Promise<void>((resolve) => {
+              const finish = () => { clearTimeout(timer); controller.signal.removeEventListener("abort", finish); resolve(); };
+              const timer = setTimeout(finish, 1_000);
+              controller.signal.addEventListener("abort", finish, { once: true });
+              if (controller.signal.aborted) finish();
+            });
           }
         }
         if (!inner) return stopped();

@@ -120,6 +120,7 @@ interface TurnState {
   timeoutHandle?: ReturnType<typeof setTimeout>;
   abortListener?: () => void;
   waitingForCancellation?: boolean;
+  writerReleaseWaitStartedAt?: number;
   interruptionReason?: "cancel" | "timeout";
 }
 
@@ -225,45 +226,92 @@ export class CodexProcessPool implements AgentRunner {
     return false;
   }
 
+  async #diagnosticRequest(method: string, params: JsonRecord): Promise<JsonRecord> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let id: number | undefined;
+    let expired = false;
+    try {
+      return await Promise.race([
+        (async () => {
+          await this.#ready;
+          if (expired) throw new Error("Codex runtime settings timed out");
+          id = this.#nextRequestId++;
+          return await new Promise<JsonRecord>((resolve, reject) => {
+            this.#diagnostics.set(id!, { resolve, reject });
+            const stdin = this.#child?.stdin;
+            if (!stdin || stdin.destroyed) { reject(new Error("Codex runtime disconnected")); return; }
+            stdin.write(JSON.stringify({ id, method, params }) + "\n");
+          });
+        })(),
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(() => reject(new Error("Codex runtime settings timed out")), 15_000);
+          timer.unref?.();
+        }),
+      ]);
+    } finally {
+      expired = true;
+      clearTimeout(timer);
+      if (id !== undefined) this.#diagnostics.delete(id);
+    }
+  }
+
+  #nativeRevision = 0;
+
+  /** Verify activity, then request unloading only this idle session. Resume still verifies writer release. */
+  async prepareSessionHandoff(id: string): Promise<boolean> {
+    if (!this.ownsSession(id)) return true;
+    // A bridge-owned turn or cancellation is never superseded by a metadata read.
+    if ([...this.#turns.values()].some((turn) => turn.threadId === id || turn.opts.resumeSessionId === id) ||
+      this.#cancelledThreads.has(id) || [...this.#coldWriters].some((writer) => writer.sessionIds.has(id)) ||
+      [...this.#unexitedChildren].some((child) => child !== this.#child)) return false;
+    const child = this.#child;
+    if (!child) return false;
+    const revision = this.#nativeRevision;
+    // Include idle children: interaction notifications are not authoritative turn
+    // completion, and parent completion need not subscribe us to child endings.
+    const ids = [...this.#ownedSessionIds];
+    const snapshots: JsonRecord[] = [];
+    for (let offset = 0; offset < ids.length; offset += 8) {
+      const batch = await Promise.all(ids.slice(offset, offset + 8).map(async (threadId) => {
+        const result = await this.#diagnosticRequest("thread/read", { threadId, includeTurns: false });
+        const thread = asRecord(result["thread"]);
+        if (thread?.["id"] !== threadId) throw new Error("Codex handoff could not verify the old session");
+        return thread;
+      }));
+      snapshots.push(...batch);
+    }
+    // Do not let a slow read erase a newer native start/completion notification.
+    if (this.#child !== child || this.#nativeRevision !== revision) return false;
+    for (const thread of snapshots) {
+      const threadId = thread["id"] as string;
+      const parent = thread["parentThreadId"];
+      if (parent === null || typeof parent === "string") this.#nativeParents.set(threadId, parent);
+      const status = asRecord(thread["status"])?.["type"];
+      if (status === "active") this.#nativeActive.add(threadId);
+      else if (status === "idle" || status === "notLoaded") this.#nativeActive.delete(threadId);
+      else throw new Error("Codex handoff could not verify the old session status");
+    }
+    if (this.hasSessionWork(id)) return false;
+    const result = await this.#diagnosticRequest("thread/unsubscribe", { threadId: id });
+    if (!["unsubscribed", "notLoaded"].includes(String(result["status"]))) {
+      throw new Error("Codex handoff did not release the old session writer");
+    }
+    this.#loadedThreadIds.delete(id);
+    this.#ownedSessionIds.delete(id);
+    return true;
+  }
+
   /** Read only the effective settings and account from this actual process. */
-  async runtimeSettings(cwd?: string): Promise<{ model?: string; effort?: string; account: string | null; authMode: "chatgpt" | "apiKey" | null }> {
+  async runtimeSettings(cwd?: string): Promise<{ model?: string; effort?: string; serviceTier: string | null; account: string | null; authMode: "chatgpt" | "apiKey" | null }> {
     this.prewarm();
-    const request = async (method: string, params: JsonRecord): Promise<JsonRecord> => {
-      let timer: ReturnType<typeof setTimeout> | undefined;
-      let id: number | undefined;
-      let expired = false;
-      try {
-        return await Promise.race([
-          (async () => {
-            await this.#ready;
-            if (expired) throw new Error("Codex runtime settings timed out");
-            id = this.#nextRequestId++;
-            return await new Promise<JsonRecord>((resolve, reject) => {
-              this.#diagnostics.set(id!, { resolve, reject });
-              const stdin = this.#child?.stdin;
-              if (!stdin || stdin.destroyed) { reject(new Error("Codex runtime disconnected")); return; }
-              stdin.write(JSON.stringify({ id, method, params }) + "\n");
-            });
-          })(),
-          new Promise<never>((_, reject) => {
-            timer = setTimeout(() => reject(new Error("Codex runtime settings timed out")), 15_000);
-            timer.unref?.();
-          }),
-        ]);
-      } finally {
-        expired = true;
-        clearTimeout(timer);
-        if (id !== undefined) this.#diagnostics.delete(id);
-      }
-    };
-    const configResult = await request("config/read", { includeLayers: false, ...(cwd ? { cwd } : {}) });
-    const accountResult = await request("account/read", { refreshToken: false });
+    const configResult = await this.#diagnosticRequest("config/read", { includeLayers: false, ...(cwd ? { cwd } : {}) });
+    const accountResult = await this.#diagnosticRequest("account/read", { refreshToken: false });
     const config = asRecord(configResult["config"]);
     const account = asRecord(accountResult["account"]);
     let model = typeof config?.["model"] === "string" ? config["model"] : undefined;
     let effort = typeof config?.["model_reasoning_effort"] === "string" ? config["model_reasoning_effort"] : undefined;
     if (!model || !effort) {
-      const catalog = await request("model/list", {});
+      const catalog = await this.#diagnosticRequest("model/list", {});
       const models = Array.isArray(catalog["data"]) ? catalog["data"].map(asRecord) : [];
       const selected = models.find((m) => model ? m?.["id"] === model || m?.["model"] === model : m?.["isDefault"] === true);
       if (!model && typeof selected?.["model"] === "string") model = selected["model"];
@@ -271,6 +319,10 @@ export class CodexProcessPool implements AgentRunner {
     }
     return {
       model, effort,
+      // Native config calls priority processing "fast"; turn/start uses "priority".
+      // Explicit null resets a resumed session when the host removes its tier.
+      serviceTier: config?.["service_tier"] === "fast" ? "priority" :
+        typeof config?.["service_tier"] === "string" ? config["service_tier"] : null,
       authMode: account?.["type"] === "apiKey" ? "apiKey" : account?.["type"] === "chatgpt" ? "chatgpt" : null,
       account: typeof account?.["email"] === "string" ? account["email"] : null,
     };
@@ -518,6 +570,11 @@ export class CodexProcessPool implements AgentRunner {
     if (state.opts.cwd != null) turnParams["cwd"] = state.opts.cwd;
     if (state.opts.model) turnParams["model"] = state.opts.model;
     if (state.opts.effort) turnParams["effort"] = codexEffortFromLarkway(state.opts.effort);
+    if (state.opts.serviceTier !== undefined) {
+      turnParams["serviceTier"] = state.opts.serviceTier;
+      // Newer native runtimes distinguish this turn from the thread default.
+      turnParams["serviceTierForTurn"] = state.opts.serviceTier ?? "default";
+    }
     try {
       this.#send("turn/start", turnParams, { turnKey: state.turnKey, kind: "turn", threadId });
     } catch (err) {
@@ -1046,6 +1103,20 @@ export class CodexProcessPool implements AgentRunner {
       case "turn": {
         const state = this.#turns.get(pending.turnKey);
         if (state == null || state.settled) return;
+        if (pending.kind === "thread" && state.threadId == null && state.opts.resumeSessionId &&
+          err.message === `codex app-server request failed: thread ${state.opts.resumeSessionId} already has an active writer`) {
+          // unsubscribe acknowledges a shutdown request before the native writer
+          // lock is necessarily dropped. Only retry an explicitly rejected resume;
+          // no turn/start (and hence no user input) has been submitted yet.
+          state.writerReleaseWaitStartedAt ??= Date.now();
+          if (Date.now() - state.writerReleaseWaitStartedAt < 15_000) {
+            const retry = setTimeout(() => {
+              if (!state.settled && !state.coldHandle) this.#sendThreadRequest(state, !this.#excludeTurnsUnsupported);
+            }, 250);
+            retry.unref?.();
+          } else this.#settleReject(state, new Error("Codex session handoff is still waiting for the previous writer to release its lock"));
+          return;
+        }
         if (pending.excludeTurns && isExcludeTurnsRejection(err.message)) {
           console.warn(
             `[codex-pool] app-server rejected thread/resume excludeTurns (${err.message}) — retrying once ` +
@@ -1066,6 +1137,8 @@ export class CodexProcessPool implements AgentRunner {
 
   #handleNotification(record: JsonRecord, raw: unknown): void {
     const params = asRecord(record["params"]);
+    if (["thread/started", "thread/closed", "thread/status/changed", "turn/started", "turn/completed"].includes(String(record["method"])) ||
+      ["subAgentActivity", "collabAgentToolCall"].includes(String(asRecord(params?.["item"])?.["type"]))) this.#nativeRevision++;
     if (record["method"] === "thread/started") {
       const thread = asRecord(params?.["thread"]);
       if (typeof thread?.["id"] === "string") {
@@ -1093,7 +1166,8 @@ export class CodexProcessPool implements AgentRunner {
     if (item?.["type"] === "subAgentActivity" && typeof item["agentThreadId"] === "string") {
       const childId = item["agentThreadId"];
       this.#ownedSessionIds.add(childId);
-      this.#nativeParents.set(childId, threadId);
+      // Interaction can target a parent or sibling; it never changes ancestry.
+      if (item["kind"] === "started" && !this.#nativeParents.has(childId)) this.#nativeParents.set(childId, threadId);
       if (item["kind"] === "started" || item["kind"] === "interacted") this.#nativeActive.add(childId);
       if (item["kind"] === "completed") this.#nativeActive.delete(childId);
     }
@@ -1102,7 +1176,7 @@ export class CodexProcessPool implements AgentRunner {
       for (const [childId, value] of Object.entries(states ?? {})) {
         const status = asRecord(value)?.["status"];
         this.#ownedSessionIds.add(childId);
-        if (!this.#nativeParents.has(childId)) this.#nativeParents.set(childId, threadId);
+        if (item["tool"] === "spawnAgent" && !this.#nativeParents.has(childId)) this.#nativeParents.set(childId, threadId);
         if (status === "running" || status === "pendingInit") this.#nativeActive.add(childId);
         if (status === "completed" || status === "errored" || status === "shutdown") this.#nativeActive.delete(childId);
       }

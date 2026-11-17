@@ -191,6 +191,8 @@ export interface RunOptions {
    * @default undefined
    */
   effort?: string;
+  /** Codex native per-turn tier; null clears a previously selected tier. */
+  serviceTier?: string | null;
   /**
    * A0 (docs/larkway-perf-plan.md §3): optional perf-marker sink. Runners
    * invoke this at up to 4 points, each ONCE, with a monotonic timestamp
