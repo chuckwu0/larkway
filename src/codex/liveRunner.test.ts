@@ -14,6 +14,7 @@ class Pool implements LivePool {
   shutdown = vi.fn(async () => {});
   ownsSession(id: string) { return this.sessions.has(id); }
   hasSessionWork(id: string) { return this.sessions.has(id) && this.hasLiveWork; }
+  async prepareSessionHandoff(id: string) { if (this.hasSessionWork(id)) return false; this.sessions.delete(id); return true; }
   finish!: () => void;
   steer = vi.fn(async () => ({ status: "accepted" as const, threadId: "session-a", turnId: "turn-a" }));
   kill = vi.fn(() => this.finish());
@@ -131,7 +132,7 @@ describe("live Codex configuration", () => {
     const c = f.runner.run({ prompt: "unrelated" }); await tick();
     expect(f.pools[1]!.calls).toHaveLength(1); f.pools[1]!.finish(); await c.done;
     f.pools[0]!.hasLiveWork = false;
-    await vi.advanceTimersByTimeAsync(100); await tick();
+    await vi.advanceTimersByTimeAsync(1_000); await tick();
     expect(f.pools[1]!.calls[1]).toMatchObject({ resumeSessionId: "session-a" });
     f.pools[1]!.finish(); await b.done;
   });
@@ -174,7 +175,7 @@ describe("live admission budgets and failure isolation", () => {
     expect(f.pools[1]!.calls).toHaveLength(0);
     expect(f.pools[0]!.kill).not.toHaveBeenCalled();
     const cancelled = f.runner.run({ prompt: "wait again", resumeSessionId: "session-a" }); await tick(); cancelled.kill();
-    await vi.advanceTimersByTimeAsync(100);
+    await vi.advanceTimersByTimeAsync(1_000);
     expect(await cancelled.done).toMatchObject({ interrupted: true, interruptionReason: "cancel" });
     expect(f.pools[0]!.kill).not.toHaveBeenCalled();
   });
@@ -199,5 +200,36 @@ describe("live admission budgets and failure isolation", () => {
     }, {}, () => pool); runners.push(runner);
     await expect(runner.run({ prompt: "must not submit" }).done).rejects.toThrow("could not be verified");
     expect(pool.calls).toHaveLength(0);
+  });
+});
+
+describe("idle native writer migration", () => {
+  it("releases an idle old session before starting it on a new generation", async () => {
+    const f = fixture(); const a = f.runner.run({ prompt: "seed" }); await tick();
+    f.pools[0]!.finish(); await a.done;
+    const release = vi.spyOn(f.pools[0]!, "prepareSessionHandoff");
+    f.set({ generation: "b", account: "b@example.test" });
+    const b = f.runner.run({ prompt: "continue", resumeSessionId: "session-a" }); await tick();
+    expect(release).toHaveBeenCalledWith("session-a");
+    expect(f.pools[1]!.calls).toHaveLength(1);
+    f.pools[1]!.finish(); await b.done;
+  });
+
+  it("settles cancellation during native reads, keeps the old process pinned, and permits unrelated work", async () => {
+    vi.useFakeTimers();
+    const f = fixture(); const a = f.runner.run({ prompt: "seed" }); await tick();
+    f.pools[0]!.finish(); await a.done;
+    let release!: (ready: boolean) => void;
+    vi.spyOn(f.pools[0]!, "prepareSessionHandoff").mockImplementation(() => new Promise(r => { release = r; }));
+    f.set({ generation: "b", account: "b@example.test" });
+    const b = f.runner.run({ prompt: "cancelled", resumeSessionId: "session-a" }); await tick();
+    const c = f.runner.run({ prompt: "unrelated" }); await tick();
+    expect(f.pools[1]!.calls.map(o => o.prompt)).toEqual(["unrelated"]);
+    b.kill(); expect(await b.done).toMatchObject({ interrupted: true });
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(f.pools[0]!.shutdown).not.toHaveBeenCalled();
+    release(false); await tick();
+    f.pools[1]!.finish(); await c.done;
+    expect(f.pools[1]!.calls.map(o => o.prompt)).toEqual(["unrelated"]);
   });
 });

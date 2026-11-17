@@ -1999,3 +1999,123 @@ describe("Codex pool runtime inspection and drain safety", () => {
     await pool.shutdown(0);
   });
 });
+
+describe("cross-generation session handoff", () => {
+  async function fixture() {
+    const pool = new CodexProcessPool({}); pool.prewarm();
+    const child = spawnedChildren[0]!;
+    readOutboundRequests(child); child.stdout.write(initResponse(1) + "\n"); await flush();
+    const notify = (method: string, params: unknown) => child.stdout.write(JSON.stringify({ method, params }) + "\n");
+    const own = (id: string, parentThreadId: string | null) => notify("thread/started", { thread: { id, parentThreadId, status: { type: "idle" } } });
+    own("parent", null); own("child", "parent"); own("other", null); await flush();
+    return { pool, child, notify, own };
+  }
+
+  it("does not turn parent/sibling interactions or observations into ancestry", async () => {
+    const { pool, child, notify } = await fixture();
+    notify("item/completed", { threadId: "child", item: { type: "subAgentActivity", kind: "interacted", agentThreadId: "parent" } });
+    notify("item/completed", { threadId: "child", item: { type: "subAgentActivity", kind: "completed", agentThreadId: "parent" } });
+    notify("item/completed", { threadId: "child", item: { type: "collabAgentToolCall", tool: "sendMessage", agentsStates: { other: { status: "running" } } } });
+    await flush();
+    expect(pool.hasSessionWork("parent")).toBe(false);
+    expect(pool.hasSessionWork("other")).toBe(true);
+    expect(child.killSignals).toEqual([]);
+    await pool.shutdown(0);
+  });
+
+  it("reconciles stale child flags and explicitly releases only the idle parent writer", async () => {
+    const { pool, child, notify } = await fixture();
+    notify("item/completed", { threadId: "parent", item: { type: "subAgentActivity", kind: "interacted", agentThreadId: "child" } }); await flush();
+    expect(pool.hasSessionWork("parent")).toBe(true);
+    const handoff = pool.prepareSessionHandoff("parent"); await flush();
+    const reads = readOutboundRequests(child);
+    expect(reads.map((r) => r.method)).toEqual(["thread/read", "thread/read", "thread/read"]);
+    for (const r of reads) {
+      const id = (r.params as { threadId: string }).threadId;
+      child.stdout.write(JSON.stringify({ id: r.id, result: { thread: { id, parentThreadId: id === "child" ? "parent" : null, status: { type: id === "other" ? "active" : "idle" } } } }) + "\n");
+    }
+    await flush();
+    const [release] = readOutboundRequests(child);
+    expect(release).toMatchObject({ method: "thread/unsubscribe", params: { threadId: "parent" } });
+    child.stdout.write(JSON.stringify({ id: release!.id, result: { status: "unsubscribed" } }) + "\n");
+    expect(await handoff).toBe(true);
+    expect(pool.ownsSession("parent")).toBe(false);
+    expect(pool.hasSessionWork("other")).toBe(true);
+    expect(child.killSignals).toEqual([]);
+    await pool.shutdown(0);
+  });
+
+  it.each(["active", "race", "error", "notSubscribed"])("keeps the old writer on %s without interrupting it", async (mode) => {
+    const { pool, child, notify } = await fixture();
+    const handoff = pool.prepareSessionHandoff("parent");
+    const outcome = handoff.catch((e: Error) => e.message);
+    await flush();
+    const reads = readOutboundRequests(child);
+    if (mode === "race") notify("turn/started", { threadId: "child", turn: { id: "new-turn" } });
+    for (const r of reads) {
+      const id = (r.params as { threadId: string }).threadId;
+      if (mode === "error") child.stdout.write(jsonRpcErrorResponse(r.id!, "unavailable") + "\n");
+      else child.stdout.write(JSON.stringify({ id: r.id, result: { thread: { id, parentThreadId: id === "child" ? "parent" : null, status: { type: mode === "active" && id === "child" ? "active" : "idle" } } } }) + "\n");
+    }
+    await flush();
+    const pending = readOutboundRequests(child);
+    if (mode === "notSubscribed") {
+      expect(pending).toHaveLength(1);
+      child.stdout.write(JSON.stringify({ id: pending[0]!.id, result: { status: "notSubscribed" } }) + "\n");
+    } else expect(pending).toHaveLength(0);
+    const result = await outcome;
+    if (mode === "active" || mode === "race") expect(result).toBe(false);
+    else expect(typeof result).toBe("string");
+    expect(pool.ownsSession("parent")).toBe(true);
+    expect(child.killSignals).toEqual([]);
+    await pool.shutdown(0);
+  });
+});
+
+describe("native writer release acknowledgement", () => {
+  it("waits through two concurrent rejected resumes and submits each input exactly once", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+    const pool = new CodexProcessPool({ allowColdFallback: false });
+    const a = pool.run({ prompt: "input-a", resumeSessionId: "session-a" });
+    const b = pool.run({ prompt: "input-b", resumeSessionId: "session-b" });
+    const child = spawnedChildren[0]!;
+    readOutboundRequests(child); child.stdout.write(initResponse(1) + "\n"); await flush();
+    const first = readOutboundRequests(child);
+    for (const r of first) child.stdout.write(jsonRpcErrorResponse(r.id!, `thread ${r.params!["threadId"]} already has an active writer`) + "\n");
+    await flush(); expect(readOutboundRequests(child)).toEqual([]);
+    await vi.advanceTimersByTimeAsync(250); await flush();
+    const retries = readOutboundRequests(child);
+    expect(retries.map(r => r.method)).toEqual(["thread/resume", "thread/resume"]);
+    for (const r of retries) child.stdout.write(threadResponse(r.id!, String(r.params!["threadId"])) + "\n");
+    await flush(); const starts = readOutboundRequests(child);
+    expect(starts.map(r => r.method)).toEqual(["turn/start", "turn/start"]);
+    expect(starts.map(r => r.params!["input"])).toEqual([
+      [{ type: "text", text: "input-a", text_elements: [] }],
+      [{ type: "text", text: "input-b", text_elements: [] }],
+    ]);
+    for (const r of starts) {
+      const id = String(r.params!["threadId"]);
+      child.stdout.write(turnStartResponse(r.id!, `turn-${id}`) + "\n" + turnCompleted(id, `turn-${id}`) + "\n");
+    }
+    await Promise.all([a.done, b.done]);
+    await vi.advanceTimersByTimeAsync(1_000); await flush(); expect(readOutboundRequests(child)).toEqual([]);
+    expect(child.killSignals).toEqual([]);
+    await pool.shutdown(0);
+  });
+
+  it.each(["cancel", "timeout"])("does not retry or submit after %s while the native writer is closing", async (mode) => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+    const pool = new CodexProcessPool({ allowColdFallback: false });
+    const turn = pool.run({ prompt: "must not execute", resumeSessionId: "session", timeoutMs: mode === "timeout" ? 100 : undefined });
+    const child = spawnedChildren[0]!;
+    readOutboundRequests(child); child.stdout.write(initResponse(1) + "\n"); await flush();
+    const [resume] = readOutboundRequests(child);
+    child.stdout.write(jsonRpcErrorResponse(resume!.id!, "thread session already has an active writer") + "\n"); await flush();
+    if (mode === "cancel") turn.kill();
+    await vi.advanceTimersByTimeAsync(1_000); await flush();
+    expect(await turn.done).toMatchObject({ interrupted: true, interruptionReason: mode });
+    expect(readOutboundRequests(child)).toEqual([]);
+    expect(child.killSignals).toEqual([]);
+    await pool.shutdown(0);
+  });
+});
