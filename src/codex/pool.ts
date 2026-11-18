@@ -276,6 +276,17 @@ export class CodexProcessPool implements AgentRunner {
         const result = await this.#diagnosticRequest("thread/read", { threadId, includeTurns: false });
         const thread = asRecord(result["thread"]);
         if (thread?.["id"] !== threadId) throw new Error("Codex handoff could not verify the old session");
+        // A system error can outlive the turn that failed. Check its latest
+        // turn before releasing the writer, including for native child agents.
+        if (asRecord(thread["status"])?.["type"] === "systemError") {
+          const turns = await this.#diagnosticRequest("thread/turns/list", { threadId, limit: 1 })
+            .catch(() => undefined);
+          const data = turns?.["data"];
+          const latest = Array.isArray(data) ? asRecord(data[0])?.["status"] : undefined;
+          if (latest === "completed" || latest === "interrupted" || latest === "failed") {
+            return { ...thread, status: { type: "idle" } };
+          }
+        }
         return thread;
       }));
       snapshots.push(...batch);
@@ -287,9 +298,9 @@ export class CodexProcessPool implements AgentRunner {
       const parent = thread["parentThreadId"];
       if (parent === null || typeof parent === "string") this.#nativeParents.set(threadId, parent);
       const status = asRecord(thread["status"])?.["type"];
-      if (status === "active") this.#nativeActive.add(threadId);
-      else if (status === "idle" || status === "notLoaded") this.#nativeActive.delete(threadId);
-      else throw new Error("Codex handoff could not verify the old session status");
+      // Unverified work blocks its own ancestry, like an active turn.
+      if (status === "idle" || status === "notLoaded") this.#nativeActive.delete(threadId);
+      else this.#nativeActive.add(threadId);
     }
     if (this.hasSessionWork(id)) return false;
     const result = await this.#diagnosticRequest("thread/unsubscribe", { threadId: id });
@@ -1157,8 +1168,8 @@ export class CodexProcessPool implements AgentRunner {
     if (record["method"] === "turn/completed" || record["method"] === "thread/closed") this.#nativeActive.delete(threadId);
     if (record["method"] === "thread/status/changed") {
       const status = asRecord(params?.["status"]);
-      if (status?.["type"] === "active") this.#nativeActive.add(threadId);
-      else this.#nativeActive.delete(threadId);
+      if (status?.["type"] === "idle" || status?.["type"] === "notLoaded") this.#nativeActive.delete(threadId);
+      else this.#nativeActive.add(threadId);
     }
     // Recent runtimes report child lifecycle on the parent's subscription,
     // without necessarily subscribing this client to the child thread itself.
