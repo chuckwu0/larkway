@@ -8616,6 +8616,7 @@ describe("handleOne — work still running when the turn ends", () => {
   async function runTurn(
     done: { exitCode: number; backgroundTasksPending?: number; stateFreshAfter?: number },
     freshState?: Record<string, unknown>,
+    backend: "pi" | "claude" = "claude",
   ): Promise<{ finalizeArgs: FinalizeArgs[] }> {
     const wt = freshState ? await seedWorktree("om_msg") : undefined;
     runClaudeImpl = () => ({
@@ -8645,7 +8646,7 @@ describe("handleOne — work still running when the turn ends", () => {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       sessionStore: store as any,
       conventions: makeConventions(),
-      botConfig: { id: "frontend", name: "Frontend", turn_taking_limit: 10, backend: "claude" },
+      botConfig: { id: "frontend", name: "Frontend", turn_taking_limit: 10, backend },
     });
     await handler.run();
     await whenFinalized;
@@ -8668,10 +8669,17 @@ describe("handleOne — work still running when the turn ends", () => {
     const { finalizeArgs } = await runTurn(
       { exitCode: 0 },
       { status: "in_progress", last_message: "还在做", updated_at: "2026-10-29T10:00:00.000Z" },
+      "pi",
     );
     expect(finalizeArgs).toHaveLength(1);
     expect(finalizeArgs[0]?.titleOverride).toBe("⏳ 进行中");
     expect(finalizeArgs[0]?.colorOverride).toBe("neutral");
+    expect(finalizeArgs[0]?.finalText).toBe("修复已提交，真机验证还在后台跑。");
+  });
+
+  it("keeps the complete Pi answer when ready state carries only a summary", async () => {
+    const { finalizeArgs } = await runTurn({ exitCode: 0 }, { status: "ready", last_message: "摘要" }, "pi");
+    expect(finalizeArgs[0]?.finalText).toBe("修复已提交，真机验证还在后台跑。");
   });
 
   it("agent-declared status:ready wins over pending background tasks", async () => {
