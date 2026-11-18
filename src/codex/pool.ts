@@ -312,16 +312,29 @@ export class CodexProcessPool implements AgentRunner {
     return true;
   }
 
-  /** Read only the effective settings and account from this actual process. */
-  async runtimeSettings(cwd?: string): Promise<{ model?: string; effort?: string; serviceTier: string | null; account: string | null; authMode: "chatgpt" | "apiKey" | null }> {
+  /** Ask the native provider whether it needs an OpenAI account, without requesting tokens. */
+  async readAccount(): Promise<{ account: string | null; authMode: "chatgpt" | "apiKey" | null; requiresOpenaiAuth?: boolean }> {
     this.prewarm();
+    const result = await this.#diagnosticRequest("account/read", { refreshToken: false });
+    const account = asRecord(result["account"]);
+    return {
+      authMode: account?.["type"] === "apiKey" ? "apiKey" : account?.["type"] === "chatgpt" ? "chatgpt" : null,
+      account: typeof account?.["email"] === "string" ? account["email"] : null,
+      ...(typeof result["requiresOpenaiAuth"] === "boolean" ? { requiresOpenaiAuth: result["requiresOpenaiAuth"] } : {}),
+    };
+  }
+
+  /** Read only the effective settings and account from this actual process. */
+  async runtimeSettings(cwd?: string) {
+    this.prewarm();
+    const child = this.#child;
     const configResult = await this.#diagnosticRequest("config/read", { includeLayers: false, ...(cwd ? { cwd } : {}) });
-    const accountResult = await this.#diagnosticRequest("account/read", { refreshToken: false });
+    if (this.#child !== child) throw new Error("Codex runtime disconnected while reading settings");
+    const account = await this.readAccount();
     const config = asRecord(configResult["config"]);
-    const account = asRecord(accountResult["account"]);
     let model = typeof config?.["model"] === "string" ? config["model"] : undefined;
     let effort = typeof config?.["model_reasoning_effort"] === "string" ? config["model_reasoning_effort"] : undefined;
-    if (!model || !effort) {
+    if (account.requiresOpenaiAuth !== false && (!model || !effort)) {
       const catalog = await this.#diagnosticRequest("model/list", {});
       const models = Array.isArray(catalog["data"]) ? catalog["data"].map(asRecord) : [];
       const selected = models.find((m) => model ? m?.["id"] === model || m?.["model"] === model : m?.["isDefault"] === true);
@@ -334,8 +347,7 @@ export class CodexProcessPool implements AgentRunner {
       // Explicit null resets a resumed session when the host removes its tier.
       serviceTier: config?.["service_tier"] === "fast" ? "priority" :
         typeof config?.["service_tier"] === "string" ? config["service_tier"] : null,
-      authMode: account?.["type"] === "apiKey" ? "apiKey" : account?.["type"] === "chatgpt" ? "chatgpt" : null,
-      account: typeof account?.["email"] === "string" ? account["email"] : null,
+      ...account,
     };
   }
 

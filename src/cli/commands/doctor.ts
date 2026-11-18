@@ -34,8 +34,8 @@ import { promisify } from "node:util";
 import type { CliContext } from "../types.js";
 import { detectClaudeLogin, claudeLoginHint } from "../claudeAuth.js";
 import {
+  detectCodexAuth,
   detectCodexBinary,
-  detectCodexLogin,
   detectCodexRuntimeWritable,
   detectPiAuth,
   detectPiBinary,
@@ -142,7 +142,7 @@ async function checkLarkCli(): Promise<CheckResult> {
  * - Otherwise → optional/informational (ok whether present or absent; just notes it
  *   in the message so the operator knows what to do if they ever add a codex bot).
  *
- * Two sub-checks: binary present in PATH + local Codex CLI login state.
+ * Checks the binary, native authentication, and runtime state directory.
  */
 async function checkCodex(ctx: CliContext): Promise<CheckResult[]> {
   const results: CheckResult[] = [];
@@ -174,29 +174,16 @@ async function checkCodex(ctx: CliContext): Promise<CheckResult[]> {
     return results;
   }
 
-  // 6b. codex 登录态
-  const loggedIn = await detectCodexLogin();
-  if (loggedIn) {
-    results.push({
-      id: "codex-login",
-      label: `codex 登录态${required ? "" : " (可选)"}`,
-      status: "ok",
-    });
-  } else {
-    // Required → warn (binary is present but not logged in — needs action).
-    // Optional → ok with informational message (no codex bot configured).
-    results.push({
-      id: "codex-login",
-      label: `codex 登录态${required ? "" : " (可选)"}`,
-      status: required ? "warn" : "ok",
-      message: required
-        ? "未检测到 codex 登录态(~/.codex/auth.json 不存在)。请运行 `codex login`。"
-        : "未检测到 codex 登录态(当前无 bot 使用 codex backend,可忽略)。如需登录:codex login",
-    });
-  }
+  const runtime = await detectCodexRuntimeWritable();
+  const auth = required && runtime.ok ? await detectCodexAuth() : null;
+  results.push({
+    id: "codex-login",
+    label: `Codex 认证${required ? "" : " (可选)"}`,
+    status: auth && auth.ready !== true ? "warn" : "ok",
+    message: auth?.message ?? (required ? "状态目录不可写，跳过认证探测。" : "当前无 bot 使用 Codex。"),
+  });
 
   // 6c. codex runtime state dir/db is writable
-  const runtime = await detectCodexRuntimeWritable();
   if (runtime.ok) {
     results.push({
       id: "codex-runtime-writable",
@@ -210,7 +197,7 @@ async function checkCodex(ctx: CliContext): Promise<CheckResult[]> {
       label: `codex 状态目录可写${required ? "" : " (可选)"}`,
       status: required ? "error" : "ok",
       message: required
-        ? `${runtime.message ?? "Codex 状态目录不可写"}。请执行: sudo chown -R "$USER":staff ~/.codex && chmod -R u+rwX ~/.codex, 然后 codex login。`
+        ? `${runtime.message ?? "Codex 状态目录不可写"}。请检查该路径的所有者及读写权限。`
         : `${runtime.message ?? "Codex 状态目录不可写"}(当前无 bot 使用 codex backend,可忽略)。`,
     });
   }

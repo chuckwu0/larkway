@@ -61,7 +61,7 @@ beforeEach(async () => {
   await writeFile(fakeCodex, "#!/usr/bin/env sh\necho 'codex 0.0.0-test'\n", "utf-8");
   await chmod(fakeCodex, 0o755);
   await mkdir(fakeCodexHome, { recursive: true });
-  await writeFile(path.join(fakeCodexHome, "auth.json"), JSON.stringify({ fake: true }), "utf-8");
+  await writeFile(path.join(fakeCodexHome, "auth.json"), JSON.stringify({ OPENAI_API_KEY: "fixture" }), "utf-8");
   process.env["PATH"] = `${fakeBin}${path.delimiter}${origPath ?? ""}`;
 });
 

@@ -34,6 +34,8 @@ import {
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { checkPiWarmPool, run } from "./doctor.js";
+import { CodexProcessPool } from "../../codex/pool.js";
+import * as backendHealth from "../backendHealth.js";
 
 // Real module namespaces — used as base, then overridden per-test.
 import * as botsStoreReal from "../botsStore.js";
@@ -406,6 +408,40 @@ describe("doctor --lint --json", () => {
         (c) => c.id === "claude-creds" && c.status === "error",
       );
       expect(claudeError).toBeDefined();
+    });
+  });
+
+  it.each([
+    { requiresOpenaiAuth: false, status: "ok", suggestsLogin: false },
+    { requiresOpenaiAuth: true, status: "warn", suggestsLogin: true },
+    { requiresOpenaiAuth: undefined, status: "warn", suggestsLogin: false },
+  ])("reports Codex auth as $status when requiresOpenaiAuth is $requiresOpenaiAuth", async ({ requiresOpenaiAuth, status, suggestsLogin }) => {
+    await withFakeHome(async () => {
+      const codexHome = path.join(tmpRoot, ".codex");
+      await mkdir(codexHome);
+      const oldCodexHome = process.env.CODEX_HOME;
+      process.env.CODEX_HOME = codexHome;
+      const binary = vi.spyOn(backendHealth, "detectCodexBinary").mockResolvedValue({ found: true });
+      const account = vi.spyOn(CodexProcessPool.prototype, "readAccount").mockResolvedValue({
+        account: null, authMode: null, requiresOpenaiAuth,
+      });
+      try {
+        await writeBotYaml("codex-bot", `${validBotYaml("codex-bot")}\nbackend: codex\n`);
+        await writeEnvFile({ TEST_APP_SECRET: "fake-secret" });
+        const output: unknown[] = [];
+        const ctx = buildCtx({ json: true, nonInteractive: true }, { captureJson: output });
+        await run(ctx, ["--lint"]);
+        const result = output[0] as { checks: Array<{ id: string; status: string; message: string }> };
+        const auth = result.checks.find((check) => check.id === "codex-login");
+        expect(account).toHaveBeenCalledOnce();
+        expect(auth?.status).toBe(status);
+        expect(auth?.message.includes("`codex login`")).toBe(suggestsLogin);
+      } finally {
+        binary.mockRestore();
+        account.mockRestore();
+        if (oldCodexHome === undefined) delete process.env.CODEX_HOME;
+        else process.env.CODEX_HOME = oldCodexHome;
+      }
     });
   });
 

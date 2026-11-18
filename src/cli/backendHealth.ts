@@ -1,45 +1,34 @@
 import { constants } from "node:fs";
 import { access, readdir, unlink, writeFile } from "node:fs/promises";
 import { execFile } from "node:child_process";
-import { homedir } from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
+import { codexHomePath, readCodexLogin } from "../codex/liveConfig.js";
+import { CodexProcessPool } from "../codex/pool.js";
 
 const execFileAsync = promisify(execFile);
 
-/**
- * codex auth.json default path.
- * Called on each invocation to respect $CODEX_HOME / HOME overrides.
- */
-export function codexAuthPath(): string {
-  return path.join(codexHomePath(), "auth.json");
-}
-
-/**
- * Codex HOME default path.
- * Called on each invocation to respect $CODEX_HOME / HOME overrides.
- */
-export function codexHomePath(): string {
-  return process.env["CODEX_HOME"] ?? path.join(homedir(), ".codex");
-}
-
-/**
- * Detect whether codex is logged in through the local Codex CLI account.
- *
- * Larkway's Codex runner strips OPENAI_API_KEY before spawning the child so the
- * dogfood/devops path uses the local subscription login rather than API key
- * billing. Therefore OPENAI_API_KEY is intentionally not accepted here.
- *
- * NEVER reads the credential value — only checks auth.json existence.
- */
-export async function detectCodexLogin(): Promise<boolean> {
+/** Inspect local auth using the same environment and account RPC as the runner. */
+export async function detectCodexAuth(): Promise<{ ready: boolean | null; message: string }> {
+  const unknown = { ready: null, message: "无法确认 Codex 凭据状态。请用启动 Larkway 的用户检查 Codex 原生配置。" };
+  const probe = new CodexProcessPool();
   try {
-    await access(codexAuthPath());
-    return true;
+    if (await readCodexLogin()) {
+      return { ready: true, message: "已检测到 Codex 本地凭据文件。" };
+    }
+    const { requiresOpenaiAuth } = await probe.readAccount();
+    if (requiresOpenaiAuth === false) {
+      return { ready: true, message: "当前 Codex 模型提供方无需 OpenAI 登录，可直接使用原生配置。" };
+    }
+    if (requiresOpenaiAuth === true) {
+      return { ready: false, message: "当前 Codex 模型提供方需要 OpenAI 登录，但未检测到可用的本地凭据文件。使用官方提供方时请运行 `codex login`，使用 CC Switch 时请确认已选中预期的提供方。" };
+    }
+    return unknown;
   } catch {
-    /* not found */
+    return unknown;
+  } finally {
+    await probe.shutdown(0);
   }
-  return false;
 }
 
 export interface CodexRuntimeWritableResult {

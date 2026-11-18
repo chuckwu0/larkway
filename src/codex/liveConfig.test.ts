@@ -40,6 +40,23 @@ describe("Codex live configuration reader", () => {
       expect(await read()).toMatchObject({ authMode: "chatgpt", account: "one@example.test" });
     } finally { await rm(dir, { recursive: true, force: true }); }
   });
+  it("tracks native provider edits with no login file and a CC Switch placeholder", async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), "live-provider-config-"));
+    try {
+      await writeFile(path.join(dir, "bot.yaml"), "id: example\nbackend: codex\n");
+      const configFile = path.join(dir, "config.toml");
+      await writeFile(configFile, 'model_provider = "custom"\n[model_providers.custom]\nexperimental_bearer_token = "fixture-one"\n');
+      const read = createCodexConfigReader(dir, "example", dir);
+      const initial = await read();
+      expect(initial.account).toBeNull();
+      expect(initial.authMode).toBeUndefined();
+      expect(JSON.stringify(initial)).not.toContain("fixture-one");
+      await writeFile(path.join(dir, "auth.json"), '{"OPENAI_API_KEY":null}');
+      expect((await read()).generation).toBe(initial.generation);
+      await writeFile(configFile, 'model_provider = "custom"\n[model_providers.custom]\nexperimental_bearer_token = "fixture-two"\n');
+      expect((await read()).generation).not.toBe(initial.generation);
+    } finally { await rm(dir, { recursive: true, force: true }); }
+  });
   it("finds yaml by bot identity and reads removal of model and effort on the next call", async () => {
     const dir = await mkdtemp(path.join(tmpdir(), "live-config-"));
     try {

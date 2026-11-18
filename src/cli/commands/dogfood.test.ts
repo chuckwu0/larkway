@@ -1,9 +1,10 @@
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { chmod, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { mkdtemp } from "node:fs/promises";
 import { run } from "./dogfood.js";
+import { CodexProcessPool } from "../../codex/pool.js";
 import * as botsStoreReal from "../botsStore.js";
 import * as hostConfigReal from "../hostConfig.js";
 import * as uiReal from "../ui.js";
@@ -39,7 +40,7 @@ beforeEach(async () => {
   const fakeClaude = path.join(fakeBin, "claude");
   await writeFile(fakeClaude, "#!/usr/bin/env sh\necho 'claude 0.0.0-test'\n", "utf8");
   await chmod(fakeClaude, 0o755);
-  await writeFile(path.join(fakeCodexHome, "auth.json"), "{\"ok\":true}\n", "utf8");
+  await writeFile(path.join(fakeCodexHome, "auth.json"), JSON.stringify({ OPENAI_API_KEY: "fixture" }), "utf8");
   process.env.PATH = `${fakeBin}${path.delimiter}${originalPath ?? ""}`;
   process.env.CODEX_HOME = fakeCodexHome;
   delete process.env.OPENAI_API_KEY;
@@ -314,19 +315,22 @@ describe.skipIf(process.platform === "win32")("dogfood preflight", () => {
     );
   });
 
-  it("fails if codex CLI is not logged in for larkway-devops", async () => {
+  it("fails if the native provider requires login and the Codex login file is missing", async () => {
     await writeDogfoodFixture();
-    process.env.CODEX_HOME = path.join(root, "missing-codex-home");
+    await rm(path.join(root, ".codex", "auth.json"));
     process.env.OPENAI_API_KEY = "sk-should-not-count";
+    const nativeAccount = vi.spyOn(CodexProcessPool.prototype, "readAccount").mockResolvedValue({
+      account: null, authMode: null, requiresOpenaiAuth: true,
+    });
     const json: unknown[] = [];
-    const code = await run(makeCtx(json), ["preflight"]);
+    const code = await run(makeCtx(json), ["preflight"]).finally(() => nativeAccount.mockRestore());
     expect(code).toBe(2);
     const payload = json[0] as { checks: Array<{ id: string; status: string; message?: string }> };
     expect(payload.checks).toContainEqual(
       expect.objectContaining({ id: "codex-login", status: "error" }),
     );
     expect(payload.checks.find((check) => check.id === "codex-login")?.message).toContain(
-      "OPENAI_API_KEY 不作为 dogfood 登录态",
+      "`codex login`",
     );
   });
 

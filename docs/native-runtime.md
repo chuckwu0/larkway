@@ -155,8 +155,9 @@ and native children keep their original process and settings. Enable pooling
 with a one-time idle service restart; `prewarmProcess: true` optionally verifies
 the runtime at startup without submitting a prompt.
 
-Both native ChatGPT subscription logins and existing file-managed API-key
-logins in Codex `auth.json` are supported. API-key or native `config.toml`
+Native ChatGPT subscriptions, file-managed API keys in Codex `auth.json`, and
+native providers that do not require OpenAI login (including CC Switch setups)
+are supported. API-key or native `config.toml`
 changes create a fresh process for subsequent turns; older generations drain
 without replaying work. The bridge still strips environment billing-key
 overrides and never logs credentials or their fingerprints. Account inspection

@@ -752,11 +752,9 @@ function lkBackendSelectHTML(value, containerId = "") {
       (isDefault ? `<span class="lk-bk-default-badge">默认</span>` : "") +
       `</span>` +
       `<span class="bk2-opt-sub">${esc(b.vendor)}` +
-      // 登录态微行:ready 探测来自 GET /api/backends(codex=login+runtime,
-      // claude 恒 true —— 细粒度登录态由能力体检卡负责,这里只做粗提示)
       (isReady
         ? `<span class="live-dot is-serving"></span>已就绪`
-        : `<span class="live-dot is-offline"></span>未就绪 · 终端 <code>${esc(id)} login</code>`) +
+        : `<span class="live-dot is-offline"></span>未就绪 · 运行 <code>larkway doctor</code>`) +
       `</span></span>` +
       `<span class="bk2-check">${sel ? ICONS.check : ""}</span>` +
       `</button>`
@@ -1267,8 +1265,8 @@ function hcComputeRows(id, bot, scan) {
     if (c.status === "fail") {
       const copyById = {
         "backend-login": {
-          name: `${backendName} 未登录`,
-          impact: `主机上底座 CLI 没登录 —— <b>本助手收到任务也跑不起来</b>。${esc(c.hint || "")}`,
+          name: `${backendName} 凭据检查未通过`,
+          impact: esc(c.hint || "请检查底座的凭据配置。"),
         },
         "lark-profile": {
           name: "lark-cli profile 不可用",
@@ -1292,12 +1290,12 @@ function hcComputeRows(id, bot, scan) {
       continue;
     }
     const okNoteById = {
-      "backend-login": `${backendName} 订阅登录态正常,底座随时可拉起。`,
+      "backend-login": `${backendName} 凭据检查通过。`,
       "lark-profile": `绑定到本应用 ${bot.app_id ? bot.app_id.slice(0, 12) + "…" : ""},能读飞书文档、拉话题历史(keychain 可读)。`,
       "git-token": "存于本机环境,clone / 推送可用。",
     };
     passed.push({
-      name: c.id === "backend-login" ? `${backendName} 已登录` : `${c.label} 已配置`,
+      name: c.id === "backend-login" ? `${backendName} 凭据就绪` : `${c.label} 已配置`,
       tag: "凭据",
       note: okNoteById[c.id] || "探测正常。",
     });

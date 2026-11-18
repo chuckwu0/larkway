@@ -49,7 +49,6 @@ function codexRuntimeRepairHint(): string {
     "这通常是 ~/.codex 目录或 state_*.sqlite 被错误权限/只读锁定导致的。请在这台机器上执行:",
     '  sudo chown -R "$USER":staff ~/.codex',
     "  chmod -R u+rwX ~/.codex",
-    "  codex login",
     "然后重启 larkway 再试。原始诊断已写入 bridge 日志。",
   ].join("\n");
 }

@@ -21,8 +21,8 @@ import * as botsStore from "../cli/botsStore.js";
 import * as hostConfig from "../cli/hostConfig.js";
 import * as bridgeControl from "../cli/bridgeControl.js";
 import {
+  detectCodexAuth,
   detectCodexBinary,
-  detectCodexLogin,
   detectCodexRuntimeWritable,
   detectPiAuth,
   detectPiBinary,
@@ -347,7 +347,7 @@ type HealthScanExecFile = (
 ) => Promise<{ stdout: string; stderr: string }>;
 let healthScanExecFile: HealthScanExecFile = execFileCompat as HealthScanExecFile;
 
-/** 底座登录态探针(生产=detectClaudeLogin / codex auth.json 文件探测 / pi auth check)。 */
+/** 底座凭据探针。 */
 let healthScanBackendLoginProbe: (backend: string, model?: string) => Promise<boolean | null> =
   defaultBackendLoginProbe;
 
@@ -419,14 +419,16 @@ async function runHealthScan(
   const loginHint =
     backend === "pi"
       ? `pi 的凭据按 provider 配置:在 ~/.pi/agent/models.json(或 provider 对应环境变量)配好 API key,然后 \`pi auth check --model ${bot.model ?? "<provider/model>"}\` 验证`
-      : `终端运行 \`${backend === "claude" ? "claude" : "codex login"}\` 完成登录`;
+      : backend === "codex"
+        ? "请运行 `larkway doctor`，检查 Codex 提供方凭据及状态目录。"
+        : "终端运行 `claude` 完成登录";
   credentials.push({
     id: "backend-login",
-    label: backend === "claude" ? "Claude 登录" : backend === "codex" ? "Codex 登录" : backend === "pi" ? "pi 模型凭据" : `${backend} 登录`,
+    label: backend === "claude" ? "Claude 登录" : backend === "codex" ? "Codex 凭据" : backend === "pi" ? "pi 模型凭据" : `${backend} 登录`,
     status: login === null ? "unknown" : login ? "ok" : "fail",
     severity: "required",
     global: true,
-    ...(login === false ? { hint: loginHint } : {}),
+    ...(login === false || (login === null && backend === "codex") ? { hint: loginHint } : {}),
   });
 
   // ② lark-cli profile bot 身份(agent 级,必需)—— auth status --json 一并
@@ -1901,20 +1903,12 @@ const BACKEND_META: Record<string, { id: string; name: string; short: string; ve
 /** Canonical display order (mirrors backendKit.jsx LK_BACKEND_ORDER, minus hypothetical gemini). */
 const BACKEND_ORDER = ["codex", "claude", "pi"];
 
-/**
- * Detect codex ready: binary in PATH AND local Codex CLI login auth.json.
- * Also require Codex's state dir/db to be writable; otherwise the first real
- * Feishu mention fails at runtime even though auth.json exists.
- *
- * OPENAI_API_KEY intentionally does not count here: the Codex runner strips it
- * before spawning the child so v0.3 dogfood/onboarding stays on subscription
- * login rather than API-key billing.
- */
-async function isCodexReady(): Promise<boolean> {
+/** Check CLI and state directory before inspecting the native provider's auth. */
+async function isCodexReady(): Promise<boolean | null> {
   const binary = await detectCodexBinary();
   if (!binary.found) return false;
-  if (!await detectCodexLogin()) return false;
-  return (await detectCodexRuntimeWritable()).ok;
+  if (!(await detectCodexRuntimeWritable()).ok) return false;
+  return (await detectCodexAuth()).ready;
 }
 
 /**
@@ -2030,7 +2024,7 @@ const getBackends: ApiHandler = async (_req) => {
   const piReady = (await detectPiBinary()).found;
   const ready: Record<string, boolean> = {
     claude: true,   // claude is always assumed ready (checked separately by doctor)
-    codex: codexReady,
+    codex: codexReady === true,
     pi: piReady,
   };
   const modelFacts = await readBackendModelFacts();

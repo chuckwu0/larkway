@@ -44,7 +44,7 @@ describe("ensureLocalBinOnPath", () => {
 describe("probeSpecForBackend", () => {
   it("knows claude and codex, skips unknown backends", () => {
     expect(probeSpecForBackend("claude")).toEqual({ bin: "claude", args: ["auth", "status"] });
-    expect(probeSpecForBackend("codex")).toEqual({ bin: "codex", args: ["login", "status"] });
+    expect(probeSpecForBackend("codex")).toEqual({ bin: "codex", args: ["--version"] });
     expect(probeSpecForBackend("gemini")).toBeUndefined();
   });
 });
@@ -54,7 +54,7 @@ describe("interpretProbe", () => {
     expect(
       interpretProbe("claude", { exitCode: 0, stdout: '{"loggedIn": true}' }).ok,
     ).toBe(true);
-    expect(interpretProbe("codex", { exitCode: 0, stdout: "Logged in" }).ok).toBe(true);
+    expect(interpretProbe("codex", { exitCode: 0, stdout: "codex-cli 0.0.0-test" }).ok).toBe(true);
   });
 
   it("unknown backend is always ok (no probe)", () => {
@@ -68,10 +68,10 @@ describe("interpretProbe", () => {
     expect(r.diagnosis).toContain(".local/bin");
   });
 
-  it("non-zero exit → not-logged-in diagnosis with login fix", () => {
-    const r = interpretProbe("codex", { exitCode: 1, stdout: "Not logged in" });
+  it("diagnoses a Codex version probe failure as a CLI problem", () => {
+    const r = interpretProbe("codex", { exitCode: 1 });
     expect(r.ok).toBe(false);
-    expect(r.diagnosis).toContain("codex login");
+    expect(r.diagnosis).toContain("codex --version");
   });
 
   it("claude loggedIn:false is caught even on exit 0 (belt and braces)", () => {
