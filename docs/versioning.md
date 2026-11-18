@@ -91,7 +91,8 @@
 | v0.3.84 | v0.3.84 | patch / 已发布 | apply Codex subscription, model and effort changes without interrupting active turns |
 | v0.3.85 | v0.3.85 | patch / 已发布 | support native API-key logins with live Codex configuration and graceful process rotation |
 | v0.3.86 | v0.3.86 | patch / 已发布 | Keep message contracts factual and agent-directed; preserve native session continuity |
-| v0.3.87 | v0.3.87 | 当前 patch / 已发布 | Fix Codex account handoff for existing topics and refresh service tier on resumed turns |
+| v0.3.87 | v0.3.87 | patch / 已发布 | Fix Codex account handoff for existing topics and refresh service tier on resumed turns |
+| v0.3.88 | v0.3.88 | 当前 patch / 已发布 | Fix Codex subscription handoff after thread errors and preserve complete Pi answers on Feishu cards |
 
 ## 使用原则
 
@@ -190,4 +191,5 @@ v0.3.84       = apply Codex subscription, model and effort changes without inter
 v0.3.85       = support native API-key logins with live Codex configuration and graceful process rotation
 v0.3.86       = Keep message contracts factual and agent-directed; preserve native session continuity
 v0.3.87       = Fix Codex account handoff for existing topics and refresh service tier on resumed turns
+v0.3.88       = Fix Codex subscription handoff after thread errors and preserve complete Pi answers on Feishu cards
 ```
