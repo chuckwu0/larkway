@@ -2045,6 +2045,36 @@ describe("cross-generation session handoff", () => {
     await pool.shutdown(0);
   });
 
+  it.each([
+    ["child", "failed", true],
+    ["child", "inProgress", false],
+    ["child", "unavailable", false],
+    ["other", "unavailable", true],
+  ] as const)("checks a system error on %s with latest turn %s", async (errored, latest, canRelease) => {
+    const { pool, child } = await fixture();
+    const handoff = pool.prepareSessionHandoff("parent");
+    await flush();
+    for (const request of readOutboundRequests(child)) {
+      const id = request.params!["threadId"];
+      const thread = { id, parentThreadId: id === "child" ? "parent" : null, status: { type: id === errored ? "systemError" : "idle" } };
+      child.stdout.write(JSON.stringify({ id: request.id, result: { thread } }) + "\n");
+    }
+    await flush();
+    const [probe] = readOutboundRequests(child);
+    expect(probe).toMatchObject({ method: "thread/turns/list", params: { threadId: errored, limit: 1 } });
+    child.stdout.write((latest === "unavailable" ? jsonRpcErrorResponse(probe!.id!, "unavailable")
+      : JSON.stringify({ id: probe!.id, result: { data: [{ status: latest }] } })) + "\n");
+    await flush();
+    const requests = readOutboundRequests(child);
+    if (canRelease) {
+      expect(requests).toHaveLength(1);
+      expect(requests[0]).toMatchObject({ method: "thread/unsubscribe", params: { threadId: "parent" } });
+      child.stdout.write(JSON.stringify({ id: requests[0]!.id, result: { status: "unsubscribed" } }) + "\n");
+    } else expect(requests).toHaveLength(0);
+    expect(await handoff).toBe(canRelease);
+    await pool.shutdown(0);
+  });
+
   it.each(["active", "race", "error", "notSubscribed"])("keeps the old writer on %s without interrupting it", async (mode) => {
     const { pool, child, notify } = await fixture();
     const handoff = pool.prepareSessionHandoff("parent");
