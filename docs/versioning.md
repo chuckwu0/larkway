@@ -92,7 +92,8 @@
 | v0.3.85 | v0.3.85 | patch / 已发布 | support native API-key logins with live Codex configuration and graceful process rotation |
 | v0.3.86 | v0.3.86 | patch / 已发布 | Keep message contracts factual and agent-directed; preserve native session continuity |
 | v0.3.87 | v0.3.87 | patch / 已发布 | Fix Codex account handoff for existing topics and refresh service tier on resumed turns |
-| v0.3.88 | v0.3.88 | 当前 patch / 已发布 | Fix Codex subscription handoff after thread errors and preserve complete Pi answers on Feishu cards |
+| v0.3.88 | v0.3.88 | patch / 已发布 | Fix Codex subscription handoff after thread errors and preserve complete Pi answers on Feishu cards |
+| v0.3.89 | v0.3.89 | 当前 patch / 已发布 | Support CC Switch without OpenAI login and fix Codex authentication guidance in doctor |
 
 ## 使用原则
 
@@ -192,4 +193,5 @@ v0.3.85       = support native API-key logins with live Codex configuration and 
 v0.3.86       = Keep message contracts factual and agent-directed; preserve native session continuity
 v0.3.87       = Fix Codex account handoff for existing topics and refresh service tier on resumed turns
 v0.3.88       = Fix Codex subscription handoff after thread errors and preserve complete Pi answers on Feishu cards
+v0.3.89       = Support CC Switch without OpenAI login and fix Codex authentication guidance in doctor
 ```
