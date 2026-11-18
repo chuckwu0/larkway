@@ -4792,8 +4792,9 @@ export class BridgeHandler {
                   // time (independent review, round 3).
                   ? `⚠️ 本轮长时间没有输出（静默 ${formatSilence(idleObservedSilenceMs)}）后结束，没有产出正文。\n` +
                     idleThresholdHint(idleTimeoutMs, idleKillAfterMs)
-                : reportedState?.last_message ??
-                  (fallbackAnswer ? fallbackAnswer : taskCardProgress?.hasProgress ? taskCardProgress.latestText : noOutputFallback);
+                : (success && backend === "pi" ? trustedAnswerText.trim() : "") ||
+                  (reportedState?.last_message ??
+                    (fallbackAnswer ? fallbackAnswer : taskCardProgress?.hasProgress ? taskCardProgress.latestText : noOutputFallback));
 
           // 批F (F2): persist this turn's user-facing answer into the session
           // transcript so a future reseed seed carries BOTH sides of the
