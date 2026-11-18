@@ -9,8 +9,8 @@
  * 1. Auth not usable — the backend CLI is installed but cannot authenticate.
  *    claude keeps its OAuth token in the macOS keychain: a locked login
  *    keychain (headless/SSH start) yields "Not logged in" even though the
- *    operator logged in from the GUI. codex similarly reports its login state
- *    via `codex login status`.
+ *    operator logged in from the GUI. Codex auth also depends on the active
+ *    native model provider, which may use its own credentials.
  * 2. CLI not on PATH — supervisors (launchd/systemd/watchdog scripts) run
  *    with a minimal PATH that misses `~/.local/bin`, where claude's native
  *    installer puts the binary. Every turn then dies with "CLI not found".
@@ -24,6 +24,7 @@
  */
 
 import path from "node:path";
+import { detectCodexAuth } from "../cli/backendHealth.js";
 import { spawnProcess } from "../platform/spawn.js";
 
 /**
@@ -65,13 +66,13 @@ export interface ProbeHint {
   model?: string;
 }
 
-/** Login-status probe command per backend; undefined = backend has no probe. */
+/** Initial CLI probe command per backend; undefined = backend has no probe. */
 export function probeSpecForBackend(backend: string, hint: ProbeHint = {}): ProbeSpec | undefined {
   switch (backend) {
     case "claude":
       return { bin: "claude", args: ["auth", "status"] };
     case "codex":
-      return { bin: "codex", args: ["login", "status"] };
+      return { bin: "codex", args: ["--version"] };
     case "pi": {
       // `pi auth check --model` takes exactly what the runner passes to
       // `--model` (bare id, provider/id or pattern) and resolves the provider
@@ -156,6 +157,9 @@ export function interpretProbe(
   const claudeLoggedOut =
     backend === "claude" && /"loggedIn"\s*:\s*false/.test(result.stdout ?? "");
   if ((result.exitCode ?? 1) !== 0 || claudeLoggedOut) {
+    if (backend === "codex") {
+      return { ok: false, diagnosis: "Codex CLI could not start. Check `codex --version` as the bridge's user." };
+    }
     const keychainHint =
       backend === "claude" && platform === "darwin"
         ? " On macOS a LOCKED login keychain produces this too (claude stores its OAuth token there; " +
@@ -173,13 +177,13 @@ export function interpretProbe(
   return { ok: true };
 }
 
-/** Run the login probe for one backend (10 s cap). Never throws. */
+/** Run the CLI probe (10 s cap), then inspect the native Codex provider if applicable. */
 export async function probeBackendReadiness(backend: string, hint: ProbeHint = {}): Promise<ProbeOutcome> {
   const spec = probeSpecForBackend(backend, hint);
   if (!spec) return { ok: true };
   const interpret = (r: Parameters<typeof interpretProbe>[1]): ProbeOutcome =>
     interpretProbe(backend, r, process.platform, hint);
-  return new Promise<ProbeOutcome>((resolve) => {
+  const outcome = await new Promise<ProbeOutcome>((resolve) => {
     let settled = false;
     let timer: ReturnType<typeof setTimeout> | undefined;
     const done = (outcome: ProbeOutcome): void => {
@@ -214,4 +218,7 @@ export async function probeBackendReadiness(backend: string, hint: ProbeHint = {
       done(interpret({ exitCode: code, stdout: Buffer.concat(out).toString("utf8") }));
     });
   });
+  if (backend !== "codex" || !outcome.ok) return outcome;
+  const auth = await detectCodexAuth();
+  return auth.ready === true ? outcome : { ok: false, diagnosis: auth.message };
 }

@@ -44,6 +44,23 @@ function fixture(onCreate?: (pool: Pool, index: number) => void) {
 }
 
 describe("live Codex configuration", () => {
+  it.each([false, true, undefined])("admits a turn without local login only when requiresOpenaiAuth is false (%s)", async (requiresOpenaiAuth) => {
+    const f = fixture((pool) => {
+      pool.settings = { account: null, authMode: null, requiresOpenaiAuth, model: "custom-model" };
+    });
+    f.set({ account: null });
+    const handle = f.runner.run({ prompt: "use the configured provider" });
+    if (requiresOpenaiAuth === false) {
+      await tick();
+      expect(f.pools[0]!.calls).toMatchObject([{ prompt: "use the configured provider", model: "custom-model" }]);
+      f.pools[0]!.finish();
+      await expect(handle.done).resolves.toMatchObject({ exitCode: 0 });
+    } else {
+      await expect(handle.done).rejects.toThrow("could not be verified");
+      expect(f.pools[0]!.calls).toHaveLength(0);
+    }
+  });
+
   it("refreshes service tier on resumed turns without rotating or interrupting the process", async () => {
     const f = fixture();
     const a = f.runner.run({ prompt: "first" }); await tick();

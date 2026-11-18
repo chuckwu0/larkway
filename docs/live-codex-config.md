@@ -20,7 +20,7 @@ This applies to new and resumed
 turns, including cold fallback; running turns and steering keep their original
 settings. Runtime status includes the tier observed at admission.
 
-Other bot settings, provider changes, and backend changes are not part of this hot-update contract.
+Edits to `config.toml` start a fresh process for subsequent turns and let the prior process drain. Bot YAML settings other than `model` and `effort` still require the normal service reload workflow.
 
 ## Subscription changes
 
@@ -30,6 +30,12 @@ not access/refresh-token bytes. Ordinary token renewal does not rotate a process
 The bridge does not log, copy, persist or inject credentials. Continue signing
 in through Codex or the host's existing account management flow. Keychain-only
 and externally supplied-token login modes are outside this file-based observer.
+
+Native providers configured by tools such as CC Switch can supply their own
+authentication. If `account/read` reports `requiresOpenaiAuth: false`, the
+warm runner accepts that provider with an absent or empty `auth.json`. Codex
+resolves its native model defaults and provider credentials. The check does
+not submit a prompt or validate credentials with the provider.
 
 When the principal changes, new work is admitted to a newly initialized native
 process. The actual process's `account/read` response is checked against the

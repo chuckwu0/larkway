@@ -1942,6 +1942,24 @@ describe("CodexProcessPool — prewarm (批D)", () => {
 });
 
 describe("Codex pool runtime inspection and drain safety", () => {
+  it("leaves a custom provider's missing effort to Codex without querying the model catalog", async () => {
+    const pool = new CodexProcessPool({});
+    const pending = pool.runtimeSettings();
+    const child = spawnedChildren[0]!;
+    readOutboundRequests(child);
+    child.stdout.write(initResponse(1) + "\n");
+    await flush();
+    const [config] = readOutboundRequests(child);
+    child.stdout.write(JSON.stringify({ id: config!.id, result: { config: { model: "custom" } } }) + "\n");
+    await flush();
+    const [account] = readOutboundRequests(child);
+    expect(account).toMatchObject({ method: "account/read", params: { refreshToken: false } });
+    child.stdout.write(JSON.stringify({ id: account!.id, result: { account: null, requiresOpenaiAuth: false } }) + "\n");
+    expect(await pending).toMatchObject({ model: "custom", effort: undefined, account: null, requiresOpenaiAuth: false });
+    expect(readOutboundRequests(child)).toHaveLength(0);
+    await pool.shutdown(0);
+  });
+
   it.each([
     { account: { type: "chatgpt", email: "example@example.test" }, authMode: "chatgpt", email: "example@example.test" },
     { account: { type: "apiKey" }, authMode: "apiKey", email: null },

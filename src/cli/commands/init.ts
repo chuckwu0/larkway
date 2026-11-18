@@ -30,7 +30,7 @@ import type { ConfigJsonType } from "../../config.js";
 import { detectClaudeLogin, claudeLoginHint } from "../claudeAuth.js";
 import {
   detectCodexBinary,
-  detectCodexLogin,
+  detectCodexAuth,
   detectCodexRuntimeWritable,
   detectPiBinary,
 } from "../backendHealth.js";
@@ -128,20 +128,21 @@ async function runPreflightChecks(ctx: CliContext, backendHint: string): Promise
       ui.failure("未找到 `codex` binary。选择 backend=codex 前请先安装 Codex CLI 并确保 PATH 可见。");
       allOk = false;
     }
-    const codexLoggedIn = await detectCodexLogin();
-    if (codexLoggedIn) {
-      ui.success("Codex CLI 已登录(auth.json)");
-    } else {
-      ui.failure("未检测到 Codex 登录态(~/.codex/auth.json)。请先运行 `codex login`。");
-      allOk = false;
-    }
     const runtime = await detectCodexRuntimeWritable();
     if (runtime.ok) {
       ui.success(`Codex 状态目录可写(${runtime.codexHome})`);
+      if (binary.found) {
+        const auth = await detectCodexAuth();
+        if (auth.ready === true) {
+          ui.success(auth.message);
+        } else {
+          ui.failure(auth.message);
+          allOk = false;
+        }
+      }
     } else {
       ui.failure(
-        `${runtime.message ?? "Codex 状态目录不可写"}。请执行: ` +
-          `sudo chown -R "$USER":staff ~/.codex && chmod -R u+rwX ~/.codex, 然后 codex login。`,
+        `${runtime.message ?? "Codex 状态目录不可写"}。请检查该路径的所有者及读写权限。`,
       );
       allOk = false;
     }

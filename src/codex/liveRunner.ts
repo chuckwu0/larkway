@@ -7,7 +7,7 @@ import { TurnEventQueue } from "../agent/turnEventQueue.js";
 import { CodexProcessPool, reapOrphanedWarmProcess, type CodexProcessPoolOptions } from "./pool.js";
 import type { CodexConfigSnapshot } from "./liveConfig.js";
 
-export type RuntimeSettings = { model?: string; effort?: string; serviceTier?: string | null; account: string | null; authMode?: "chatgpt" | "apiKey" | null };
+export type RuntimeSettings = { model?: string; effort?: string; serviceTier?: string | null; account: string | null; authMode?: "chatgpt" | "apiKey" | null; requiresOpenaiAuth?: boolean };
 export interface LivePool extends AgentRunner {
   readonly childPid: number | undefined;
   readonly hasLiveWork: boolean;
@@ -98,11 +98,16 @@ export class LiveCodexRunner implements AgentRunner {
       }
       const native = await generation.pool.runtimeSettings(cwd);
       const verifiedPid = generation.pool.childPid;
-      if (snapshot.authMode !== undefined && native.authMode !== snapshot.authMode) {
-        throw new Error("Codex process authentication mode differs from the selected login");
-      }
-      if (snapshot.account !== null && native.account !== snapshot.account) {
-        throw new Error("Codex process account differs from the selected subscription");
+      if (native.requiresOpenaiAuth !== false) {
+        if (snapshot.authMode === undefined && snapshot.account === null) {
+          throw new Error("Codex has no supported local login and the provider has not confirmed independent authentication");
+        }
+        if (snapshot.authMode !== undefined && native.authMode !== snapshot.authMode) {
+          throw new Error("Codex process authentication mode differs from the selected login");
+        }
+        if (snapshot.account !== null && native.account !== snapshot.account) {
+          throw new Error("Codex process account differs from the selected subscription");
+        }
       }
       // Detect edits racing process initialization. No request has been submitted.
       const latest = await this.readConfig();
@@ -113,7 +118,9 @@ export class LiveCodexRunner implements AgentRunner {
       if (verifiedPid === undefined || generation.pool.childPid !== verifiedPid) throw new Error("Verified Codex process exited before admission");
       const settings = { ...native, model: snapshot.model ?? native.model, effort: snapshot.effort ?? native.effort };
       // Explicit model prevents thread/resume from pinning an old thread override.
-      if (!settings.model || !settings.effort) throw new Error("Set an explicit Codex model and reasoning effort before starting turns");
+      if (native.requiresOpenaiAuth !== false && (!settings.model || !settings.effort)) {
+        throw new Error("Set an explicit Codex model and reasoning effort before starting turns");
+      }
       generation.settings = settings;
       this.#current = generation;
       this.#next = settings;

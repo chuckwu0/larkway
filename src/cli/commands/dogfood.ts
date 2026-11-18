@@ -5,7 +5,7 @@ import { resolveAgentWorkspacePathFromHome } from "../../config/paths.js";
 import {
   detectClaudeBinary,
   detectCodexBinary,
-  detectCodexLogin,
+  detectCodexAuth,
   detectCodexRuntimeWritable,
 } from "../backendHealth.js";
 import { checkWorkspacePermissionGrant } from "../../agent/permissionGate.js";
@@ -362,8 +362,8 @@ async function backendHealthChecks(backend: string, botId: string): Promise<Chec
     }];
   }
 
-  const loggedIn = await detectCodexLogin();
   const runtime = await detectCodexRuntimeWritable();
+  const auth = runtime.ok ? await detectCodexAuth() : null;
   return [
     {
       id: "codex-binary",
@@ -373,11 +373,9 @@ async function backendHealthChecks(backend: string, botId: string): Promise<Chec
     },
     {
       id: "codex-login",
-      label: "codex CLI is logged in",
-      status: loggedIn ? "ok" : botId === DEFAULT_BOT_ID ? "error" : "warn",
-      message: loggedIn
-        ? undefined
-        : "未检测到 ~/.codex/auth.json;请先运行 `codex login`。OPENAI_API_KEY 不作为 dogfood 登录态,因为 Larkway 的 Codex runner 会剥离 API key。",
+      label: "codex provider authentication",
+      status: !auth || auth.ready === true ? "ok" : botId === DEFAULT_BOT_ID ? "error" : "warn",
+      message: auth?.message ?? "状态目录不可写，跳过认证探测。",
     },
     {
       id: "codex-runtime-writable",
@@ -385,7 +383,7 @@ async function backendHealthChecks(backend: string, botId: string): Promise<Chec
       status: runtime.ok ? "ok" : botId === DEFAULT_BOT_ID ? "error" : "warn",
       message: runtime.ok
         ? runtime.codexHome
-        : `${runtime.message ?? "Codex 状态目录不可写"}。请执行: sudo chown -R "$USER":staff ~/.codex && chmod -R u+rwX ~/.codex, 然后 codex login。`,
+        : `${runtime.message ?? "Codex 状态目录不可写"}。请检查该路径的所有者及读写权限。`,
     },
   ];
 }
