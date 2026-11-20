@@ -2131,6 +2131,56 @@ describe("cross-generation session handoff", () => {
 });
 
 describe("native writer release acknowledgement", () => {
+  it("keeps a locked continuation queued past a minute while another topic completes", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+    const pool = new CodexProcessPool({ allowColdFallback: false });
+    const waiting = pool.run({ prompt: "continue exactly once", resumeSessionId: "old" });
+    void waiting.done.catch(() => {});
+    const child = spawnedChildren[0]!;
+    readOutboundRequests(child);
+    child.stdout.write(initResponse(1) + "\n");
+    await flush();
+    let [resume] = readOutboundRequests(child);
+    const rejectResume = async () => {
+      expect(resume).toMatchObject({ method: "thread/resume", params: { threadId: "old" } });
+      child.stdout.write(jsonRpcErrorResponse(resume!.id!, "thread old already has an active writer") + "\n");
+      await flush();
+    };
+    await rejectResume();
+
+    const other = pool.run({ prompt: "unrelated topic" });
+    await flush();
+    const [fresh] = readOutboundRequests(child);
+    expect(fresh?.method).toBe("thread/start");
+    child.stdout.write(threadResponse(fresh!.id!, "new") + "\n");
+    await flush();
+    const [start] = readOutboundRequests(child);
+    child.stdout.write(turnStartResponse(start!.id!, "fresh-turn") + "\n" + turnCompleted("new", "fresh-turn") + "\n");
+    expect((await other.done).exitCode).toBe(0);
+
+    for (let elapsed = 0; elapsed < 65_000; elapsed += 5_000) {
+      await vi.advanceTimersByTimeAsync(5_000);
+      const requests = readOutboundRequests(child);
+      expect(requests).toHaveLength(1);
+      [resume] = requests;
+      await rejectResume();
+    }
+    await vi.advanceTimersByTimeAsync(5_000);
+    const [last] = readOutboundRequests(child);
+    expect(last?.method).toBe("thread/resume");
+    child.stdout.write(threadResponse(last!.id!, "old") + "\n");
+    await flush();
+    const requests = readOutboundRequests(child);
+    expect(requests).toMatchObject([{ method: "turn/start", params: {
+      threadId: "old", input: [{ text: "continue exactly once" }],
+    } }]);
+    child.stdout.write(turnStartResponse(requests[0]!.id!, "resumed-turn") + "\n" + turnCompleted("old", "resumed-turn") + "\n");
+    expect((await waiting.done).sessionId).toBe("old");
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(readOutboundRequests(child)).toEqual([]);
+    await pool.shutdown(0);
+  });
+
   it("waits through two concurrent rejected resumes and submits each input exactly once", async () => {
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
     const pool = new CodexProcessPool({ allowColdFallback: false });
@@ -2161,7 +2211,7 @@ describe("native writer release acknowledgement", () => {
     await pool.shutdown(0);
   });
 
-  it.each(["cancel", "timeout"])("does not retry or submit after %s while the native writer is closing", async (mode) => {
+  it.each(["cancel", "timeout", "shutdown"])("does not retry or submit after %s while the native writer is closing", async (mode) => {
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
     const pool = new CodexProcessPool({ allowColdFallback: false });
     const turn = pool.run({ prompt: "must not execute", resumeSessionId: "session", timeoutMs: mode === "timeout" ? 100 : undefined });
@@ -2170,10 +2220,33 @@ describe("native writer release acknowledgement", () => {
     const [resume] = readOutboundRequests(child);
     child.stdout.write(jsonRpcErrorResponse(resume!.id!, "thread session already has an active writer") + "\n"); await flush();
     if (mode === "cancel") turn.kill();
+    if (mode === "shutdown") await pool.shutdown();
     await vi.advanceTimersByTimeAsync(1_000); await flush();
-    expect(await turn.done).toMatchObject({ interrupted: true, interruptionReason: mode });
+    expect(await turn.done).toMatchObject({ interrupted: true, interruptionReason: mode === "shutdown" ? "cancel" : mode });
     expect(readOutboundRequests(child)).toEqual([]);
-    expect(child.killSignals).toEqual([]);
+    if (mode !== "shutdown") expect(child.killSignals).toEqual([]);
     await pool.shutdown(0);
+  });
+
+  it("ignores a successful retry that arrives after shutdown cancels the wait", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+    const pool = new CodexProcessPool({ allowColdFallback: false });
+    const turn = pool.run({ prompt: "do not submit", resumeSessionId: "old" });
+    const child = spawnedChildren[0]!;
+    readOutboundRequests(child);
+    child.stdout.write(initResponse(1) + "\n");
+    await flush();
+    const [first] = readOutboundRequests(child);
+    child.stdout.write(jsonRpcErrorResponse(first!.id!, "thread old already has an active writer") + "\n");
+    await flush();
+    await vi.advanceTimersByTimeAsync(250);
+    const [retry] = readOutboundRequests(child);
+    expect(retry?.method).toBe("thread/resume");
+    const shutdown = pool.shutdown();
+    child.stdout.write(threadResponse(retry!.id!, "old") + "\n");
+    await flush();
+    await shutdown;
+    expect(await turn.done).toMatchObject({ interrupted: true });
+    expect(readOutboundRequests(child)).toEqual([]);
   });
 });

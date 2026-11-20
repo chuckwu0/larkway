@@ -120,7 +120,8 @@ interface TurnState {
   timeoutHandle?: ReturnType<typeof setTimeout>;
   abortListener?: () => void;
   waitingForCancellation?: boolean;
-  writerReleaseWaitStartedAt?: number;
+  /** Retained during the retry RPC too, until resume succeeds or the wait ends. */
+  writerRetry?: ReturnType<typeof setTimeout>;
   interruptionReason?: "cancel" | "timeout";
 }
 
@@ -513,6 +514,7 @@ export class CodexProcessPool implements AgentRunner {
     this.#shuttingDown = true;
     // Native-stop gates never hold a locally queued handle open on shutdown.
     for (const state of this.#turns.values()) {
+      if (state.writerRetry) this.#interruptTurn(state.turnKey);
       if (state.waitingForCancellation) this.#settleReject(state, new Error("[codex-pool] pool is shutting down while waiting for a cancelled turn"));
     }
     if (this.#idleTimer) {
@@ -628,6 +630,8 @@ export class CodexProcessPool implements AgentRunner {
    */
   #fallbackToCold(state: TurnState, causeErr: Error): void {
     if (state.settled || state.coldHandle) return;
+    clearTimeout(state.writerRetry);
+    state.writerRetry = undefined;
     if (!this.#allowColdFallback) { this.#settleReject(state, causeErr); return; }
 
     if (state.threadId != null) {
@@ -777,6 +781,7 @@ export class CodexProcessPool implements AgentRunner {
   #settleResolve(state: TurnState, result: DoneResult): void {
     if (state.settled) return;
     state.settled = true;
+    clearTimeout(state.writerRetry);
     if (state.timeoutHandle) clearTimeout(state.timeoutHandle);
     if (state.abortListener) state.opts.abortSignal?.removeEventListener("abort", state.abortListener);
     state.queue.end();
@@ -792,6 +797,7 @@ export class CodexProcessPool implements AgentRunner {
   #settleReject(state: TurnState, err: Error): void {
     if (state.settled) return;
     state.settled = true;
+    clearTimeout(state.writerRetry);
     if (state.timeoutHandle) clearTimeout(state.timeoutHandle);
     if (state.abortListener) state.opts.abortSignal?.removeEventListener("abort", state.abortListener);
     state.queue.end();
@@ -1084,6 +1090,7 @@ export class CodexProcessPool implements AgentRunner {
       case "thread": {
         const state = this.#turns.get(pending.turnKey);
         if (state == null || state.settled) return;
+        state.writerRetry = undefined;
         const threadId = extractThreadIdFromThreadResponse(raw);
         if (threadId == null) {
           this.#fallbackToCold(state, new Error("thread/start|resume response missing thread.id"));
@@ -1133,13 +1140,14 @@ export class CodexProcessPool implements AgentRunner {
           // unsubscribe acknowledges a shutdown request before the native writer
           // lock is necessarily dropped. Only retry an explicitly rejected resume;
           // no turn/start (and hence no user input) has been submitted yet.
-          state.writerReleaseWaitStartedAt ??= Date.now();
-          if (Date.now() - state.writerReleaseWaitStartedAt < 15_000) {
-            const retry = setTimeout(() => {
-              if (!state.settled && !state.coldHandle) this.#sendThreadRequest(state, !this.#excludeTurnsUnsupported);
-            }, 250);
-            retry.unref?.();
-          } else this.#settleReject(state, new Error("Codex session handoff is still waiting for the previous writer to release its lock"));
+          if (this.#shuttingDown) {
+            this.#interruptTurn(state.turnKey);
+            return;
+          }
+          // Try promptly once, then poll slowly under the turn's own timeout/cancellation.
+          const delay = state.writerRetry ? 5_000 : 250;
+          state.writerRetry = setTimeout(() => this.#sendThreadRequest(state, !this.#excludeTurnsUnsupported), delay);
+          state.writerRetry.unref?.();
           return;
         }
         if (pending.excludeTurns && isExcludeTurnsRejection(err.message)) {
