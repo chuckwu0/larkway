@@ -806,6 +806,8 @@ export class CodexProcessPool implements AgentRunner {
     const [bin, args] = buildCodexCommand({ prompt: "" }, this.#codexBinPath);
     const env = buildCodexEnv(this.#botGitIdentity, this.#gitlabToken, this.#larkCliConfigDir);
     const child = spawnPiped(bin, args, { env });
+    // An unread stderr pipe can fill and block the app-server's RPC workers.
+    child.stderr.resume();
     this.#child = child;
     if (child.pid !== undefined) this.#unexitedChildren.add(child);
     this.#childSpawnedAt = Date.now();
