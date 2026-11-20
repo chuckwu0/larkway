@@ -1931,6 +1931,16 @@ async function writeFileForTest(filePath: string, content: unknown): Promise<voi
 // ---------------------------------------------------------------------------
 
 describe("CodexProcessPool — prewarm (批D)", () => {
+  it("drains stderr even while the app-server is idle", async () => {
+    const pool = new CodexProcessPool({});
+    pool.prewarm();
+    const { stderr } = spawnedChildren[0]!;
+    stderr.write(Buffer.alloc(stderr.readableHighWaterMark * 2));
+    await flush();
+    expect(stderr.readableLength).toBe(0);
+    await pool.shutdown(0);
+  });
+
   it("prewarm() spawns the app-server before any turn, and run() reuses it (idempotent)", async () => {
     const pool = new CodexProcessPool({});
     expect(spawnedChildren).toHaveLength(0);
