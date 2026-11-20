@@ -93,7 +93,8 @@
 | v0.3.86 | v0.3.86 | patch / 已发布 | Keep message contracts factual and agent-directed; preserve native session continuity |
 | v0.3.87 | v0.3.87 | patch / 已发布 | Fix Codex account handoff for existing topics and refresh service tier on resumed turns |
 | v0.3.88 | v0.3.88 | patch / 已发布 | Fix Codex subscription handoff after thread errors and preserve complete Pi answers on Feishu cards |
-| v0.3.89 | v0.3.89 | 当前 patch / 已发布 | Support CC Switch without OpenAI login and fix Codex authentication guidance in doctor |
+| v0.3.89 | v0.3.89 | patch / 已发布 | Support CC Switch without OpenAI login and fix Codex authentication guidance in doctor |
+| v0.3.90 | v0.3.90 | 当前 patch / 已发布 | 持续读取常驻 Codex 进程的错误输出，修复日志管道写满后当前任务卡住、新任务配置校验超时的问题。 |
 
 ## 使用原则
 
@@ -194,4 +195,5 @@ v0.3.86       = Keep message contracts factual and agent-directed; preserve nati
 v0.3.87       = Fix Codex account handoff for existing topics and refresh service tier on resumed turns
 v0.3.88       = Fix Codex subscription handoff after thread errors and preserve complete Pi answers on Feishu cards
 v0.3.89       = Support CC Switch without OpenAI login and fix Codex authentication guidance in doctor
+v0.3.90       = 持续读取常驻 Codex 进程的错误输出，修复日志管道写满后当前任务卡住、新任务配置校验超时的问题。
 ```
