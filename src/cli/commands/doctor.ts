@@ -39,6 +39,7 @@ import {
   detectCodexRuntimeWritable,
   detectPiAuth,
   detectPiBinary,
+  detectAntigravityBinary,
 } from "../backendHealth.js";
 import { effectiveWarmProcess } from "../../config/botLoader.js";
 import { DEFAULT_MAX_PROCESSES as PI_DEFAULT_MAX_PROCESSES } from "../../pi/pool.js";
@@ -850,6 +851,14 @@ async function runAllChecks(ctx: CliContext, opts: { lint: boolean }): Promise<C
   results.push(...codexChecks);
 
   // 6b. pi CLI availability (required only if a bot uses backend: pi)
+  if (await backendRequired(ctx, "antigravity")) {
+    const agy = await detectAntigravityBinary();
+    results.push({
+      id: "antigravity-binary", label: "Antigravity CLI",
+      status: agy.found ? "ok" : "error",
+      message: agy.found ? `agy ${agy.version}。订阅登录需在 agy 中确认。` : "请安装 Antigravity CLI 并运行 agy 登录。",
+    });
+  }
   const piChecks = await checkPi(ctx);
   results.push(...piChecks);
   results.push(...(await checkPiWarmPool(ctx)));

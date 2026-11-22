@@ -145,7 +145,7 @@ export function runtimeRequirementsForBots(bots: BotConfig[]): RuntimeRequiremen
 
   for (const bot of bots) {
     addCliRequirement(requirements, {
-      command: bot.backend ?? "claude",
+      command: bot.backend === "antigravity" ? "agy" : bot.backend ?? "claude",
       severity: "required",
       botIds: [bot.id],
       reason: `Required to run this bot's ${bot.backend ?? "claude"} backend.`,

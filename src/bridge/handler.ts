@@ -4792,7 +4792,7 @@ export class BridgeHandler {
                   // time (independent review, round 3).
                   ? `⚠️ 本轮长时间没有输出（静默 ${formatSilence(idleObservedSilenceMs)}）后结束，没有产出正文。\n` +
                     idleThresholdHint(idleTimeoutMs, idleKillAfterMs)
-                : (success && backend === "pi" ? trustedAnswerText.trim() : "") ||
+                : (success && (backend === "pi" || backend === "antigravity") ? trustedAnswerText.trim() : "") ||
                   (reportedState?.last_message ??
                     (fallbackAnswer ? fallbackAnswer : taskCardProgress?.hasProgress ? taskCardProgress.latestText : noOutputFallback));
 

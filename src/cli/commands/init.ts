@@ -33,6 +33,7 @@ import {
   detectCodexAuth,
   detectCodexRuntimeWritable,
   detectPiBinary,
+  detectAntigravityBinary,
 } from "../backendHealth.js";
 import { ensureAgentWorkspace, resetAgentWorkspacePermissions } from "../../agent/workspaceStore.js";
 import { permissionItemsFromCapabilities } from "../../agent/permissionPlan.js";
@@ -144,6 +145,13 @@ async function runPreflightChecks(ctx: CliContext, backendHint: string): Promise
       ui.failure(
         `${runtime.message ?? "Codex 状态目录不可写"}。请检查该路径的所有者及读写权限。`,
       );
+      allOk = false;
+    }
+  } else if (backendHint === "antigravity") {
+    const binary = await detectAntigravityBinary();
+    if (binary.found) ui.success(`Antigravity CLI ${binary.version}，请以启动 bridge 的用户运行 agy 完成 Google 登录。`);
+    else {
+      ui.failure("未找到可用的 agy。请先安装 Google Antigravity CLI。");
       allOk = false;
     }
   } else if (backendHint === "pi") {
@@ -574,7 +582,7 @@ async function collectBotBasics(
     argMap["backend"] ??
     (flags.nonInteractive
       ? "codex"
-      : await ui.prompt("Agent backend (codex / claude):", { default: "codex", ...niOpts }))
+      : await ui.prompt("Agent backend (codex / claude / pi / antigravity):", { default: "codex", ...niOpts }))
   ).trim();
   if (!backend) {
     throw new Error("backend 不能为空");

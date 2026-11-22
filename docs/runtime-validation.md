@@ -11,6 +11,15 @@ This guide describes an opt-in validation workflow. It does not run as part of
 Feishu runs require an authorized test environment. Runtime defaults and known
 interaction gaps are in [native runtime alignment](native-runtime.md).
 
+## Local Antigravity smoke check
+
+After signing in to `agy` with the intended Google account, run
+`pnpm exec tsx scripts/smoke-antigravity.ts --run` from the checkout. This
+submits three Neon High turns in a disposable local directory. It verifies
+a tool-created file, two independent conversation IDs, and recall after cold
+resume with another topic in between. The script prints the fixture directory
+for inspection. It uses no Feishu credentials or transport.
+
 ## Prepare comparable, isolated runs
 
 Record the source revision and build checksum, runtime CLI versions, model,

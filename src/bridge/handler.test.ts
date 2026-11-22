@@ -8616,7 +8616,7 @@ describe("handleOne — work still running when the turn ends", () => {
   async function runTurn(
     done: { exitCode: number; backgroundTasksPending?: number; stateFreshAfter?: number },
     freshState?: Record<string, unknown>,
-    backend: "pi" | "claude" = "claude",
+    backend: "pi" | "claude" | "antigravity" = "claude",
   ): Promise<{ finalizeArgs: FinalizeArgs[] }> {
     const wt = freshState ? await seedWorktree("om_msg") : undefined;
     runClaudeImpl = () => ({
@@ -8677,8 +8677,8 @@ describe("handleOne — work still running when the turn ends", () => {
     expect(finalizeArgs[0]?.finalText).toBe("修复已提交，真机验证还在后台跑。");
   });
 
-  it("keeps the complete Pi answer when ready state carries only a summary", async () => {
-    const { finalizeArgs } = await runTurn({ exitCode: 0 }, { status: "ready", last_message: "摘要" }, "pi");
+  it.each(["pi", "antigravity"] as const)("keeps the complete %s answer when ready state carries only a summary", async (backend) => {
+    const { finalizeArgs } = await runTurn({ exitCode: 0 }, { status: "ready", last_message: "摘要" }, backend);
     expect(finalizeArgs[0]?.finalText).toBe("修复已提交，真机验证还在后台跑。");
   });
 

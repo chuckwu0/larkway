@@ -638,15 +638,15 @@ const BR = {
 
 /**
  * 底座静态元数据注册表(可扩展:加第三个 = 加一条)。
- * 仅 claude + codex 是真实底座;gemini 等假想项不进 UI。
  */
 const LK_BACKENDS_META = {
   claude: { id: "claude", name: "Claude Code", short: "Claude", vendor: "Anthropic 订阅", mono: "CC" },
+  antigravity: { id: "antigravity", name: "Antigravity CLI", short: "Antigravity", vendor: "Google AI 订阅", mono: "AG" },
   codex:  { id: "codex",  name: "Codex",       short: "Codex",  vendor: "OpenAI 订阅",  mono: "CX" },
 };
 
 /** 显示顺序(镜像 backendKit.jsx LK_BACKEND_ORDER,去掉 hypothetical gemini)。 */
-const LK_BACKEND_ORDER = ["codex", "claude"];
+const LK_BACKEND_ORDER = ["codex", "claude", "antigravity"];
 const LK_BACKEND_DEFAULT = "codex";
 
 /**
@@ -742,6 +742,9 @@ function lkBackendSelectHTML(value, containerId = "") {
     const sel = id === value;
     const isReady = _backendReady[id] !== false; // 默认就绪
     const isDefault = id === LK_BACKEND_DEFAULT;
+    const readyLabel = id === "antigravity"
+      ? (_backendReady[id] === true ? "已检测到 agy，登录状态请在 CLI 中确认" : "等待 CLI 检测")
+      : "已就绪";
     return (
       `<button type="button" role="radio" aria-checked="${sel}" data-bk-id="${esc(id)}"` +
       (containerId ? ` data-bk-container="${esc(containerId)}"` : "") +
@@ -753,7 +756,7 @@ function lkBackendSelectHTML(value, containerId = "") {
       `</span>` +
       `<span class="bk2-opt-sub">${esc(b.vendor)}` +
       (isReady
-        ? `<span class="live-dot is-serving"></span>已就绪`
+        ? `<span class="live-dot is-serving"></span>${readyLabel}`
         : `<span class="live-dot is-offline"></span>未就绪 · 运行 <code>larkway doctor</code>`) +
       `</span></span>` +
       `<span class="bk2-check">${sel ? ICONS.check : ""}</span>` +
@@ -827,6 +830,7 @@ function lkHexA(hex, alpha) {
  * @returns {Array<{v:string,d:string}>}
  */
 function modelSuggestionsForBackend(backendId) {
+  if (backendId === "antigravity") return [{ v: "gemini-4-neon", d: "Gemini 4 Neon" }];
   if (backendId === "codex") {
     // 中文定位描述覆盖已知官方模型;本机 cache 里其余模型用它自带的英文描述。
     const curated = {
@@ -859,6 +863,9 @@ function modelSuggestionsForBackend(backendId) {
  * @param {string} backendId
  */
 function effortLevelsForBackend(backendId) {
+  if (backendId === "antigravity") {
+    return ["", "low", "medium", "high", "xhigh", "max"].map(v => ({ v, label: v || "默认" }));
+  }
   const labels = backendId === "codex"
     ? { low: "Light", medium: "Medium", high: "High", max: "Extra High" }
     : { low: "low", medium: "medium", high: "high", max: "max" };
@@ -975,6 +982,7 @@ function buildModelEffortHTML(bot) {
 
 /** 覆盖区底部提示文案(按底座措辞)。 */
 function bk2AdvHintText(backendId) {
+  if (backendId === "antigravity") return "用 agy models 查看本机账号可用的模型和推理档位。";
   return backendId === "codex"
     ? "建议不是白名单 —— 列表底部可输入任意模型名;切到 Claude Code 时档位显示 low / medium / high / max。"
     : "建议不是白名单 —— 列表底部可输入任意模型名;切到 Codex 时档位显示 Light / Medium / High / Extra High。";

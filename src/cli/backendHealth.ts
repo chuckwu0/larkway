@@ -5,8 +5,19 @@ import path from "node:path";
 import { promisify } from "node:util";
 import { codexHomePath, readCodexLogin } from "../codex/liveConfig.js";
 import { CodexProcessPool } from "../codex/pool.js";
+import { commandProbeEnv } from "../runtimeRequirements.js";
 
 const execFileAsync = promisify(execFile);
+
+/** Presence/version only. A subscription turn requires a native Google login. */
+export async function detectAntigravityBinary(): Promise<{ found: boolean; version?: string }> {
+  try {
+    const { stdout } = await execFileAsync("agy", ["--version"], { env: commandProbeEnv(), timeout: 10_000 });
+    return { found: true, version: stdout.trim() };
+  } catch {
+    return { found: false };
+  }
+}
 
 /** Inspect local auth using the same environment and account RPC as the runner. */
 export async function detectCodexAuth(): Promise<{ ready: boolean | null; message: string }> {
