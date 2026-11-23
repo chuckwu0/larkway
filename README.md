@@ -103,6 +103,8 @@ larkway start           # long-running; runs in background, logs to ~/.larkway/l
 | **pi** | `pi` ([pi coding agent](https://github.com/earendil-works/pi)) | Provider API key in `~/.pi/agent/models.json` (or the provider's env var) | Bring your own model — any provider pi supports, including custom OpenAI-compatible endpoints |
 | **Antigravity** | `agy` | Local Google sign-in | Google Antigravity account quota |
 
+Google limits consumer-plan headless CLI use to direct scripts and CI. Its support policy excludes wrappers such as this backend. Check your account’s permitted use before enabling it. [Google Antigravity FAQ](https://antigravity.google/docs/faq/).
+
 For Antigravity, install the [official CLI](https://antigravity.google/docs/getting-started?tab=cli) and run `agy` once as the bridge user to sign in with your Google account. Set `backend: antigravity` in the bot YAML. Optional overrides include `model: gemini-4-neon` and `effort: high`. Each turn starts a local process and resumes the topic by conversation ID. The bridge displays the native final response. Headless permissions follow the configured bridge mode: `acceptEdits` selects `accept-edits`, `ask` selects `plan`, and `bypassPermissions` enables automatic tool approval. Interactive approval in Feishu and warm processes are unavailable for this backend.
 
 Larkway uses credentials already configured for each backend. It removes `OPENAI_API_KEY` and `ANTHROPIC_API_KEY` from the Codex subprocess environment.

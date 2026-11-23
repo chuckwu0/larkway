@@ -103,6 +103,8 @@ larkway start           # 长驻进程，后台运行，日志写入 ~/.larkway/
 | **pi** | `pi`（[pi coding agent](https://github.com/earendil-works/pi)） | `~/.pi/agent/models.json` 里的 provider API key（或 provider 对应环境变量） | 自带模型：pi 支持的任何 provider，含自定义 OpenAI 兼容端点 |
 | **Antigravity** | `agy` | 本机 Google 账号登录 | Antigravity 账号额度 |
 
+Google 将个人套餐的无界面 CLI 用途限定为直接运行脚本和 CI。此类第三方应用封装超出其支持范围，启用前请核对账号的适用条件。[Google Antigravity FAQ](https://antigravity.google/docs/faq/)。
+
 安装 [Antigravity CLI](https://antigravity.google/docs/getting-started?tab=cli)，用运行 bridge 的系统用户启动一次 `agy` 并登录 Google。在 bot YAML 设置 `backend: antigravity`，可选配 `model: gemini-4-neon` 和 `effort: high`。每轮启动本地进程，按飞书话题保存的 conversation ID 续聊，主卡显示原生最终回答。权限模式 `acceptEdits` 对应 `accept-edits`，`ask` 对应 `plan`，`bypassPermissions` 自动批准工具。此底座暂未接入飞书交互审批和热进程。
 
 **pi 底座**是订阅 token 用尽时的出口：bot yaml 写 `backend: pi` + `model: <provider>/<model>`，pi 就在同一个 workspace（`AGENTS.md`、`.agents/skills/`、已 clone 的仓库）上跑你在 pi 里配好的模型。Larkway 对 pi 子进程原样透传环境变量：自己仍不注入任何 key，但也不像 claude/codex 那样剥掉 provider key，因为对 pi 来说 key 就是登录态。`effort` 对应 pi 的 `--thinking` 档位（`models.json` 里该模型要声明 `reasoning: true`，否则 pi 只支持 `off`）。用 `pi auth check --model <provider>/<model>` 验证凭据；`larkway doctor` 会对 pi bot 配置的每个 model 跑这项检查。pi 默认每轮冷启动；bot yaml 写 `warmProcess: true` 则为每个活跃话题常驻一个 `pi --mode rpc` 进程（需显式开启，限制、内存占用和与冷启动的差异见[原生运行时约定](docs/native-runtime.md)）。注意 pi 没有权限系统，所有权限模式在 pi 上都等于全量访问，`ask` 无效；larkway 以 `--approve`（项目信任）启动 pi，workspace 及其父目录里的 `.pi/extensions`、`.pi/settings.json` 也会被加载——agent 能写自己的 cwd，因此它这一轮装的扩展下一轮就会在 pi 进程内执行；这不比它已有的 shell 权限更宽，但值得知道。开了 pi 热池时 pi 以 RPC 模式运行，MCP 服务还会看到 sampling/elicitation 能力（larkway 对这类请求一律回复取消），见[原生运行时约定](docs/native-runtime.md)。
