@@ -148,6 +148,7 @@ function csv(items: string[]): string {
 }
 
 function answerContract(backend: string): string {
+  if (backend === "antigravity") return "正常输出最终答案，bridge 使用 Antigravity 原生结果正文。";
   if (backend === "codex") {
     return `正常输出最终答案,bridge 使用 Codex 原生 final_answer 通道。旧版 runtime 可兼容独立行 ${ANSWER_BEGIN_MARKER} / ${ANSWER_END_MARKER} marker。`;
   }
@@ -165,7 +166,7 @@ function renderStateContract(input: RenderPromptInput, full: boolean): string[] 
     // names every use of it (cards, task_handle, handoffs), not cards alone.
     return block("contract-anchor", [
       "进展与补充分开。",
-      backend === "codex"
+      backend === "codex" || backend === "antigravity"
         ? `卡片/任务/交接声明写 ${target}。`
         : `正文放独立行 ${ANSWER_BEGIN_MARKER} / ${ANSWER_END_MARKER} 之间;卡片/任务/交接声明写 ${target}。`,
     ]);

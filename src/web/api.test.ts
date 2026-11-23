@@ -1712,6 +1712,7 @@ describe("GET /api/backends — backend registry", () => {
     const ids = backends.map((b) => b.id);
     expect(ids).toContain("claude");
     expect(ids).toContain("codex");
+    expect(ids).toContain("antigravity");
     // Each entry has the required fields
     for (const b of backends) {
       expect(typeof b.id).toBe("string");

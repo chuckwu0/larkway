@@ -193,7 +193,7 @@ async function runAdd(ctx: CliContext, args: string[]): Promise<number> {
   }
 
   // ---- backend ----
-  const backend = await ui.prompt("Agent backend (codex / claude / pi):", {
+  const backend = await ui.prompt("Agent backend (codex / claude / pi / antigravity):", {
     default: setMap.get("backend") ?? "codex",
     nonInteractive: flags.nonInteractive,
   });

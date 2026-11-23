@@ -118,7 +118,7 @@ describe("answer and optional card transport", () => {
     );
   });
 
-  it.each(["claude", "pi", "codex"])("the %s continuation anchor names every state use, not cards alone", async (backend) => {
+  it.each(["claude", "pi", "codex", "antigravity"])("the %s continuation anchor names every state use, not cards alone", async (backend) => {
     const anchor = between(await renderPrompt(makeInput({ backend, isNewThread: false })), "contract-anchor");
     // Once compaction drops the full contract this line is the only state
     // guidance left; task_handle (done/note) and handoffs are written there too.

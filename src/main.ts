@@ -40,6 +40,7 @@ import { ClaudeProcessPool, reapOrphanedWarmClaudeProcesses } from "./claude/poo
 import { CodexRunner } from "./codex/runner.js";
 import { LiveCodexRunner, reapCodexGenerations } from "./codex/liveRunner.js";
 import { createCodexConfigReader } from "./codex/liveConfig.js";
+import { AntigravityRunner } from "./antigravity/runner.js";
 import { PiRunner } from "./pi/runner.js";
 import { PiProcessPool } from "./pi/pool.js";
 import { ensureLarkCliProfile, deriveLarkCliProfile } from "./lark/profileBootstrap.js";
@@ -1475,6 +1476,7 @@ registerRunner("codex", () => new CodexRunner());
 // pi (BYO-model backend, src/pi/runner.ts): cold spawn per turn. A bot with
 // `warmProcess: true` gets its own PiProcessPool, registered as `pi-pool:<id>` when the bot starts.
 registerRunner("pi", () => new PiRunner());
+registerRunner("antigravity", () => new AntigravityRunner());
 
 async function main(): Promise<void> {
   // Log redaction FIRST — before anything can log. Wraps the global console so

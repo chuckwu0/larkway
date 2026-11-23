@@ -71,6 +71,8 @@ export function probeSpecForBackend(backend: string, hint: ProbeHint = {}): Prob
   switch (backend) {
     case "claude":
       return { bin: "claude", args: ["auth", "status"] };
+    case "antigravity":
+      return { bin: "agy", args: ["--version"] };
     case "codex":
       return { bin: "codex", args: ["--version"] };
     case "pi": {
@@ -157,6 +159,9 @@ export function interpretProbe(
   const claudeLoggedOut =
     backend === "claude" && /"loggedIn"\s*:\s*false/.test(result.stdout ?? "");
   if ((result.exitCode ?? 1) !== 0 || claudeLoggedOut) {
+    if (backend === "antigravity") {
+      return { ok: false, diagnosis: "Antigravity CLI could not start. Check agy --version as the bridge user." };
+    }
     if (backend === "codex") {
       return { ok: false, diagnosis: "Codex CLI could not start. Check `codex --version` as the bridge's user." };
     }

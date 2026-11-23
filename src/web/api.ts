@@ -26,6 +26,7 @@ import {
   detectCodexRuntimeWritable,
   detectPiAuth,
   detectPiBinary,
+  detectAntigravityBinary,
 } from "../cli/backendHealth.js";
 import {
   defaultPermissionCapabilitiesForBot,
@@ -366,6 +367,7 @@ async function defaultBackendLoginProbe(backend: string, model?: string): Promis
     if (backend === "codex") return await isCodexReady();
     // pi: per-provider credentials — ask about the bot's own model; no model
     // configured → binary presence is the only fact we can state.
+    if (backend === "antigravity") return (await detectAntigravityBinary()).found ? null : false;
     if (backend === "pi") return await isPiReady(model);
     return null; // 未知底座:探测不了,如实 unknown
   } catch {
@@ -416,7 +418,7 @@ async function runHealthScan(
 
   // ① 底座登录态(主机级,必需)
   const login = await healthScanBackendLoginProbe(backend, bot.model);
-  const loginHint =
+  const loginHint = backend === "antigravity" ? "以启动 bridge 的用户安装 agy 并完成 Google 登录。" :
     backend === "pi"
       ? `pi 的凭据按 provider 配置:在 ~/.pi/agent/models.json(或 provider 对应环境变量)配好 API key,然后 \`pi auth check --model ${bot.model ?? "<provider/model>"}\` 验证`
       : backend === "codex"
@@ -428,7 +430,7 @@ async function runHealthScan(
     status: login === null ? "unknown" : login ? "ok" : "fail",
     severity: "required",
     global: true,
-    ...(login === false || (login === null && backend === "codex") ? { hint: loginHint } : {}),
+    ...(login === false || (login === null && (backend === "codex" || backend === "antigravity")) ? { hint: loginHint } : {}),
   });
 
   // ② lark-cli profile bot 身份(agent 级,必需)—— auth status --json 一并
@@ -1896,12 +1898,13 @@ const getRuntimeRequirements: ApiHandler = async (req) => {
 /** Static display metadata for each supported backend. */
 const BACKEND_META: Record<string, { id: string; name: string; short: string; vendor: string; mono: string }> = {
   claude: { id: "claude", name: "Claude Code", short: "Claude", vendor: "Anthropic 订阅", mono: "CC" },
+  antigravity: { id: "antigravity", name: "Antigravity CLI", short: "Antigravity", vendor: "Google AI 订阅", mono: "AG" },
   codex:  { id: "codex",  name: "Codex",       short: "Codex",  vendor: "OpenAI 订阅",  mono: "CX" },
   pi:     { id: "pi",     name: "pi",          short: "pi",     vendor: "自带模型 / API key", mono: "PI" },
 };
 
 /** Canonical display order (mirrors backendKit.jsx LK_BACKEND_ORDER, minus hypothetical gemini). */
-const BACKEND_ORDER = ["codex", "claude", "pi"];
+const BACKEND_ORDER = ["codex", "claude", "pi", "antigravity"];
 
 /** Check CLI and state directory before inspecting the native provider's auth. */
 async function isCodexReady(): Promise<boolean | null> {
@@ -2026,6 +2029,7 @@ const getBackends: ApiHandler = async (_req) => {
     claude: true,   // claude is always assumed ready (checked separately by doctor)
     codex: codexReady === true,
     pi: piReady,
+    antigravity: (await detectAntigravityBinary()).found,
   };
   const modelFacts = await readBackendModelFacts();
   const backends = BACKEND_ORDER.map((id) => ({

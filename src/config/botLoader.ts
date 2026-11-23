@@ -767,7 +767,7 @@ export async function loadBotsDetailed(botsDir: string): Promise<LoadBotsResult>
     // otherwise silently reach the CLI and fail the bot's spawn every turn
     // with no upfront signal. Advisory only — matches the existing
     // doctor/warn style (never blocks startup over it).
-    if (bot.effort && !KNOWN_EFFORT_VALUES.has(bot.effort)) {
+    if (bot.effort && !KNOWN_EFFORT_VALUES.has(bot.effort) && !(bot.backend === "antigravity" && bot.effort === "xhigh")) {
       console.warn(
         `[botLoader] Bot "${bot.id}" effort "${bot.effort}" is not one of the known values ` +
           `(${[...KNOWN_EFFORT_VALUES].join(", ")}). Continuing — the value is still passed ` +
