@@ -6,6 +6,7 @@
 - pnpm 9 (`npm i -g pnpm@9`)
 - `claude` CLI on PATH (for integration testing against a real agent backend)
 - `codex` CLI on PATH (optional — only needed to exercise the Codex backend)
+- `agy` CLI on PATH (optional — only needed to exercise the Antigravity / Gemini backend)
 - `pi` CLI on PATH (optional — only needed to exercise the pi backend; `npm i -g @earendil-works/pi-coding-agent`)
 
 ## Setup
@@ -105,6 +106,7 @@ src/
   agent/        AgentRunner interface + backend registry (extension point)
   claude/       ClaudeRunner — spawns the `claude` CLI
   codex/        CodexRunner  — spawns the `codex` CLI
+  antigravity/  AntigravityRunner — spawns the `agy` CLI (Gemini)
   pi/           PiRunner     — spawns the `pi` CLI in headless JSON mode
   bridge/       Core message handler, card renderer, state files
   lark/         Feishu WebSocket channel client, card/message parsing
@@ -243,6 +245,7 @@ The string key is how users select the backend in their bot config
 |---|---|---|
 | `src/claude/runner.ts` | `"claude"` | `claude --output-format stream-json` |
 | `src/codex/runner.ts` | `"codex"` | `codex app-server --stdio` |
+| `src/antigravity/runner.ts` | `"antigravity"` | `agy --input-format stream-json --output-format stream-json` (prompt via stdin) |
 | `src/pi/runner.ts` | `"pi"` | `pi -p --mode json --approve` (prompt via stdin) |
 
 `ClaudeRunner` is the canonical reference — it handles session resume,

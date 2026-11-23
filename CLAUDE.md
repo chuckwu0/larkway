@@ -20,6 +20,7 @@ src/
   agent/        AgentRunner interface + backend registry — the extension point
   claude/       ClaudeRunner: spawns `claude --output-format stream-json`
   codex/        CodexRunner: JSON-RPC over `codex app-server --stdio`
+  antigravity/  AntigravityRunner: spawns `agy --input-format stream-json --output-format stream-json` (Gemini)
   pi/           PiRunner: spawns `pi -p --mode json` (BYO-model backend)
   bridge/       Message handler, card renderer, session state files
   lark/         Feishu WS channel client, card/message parsing utilities
@@ -41,6 +42,7 @@ Key files:
 | `src/lark/card.ts` | Card rendering + throttled Feishu PATCH |
 | `src/claude/runner.ts` | Reference runner implementation |
 | `src/codex/runner.ts` | Codex app-server lifecycle and protocol adapter |
+| `src/antigravity/runner.ts` | Antigravity CLI (`agy`) cold stream-json adapter with pre-session auth timeout retry |
 | `src/pi/runner.ts` | pi headless JSON-mode adapter (provider keys pass through — see rule 3) |
 | `src/config/botLoader.ts` | Loads `bots/*.yaml` into typed `BotConfig` |
 
@@ -68,7 +70,7 @@ Cover first-turn, continuation, steering, unknown mention identity, and explicit
 legacy task declarations in regression tests.
 
 **2. Reuse CLIs, not SDKs — with one deliberate exception.**
-Spawn `lark-cli`, `claude`, `codex`, `glab`, `git` as child processes rather
+Spawn `lark-cli`, `claude`, `codex`, `agy`, `pi`, `glab`, `git` as child processes rather
 than importing their SDK packages. This keeps deps minimal and avoids auth
 surface duplication. Existing exception: the inbound WS channel uses the
 version-pinned `@larksuiteoapi/node-sdk@1.76.0` (`lark/channelClient.ts`,
@@ -79,7 +81,8 @@ without the same level of justification.
 **3. Subscription auth, not API keys.**
 Use the CLI's existing local subscription login. The Claude runner strips
 `ANTHROPIC_API_KEY`; the Codex runner strips both `OPENAI_API_KEY` and
-`ANTHROPIC_API_KEY`. Do not reintroduce billing-key overrides or copy account
+`ANTHROPIC_API_KEY`; the Antigravity runner strips `GEMINI_API_KEY`,
+`GOOGLE_API_KEY`, and `AGY_ADC_AUTH`. Do not reintroduce billing-key overrides or copy account
 credentials into configuration or test evidence.
 Codex may also use an existing API-key login managed by its native CLI in
 `auth.json`. The bridge reads only a private in-memory fingerprint to detect

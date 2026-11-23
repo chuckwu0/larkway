@@ -1,12 +1,12 @@
 # Larkway
 
-> 把你的 Claude Code 或 Codex 订阅变成全团队都能 @ 的飞书 Agent。
+> 把你的 Claude Code、Codex 或 Gemini（Antigravity CLI）订阅变成全团队都能 @ 的飞书 Agent。
 
 🌐 [larkway.dev](https://larkway.dev) · [English](README.md)
 
 ---
 
-你在飞书话题里 @ bot，它在你的机器上运行——读真实代码库、执行命令、开 MR——把结果贴回飞书。你可以直接接入已经配置好的 Claude Code / Codex workspace，或创建托管 workspace。Larkway 负责飞书触发与本地 runtime 的连接。
+你在飞书话题里 @ bot，它在你的机器上运行——读真实代码库、执行命令、开 MR——把结果贴回飞书。你可以直接接入已经配置好的 Claude Code / Codex / Gemini（Antigravity）workspace，或创建托管 workspace。Larkway 负责飞书触发与本地 runtime 的连接。
 
 **当前版本：v0.3.93**
 
@@ -24,7 +24,7 @@
 
 工程师知道某个功能是怎么实现的，其他人不知道，只能问。这个摩擦不断叠加：数据分析师想弄清楚某个指标有没有过滤已删除的记录，PM 想知道某个图表背后调的是哪个 API，QA 工程师在没有上下文的情况下试图复现一个 bug。
 
-通用 AI 助手无法可靠地回答这些问题——它访问不到你的代码。而一个在你真实仓库里运行 Claude Code 或 Codex 的 bot 可以。
+通用 AI 助手无法可靠地回答这些问题——它访问不到你的代码。而一个在你真实仓库里运行 Claude Code、Codex 或 Gemini（Antigravity）的 bot 可以。
 
 Larkway 让这个 bot 的安装和持久运行变得简单：在一台常开的机器上 `larkway start`，在任何飞书话题里 @-mention，团队就有了一个自助回答"这个到底是怎么实现的"的入口。
 
@@ -39,7 +39,7 @@ Larkway 让这个 bot 的安装和持久运行变得简单：在一台常开的�
   ▼  WebSocket 长连接（纯出网，不需要公网端口）
 larkway bridge
   │  spawn 子进程  ──►  claude --resume <session_id> -p "<prompt>"
-  │                     （或：codex ...）
+  │                     （或：codex / agy / pi ...）
   │
   ▼  stream-json (NDJSON)
 lark.card              ◄──  agent 读仓库、跑 bash、改代码、
@@ -109,7 +109,7 @@ Google 将个人套餐的无界面 CLI 用途限定为直接运行脚本和 CI�
 
 **pi 底座**是订阅 token 用尽时的出口：bot yaml 写 `backend: pi` + `model: <provider>/<model>`，pi 就在同一个 workspace（`AGENTS.md`、`.agents/skills/`、已 clone 的仓库）上跑你在 pi 里配好的模型。Larkway 对 pi 子进程原样透传环境变量：自己仍不注入任何 key，但也不像 claude/codex 那样剥掉 provider key，因为对 pi 来说 key 就是登录态。`effort` 对应 pi 的 `--thinking` 档位（`models.json` 里该模型要声明 `reasoning: true`，否则 pi 只支持 `off`）。用 `pi auth check --model <provider>/<model>` 验证凭据；`larkway doctor` 会对 pi bot 配置的每个 model 跑这项检查。pi 默认每轮冷启动；bot yaml 写 `warmProcess: true` 则为每个活跃话题常驻一个 `pi --mode rpc` 进程（需显式开启，限制、内存占用和与冷启动的差异见[原生运行时约定](docs/native-runtime.md)）。注意 pi 没有权限系统，所有权限模式在 pi 上都等于全量访问，`ask` 无效；larkway 以 `--approve`（项目信任）启动 pi，workspace 及其父目录里的 `.pi/extensions`、`.pi/settings.json` 也会被加载——agent 能写自己的 cwd，因此它这一轮装的扩展下一轮就会在 pi 进程内执行；这不比它已有的 shell 权限更宽，但值得知道。开了 pi 热池时 pi 以 RPC 模式运行，MCP 服务还会看到 sampling/elicitation 能力（larkway 对这类请求一律回复取消），见[原生运行时约定](docs/native-runtime.md)。
 
-Larkway 使用各底座已有的凭据。启动 Codex 子进程时会移除环境变量 `OPENAI_API_KEY` 和 `ANTHROPIC_API_KEY`。
+Larkway 使用各底座已有的凭据。启动 Codex 子进程时会移除环境变量 `OPENAI_API_KEY` 和 `ANTHROPIC_API_KEY`，启动 Antigravity 子进程时会移除 `GEMINI_API_KEY`、`GOOGLE_API_KEY` 和 `AGY_ADC_AUTH`。
 
 如果 CC Switch 配置的 Codex 已经能用，用同一个系统用户和 `CODEX_HOME` 启动 Larkway 即可。Codex 确认当前提供方无需 OpenAI 登录时，可以跳过 `codex login`。`larkway doctor` 检查这一条件时无需提交模型请求。
 
@@ -177,7 +177,7 @@ scope 是否健康）。完整设计、配置项、平台事实排查记录见�
 
 - **macOS / Linux / Windows** —— 原生 Windows 支持处于 beta(服务注册走任务计划程序;全量测试已在 Windows CI 上运行);偏好 Linux 环境也可继续用 [WSL](https://learn.microsoft.com/windows/wsl/install)
 - **Node.js 20+ LTS**
-- **Claude Code 或 Codex 订阅**，本地 CLI 已安装并登录
+- **至少一个已安装并登录的本地 Agent CLI**（Claude Code `claude`、Codex `codex`、Antigravity / Gemini `agy`，或自带模型的 `pi`）
 - **`lark-cli`** —— 飞书长连接客户端和消息工具
 - **`git` + `gh`** —— 需要开 PR 的 bot 必须(GitHub 为默认;GitLab 仓库用 `glab`);只读 bot 可省
 - **一台常开的机器** —— bridge 必须持续运行才能接收飞书事件；经常休眠的笔记本会漏消息，小服务器或台式机更合适

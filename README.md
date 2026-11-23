@@ -1,12 +1,12 @@
 # Larkway
 
-> Turn your Claude Code or Codex subscription into a Feishu (Lark) agent your whole team can @-mention.
+> Turn your Claude Code, Codex, or Gemini (Antigravity CLI) subscription into a Feishu (Lark) agent your whole team can @-mention.
 
 🌐 [larkway.dev](https://larkway.dev) · [中文版](README.zh.md)
 
 ---
 
-You @ the bot in a Feishu thread. It runs on your machine — reading your real codebase, executing commands, opening MRs — and posts the result back. Connect a workspace that already works with Claude Code or Codex, or create a managed one. Larkway connects Feishu triggers to that local runtime.
+You @ the bot in a Feishu thread. It runs on your machine — reading your real codebase, executing commands, opening MRs — and posts the result back. Connect a workspace that already works with Claude Code, Codex, or Gemini (Antigravity), or create a managed one. Larkway connects Feishu triggers to that local runtime.
 
 **Current release: v0.3.93**
 
@@ -24,7 +24,7 @@ See Larkway in action and talk through how to set it up for your team — scan t
 
 The engineers on your team know how a feature is actually implemented. Everyone else has to ask them. That friction compounds: a data analyst wondering whether a metric counts deleted records, a PM asking which API endpoint powers a chart, a QA engineer trying to reproduce a bug without context.
 
-A generic AI assistant cannot answer these questions reliably — it has no access to your code. A bot that runs Claude Code or Codex against your real repository can.
+A generic AI assistant cannot answer these questions reliably — it has no access to your code. A bot that runs Claude Code, Codex, or Gemini (Antigravity) against your real repository can.
 
 Larkway makes that bot trivially installable and persistent: one `larkway start` on an always-on machine, one `@mention` in any Feishu thread, and your team has a self-serve answer to "how is this actually implemented."
 
@@ -39,7 +39,7 @@ Feishu thread
   ▼  WebSocket long-connection (outbound only, no public endpoint needed)
 larkway bridge
   │  spawns subprocess  ──►  claude --resume <session_id> -p "<prompt>"
-  │                          (or: codex ...)
+  │                          (or: codex / agy / pi ...)
   │
   ▼  stream-json (NDJSON)
 lark.card                ◄──  agent reads repo, runs bash, edits files,
@@ -107,7 +107,7 @@ Google limits consumer-plan headless CLI use to direct scripts and CI. Its suppo
 
 For Antigravity, install the [official CLI](https://antigravity.google/docs/getting-started?tab=cli) and run `agy` once as the bridge user to sign in with your Google account. Set `backend: antigravity` in the bot YAML. Optional overrides include `model: gemini-4-neon` and `effort: high`. Each turn starts a local process and resumes the topic by conversation ID. The bridge displays the native final response. Headless permissions follow the configured bridge mode: `acceptEdits` selects `accept-edits`, `ask` selects `plan`, and `bypassPermissions` enables automatic tool approval. Interactive approval in Feishu and warm processes are unavailable for this backend.
 
-Larkway uses credentials already configured for each backend. It removes `OPENAI_API_KEY` and `ANTHROPIC_API_KEY` from the Codex subprocess environment.
+Larkway uses credentials already configured for each backend. It removes `OPENAI_API_KEY` and `ANTHROPIC_API_KEY` from the Codex subprocess environment, and removes `GEMINI_API_KEY`, `GOOGLE_API_KEY`, and `AGY_ADC_AUTH` from the Antigravity subprocess environment.
 
 If Codex already works with CC Switch, run Larkway as the same user with the same `CODEX_HOME`. Providers that Codex reports as independent of OpenAI login can run without `codex login`. `larkway doctor` checks that requirement without submitting a model request.
 
@@ -244,7 +244,7 @@ platform-fact writeups: [docs/task-handle.md](docs/task-handle.md).
 
 - **macOS, Linux, or Windows** — native Windows support is in beta (service registration via Task Scheduler; the full test suite runs on Windows CI); [WSL](https://learn.microsoft.com/windows/wsl/install) remains a fully-supported alternative if you prefer a Linux environment
 - **Node.js 20+ LTS**
-- **A Claude Code or Codex subscription** with local CLI installed and logged in
+- **A local coding agent CLI** — Claude Code (`claude`), Codex (`codex`), Antigravity / Gemini (`agy`), or pi (`pi`) — installed and authenticated
 - **`lark-cli`** — Feishu long-connection client and message utilities: `npm i -g @larksuite/cli`, then `lark-cli auth login` (the agent uses it to read thread history and attachments; `larkway doctor` checks it's present)
 - **`git` + `gh`** — for bots that open PRs (GitHub is the default forge; use `glab` instead for GitLab repos; both optional for read-only bots)
 - **An always-on host machine** — the bridge must stay running to receive Feishu events; a laptop that sleeps will miss messages; a small server or desktop works well

@@ -1,15 +1,16 @@
 # 原生 runtime 对齐
 
-Larkway 的目标是把飞书话题接到本地 Claude Code / Codex。在相同模型、任务、目录和权限下，尽量保持直接使用 runtime 时的完成质量、工具能力和会话连续性。bridge 负责传递场景事实、指针和展示结果。
+Larkway 的目标是把飞书话题接到本地 Claude Code / Codex / Antigravity（Gemini）/ pi。在相同模型、任务、目录和权限下，尽量保持直接使用 runtime 时的完成质量、工具能力和会话连续性。bridge 负责传递场景事实、指针和展示结果。
 
 ## 当前默认行为
 
-- 原生长任务默认没有 bridge 强加的总时限：Claude、Codex、pi 的冷启动和热池六条路径一致，不会仅因运行超过 60 分钟而结束当前 turn。需要自动总预算时显式设置 `subprocess_timeout_seconds`，详见下文「长任务与时间预算」。
+- 原生长任务默认没有 bridge 强加的总时限：Claude、Codex、pi（冷启动/热池）以及 Antigravity（冷启动）路径一致，不会仅因运行超过 60 分钟而结束当前 turn。需要自动总预算时显式设置 `subprocess_timeout_seconds`，详见下文「长任务与时间预算」。
 - `agent_workspace` 首轮提供完整但精简的场景契约，续轮默认 `promptMode: delta`。新会话、目录或 backend 切换时重新发送完整契约；配置切换还携带可用的旧摘要和记录摘录，并明确原生上下文已经重开。
 - 身份与职责由原生 `AGENTS.md` 加载；Claude 的 `CLAUDE.md` 指向同一内容。bridge 不再逐轮复制工作方式。旧 runtime 保留兼容注入。
 - 不要求先读历史、先建任务卡、写状态文件、导出飞书文档或整理记忆。这些操作由任务和 Agent 定义决定。需要交互卡片的 Agent 仍可按 [prompt 契约](prompt-contract.md) 使用可选状态文件。
 - `sessionReseedTurns`、`sessionReseedChars`、`p2pStickyIdleMs` 默认均为 `0`。优先沿用原生 session 和原生压缩；显式设置的重开策略、用户重置和已确认的失效会话恢复仍保留。
 - Codex 使用协议的 `phase: final_answer` 作为最终答案，显式 commentary 完成段落作为独立过程回复展示，不要求输出自定义答案标记；未带 phase 的旧协议保留标记兼容。Claude 保留简短的答案标记约定。Codex 不再强制详细 reasoning summary，沿用宿主配置。
+- Antigravity（`backend: antigravity`，Gemini 底座）走 `agy --input-format stream-json --output-format stream-json`，每轮冷启动；prompt 经 stdin 传入，`--conversation <id>` 按话题续接原生会话，`model` / `effort` 透传给 `--model` / `--effort`，主卡仅使用终态 `result.response` 作为最终答案。启动子进程时移除 `GEMINI_API_KEY`、`GOOGLE_API_KEY` 与 `AGY_ADC_AUTH`，使用本机 `agy` 登录态；若在 session 初始化前遇到瞬时鉴权刷新超时（`authentication failed or timed out`），runner 会等旧子进程退出后做有界、可取消的短退避重试（默认 1s / 2s）。权限模式 `bypassPermissions` 映射 `--dangerously-skip-permissions`，`acceptEdits` 映射 `--mode accept-edits`，`ask` 映射 `--mode plan`。暂未接入热进程池与飞书交互审批。
 - pi（`backend: pi`，自带模型底座）默认走 `pi -p --mode json --approve`，每轮冷启动；prompt 经 stdin 传入，`--session-id` 续接原生 session，`model` 直接传 `--model`（支持 `provider/id`），`effort` 传 `--thinking`。答案沿用 Claude 的标记约定。`--approve` 必带：非交互模式下 pi 不弹项目信任提示，不带它会静默跳过 workspace 的 `.agents/skills/`。pi 无权限系统，所有权限模式等价全量访问；环境变量原样透传（provider key 即登录态）。
 - pi 热进程池需显式 `warmProcess: true`（默认关；更早的版本里 pi 上的这一项只打告警、不生效，升级后会直接开池，部署前请核对 pi bot 的 yaml，见[升级](#从-v0374-及更早版本升级)；`larkway doctor` 会列出开了热池的 pi bot，只作提示，不影响退出码）：每个话题常驻一个 `pi --mode rpc --approve`，启动参数与冷启动相同（`--session-id`、`--model`、`--thinking`、`--skill`），空闲 `warmProcessIdleMs` 后回收，数量上限 `warmProcessMaxProcesses`，续轮直接在原进程里发 prompt。每轮重新下发 thinking；配置了 `model` 时，进程内模型被改动会改回启动时的模型，未配置时沿用 session 当前的模型（与冷启动续接一致）。进程在首个事件前退出，或正在执行不是 larkway 发起的 run 或压缩，则本轮改走冷启动；配置变化、换 session 或重开 session 时先等旧进程退出再起新进程（同一 session 文件只有一个写者）。与冷启动的已知差异：RPC 模式下 pi 为扩展提供 UI 通道，pi-mcp-adapter 因此向 MCP 服务声明 `sampling`、`elicitation` 能力（print 模式不声明），larkway 对扩展弹出的选择、确认、输入一律回复取消，即按拒绝处理；在 pi 的 MCP 配置里设 `settings.sampling: false` 和 `settings.elicitation: false` 可去掉这两项声明。pi 接受 prompt 之前打印的记录（如 prompt 预检触发的阈值压缩 `compaction_start` / `compaction_end`）热池不转发，冷启动会作为原始事件转发。热进程的一轮在 `agent_settled` 结束，没有冷启动那种结束后 30 秒的兜底 SIGTERM；回收时发 SIGTERM，pi 只结束仍在执行的 bash 调用。已结束的 bash 调用留在后台的进程（如 `npm run dev &`），冷热两种模式下 larkway 和 pi 都不清理。Windows 上回收不发信号（信号只会结束 cmd.exe 包装进程，pi 本体继续运行），而是关闭 stdin 让 pi 自行退出；5 秒后仍未退出，则经包装进程用 `taskkill /T /F` 结束整个进程树。旧进程以包装进程退出且 stdout 关闭为准；同一 session 的替代写者须等待真实退出，关闭池时的有界等待不代表旧进程已死。Windows 行为尚未实测。空闲进程约占 130–150 MB 内存（n=1，只量了 pi 本体；pi-mcp-adapter 拉起的 stdio MCP 子进程不在内，开池前请按整棵进程树估算）。larkway 不加 `--offline`。RPC 模式（热池）每次起进程都会在后台刷新模型目录和 provider 可用性，print 模式（冷启动）不做，有出网白名单的主机会看到这些额外请求。在 `<LARKWAY_HOME>/.env` 设 `PI_OFFLINE=1` 对冷热两路同时关闭这类联网，同时也关闭缺失扩展包的自动安装和工具下载。
 - Claude 热进程的复用与预热匹配包含实际启动参数，包括权限模式、可执行文件和需要 `--add-dir` 的仓库目录。`addDirs` 中只有两类仓库会传 `--add-dir`：含非空 `.claude/skills/<name>/SKILL.md` 的（skills 发现），以及解析符号链接后位于 cwd 之外的（例如链接进 workspace 的外部仓库，`--add-dir` 同时是它的目录访问授权）。clone 或删除 cwd 内不带 skills 的仓库不改变启动参数，热进程照常复用。仓库开始或不再需要该参数（新 clone、切分支、新增 skill、链接改指向）后，下一轮起新进程并按原 session 恢复，避免漏掉原生 skills。
@@ -60,7 +61,7 @@ Larkway 的目标是把飞书话题接到本地 Claude Code / Codex。在相同�
 热进程退役或 Codex 原生 turn 的停止尚待确认时，同 session 等待者仍可取消、
 受其显式预算约束，并在关闭池时收尾；其他话题不因此被中断。
 
-以下设置互相独立，适用于 Claude、Codex、pi 的冷启动与热进程池：
+以下设置互相独立，适用于 Claude、Codex、Antigravity 与 pi：
 
 | 设置 | 默认值与含义 |
 |---|---|

@@ -59,8 +59,11 @@ read_only: true
 # per-topic session artifact dir; agent orchestrates everything else.
 runtime: agent_workspace
 
-# Agent backend subprocess.
-# "claude" = local Claude Code (reads ~/.claude/.credentials.json).
+# Agent backend subprocess:
+#   "claude"      = local Claude Code (`~/.claude/.credentials.json`)
+#   "codex"       = OpenAI Codex CLI
+#   "antigravity" = Google Antigravity CLI (`agy`, Gemini)
+#   "pi"          = pi coding agent (BYO model)
 backend: claude
 
 # Chain-of-thought (COT) display — surface the agent's thinking + tool activity

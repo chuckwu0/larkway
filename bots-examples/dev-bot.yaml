@@ -6,7 +6,7 @@
 #                               workspace and per-topic session dir; agent
 #                               decides how to clone, branch, and worktree.
 #   backend: codex            — uses OpenAI Codex subprocess.
-#                               Change to "claude" if using Claude Code.
+#                               Other backends: "claude", "antigravity" (Gemini), "pi".
 #
 # Copy to  ~/.larkway/bots/<your-id>.yaml  and fill in real values.
 # All sensitive values (secrets, tokens) go in .env — never in yaml.
@@ -49,9 +49,11 @@ read_only: false
 # V0.3 runtime layout.
 runtime: agent_workspace
 
-# Agent backend subprocess.
-# "codex" = OpenAI Codex CLI (reads CODEX_API_KEY from env).
-# Switch to "claude" to use local Claude Code instead.
+# Agent backend subprocess:
+#   "codex"       = OpenAI Codex CLI (local subscription or configured provider)
+#   "claude"      = Claude Code CLI
+#   "antigravity" = Google Antigravity CLI (`agy`, Gemini)
+#   "pi"          = pi coding agent (BYO model)
 backend: codex
 
 # Chain-of-thought (COT) display — surface the agent's thinking + tool activity
