@@ -1,10 +1,63 @@
 import { buildAgentEnv } from "../agent/childEnv.js";
 import { TurnEventQueue } from "../agent/turnEventQueue.js";
 import { runColdJson } from "../agent/coldJsonRunner.js";
+import { resolveRunTimeoutMs } from "../agent/runTimeout.js";
 import {
   createPerfMarker,
   type AgentRunner, type AgentStreamEvent, type RunHandle, type RunOptions,
 } from "../agent/runner.js";
+
+const DEFAULT_AUTH_RETRY_DELAYS_MS = [1_000, 2_000] as const;
+
+export function isRetryableStartupAuthError(err: unknown): boolean {
+  const message = err instanceof Error ? err.message : String(err);
+  return /authentication failed or timed out/i.test(message);
+}
+
+function isTurnProgressEvent(event: AgentStreamEvent): boolean {
+  return (
+    event.type === "system_init" ||
+    event.type === "tool_use" ||
+    event.type === "tool_result" ||
+    event.type === "answer_delta" ||
+    event.type === "answer_snapshot" ||
+    event.type === "progress_message" ||
+    event.type === "progress_snapshot" ||
+    event.type === "thinking_delta" ||
+    event.type === "thinking_snapshot"
+  );
+}
+
+function waitAbortable(ms: number, signal: AbortSignal): Promise<boolean> {
+  if (signal.aborted) return Promise.resolve(false);
+  if (ms <= 0) return Promise.resolve(true);
+  return new Promise<boolean>((resolve) => {
+    const onAbort = (): void => {
+      clearTimeout(timer);
+      resolve(false);
+    };
+    const timer = setTimeout(() => {
+      signal.removeEventListener("abort", onAbort);
+      resolve(true);
+    }, ms);
+    timer.unref();
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
+export interface AntigravityAttempt {
+  handle: RunHandle;
+  decoder: { readonly sessionId?: string; readonly assistantError?: string };
+}
+
+export interface AntigravityRunnerOptions {
+  /** Override per-attempt execution in unit tests; defaults to cold `agy` CLI subprocesses. */
+  startAttempt?: (opts: RunOptions) => AntigravityAttempt;
+  /** Backoff delays (ms) between retries of pre-session startup auth timeouts. */
+  authRetryDelaysMs?: readonly number[];
+  /** Override abortable backoff sleep in unit tests. */
+  sleep?: (ms: number, signal: AbortSignal) => Promise<boolean>;
+}
 
 export function antigravityArgs(opts: RunOptions): string[] {
   const args = ["--input-format", "stream-json", "--output-format", "stream-json"];
@@ -74,31 +127,156 @@ export class AntigravityTurnDecoder {
 }
 
 export class AntigravityRunner implements AgentRunner {
+  constructor(private readonly options: AntigravityRunnerOptions = {}) {}
+
   run(opts: RunOptions): RunHandle {
     const env = buildAgentEnv(opts.botGitIdentity, opts.gitlabToken, opts.larkCliConfigDir);
     delete env.GEMINI_API_KEY;
     delete env.GOOGLE_API_KEY;
     delete env.AGY_ADC_AUTH;
     const markPerf = createPerfMarker(opts.onPerfMarker);
-    const decoder = new AntigravityTurnDecoder(opts.resumeSessionId);
-    const handle = runColdJson(opts, {
-      name: "agy",
-      bin: opts.agentBinPath ?? "agy",
-      args: antigravityArgs(opts),
-      input: JSON.stringify({ event: "user", message: { content: opts.prompt } }) + "\n",
-      env, markPerf, installHint: "Antigravity CLI",
-      decoder,
+    const retryDelaysMs = this.options.authRetryDelaysMs ?? DEFAULT_AUTH_RETRY_DELAYS_MS;
+    const sleep = this.options.sleep ?? waitAbortable;
+    const totalTimeoutMs = resolveRunTimeoutMs(opts.timeoutMs);
+    const deadlineMs = totalTimeoutMs === undefined ? undefined : Date.now() + totalTimeoutMs;
+
+    const startAttempt = this.options.startAttempt ?? ((attemptOpts: RunOptions): AntigravityAttempt => {
+      const decoder = new AntigravityTurnDecoder(attemptOpts.resumeSessionId);
+      const handle = runColdJson(attemptOpts, {
+        name: "agy",
+        bin: attemptOpts.agentBinPath ?? "agy",
+        args: antigravityArgs(attemptOpts),
+        input: JSON.stringify({ event: "user", message: { content: attemptOpts.prompt } }) + "\n",
+        env, markPerf, installHint: "Antigravity CLI",
+        decoder,
+      });
+      return { handle, decoder };
     });
+
+    const attemptAbort = new AbortController();
+    let stopReason: "cancel" | "timeout" | undefined;
+    let currentHandle: RunHandle | undefined;
+
+    const stop = (reason: "cancel" | "timeout"): void => {
+      if (!stopReason) stopReason = reason;
+      if (!attemptAbort.signal.aborted) attemptAbort.abort();
+      currentHandle?.kill();
+    };
+    const onCallerAbort = (): void => stop("cancel");
+    if (opts.abortSignal) {
+      if (opts.abortSignal.aborted) stop("cancel");
+      else opts.abortSignal.addEventListener("abort", onCallerAbort, { once: true });
+    }
+
+    const buildAttemptOpts = (): RunOptions => ({
+      ...opts,
+      abortSignal: attemptAbort.signal,
+      ...(deadlineMs !== undefined ? { timeoutMs: Math.max(1, deadlineMs - Date.now()) } : {}),
+    });
+
+    // Spawn the first attempt synchronously so `pid` is available immediately.
+    const firstAttempt = startAttempt(buildAttemptOpts());
+    currentHandle = firstAttempt.handle;
+
     // Native result validation must advance even while a card update waits on Feishu.
     const events = new TurnEventQueue();
-    const drain = (async () => {
+    let resolveProcessExited!: () => void;
+    const processExited = new Promise<void>((resolve) => { resolveProcessExited = resolve; });
+
+    const done: RunHandle["done"] = (async () => {
       try {
-        for await (const event of handle.events) events.push(event);
+        let attempt = firstAttempt;
+        for (let attemptIndex = 0; ; attemptIndex += 1) {
+          const { handle, decoder } = attempt;
+          currentHandle = handle;
+          const canRetryAfterThis = attemptIndex < retryDelaysMs.length;
+          const settledDone = handle.done.then(
+            (value) => ({ ok: true as const, value }),
+            (error: unknown) => ({ ok: false as const, error }),
+          );
+
+          let sawTurnProgress = false;
+          let streaming = !canRetryAfterThis;
+          const preProgressBuffer: AgentStreamEvent[] = [];
+          const flushBuffer = (): void => {
+            for (const buffered of preProgressBuffer.splice(0)) events.push(buffered);
+          };
+
+          for await (const event of handle.events) {
+            if (isTurnProgressEvent(event)) {
+              sawTurnProgress = true;
+              streaming = true;
+            }
+            if (streaming) {
+              flushBuffer();
+              events.push(event);
+            } else {
+              preProgressBuffer.push(event);
+            }
+          }
+
+          const outcome = await settledDone;
+          if (outcome.ok) {
+            flushBuffer();
+            return outcome.value;
+          }
+
+          const retryable =
+            canRetryAfterThis &&
+            !stopReason &&
+            !attemptAbort.signal.aborted &&
+            !sawTurnProgress &&
+            decoder.sessionId === undefined &&
+            isRetryableStartupAuthError(outcome.error);
+          const delayMs = retryDelaysMs[attemptIndex];
+          const hasBudget =
+            delayMs !== undefined &&
+            (deadlineMs === undefined || (deadlineMs - Date.now()) > delayMs);
+
+          if (!retryable || !hasBudget) {
+            flushBuffer();
+            throw outcome.error;
+          }
+
+          console.warn(
+            `[agy-runner] startup auth failed or timed out before session init ` +
+              `(attempt ${attemptIndex + 1}/${retryDelaysMs.length + 1}); retrying in ${delayMs}ms`,
+          );
+
+          // Wait for the failed subprocess to release its PID file before spawning a retry.
+          await handle.processExited?.catch(() => undefined);
+          if (stopReason || attemptAbort.signal.aborted) {
+            return { exitCode: 1, interrupted: true, interruptionReason: stopReason ?? "cancel" };
+          }
+
+          const slept = await sleep(delayMs, attemptAbort.signal);
+          if (!slept || stopReason || attemptAbort.signal.aborted) {
+            return { exitCode: 1, interrupted: true, interruptionReason: stopReason ?? "cancel" };
+          }
+          if (deadlineMs !== undefined && deadlineMs - Date.now() <= 0) {
+            return { exitCode: 1, interrupted: true, interruptionReason: "timeout" as const };
+          }
+
+          attempt = startAttempt(buildAttemptOpts());
+        }
       } finally {
         events.end();
+        opts.abortSignal?.removeEventListener("abort", onCallerAbort);
+        const lastExited = currentHandle?.processExited;
+        if (lastExited) {
+          void lastExited.then(resolveProcessExited, resolveProcessExited);
+        } else {
+          resolveProcessExited();
+        }
       }
     })();
-    const done = Promise.all([handle.done, drain]).then(([result]) => result);
-    return { ...handle, events, done };
+
+    return {
+      events,
+      done,
+      processExited,
+      kill: () => stop("cancel"),
+      pid: firstAttempt.handle.pid,
+    };
   }
 }
