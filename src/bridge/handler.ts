@@ -18,7 +18,6 @@
  *  - close() is soft: sets a flag; running handleOne finishes naturally
  */
 
-import child_process from "node:child_process";
 import fs from "node:fs/promises";
 import path from "node:path";
 import type { InboundClient } from "../lark/transport.js";
@@ -127,825 +126,47 @@ import {
 } from "../lark/channelCardKitClient.js";
 import type { OutboundPostClient } from "../lark/outboundPostClient.js";
 import { buildPostContent } from "../lark/postContent.js";
-import { derivePostIdempotencyKey, digestPostContent } from "../lark/idempotency.js";
+import {
+  ensureNodeModules,
+  ensureRepoClone,
+  execGit,
+  isWorktreeGitHealthy,
+  pathExists,
+  writeWorktreeSettings,
+} from "./legacyProvisioning.js";
+import {
+  canCoalesceFollowup,
+  COT_BUBBLE_CREATE_BUDGET_MS,
+  COT_LEDGER_WRITE_GRACE_MS,
+  createOnlyPostFallback,
+  DEFAULT_CARDKIT_IDLE_TIMEOUT_MS,
+  DEFAULT_P2P_STICKY_IDLE_MS,
+  DEFAULT_SESSION_RESEED_CHARS,
+  DEFAULT_SESSION_RESEED_TURNS,
+  HANDOFF_BUBBLE_WAIT_MS,
+  IDLE_NOTICE_REFRESH_MS,
+  idleThresholdHint,
+  MODEL_FIRST_ROOT_PROBE_BUDGET_MS,
+  PERF_SAMPLE_TAIL_BUDGET_MS,
+  prepareCardKitOverflowChunks,
+  RESEED_WARNING_CHARS_RATIO,
+  RESEED_WARNING_WINDOW_TURNS,
+  resolveIdleKillAfterMs,
+  resolveModelFirstMode,
+  resolveStuckSessionResetAfter,
+  sendCardKitOverflowChunks,
+  summarizeMentionPolicyRules,
+  TASK_CARD_BLACKHOLE_TURNS,
+  withHandoffSentNote,
+  type ModelFirstMode,
+} from "./turnHelpers.js";
 
-/**
- * Idle notice threshold, not a total runtime deadline or a default kill.
- * Any runner event refreshes activity; an in-flight tool is exempt from idle
- * interruption (not the waiting notice). A quiet turn keeps running unless the operator opts into
- * idle_kill_seconds, the user stops it, or an explicit total budget expires.
- * Default 3 minutes, overridable by bot yaml idle_timeout_seconds.
- */
-const DEFAULT_CARDKIT_IDLE_TIMEOUT_MS = 3 * 60 * 1000;
-
-/**
- * BL-48 修订 (2026-07-28, owner decision): **the idle watchdog no longer
- * terminates a turn by default.** Crossing the threshold marks the turn suspect
- * and says so on the card; nothing kills it. Opt in per bot with
- * `idle_kill_seconds` (bot yaml → HandlerDeps.responseSurfaceIdleKillMs).
- *
- * Why the default flipped, recorded so it doesn't get "optimized" back:
- *
- * 1. **The judgment is undecidable and we made it load-bearing for a
- *    destructive act.** Silence has at least four causes (real hang, long
- *    prefill, upstream backoff, a phase the vendor doesn't report) and the
- *    bridge cannot tell them apart. Three releases in a row tried to make the
- *    inference sharper (more event types, a bigger threshold, grading); none
- *    questioned whether an inference we cannot verify should authorize killing
- *    a user's work. Owner's framing: 「你没办法判断用户是怎么使用这个 Agent 的」.
- *
- * 2. **The user already has the stop control, in exactly this window.** Feishu
- *    renders a ⏹ button on the in-progress COT bubble; clicking it sends
- *    `@bot /stop`, which BL-42 already intercepts and stops the turn. The
- *    automatic kill was therefore not just a guess on the user's behalf — it was
- *    redundant with a control they had all along. And it actively shortened it:
- *    killing the turn completes the bubble, which removes the ⏹.
- *
- * 3. **Finishing and stopping remain explicit.** The runner's completion or
- *    failure, the user's stop, or an operator-configured total budget finalizes
- *    the card. With no budget and no stop, a silent turn may remain pending;
- *    a notice is not evidence that the work should be destroyed.
- *
- * 4. **It defended the cheap failure and was blind to the expensive one.** A
- *    silent hang costs a concurrency slot and zero tokens; a livelock (looping
- *    while emitting) burns money and never trips an *idle* watchdog at all.
- *    Bounding that one needs a cost/budget net, which is orthogonal and
- *    tracked separately.
- *
- * What still terminates a turn: the runner finishing, the user's ⏹ / `/stop`,
- * an explicit total wall-clock budget, and `idle_kill_seconds` where an operator asks for
- * it — unattended fleets (cron, batch dispatch) have nobody reading the bubble,
- * so they can still opt into a shorter automatic cut.
- *
- * @returns ms of continuous silence after which to interrupt, or undefined for
- *   "never" (the default). A configured budget is clamped to
- *   IDLE_KILL_CEILING_MS and raised to at least the suspect threshold.
- */
-export function resolveIdleKillAfterMs(
-  configuredKillMs: number | undefined,
-  suspectAfterMs: number,
-): number | undefined {
-  if (configuredKillMs === undefined) return undefined;
-  // Preserve the opt-in idle-kill ceiling independently of total budgets.
-  // A notice threshold above the ceiling must not disable the opted-in kill;
-  // in that case interruption can occur before the notice is due.
-  return Math.min(Math.max(suspectAfterMs, configuredKillMs), IDLE_KILL_CEILING_MS);
-}
-
-/**
- * Existing ceiling on opt-in continuous-silence kills, independent of the
- * notice threshold and any total wall-clock budget. Never enabled by default.
- */
-const IDLE_KILL_CEILING_MS = 15 * 60 * 1000;
-
-/**
- * Refresh the elapsed-silence notice once a minute while a turn remains quiet.
- * With neither idle-kill nor a total budget, waiting is unbounded; the notice
- * must keep counting rather than implying a frozen status or deadline.
- */
-const IDLE_NOTICE_REFRESH_MS = 60_000;
-
-/**
- * Max wait for this turn's cot.json write before the bubble is finalized anyway.
- * The ledger only matters if we CRASH; a completed bubble matters always, so a
- * stalled local write must never hold the completion hostage.
- */
-const COT_LEDGER_WRITE_GRACE_MS = 2_000;
-
-/**
- * The knob hint on both interrupt cards. Quotes THIS bot's live threshold, not
- * the global default — a bot already running `idle_timeout_seconds: 600` would
- * otherwise be told "默认 180", which is both wrong for it and useless advice.
- */
-function idleThresholdHint(idleTimeoutMs: number, idleKillAfterMs?: number): string {
-  // No kill configured → this card came from a hang that ended some other way
-  // (runaway guard / runner error). Pointing at `idle_kill_seconds`, which the
-  // operator never set, would be nonsense advice.
-  if (idleKillAfterMs === undefined) {
-    return (
-      `本 bot 未配置自动中断（\`idle_kill_seconds\` 未设）——` +
-      // NOT "本轮是自己结束的": this hint also renders on the runaway-guard ending,
-      // where something else DID end the turn. Claiming otherwise contradicted the
-      // very branch that produced it (independent review, round 5).
-      `我们不会因为静默打断它；本轮结束另有原因（子进程退出或 60 分钟兜底）。提示阈值 ` +
-      `${Math.round(idleTimeoutMs / 1000)} 秒 = \`idle_timeout_seconds\`。`
-    );
-  }
-  // BL-48 修订: reachable only when an operator opted into `idle_kill_seconds`
-  // (idle-kill is off by default), so the advice is about THAT knob — telling
-  // them to raise `idle_timeout_seconds`, which now only moves the ⏳ notice,
-  // would not stop the interrupt they just hit.
-  // Reachable only past the early return above, so a budget always exists.
-  const atCeiling = idleKillAfterMs >= IDLE_KILL_CEILING_MS;
-  return (
-    `本 bot 配了 \`idle_kill_seconds\`（生效 ${Math.round(idleKillAfterMs / 1000)} 秒` +
-    (atCeiling ? `，已顶到 ${Math.round(IDLE_KILL_CEILING_MS / 60_000)} 分钟上限` : "") +
-    `）。若这类任务本来就要长时间静默思考，` +
-    // Once clamped at the ceiling, raising the knob cannot move the interrupt —
-    // only deleting it can (independent review, round 3).
-    (atCeiling ? "把它删掉" : "调大或直接删掉它") +
-    `（删掉 = 不再自动中断，只在卡片上提示等待；当前提示阈值 ` +
-    `${Math.round(idleTimeoutMs / 1000)} 秒 = \`idle_timeout_seconds\`）。`
-  );
-}
-
-/**
- * Max time the COT bubble create may sit in front of the answer card's first
- * frame. The bubble is created before the card (timeline ordering), but a slow
- * create (hung GET / multi-tier create) must not delay the card — past this
- * budget, the card is sent and the bubble handle is adopted in the background.
- */
-const COT_BUBBLE_CREATE_BUDGET_MS = 3_000;
-
-/**
- * How long a turn's handoff mirror posts wait for its COT bubble to land. A
- * new topic's bubble is created after the card without being awaited (WP-2
- * c) while the mirror of a peer in another process goes out alongside the
- * final card (WP-8), so a quick turn could post the mirror between the card
- * and the bubble. Bounded: a slow or failed create never holds a handoff.
- */
-const HANDOFF_BUBBLE_WAIT_MS = 1_000;
-
-/**
- * WP-0: the success-path perf sample is written once the turn is delivered, so
- * it carries the post-runner timeline. A tail (declare hooks + finalize +
- * handoffs) still running this long after the runner finished writes the
- * sample anyway — without the points it has not reached — so a stuck tail
- * does not also lose the turn's usage and runner timings. A process that dies
- * inside the budget still loses that turn's sample.
- */
-const PERF_SAMPLE_TAIL_BUDGET_MS = 60_000;
-
-/**
- * BL-38 (poison-session self-heal): after this many CONSECUTIVE turns that end
- * by the idle watchdog (a confirmed hang — the thread keeps resuming into a
- * session that goes silent before its first tool call), the thread's session
- * record is dropped so the next @ starts from a fresh session. A single
- * idle-kill is often transient (the owner just retries); only a repeated,
- * same-session hang is the "behaviorally poisoned session" this treats — and it
- * produces no resume error, so the stale/ghost-session purge never fires on it.
- * Env LARKWAY_STUCK_SESSION_RESET_AFTER overrides the default (kept a module
- * constant, not a bot-config field, to stay simple). A non-positive /
- * unparseable override falls back to the default.
- */
-const DEFAULT_STUCK_SESSION_RESET_AFTER = 3;
-
-// Native runtimes own context compaction. Session replacement is opt-in.
-const DEFAULT_SESSION_RESEED_TURNS = 0;
-const DEFAULT_P2P_STICKY_IDLE_MS = 0;
-const DEFAULT_SESSION_RESEED_CHARS = 0;
-
-/**
- * 批G G1 (P1) pre-reseed warning window: the last N turns before the
- * turn-count trigger (and, for the volume trigger, past this ratio of the
- * char threshold) carry a one-line "补 summary.md 到可交接程度" warning.
- * The TURN window is bounded by construction (≤ N turns per generation);
- * the VOLUME window is a ratio band [85%, 100%) — with slow per-turn growth
- * it can span more turns (harmless: same single line, and reseedWarnings is
- * documented as a per-turn count).
- */
-const RESEED_WARNING_WINDOW_TURNS = 5;
-const RESEED_WARNING_CHARS_RATIO = 0.85;
-
-/**
- * BL-49: turns a thread may run with no task card before the bridge records a
- * "任务卡黑洞" diagnostic runtime event. 4 = comfortably past the 2-turn 判据
- * (see prompt.ts's threadTurnCount doc), so a thread that legitimately stayed a
- * short Q&A never trips it. Diagnostic only — never user-visible, never a nudge.
- */
-const TASK_CARD_BLACKHOLE_TURNS = 4;
-
-function resolveStuckSessionResetAfter(): number {
-  const raw = process.env.LARKWAY_STUCK_SESSION_RESET_AFTER;
-  if (raw === undefined) return DEFAULT_STUCK_SESSION_RESET_AFTER;
-  const n = Number.parseInt(raw, 10);
-  return Number.isFinite(n) && n > 0 ? n : DEFAULT_STUCK_SESSION_RESET_AFTER;
-}
-
-/**
- * WP-10 model-first surface lane, env LARKWAY_MODEL_FIRST:
- *   - `off` (default; also unset or unrecognised): the reply surfaces (⏳
- *     reaction, answer card, COT bubble) exist before the runner starts.
- *   - `continuation`: a follow-up turn in a topic this bot already has a
- *     session for starts the runner first; its surfaces open alongside it, in
- *     their usual order, and its early events wait for the card. Every other
- *     turn stays card-first: the card of a turn that opens a topic is what
- *     creates the topic, and an agent that replied through lark-cli ahead of
- *     it would land outside.
- *   - `all`: every turn starts the runner first, including one that opens a
- *     topic — so its agent's early lark-cli replies can land outside the topic
- *     (docs/native-runtime.md recommends `continuation`).
- * Pure scheduling: the same calls happen either way, only what the runner
- * waits for changes.
- */
-export type ModelFirstMode = "off" | "continuation" | "all";
-
-let warnedModelFirstValue: string | undefined;
-
-export function resolveModelFirstMode(raw: string | undefined = process.env.LARKWAY_MODEL_FIRST): ModelFirstMode {
-  const value = raw?.trim().toLowerCase() ?? "";
-  if (value === "continuation" || value === "all") return value;
-  if (value !== "" && value !== "off" && warnedModelFirstValue !== value) {
-    warnedModelFirstValue = value;
-    console.warn(`[bridge.handler] LARKWAY_MODEL_FIRST=${raw}: expected off|continuation|all — using off`);
-  }
-  return "off";
-}
-
-/**
- * WP-10: how long a model-first turn waits for the in-topic task-root probe
- * (a message lookup, cached per root) before rendering without <task-root>.
- * A turn of a bot with no task-claim hook does not wait for it at all.
- */
-const MODEL_FIRST_ROOT_PROBE_BUDGET_MS = 1_000;
-
-function summarizeMentionPolicyRules(rules: string[]): string {
-  const counts = new Map<string, number>();
-  for (const rule of rules) {
-    counts.set(rule, (counts.get(rule) ?? 0) + 1);
-  }
-  return Array.from(counts.entries())
-    .map(([rule, count]) => `${rule}=${count}`)
-    .join(", ");
-}
-
-// ---------------------------------------------------------------------------
-// Private helpers — worktree bootstrap
-// ---------------------------------------------------------------------------
-
-/**
- * Ceiling for any single pre-spawn git operation (clone/fetch/worktree).
- * git itself has NO network timeout: a half-open TCP path hangs a fetch
- * indefinitely, and these run BEFORE the runner spawns — outside both the
- * idle watchdog and the subprocess timeout — so an un-bounded hang here
- * permanently occupied the thread's serial queue AND one of the
- * concurrent turn slots (at the configured limit the bot stalls until
- * restart). Generous: a cold clone of a large repo legitimately takes
- * minutes; this only cuts true black holes.
- */
-const GIT_OP_TIMEOUT_MS = 10 * 60 * 1000;
-
-function execGit(cwd: string, args: string[]): Promise<void> {
-  return new Promise((resolve, reject) => {
-    const child = child_process.spawn("git", args, {
-      cwd,
-      stdio: ["ignore", "pipe", "pipe"],
-    });
-    let stderr = "";
-    let timedOut = false;
-    const timer = setTimeout(() => {
-      timedOut = true;
-      child.kill("SIGTERM");
-      const killTimer = setTimeout(() => child.kill("SIGKILL"), 5_000);
-      killTimer.unref();
-    }, GIT_OP_TIMEOUT_MS);
-    timer.unref();
-    child.stderr.on("data", (c: Buffer) => {
-      stderr += c.toString();
-    });
-    child.on("close", (code: number | null) => {
-      clearTimeout(timer);
-      if (timedOut) {
-        reject(
-          new Error(
-            `git ${args.join(" ")} timed out after ${GIT_OP_TIMEOUT_MS / 1000}s (killed)\nstderr: ${stderr}`,
-          ),
-        );
-      } else if (code === 0) resolve();
-      else
-        reject(
-          new Error(`git ${args.join(" ")} exited ${code ?? "null"}\nstderr: ${stderr}`)
-        );
-    });
-    child.on("error", (err) => {
-      clearTimeout(timer);
-      reject(err);
-    });
-  });
-}
-
-async function pathExists(p: string): Promise<boolean> {
-  try {
-    await fs.stat(p);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-/**
- * BL-8: Check whether an existing per-thread directory is a healthy git
- * worktree. Migration from an older machine can leave worktrees whose `.git`
- * pointer references a dead path on the old host. Running any `git` command
- * inside such a dir produces "fatal: not a git repository" and breaks the
- * entire turn.
- *
- * Strategy: run `git -C <dir> rev-parse --git-dir` (cheap: just resolves the
- * .git pointer, no network). Returns true when exit-code=0, false otherwise.
- * Errors are swallowed — an unhealthy worktree should trigger a rebuild, not
- * a hard failure.
- */
-async function isWorktreeGitHealthy(worktreePath: string): Promise<boolean> {
-  return new Promise((resolve) => {
-    const child = child_process.spawn(
-      "git",
-      ["-C", worktreePath, "rev-parse", "--git-dir"],
-      { stdio: ["ignore", "pipe", "pipe"] },
-    );
-    child.on("close", (code) => resolve(code === 0));
-    child.on("error", () => resolve(false));
-  });
-}
-
-/**
- * Ensure a shared-cache repo clone exists at `basePath`.
- *
- * - If basePath is already a git repo (.git exists): noop — caller will fetch.
- * - If basePath is missing AND url is provided: clone into basePath.
- *   Token auth is handled via a temporary GIT_ASKPASS script so the token
- *   **never lands in .git/config** (no-op after clone: remote URL is rewritten
- *   to strip any credential). This satisfies the "no token in workspace" rule.
- * - If basePath is missing AND url is absent: throw a clear error directing
- *   the operator to either configure a url or manually clone.
- *
- * @param basePath  Absolute path to the shared-cache clone directory.
- * @param url       Full clone URL (https://...). Optional.
- * @param token     GitLab PAT used for auth. Never written to disk.
- * @param label     Human-readable name for log messages (e.g. slug).
- */
-/**
- * 批D gated coalescing: decide whether `candidate` —
- * a message QUEUED behind an in-flight turn on the same serial chain — may be
- * merged into the turn `primary` is about to start, instead of burning a full
- * turn of its own. Deliberately conservative; every reject falls back to
- * today's behavior (its own turn), so a `false` here is never wrong, only
- * slower.
- *
- * Requirements:
- *  - Both are REAL user messages. Synthetic turns (card-button clicks, task
- *    stall/comment wake-ups — identified by `larkway_trigger_type` /
- *    `reply_anchor_message_id`, which no real inbound event carries) have
- *    their own content contracts and never coalesce.
- *  - Same SESSION key (`root_id ?? message_id` — message.ts's threadId rule).
- *    The serial-queue key can be a superset of the session key (quote replies
- *    keyed by parent_id), and merging across sessions would leak one
- *    session's ask into another's turn.
- *  - The candidate parses to plain non-empty text with no attachments: the
- *    merged prompt represents followups as text lines only, so an image/file
- *    followup (whose keys ride per-message prompt facts) and an empty-@
- *    followup (whose contract is "pull the thread history first") each keep
- *    their own turn.
- *  - The candidate neither @-mentions someone besides this bot nor quotes a
- *    specific earlier message: those facts (mentioned_others / quoted_message)
- *    are rendered from the turn's primary message only, so a merged followup
- *    would lose them.
- */
-export function canCoalesceFollowup(
-  primary: import("../lark/transport.js").LarkMessageEvent,
-  candidate: import("../lark/transport.js").LarkMessageEvent,
-  keyOpts?: SessionKeyOptions,
-  selfOpenId?: string,
-): boolean {
-  if (primary.larkway_trigger_type != null || candidate.larkway_trigger_type != null) return false;
-  if (primary.reply_anchor_message_id != null || candidate.reply_anchor_message_id != null) return false;
-  // 批F (F1): session-key derivation is shared with message.ts/run() —
-  // coalescing must merge exactly the messages that would land on one
-  // session, no more, no less. Note deriveSessionKey never returns parent_id,
-  // matching the OLD inline rule here (a quote reply keyed by its own
-  // message_id never coalesced, and still doesn't).
-  if (deriveSessionKey(primary, keyOpts) !== deriveSessionKey(candidate, keyOpts)) return false;
-  try {
-    const parsed = parseMessage(candidate);
-    if (parsed.attachments.length > 0) return false;
-    if (parsed.text.trim() === "") return false;
-    if (mentionedOthers(parsed, selfOpenId).length > 0 || quotedMessageId(parsed) !== undefined) return false;
-  } catch {
-    return false;
-  }
-  return true;
-}
-
-/**
- * Per-basePath serialization for clone-if-missing + timeout cleanup. The
- * shared repo cache is used across threads AND bots (main.ts sharedReposDir),
- * while handler-level serialization is per session key only — so two turns
- * can race ensureRepoClone on the SAME basePath. That was mostly benign until
- * the timeout path gained a destructive rm of a partial clone: an unserialized
- * rm racing a fresh concurrent clone could delete the new clone's files from
- * under it (valid-looking .git, missing objects — a poisoned cache needing
- * manual repair). Chain entries are bounded by the number of configured repos.
- */
-const repoCloneLocks = new Map<string, Promise<void>>();
-
-function ensureRepoClone(
-  basePath: string,
-  url: string | undefined,
-  token: string | undefined,
-  label: string,
-): Promise<void> {
-  const prev = repoCloneLocks.get(basePath) ?? Promise.resolve();
-  // A failed predecessor must not fail (or block) this attempt — swallow it
-  // for chaining purposes; each caller still sees its OWN attempt's outcome.
-  const next = prev
-    .catch(() => {})
-    .then(() => ensureRepoCloneImpl(basePath, url, token, label));
-  repoCloneLocks.set(basePath, next.catch(() => {}));
-  return next;
-}
-
-async function ensureRepoCloneImpl(
-  basePath: string,
-  url: string | undefined,
-  token: string | undefined,
-  label: string,
-): Promise<void> {
-  // Already a git repo → caller handles fetch; nothing to do here.
-  const gitDir = path.join(basePath, ".git");
-  if (await pathExists(gitDir)) {
-    return;
-  }
-
-  // Base path exists but is not a git repo (empty dir or stale artefact).
-  // Fall through to clone logic: clone will fail with a useful git error if
-  // the dir is non-empty, surfacing the problem clearly.
-
-  if (!url) {
-    throw new Error(
-      `[bridge.handler] repo "${label}" has no local clone at ${basePath} and no url is configured. ` +
-        `Configure repos[].url in the bot yaml or manually clone the repo to ${basePath}.`,
-    );
-  }
-
-  // Clone with token auth via GIT_ASKPASS (ephemeral shell script).
-  // The token is passed through an env var read by the script — it is NEVER
-  // embedded in the clone URL or written to .git/config.
-  //
-  // After the clone, we rewrite the remote URL to the credential-free form
-  // so that any later `git fetch` in the workspace also uses ASKPASS and the
-  // token stays out of .git/config permanently.
-  // Process-unique suffix (pid + time + random) so concurrent ensureRepoClone
-  // calls — even within the same millisecond — never collide on the temp script
-  // name or the token env var (current callers are sequential, but this keeps it
-  // safe if clones are ever parallelised).
-  const uniq = `${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
-  // GIT_ASKPASS must point at something the OS can execute: a /bin/sh script
-  // on POSIX, a .cmd batch file on Windows (git-for-windows runs it via cmd).
-  const isWin = process.platform === "win32";
-  const tmpScript = path.join(basePath, "..", `.askpass-${uniq}.${isWin ? "cmd" : "sh"}`);
-  const tokenEnvVar = `LARKWAY_GIT_TOKEN_${uniq.replace(/[^a-zA-Z0-9]/g, "_")}`;
-  try {
-    // Ensure parent dir exists so we can write the script.
-    await fs.mkdir(path.dirname(basePath), { recursive: true });
-
-    // Write a minimal ASKPASS script: prints the token for "Password" prompts.
-    const scriptContent = isWin
-      ? `@echo off\r\necho %${tokenEnvVar}%\r\n`
-      : ["#!/bin/sh", `echo "\${${tokenEnvVar}}"`].join("\n") + "\n";
-    await fs.writeFile(tmpScript, scriptContent, { mode: 0o700, encoding: "utf8" });
-
-    console.log(`[bridge.handler] cloning ${label} into ${basePath} …`);
-    const env: NodeJS.ProcessEnv = {
-      ...process.env,
-      GIT_ASKPASS: tmpScript,
-      GIT_TERMINAL_PROMPT: "0",
-      [tokenEnvVar]: token ?? "",
-    };
-    // Same black-hole ceiling as execGit (see GIT_OP_TIMEOUT_MS): the cold
-    // clone is the single most network-exposed pre-spawn git op, runs inside
-    // the thread serial queue AND holds a MAX_CONCURRENT slot — an un-bounded
-    // half-open TCP hang here stalled the whole bot until restart.
-    let timedOut = false;
-    try {
-      await new Promise<void>((resolve, reject) => {
-        const child = child_process.spawn(
-          "git",
-          ["clone", "--quiet", url, basePath],
-          { stdio: ["ignore", "pipe", "pipe"], env },
-        );
-        let stderr = "";
-        const timer = setTimeout(() => {
-          timedOut = true;
-          child.kill("SIGTERM");
-          const killTimer = setTimeout(() => child.kill("SIGKILL"), 5_000);
-          killTimer.unref();
-        }, GIT_OP_TIMEOUT_MS);
-        timer.unref();
-        child.stderr.on("data", (b: Buffer) => { stderr += b.toString(); });
-        child.on("close", (code) => {
-          clearTimeout(timer);
-          if (timedOut) {
-            reject(new Error(
-              `git clone ${url} timed out after ${GIT_OP_TIMEOUT_MS / 1000}s (killed)\nstderr: ${stderr}`,
-            ));
-          } else if (code === 0) resolve();
-          else reject(new Error(`git clone ${url} exited ${code ?? "null"}\nstderr: ${stderr}`));
-        });
-        child.on("error", (err) => {
-          clearTimeout(timer);
-          reject(err);
-        });
-      });
-    } catch (err) {
-      if (timedOut) {
-        // A SIGKILL'd clone can leave a partial basePath (incl. a partial
-        // .git that would fool the "already a repo" fast-path next turn).
-        // Only the timeout path may own this dir: a pre-existing non-empty
-        // dir makes clone fail fast with exit≠0 long before the ceiling.
-        // AWAITED before the error propagates (and the per-basePath lock
-        // releases), so a queued concurrent clone can never start while this
-        // destructive rm is still scanning.
-        await fs.rm(basePath, { recursive: true, force: true }).catch(() => {});
-      }
-      throw err;
-    }
-    console.log(`[bridge.handler] clone of ${label} complete.`);
-
-    // Rewrite remote URL to credential-free form so .git/config stays clean.
-    // Use the original url (without embedded credentials) — it already is
-    // credential-free since we passed the token via ASKPASS, not in the URL.
-    // This is a no-op in practice but serves as an explicit safeguard.
-    await execGit(basePath, ["remote", "set-url", "origin", url]);
-  } finally {
-    // Always remove the ephemeral ASKPASS script.
-    await fs.unlink(tmpScript).catch(() => {});
-  }
-}
-
-/**
- * Bridge core Bash allow-list — capabilities the bridge itself depends on
- * regardless of project (Lark IO, git ops, gh/glab PR/MR ops, port detection,
- * HTTP probe, basic POSIX scripting). Project-stack-specific tools
- * (pnpm, gradle, cargo, NEXT_PUBLIC_PORT=...) come from
- * `~/.larkway/config.json permissions.allowExtra` — see WriteWorktreeSettingsOpts.
- */
-const CORE_ALLOW_RULES = [
-  "Bash(lark-cli *)",
-  "Bash(git *)",
-  "Bash(gh *)",
-  "Bash(glab *)",
-  "Bash(lsof *)",
-  "Bash(curl *)",
-  "Bash(wget *)",
-  "Bash(python3 *)",
-  "Bash(netstat *)",
-  "Bash(nc *)",
-  "Bash(env *)",
-  "Bash(which *)",
-  "Bash(ls *)",
-  "Bash(cat *)",
-  "Bash(grep *)",
-  "Bash(awk *)",
-  "Bash(sed *)",
-  "Bash(find *)",
-  "Bash(echo *)",
-  "Bash(printf *)",
-  "Bash(sort *)",
-  "Bash(uniq *)",
-  "Bash(head *)",
-  "Bash(tail *)",
-  "Bash(jq *)",
-  "Bash(unzip *)",
-  "Bash(mkdir *)",
-  "Bash(cp *)",
-  "Bash(mv *)",
-  "Bash(date *)",
-  "Bash(setsid *)",
-  "Bash(nohup *)",
-  "Bash(kill *)",
-  "Bash(sleep *)",
-  "Bash(test *)",
-  // Build / run tools: frontend bots need pnpm/npm/node/npx to build and dev.
-  // Including here (core) so all bots benefit without needing allowExtra config.
-  "Bash(pnpm *)",
-  "Bash(npm *)",
-  "Bash(node *)",
-  "Bash(npx *)",
-  // Dev-server env-prefix pattern: NEXT_PUBLIC_PORT=3000 pnpm dev, etc.
-  "Bash(NEXT_PUBLIC_PORT=* *)",
-];
-
-const CORE_DENY_RULES = [
-  "Bash(git push --force *)",
-  "Bash(rm -rf /*)",
-  "Bash(npm publish *)",
-];
-
-interface WriteWorktreeSettingsOpts {
-  /** Project-stack-specific extras merged with CORE_ALLOW_RULES (deduped). */
-  allowExtra?: string[];
-  /**
-   * 批H H5: agent_workspace writes allow-rules ONLY. Relocating the file to
-   * runCwd made it live for the first time — silently activating
-   * CORE_DENY_RULES (git push --force / npm publish blocks) for every
-   * deployed bot would be an unannounced behavior change riding a
-   * dead-write cleanup (deny rules bind even under bypassPermissions).
-   * Activating deny for agent_workspace is a separate product decision
-   * (backlog). Legacy keeps deny — there the file was always live.
-   */
-  includeDeny?: boolean;
-  /**
-   * 批H H5: refuse to overwrite a file we didn't author (no _larkway_managed
-   * marker) — the workspace root is long-lived and owner-editable, unlike
-   * the throwaway per-session dirs this used to target.
-   */
-  respectForeignFile?: boolean;
-}
-
-async function writeWorktreeSettings(
-  worktreePath: string,
-  opts: WriteWorktreeSettingsOpts = {},
-): Promise<void> {
-  // Use settings.local.json instead of settings.json:
-  // - settings.json is repo-tracked in many projects (e.g. web-app has
-  //   PostToolUse hooks committed there); overwriting it pollutes the worktree
-  //   with a modified tracked file that `git add -A` would inadvertently commit.
-  // - settings.local.json is conventionally git-ignored (via ~/.config/git/ignore
-  //   pattern `**/.claude/settings.local.json`), so it stays out of commits.
-  //
-  // 批H H5: content-compare idempotence — the agent_workspace call site now
-  // targets the WORKSPACE ROOT (a long-lived dir hit on every turn of every
-  // session), so an unconditional write would be a per-turn no-op write and
-  // a misleading fresh mtime. Skip when the payload is byte-identical;
-  // rewrite only when the rules actually changed (e.g. allowExtra config).
-  const dir = path.join(worktreePath, ".claude");
-  await fs.mkdir(dir, { recursive: true });
-  const allow = Array.from(new Set([...CORE_ALLOW_RULES, ...(opts.allowExtra ?? [])]));
-  const settings = {
-    _larkway_managed: true,
-    permissions: {
-      allow,
-      ...(opts.includeDeny === false ? {} : { deny: CORE_DENY_RULES }),
-    },
-  };
-  const filePath = path.join(dir, "settings.local.json");
-  const payload = JSON.stringify(settings, null, 2);
-  try {
-    const existing = await fs.readFile(filePath, "utf8");
-    if (existing === payload) return;
-    if (opts.respectForeignFile) {
-      try {
-        const parsed = JSON.parse(existing) as { _larkway_managed?: unknown };
-        if (parsed._larkway_managed !== true) return; // human-authored — hands off
-      } catch {
-        return; // unparseable = definitely not ours — hands off
-      }
-    }
-  } catch {
-    /* missing/unreadable — write below */
-  }
-  await fs.writeFile(filePath, payload, "utf8");
-}
-
-/**
- * Pre-install node_modules in worktree's monorep dir so the bot doesn't
- * have to do it from a cold start in stage 1. Try `--offline
- * --frozen-lockfile` first (fastest; expects warm pnpm store + lockfile
- * matches), fall back to a normal install if that errors.
- *
- * No-op when worktree has no `monorep/package.json` (e.g. non-monorepo
- * project) or when `monorep/node_modules/.modules.yaml` already exists
- * (means a prior install completed for the same lockfile).
- *
- * Best-effort: throws are caught by caller so bot can recover via SKILL.
- * Output redirected to /dev/null to keep bridge log clean (errors still
- * surface via the rejected promise).
- */
-async function ensureNodeModules(worktreePath: string): Promise<void> {
-  const monorepDir = path.join(worktreePath, "monorep");
-  const pkgJson = path.join(monorepDir, "package.json");
-  if (!(await pathExists(pkgJson))) return; // not a monorep layout — skip
-
-  // Quick skip when prior install already populated node_modules.
-  const modulesMarker = path.join(monorepDir, "node_modules", ".modules.yaml");
-  if (await pathExists(modulesMarker)) return;
-
-  const start = Date.now();
-  try {
-    await execFile(
-      "pnpm",
-      ["install", "--offline", "--frozen-lockfile"],
-      { cwd: monorepDir, timeoutMs: 180_000 },
-    );
-    console.log(
-      `[bridge.handler] pnpm install --offline ok (${(
-        (Date.now() - start) / 1000
-      ).toFixed(1)}s) in ${monorepDir}`,
-    );
-    return;
-  } catch (offlineErr) {
-    console.warn(
-      `[bridge.handler] --offline install failed (will fall back to network): ${(offlineErr as Error).message.slice(0, 200)}`,
-    );
-  }
-
-  await execFile(
-    "pnpm",
-    ["install", "--frozen-lockfile"],
-    { cwd: monorepDir, timeoutMs: 600_000 },
-  );
-  console.log(
-    `[bridge.handler] pnpm install (network) ok (${(
-      (Date.now() - start) / 1000
-    ).toFixed(1)}s) in ${monorepDir}`,
-  );
-}
-
-/**
- * Tiny exec wrapper. Resolves on exit code 0; rejects with stderr on non-zero.
- */
-function execFile(
-  cmd: string,
-  args: string[],
-  opts: { cwd: string; timeoutMs: number },
-): Promise<void> {
-  return new Promise((resolve, reject) => {
-    const child = child_process.spawn(cmd, args, {
-      cwd: opts.cwd,
-      stdio: ["ignore", "pipe", "pipe"],
-    });
-    let stderr = "";
-    child.stdout.on("data", () => {}); // drain
-    child.stderr.on("data", (b: Buffer) => {
-      stderr += b.toString();
-    });
-    const timer = setTimeout(() => {
-      child.kill("SIGTERM");
-      reject(new Error(`${cmd} ${args.join(" ")} timed out after ${opts.timeoutMs}ms`));
-    }, opts.timeoutMs);
-    timer.unref();
-    child.on("close", (code) => {
-      clearTimeout(timer);
-      if (code === 0) resolve();
-      else reject(new Error(`${cmd} ${args.join(" ")} exit ${code}\nstderr: ${stderr.trim().slice(-500)}`));
-    });
-    child.on("error", (err) => {
-      clearTimeout(timer);
-      reject(err);
-    });
-  });
-}
-
-async function createOnlyPostFallback(opts: {
-  postClient?: OutboundPostClient;
-  replyToMessageId: string;
-  replyInThread: boolean;
-  botId: string;
-  threadId: string;
-  triggerMessageId: string;
-  finalText: string;
-  failureReason: string;
-  title?: string;
-  logPrefix: string;
-}): Promise<{ messageId: string; idempotencyKey: string } | null> {
-  if (!opts.postClient) {
-    console.error(`${opts.logPrefix} create-only post fallback unavailable: no postClient`);
-    return null;
-  }
-
-  const text = [
-    opts.finalText.trim() || "执行结果无法通过卡片展示。",
-    "",
-    `fallback_reason: ${opts.failureReason}`,
-  ].join("\n");
-  const content = buildPostContent({
-    text,
-    title: opts.title ?? "Larkway fallback",
-  });
-  const idempotencyKey = derivePostIdempotencyKey({
-    botId: opts.botId,
-    threadId: opts.threadId,
-    triggerMessageId: opts.triggerMessageId,
-    role: "fallback",
-    logicalIndex: 0,
-    contentDigest: digestPostContent(content),
-  });
-
-  try {
-    const sent = await opts.postClient.createPostReply(opts.replyToMessageId, content, {
-      replyInThread: opts.replyInThread,
-      idempotencyKey,
-    });
-    console.warn(
-      `${opts.logPrefix} create-only post fallback sent as ${sent.messageId}`,
-    );
-    return { messageId: sent.messageId, idempotencyKey };
-  } catch (err) {
-    console.error(`${opts.logPrefix} create-only post fallback failed:`, err);
-    return null;
-  }
-}
-
-/**
- * Appends 「已交接给 <peer>」 (display names, 、-joined) to a bridge failure
- * card's or fallback post's text when this turn's handoff mirrors already
- * went out. WP-8 sends them alongside the final card, so a turn can fail
- * after its peer was woken; without the line the user sees only the failure
- * and a re-@ would hand off again.
- */
-function withHandoffSentNote(text: string, peerNames: readonly string[]): string {
-  const names = [...new Set(peerNames)];
-  return names.length > 0 ? `${text}\n\n已交接给 ${names.join("、")}` : text;
-}
+export {
+  canCoalesceFollowup,
+  resolveIdleKillAfterMs,
+  resolveModelFirstMode,
+  type ModelFirstMode,
+};
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -1398,6 +619,51 @@ export class BridgeHandler {
    * see runtimeWarningsCleared).
    */
   private readonly runtimeWarningsSent = new Map<string, string>();
+  /**
+   * Per-session fingerprint of the last unclaimed `<task-handle>` candidate
+   * snapshot delivered on a successful turn (mirrors `runtimeWarningsSent`).
+   * Avoids re-injecting the unchanged candidate list on every delta turn.
+   */
+  private readonly taskCandidatesSent = new Map<string, string>();
+  /**
+   * Managed agent workspaces already scaffolded in this process, keyed by
+   * workspace path → { dirIno, agentsMdIno }. Validated cheaply with two stats
+   * on cache hit so external deletion/replacement of the workspace or AGENTS.md
+   * triggers automatic scaffold repair.
+   */
+  private readonly ensuredWorkspaces = new Map<string, { dirIno: number | bigint; agentsMdIno: number | bigint }>();
+
+  private async isManagedWorkspaceStillValid(wsPath: string): Promise<boolean> {
+    const cached = this.ensuredWorkspaces.get(wsPath);
+    if (!cached) return false;
+    try {
+      const [dirSt, agentsSt] = await Promise.all([
+        fs.stat(wsPath),
+        fs.stat(path.join(wsPath, "AGENTS.md")),
+      ]);
+      if (dirSt.isDirectory() && agentsSt.isFile() && dirSt.ino === cached.dirIno && agentsSt.ino === cached.agentsMdIno) {
+        return true;
+      }
+    } catch {
+      // Missing dir or AGENTS.md — evict cache so caller repairs scaffold.
+    }
+    this.ensuredWorkspaces.delete(wsPath);
+    return false;
+  }
+
+  private async recordEnsuredWorkspace(wsPath: string): Promise<void> {
+    try {
+      const [dirSt, agentsSt] = await Promise.all([
+        fs.stat(wsPath),
+        fs.stat(path.join(wsPath, "AGENTS.md")),
+      ]);
+      if (dirSt.isDirectory() && agentsSt.isFile()) {
+        this.ensuredWorkspaces.set(wsPath, { dirIno: dirSt.ino, agentsMdIno: agentsSt.ino });
+      }
+    } catch {
+      this.ensuredWorkspaces.delete(wsPath);
+    }
+  }
 
   constructor(deps: BridgeHandlerDeps) {
     this.deps = deps;
@@ -1440,9 +706,8 @@ export class BridgeHandler {
       messageCreateAt: larkEpochMs(event.create_time), wsAt: event.ws_at,
       status: "sending", prompt: renderSteeringInput(parsed, this.deps.botConfig?.bot_open_id, this.deps.larkCliProfile, this.deps.botConfig?.owner_open_id, active.taskMessageId),
     };
-    // The durable sending record precedes any native side effects.
-    await this.inputDeliveries.put(record);
-    let result: import("../agent/runner.js").SteerResult;
+    // Prepare local session artifacts first so the single durable `sending`
+    // journal write carries `sentAt` and lands strictly before `handle.steer()`.
     try {
       if (this.deps.conventions.runtime === "agent_workspace") {
         await ensureSessionArtifacts({ sessionPath: active.sessionPath, parsed, isNewThread: false, larkCliProfile: this.deps.larkCliProfile });
@@ -1455,6 +720,7 @@ export class BridgeHandler {
     void this.deps.client.addProcessingReaction?.(event.message_id).catch(() => {});
     record.sentAt = new Date().toISOString();
     await this.inputDeliveries.put(record);
+    let result: import("../agent/runner.js").SteerResult;
     try { result = await active.handle.steer(record.prompt); }
     catch { result = { status: "unknown", reason: "Native input delivery threw without a confirmed acknowledgement" }; }
     void this.deps.client.removeProcessingReaction?.(event.message_id).catch(() => {});
@@ -1540,6 +806,20 @@ export class BridgeHandler {
   /** WP-2 (f): identity of the rendered warning lines — see runtimeWarningsSent. */
   private static runtimeWarningsFingerprint(warnings: readonly RuntimeRequirement[]): string {
     return JSON.stringify(warnings.map((w) => [w.label, w.command, w.reason, w.installHint]));
+  }
+
+  /** Identity of the unclaimed `<task-handle>` candidate snapshot for delta dedup. */
+  private static taskCandidatesFingerprint(
+    tasklistGuid: string | undefined,
+    claimed: boolean,
+    candidates: readonly TaskCandidate[],
+  ): string {
+    if (!tasklistGuid) return "";
+    if (claimed) return `claimed:${tasklistGuid}`;
+    return JSON.stringify([
+      tasklistGuid,
+      candidates.map((c) => [c.guid, c.summary, c.descriptionExcerpt ?? ""]),
+    ]);
   }
 
   /**
@@ -1924,6 +1204,7 @@ export class BridgeHandler {
     // Every exit that reads or finalizes a surface waits for it first. Never
     // rejects: a failed step is logged and the next one still runs.
     let surfaceReady: Promise<void> | undefined;
+    let eventWriteChain: Promise<void> = Promise.resolve();
     const chainSurface = (step: () => Promise<unknown>): void => {
       surfaceReady = (surfaceReady ?? Promise.resolve()).then(step).then(
         () => undefined,
@@ -1961,10 +1242,21 @@ export class BridgeHandler {
     // V1 (no bot yaml) has no id — metrics/harvest paths use the same
     // sentinel bucket sessionStore.put() defaults to.
     const metricBotId = botId ?? "v1-default";
-    // 批G G4: L2 live-read — a few-KB local file per turn buys "edit L2, no
-    // restart". Boot-cached deps.agentMemory remains the fallback.
+    // 批G G4: L2 live-read — needed only by legacy runtime (prompt injection) or
+    // the first managed-workspace scaffold in this process. BYO and already-ensured
+    // agent workspaces load native AGENTS.md directly and never inject agentMemory.
     let agentMemory = this.deps.agentMemory;
-    if (this.deps.agentMemoryPath) {
+    const isAgentWorkspaceBot = this.deps.conventions.runtime === "agent_workspace";
+    const managedWorkspaceValid =
+      isAgentWorkspaceBot &&
+      this.deps.conventions.byoWorkspace !== true &&
+      this.deps.conventions.agentWorkspacePath !== undefined
+        ? await this.isManagedWorkspaceStillValid(this.deps.conventions.agentWorkspacePath)
+        : false;
+    const skipMemoryRead =
+      isAgentWorkspaceBot &&
+      (this.deps.conventions.byoWorkspace === true || managedWorkspaceValid);
+    if (this.deps.agentMemoryPath && !skipMemoryRead) {
       try {
         agentMemory = await fs.readFile(this.deps.agentMemoryPath, "utf8");
       } catch {
@@ -2032,13 +1324,22 @@ export class BridgeHandler {
     // lastTurnMentionsAt so the handoff-break anchor is turn-start, not
     // turn-completion + a getTask round-trip — see turnReceivedAt below.
     const turnReceivedAt = this.threadReceivedAt.get(threadId);
-    const recordEvent = async (patch: Omit<RuntimeEventPatch, "id">) => {
-      if (!this.deps.recordRuntimeEvent) return;
-      try {
-        await this.deps.recordRuntimeEvent({ id: eventLogId, ...patch });
-      } catch (err) {
-        console.warn("[bridge.handler] recordRuntimeEvent failed (continuing):", err);
-      }
+    // Serialize event-log writes off the hot path: intermediate "received" /
+    // "running" entries run asynchronously in order and are drained before the
+    // terminal "completed" / "failed" record (and in handleOne's finally block)
+    // so dashboard diagnostics never stall runner startup or card delivery.
+    const recordEvent = (patch: Omit<RuntimeEventPatch, "id">, opts?: { sync?: boolean }): Promise<void> => {
+      if (!this.deps.recordRuntimeEvent) return Promise.resolve();
+      const recorder = this.deps.recordRuntimeEvent;
+      const run = eventWriteChain.then(async () => {
+        try {
+          await recorder({ id: eventLogId, ...patch });
+        } catch (err) {
+          console.warn("[bridge.handler] recordRuntimeEvent failed (continuing):", err);
+        }
+      });
+      eventWriteChain = run;
+      return opts?.sync ? run : Promise.resolve();
     };
     const recordPerf = async (sample: PerfSample) => {
       if (!this.deps.recordPerfSample) return;
@@ -2176,6 +1477,12 @@ export class BridgeHandler {
     const removeProcessingReactionPreRunner = async (): Promise<void> => {
       if (!this.deps.client.removeProcessingReaction) return;
       await turnPerf.timed("reactionRemoveMs", this.deps.client.removeProcessingReaction(messageId));
+      // Clear any queued-turn reactions placed on coalesced followups too.
+      for (const f of followups) {
+        if (f.message_id && f.message_id !== messageId) {
+          void this.deps.client.removeProcessingReaction(f.message_id).catch(() => {});
+        }
+      }
     };
 
     // 批D: make each coalesced followup visible in the runtime event log (Web
@@ -2833,35 +2140,41 @@ export class BridgeHandler {
       const extraRepos = conventions.extraRepoPaths ?? [];
 
       if (isAgentWorkspace && !conventions.byoWorkspace) {
-        await ensureAgentWorkspace({
-          agentId: botId ?? "v1-default",
-          workspacePath: conventions.agentWorkspacePath!,
-          reposPath: conventions.workspaceReposPath!,
-          sessionPath: worktreePath,
-          bot: {
-            name: this.deps.botConfig?.name ?? "Larkway Agent",
-            description: this.deps.botConfig?.description ?? "Local agent served through Larkway.",
-            gitlab_token_env: this.deps.botConfig?.git_token_env ?? this.deps.botConfig?.gitlab_token_env,
-          },
-          agentMemory,
-          repos: [
-            ...(conventions.defaultProjectSlug
-              ? [
-                  {
-                    slug: conventions.defaultProjectSlug,
-                    branch: conventions.defaultBranch,
-                    url: conventions.primaryRepoUrl,
-                    suggestedPath: conventions.repoCachePath ?? conventions.workspaceReposPath!,
-                  },
-                ]
-              : []),
-            ...extraRepos.map((repo) => ({
-              slug: repo.slug,
-              url: repo.url,
-              suggestedPath: repo.cachePath,
-            })),
-          ],
-        });
+        const wsPath = conventions.agentWorkspacePath!;
+        if (managedWorkspaceValid) {
+          await fs.mkdir(worktreePath, { recursive: true });
+        } else {
+          await ensureAgentWorkspace({
+            agentId: botId ?? "v1-default",
+            workspacePath: wsPath,
+            reposPath: conventions.workspaceReposPath!,
+            sessionPath: worktreePath,
+            bot: {
+              name: this.deps.botConfig?.name ?? "Larkway Agent",
+              description: this.deps.botConfig?.description ?? "Local agent served through Larkway.",
+              gitlab_token_env: this.deps.botConfig?.git_token_env ?? this.deps.botConfig?.gitlab_token_env,
+            },
+            agentMemory,
+            repos: [
+              ...(conventions.defaultProjectSlug
+                ? [
+                    {
+                      slug: conventions.defaultProjectSlug,
+                      branch: conventions.defaultBranch,
+                      url: conventions.primaryRepoUrl,
+                      suggestedPath: conventions.repoCachePath ?? conventions.workspaceReposPath!,
+                    },
+                  ]
+                : []),
+              ...extraRepos.map((repo) => ({
+                slug: repo.slug,
+                url: repo.url,
+                suggestedPath: repo.cachePath,
+              })),
+            ],
+          });
+          await this.recordEnsuredWorkspace(wsPath);
+        }
       }
 
       // Step 4a-i: ensure primary cache clone exists.
@@ -3395,6 +2708,26 @@ export class BridgeHandler {
           }
         }
 
+        const taskHandleTasklistGuid = this.deps.botConfig?.taskHandle?.tasklistGuid;
+        const taskHandleClaimed = this.deps.taskHandleClaimedLookup?.(threadId) ?? false;
+        const taskHandleCandidates = this.deps.taskHandleCandidatesLookup?.() ?? [];
+        if (rendersFullPrompt) {
+          this.taskCandidatesSent.delete(threadId);
+        }
+        const taskCandidatesKey = BridgeHandler.taskCandidatesFingerprint(
+          taskHandleTasklistGuid,
+          taskHandleClaimed,
+          taskHandleCandidates,
+        );
+        const taskHandleCandidatesChanged =
+          rendersFullPrompt || this.taskCandidatesSent.get(threadId) !== taskCandidatesKey;
+        const taskCandidatesEmitted =
+          !taskRootInfo &&
+          Boolean(taskHandleTasklistGuid) &&
+          !taskHandleClaimed &&
+          taskHandleCandidates.length > 0 &&
+          taskHandleCandidatesChanged;
+
         const promptRenderStartedAt = Date.now();
         const prompt = await renderPrompt({
           parsed,
@@ -3467,13 +2800,14 @@ export class BridgeHandler {
           runtimeWarnings,
           runtimeWarningsChanged,
           runtimeWarningsCleared,
-          taskHandleTasklistGuid: this.deps.botConfig?.taskHandle?.tasklistGuid,
-          taskHandleClaimed: this.deps.taskHandleClaimedLookup?.(threadId) ?? false,
+          taskHandleTasklistGuid,
+          taskHandleClaimed,
           // BL-49: mechanical 建卡 判据 facts. Counts THIS turn (a brand-new
           // topic is 1), matching the number the agent can see in the thread.
           threadTurnCount: (existing?.turnCount ?? 0) + 1,
-          threadHasTaskCard: this.deps.taskHandleClaimedLookup?.(threadId) ?? false,
-          taskHandleCandidates: this.deps.taskHandleCandidatesLookup?.() ?? [],
+          threadHasTaskCard: taskHandleClaimed,
+          taskHandleCandidates,
+          taskHandleCandidatesChanged,
           taskRoot: taskRootInfo
             ? {
                 ...taskRootInfo,
@@ -4076,6 +3410,7 @@ export class BridgeHandler {
             // them undefined, same as every perf sample recorded before this.
             pooled: result.pooled,
             resumeMode: result.resumeMode,
+            processStart: result.processStart,
             usage: resultEvent?.usage,
             lastRequestInputTokens: resultEvent?.lastRequestInputTokens,
           };
@@ -4477,7 +3812,14 @@ export class BridgeHandler {
           // before turn/start carries the prompt (src/codex/pool.ts), so a turn
           // that fails from there never put the block into the session history.
           // A failed turn repeats it next time — the cheap direction.
-          if (success) this.runtimeWarningsSent.set(threadId, runtimeWarningsKey);
+          if (success) {
+            this.runtimeWarningsSent.set(threadId, runtimeWarningsKey);
+            if (taskCandidatesEmitted) {
+              this.taskCandidatesSent.set(threadId, taskCandidatesKey);
+            } else if (taskHandleClaimed) {
+              this.taskCandidatesSent.delete(threadId);
+            }
+          }
 
           // BL-38 counter: a confirmed idle-stuck turn accrues (+1); a clean
           // success resets to 0; any OTHER failure (crash / explicit `failed`)
@@ -4797,25 +4139,23 @@ export class BridgeHandler {
                     (fallbackAnswer ? fallbackAnswer : taskCardProgress?.hasProgress ? taskCardProgress.latestText : noOutputFallback));
 
           // 批F (F2): persist this turn's user-facing answer into the session
-          // transcript so a future reseed seed carries BOTH sides of the
-          // conversation (transcript.md previously recorded only user text).
-          // Awaited (it's a fast local append) so the next serialized turn's
-          // transcript entry / seed read never races this one; failure is
-          // still swallowed — a missed answer line never affects the turn.
+          // transcript concurrently with card delivery (joined before handleOne
+          // returns, so the next serialized turn on this thread still sees it).
           // Agent_workspace only (legacy has no transcript.md); /stop turns
           // record nothing (no answer was produced).
-          if (isAgentWorkspace && !stoppedByUser) {
-            await appendTranscriptAnswer(
-              worktreePath,
-              cardBody,
-              success ? "completed" : "failed",
-            ).catch((err) =>
-              console.warn(
-                "[bridge.handler] transcript answer append failed (continuing):",
-                err,
-              ),
-            );
-          }
+          const transcriptSaved =
+            isAgentWorkspace && !stoppedByUser
+              ? appendTranscriptAnswer(
+                  worktreePath,
+                  cardBody,
+                  success ? "completed" : "failed",
+                ).catch((err) =>
+                  console.warn(
+                    "[bridge.handler] transcript answer append failed (continuing):",
+                    err,
+                  ),
+                )
+              : undefined;
 
           // 批G G6 (P1): mechanical memory-visibility card tail (原则 4 —
           // "记忆可见即可纠,且可见性必须机械"). Two mechanical sources:
@@ -4961,7 +4301,7 @@ export class BridgeHandler {
                 // interrupt — both set success=false) settles the reasoning panel
                 // with the errored title. No-op when no panel was created.
                 if (!success) cardKitProgress.markCotError();
-                await cardKitProgress.finalize({
+                const finalizeRes = await cardKitProgress.finalize({
                   executionStatus: stoppedByUser ? "本轮已停止" : budgetExhausted ? "本轮预算耗尽" : result.interrupted ? "本轮已中断" : success ? "本轮已结束" : "本轮执行失败",
                   title: baseCardPayload.titleOverride,
                   finalText: baseCardPayload.finalText,
@@ -4971,11 +4311,69 @@ export class BridgeHandler {
                   imageBlocks: baseCardPayload.imageBlocks,
                   contentBlocks: baseCardPayload.contentBlocks,
                 });
-                await updateCardKitRecord({
-                  status: "finalized",
-                  sequence: cardKitProgress.sequence,
-                });
-                await deleteCardKitFile(worktreePath);
+                const pendingOverflowChunks = finalizeRes?.overflowText
+                  ? prepareCardKitOverflowChunks({
+                      botId: this.deps.botConfig?.id ?? "v1-default",
+                      threadId,
+                      triggerMessageId: messageId,
+                      overflowText: finalizeRes.overflowText,
+                    })
+                  : [];
+                if (pendingOverflowChunks.length > 0 && this.deps.postClient) {
+                  // Persist unsent overflow chunks in cardkit.json BEFORE posting
+                  // so a crash or partial failure can resume cleanly on restart
+                  // using the exact same idempotency keys.
+                  await updateCardKitRecord({
+                    status: "finalized",
+                    sequence: cardKitProgress.sequence,
+                    pendingOverflow: {
+                      triggerMessageId: messageId,
+                      chunks: pendingOverflowChunks,
+                    },
+                  });
+                  const delivery = await sendCardKitOverflowChunks({
+                    postClient: this.deps.postClient,
+                    replyToMessageId: replyAnchorId,
+                    replyInThread,
+                    chunks: pendingOverflowChunks,
+                    onChunkSent: async (idx) => {
+                      pendingOverflowChunks[idx]!.sent = true;
+                      await updateCardKitRecord({
+                        pendingOverflow: {
+                          triggerMessageId: messageId,
+                          chunks: pendingOverflowChunks,
+                        },
+                      }).catch((saveErr) => {
+                        console.warn("[bridge.handler] checkpoint overflow chunk failed:", saveErr);
+                      });
+                    },
+                  });
+                  if (delivery.sent === delivery.total) {
+                    await deleteCardKitFile(worktreePath);
+                  } else {
+                    await recordEvent({
+                      status: "running",
+                      appendPath: "超长续发部分失败",
+                      reason:
+                        `CardKit 超长续发仅成功 ${delivery.sent}/${delivery.total} 段` +
+                        (delivery.error ? `（${delivery.error}）` : "") +
+                        `，未发段落已保留在 cardkit.json 等待恢复。`,
+                    });
+                  }
+                } else {
+                  await updateCardKitRecord({
+                    status: "finalized",
+                    sequence: cardKitProgress.sequence,
+                  });
+                  await deleteCardKitFile(worktreePath);
+                  if (pendingOverflowChunks.length > 0 && !this.deps.postClient) {
+                    await recordEvent({
+                      status: "running",
+                      appendPath: "超长续发跳过",
+                      reason: "CardKit 正文超出 30KB，但未配置 postClient，无法发送续发消息。",
+                    });
+                  }
+                }
               } catch (err) {
                 const fallbackReason =
                   `CardKit finalize failed; visible legacy card fallback used: ${String(err)}`;
@@ -5166,10 +4564,9 @@ export class BridgeHandler {
               : undefined;
 
           // WP-8 join. The card delivery's error is the turn's error (same as
-          // when it was awaited inline); the handoffs and the task signals
-          // never reject, and both finish before any terminal record below —
-          // their running-status events must not land after 已完成.
-          const [cardDelivery] = await Promise.allSettled([cardDelivered, handoffsSettled, taskSignalsSettled]);
+          // when it was awaited inline); the handoffs, task signals, and
+          // transcript append never reject and settle before handleOne returns.
+          const [cardDelivery] = await Promise.allSettled([cardDelivered, handoffsSettled, taskSignalsSettled, transcriptSaved]);
           if (cardDelivery.status === "rejected") throw cardDelivery.reason;
 
           // BL-49 "任务卡黑洞" diagnostic. The v5 main path has no equivalent of
@@ -5204,13 +4601,16 @@ export class BridgeHandler {
           // the success path (Fix B / Bug #10 + self-heal in-flight tracking).
           settle(true);
           turnTerminalRecorded = true;
-          await recordEvent({
-            status: "completed",
-            finishedAt: new Date().toISOString(),
-            durationMs: Date.now() - eventStartedAt,
-            appendPath: "已完成",
-            reason: "Agent 已结束，消息已确认。",
-          });
+          await recordEvent(
+            {
+              status: "completed",
+              finishedAt: new Date().toISOString(),
+              durationMs: Date.now() - eventStartedAt,
+              appendPath: "已完成",
+              reason: "Agent 已结束，消息已确认。",
+            },
+            { sync: true },
+          );
           // `success` here is the state.json/exitCode-derived business outcome
           // (may be false even though the bridge dispatch itself completed
           // cleanly, e.g. bot reported status=failed) — maps 1:1 onto the
@@ -5406,18 +4806,26 @@ export class BridgeHandler {
         });
       }
       await this.deps.client.removeProcessingReaction?.(messageId);
+      for (const f of followups) {
+        if (f.message_id && f.message_id !== messageId) {
+          void this.deps.client.removeProcessingReaction?.(f.message_id).catch(() => {});
+        }
+      }
       // WP-8: a throw after state.json was read (session write, card delivery)
       // can leave the task-signal chain running. Its claim precedes the failed
       // writeback, and its running-status events precede the terminal record.
       if (taskSignalsSettled) await taskSignalsSettled;
       turnTerminalRecorded = true;
-      await recordEvent({
-        status: "failed",
-        finishedAt: new Date().toISOString(),
-        durationMs: Date.now() - eventStartedAt,
-        appendPath: "异常",
-        reason: String(err),
-      });
+      await recordEvent(
+        {
+          status: "failed",
+          finishedAt: new Date().toISOString(),
+          durationMs: Date.now() - eventStartedAt,
+          appendPath: "异常",
+          reason: String(err),
+        },
+        { sync: true },
+      );
       await invokeTaskHandleLifecycle({ status: "failed", failureReason: String(err) });
 
       // Terminal FAILURE/ABORT: release the message from in-flight WITHOUT
@@ -5570,6 +4978,7 @@ export class BridgeHandler {
       // WP-8: handleOne never resolves ahead of its task-signal chain (the
       // success and error paths already joined it; this covers any other exit).
       if (taskSignalsSettled) await taskSignalsSettled;
+      await eventWriteChain;
     }
   }
 }

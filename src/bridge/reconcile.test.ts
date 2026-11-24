@@ -602,6 +602,46 @@ describe("reconcileOrphanedCards — integration", () => {
     expect(ledger?.lastVisibleFallbackMessageId).toBe("om_post_fallback");
   });
 
+  it("resumes unsent pendingOverflow chunks from a finalized cardkit.json without duplicating already-sent chunks", async () => {
+    const wt = await seedWorktree(
+      "om_cardkit_overflow_resume",
+      null,
+      state("ready", { last_message: "Long answer" }),
+    );
+    await writeCardKitFile(
+      wt,
+      cardKit({
+        threadId: "om_cardkit_overflow_resume",
+        status: "finalized",
+        replyToMessageId: "om_trigger_overflow",
+        pendingOverflow: {
+          triggerMessageId: "om_trigger_overflow",
+          chunks: [
+            { content: '{"zh_cn":{"title":"续 (1/2)","content":[]}}', idempotencyKey: "lw-p-chunk1", sent: true },
+            { content: '{"zh_cn":{"title":"续 (2/2)","content":[]}}', idempotencyKey: "lw-p-chunk2", sent: false },
+          ],
+        },
+      }),
+    );
+    const { renderer } = makeFakeRenderer();
+    const { client: cardKitClient } = makeFakeCardKitClient();
+    const { client: postClient, calls: postCalls } = makeFakePostClient();
+
+    await reconcileOrphanedCards({
+      botId: "gitlab",
+      worktreesDir: root,
+      cardRenderer: renderer,
+      cardKitClient,
+      postClient,
+      log: () => {},
+    });
+
+    expect(postCalls).toHaveLength(1);
+    expect(postCalls[0]?.replyToMessageId).toBe("om_trigger_overflow");
+    expect(postCalls[0]?.idempotencyKey).toBe("lw-p-chunk2");
+    expect(await readCardKitFile(wt)).toBeNull();
+  });
+
   it("finalizes a failed orphan as failure with the bot's error as failureReason", async () => {
     const wt = await seedWorktree(
       "om_t2",

@@ -50,6 +50,7 @@ import {
   type CardKitFile,
 } from "./cardkitFile.js";
 import { finalizeExistingCardKitCard } from "./cardkitProgress.js";
+import { sendCardKitOverflowChunks } from "./turnHelpers.js";
 import {
   markPostLedgerFallbackVisible,
   reconcilePostFileOrphans,
@@ -816,30 +817,86 @@ export async function reconcileOrphanedCards(deps: ReconcileDeps): Promise<void>
       }
 
       if (cardKit) {
-        const selectedCardKit = shouldReconcileCardKit({
-          cardKit,
-          state,
-          botId: deps.botId,
-          pidAlive,
-          ageMs,
-          minAgeMs,
-        });
-        if (selectedCardKit?.reconcile && state) {
+        // Resume any CardKit overflow continuation chunks left unsent by a crash
+        // or partial network failure after the main card was already finalized.
+        const hasPendingOverflow =
+          cardKit.status === "finalized" &&
+          (cardKit.pendingOverflow?.chunks.some((c) => !c.sent) ?? false);
+        if (
+          hasPendingOverflow &&
+          cardKit.botId === deps.botId &&
+          !pidAlive &&
+          ageMs >= minAgeMs &&
+          deps.postClient
+        ) {
           try {
-            await reconcileCardKitRecord({
-              deps,
-              worktreePath: wtPath,
-              name,
-              cardKit,
-              state,
-              success: selectedCardKit.success,
-              stateFresh: selectedCardKit.stateFresh,
-              reason: selectedCardKit.reason,
-              nowIso,
-              log,
+            const chunks = cardKit.pendingOverflow!.chunks.map((c) => ({ ...c }));
+            const delivery = await sendCardKitOverflowChunks({
+              postClient: deps.postClient,
+              replyToMessageId: cardKit.replyToMessageId,
+              replyInThread: cardKit.replyInThread,
+              chunks,
+              onChunkSent: async (idx) => {
+                chunks[idx]!.sent = true;
+                await writeCardKitFile(wtPath, {
+                  ...cardKit,
+                  pendingOverflow: {
+                    triggerMessageId: cardKit.pendingOverflow!.triggerMessageId,
+                    chunks,
+                  },
+                  updatedAt: nowIso,
+                });
+              },
             });
+            if (delivery.sent === delivery.total) {
+              await deleteCardKitFile(wtPath);
+              log(`[reconcile] resumed cardkit overflow for ${name} (${delivery.sent}/${delivery.total} chunks)`);
+            } else {
+              const nextRetry = cardKit.retryCount + 1;
+              if (nextRetry > RETRY_CAP) {
+                log(`[reconcile] cardkit overflow ${name} exceeded retry cap — deleting cardkit.json`);
+                await deleteCardKitFile(wtPath);
+              } else {
+                await writeCardKitFile(wtPath, {
+                  ...cardKit,
+                  retryCount: nextRetry,
+                  pendingOverflow: {
+                    triggerMessageId: cardKit.pendingOverflow!.triggerMessageId,
+                    chunks,
+                  },
+                  updatedAt: nowIso,
+                });
+              }
+            }
           } catch (err) {
-            log(`[reconcile] cardkit failed for ${name} (skipping): ${String(err)}`);
+            log(`[reconcile] cardkit overflow resume failed for ${name} (skipping): ${String(err)}`);
+          }
+        } else {
+          const selectedCardKit = shouldReconcileCardKit({
+            cardKit,
+            state,
+            botId: deps.botId,
+            pidAlive,
+            ageMs,
+            minAgeMs,
+          });
+          if (selectedCardKit?.reconcile && state) {
+            try {
+              await reconcileCardKitRecord({
+                deps,
+                worktreePath: wtPath,
+                name,
+                cardKit,
+                state,
+                success: selectedCardKit.success,
+                stateFresh: selectedCardKit.stateFresh,
+                reason: selectedCardKit.reason,
+                nowIso,
+                log,
+              });
+            } catch (err) {
+              log(`[reconcile] cardkit failed for ${name} (skipping): ${String(err)}`);
+            }
           }
         }
       }

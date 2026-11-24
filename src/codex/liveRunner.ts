@@ -1,11 +1,14 @@
 import { randomUUID } from "node:crypto";
-import { mkdir, readFile, readdir, rename, unlink, writeFile } from "node:fs/promises";
+import { mkdir, readFile, readdir, realpath, rename, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 import type { AgentRunner, RunHandle, RunOptions } from "../agent/runner.js";
 import { resolveRunTimeoutMs } from "../agent/runTimeout.js";
 import { TurnEventQueue } from "../agent/turnEventQueue.js";
 import { CodexProcessPool, reapOrphanedWarmProcess, type CodexProcessPoolOptions } from "./pool.js";
-import type { CodexConfigSnapshot } from "./liveConfig.js";
+import { statFileSignature, type CodexConfigSnapshot } from "./liveConfig.js";
+
+/** Re-verify native RPC settings periodically even when tracked local file stats stay unchanged. */
+const NATIVE_SETTINGS_CACHE_TTL_MS = 60_000;
 
 export type RuntimeSettings = { model?: string; effort?: string; serviceTier?: string | null; account: string | null; authMode?: "chatgpt" | "apiKey" | null; requiresOpenaiAuth?: boolean };
 export interface LivePool extends AgentRunner {
@@ -22,6 +25,11 @@ interface Generation {
   pool: LivePool;
   reservations: number;
   settings?: RuntimeSettings;
+  verifiedPid?: number;
+  verifiedNative?: RuntimeSettings;
+  verifiedStatKey?: string;
+  verifiedCwd?: string;
+  verifiedAt?: number;
   retiring: boolean;
 }
 export interface LiveCodexStatus {
@@ -79,12 +87,68 @@ export class LiveCodexRunner implements AgentRunner {
     return next;
   }
 
+  /**
+   * Stat every ancestor `<dir>/.codex/config.toml` from resolved `cwd` up to
+   * filesystem root so project-root config edits invalidate the cache even when
+   * turns run from a nested subdirectory or via a changed symlink.
+   */
+  async #cwdConfigStatKey(cwd: string): Promise<{ realCwd: string; statKey: string } | undefined> {
+    try {
+      const realCwd = await realpath(cwd).catch(() => path.resolve(cwd));
+      const configPaths: string[] = [];
+      let cur = realCwd;
+      for (let depth = 0; depth < 32; depth += 1) {
+        configPaths.push(path.join(cur, ".codex", "config.toml"));
+        const parent = path.dirname(cur);
+        if (parent === cur) break;
+        cur = parent;
+      }
+      const sigs = await Promise.all(configPaths.map((p) => statFileSignature(p)));
+      return { realCwd, statKey: `${realCwd}|${sigs.join(",")}` };
+    } catch {
+      return undefined;
+    }
+  }
+
   async #prepare(cwd?: string): Promise<{ generation: Generation; settings: RuntimeSettings }> {
     if (this.#closed) throw new Error("Codex runtime is shutting down");
     let candidate: Generation | undefined;
     try {
       const snapshot = await this.readConfig();
+      const cwdInfo =
+        snapshot.nativeStatKey !== undefined && cwd !== undefined
+          ? await this.#cwdConfigStatKey(cwd)
+          : undefined;
+      const effectiveCwdKey = cwd !== undefined ? cwdInfo?.realCwd : undefined;
+      const nativeStatKey =
+        snapshot.nativeStatKey !== undefined && (cwd === undefined || cwdInfo !== undefined)
+          ? `${snapshot.nativeStatKey}|${cwdInfo?.statKey ?? ""}`
+          : undefined;
       let generation = this.#current;
+      if (
+        generation &&
+        generation.key === snapshot.generation &&
+        nativeStatKey !== undefined &&
+        generation.verifiedNative !== undefined &&
+        generation.verifiedStatKey === nativeStatKey &&
+        generation.verifiedCwd === effectiveCwdKey &&
+        generation.verifiedPid !== undefined &&
+        generation.pool.childPid === generation.verifiedPid &&
+        generation.verifiedAt !== undefined &&
+        Date.now() - generation.verifiedAt < NATIVE_SETTINGS_CACHE_TTL_MS
+      ) {
+        const native = generation.verifiedNative;
+        const settings = { ...native, model: snapshot.model ?? native.model, effort: snapshot.effort ?? native.effort };
+        if (native.requiresOpenaiAuth !== false && (!settings.model || !settings.effort)) {
+          throw new Error("Set an explicit Codex model and reasoning effort before starting turns");
+        }
+        generation.settings = settings;
+        this.#current = generation;
+        this.#next = settings;
+        this.#updatePidHint();
+        this.#error = undefined;
+        return { generation, settings };
+      }
       if (!generation || generation.key !== snapshot.generation) {
         // Unique files retain every draining process in the crash-recovery inventory.
         const pidFilePath = this.options.pidFilePath
@@ -122,6 +186,13 @@ export class LiveCodexRunner implements AgentRunner {
         throw new Error("Set an explicit Codex model and reasoning effort before starting turns");
       }
       generation.settings = settings;
+      if (nativeStatKey !== undefined) {
+        generation.verifiedPid = verifiedPid;
+        generation.verifiedNative = native;
+        generation.verifiedStatKey = nativeStatKey;
+        generation.verifiedCwd = effectiveCwdKey;
+        generation.verifiedAt = Date.now();
+      }
       this.#current = generation;
       this.#next = settings;
       this.#updatePidHint();

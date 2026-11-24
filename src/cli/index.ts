@@ -75,8 +75,7 @@ const USAGE = `larkway — Feishu ↔ local CLI agent bridge host manager
   memory edit <id>       编辑 L2 职能 memory
   perms <id>             调 L1 暴露面 + 确认 workspace 权限 grant
   start|stop|status|logs 生命周期(status --deep / logs --follow)
-  update                 pull + install + restart
-  dogfood preflight|guide [id] v0.3 Phase 1 dogfood 前置验收 / 下一步指引
+  update                 升级 npm 包并重启 bridge(--package <spec> / --latest / --git-pull / --dry-run)
   ui                     启动轻量 Web UI 管理面(127.0.0.1 + token)
   tasklist-init          为话题↔任务句柄 feature provisioning 共享清单(docs/task-handle.md)
   wake <id> --at --prompt 给 bot 挂一次性闹钟(周期闹钟写 bot yaml schedules:;docs/schedule.md)
@@ -85,7 +84,41 @@ const USAGE = `larkway — Feishu ↔ local CLI agent bridge host manager
   --json                 机器可读输出(与其他 flag 正交)
   --non-interactive      无人值守(服务器 / CI;凭据走 env 引用)
   --advanced             暴露 worktree 路径 / token scope / 多 bot / peers
-  -h, --help             显示本帮助`;
+  -h, --help             显示本帮助(或 larkway <命令> --help 查看子命令说明)`;
+
+const COMMAND_USAGE: Record<string, string> = {
+  init: `larkway init [--non-interactive] [--advanced] [--json]
+  CLI onboarding 向导: 扫码创建飞书应用、写 ~/.larkway/.env 与首个 bot 配置。`,
+  doctor: `larkway doctor [--fix] [--force] [--lint] [--json]
+  环境体检与修复:
+    --fix    自动修复安全项
+    --force  配合 --fix 清理坏 worktree 等高风险项
+    --lint   只读检查(CI 闸门: 0=全绿, 1=warn, 2=error)`,
+  bot: `larkway bot <add|list|edit> [id] [--advanced] [--json]
+  管理 ~/.larkway/bots/*.yaml 中的 bot 定义。`,
+  memory: `larkway memory edit <id>
+  编辑指定 bot 的 L2 职责说明(memory.md)并同步到托管 workspace。`,
+  perms: `larkway perms <id> [--json]
+  调整指定 bot 的 L1 暴露面并确认 workspace 权限 grant。`,
+  start: `larkway start [--json]
+  启动 bridge(注册并启动本机系统服务 launchd / systemd / Task Scheduler)。`,
+  stop: `larkway stop [--json]
+  停止 bridge 并禁用自启动。`,
+  status: `larkway status [--deep] [--json]
+  查看 bridge 运行态与各 bot 心跳状态(--deep 附带详细诊断)。`,
+  logs: `larkway logs [--follow] [-n <lines>]
+  查看 bridge 运行日志(默认末尾行,--follow 实时跟踪)。`,
+  update: `larkway update [--package <spec> | --latest | --git-pull] [--dry-run] [--json]
+  升级 larkway 并重启 bridge:
+    --package <spec>  安装显式 npm spec(如 larkway@0.3.93)
+    --latest          显式升级到 npm latest
+    --git-pull        源码目录回退路径(git pull --ff-only + pnpm install)
+    --dry-run         仅打印步骤不执行`,
+  ui: `larkway ui [--port <port>] [--no-open]
+  启动本地 Web 管理面(仅监听 127.0.0.1 + 随机 token)。`,
+  wake: `larkway wake <botId> --at <time> --prompt <text> [--chat <oc_...>] [--note <label>] [--json]
+  给指定 bot 挂一次性闹钟(周期调度请写 bot yaml 的 schedules:, 见 docs/schedule.md)。`,
+};
 
 // ---------------------------------------------------------------------------
 // argv parsing
@@ -181,15 +214,12 @@ export async function main(argv: string[]): Promise<number> {
   }
 
   if (help) {
-    // v3.4: `larkway <command> --help` should show that command's OWN
-    // detailed help, not just the one-line blurb in the top-level USAGE
-    // below — this is `tasklist-init`'s primary documentation entry point
-    // (docs/task-handle.md §7: an agent's first move is always --help).
-    // Scoped to tasklist-init only for now (it's the one command whose
-    // USAGE is written to be read this way); every other command keeps its
-    // existing top-level-USAGE-on-any---help behavior unchanged.
     if (command === "tasklist-init") {
       return tasklistInitRun(buildContext(flags), ["help"]);
+    }
+    if (command && COMMAND_USAGE[command]) {
+      ui.print(COMMAND_USAGE[command]);
+      return 0;
     }
     ui.print(USAGE);
     return 0;

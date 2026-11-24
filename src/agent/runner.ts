@@ -304,6 +304,13 @@ export interface RunHandle {
     sessionId?: string;
     pooled?: boolean;
     resumeMode?: "same-process" | "cold";
+    /**
+     * How the runner acquired the process for this turn (BL-58 #6):
+     *   - "standby": adopted a pre-warmed blank standby process (zero cold start).
+     *   - "reused": reused an already-warm process that served a prior turn.
+     *   - "spawned": spawned a fresh process for this turn (pool miss or cold fallback).
+     */
+    processStart?: "standby" | "reused" | "spawned";
     backgroundTasksPending?: number;
     /** Ignore state reports written before the last native background yield (epoch ms). */
     stateFreshAfter?: number;

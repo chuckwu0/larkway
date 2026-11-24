@@ -37,8 +37,10 @@ function panelFixture(workspace = "") {
 }
 
 describe("Agent configuration form", () => {
+  const readOptionalIntInput = browserFunction("readOptionalIntInput");
   const readValues = browserFunction("readAgentConfigValues", {
     inferRepoSlugFromUrl: browserFunction("inferRepoSlugFromUrl"),
+    readOptionalIntInput,
   });
 
   it("preserves existing release branches and legacy slug-only pointers when saving metadata", () => {
@@ -90,5 +92,77 @@ describe("Agent configuration form", () => {
     } else {
       expect(payload[2].memory_content).toBe("Short identity");
     }
+  });
+
+  it("reads advanced runtime knobs when present in the edit form and exposes pi in default backend order", () => {
+    const fixture = panelFixture();
+    const ac = fixture.querySelector("#ac-panel") as unknown as {
+      querySelector: (s: string) => unknown;
+    };
+    const origQuery = ac.querySelector;
+    const extra: Record<string, unknown> = {
+      "#ac-cot": { value: "off" },
+      "#ac-max-concurrent": { value: "8" },
+      "#ac-idle-timeout": { value: "300" },
+      "#ac-p2p-sticky": { checked: true },
+      "#ac-shared-knowledge": { checked: false },
+    };
+    ac.querySelector = (s: string) => extra[s] ?? origQuery(s);
+    const config = readValues(fixture);
+    expect(config).toMatchObject({
+      cot: "off",
+      max_concurrent_turns: 8,
+      idle_timeout_seconds: 300,
+      p2pStickySession: true,
+      sharedKnowledge: false,
+    });
+    expect(source).toContain('pi:     { id: "pi"');
+    expect(source).toContain('"codex", "claude", "pi", "antigravity"');
+  });
+
+  it("renders /api/status without throwing ReferenceError and stores hostDisk", () => {
+    const state = {
+      bots: [],
+      selected: null,
+      liveness: {},
+      lastSeenMs: {},
+      runningBackends: {},
+      codexRuntimes: {},
+      livenessKnown: false,
+      pendingRestart: { newCount: 0, ghostCount: 0, ghosts: [] },
+      hostDisk: null as unknown,
+      restart: { status: "idle", elapsed: 0 },
+    };
+    const renderStatus = browserFunction("renderStatus", {
+      state,
+      document: { getElementById: () => null },
+      codexRuntimeHTML: () => "",
+      renderBotList: vi.fn(),
+      renderDetailBanner: vi.fn(),
+      refreshDetailHero: vi.fn(),
+      renderServiceIndicator: vi.fn(),
+    });
+    expect(() =>
+      renderStatus({
+        bots: [],
+        hostDisk: { freeBytes: 1024 ** 3, freeGiB: 1, status: "warn" },
+      }),
+    ).not.toThrow();
+    expect(state.hostDisk).toEqual({ freeBytes: 1024 ** 3, freeGiB: 1, status: "warn" });
+  });
+
+  it("validates numeric form knobs without parseInt truncation (1e2 -> 100, rejects 30.9)", () => {
+    const toast = vi.fn();
+    const validateOptionalInt = browserFunction("validateOptionalIntInput", {
+      readOptionalIntInput,
+      toast,
+    });
+    expect(readOptionalIntInput({ value: "" })).toBeNull();
+    expect(readOptionalIntInput({ value: "1e2", valueAsNumber: 100 })).toBe(100);
+    expect(readOptionalIntInput({ value: "30.9", valueAsNumber: 30.9 })).toBe(30.9);
+    expect(validateOptionalInt({ value: "30.9", valueAsNumber: 30.9 }, "静默提示阈值", 10, 3600)).toBe(false);
+    expect(validateOptionalInt({ value: "1e2", valueAsNumber: 100 }, "最大并发话题数", 1, 50)).toBe(false);
+    expect(validateOptionalInt({ value: "12", valueAsNumber: 12 }, "最大并发话题数", 1, 50)).toBe(true);
+    expect(toast).toHaveBeenCalledTimes(2);
   });
 });

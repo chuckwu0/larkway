@@ -103,6 +103,12 @@ export interface RenderPromptInput {
   taskHandleTasklistGuid?: string;
   taskHandleClaimed?: boolean;
   taskHandleCandidates?: readonly TaskCandidate[];
+  /**
+   * Delta turns skip repeating the unclaimed `<task-handle>` candidates block
+   * when the handler reports the candidate snapshot unchanged since the last
+   * successful turn on this session. Absent = changed (backward compatible).
+   */
+  taskHandleCandidatesChanged?: boolean;
   /** Observed facts only; neither fact imposes task-card creation. */
   threadTurnCount?: number;
   threadHasTaskCard?: boolean;
@@ -179,7 +185,9 @@ function renderStateContract(input: RenderPromptInput, full: boolean): string[] 
     `纯文字回答不用写 state.json。需要结构化卡片时可写 ${target}。`,
     "state.json: {status:\"ready\"|\"in_progress\"|\"failed\", last_message?:正文, error?:错误, updated_at?:当前ISO时间};原子替换,显式时间勿沿用旧值。status 描述任务结果,单次工具错误不等于任务失败。",
     "可选字段: choices:[{label,value}](最多5个,单选按钮,value逐字回传;多项信息可直接文字提问),choice_prompt;content_blocks:[{type:\"markdown\",content}|{type:\"image\",img_key,alt?}](最多12块/4图,非空时覆盖正文,img_key须已上传)。",
-    "可选交互: response_surface:{post:{mentions:[{user_id}]}} 仅视觉@;handoffs:[{to,text}](最多3条,to为peer名,text自包含)由bridge发真实post并直递本地peer。",
+    (input.peers?.length ?? 0) > 0
+      ? "可选交互: response_surface:{post:{mentions:[{user_id}]}} 仅视觉@;handoffs:[{to,text}](最多3条,to为peer名,text自包含)由bridge发真实post并直递本地peer。"
+      : "可选交互: response_surface:{post:{mentions:[{user_id}]}} 仅视觉@。",
     ...(input.taskHandleTasklistGuid || input.taskHandleClaimed || input.taskRoot?.claimed ? [
       "兼容任务投影: task_handle:{create?:{summary,due?},guid?,note?,due?,due_reason?,blocked?,done?};仅显式使用既有任务投影时声明。done 表示交付,非本轮结束。",
     ] : []),
@@ -260,6 +268,7 @@ function renderTaskContext(input: RenderPromptInput, full: boolean, topicId: str
   if (!input.taskHandleTasklistGuid) return [];
   const candidates = input.taskHandleCandidates ?? [];
   if (!input.taskHandleClaimed && candidates.length === 0) return [];
+  if (!full && !input.taskHandleClaimed && input.taskHandleCandidatesChanged === false) return [];
   return block("task-handle", [
     // Not needed to claim (task_handle takes the task guid), but kept on delta
     // turns too: task-handle skill copies installed before delta prompts
@@ -412,7 +421,9 @@ export async function renderPrompt(input: RenderPromptInput): Promise<string> {
     ...(parsed.feishuDocLinks.length > 0 ? [`document: lark-cli docs +fetch --doc <doc-url>${profile} --as bot`] : []),
     ...(input.larkCliProfile ? [`lark_cli_profile: ${input.larkCliProfile} (bot身份)`] : []),
     ...(c.gitlabTokenEnvName ? [`gitlab_token_env_name: ${c.gitlabTokenEnvName}`] : []),
-    `dev_hostname: ${c.devHostname}; port_range: ${c.portRangeStart}-${c.portRangeEnd}`,
+    ...((c.defaultProjectSlug || c.repoCachePath || (input.extraRepoPaths ?? c.extraRepoPaths ?? []).length > 0)
+      ? [`dev_hostname: ${c.devHostname}; port_range: ${c.portRangeStart}-${c.portRangeEnd}`]
+      : []),
   ];
   // Workspace identity is projected into native AGENTS.md. Never repeat the
   // legacy persona there (including BYO workspaces owned by the operator).

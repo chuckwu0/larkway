@@ -33,7 +33,7 @@ import {
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { checkPiWarmPool, run } from "./doctor.js";
+import { checkPiWarmPool, classifyDiskSpace, run } from "./doctor.js";
 import { CodexProcessPool } from "../../codex/pool.js";
 import * as backendHealth from "../backendHealth.js";
 
@@ -886,5 +886,30 @@ describe("checkPiWarmPool", () => {
   it("says nothing when no pi bot has the pool on", async () => {
     await writeBotYaml("pi-cold", `${validBotYaml("pi-cold")}\nbackend: pi\n`);
     expect(await checkPiWarmPool(buildCtx({}))).toEqual([]);
+  });
+});
+
+describe("classifyDiskSpace & git_token_env checks", () => {
+  it("classifies disk space thresholds into ok / warn / error", () => {
+    expect(classifyDiskSpace(10 * 1024 ** 3, "/tmp/lw").status).toBe("ok");
+    expect(classifyDiskSpace(1 * 1024 ** 3, "/tmp/lw").status).toBe("warn");
+    expect(classifyDiskSpace(100 * 1024 ** 2, "/tmp/lw").status).toBe("error");
+  });
+
+  it("validates preferred git_token_env as well as legacy gitlab_token_env", async () => {
+    await withFakeHome(async () => {
+      await writeBotYaml("git-bot", `${validBotYaml("git-bot")}\ngit_token_env: MY_GIT_PAT\n`);
+      await writeEnvFile({ TEST_APP_SECRET: "secret123" });
+      await writeFakeClaude();
+
+      const output: unknown[] = [];
+      const ctx = buildCtx({ json: true, nonInteractive: true }, { captureJson: output });
+      const code = await run(ctx, ["--lint"]);
+      expect(code).toBe(2);
+      const result = output[0] as { checks: Array<{ id: string; status: string; message?: string }> };
+      const check = result.checks.find((c) => c.id === "feishu-creds-git-bot-gitlab-token");
+      expect(check).toMatchObject({ status: "error" });
+      expect(check?.message).toContain("MY_GIT_PAT");
+    });
   });
 });

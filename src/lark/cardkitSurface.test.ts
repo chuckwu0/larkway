@@ -1,12 +1,15 @@
 import { describe, expect, it } from "vitest";
 import {
   buildCardKitFinalCard,
+  buildCardKitFinalCardWithOverflow,
   buildCardKitInitialCard,
   buildCotPanelElement,
+  splitOverflowMarkdownChunks,
   CARDKIT_FOOTER_ELEMENT_ID,
   CARDKIT_FINAL_ELEMENT_ID,
   CARDKIT_COT_PANEL_ELEMENT_ID,
   CARDKIT_COT_INNER_ELEMENT_ID,
+  MAX_CARD_BYTES,
 } from "./cardkitSurface.js";
 
 function elements(card: Record<string, unknown>): Record<string, unknown>[] {
@@ -146,4 +149,65 @@ describe("cardkitSurface", () => {
     expect(elements(card).some((e) => e["tag"] === "collapsible_panel")).toBe(false);
   });
 
+  it("binary-searches max UTF-8 prefix under 30KB and returns overflowText instead of blanking the answer", () => {
+    const longAnswer = Array.from({ length: 1200 }, (_, i) => `第 ${i + 1} 行：这是一段用于测试超长回答智能截断与续发的中文内容。`).join("\n");
+    expect(Buffer.byteLength(longAnswer, "utf8")).toBeGreaterThan(MAX_CARD_BYTES * 2);
+
+    const { card, overflowText } = buildCardKitFinalCardWithOverflow({ finalText: longAnswer });
+    const bytes = Buffer.byteLength(JSON.stringify(card), "utf8");
+    expect(bytes).toBeLessThanOrEqual(MAX_CARD_BYTES);
+    expect(bytes).toBeGreaterThan(MAX_CARD_BYTES - 2048);
+
+    const finalEl = elements(card).find((e) => e["element_id"] === CARDKIT_FINAL_ELEMENT_ID);
+    const rendered = String(finalEl?.["content"] ?? "");
+    expect(rendered).toContain("第 1 行：");
+    expect(rendered).toContain("后续部分见下方续发消息");
+    expect(overflowText).toBeTruthy();
+    expect(overflowText).toContain("第 1200 行：");
+
+    const chunks = splitOverflowMarkdownChunks(overflowText!, 12_000, 10);
+    expect(chunks.length).toBeGreaterThan(1);
+    for (const chunk of chunks) {
+      expect(Buffer.byteLength(chunk, "utf8")).toBeLessThanOrEqual(12_000);
+    }
+    expect(chunks.join("\n")).toContain("第 1200 行：");
+  });
+
+  it("caps overflow chunks and appends a local-artifact note when output is gigantic", () => {
+    const huge = "字".repeat(40_000);
+    const chunks = splitOverflowMarkdownChunks(huge, 4_000, 2);
+    expect(chunks).toHaveLength(2);
+    expect(chunks[1]).toContain("本地 session 产物");
+  });
+
+  it("keeps card strictly within MAX_CARD_BYTES even when choicePrompt is huge and moves excess prompt to overflow", () => {
+    const hugePrompt = "说明".repeat(6_000); // 12,000 Chinese chars (~36KB UTF-8)
+    const built = buildCardKitFinalCardWithOverflow({
+      finalText: "简短结论。",
+      choicePrompt: hugePrompt,
+      choices: [{ label: "继续执行", value: "go" }],
+    });
+    const serialized = JSON.stringify(built.card);
+    expect(Buffer.byteLength(serialized, "utf8")).toBeLessThanOrEqual(MAX_CARD_BYTES);
+    expect(serialized).toContain("简短结论。");
+    expect(built.overflowText).toContain(hugePrompt);
+  });
+
+  it("preserves exact indentation and blank lines across card prefix and overflow chunks", () => {
+    const lines: string[] = [];
+    for (let i = 0; i < 900; i += 1) {
+      lines.push(`def fn_${i}():\n    value = ${i}\n    return value\n`);
+    }
+    const original = lines.join("\n").trim();
+    const built = buildCardKitFinalCardWithOverflow({ finalText: original });
+    expect(built.overflowText).toBeTruthy();
+    const elements = (built.card["body"] as { elements: Array<Record<string, unknown>> }).elements;
+    const finalEl = elements.find((e) => e["element_id"] === "final_md");
+    const shown = String(finalEl?.["content"] ?? "");
+    const suffixIdx = shown.indexOf("\n\n_（内容较长");
+    expect(suffixIdx).toBeGreaterThan(0);
+    const prefix = shown.slice(0, suffixIdx);
+    const chunks = splitOverflowMarkdownChunks(built.overflowText!, 12_000, 4);
+    expect(prefix + chunks.join("")).toBe(original);
+  });
 });

@@ -13,7 +13,7 @@
  * memory.md / business skills.
  */
 
-import { readdir, readFile, stat } from "node:fs/promises";
+import { readdir, readFile, stat, statfs } from "node:fs/promises";
 import path from "node:path";
 import yaml from "js-yaml";
 
@@ -1036,8 +1036,27 @@ const putBot: ApiHandler = async (req) => {
     }
     if (existing) {
       const merged: Record<string, unknown> = { ...existing };
-      for (const k of ["name", "description", "chats", "repos", "turn_taking_limit", "backend", "subprocess_timeout_seconds"]) {
+      for (const k of [
+        "name",
+        "description",
+        "chats",
+        "repos",
+        "turn_taking_limit",
+        "backend",
+        "subprocess_timeout_seconds",
+        "cot",
+        "sharedKnowledge",
+        "p2pStickySession",
+      ]) {
         if (k in bodyWithoutTokenFields) merged[k] = bodyWithoutTokenFields[k];
+      }
+      // Optional numeric knobs: null/""/undefined clears back to schema default.
+      for (const k of ["max_concurrent_turns", "idle_timeout_seconds"] as const) {
+        if (k in bodyWithoutTokenFields) {
+          const v = bodyWithoutTokenFields[k];
+          if (v === null || v === "" || v === undefined) delete merged[k];
+          else merged[k] = v;
+        }
       }
       if (hasWorkspace) {
         if (requestedWorkspace) {
@@ -1572,6 +1591,25 @@ const getStatus: ApiHandler = async (req) => {
     // log doesn't exist yet
   }
 
+  // Read-only host disk free space (statfs, zero subprocesses, best-effort).
+  let hostDisk: { freeBytes: number; freeGiB: number; status: "ok" | "warn" | "error" } | null = null;
+  try {
+    const fsStats = await statfs(larkwayHome);
+    const freeBytes = Number(fsStats.bavail) * Number(fsStats.bsize);
+    if (Number.isFinite(freeBytes) && freeBytes >= 0) {
+      const freeGiB = Math.round((freeBytes / (1024 * 1024 * 1024)) * 10) / 10;
+      const status =
+        freeBytes < 512 * 1024 * 1024
+          ? "error"
+          : freeBytes < 2 * 1024 * 1024 * 1024
+            ? "warn"
+            : "ok";
+      hostDisk = { freeBytes, freeGiB, status };
+    }
+  } catch {
+    hostDisk = null;
+  }
+
   return {
     status: 200,
     json: {
@@ -1588,9 +1626,9 @@ const getStatus: ApiHandler = async (req) => {
       configPresent: !!cfg,
       localBotCount,
       centralAvailable: false,
-      centralRepo: null,
       logExists,
       logSizeKb,
+      hostDisk,
       // 批I I1: bridge-boot load diagnostics — skipped bots MUST be visible
       // on the dashboard, not just a line in the boot log ("防炸变静默少一个").
       botLoadDiagnostics: await readBotLoadDiagnostics(ctx.larkwayDir),

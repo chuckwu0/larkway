@@ -7,6 +7,7 @@ import {
 import {
   buildCardKitAnswerElement,
   buildCardKitFinalCard,
+  buildCardKitFinalCardWithOverflow,
   buildCardKitFinalMarkdown,
   buildCardKitInitialCard,
   buildCotPanelElement,
@@ -79,7 +80,7 @@ export interface CardKitProgressHandle {
   readonly callDurationsMs?: readonly number[];
   handle(event: AgentStreamEvent): void;
   drain(): Promise<void>;
-  finalize(opts: BuildCardKitFinalCardOpts): Promise<void>;
+  finalize(opts: BuildCardKitFinalCardOpts): Promise<{ overflowText?: string } | void>;
   close(): void;
   /** COT-in-card: mark this turn errored so the panel's settled title reflects it. */
   markCotError(): void;
@@ -415,7 +416,7 @@ class LiveCardKitProgressHandle implements CardKitProgressHandle {
     await this.inFlight;
   }
 
-  async finalize(opts: BuildCardKitFinalCardOpts): Promise<void> {
+  async finalize(opts: BuildCardKitFinalCardOpts): Promise<{ overflowText?: string } | undefined> {
     // WP-4: stop taking work and wait only for the call already in flight.
     // Pending patch timers and queued nodes that have not started are dropped:
     // the final card below carries the final answer and reasoning panel (and no
@@ -432,9 +433,10 @@ class LiveCardKitProgressHandle implements CardKitProgressHandle {
     // holds it in final_md. The cost is the typing animation for that final
     // replacement.
     const finalMarkdown = buildCardKitFinalMarkdown(opts);
+    const built = buildCardKitFinalCardWithOverflow(finalOpts);
     try {
       await this.next((sequence) =>
-        this.cardKitClient.updateCardEntity(this.cardId, buildCardKitFinalCard(finalOpts), {
+        this.cardKitClient.updateCardEntity(this.cardId, built.card, {
           sequence,
           uuid: sequenceUuid(this.cardId, "final-card", sequence),
         }),
@@ -459,6 +461,7 @@ class LiveCardKitProgressHandle implements CardKitProgressHandle {
         },
       ),
     );
+    return built.overflowText ? { overflowText: built.overflowText } : undefined;
   }
 
   /**

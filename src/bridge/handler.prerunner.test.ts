@@ -476,27 +476,34 @@ describe("WP-2 (b): live roster off the runner's critical path", () => {
   });
 
   it("a turn aborted before its terminal record gets no roster diagnostic afterwards", async () => {
-    const lookup = deferred<LiveBotRoster | null>();
-    const resolver: LiveRosterResolver = () => lookup.promise;
-    const { captured } = registerScriptedRunner([{}]);
-    const { client, outcomes } = sequentialClient([continuationEvent("om_test_reply")]);
-    client.addProcessingReaction = async () => {
-      throw new Error("reaction: TLS handshake timeout");
-    };
-    const { handler, events } = makeHandler({
-      client,
-      store: fakeSessionStore([existingSession()]),
-      deps: { peers: PEERS, resolveLiveRoster: resolver },
-    });
+    const prevModelFirst = process.env["LARKWAY_MODEL_FIRST"];
+    process.env["LARKWAY_MODEL_FIRST"] = "off";
+    try {
+      const lookup = deferred<LiveBotRoster | null>();
+      const resolver: LiveRosterResolver = () => lookup.promise;
+      const { captured } = registerScriptedRunner([{}]);
+      const { client, outcomes } = sequentialClient([continuationEvent("om_test_reply")]);
+      client.addProcessingReaction = async () => {
+        throw new Error("reaction: TLS handshake timeout");
+      };
+      const { handler, events } = makeHandler({
+        client,
+        store: fakeSessionStore([existingSession()]),
+        deps: { peers: PEERS, resolveLiveRoster: resolver },
+      });
 
-    await runAll(handler);
-    expect(captured).toHaveLength(0);
-    expect(outcomes).toEqual(["unhandled:om_test_reply"]);
+      await runAll(handler);
+      expect(captured).toHaveLength(0);
+      expect(outcomes).toEqual(["unhandled:om_test_reply"]);
 
-    lookup.resolve(LIVE_ROSTER); // a remap that would otherwise be recorded
-    await new Promise((resolve) => setTimeout(resolve, 10));
-    expect(events.filter((e) => e.appendPath === "peer roster")).toEqual([]);
-    expect(events.filter((e) => e.status === "running")).toEqual([]);
+      lookup.resolve(LIVE_ROSTER); // a remap that would otherwise be recorded
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      expect(events.filter((e) => e.appendPath === "peer roster")).toEqual([]);
+      expect(events.filter((e) => e.status === "running")).toEqual([]);
+    } finally {
+      if (prevModelFirst === undefined) delete process.env["LARKWAY_MODEL_FIRST"];
+      else process.env["LARKWAY_MODEL_FIRST"] = prevModelFirst;
+    }
   });
 });
 

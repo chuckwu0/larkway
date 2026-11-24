@@ -1921,4 +1921,45 @@ describe("BYO workspace configuration", () => {
     expect(await readFile(path.join(dir, "agents", "test-bot", "workspace", "AGENTS.md"), "utf8")).toContain("A bot used in tests");
     expect(await readdir(workspace)).toEqual([]);
   });
+
+  it("persists and clears advanced runtime knobs via PUT /api/bot/:id and surfaces hostDisk in GET /api/status", async () => {
+    const dir = await makeLocalBotsDir();
+    const ctx = makeCtx(dir);
+    const put1 = await call(ctx, "PUT /api/bot/:id", {
+      params: { id: "test-bot" },
+      body: {
+        cot: "off",
+        max_concurrent_turns: 8,
+        idle_timeout_seconds: 300,
+        p2pStickySession: true,
+        sharedKnowledge: true,
+      },
+    });
+    expect(put1.status).toBe(200);
+    const saved1 = yaml.load(await readFile(path.join(dir, "test-bot.yaml"), "utf8")) as Record<string, unknown>;
+    expect(saved1).toMatchObject({
+      cot: "off",
+      max_concurrent_turns: 8,
+      idle_timeout_seconds: 300,
+      p2pStickySession: true,
+      sharedKnowledge: true,
+    });
+
+    // Clearing optional numeric overrides removes them cleanly.
+    const put2 = await call(ctx, "PUT /api/bot/:id", {
+      params: { id: "test-bot" },
+      body: { max_concurrent_turns: null, idle_timeout_seconds: "" },
+    });
+    expect(put2.status).toBe(200);
+    const saved2 = yaml.load(await readFile(path.join(dir, "test-bot.yaml"), "utf8")) as Record<string, unknown>;
+    expect(saved2.max_concurrent_turns).toBeUndefined();
+    expect(saved2.idle_timeout_seconds).toBeUndefined();
+
+    const statusRes = await call(ctx, "GET /api/status");
+    expect(statusRes.status).toBe(200);
+    const statusJson = statusRes.json as { hostDisk?: { freeBytes: number; freeGiB: number; status: string } | null };
+    expect(statusJson.hostDisk).toBeTruthy();
+    expect(typeof statusJson.hostDisk?.freeBytes).toBe("number");
+    expect(["ok", "warn", "error"]).toContain(statusJson.hostDisk?.status);
+  });
 });

@@ -27,7 +27,7 @@
     "build": "node scripts/build.mjs",
     "prepack": "node scripts/build.mjs",
     "typecheck": "tsc --noEmit",
-    "check:links": "bash bin/check-doc-links.sh",
+    "check:links": "node scripts/check-doc-links.mjs",
     "test": "vitest run",
     "test:v0.3": "bash bin/v0.3-local-acceptance.sh"
   },

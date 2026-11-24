@@ -1,5 +1,6 @@
 import { describe, expect, it, vi, afterEach } from "vitest";
 import type { OutboundCardKitClient } from "../lark/channelCardKitClient.js";
+import { MAX_CARD_BYTES } from "../lark/cardkitSurface.js";
 import { createCardKitProgressHandle, finalizeExistingCardKitCard } from "./cardkitProgress.js";
 
 function fakeCardKitClient(opts?: { initialElements?: string[] }) {
@@ -1067,5 +1068,23 @@ describe("CardKit finalize failure: the card left behind", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it("returns overflowText when finalText exceeds CardKit 30KB payload limit while keeping card under cap", async () => {
+    const { client, calls } = fakeCardKitClient();
+    const handle = await createCardKitProgressHandle({
+      cardKitClient: client,
+      replyToMessageId: "trigger_message",
+      replyInThread: true,
+      facts,
+      patchIntervalMs: 0,
+    });
+    const big = Array.from({ length: 800 }, (_, i) => `第 ${i + 1} 行：这是一段用于测试超过 CardKit 30KB 卡片体积上限的超长 Markdown 内容。`).join("\n");
+    const res = await handle.finalize({ finalText: big });
+    expect(res?.overflowText).toBeTruthy();
+    const updateCall = calls.find((c) => c.name === "updateCardEntity");
+    expect(updateCall).toBeDefined();
+    const cardJson = JSON.stringify(updateCall!.args[1]);
+    expect(Buffer.byteLength(cardJson, "utf8")).toBeLessThanOrEqual(MAX_CARD_BYTES);
   });
 });

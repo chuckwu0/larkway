@@ -127,6 +127,8 @@ export interface PerfSample {
    */
   pooled?: boolean;
   resumeMode?: "same-process" | "cold";
+  /** BL-58 #6: whether a pooled turn adopted a standby blank, reused a live child, or spawned fresh. */
+  processStart?: "standby" | "reused" | "spawned";
   /** pi only (WP-0): ms from spawn to pi's own `agent_start` line. */
   spawnToAgentStartMs?: number;
 
@@ -278,20 +280,51 @@ export function resolvePerfLogPath(larkwayHome: string, botId?: string): string 
   return path.join(dir, "perf.jsonl");
 }
 
+/** Rotate perf.jsonl once it reaches 10 MiB (keeps one `.1` backup, bounded disk usage). */
+export const DEFAULT_PERF_LOG_MAX_BYTES = 10 * 1024 * 1024;
+
+/** Per-destination serialization so concurrent turns never race stat -> rename -> append. */
+const perfWriteChains = new Map<string, Promise<void>>();
+
 /**
- * Append one perf sample as a JSONL line. Callers (handler.ts) already treat
- * this as a best-effort swallow-warn side channel (same contract as
- * recordRuntimeEvent) — this function itself does not swallow so a caller
- * that wants to know about a write failure still can.
+ * Append one perf sample as a JSONL line, rotating to `.1` once the active
+ * file exceeds `maxBytes`. Operations on the same destination file are
+ * serialized in-process so two concurrent turns cannot race and overwrite the
+ * `.1` archive with a fresh single-line file.
  */
 export async function appendPerfSample(
   larkwayHome: string,
   botId: string | undefined,
   sample: PerfSample,
+  maxBytes = DEFAULT_PERF_LOG_MAX_BYTES,
 ): Promise<void> {
   const file = resolvePerfLogPath(larkwayHome, botId);
-  await fs.mkdir(path.dirname(file), { recursive: true });
-  await fs.appendFile(file, `${JSON.stringify(sample)}\n`, "utf8");
+  const prev = perfWriteChains.get(file) ?? Promise.resolve();
+  const run = prev
+    .catch(() => {})
+    .then(async () => {
+      await fs.mkdir(path.dirname(file), { recursive: true });
+      if (maxBytes > 0) {
+        try {
+          const st = await fs.stat(file);
+          if (st.size >= maxBytes) {
+            await fs.rename(file, `${file}.1`);
+          }
+        } catch (err) {
+          if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
+            console.warn(`[perfLog] rotate ${file} failed (continuing append):`, err);
+          }
+        }
+      }
+      await fs.appendFile(file, `${JSON.stringify(sample)}\n`, "utf8");
+    });
+  const settled = run.finally(() => {
+    if (perfWriteChains.get(file) === settled) {
+      perfWriteChains.delete(file);
+    }
+  });
+  perfWriteChains.set(file, settled);
+  return run;
 }
 
 /** Read back all samples for a bot — test/analysis helper (not used by the hot path). */

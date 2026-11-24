@@ -1,6 +1,6 @@
 # Larkway
 
-> 把你的 Claude Code、Codex 或 Gemini（Antigravity CLI）订阅变成全团队都能 @ 的飞书 Agent。
+> 把本机的 Claude Code / Codex 订阅（以及遵循 Google CLI 条款的 Antigravity / Gemini，或经 `pi` 接入的自带模型）变成全团队都能 @ 的飞书 Agent。
 
 🌐 [larkway.dev](https://larkway.dev) · [English](README.md)
 
@@ -57,7 +57,7 @@ lark.card              ◄──  agent 读仓库、跑 bash、改代码、
 - 子进程生命周期：spawn、stream-json 解析、session ID 持久化
 - 飞书卡片：agent 流式输出时节流 PATCH 实时更新
 - Session KV：`thread_id → session_id`，后续消息自动续接上下文
-- 空闲 GC：worktree 清理
+- 空闲 GC：过期 session 产物回收与遗留 worktree 清理
 
 **Larkway 不做的事**——agent 自己决定：
 
@@ -83,10 +83,12 @@ lark.card              ◄──  agent 读仓库、跑 bash、改代码、
 larkway doctor          # 列出缺失的依赖；--fix 自动修复部分问题
 
 # 2. 注册飞书 app + 配置第一个 bot
-larkway init            # CLI 向导：扫码 → 命名 bot → 选 backend
+larkway                 # 直接打开本地 Web 管理面（推荐：扫码绑定 + 可视化配置）
+# 无浏览器 / 纯终端服务器场景可用 CLI 向导：
+# larkway init          # CLI 向导：扫码 → 命名 bot → 选 backend
 
 # 3. 启动 bridge
-larkway start           # 长驻进程，后台运行，日志写入 ~/.larkway/logs/
+larkway start           # 注册系统服务（launchd / systemd / 任务计划程序），日志写入 ~/.larkway/logs/
 
 # 4. 把 bot 加到飞书群
 #    群设置 → 群机器人 → 添加机器人 → 选你的 bot → @ 它提需求
@@ -112,6 +114,24 @@ Google 将个人套餐的无界面 CLI 用途限定为直接运行脚本和 CI�
 Larkway 使用各底座已有的凭据。启动 Codex 子进程时会移除环境变量 `OPENAI_API_KEY` 和 `ANTHROPIC_API_KEY`，启动 Antigravity 子进程时会移除 `GEMINI_API_KEY`、`GOOGLE_API_KEY` 和 `AGY_ADC_AUTH`。
 
 如果 CC Switch 配置的 Codex 已经能用，用同一个系统用户和 `CODEX_HOME` 启动 Larkway 即可。Codex 确认当前提供方无需 OpenAI 登录时，可以跳过 `codex login`。`larkway doctor` 检查这一条件时无需提交模型请求。
+
+---
+
+## 安全模型 —— 把 bot 拉进群前先读这段
+
+Larkway 在**你自己的机器上，以你的系统用户权限**运行真实的编程 Agent。请务必明确这意味着什么：
+
+**谁能触发它。** 默认配置为 `chats: []`（*开放模式*）：只要 bot 被拉进某个群，群里任何人 `@` 它都会触发执行。如需收窄范围，请在 bot YAML 中填写允许的群白名单（`chats: [oc_…]`），其他群的消息会被直接忽略。
+
+**被触发的 Agent 能做什么。** Larkway 本身不对 Agent 子进程做 OS 沙箱隔离。在默认的 `bypassPermissions` 模式下（无人值守无界面运行必需，否则交互权限提示会让轮次静默挂起），Claude 底座的 Agent 拥有当前系统用户的文件读写、命令执行与网络权限；Codex 底座对应全量访问。你可以在 `~/.larkway/config.json` 中通过 `permissions.mode` 全局收紧（`acceptEdits` / `ask`），代价是遇到被拦截的操作时轮次会停住。**注意：上述模式名沿用 Claude 语义；在 Codex 上除 `ask` 外均映射到全量访问；在 pi 上所有模式均等价全量访问（pi 本身无权限系统，`ask` 无法生效）。Larkway 启动 pi 时必带 `--approve`（项目信任），workspace 及父目录的 `.pi/extensions` 和 `.pi/settings.json` 会被加载；开启 pi 热池（RPC 模式）时 MCP 服务会收到 `sampling` / `elicitation` 能力声明，Larkway 对此类请求一律回复取消，详见[原生运行时约定](docs/native-runtime.md)。**
+
+**提示词注入是真实风险。** 触发消息、以及 Agent 自行拉取的话题历史与附件都会进入模型输入。群内成员可能试图诱导 Agent 执行未预期操作；L2 memory 与仓库里的 `AGENTS.md` / `CLAUDE.md` 属于行为指引，而非安全边界。
+
+**实践建议：**
+- 把「bot 所在的群」视为第一道安全边界；任何有写权限的 bot 建议配置 `chats:` 白名单。
+- 有写代码能力的 bot 建议对接可评审、可回滚的仓库（如通过 PR/MR 流程），不要把高危生产凭据直接暴露在宿主机环境变量中。
+- `~/.larkway/.env` 中的密钥由同一台宿主机上的所有 bot 共享，任何可读宿主目录的 Agent 都能访问；不要把低信任开放群的 bot 与高价值生产凭据混部在同一宿主机。
+- 默认每个 bot 使用独立的 lark-cli 配置目录（`~/.larkway/<botId>/lark-cli/`）及自身应用 profile，不继承宿主个人登录态（显式 `lark_cli_isolated: false` 保留旧共享行为）。这是身份配置隔离，不是 OS 沙箱。
 
 ---
 
@@ -147,6 +167,7 @@ workspace: /absolute/path/to/existing-workspace
 - **Session 续接** —— 每个飞书话题映射到持久 `session_id`，agent 记得之前做了什么
 - **Agent Workspace** —— 可创建托管目录或接入现有目录，每个话题有独立 session 工件。多个话题共享 workspace；并发改代码需要 Agent 自行创建独立 worktree。
 - **Codex 运行时预检** —— `larkway doctor` 在启动前验证 Codex 状态目录可写
+- **系统服务常驻** —— `larkway start` 自动注册为 launchd（macOS）/ systemd（Linux）/ 任务计划程序（Windows）服务，重启自启、崩溃自动拉起；`larkway stop` 停止并禁用自启
 - **话题↔飞书任务句柄** —— 把话题转成飞书任务，agent 自动认领并自己维护整个生命周期（完成/失败重开/停滞唤醒/协作断链检测/过期催更）——详见下方
 
 ---
@@ -207,8 +228,10 @@ scope 是否健康）。完整设计、配置项、平台事实排查记录见�
 | 架构图 + 模块 I/O | [docs/architecture.md](docs/architecture.md) |
 | Agent 能力模型（L0–L3） | [docs/agent-capability-model.md](docs/agent-capability-model.md) |
 | Agent workspace 运行时（v0.3） | [docs/agent-workspace.md](docs/agent-workspace.md) |
+| 原生运行时约定与性能调优 | [docs/native-runtime.md](docs/native-runtime.md) |
 | 版本历史与 semver 映射 | [docs/versioning.md](docs/versioning.md) |
 | Bridge ↔ Agent Prompt 契约 | [docs/prompt-contract.md](docs/prompt-contract.md) |
+| 组织知识库（记忆/收割/维护） | [docs/knowledge-base.md](docs/knowledge-base.md) |
 | 话题↔飞书任务句柄（设计 + 配置） | [docs/task-handle.md](docs/task-handle.md) |
 | Bot 配置 + memory 模板 | [bots-examples/](bots-examples/) |
 

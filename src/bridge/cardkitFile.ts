@@ -58,6 +58,18 @@ export const CardKitFileSchema = z.object({
     })
     .optional(),
   lastVisibleFallbackMessageId: z.string().min(1).nullable().default(null),
+  pendingOverflow: z
+    .object({
+      triggerMessageId: z.string().min(1),
+      chunks: z.array(
+        z.object({
+          content: z.string().min(1),
+          idempotencyKey: z.string().min(1),
+          sent: z.boolean().default(false),
+        }),
+      ),
+    })
+    .optional(),
   retryCount: z.number().int().nonnegative().default(0),
   createdAt: z.string().min(1),
   updatedAt: z.string().min(1),

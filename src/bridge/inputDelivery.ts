@@ -2,7 +2,13 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 import type { ParsedMessage } from "../lark/message.js";
-import { deriveTriggerFacts, mentionedOthers, quotedMessageId } from "../agent/triggerFacts.js";
+import {
+  DEFAULT_CONTINUATION_TRIGGER_TYPE,
+  deriveTriggerFacts,
+  hasContentBeyondText,
+  mentionedOthers,
+  quotedMessageId,
+} from "../agent/triggerFacts.js";
 import { ordinaryReplyCommand } from "../agent/communication.js";
 
 export interface InputDeliveryRecord {
@@ -37,27 +43,36 @@ export class InputDeliveryStore {
   }
 }
 
+function renderMentioned(person: { name?: string; openId?: string }): string {
+  if (person.name && person.openId) return `${person.name} (${person.openId})`;
+  return person.name ?? person.openId ?? "";
+}
+
 /** Preserve message identity and resource pointers without classifying business intent. */
 export function renderSteeringInput(parsed: ParsedMessage, selfOpenId?: string, profile?: string, ownerOpenId?: string, taskMessageId?: string): string {
   const trigger = deriveTriggerFacts(parsed, false, profile);
+  const others = mentionedOthers(parsed, selfOpenId);
+  const quoted = quotedMessageId(parsed);
+  const attachments = parsed.attachments.map((a) => a.fileKey);
+  const images = parsed.attachments.filter((a) => a.fileType === "image").map((a) => a.fileKey);
+  const includeRaw = hasContentBeyondText(parsed) || others.length > 0 || !!quoted;
   return [
     "<thread-context>",
     `message_id: ${parsed.messageId}`,
     ...(taskMessageId ? [`task_card_message_id: ${taskMessageId}`] : []),
     `chat_id: ${parsed.chatId}`,
     ...(ownerOpenId ? [`sender_is_owner: ${parsed.senderOpenId === ownerOpenId}`] : []),
-    ...(parsed.raw.thread_id ? [`feishu_thread_id: ${parsed.raw.thread_id}`] : []),
-    ...(quotedMessageId(parsed) ? [`quoted_message: ${quotedMessageId(parsed)}`] : []),
-    `trigger_type: ${trigger.triggerType}`,
-    `message_create_time: ${parsed.raw.create_time}`,
-    `raw_pointer: ${trigger.rawMessagePointer}`,
-    `attachments: ${JSON.stringify(parsed.attachments)}`,
-    `feishu_doc_links: ${JSON.stringify(parsed.feishuDocLinks)}`,
-    `mentioned_others: ${JSON.stringify(mentionedOthers(parsed, selfOpenId))}`,
+    ...(trigger.feishuThreadId?.startsWith("omt_") ? [`feishu_thread_id: ${trigger.feishuThreadId}`] : []),
+    ...(quoted ? [`quoted_message: ${quoted}`] : []),
+    ...(trigger.triggerType !== DEFAULT_CONTINUATION_TRIGGER_TYPE ? [`trigger_type: ${trigger.triggerType}`] : []),
+    ...(includeRaw ? [`raw_pointer: ${trigger.rawMessagePointer}`] : []),
+    ...(attachments.length > 0 ? [`attachments: ${attachments.join(",")}`] : []),
+    ...(images.length > 0 ? [`images: ${images.join(",")}`] : []),
+    ...(parsed.feishuDocLinks.length > 0 ? [`feishu_doc_links: ${parsed.feishuDocLinks.join(",")}`] : []),
+    ...(others.length > 0 ? [`mentioned_others: ${others.map(renderMentioned).join(", ")}`] : []),
     "</thread-context>", "<communication>",
-    "是否需要单独回应这条输入由你判断；需要时可发新普通消息，不把追问答复写入主任务卡。需要强调信息或@人时也可主动发普通消息；不要重复播报过程。",
+    "是否需要单独回应这条输入由你判断；不把追问答复写入主任务卡。需要强调或@人时可发普通消息，不播报过程。",
     `ordinary_reply: ${ordinaryReplyCommand(parsed.messageId, profile)}`,
-    "主卡进展用 state.json 的 card_progress:{message_id:task_card_message_id,text:简短当前进展}，原子替换；final_answer 用于主任务交付。",
     "</communication>", "", "<user-message>",
     `${parsed.senderOpenId}: ${parsed.text}`, "</user-message>",
   ].join("\n");

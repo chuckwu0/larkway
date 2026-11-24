@@ -451,14 +451,15 @@ function expectCardFinalized(log: string[]): void {
 }
 
 describe("resolveModelFirstMode", () => {
-  it("is off unless set to continuation or all (trimmed, any case)", () => {
+  it("defaults to continuation when unset/empty and honors off, continuation, or all (trimmed, any case)", () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     try {
-      expect(resolveModelFirstMode()).toBe("off"); // LARKWAY_MODEL_FIRST unset
+      expect(resolveModelFirstMode()).toBe("continuation"); // LARKWAY_MODEL_FIRST unset → default
       process.env["LARKWAY_MODEL_FIRST"] = "all";
       expect(resolveModelFirstMode()).toBe("all");
-      expect(resolveModelFirstMode("")).toBe("off");
+      expect(resolveModelFirstMode("")).toBe("continuation");
       expect(resolveModelFirstMode("off")).toBe("off");
+      expect(resolveModelFirstMode(" OFF ")).toBe("off");
       expect(resolveModelFirstMode(" Continuation ")).toBe("continuation");
       expect(resolveModelFirstMode("ALL")).toBe("all");
       expect(resolveModelFirstMode("yes-please")).toBe("off");
@@ -731,7 +732,27 @@ describe("WP-10: which turns go model-first", () => {
     });
   });
 
-  it("the flag unset: the same follow-up is card-first", async () => {
+  it("the flag unset: a continuation follow-up defaults to model-first", async () => {
+    const log: string[] = [];
+    const gate = deferred();
+    registerScript([{}], log);
+    const { client } = inboundClient(log, continuationEvent());
+    const { handler } = makeHandler({
+      log,
+      client,
+      cardKit: recordingCardKit(log, { gate: gate.promise }),
+      store: fakeSessionStore([existingSession()]),
+    });
+    const run = runAll(handler);
+    await vi.waitFor(() => expect(log).toContain("run:1"), CI_WAIT);
+    expect(log).not.toContain("cardkit:create:end");
+    gate.resolve();
+    await run;
+    expect(log.indexOf("run:1")).toBeLessThan(log.indexOf("cardkit:create:end"));
+  });
+
+  it("LARKWAY_MODEL_FIRST=off: the same follow-up is card-first", async () => {
+    process.env["LARKWAY_MODEL_FIRST"] = "off";
     const log: string[] = [];
     registerScript([{}], log);
     const { client } = inboundClient(log, continuationEvent());

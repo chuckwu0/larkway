@@ -250,3 +250,127 @@ describe("idle native writer migration", () => {
     expect(f.pools[1]!.calls.map(o => o.prompt)).toEqual(["unrelated"]);
   });
 });
+
+describe("stat-cached native settings fast path", () => {
+  it("skips runtimeSettings RPCs on steady-state turns and re-verifies on nativeStatKey, pid, cwd, or TTL change", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "Date"] });
+    let snapshot: CodexConfigSnapshot = {
+      generation: "a",
+      account: "a@example.test",
+      nativeStatKey: "auth:1|cfg:1",
+    };
+    let readCount = 0;
+    const pools: Pool[] = [];
+    const runner = new LiveCodexRunner(
+      async () => {
+        readCount += 1;
+        return { ...snapshot };
+      },
+      {},
+      () => {
+        const p = new Pool();
+        p.settings = { account: "a@example.test", model: "host-m", effort: "high" };
+        pools.push(p);
+        return p;
+      },
+    );
+    runners.push(runner);
+
+    // Turn 1: cold verification (2 reads + 1 runtimeSettings RPC).
+    const t1 = runner.run({ prompt: "one", cwd: "/tmp/no-codex-a" });
+    await vi.waitFor(() => expect(pools[0]?.calls).toHaveLength(1));
+    expect(pools[0]!.runtimeSettings).toHaveBeenCalledTimes(1);
+    expect(readCount).toBe(2);
+    pools[0]!.finish();
+    await t1.done;
+
+    // Turn 2: steady state + YAML model override change → 0 runtimeSettings RPCs, 1 readConfig.
+    snapshot = { ...snapshot, model: "yaml-m", effort: "medium" };
+    const t2 = runner.run({ prompt: "two", cwd: "/tmp/no-codex-a", resumeSessionId: "session-a" });
+    await vi.waitFor(() => expect(pools[0]!.calls).toHaveLength(2));
+    expect(pools[0]!.runtimeSettings).toHaveBeenCalledTimes(1);
+    expect(readCount).toBe(3);
+    expect(pools[0]!.calls[1]).toMatchObject({ model: "yaml-m", effort: "medium" });
+    pools[0]!.finish();
+    await t2.done;
+
+    // Turn 3: nativeStatKey changed → full re-verification.
+    snapshot = { ...snapshot, nativeStatKey: "auth:1|cfg:2" };
+    const t3 = runner.run({ prompt: "three", cwd: "/tmp/no-codex-a" });
+    await vi.waitFor(() => expect(pools[0]!.calls).toHaveLength(3));
+    expect(pools[0]!.runtimeSettings).toHaveBeenCalledTimes(2);
+    pools[0]!.finish();
+    await t3.done;
+
+    // Turn 4: childPid changed → full re-verification.
+    pools[0]!.childPid = 999;
+    const t4 = runner.run({ prompt: "four", cwd: "/tmp/no-codex-a" });
+    await vi.waitFor(() => expect(pools[0]!.calls).toHaveLength(4));
+    expect(pools[0]!.runtimeSettings).toHaveBeenCalledTimes(3);
+    pools[0]!.finish();
+    await t4.done;
+
+    // Turn 5: TTL (60s) expired → full re-verification.
+    await vi.advanceTimersByTimeAsync(61_000);
+    const t5 = runner.run({ prompt: "five", cwd: "/tmp/no-codex-a" });
+    await vi.waitFor(() => expect(pools[0]!.calls).toHaveLength(5));
+    expect(pools[0]!.runtimeSettings).toHaveBeenCalledTimes(4);
+    pools[0]!.finish();
+    await t5.done;
+  });
+
+  it("invalidates the cached runtimeSettings when an ancestor project .codex/config.toml changes", async () => {
+    const { mkdtemp, mkdir, rm, writeFile } = await import("node:fs/promises");
+    const { tmpdir } = await import("node:os");
+    const path = await import("node:path");
+    const root = await mkdtemp(path.join(tmpdir(), "larkway-codex-ancestor-"));
+    try {
+      const subDir = path.join(root, "packages", "sub");
+      const codexDir = path.join(root, ".codex");
+      await mkdir(subDir, { recursive: true });
+      await mkdir(codexDir, { recursive: true });
+      const ancestorConfig = path.join(codexDir, "config.toml");
+      await writeFile(ancestorConfig, 'model = "gpt-5.4"\n', "utf8");
+
+      const pools: Pool[] = [];
+      const runner = new LiveCodexRunner(
+        async () => ({
+          generation: "a:1",
+          account: "a@example.test",
+          nativeStatKey: "home-v1",
+        }),
+        {},
+        () => {
+          const p = new Pool();
+          p.settings = { account: "a@example.test", model: "host-m", effort: "high" };
+          pools.push(p);
+          return p;
+        },
+      );
+      runners.push(runner);
+
+      const t1 = runner.run({ prompt: "one", cwd: subDir });
+      await vi.waitFor(() => expect(pools[0]!.calls).toHaveLength(1));
+      expect(pools[0]!.runtimeSettings).toHaveBeenCalledTimes(1);
+      pools[0]!.finish();
+      await t1.done;
+
+      // Same subdir, unchanged ancestor config → cache hit.
+      const t2 = runner.run({ prompt: "two", cwd: subDir });
+      await vi.waitFor(() => expect(pools[0]!.calls).toHaveLength(2));
+      expect(pools[0]!.runtimeSettings).toHaveBeenCalledTimes(1);
+      pools[0]!.finish();
+      await t2.done;
+
+      // Modify ancestor project-root .codex/config.toml → cache invalidates immediately.
+      await writeFile(ancestorConfig, 'model = "gpt-5.4"\nmodel_reasoning_effort = "high"\n', "utf8");
+      const t3 = runner.run({ prompt: "three", cwd: subDir });
+      await vi.waitFor(() => expect(pools[0]!.calls).toHaveLength(3));
+      expect(pools[0]!.runtimeSettings).toHaveBeenCalledTimes(2);
+      pools[0]!.finish();
+      await t3.done;
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+});

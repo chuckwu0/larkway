@@ -409,6 +409,8 @@ const state = {
    */
   runningBackends: {},
   codexRuntimes: {},
+  /** 宿主机磁盘剩余空间快照(/api/status 的 hostDisk)。 */
+  hostDisk: null,
   /** 最近事件面板筛选状态,按 bot id 索引。 */
   eventFilters: {},
   /** 最近事件面板是否展开全部,按 bot id 索引。 */
@@ -643,10 +645,11 @@ const LK_BACKENDS_META = {
   claude: { id: "claude", name: "Claude Code", short: "Claude", vendor: "Anthropic 订阅", mono: "CC" },
   antigravity: { id: "antigravity", name: "Antigravity CLI", short: "Antigravity", vendor: "Google AI 订阅", mono: "AG" },
   codex:  { id: "codex",  name: "Codex",       short: "Codex",  vendor: "OpenAI 订阅",  mono: "CX" },
+  pi:     { id: "pi",     name: "pi",          short: "pi",     vendor: "自带模型 / API key", mono: "PI" },
 };
 
-/** 显示顺序(镜像 backendKit.jsx LK_BACKEND_ORDER,去掉 hypothetical gemini)。 */
-const LK_BACKEND_ORDER = ["codex", "claude", "antigravity"];
+/** 显示顺序(启动后由 GET /api/backends 动态同步，静态表仅作兜底)。 */
+let LK_BACKEND_ORDER = ["codex", "claude", "pi", "antigravity"];
 const LK_BACKEND_DEFAULT = "codex";
 
 /**
@@ -712,19 +715,29 @@ let _backendReady = {};
  */
 let _backendModelFacts = {};
 
-/** 拉一次 /api/backends 并更新 _backendReady/_backendModelFacts,供 select 渲染前调用。 */
+/** 拉一次 /api/backends 并更新注册表、_backendReady/_backendModelFacts,供 select 渲染前调用。 */
 async function loadBackends() {
   try {
     const res = await api("GET", "/api/backends");
     if (res.ok && Array.isArray(res.json?.backends)) {
+      const order = [];
       for (const b of res.json.backends) {
-        if (typeof b.id !== "string") continue;
+        if (typeof b.id !== "string" || !b.id) continue;
+        order.push(b.id);
+        LK_BACKENDS_META[b.id] = {
+          id: b.id,
+          name: typeof b.name === "string" && b.name ? b.name : (LK_BACKENDS_META[b.id]?.name ?? b.id),
+          short: typeof b.short === "string" && b.short ? b.short : (LK_BACKENDS_META[b.id]?.short ?? b.id),
+          vendor: typeof b.vendor === "string" && b.vendor ? b.vendor : (LK_BACKENDS_META[b.id]?.vendor ?? "第三方底座"),
+          mono: typeof b.mono === "string" && b.mono ? b.mono : (LK_BACKENDS_META[b.id]?.mono ?? b.id.slice(0, 2).toUpperCase()),
+        };
         _backendReady[b.id] = !!b.ready;
         _backendModelFacts[b.id] = {
           globalDefault: b.globalDefault && typeof b.globalDefault === "object" ? b.globalDefault : undefined,
           visibleModels: Array.isArray(b.visibleModels) ? b.visibleModels : undefined,
         };
       }
+      if (order.length > 0) LK_BACKEND_ORDER = order;
     }
   } catch { /* 失败静默;ready 默认 true */ }
 }
@@ -737,14 +750,17 @@ async function loadBackends() {
  * @param {string} [containerId] 容器 id(用于 change 事件冒泡)
  */
 function lkBackendSelectHTML(value, containerId = "") {
-  const items = LK_BACKEND_ORDER.map((id) => {
+  const order = LK_BACKEND_ORDER.includes(value) || !value ? LK_BACKEND_ORDER : [...LK_BACKEND_ORDER, value];
+  const items = order.map((id) => {
     const b = lkBackend(id);
     const sel = id === value;
     const isReady = _backendReady[id] !== false; // 默认就绪
     const isDefault = id === LK_BACKEND_DEFAULT;
     const readyLabel = id === "antigravity"
       ? (_backendReady[id] === true ? "已检测到 agy，登录状态请在 CLI 中确认" : "等待 CLI 检测")
-      : "已就绪";
+      : id === "pi"
+        ? (_backendReady[id] === true ? "已检测到 pi，按模型检查 provider 凭据" : "等待 CLI 检测")
+        : "已就绪";
     return (
       `<button type="button" role="radio" aria-checked="${sel}" data-bk-id="${esc(id)}"` +
       (containerId ? ` data-bk-container="${esc(containerId)}"` : "") +
@@ -831,6 +847,7 @@ function lkHexA(hex, alpha) {
  */
 function modelSuggestionsForBackend(backendId) {
   if (backendId === "antigravity") return [{ v: "gemini-4-neon", d: "Gemini 4 Neon" }];
+  if (backendId === "pi") return [];
   if (backendId === "codex") {
     // 中文定位描述覆盖已知官方模型;本机 cache 里其余模型用它自带的英文描述。
     const curated = {
@@ -983,6 +1000,7 @@ function buildModelEffortHTML(bot) {
 /** 覆盖区底部提示文案(按底座措辞)。 */
 function bk2AdvHintText(backendId) {
   if (backendId === "antigravity") return "用 agy models 查看本机账号可用的模型和推理档位。";
+  if (backendId === "pi") return "填 ~/.pi/agent/models.json 中配置的 provider/model（例如 openai/gpt-4o）；用 pi auth check --model <id> 验证凭据。";
   return backendId === "codex"
     ? "建议不是白名单 —— 列表底部可输入任意模型名;切到 Claude Code 时档位显示 low / medium / high / max。"
     : "建议不是白名单 —— 列表底部可输入任意模型名;切到 Codex 时档位显示 Light / Medium / High / Extra High。";
@@ -2050,6 +2068,9 @@ function renderStatus(status) {
   } else {
     state.pendingRestart = { newCount: 0, ghostCount: 0, ghosts: [] };
   }
+
+  // 宿主机磁盘剩余空间(由 GET /api/status 返回，低空间时在顶栏显示提醒)
+  state.hostDisk = status?.hostDisk ?? null;
 
   // ── BL-18:每次 poll 落地时推进重启状态机 ──────────────────────────────────
   if (state.restart.status === "restarting") {
@@ -3129,6 +3150,11 @@ function buildAgentConfigHTML(bot, memContent, mode, prefill) {
 
   // 层三 summary 药丸
   const chatCount = chatsVal.split("\n").map((s) => s.trim()).filter(Boolean).length;
+  const maxConcVal = bot.max_concurrent_turns ?? "";
+  const idleTimeoutVal = bot.idle_timeout_seconds ?? "";
+  const cotVal = bot.cot ?? "brief";
+  const p2pSticky = bot.p2pStickySession === true;
+  const sharedKnowledge = bot.sharedKnowledge === true;
   const advSummaryHTML =
     acPillHTML("muted", "M13 2 3 14h7l-1 8 10-12h-7l1-6Z", `${turnLimit} 轮协作提醒`) +
     acPillHTML("muted", "M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2M9 11a4 4 0 1 0 0-8 4 4 0 0 0 0 8M22 21v-2a4 4 0 0 0-3-3.9M16 3.1a4 4 0 0 1 0 7.8", chatCount === 0 ? "任何群都能 @" : `仅 ${chatCount} 个群`);
@@ -3292,6 +3318,44 @@ function buildAgentConfigHTML(bot, memContent, mode, prefill) {
     `<p class="ac-hint">留空 = 任何群 @ 它都会回复（最省事，推荐）。只想限定 → 填群号 oc_…，一行一个。</p>` +
     `<textarea id="ac-chats" name="chats" class="ac-input" rows="2" placeholder="留空即可；或一行一个 oc_…">${esc(chatsVal)}</textarea>` +
     `</div>` +
+    (isCreate
+      ? ""
+      : `<details class="ac-token-advanced">` +
+        `<summary>运行参数与会话策略 <span>高级 · 可选</span></summary>` +
+        `<div class="ac-field">` +
+        `<label class="ac-label" for="ac-cot">思维链展示（cot）</label>` +
+        `<p class="ac-hint">默认 brief（思考过程 + 工具名）；选 off 可关闭思考气泡以减少消息噪音。</p>` +
+        `<select id="ac-cot" name="cot" class="ac-input" style="width:200px">` +
+        `<option value="brief"${cotVal === "brief" ? " selected" : ""}>brief（默认）</option>` +
+        `<option value="detailed"${cotVal === "detailed" ? " selected" : ""}>detailed（含工具参数与摘录）</option>` +
+        `<option value="off"${cotVal === "off" ? " selected" : ""}>off（关闭思考过程）</option>` +
+        `</select>` +
+        `</div>` +
+        `<div class="ac-field">` +
+        `<label class="ac-label" for="ac-max-concurrent">最大并发话题数（max_concurrent_turns）</label>` +
+        `<p class="ac-hint">同一话题内仍串行；留空默认 5，修改后重启 bridge 生效。</p>` +
+        `<input id="ac-max-concurrent" name="max_concurrent_turns" class="ac-input" type="number" min="1" placeholder="5" value="${esc(maxConcVal)}" style="width:130px" />` +
+        `</div>` +
+        `<div class="ac-field">` +
+        `<label class="ac-label" for="ac-idle-timeout">静默等待提醒阈值（秒，idle_timeout_seconds）</label>` +
+        `<p class="ac-hint">连续无输出超过此秒数时卡片显示等待提醒（不会自动中断）；留空默认 180，最小 30。</p>` +
+        `<input id="ac-idle-timeout" name="idle_timeout_seconds" class="ac-input" type="number" min="30" placeholder="180" value="${esc(idleTimeoutVal)}" style="width:130px" />` +
+        `</div>` +
+        `<div class="ac-field">` +
+        `<label class="ac-label" style="display:inline-flex;align-items:center;gap:8px;cursor:pointer">` +
+        `<input id="ac-p2p-sticky" name="p2pStickySession" type="checkbox"${p2pSticky ? " checked" : ""} />` +
+        `单聊连续会话（p2pStickySession）` +
+        `</label>` +
+        `<p class="ac-hint">开启后，1:1 私聊的顶层消息共享同一个 session，像跟人连续聊天一样记住上下文。</p>` +
+        `</div>` +
+        `<div class="ac-field">` +
+        `<label class="ac-label" style="display:inline-flex;align-items:center;gap:8px;cursor:pointer">` +
+        `<input id="ac-shared-knowledge" name="sharedKnowledge" type="checkbox"${sharedKnowledge ? " checked" : ""} />` +
+        `加入共享组织知识库（sharedKnowledge）` +
+        `</label>` +
+        `<p class="ac-hint">默认关闭；仅需要跨多个 Agent 共享同一本机知识库时开启。</p>` +
+        `</div>` +
+        `</details>`) +
     `</div>` + // ac-adv-body
     `</section>` +
 
@@ -3575,6 +3639,20 @@ function readAgentConfigValues(panel) {
   const effortSel = panel.querySelector("#ac-effort");
   if (modelInput) config.model = modelInput.value.trim();
   if (effortSel) config.effort = effortSel.value;
+  const cotSel = ac.querySelector("#ac-cot");
+  if (cotSel && cotSel.value) config.cot = cotSel.value;
+  const maxConcInput = ac.querySelector("#ac-max-concurrent");
+  if (maxConcInput) {
+    config.max_concurrent_turns = readOptionalIntInput(maxConcInput);
+  }
+  const idleTimeoutInput = ac.querySelector("#ac-idle-timeout");
+  if (idleTimeoutInput) {
+    config.idle_timeout_seconds = readOptionalIntInput(idleTimeoutInput);
+  }
+  const p2pStickyEl = ac.querySelector("#ac-p2p-sticky");
+  if (p2pStickyEl) config.p2pStickySession = !!p2pStickyEl.checked;
+  const sharedKnowledgeEl = ac.querySelector("#ac-shared-knowledge");
+  if (sharedKnowledgeEl) config.sharedKnowledge = !!sharedKnowledgeEl.checked;
   if (botId) config.id = botId;
   // ① 新保存契约:_gitlabTokenValue === undefined 表示「不带字段」(保留现有)
   if (_gitlabTokenValue !== undefined) config.gitlab_token_value = _gitlabTokenValue;
@@ -3582,7 +3660,40 @@ function readAgentConfigValues(panel) {
   return config;
 }
 
-// ── 仓库行 CRUD ──────────────────────────────────────────────────────────────
+/**
+ * Parse an optional integer <input type="number"> without parseInt's silent
+ * truncation (`"1e2"` -> `1`, `"30.9"` -> `30`). Blank -> `null`; valid finite
+ * integer -> `number`; anything else -> non-null invalid marker (`num` or raw
+ * string) so validation/API rejects it rather than clearing the field.
+ */
+function readOptionalIntInput(input) {
+  const raw = (input?.value ?? "").trim();
+  if (raw === "") return null;
+  const num =
+    typeof input.valueAsNumber === "number" && !Number.isNaN(input.valueAsNumber)
+      ? input.valueAsNumber
+      : Number(raw);
+  if (Number.isFinite(num)) return num;
+  return raw;
+}
+
+function validateOptionalIntInput(input, label, min, max) {
+  if (!input) return true;
+  if (input.validity && !input.validity.valid) {
+    toast(`${label} 必须是 ${min}–${max} 的整数。`, "warn");
+    input.focus?.();
+    input.reportValidity?.();
+    return false;
+  }
+  const val = readOptionalIntInput(input);
+  if (val === null) return true;
+  if (typeof val !== "number" || !Number.isInteger(val) || val < min || val > max) {
+    toast(`${label} 必须是 ${min}–${max} 的整数。`, "warn");
+    input.focus?.();
+    return false;
+  }
+  return true;
+}
 
 function acGetRepos(ac) {
   const rows = ac.querySelectorAll(".ac-repo-row");
@@ -3600,6 +3711,12 @@ function acGetRepos(ac) {
 function validateCodeAccessConfig(panel) {
   const ac = panel?.querySelector?.("#ac-panel") ?? panel;
   if (!ac) return true;
+  if (!validateOptionalIntInput(ac.querySelector("#ac-max-concurrent"), "最大并发话题数", 1, 50)) {
+    return false;
+  }
+  if (!validateOptionalIntInput(ac.querySelector("#ac-idle-timeout"), "静默提示阈值（秒）", 10, 3600)) {
+    return false;
+  }
   const codeAccessBtn = ac.querySelector("#ac-code-access-btn");
   const codeAccess = codeAccessBtn?.getAttribute("aria-checked") === "true";
   if (!codeAccess) return true;
@@ -4122,6 +4239,10 @@ function wireDetailEvents(panel, id, bot) {
       updateFormDirty(panel);
       acRefreshHero(panel, id, bot);
     });
+    acPanelEl.addEventListener("change", () => {
+      state.formDirty = acFormSnapshot(panel) !== panel._acBaseline;
+      updateFormDirty(panel);
+    });
     acPanelEl.addEventListener("ac-change", () => {
       state.formDirty = acFormSnapshot(panel) !== panel._acBaseline;
       updateFormDirty(panel);
@@ -4548,6 +4669,16 @@ function renderServiceIndicator() {
 
   // running + ok → 绿 chip + 幽灵「重启服务」按钮(照 LkServiceRestartChip serving)
   if (!readonly) {
+    const disk = state.hostDisk;
+    const diskLow = disk && (disk.status === "warn" || disk.status === "error");
+    const diskTag = diskLow
+      ? `<span title="宿主机 ~/.larkway 所在分区剩余 ${esc(disk.freeGiB)} GiB，建议清理旧仓库或日志" ` +
+        `style="display:inline-flex;align-items:center;gap:4px;padding:0 10px;height:36px;` +
+        `border-left:1px solid ${LIVE_EDGE.serving};font-size:12px;font-weight:600;` +
+        `color:${disk.status === "error" ? LIVE_TEXT.offline : LIVE_TEXT.degraded};` +
+        `background:${disk.status === "error" ? LIVE_SOFT.offline : LIVE_SOFT.degraded};white-space:nowrap">` +
+        `${ICONS.warn}磁盘余 ${esc(disk.freeGiB)} GiB</span>`
+      : "";
     container.innerHTML =
       `<div class="lk-svc-indicator" style="display:inline-flex;align-items:center;gap:0;` +
       `border-radius:10px;border:1px solid ${LIVE_EDGE.serving};background:${LIVE_SOFT.serving};overflow:hidden">` +
@@ -4556,6 +4687,7 @@ function renderServiceIndicator() {
       `<span class="live-dot is-serving" style="width:8px;height:8px;flex-shrink:0"></span>` +
       `正常服务中` +
       `</span>` +
+      diskTag +
       `<button type="button" id="btn-svc-restart" ` +
       `style="display:inline-flex;align-items:center;gap:6px;height:36px;padding:0 13px;` +
       `border:none;border-left:1px solid ${LIVE_EDGE.serving};background:#fff;` +
@@ -5508,13 +5640,6 @@ function wireEvents() {
     void doUpdateVersion();
   });
 
-  // 同步预览 modal 背景点击关闭
-  document.getElementById("modal-backdrop")?.addEventListener("click", (e) => {
-    if (e.target === e.currentTarget) {
-      e.currentTarget.hidden = true;
-    }
-  });
-
   // 添加新助手 modal 背景点击 → 走取消(中止后端 + 清定时器)
   document.getElementById("onboard-backdrop")?.addEventListener("click", (e) => {
     if (e.target === e.currentTarget) {
@@ -5527,16 +5652,13 @@ function wireEvents() {
     await doBridgeRestart(e.currentTarget);
   });
 
-  // Esc 关闭 modal（同步预览直接关；添加新助手走取消清理）
+  // Esc 关闭「添加新助手」modal（走取消清理）
   document.addEventListener("keydown", (e) => {
     if (e.key !== "Escape") return;
     const ob = document.getElementById("onboard-backdrop");
     if (ob && !ob.hidden) {
       closeOnboardModal();
-      return;
     }
-    const bd = document.getElementById("modal-backdrop");
-    if (bd && !bd.hidden) bd.hidden = true;
   });
 }
 

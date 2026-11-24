@@ -4,7 +4,7 @@ import { runColdJson } from "../agent/coldJsonRunner.js";
 import { resolveRunTimeoutMs } from "../agent/runTimeout.js";
 import {
   createPerfMarker,
-  type AgentRunner, type AgentStreamEvent, type RunHandle, type RunOptions,
+  type AgentRunner, type AgentStreamEvent, type RunHandle, type RunOptions, type TurnUsage,
 } from "../agent/runner.js";
 
 const DEFAULT_AUTH_RETRY_DELAYS_MS = [1_000, 2_000] as const;
@@ -74,6 +74,60 @@ function object(value: unknown): Record<string, unknown> | undefined {
   return value !== null && typeof value === "object" ? value as Record<string, unknown> : undefined;
 }
 
+function finiteNonNeg(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : undefined;
+}
+
+function extractAntigravityUsage(result: Record<string, unknown>): TurnUsage | undefined {
+  const src = object(result.usage) ?? object(result.token_usage) ?? object(result.metrics);
+  if (!src) return undefined;
+  // Two distinct native shapes:
+  //   1. Exclusive buckets (Anthropic-style `input_tokens`): `input_tokens`
+  //      already excludes cache read/creation tokens.
+  //   2. Inclusive prompt total (OpenAI `prompt_tokens` / Gemini
+  //      `prompt_token_count`): includes cached read/creation tokens, so both
+  //      included cache buckets must be subtracted to preserve TurnUsage's
+  //      disjoint-bucket contract.
+  const exclusiveInput = finiteNonNeg(src.input_tokens);
+  const inclusivePrompt =
+    exclusiveInput === undefined
+      ? (finiteNonNeg(src.prompt_tokens) ?? finiteNonNeg(src.prompt_token_count))
+      : undefined;
+  const outputTokens =
+    finiteNonNeg(src.output_tokens) ??
+    finiteNonNeg(src.completion_tokens) ??
+    finiteNonNeg(src.candidates_token_count);
+  const cacheReadTokens =
+    finiteNonNeg(src.cache_read_input_tokens) ??
+    finiteNonNeg(src.cached_tokens) ??
+    finiteNonNeg(src.cached_content_token_count);
+  const cacheCreationTokens = finiteNonNeg(src.cache_creation_input_tokens);
+  const reasoningTokens = finiteNonNeg(src.reasoning_tokens) ?? finiteNonNeg(src.thoughts_token_count);
+  if (
+    exclusiveInput === undefined &&
+    inclusivePrompt === undefined &&
+    outputTokens === undefined &&
+    cacheReadTokens === undefined &&
+    cacheCreationTokens === undefined &&
+    reasoningTokens === undefined
+  ) {
+    return undefined;
+  }
+  const inputTokens =
+    exclusiveInput !== undefined
+      ? exclusiveInput
+      : inclusivePrompt !== undefined
+        ? Math.max(0, inclusivePrompt - (cacheReadTokens ?? 0) - (cacheCreationTokens ?? 0))
+        : 0;
+  return {
+    inputTokens,
+    cacheCreationTokens: cacheCreationTokens ?? 0,
+    cacheReadTokens: cacheReadTokens ?? 0,
+    outputTokens: outputTokens ?? 0,
+    ...(reasoningTokens !== undefined ? { reasoningTokens } : {}),
+  };
+}
+
 export class AntigravityTurnDecoder {
   sessionId?: string;
   // A missing result must fail even if the CLI exits zero.
@@ -110,7 +164,8 @@ export class AntigravityTurnDecoder {
       if (success && typeof result.response === "string") {
         yield { type: "answer_snapshot", text: result.response, raw };
       }
-      yield { type: "result", stopReason: String(result.status), raw };
+      const usage = extractAntigravityUsage(result);
+      yield { type: "result", stopReason: String(result.status), ...(usage ? { usage } : {}), raw };
     } else if (event?.event === "step_update" && step?.step_type === "tool" &&
         typeof step.step_index === "number" && typeof step.tool_name === "string") {
       if (!this.tools.has(step.step_index)) {

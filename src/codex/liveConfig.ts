@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { readFile, readdir } from "node:fs/promises";
+import { readFile, readdir, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import path from "node:path";
 import yaml from "js-yaml";
@@ -13,10 +13,28 @@ export interface CodexConfigSnapshot {
   account: string | null;
   model?: string;
   effort?: string;
+  /**
+   * Process-local stat fingerprint of native Codex files (`auth.json` +
+   * `config.toml`). Present for real disk-backed readers so LiveCodexRunner
+   * can skip redundant `config/read` + `account/read` RPCs when nothing on
+   * disk changed; absent for synthetic test readers so mocks verify every turn.
+   */
+  nativeStatKey?: string;
 }
 
 const slice = BotConfigSchema.pick({ id: true, backend: true, model: true, effort: true }).strip();
 const digest = (s: string): string => createHash("sha256").update(s).digest("hex");
+
+/** High-resolution stat signature for cache invalidation ("enoent" when absent). */
+export async function statFileSignature(filePath: string): Promise<string> {
+  try {
+    const st = await stat(filePath, { bigint: true });
+    return `${st.ino}:${st.size}:${st.mtimeNs}:${st.ctimeNs}`;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return "enoent";
+    throw error;
+  }
+}
 
 export function codexHomePath(): string {
   return process.env["CODEX_HOME"] ?? path.join(homedir(), ".codex");
@@ -70,7 +88,23 @@ async function readCodexFile(home: string, file: "auth.json" | "config.toml"): P
 /** Read at admission, not at message receipt: queued turns see the latest values. */
 export function createCodexConfigReader(botsDir: string, botId: string, home = codexHomePath()): () => Promise<CodexConfigSnapshot> {
   let botFile: string | undefined;
+  let cachedBotStat: string | undefined;
+  let cachedBot: ReturnType<typeof slice.parse> | undefined;
+  let cachedNativeStatKey: string | undefined;
+  let cachedNative: { generation: string; authMode?: "chatgpt" | "apiKey"; account: string | null } | undefined;
+
+  const authPath = path.join(home, "auth.json");
+  const configPath = path.join(home, "config.toml");
+
   return async () => {
+    if (botFile) {
+      const currentBotStat = await statFileSignature(botFile).catch(() => "enoent");
+      if (currentBotStat === "enoent") {
+        botFile = undefined;
+        cachedBotStat = undefined;
+        cachedBot = undefined;
+      }
+    }
     if (!botFile) {
       for (const name of (await readdir(botsDir)).sort()) {
         if (!/\.ya?ml$/.test(name)) continue;
@@ -81,19 +115,54 @@ export function createCodexConfigReader(botsDir: string, botId: string, home = c
       }
     }
     if (!botFile) throw new Error("Codex bot configuration not found; new turn was not started");
+
+    const [botStat, authStat, configStat] = await Promise.all([
+      statFileSignature(botFile).catch(() => { throw new Error("Codex model/effort configuration is invalid; new turn was not started"); }),
+      statFileSignature(authPath).catch(() => { throw new Error("Cannot read Codex auth.json"); }),
+      statFileSignature(configPath).catch(() => { throw new Error("Cannot read Codex config.toml"); }),
+    ]);
+
     let bot: ReturnType<typeof slice.parse>;
-    try { bot = slice.parse(yaml.load(await readFile(botFile, "utf8"))); }
-    catch { throw new Error("Codex model/effort configuration is invalid; new turn was not started"); }
-    if (bot.id !== botId || bot.backend !== "codex") throw new Error("Changing bot identity/backend requires a service restart");
-    const [identity, config] = await Promise.all([readCodexLogin(home), readCodexFile(home, "config.toml")]);
-    // The native provider (including its endpoint and credentials) is process-scoped.
-    // Keep only a fingerprint and let the app-server decide if login is required.
+    if (cachedBot && cachedBotStat === botStat) {
+      bot = cachedBot;
+    } else {
+      try { bot = slice.parse(yaml.load(await readFile(botFile, "utf8"))); }
+      catch {
+        cachedBotStat = undefined;
+        cachedBot = undefined;
+        throw new Error("Codex model/effort configuration is invalid; new turn was not started");
+      }
+      if (bot.id !== botId || bot.backend !== "codex") {
+        cachedBotStat = undefined;
+        cachedBot = undefined;
+        throw new Error("Changing bot identity/backend requires a service restart");
+      }
+      cachedBot = bot;
+      cachedBotStat = botStat;
+    }
+
+    const nativeStatKey = `${authStat}|${configStat}`;
+    let native = cachedNative;
+    if (!native || cachedNativeStatKey !== nativeStatKey) {
+      const [identity, config] = await Promise.all([readCodexLogin(home), readCodexFile(home, "config.toml")]);
+      // The native provider (including its endpoint and credentials) is process-scoped.
+      // Keep only a fingerprint and let the app-server decide if login is required.
+      native = {
+        generation: digest(JSON.stringify([identity?.key ?? null, config])),
+        authMode: identity?.authMode,
+        account: identity?.account ?? null,
+      };
+      cachedNative = native;
+      cachedNativeStatKey = nativeStatKey;
+    }
+
     return {
-      generation: digest(JSON.stringify([identity?.key ?? null, config])),
-      authMode: identity?.authMode,
-      account: identity?.account ?? null,
+      generation: native.generation,
+      authMode: native.authMode,
+      account: native.account,
       model: bot.model,
       effort: bot.effort,
+      nativeStatKey,
     };
   };
 }

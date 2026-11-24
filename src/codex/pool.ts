@@ -52,7 +52,8 @@
  *    next bridge boot via {@link reapOrphanedWarmProcess}.
  */
 
-import { execFile, spawn, type ChildProcess } from "node:child_process";
+import { spawn, type ChildProcess } from "node:child_process";
+import { readProcessCommandLine } from "../agent/processInspect.js";
 import { spawnPiped } from "../platform/spawn.js";
 import { resolveRunTimeoutMs } from "../agent/runTimeout.js";
 import { CodexSteering } from "./steering.js";
@@ -1261,15 +1262,6 @@ export class CodexProcessPool implements AgentRunner {
 // ---------------------------------------------------------------------------
 // reapOrphanedWarmProcess — boot-time hard-kill orphan sweep (M2)
 // ---------------------------------------------------------------------------
-
-/** Runs `ps -p <pid> -o command=` and resolves its stdout (empty string on any error — never throws/rejects). */
-function readProcessCommandLine(pid: number): Promise<string> {
-  return new Promise((resolve) => {
-    execFile("ps", ["-p", String(pid), "-o", "command="], (err, stdout) => {
-      resolve(err ? "" : stdout);
-    });
-  });
-}
 
 /**
  * A hard kill (kill -9, a watchdog, an OOM) never gives CodexProcessPool a

@@ -174,4 +174,45 @@ describe("TurnPerfRecorder", () => {
     expect(filled).not.toHaveProperty("postRunner");
     expect(JSON.parse(JSON.stringify(filled))).not.toHaveProperty("wsAt");
   });
+
+  it("round-trips processStart and rotates perf.jsonl once it exceeds maxBytes", async () => {
+    root = await mkdtemp(path.join(tmpdir(), "larkway-perflog-rot-"));
+    await appendPerfSample(root, "frontend", sample({ threadId: "om_1", processStart: "standby" }), 120);
+    await appendPerfSample(root, "frontend", sample({ threadId: "om_2", processStart: "reused" }), 120);
+
+    // First sample was > 120 bytes so second write rotated perf.jsonl → perf.jsonl.1.
+    const current = await readPerfSamples(root, "frontend");
+    expect(current).toHaveLength(1);
+    expect(current[0]).toMatchObject({ threadId: "om_2", processStart: "reused" });
+    const rotated = await readPerfSamples(root, "frontend").then(async () => {
+      const { readFile } = await import("node:fs/promises");
+      return readFile(`${resolvePerfLogPath(root, "frontend")}.1`, "utf8");
+    });
+    expect(rotated).toContain("om_1");
+    expect(rotated).toContain("standby");
+  });
+
+  it("serializes concurrent rotations so the .1 archive is never overwritten by a single fresh sample", async () => {
+    root = await mkdtemp(path.join(tmpdir(), "larkway-perflog-race-"));
+    // Seed two history entries and measure their exact size so the threshold
+    // sits strictly between 1 sample and 2 samples.
+    await appendPerfSample(root, "frontend", sample({ threadId: "om_hist_1" }), 10_000);
+    await appendPerfSample(root, "frontend", sample({ threadId: "om_hist_2" }), 10_000);
+    const { readFile, stat } = await import("node:fs/promises");
+    const seededBytes = (await stat(resolvePerfLogPath(root, "frontend"))).size;
+
+    // Fire two concurrent appends at threshold = seededBytes: only the first
+    // should rotate `[om_hist_1, om_hist_2]` into `.1`; the second sees the
+    // single fresh sample (< seededBytes) and appends without overwriting `.1`.
+    await Promise.all([
+      appendPerfSample(root, "frontend", sample({ threadId: "om_new_1" }), seededBytes),
+      appendPerfSample(root, "frontend", sample({ threadId: "om_new_2" }), seededBytes),
+    ]);
+
+    const rotated = await readFile(`${resolvePerfLogPath(root, "frontend")}.1`, "utf8");
+    expect(rotated).toContain("om_hist_1");
+    expect(rotated).toContain("om_hist_2");
+    const current = await readPerfSamples(root, "frontend");
+    expect(current.map((s) => s.threadId)).toEqual(["om_new_1", "om_new_2"]);
+  });
 });

@@ -127,7 +127,12 @@ describe("answer and optional card transport", () => {
   });
 
   it("documents rich output without requiring a state write for plain replies", async () => {
-    const prompt = await renderPrompt(makeInput({ taskHandleTasklistGuid: "list_one" }));
+    const prompt = await renderPrompt(
+      makeInput({
+        taskHandleTasklistGuid: "list_one",
+        peers: [{ id: "ou_test_peer", name: "Peer", description: "peer bot" }],
+      }),
+    );
     const contract = between(prompt, "state-contract");
     for (const capability of ["status", "last_message", "error", "updated_at", "choices", "content_blocks", "handoffs", "task_handle"]) {
       expect(contract).toContain(capability);
@@ -139,6 +144,44 @@ describe("answer and optional card transport", () => {
     expect(contract).toContain("不要自行 PATCH/PUT");
     expect(contract).toContain("单次工具错误不等于任务失败");
     expect(contract).not.toContain("干净退出进程"); // A warm runtime ends a turn, not its process.
+  });
+
+  it("omits handoffs without peers, omits dev_hostname without repos, and skips unchanged task candidates on delta turns", async () => {
+    const noPeers = await renderPrompt(makeInput());
+    expect(between(noPeers, "state-contract")).not.toContain("handoffs");
+    expect(between(noPeers, "context-pointers")).not.toContain("dev_hostname:");
+    expect(between(noPeers, "context-pointers")).not.toContain("port_range:");
+
+    const withRepo = await renderPrompt(
+      makeInput({
+        conventions: {
+          ...makeInput().conventions,
+          defaultProjectSlug: "acme/app",
+        },
+      }),
+    );
+    expect(between(withRepo, "context-pointers")).toContain("dev_hostname:");
+
+    const deltaUnchanged = await renderPrompt(
+      makeInput({
+        isNewThread: false,
+        taskHandleTasklistGuid: "list_one",
+        taskHandleCandidates: [{ guid: "task_1", summary: "Fix bug" }],
+        taskHandleCandidatesChanged: false,
+      }),
+    );
+    expect(deltaUnchanged).not.toContain("<task-handle>");
+
+    const deltaChanged = await renderPrompt(
+      makeInput({
+        isNewThread: false,
+        taskHandleTasklistGuid: "list_one",
+        taskHandleCandidates: [{ guid: "task_1", summary: "Fix bug" }],
+        taskHandleCandidatesChanged: true,
+      }),
+    );
+    expect(deltaChanged).toContain("<task-handle>");
+    expect(deltaChanged).toContain("task_1");
   });
 
   it("derives a usable state path for legacy callers without stateFilePath", async () => {

@@ -84,10 +84,10 @@ turn_taking_limit: 15
 # lark-cli named profile for WS subscribe.
 lark_cli_profile: dev-bot-profile
 
-# Env var name holding this bot's GitLab PAT (api-scoped for MR creation).
-gitlab_token_env: DEV_BOT_GITLAB_TOKEN
+# Env var name holding this bot's Git PAT (preferred field; `gitlab_token_env` is still accepted as a legacy alias).
+git_token_env: DEV_BOT_GIT_TOKEN
 
-# Optional git author identity for commits made in this bot's worktrees.
+# Optional git author identity for commits made by this bot.
 git_identity:
   name: Dev Bot
   email: dev-bot@example.com

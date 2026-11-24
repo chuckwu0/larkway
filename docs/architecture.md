@@ -1,213 +1,116 @@
-# Larkway 架构
+# Larkway 架构（v0.3.x）
 
-> **状态**:🗄 v1 基础架构(bridge / runner / card / session)。V2 多 bot 扩展是 v0.2 系列历史口径,其中 V2.2 = v0.2.2,见 [versioning.md](versioning.md);v0.3 当前权威见 [agent-workspace.md](agent-workspace.md)、[principles.md](principles.md) 和 [provisioning-model.md](provisioning-model.md)。核心模块**边界**(bridge/runner/card/session 的职责划分)仍适用,但**具体细节请以代码为准**——本文已知与现状不符的点:入口是 `src/main.ts`(TypeScript,非 main.py);默认 permission mode 是 `bypassPermissions`(非 acceptEdits,v0.3.18 起,见 README Security model);sessions.json 是 version-2、key 为 `threadId::botId`(非单 thread_id);`logs/<thread_id>.jsonl` 全量事件流从未实现(实际只有 `perf.jsonl`);housekeeping GC 在 v0.3.30 起会杀进程并删除 idle session 目录(非只读)。
+> **权威体系**：产品与薄通道边界见 [principles.md](principles.md)；Agent Workspace 目录与运行约定见 [agent-workspace.md](agent-workspace.md) 与 [native-runtime.md](native-runtime.md)；Bridge ↔ Agent 协议见 [prompt-contract.md](prompt-contract.md)；版本历史见 [versioning.md](versioning.md)。
 
-## 高层架构图
+## 高层架构
+
+Larkway 是单进程（Node.js 20+ / TypeScript）**飞书 ↔ 本地 Agent CLI 薄通道**。一台宿主机上的一个 bridge 进程同时托管多个 bot，每个 bot 独立拥有飞书长连接、session 存储、workspace 与后端运行器（Claude Code / Codex / Antigravity Gemini / pi）。
 
 ```
-┌─────────────────────┐
-│  飞书 Open Platform │
-│  ─────────────────  │
-│  events:            │
-│    im.message.      │
-│      receive_v1     │
-│  reply / patch:     │
-│    POST messages    │
-│    PATCH messages   │
-└──────────┬──────────┘
-           │  WebSocket 长连接(纯出网 *.feishu.cn,无需公网)
-           │  REST(回复 / 卡片 PATCH,出网 HTTPS)
-           ▼
-┌──────────────────────────────────────────────────────────────────┐
-│  开发者笔记本(MVP 单进程)                                         │
-│                                                                  │
-│  ┌──────────────────────────────────────────────────────────┐   │
-│  │              Larkway (TypeScript, Node.js)                │   │
-│  │                                                          │   │
-│  │   ┌──────────────┐   ┌──────────────┐  ┌────────────┐    │   │
-│  │   │ lark.client  │──▶│ bridge.      │─▶│ claude.    │    │   │
-│  │   │ (long-conn)  │   │ handler      │  │ runner     │    │   │
-│  │   └──────────────┘   │              │  │ (subprocess│    │   │
-│  │   ┌──────────────┐   │              │  │  spawn)    │    │   │
-│  │   │ lark.message │──▶│              │  └─────┬──────┘    │   │
-│  │   │ (parse raw)  │   └─────┬────────┘        │           │   │
-│  │   └──────────────┘         │                 │           │   │
-│  │                            ▼                 ▼ stream-   │   │
-│  │   ┌──────────────┐  ┌─────────────┐  ┌─────  json ───┐   │   │
-│  │   │ session.     │◀─│ claude.     │  │  lark.card    │   │   │
-│  │   │ store        │  │ prompt      │  │  (节流 PATCH) │   │   │
-│  │   │ (JSON file)  │  │ (template)  │  └───────────────┘   │   │
-│  │   └──────────────┘  └─────────────┘                      │   │
-│  │                                                          │   │
-│  │   ┌──────────────────────────────────────────────────┐   │   │
-│  │   │ housekeeping.gc (后台 cron, 30min/次)             │   │   │
-│  │   └──────────────────────────────────────────────────┘   │   │
-│  └──────────────────────────────────────────────────────────┘   │
-│                              │                                   │
-│                              │ spawn                             │
-│                              ▼                                   │
-│  ┌──────────────────────────────────────────────────────────┐   │
-│  │  claude (CLI subprocess, 订阅账号本地登录态)              │   │
-│  │  ──────────────────────────────────────────────────────  │   │
-│  │   读 ~/.larkway/worktrees/<thread_id>/CLAUDE.md          │   │
-│  │     ←(继承自 frontend repo 主目录的 CLAUDE.md)            │   │
-│  │   读 .claude/skills/landing-page-integration/SKILL.md    │   │
-│  │                                                          │   │
-│  │   工具调用:                                              │   │
-│  │     Bash:  git worktree / pnpm dev / lsof / ...          │   │
-│  │     Bash:  lark-cli docs +get / im +download / ...       │   │
-│  │     Bash:  glab mr create / git push / ...               │   │
-│  │     Edit / Read / Write / Glob / Grep                    │   │
-│  └──────────────────────────────────────────────────────────┘   │
-│                                                                  │
-│  ~/.larkway/                                                     │
-│    ├─ config.json                                                │
-│    ├─ sessions.json     (thread_id ↔ session_id)                 │
-│    ├─ repos/<project>/  (主 clone 缓存,定期 fetch)              │
-│    ├─ worktrees/<thread_id>/  (V0.2 legacy;agent 自己 worktree add) │
-│    ├─ agents/<agentId>/workspace/  (V0.3 Agent Workspace)        │
-│    │    ├─ AGENTS.md / CLAUDE.md                                 │
-│    │    ├─ memory/                                               │
-│    │    ├─ permissions/ (request.md / granted.md)                │
-│    │    ├─ sessions/<thread_id>/                                 │
-│    │    │    ├─ transcript.md / summary.md                       │
-│    │    │    └─ .larkway/state.json                              │
-│    │    └─ repos/                                                │
-│    └─ logs/<thread_id>.jsonl                                     │
-└──────────────────────────────────────────────────────────────────┘
-                              │
-                              │ http://your-host.local:<port>
-                              ▼
-                    ┌──────────────────┐
-                    │  运营浏览器       │
-                    │  (公司 VPN 内)    │
-                    └──────────────────┘
+┌──────────────────────────────────────────────────────────────────────┐
+│  飞书 Open Platform                                                   │
+│    WebSocket 长连接（纯出网 *.feishu.cn，无需公网 IP / 入站端口）       │
+│    REST（CardKit 流式卡片 / COT 思考气泡 / Post 回复 / 反应 / Task v2） │
+└─────────────────────────────────┬────────────────────────────────────┘
+                                  │
+                                  ▼
+┌──────────────────────────────────────────────────────────────────────┐
+│  宿主机：larkway bridge（src/main.ts，launchd / systemd / Task Scheduler）│
+│                                                                      │
+│  ┌─────────────────────┐    ┌──────────────────┐    ┌──────────────┐ │
+│  │ lark/channelClient  │───▶│ bridge/handler   │───▶│ agent/runner │ │
+│  │  • WS 长连接 + 补抓  │    │  • 同话题串行     │    │  • claude/   │ │
+│  │  • 去重 + 卡片回调   │    │  • 跨话题并发     │    │    warm pool │ │
+│  │  • lark/message 解析 │    │  • model-first   │    │  • codex/    │ │
+│  └─────────────────────┘    │  • turn/steer    │    │    app-server│ │
+│                             │  • claude/prompt │    │  • antigrav/ │ │
+│  ┌─────────────────────┐    │    (full / delta)│    │  • pi/       │ │
+│  │ lark/cardkitSurface │◀───│                  │◀───│    cold / rpc│ │
+│  │ bridge/cardkitProg  │    └────────┬─────────┘    └──────────────┘ │
+│  │ bridge/cotProgress  │             │                               │
+│  └─────────────────────┘             ▼                               │
+│  ┌─────────────────────┐    ┌──────────────────┐    ┌──────────────┐ │
+│  │ sessionStore (v2)   │    │ tasklist/*       │    │ housekeeping │ │
+│  │ eventLog / perfLog  │    │ (可选任务句柄)    │    │ (空闲 GC/归档)│ │
+│  └─────────────────────┘    └──────────────────┘    └──────────────┘ │
+│                                                                      │
+│  管理面：src/cli/*（init/doctor/start/stop/ui/update/wake）            │
+│          src/web/*（127.0.0.1 + token 本地 Web 看板）                 │
+└─────────────────────────────────┬────────────────────────────────────┘
+                                  │ spawn / JSON-RPC / stream-json
+                                  ▼
+┌──────────────────────────────────────────────────────────────────────┐
+│  本地 Agent CLI 子进程（使用宿主原生订阅/登录态，默认 bypassPermissions）│
+│    • claude（热进程池 + 空白预热 standby）                             │
+│    • codex（常驻 app-server + 在线配置/账号热切换）                    │
+│    • agy（Antigravity Gemini，冷启动）                                │
+│    • pi（自带模型，默认冷启动，可选 RPC 热池）                         │
+│    • 原生读取 cwd 下的 AGENTS.md / CLAUDE.md / .agents/skills/        │
+└──────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## 数据流(单条消息)
+## 单轮消息数据流
 
-```
-[运营] 在飞书话题里 @bot 发消息(可能含飞书文档链接 + 附件)
-   │
-   ▼ (1) 飞书 Open Platform 把 im.message.receive_v1 事件推到长连
-[lark.client]
-   │ (2) NDJSON 一行 → JSON dict
-   ▼
-[lark.message] 解析:
-   - text
-   - sender (open_id, name)
-   - chat_id, thread_id, message_id
-   - mentions[]   → 过滤 bot_open_id 命中
-   - attachments[]
-   - feishu_doc_links[]   ← 从 text 正则匹配
-   │
-   ▼ (3) 过滤 + 白名单
-[bridge.handler]
-   │ (4) is_new_thread = session_store.get(thread_id) is None
-   ▼
-[lark.card]
-   │ (5) 立刻发 CardKit 单卡占位: "努力回答中..." → 拿 card_message_id
-   ▼
-[claude.prompt]
-   │ (6) 拼 thread-context prompt:
-   │     - <thread-context>: ids, sender, attachments, links, 约定路径
-   │     - <user-message>:  原文
-   ▼
-[claude.runner]
-   │ (7) child_process.spawn:
-   │       claude --permission-mode acceptEdits
-   │              --output-format stream-json
-   │              --include-partial-messages
-   │              [--resume <session_id>]
-   │              -p "<prompt>"
-   ▼
-   [claude 子进程] 自主编排:
-   │   • 读项目 CLAUDE.md / SKILL → 知道流程
-   │   • bash: git worktree 创建/确认
-   │   • bash: lark-cli 拉素材
-   │   • Edit/Write 改代码
-   │   • bash: 跑项目 git workflow → push → 开 MR
-   │   • bash: 启动 / 复用 dev server
-   │   • 输出最终消息含 MR URL + 预览 URL
-   │
-   │ stream-json (NDJSON) 逐事件输出:
-   │   - system_init  (含 session_id)        ──┐
-   │   - assistant message (internal text)    │
-   │   - assistant message (answer channel)   │
-   │   - assistant message (tool_use, hidden) │
-   │   - tool_result (压缩,可丢)              │
-   │   - assistant message (final text)       │
-   │   - result (stop_reason)                ──┘
-   │
-   ▼ (8) runner 解析每行
-[lark.card]
-   │ (9) PATCH 同一张 CardKit 卡片:
-   │     - answer channel → final_md 真流式累积
-   │     - internal text / tool_use / tool_result → 不渲染到卡片
-   ▼
-[session.store]
-   │ (10) 子进程结束 → 持久化 session_id
-   ▼
-[lark.card]
-   │ (11) final patch:
-   │      ✅ 完成
-   │      MR: https://gitlab/.../-/merge_requests/1234
-   │      预览: http://your-host.local:3007/
-   │      [继续修改] [打断] [关闭话题]
-   ▼
-[运营]看到结果,继续 @bot 迭代 → 回到 (1)
+1. **入站接收**（`src/lark/channelClient.ts`）：通过飞书长连接收到 `im.message.receive_v1` 或卡片按钮回调，完成去重与 allowlist 过滤（默认入站去抖 0ms），同时辅以断线/周期性 gap-fill 补抓防漏消息。
+2. **解析与排队**（`src/lark/message.ts`、`src/bridge/handler.ts`）：解析发送者、文本、引用、附件和文档链接；同 session 串行（运行中支持 Codex `turn/steer` 原生追加输入，否则排队并在下一轮合并纯文本追问），不同话题按 `max_concurrent_turns`（默认 5）并发执行；`/stop` 与 ⏹ 走带外中断。
+3. **响应面与调度**（`src/bridge/cardkitProgress.ts`、`src/bridge/cotProgress.ts`）：
+   - 默认 `LARKWAY_MODEL_FIRST=continuation`：已有 session 的话题内续轮并行创建 COT 气泡与 CardKit 流式卡片，同时立即启动 runner；早期流式事件在内存缓冲并在卡片就绪后按序回放。
+   - 开新话题的轮次先建卡片以在飞书创建话题，再启动 runner。
+4. **Prompt 构造**（`src/claude/prompt.ts`）：新 session 发送精简完整契约，续轮默认 `promptMode: delta` 仅传本条消息的动态事实与一行输出锚点；身份与项目工作流留在 workspace 的原生 `AGENTS.md` / `CLAUDE.md` 与 skills 中，不逐轮复制。
+5. **底座执行**（`src/claude/`、`src/codex/`、`src/antigravity/`、`src/pi/`）：通过统一 `AgentRunner` 接口消费结构化事件流（`system_init`、`thinking_delta`、`tool_use`/`tool_result`、`answer_delta`/`answer_snapshot`、`result`）。
+6. **收尾交付**（`src/lark/cardkitSurface.ts`、`src/bridge/localHandoff.ts`、`src/claude/sessionStore.ts`）：读取可选 `.larkway/state.json`，将终稿卡片、handoff 镜像、任务生命周期回写与 transcript 落盘并行收尾；超过 CardKit 30KB 预算的长回答保留最大可读前缀并通过后续 post 续发；持久化 `sessions.json`（v2）与 `perf.jsonl`（单文件满 10 MiB 自动轮转）。
+
+---
+
+## 模块地图
+
+| 目录 / 模块 | 职责 |
+|---|---|
+| `src/main.ts` | Bridge 进程装配入口：加载 `bots/*.yaml`、探针自检、启动各 bot 的连接与热池、注册信号与优雅退出 |
+| `src/bridge/` | 消息调度（`handler.ts`）、CardKit/COT 进度、本地 handoff、`inputDelivery`、`perfLog`、`eventLog`、`stateFile` |
+| `src/lark/` | 飞书传输与出站客户端（`channelClient`、`channelCardKitClient`、`channelCotClient`、`channelPostClient`、`cardkitSurface`、`rosterResolver`） |
+| `src/agent/` | 统一 `AgentRunner` 契约、子进程环境隔离、managed/BYO `workspaceStore`、`sessionArtifacts`、启动自检 `readiness` |
+| `src/claude/` | Claude Code 冷启动与热进程池（`pool.ts`）、prompt 渲染（`prompt.ts`）、`sessionStore.ts` |
+| `src/codex/` | Codex 常驻 `app-server` 池（`pool.ts`）、在线配置/账号热切（`liveRunner.ts`、`liveConfig.ts`） |
+| `src/antigravity/` | Google Antigravity CLI（`agy`）冷启动运行器与瞬时鉴权超时重试 |
+| `src/pi/` | `pi` 冷启动运行器与可选 RPC 热进程池 |
+| `src/tasklist/` | 可选的「话题 ↔ 飞书任务句柄」模块，与 `bridge/` 解耦，仅通过注入 hook 交互 |
+| `src/housekeeping/` | 空闲 session 回收、知识收割与遗留 worktree 清理 |
+| `src/cli/` + `src/web/` | 宿主机管理 CLI 与本地 127.0.0.1 Web 看板 |
+
+---
+
+## 本地状态目录（`~/.larkway/`）
+
+```text
+~/.larkway/
+  ├─ .env                           # 密钥单一源（0600，绝不进入 yaml）
+  ├─ config.json                    # 宿主机级设置（如 permissions.mode）
+  ├─ bots/<id>.yaml                 # bot 运行连接定义
+  ├─ bots/<id>.memory.md            # 托管 workspace 的身份编辑源（BYO 模式不用）
+  ├─ sessions.json                  # version-2 KV，key = threadId::botId
+  ├─ logs/bridge.log                # bridge 主日志
+  ├─ <id>/
+  │    ├─ status.json               # 心跳与运行态（供 Web 看板 / status 命令读取）
+  │    ├─ events.jsonl              # 最近消息诊断事件
+  │    ├─ perf.jsonl(.1)            # 每轮性能与 token 样本（10 MiB 自动轮转）
+  │    ├─ lark-cli/                 # bot 隔离的 lark-cli 配置目录
+  │    └─ task-handles.json         # 可选任务句柄映射
+  └─ agents/<id>/
+       ├─ workspace/                # 托管 workspace（AGENTS.md / CLAUDE.md / repos/ / sessions/）
+       └─ sessions/                 # BYO workspace 模式下的独立 session 产物目录
 ```
 
 ---
 
-## 模块依赖图
+## 边界与非职责
 
-```
-                    main.py
-                       │
-                       ▼
-         ┌────── bridge.handler ──────┐
-         │             │              │
-         ▼             ▼              ▼
-   lark.client   claude.runner   lark.card
-         │             │              │
-         ▼             ▼              ▼
-   lark.message   claude.prompt   (内部 lark API client)
-                       │
-                       ▼
-                 session.store
+Larkway 坚持「薄通道」原则（详见 [principles.md](principles.md)）：
 
-  housekeeping.gc ──── 独立后台 task,只读 sessions.json + 文件系统
-  tasklist.*      ──── 独立模块(store/client/writeback/commentPoller),bridge.handler 只调一个
-                       可选注入 hook,不含任务业务逻辑 —— 见 [task-handle.md](task-handle.md)
-```
-
----
-
-## 状态持久化
-
-| 数据 | 存储 | Schema |
-|---|---|---|
-| `sessions.json` | JSON 文件 | `{ thread_id: { session_id, last_active_ts, created_ts, sender_open_id } }` |
-| `worktrees/<thread_id>/` | 文件系统(由 agent 创建) | git worktree |
-| `repos/<project>/` | 文件系统(由 agent / Larkway 启动时确保 clone) | git 主 clone |
-| `logs/<thread_id>.jsonl` | 文件追加 | 一行一事件,full stream-json + lark events |
-| `config.json` | JSON 文件 | 见 examples/config.example.json |
-
-**注意**:Larkway 不存 worktree 状态(分支名、是否 stash 等),那是 git 自己的事;Larkway 不存 dev server 状态(端口、PID),那是 agent 自己的事(可以让 agent 写到 worktree 里的 `.larkway-state.json`)。
-
----
-
-## 边界与"非职责"
-
-Larkway 明确**不做**的事:
-
-- ❌ 不调 GitLab API(由项目 git workflow 接管)
-- ❌ 不下载飞书附件 / 文档(由 agent 用 `lark-cli` 自己拉)
-- ❌ 不 `git worktree add`(由 agent 自己建)
-- ❌ 不启 dev server(由 agent 自己启)
-- ❌ 不解析 agent 输出里的 MR URL / 预览 URL(直接显给运营,Larkway 不需要)
-- ❌ 不做 runtime 执行权限(runtime 层由 Claude Code settings / Codex permission profile 负责);Larkway 的 `permissions/` 目录记录的是**产品层授权**(群限制 / token env / repo 访问 / 高风险 gate),与 runtime 执行权限分开,详见 [agent-workspace.md §3](agent-workspace.md)
-- ❌ 不做多 IM 平台抽象(只飞书,YAGNI)
+- ❌ 不做业务流程编排、不建 worktree、不启 dev server、不替 Agent 调 GitHub/GitLab API——全部由本地 Agent 读取 `AGENTS.md` / skills 自主决定。
+- ❌ 不注入计费 API key（`pi` 透传宿主机 provider 环境除外），不充当模型代理。
+- ❌ 不解析 Agent 自然语言正文来推断业务状态（如扫描 MR URL 或关键词）；结构化能力仅通过显式 `.larkway/state.json` 契约传递。
+- ❌ 不做 OS 沙箱隔离（安全边界说明见 [README.zh.md](../README.zh.md#安全模型--把-bot-拉进群前先读这段) / [README.md](../README.md#security-model--read-this-before-inviting-the-bot-anywhere)）。
+- ❌ 不做多 IM 平台抽象（聚焦飞书，YAGNI）。

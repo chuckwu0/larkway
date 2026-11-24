@@ -1,0 +1,36 @@
+# ============================================================
+# Example bot: pi backend (BYO model / custom OpenAI-compatible provider)
+#
+# Use `backend: pi` when you want to run your own provider/model configured in
+# `~/.pi/agent/models.json` (or via provider env vars). Verify credentials first:
+#   pi auth check --model <provider>/<model>
+#
+# Copy to  ~/.larkway/bots/<your-id>.yaml  and fill in real values.
+# ============================================================
+
+id: pi-bot
+name: Pi Bot
+description: Answers questions and executes tasks using a custom model configured in pi.
+
+app_id: cli_pppppppppppppp
+app_secret_env: PI_BOT_APP_SECRET    # env var name; secret stays in ~/.larkway/.env
+bot_open_id: ou_pppppppppppppppppppppppppppppppp
+
+chats: []
+peers: []
+
+runtime: agent_workspace
+backend: pi
+
+# Passed verbatim to `pi --model <value>`.
+model: openai/gpt-5.4
+# Optional thinking level (`low` | `medium` | `high` | `max`) if model has reasoning: true.
+# effort: medium
+
+# Cold start per turn by default; set `warmProcess: true` to keep an RPC pool.
+# warmProcess: false
+
+cot: brief
+cotSurface: bubble
+# Optional: path to a role/instructions file next to this yaml (file must exist if set).
+# memory_file: pi-bot.memory.md

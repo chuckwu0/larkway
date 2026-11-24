@@ -32,4 +32,26 @@ describe("input delivery journal", () => {
     expect(prompt).not.toContain("请用新的普通消息回应");
     expect(prompt).toContain("message_id: input");
   });
+
+  it("omits empty metadata fields and raw_pointer on plain-text continuation steering input", () => {
+    const parsed = parseMessage({
+      message_id: "om_plain",
+      chat_id: "oc_chat",
+      chat_type: "group",
+      root_id: "om_root",
+      sender_id: "ou_owner",
+      content: JSON.stringify({ text: "顺便跑一下 typecheck" }),
+      create_time: "1700000000000",
+    });
+    const prompt = renderSteeringInput(parsed, "ou_bot", "profile", "ou_owner", "om_card");
+    expect(prompt).toContain("sender_is_owner: true");
+    expect(prompt).toContain("message_id: om_plain");
+    expect(prompt).toContain("task_card_message_id: om_card");
+    expect(prompt).not.toContain("attachments:");
+    expect(prompt).not.toContain("feishu_doc_links:");
+    expect(prompt).not.toContain("mentioned_others:");
+    expect(prompt).not.toContain("raw_pointer:");
+    expect(prompt).not.toContain("trigger_type:");
+    expect(prompt).not.toContain("message_create_time:");
+  });
 });

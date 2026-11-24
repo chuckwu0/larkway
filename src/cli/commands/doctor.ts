@@ -27,7 +27,7 @@
  *   2 = 有 error(至少一项)
  */
 
-import { access, readdir, readFile, rm } from "node:fs/promises";
+import { access, readdir, readFile, rm, statfs } from "node:fs/promises";
 import { execFile } from "node:child_process";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -251,20 +251,21 @@ async function checkFeishuCreds(ctx: CliContext): Promise<CheckResult[]> {
       });
     }
 
-    // gitlab_token_env 可选,但若引用了就必须有值
-    if (bot.gitlab_token_env) {
-      const gitlabTokenVal = await ctx.hostConfig.readSecret(bot.gitlab_token_env);
-      if (!gitlabTokenVal) {
+    // git_token_env (preferred) / gitlab_token_env (legacy alias): 可选,但若引用了就必须有值
+    const gitTokenEnv = bot.git_token_env ?? bot.gitlab_token_env;
+    if (gitTokenEnv) {
+      const gitTokenVal = await ctx.hostConfig.readSecret(gitTokenEnv);
+      if (!gitTokenVal) {
         results.push({
           id: `feishu-creds-${id}-gitlab-token`,
-          label: `bot "${id}" GitLab Token`,
+          label: `bot "${id}" Git Token`,
           status: "error",
-          message: `bot yaml 引用的 ${bot.gitlab_token_env} 在 ~/.larkway/.env 中没有值。`,
+          message: `bot yaml 引用的 ${gitTokenEnv} 在 ~/.larkway/.env 中没有值。`,
         });
       } else {
         results.push({
           id: `feishu-creds-${id}-gitlab-token`,
-          label: `bot "${id}" GitLab Token`,
+          label: `bot "${id}" Git Token`,
           status: "ok",
         });
       }
@@ -817,6 +818,51 @@ export async function checkPiWarmPool(ctx: CliContext): Promise<CheckResult[]> {
   }];
 }
 
+const DISK_ERROR_BYTES = 512 * 1024 * 1024; // 512 MiB
+const DISK_WARN_BYTES = 2 * 1024 * 1024 * 1024; // 2 GiB
+
+/** Pure disk-space classifier for doctor + unit tests. */
+export function classifyDiskSpace(freeBytes: number, dirPath: string): CheckResult {
+  const gb = (freeBytes / (1024 * 1024 * 1024)).toFixed(1);
+  if (freeBytes < DISK_ERROR_BYTES) {
+    return {
+      id: "host-disk-space",
+      label: "宿主机可用磁盘空间",
+      status: "error",
+      message: `${dirPath} 所在分区仅剩 ${gb} GiB(低于 0.5 GiB),可能导致 git clone、session 写入与日志失败。请清理冗余仓库/构建产物或旧 session 目录。`,
+    };
+  }
+  if (freeBytes < DISK_WARN_BYTES) {
+    return {
+      id: "host-disk-space",
+      label: "宿主机可用磁盘空间",
+      status: "warn",
+      message: `${dirPath} 所在分区剩余 ${gb} GiB(建议 ≥ 2 GiB)。可检查 ~/.larkway/agents/*/workspace/repos 与历史日志占用。`,
+    };
+  }
+  return {
+    id: "host-disk-space",
+    label: "宿主机可用磁盘空间",
+    status: "ok",
+    message: `${gb} GiB 可用`,
+  };
+}
+
+/** 8. 宿主机磁盘剩余空间检查(只读,跨平台 fs.statfs,无子进程)。 */
+async function checkDiskSpace(ctx: CliContext): Promise<CheckResult> {
+  const dir = ctx.paths.larkwayDir;
+  try {
+    const stats = await statfs(dir);
+    const freeBytes = Number(stats.bavail) * Number(stats.bsize);
+    if (!Number.isFinite(freeBytes) || freeBytes < 0) {
+      return { id: "host-disk-space", label: "宿主机可用磁盘空间", status: "ok", message: "无法获取剩余空间(已跳过)" };
+    }
+    return classifyDiskSpace(freeBytes, dir);
+  } catch {
+    return { id: "host-disk-space", label: "宿主机可用磁盘空间", status: "ok", message: "目录尚未创建或不支持 statfs(已跳过)" };
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Run all checks
 // ---------------------------------------------------------------------------
@@ -850,13 +896,15 @@ async function runAllChecks(ctx: CliContext, opts: { lint: boolean }): Promise<C
   const codexChecks = await checkCodex(ctx);
   results.push(...codexChecks);
 
-  // 6b. pi CLI availability (required only if a bot uses backend: pi)
+  // 6b. Antigravity & pi CLI availability
   if (await backendRequired(ctx, "antigravity")) {
     const agy = await detectAntigravityBinary();
     results.push({
       id: "antigravity-binary", label: "Antigravity CLI",
       status: agy.found ? "ok" : "error",
-      message: agy.found ? `agy ${agy.version}。订阅登录需在 agy 中确认。` : "请安装 Antigravity CLI 并运行 agy 登录。",
+      message: agy.found
+        ? `agy ${agy.version}。请以运行 bridge 的系统用户执行一次 \`agy\` 确认 Google 账号已登录(个人套餐适用边界见 README)。`
+        : "未找到 `agy` binary。请安装 Antigravity CLI 并以运行 bridge 的用户运行 `agy` 登录。",
     });
   }
   const piChecks = await checkPi(ctx);
@@ -866,6 +914,9 @@ async function runAllChecks(ctx: CliContext, opts: { lint: boolean }): Promise<C
   // 7. Task-handle config status + scope probe (v3.4 discoverability)
   const taskHandleChecks = await checkTaskHandle(ctx, opts);
   results.push(...taskHandleChecks);
+
+  // 8. Host disk free space (read-only fs.statfs)
+  results.push(await checkDiskSpace(ctx));
 
   return results;
 }

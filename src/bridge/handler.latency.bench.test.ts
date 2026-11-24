@@ -92,8 +92,8 @@ interface Scenario {
   expectCalls: number;
   /** Calls started before runner.run() but not waited on (still in flight at run()). */
   expectInFlight: number;
-  /** WP-10: LARKWAY_MODEL_FIRST for this scenario (unset = off). */
-  mode?: "continuation" | "all";
+  /** WP-10: LARKWAY_MODEL_FIRST for this scenario (unset defaults to continuation). */
+  mode?: "off" | "continuation" | "all";
   /**
    * WP-10, continuation only: the bot has a task-claim hook (as main.ts
    * wires for every bot with an id), and the topic root's lookup is `cold`
@@ -105,14 +105,15 @@ interface Scenario {
 
 /** WP-10: does the scenario's turn start its runner before its surfaces? */
 function goesModelFirst(s: Scenario): boolean {
-  return s.mode === "all" || (s.mode === "continuation" && s.thread === "continuation");
+  const mode = s.mode ?? "continuation";
+  return mode === "all" || (mode === "continuation" && s.thread === "continuation");
 }
 
 // new topic:    [roster ‖ card reply] → card idConvert (| failed reply →
 //               legacy card); the COT bubble create on the card is started,
 //               not awaited (in flight at run()).
 // continuation: [root probe ‖ roster ‖ COT (chat; a rejected thread attempt
-//               first when untried, then chat)] → card.
+//               first when untried, then chat)] → card (when mode="off").
 // The delta prompt does not wait on the roster; the full (new-topic) prompt
 // does, by which time it has long completed alongside the card reply.
 // The ⏳ reaction's add (at the start) and delete (once the card exists) run
@@ -124,15 +125,17 @@ const SCENARIOS: Scenario[] = [
   { name: "new/roster-warm/cardkit-ok", thread: "new", roster: "warm", cardkit: "ok", expectSerial: 2, expectCalls: 3, expectInFlight: 1 },
   { name: "new/roster-cold/cardkit-fail", thread: "new", roster: "cold", cardkit: "fail", expectSerial: 2, expectCalls: 4, expectInFlight: 1 },
   { name: "new/roster-warm/cardkit-fail", thread: "new", roster: "warm", cardkit: "fail", expectSerial: 2, expectCalls: 3, expectInFlight: 1 },
-  { name: "continuation/roster-cold/cardkit-ok", thread: "continuation", roster: "cold", cardkit: "ok", expectSerial: 3, expectCalls: 5, expectInFlight: 0 },
-  { name: "continuation/roster-warm/cardkit-ok", thread: "continuation", roster: "warm", cardkit: "ok", expectSerial: 3, expectCalls: 4, expectInFlight: 0 },
-  { name: "continuation/roster-cold/cardkit-fail", thread: "continuation", roster: "cold", cardkit: "fail", expectSerial: 3, expectCalls: 5, expectInFlight: 0 },
-  { name: "continuation/roster-warm/cardkit-fail", thread: "continuation", roster: "warm", cardkit: "fail", expectSerial: 3, expectCalls: 4, expectInFlight: 0 },
+  { name: "continuation/roster-cold/cardkit-ok", mode: "off", thread: "continuation", roster: "cold", cardkit: "ok", expectSerial: 3, expectCalls: 5, expectInFlight: 0 },
+  { name: "continuation/roster-warm/cardkit-ok", mode: "off", thread: "continuation", roster: "warm", cardkit: "ok", expectSerial: 3, expectCalls: 4, expectInFlight: 0 },
+  { name: "continuation/roster-cold/cardkit-fail", mode: "off", thread: "continuation", roster: "cold", cardkit: "fail", expectSerial: 3, expectCalls: 5, expectInFlight: 0 },
+  { name: "continuation/roster-warm/cardkit-fail", mode: "off", thread: "continuation", roster: "warm", cardkit: "fail", expectSerial: 3, expectCalls: 4, expectInFlight: 0 },
   {
     name: "continuation/roster-warm/cardkit-ok/cot-thread-untried",
-    thread: "continuation", roster: "warm", cardkit: "ok", cotThread: "untried",
+    mode: "off", thread: "continuation", roster: "warm", cardkit: "ok", cotThread: "untried",
     expectSerial: 4, expectCalls: 5, expectInFlight: 0,
   },
+  // Default (LARKWAY_MODEL_FIRST unset): continuation turns run model-first out of the box.
+  { name: "default:continuation/roster-warm/cardkit-ok", thread: "continuation", roster: "warm", cardkit: "ok", expectSerial: 0, expectCalls: 2, expectInFlight: 2 },
   // WP-10 model-first: before run() only the calls fired at turn start — the
   // root probe (not awaited: this bot has no task-claim hook), the roster —
   // and the lane's first step (COT, or the card on a new topic), which starts

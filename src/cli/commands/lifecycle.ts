@@ -325,9 +325,41 @@ async function cmdStatus(ctx: CliContext, args: string[]): Promise<number> {
 // Sub-command: logs
 // ---------------------------------------------------------------------------
 
+function parseLogLineCount(args: string[], defaultLines = 50): number | { error: string } {
+  for (let i = 0; i < args.length; i += 1) {
+    const arg = args[i]!;
+    if (arg === "-n" || arg === "--lines") {
+      const next = args[i + 1];
+      if (!next || !/^\d+$/.test(next) || Number(next) <= 0) {
+        return { error: `${arg} 需要正整数行数，例如 larkway logs -n 100` };
+      }
+      return Number(next);
+    }
+    const eqMatch = arg.match(/^(?:-n=|--lines=)(.+)$/);
+    if (eqMatch) {
+      const val = eqMatch[1]!;
+      if (!/^\d+$/.test(val) || Number(val) <= 0) {
+        return { error: `行数参数必须是正整数，例如 larkway logs -n 100` };
+      }
+      return Number(val);
+    }
+  }
+  return defaultLines;
+}
+
 async function cmdLogs(ctx: CliContext, args: string[]): Promise<number> {
   const { ui, paths, flags } = ctx;
   const follow = args.includes("--follow") || args.includes("-f");
+  const parsedLines = parseLogLineCount(args, 50);
+  if (typeof parsedLines !== "number") {
+    if (flags.json) {
+      ui.emitJson({ ok: false, error: parsedLines.error });
+    } else {
+      ui.failure(parsedLines.error);
+    }
+    return 1;
+  }
+  const lineCount = parsedLines;
   const logPath = bridgeLogPath(paths.larkwayDir);
 
   const exists = await logFileExists(logPath);
@@ -356,7 +388,7 @@ async function cmdLogs(ctx: CliContext, args: string[]): Promise<number> {
     // tail, then poll for appended bytes until Ctrl-C. 500ms poll is plenty
     // for human log-watching and avoids fs.watch's platform quirks.
     ui.print(ui.dim(`正在跟随日志 ${logPath}  (Ctrl-C 退出)`));
-    process.stdout.write(await tailFile(logPath, 50));
+    process.stdout.write(await tailFile(logPath, lineCount));
     const { stat: statFile, open: openFile } = await import("node:fs/promises");
     let offset = await statFile(logPath).then((s) => s.size).catch(() => 0);
     return await new Promise<number>((resolve) => {
@@ -389,8 +421,8 @@ async function cmdLogs(ctx: CliContext, args: string[]): Promise<number> {
     });
   }
 
-  // One-shot: print last 50 lines.
-  const lines = await tailFile(logPath, 50);
+  // One-shot: print last N lines (default 50, configurable via -n / --lines).
+  const lines = await tailFile(logPath, lineCount);
   if (flags.json) {
     ui.emitJson({ ok: true, path: logPath, lines: lines.split("\n").filter(Boolean) });
   } else {

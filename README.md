@@ -1,6 +1,6 @@
 # Larkway
 
-> Turn your Claude Code, Codex, or Gemini (Antigravity CLI) subscription into a Feishu (Lark) agent your whole team can @-mention.
+> Turn your local Claude Code or Codex subscription — plus Antigravity (Gemini, subject to Google's CLI terms) or bring-your-own models via `pi` — into a Feishu (Lark) agent your whole team can @-mention.
 
 🌐 [larkway.dev](https://larkway.dev) · [中文版](README.zh.md)
 
@@ -57,7 +57,7 @@ Feishu thread
 - Subprocess lifecycle: spawn, stream-json parse, session-ID persistence
 - Feishu card: throttled real-time PATCH as the agent streams output
 - Session KV: `thread_id → session_id` so follow-up messages resume context
-- Idle GC: worktree housekeeping
+- Idle GC: idle session artifact reclamation and legacy worktree housekeeping
 
 **What Larkway does NOT do** — the agent decides everything else:
 
@@ -83,10 +83,12 @@ This boundary is intentional. Workflow changes go into your repository's agent g
 larkway doctor          # lists missing dependencies; --fix auto-installs some
 
 # 2. Register a Feishu app and configure your first bot
-larkway init            # CLI wizard: scan QR code → name the bot → pick a backend
+larkway                 # opens local Web UI (recommended — scan QR + visual config)
+# or headless / server without a browser:
+# larkway init          # CLI wizard: scan QR code → name the bot → pick a backend
 
 # 3. Start the bridge
-larkway start           # long-running; runs in background, logs to ~/.larkway/logs/
+larkway start           # registers OS service (launchd/systemd/Task Scheduler), logs to ~/.larkway/logs/
 
 # 4. Add the bot to a Feishu group
 #    Group settings → Bots → Add bot → pick yours → @-mention it

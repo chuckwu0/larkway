@@ -13,13 +13,13 @@ Larkway 传递飞书触发事实、可选资源指针和最小输出协议。任
 | `agent-memory` | legacy bot 的身份文本，最多 4,000 字符 | 仅 legacy runtime；不注入 agent workspace |
 | `runtime-warnings` | 本机缺失能力、诊断、安装提示 | 有检测结果时；delta 续轮仅在结果变化时（handler 未声明“未变化”即照发），并注明列表完整、未列出的此前缺失项已恢复；列表变空（含 bridge 重启后该 session 的第一轮）时 delta 发一行“当前未检测到缺失”，只发一次 |
 | `thread-context` | 当前消息、会话、资源和 owner 事实；delta 只列本条消息的事实和偏离常态的值（见下） | 每轮 |
-| `context-pointers` | 按需取消息/历史/文档的命令、profile、env 名、开发地址 | 完整 prompt |
-| `state-contract` | 输出通道和可选卡片字段概要 | 完整 prompt |
+| `context-pointers` | 按需取消息/历史/文档的命令、profile、env 名；仅配置了仓库指针时附带 `dev_hostname` / `port_range` | 完整 prompt |
+| `state-contract` | 输出通道和可选卡片字段概要（`handoffs` 仅在配置了 `peers` 时注入） | 完整 prompt |
 | `contract-anchor` | 一行：答案 marker 提示（Codex 省略）及 state 路径（卡片、任务、交接声明都写在这里） | delta 续轮 |
 | `agent-workspace` / `workspace` | workspace/session/repo/知识库位置 | 完整 prompt |
 | `peer-bots` | peer 名册与交接接口 | 完整 prompt，且有配置；不注入 turn-taking 工作流参数 |
 | `workspace-file-changes` | 工作区文件变化事实 | 有变化时，包括 delta |
-| `task-root` / `task-handle` | 任务分享入口或关联/候选任务事实 | 有相关任务时，包括 delta（清单 guid 行照带；候选只带 guid、summary、话题 id；指向本话题的候选另带描述） |
+| `task-root` / `task-handle` | 任务分享入口或关联/候选任务事实 | 有相关任务时，包括 delta（未认领候选在 delta 续轮仅于快照变化时重发，避免重复注入未变清单；清单 guid 行照带；候选只带 guid、summary、话题 id；指向本话题的候选另带描述） |
 | `session-reseed` | 明确重开会话的原因、摘要和转录摘录、完整转录路径 | 显式恢复时 |
 | `user-message` | 用户原文和按到达顺序合并的追加消息 | 每轮 |
 
@@ -111,7 +111,7 @@ bridge 发本轮终卡的同时发出 `handoffs` 镜像 post：另一个 bridge 
 
 主任务卡只显示显式 `card_progress:{message_id,text}`；`message_id` 必须是该活跃主卡的触发消息，摘要在实质变化时原子更新。普通 commentary 不自动展示，也不折叠或分段补发。
 
-运行中追加输入带 `task_card_message_id`（主卡触发 ID）及 `ordinary_reply`（以当前输入为目标的 lark-cli bot 回复命令指针）。是否需要单独回应由 Agent 判断；需要时，追问答复、主动重要补充和需要真实 @ 人的沟通可由 Agent 使用原生工具发新普通消息；该指针不由 bridge 执行，不改变 Agent 权限或既有任务工作流。最终答案仍用于主任务的交付结论。
+运行中追加输入带 `task_card_message_id`（主卡触发 ID）及 `ordinary_reply`（以当前输入为目标的 lark-cli bot 回复命令指针），并沿用 delta 精简规则（普通纯文本追问省略空附件/链接/@ 列表、常态 `trigger_type` 与非必要的 `raw_pointer`）。是否需要单独回应由 Agent 判断；需要时，追问答复、主动重要补充和需要真实 @ 人的沟通可由 Agent 使用原生工具发新普通消息；该指针不由 bridge 执行，不改变 Agent 权限或既有任务工作流。最终答案仍用于主任务的交付结论。
 
 已有 native session 的输出契约版本变更时，仅补发一次完整 `state-contract`，不重复 workspace/peer 指针、不重开原生会话；版本随 session 记录保存。稳定续轮仍只发短 anchor。
 

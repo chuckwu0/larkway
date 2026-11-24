@@ -69,7 +69,8 @@
  * interrupt it. Between-turn work is protected for a bounded interval too.
  */
 
-import { execFile, spawn, type ChildProcess } from "node:child_process";
+import { spawn, type ChildProcess } from "node:child_process";
+import { readProcessCommandLine, readProcessStartTimeMs } from "../agent/processInspect.js";
 import { findOnPath, spawnPiped } from "../platform/spawn.js";
 import { realpathSync } from "node:fs";
 import { mkdir, readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
@@ -107,6 +108,7 @@ type DoneResult = {
   interruptionReason?: "cancel" | "timeout";
   pooled?: boolean;
   resumeMode?: "same-process" | "cold";
+  processStart?: "standby" | "reused" | "spawned";
   backgroundTasksPending?: number;
   stateFreshAfter?: number;
 };
@@ -168,6 +170,8 @@ interface TurnState {
   usageState: ClaudeTurnUsageState;
   /** Whether this turn continues an entry that already accepted a prior turn. */
   reusedProcess: boolean;
+  /** BL-58 #6: whether this turn adopted a blank standby, reused a warm thread child, or spawned fresh. */
+  processStart: "standby" | "reused" | "spawned";
   /**
    * The warm process this turn is queued/running on, once run() has picked
    * or spawned one. Undefined only in the brief synchronous window before
@@ -482,6 +486,7 @@ export class ClaudeProcessPool implements AgentRunner {
       answerExtractor: new AnswerChannelExtractor(),
       usageState: newClaudeTurnUsageState(),
       reusedProcess: false,
+      processStart: "spawned",
       entry: undefined,
     };
 
@@ -617,6 +622,7 @@ export class ClaudeProcessPool implements AgentRunner {
     }
 
     let entry = this.#entries.get(key);
+    let adoptedBlank = false;
     if (entry == null && opts.resumeSessionId == null) {
       // 批D blank adoption: a NEW session (nothing to --resume) whose spawn
       // signature matches the standby blank takes it over in place — the
@@ -624,6 +630,7 @@ export class ClaudeProcessPool implements AgentRunner {
       // stdin write hits a fully warm process. Resume turns can never adopt
       // (--resume is a spawn-time flag the blank wasn't given).
       entry = this.#adoptBlankEntry(key, threadId, opts, needsAddDir);
+      if (entry != null) adoptedBlank = true;
     }
     if (entry == null) {
       if (this.#entries.size >= this.#maxProcesses) {
@@ -648,6 +655,7 @@ export class ClaudeProcessPool implements AgentRunner {
     }
 
     state.entry = entry;
+    state.processStart = adoptedBlank ? "standby" : entry.hasRunTurn ? "reused" : "spawned";
     const pidAtReturn = entry.child.pid;
     entry.queueChain = entry.queueChain.then(() => this.#runTurnOnEntry(entry!, state));
 
@@ -780,6 +788,9 @@ export class ClaudeProcessPool implements AgentRunner {
     entry.current = state;
     entry.lastUsedAt = Date.now();
     state.reusedProcess = entry.hasRunTurn;
+    if (state.processStart !== "standby") {
+      state.processStart = entry.hasRunTurn ? "reused" : "spawned";
+    }
 
     const line =
       JSON.stringify({
@@ -829,6 +840,7 @@ export class ClaudeProcessPool implements AgentRunner {
       resumeMode: state.opts.resumeSessionId != null
         ? state.reusedProcess ? "same-process" : "cold"
         : undefined,
+      processStart: state.processStart,
       ...(backgroundTasksPending > 0 ? { backgroundTasksPending } : {}),
       ...(state.stateFreshAfter !== undefined ? { stateFreshAfter: state.stateFreshAfter } : {}),
     });
@@ -888,6 +900,7 @@ export class ClaudeProcessPool implements AgentRunner {
           ...result,
           pooled: false,
           resumeMode: state.opts.resumeSessionId != null ? "cold" : undefined,
+          processStart: "spawned",
         }),
       (err) => this.#settleReject(state, err instanceof Error ? err : new Error(String(err))),
     );
@@ -1090,7 +1103,7 @@ export class ClaudeProcessPool implements AgentRunner {
     );
     // Replenish AFTER this turn's entry bookkeeping settles — a synchronous
     // spawn here would race the #entries.set above for the capacity check.
-    queueMicrotask(() => this.#maybeSpawnBlank());
+    queueMicrotask(() => this.#maybeSpawnBlank({ evictStaleForStandby: true }));
     return blank;
   }
 
@@ -1098,13 +1111,29 @@ export class ClaudeProcessPool implements AgentRunner {
    * Spawn the standby blank when prewarm is configured and conditions allow:
    * at most one blank at a time, never past maxProcesses, never while
    * shutting down, and never after the circuit breaker tripped.
+   *
+   * BL-58 #6: when the pool is full (`entries.size >= maxProcesses`) and
+   * `evictStaleForStandby` is set, if `maxProcesses >= 2` and the longest-idle
+   * thread entry has been quiet past the stale-standby threshold (half of
+   * `idleMs`, capped at 3 min), reclaim that stale slot so new topics keep
+   * getting instant standby adoption instead of falling back to 1.2-3.5s cold
+   * starts until the full 10 min idle sweep.
    */
-  #maybeSpawnBlank(): void {
+  #maybeSpawnBlank(spawnOpts?: { evictStaleForStandby?: boolean }): void {
     if (this.#prewarmProto == null || this.#prewarmDisabled || this.#shuttingDown) return;
     if (this.#prewarmRespawnTimer != null) return; // a backoff respawn is already scheduled
-    if (this.#entries.size >= this.#maxProcesses) return; // real threads own every slot — retry on next exit
     for (const e of this.#entries.values()) {
       if (e.blank) return; // standby already present
+    }
+    if (this.#entries.size >= this.#maxProcesses) {
+      if (spawnOpts?.evictStaleForStandby && this.#maxProcesses >= 2) {
+        const staleFloorMs = Math.min(Math.floor(this.#idleMs / 2), 3 * 60 * 1000);
+        const victim = this.#pickLruIdleVictim();
+        if (victim && !victim.blank && Date.now() - victim.lastUsedAt >= staleFloorMs) {
+          this.#destroyEntry(victim, "reclaiming stale idle slot for blank standby (BL-58 #6)");
+        }
+      }
+      if (this.#entries.size >= this.#maxProcesses) return;
     }
     const proto = this.#prewarmProto;
     const key = `__blank__::${this.#botId}::${this.#nextBlankId++}`;
@@ -1519,6 +1548,9 @@ export class ClaudeProcessPool implements AgentRunner {
           );
         }
       }
+      // BL-58 #6: once an idle thread ages out (or becomes stale while the pool
+      // is full), replenish the blank standby so the next new topic stays warm.
+      this.#maybeSpawnBlank({ evictStaleForStandby: true });
     }, cadenceMs);
     this.#idleSweepTimer.unref?.();
   }
@@ -1651,29 +1683,6 @@ const REAP_FRESHNESS_GUARD_MS = 5_000;
  * `lstart` has ~1s resolution and boot-time process scheduling adds jitter.
  */
 const REAP_START_TIME_TOLERANCE_MS = 10_000;
-
-/** Runs `ps -p <pid> -o command=` and resolves its stdout (empty string on any error — never throws/rejects). */
-function readProcessCommandLine(pid: number): Promise<string> {
-  return new Promise((resolve) => {
-    execFile("ps", ["-p", String(pid), "-o", "command="], (err, stdout) => {
-      resolve(err ? "" : stdout);
-    });
-  });
-}
-
-/** Runs `ps -p <pid> -o lstart=` and resolves the process's start time as epoch ms, or undefined if it can't be determined (never throws/rejects). */
-function readProcessStartTimeMs(pid: number): Promise<number | undefined> {
-  return new Promise((resolve) => {
-    execFile("ps", ["-p", String(pid), "-o", "lstart="], (err, stdout) => {
-      if (err) {
-        resolve(undefined);
-        return;
-      }
-      const parsed = Date.parse(stdout.trim());
-      resolve(Number.isNaN(parsed) ? undefined : parsed);
-    });
-  });
-}
 
 /**
  * A hard kill (kill -9, a watchdog, an OOM) never gives ClaudeProcessPool a

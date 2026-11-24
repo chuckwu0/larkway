@@ -2175,3 +2175,85 @@ describe("ClaudeProcessPool — background task lifecycle", () => {
     expect(child.killed).toBe(true);
   });
 });
+
+describe("ClaudeProcessPool — BL-58 #6 processStart & stale-slot standby replenishment", () => {
+  const PROTO = { cwd: "/ws/bot-a", model: "sonnet", effort: "high", permissionMode: "bypassPermissions" as const };
+
+  it("reports processStart as standby (blank adopted), reused (warm hit), and spawned (cold/new warm)", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const pool = new ClaudeProcessPool({ botId: "bot-a", maxProcesses: 3 });
+      pool.prewarm(PROTO);
+      await flush();
+
+      // Turn 1 on matching signature adopts the blank standby.
+      const h1 = pool.run({ ...PROTO, prompt: "first", threadId: "t1" });
+      await flush();
+      const cStandby = spawnedChildren[0]!;
+      cStandby.stdout.write(systemInit("s1") + "\n");
+      cStandby.stdout.write(resultLine("success") + "\n");
+      await flush();
+      expect((await h1.done).processStart).toBe("standby");
+
+      // Turn 2 on same thread reuses the warm process.
+      const h2 = pool.run({ ...PROTO, prompt: "second", threadId: "t1", resumeSessionId: "s1" });
+      await flush();
+      cStandby.stdout.write(resultLine("success") + "\n");
+      await flush();
+      expect((await h2.done).processStart).toBe("reused");
+
+      // Turn 3 on a different cwd misses the standby and spawns a new warm process.
+      const h3 = pool.run({ prompt: "third", cwd: "/other/cwd", threadId: "t3" });
+      await flush();
+      const cSpawned = spawnedChildren[spawnedChildren.length - 1]!;
+      cSpawned.stdout.write(systemInit("s3") + "\n");
+      cSpawned.stdout.write(resultLine("success") + "\n");
+      await flush();
+      expect((await h3.done).processStart).toBe("spawned");
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+
+  it("evicts a stale idle thread slot on sweep to replenish the blank standby when full", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "Date"] });
+    try {
+      const pool = new ClaudeProcessPool({ botId: "bot-a", maxProcesses: 2, idleMs: 600_000 });
+      pool.prewarm(PROTO);
+      await flush();
+      expect(pool.blankProcessCountForTesting).toBe(1);
+
+      // Occupy both slots with two real threads (t1 adopts blank, t2 adopts replenished blank → pool full, 0 blanks).
+      const h1 = pool.run({ ...PROTO, prompt: "a", threadId: "t1" });
+      await flush();
+      spawnedChildren[0]!.stdout.write(systemInit("s1") + "\n");
+      spawnedChildren[0]!.stdout.write(resultLine("success") + "\n");
+      await flush();
+      await h1.done;
+      expect(pool.blankProcessCountForTesting).toBe(1);
+
+      // Move forward 1 min so t1 is older than t2, then adopt the second blank for t2.
+      await vi.advanceTimersByTimeAsync(60_000);
+      const h2 = pool.run({ ...PROTO, prompt: "b", threadId: "t2" });
+      await flush();
+      spawnedChildren[1]!.stdout.write(systemInit("s2") + "\n");
+      spawnedChildren[1]!.stdout.write(resultLine("success") + "\n");
+      await flush();
+      await h2.done;
+      // Pool is full (2/2 active threads) and t1 is only 1 min old (< 3 min stale floor): no eviction yet.
+      expect(pool.blankProcessCountForTesting).toBe(0);
+      expect(spawnedChildren[0]!.killed).toBe(false);
+
+      // Advance 2.5 more minutes (t1 is now 3.5 min idle >= 3 min stale floor, still < 10 min idleMs).
+      await vi.advanceTimersByTimeAsync(150_000);
+      await flush();
+      expect(spawnedChildren[0]!.killed).toBe(true);
+      expect(spawnedChildren[1]!.killed).toBe(false);
+      expect(pool.blankProcessCountForTesting).toBe(1);
+    } finally {
+      vi.useRealTimers();
+      warnSpy.mockRestore();
+    }
+  });
+});

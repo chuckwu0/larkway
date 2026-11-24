@@ -8,8 +8,10 @@ export const CARDKIT_CHOICES_ELEMENT_ID = "choices_slot";
 export const CARDKIT_COT_PANEL_ELEMENT_ID = "cot_panel";
 export const CARDKIT_COT_INNER_ELEMENT_ID = "cot_inner_md";
 
-const MAX_CARD_BYTES = 30 * 1024;
+export const MAX_CARD_BYTES = 30 * 1024;
 const FINAL_BUDGET_CHARS = 22_000;
+const OVERFLOW_SUFFIX = "\n\n_（内容较长，后续部分见下方续发消息或本地 session 产物）_";
+const HARD_FALLBACK_CONTENT = "_内容过长，已截断。完整内容请查看下方续发消息或本地 session 产物。_";
 const CHOICE_MARKERS = ["A", "B", "C", "D", "E"] as const;
 
 export interface CardKitMentionTarget {
@@ -93,38 +95,167 @@ function truncateChars(text: string, maxChars: number, suffix: string): string {
   return `${text.slice(0, Math.max(0, maxChars - suffix.length))}${suffix}`;
 }
 
-function truncateCardToBudget(card: Record<string, unknown>): Record<string, unknown> {
-  let out = card;
-  let json = JSON.stringify(out);
-  if (Buffer.byteLength(json, "utf8") <= MAX_CARD_BYTES) return out;
+function safeSliceEnd(text: string, end: number): number {
+  if (end <= 0) return 0;
+  if (end >= text.length) return text.length;
+  // Avoid splitting a UTF-16 surrogate pair.
+  const code = text.charCodeAt(end - 1);
+  if (code >= 0xd800 && code <= 0xdbff) return end - 1;
+  return end;
+}
 
-  const cloned = structuredClone(out) as Record<string, unknown>;
-  const elements = ((cloned["body"] as Record<string, unknown>)["elements"] ?? []) as Record<
-    string,
-    unknown
-  >[];
+function preferLineBoundary(text: string, maxEnd: number): number {
+  const safe = safeSliceEnd(text, maxEnd);
+  if (safe <= 0 || safe >= text.length) return safe;
+  const searchFloor = Math.max(0, safe - 240);
+  const nl = text.lastIndexOf("\n", safe - 1);
+  if (nl >= searchFloor && nl >= Math.floor(safe * 0.7)) {
+    // Include the trailing `\n` in the prefix slice (`nl + 1 <= safe`) so the
+    // continuation starts at column 0 of the next line with zero stripping of
+    // leading indentation (Python/YAML) or blank lines.
+    return nl + 1;
+  }
+  return safe;
+}
 
-  for (const element of elements) {
-    if (element["element_id"] === CARDKIT_FINAL_ELEMENT_ID && typeof element["content"] === "string") {
-      element["content"] = truncateChars(
-        element["content"],
-        Math.floor((element["content"] as string).length * 0.75),
-        "\n\n_内容过长,后续部分已省略_",
-      );
-      break;
+const CHOICE_PROMPT_OVERFLOW_PLACEHOLDER = "_（选项说明较长，详见下方续发消息）_";
+
+function cardByteLength(card: Record<string, unknown>): number {
+  return Buffer.byteLength(JSON.stringify(card), "utf8");
+}
+
+function binarySearchAnswerFit(
+  card: Record<string, unknown>,
+  finalElement: Record<string, unknown>,
+  fullContent: string,
+): number {
+  let lo = 0;
+  let hi = fullContent.length;
+  let best = 0;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    const cut = safeSliceEnd(fullContent, mid);
+    finalElement["content"] = `${fullContent.slice(0, cut)}${OVERFLOW_SUFFIX}`;
+    if (cardByteLength(card) <= MAX_CARD_BYTES) {
+      best = cut;
+      lo = mid + 1;
+    } else {
+      hi = mid - 1;
     }
   }
-  out = cloned;
-  json = JSON.stringify(out);
-  if (Buffer.byteLength(json, "utf8") <= MAX_CARD_BYTES) return out;
+  return best;
+}
 
-  for (const element of elements) {
-    if (element["element_id"] === CARDKIT_FINAL_ELEMENT_ID) {
-      element["content"] = "_内容过长,已截断。完整内容请查看本地 session 产物。_";
-      break;
+function fitCardToBudget(
+  card: Record<string, unknown>,
+  fullContent: string,
+  meta?: { choicePromptIndex?: number; choicePromptText?: string },
+): { card: Record<string, unknown>; overflowText?: string } {
+  if (cardByteLength(card) <= MAX_CARD_BYTES) {
+    return { card };
+  }
+
+  const cloned = structuredClone(card) as Record<string, unknown>;
+  const body = cloned["body"] as Record<string, unknown>;
+  const elements = ((body["elements"] ?? []) as Record<string, unknown>[]);
+
+  const finalElement = elements.find(
+    (element) => element["element_id"] === CARDKIT_FINAL_ELEMENT_ID && typeof element["content"] === "string",
+  );
+  if (!finalElement) {
+    return { card: cloned };
+  }
+
+  // 1. Trim collapsed COT panel first so user-facing answer keeps maximum room.
+  const cotPanelIndex = elements.findIndex((el) => el["element_id"] === CARDKIT_COT_PANEL_ELEMENT_ID);
+  if (cotPanelIndex >= 0) {
+    const cotPanel = elements[cotPanelIndex]!;
+    if (Array.isArray(cotPanel["elements"])) {
+      const inner = (cotPanel["elements"] as Record<string, unknown>[])[0];
+      if (inner && typeof inner["content"] === "string" && inner["content"].length > 400) {
+        inner["content"] = `${inner["content"].slice(0, 400)}\n\n_…思考过程已精简以保留正文空间_`;
+        if (cardByteLength(cloned) <= MAX_CARD_BYTES) {
+          return { card: cloned };
+        }
+      }
     }
   }
-  return cloned;
+
+  // Track any optional element text moved to continuation posts (e.g. oversized choicePrompt).
+  const extraOverflowParts: string[] = [];
+  let movedChoicePrompt = false;
+
+  const tryShedChoicePrompt = (): boolean => {
+    if (movedChoicePrompt || meta?.choicePromptIndex === undefined || !meta.choicePromptText) {
+      return false;
+    }
+    const promptEl = elements[meta.choicePromptIndex];
+    if (!promptEl || promptEl["tag"] !== "markdown") return false;
+    movedChoicePrompt = true;
+    promptEl["content"] = CHOICE_PROMPT_OVERFLOW_PLACEHOLDER;
+    extraOverflowParts.push(meta.choicePromptText);
+    return true;
+  };
+
+  // 2. Binary-search the maximum prefix of `fullContent` (+ suffix) that fits.
+  let best = binarySearchAnswerFit(cloned, finalElement, fullContent);
+
+  // If optional elements (like a huge choicePrompt or COT panel) ate the entire
+  // card budget so even 0 chars of answer fit, shed those optional elements and
+  // re-evaluate so both the answer and the choice buttons stay intact.
+  if (best === 0) {
+    if (cotPanelIndex >= 0) {
+      elements.splice(cotPanelIndex, 1);
+      if (meta?.choicePromptIndex !== undefined && meta.choicePromptIndex > cotPanelIndex) {
+        meta = { ...meta, choicePromptIndex: meta.choicePromptIndex - 1 };
+      }
+    }
+    tryShedChoicePrompt();
+    // After shedding optional elements, the entire answer itself might now fit!
+    finalElement["content"] = fullContent;
+    if (cardByteLength(cloned) <= MAX_CARD_BYTES) {
+      const overflow = extraOverflowParts.join("\n\n");
+      return { card: cloned, ...(overflow ? { overflowText: overflow } : {}) };
+    }
+    best = binarySearchAnswerFit(cloned, finalElement, fullContent);
+  }
+
+  if (best > 0) {
+    const cut = preferLineBoundary(fullContent, best);
+    finalElement["content"] = `${fullContent.slice(0, cut)}${OVERFLOW_SUFFIX}`;
+    let actualCut = cut;
+    if (cardByteLength(cloned) > MAX_CARD_BYTES) {
+      actualCut = best;
+      finalElement["content"] = `${fullContent.slice(0, best)}${OVERFLOW_SUFFIX}`;
+    }
+    const rest = fullContent.slice(actualCut);
+    const overflowParts = [...(rest ? [rest] : []), ...extraOverflowParts];
+    const overflow = overflowParts.join("\n\n");
+    return { card: cloned, ...(overflow ? { overflowText: overflow } : {}) };
+  }
+
+  // 3. Hard fallback: replace answer and shed optional elements until strictly <= MAX_CARD_BYTES.
+  tryShedChoicePrompt();
+  finalElement["content"] = HARD_FALLBACK_CONTENT;
+  const fallbackParts: string[] = [...(fullContent ? [fullContent] : []), ...extraOverflowParts];
+
+  if (cardByteLength(cloned) > MAX_CARD_BYTES) {
+    for (let i = elements.length - 1; i >= 0 && cardByteLength(cloned) > MAX_CARD_BYTES; i -= 1) {
+      const el = elements[i]!;
+      if (el === finalElement) continue;
+      elements.splice(i, 1);
+      if (
+        el["tag"] === "markdown" &&
+        typeof el["content"] === "string" &&
+        el["content"] !== CHOICE_PROMPT_OVERFLOW_PLACEHOLDER
+      ) {
+        fallbackParts.push(el["content"]);
+      }
+    }
+  }
+
+  const overflow = fallbackParts.join("\n\n");
+  return { card: cloned, ...(overflow ? { overflowText: overflow } : {}) };
 }
 
 export function buildCardKitInitialCard(
@@ -189,18 +320,28 @@ function buildImageElement(block: ImageBlock): Record<string, unknown> {
   return element;
 }
 
-function finalMarkdown(opts: BuildCardKitFinalCardOpts): string {
+function rawFinalMarkdown(opts: BuildCardKitFinalCardOpts): string {
   const mentionLine = (opts.mentions ?? []).map(safeAtMention).filter(Boolean).join(" ");
   const blocks = opts.contentBlocks?.filter((b) => b.type === "markdown") ?? [];
   const body = blocks.length
     ? blocks.map((b) => b.content.trim()).filter(Boolean).join("\n\n")
     : opts.finalText.trim();
-  return truncateChars([mentionLine, body].filter(Boolean).join("\n\n") || "完成。", FINAL_BUDGET_CHARS, "\n\n_内容过长,已截断。_");
+  return [mentionLine, body].filter(Boolean).join("\n\n") || "完成。";
 }
 
-export function buildCardKitFinalCard(
+function finalMarkdown(opts: BuildCardKitFinalCardOpts): string {
+  return truncateChars(rawFinalMarkdown(opts), FINAL_BUDGET_CHARS, "\n\n_内容过长,已截断。_");
+}
+
+export interface BuiltCardKitFinalCard {
+  card: Record<string, unknown>;
+  /** Remaining answer markdown that did not fit inside MAX_CARD_BYTES. */
+  overflowText?: string;
+}
+
+export function buildCardKitFinalCardWithOverflow(
   opts: BuildCardKitFinalCardOpts,
-): Record<string, unknown> {
+): BuiltCardKitFinalCard {
   const elements: unknown[] = [];
   // Collapsed reasoning panel sits ABOVE the answer (matches its streaming
   // position). Embedded here so the full-card rebuild keeps it (collapsed).
@@ -213,7 +354,8 @@ export function buildCardKitFinalCard(
       }),
     );
   }
-  elements.push(buildCardKitAnswerElement(finalMarkdown(opts)));
+  const fullContent = rawFinalMarkdown(opts);
+  elements.push(buildCardKitAnswerElement(fullContent));
   const images: ImageBlock[] = [];
   if (opts.contentBlocks?.length) {
     for (const block of opts.contentBlocks) {
@@ -226,23 +368,84 @@ export function buildCardKitFinalCard(
     elements.push({ tag: "hr" });
     for (const image of images) elements.push(buildImageElement(image));
   }
+  let choicePromptIndex: number | undefined;
   if (opts.choices?.length) {
     elements.push({ tag: "hr" });
-    if (opts.choicePrompt) elements.push(markdown(opts.choicePrompt));
+    if (opts.choicePrompt) {
+      choicePromptIndex = elements.length;
+      elements.push(markdown(opts.choicePrompt));
+    }
     elements.push(markdown(buildChoiceLegend(opts.choices)));
     elements.push(buildChoiceRow(opts.choices, opts.choicePrompt));
   }
-  return truncateCardToBudget({
-    schema: "2.0",
-    config: {
-      update_multi: true,
-      streaming_mode: false,
-      summary: { content: truncateChars(opts.finalText.replace(/\s+/g, " ").trim(), 50, "...") },
+  return fitCardToBudget(
+    {
+      schema: "2.0",
+      config: {
+        update_multi: true,
+        streaming_mode: false,
+        summary: { content: truncateChars(opts.finalText.replace(/\s+/g, " ").trim(), 50, "...") },
+      },
+      body: { elements },
     },
-    body: { elements },
-  });
+    fullContent,
+    choicePromptIndex !== undefined ? { choicePromptIndex, choicePromptText: opts.choicePrompt } : undefined,
+  );
+}
+
+export function buildCardKitFinalCard(
+  opts: BuildCardKitFinalCardOpts,
+): Record<string, unknown> {
+  return buildCardKitFinalCardWithOverflow(opts).card;
 }
 
 export function buildCardKitFinalMarkdown(opts: BuildCardKitFinalCardOpts): string {
   return finalMarkdown(opts);
+}
+
+/**
+ * Split long overflow markdown into safe UTF-8 post chunks so follow-up post
+ * messages stay well below Feishu's post payload limit and never drop text
+ * silently. Preserves exact source slices (indentation, blank lines) so
+ * concatenating chunks reproduces the original text identically when within
+ * `maxChunks`; any remainder beyond the cap appends a concise local-artifact
+ * notice to the last chunk.
+ */
+export function splitOverflowMarkdownChunks(
+  text: string,
+  maxBytesPerChunk = 12_000,
+  maxChunks = 4,
+): string[] {
+  if (!text || !/\S/.test(text)) return [];
+  const chunks: string[] = [];
+  let cursor = 0;
+  while (cursor < text.length && chunks.length < maxChunks) {
+    const rest = text.slice(cursor);
+    if (Buffer.byteLength(rest, "utf8") <= maxBytesPerChunk) {
+      chunks.push(rest);
+      cursor = text.length;
+      break;
+    }
+    let lo = 1;
+    let hi = rest.length;
+    let best = 1;
+    while (lo <= hi) {
+      const mid = (lo + hi) >> 1;
+      const cut = safeSliceEnd(rest, mid);
+      if (Buffer.byteLength(rest.slice(0, cut), "utf8") <= maxBytesPerChunk) {
+        best = Math.max(1, cut);
+        lo = mid + 1;
+      } else {
+        hi = mid - 1;
+      }
+    }
+    const cut = preferLineBoundary(rest, best);
+    const step = cut > 0 ? cut : best;
+    chunks.push(rest.slice(0, step));
+    cursor += step;
+  }
+  if (cursor < text.length && chunks.length > 0) {
+    chunks[chunks.length - 1] += "\n\n_（内容极长，其余部分请查看本地 session 产物）_";
+  }
+  return chunks;
 }

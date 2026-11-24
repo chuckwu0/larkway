@@ -72,4 +72,27 @@ describe("Codex live configuration reader", () => {
       await expect(read()).rejects.toThrow("configuration is invalid");
     } finally { await rm(dir, { recursive: true, force: true }); }
   });
+
+  it("caches unchanged files via nativeStatKey and invalidates only when native files change", async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), "live-stat-cache-"));
+    try {
+      await writeFile(path.join(dir, "auth.json"), auth("one"));
+      await writeFile(path.join(dir, "config.toml"), 'model = "gpt-5.5"\n');
+      const botFile = path.join(dir, "bot.yaml");
+      await writeFile(botFile, "id: example\nbackend: codex\nmodel: first\n");
+      const read = createCodexConfigReader(dir, "example", dir);
+      const a = await read();
+      expect(a.nativeStatKey).toBeTruthy();
+      // YAML-only edit changes model but preserves nativeStatKey & generation.
+      await writeFile(botFile, "id: example\nbackend: codex\nmodel: second\n");
+      const b = await read();
+      expect(b.model).toBe("second");
+      expect(b.generation).toBe(a.generation);
+      expect(b.nativeStatKey).toBe(a.nativeStatKey);
+      // Native config.toml edit changes nativeStatKey.
+      await writeFile(path.join(dir, "config.toml"), 'model = "gpt-5.5"\nmodel_reasoning_effort = "high"\n');
+      const c = await read();
+      expect(c.nativeStatKey).not.toBe(a.nativeStatKey);
+    } finally { await rm(dir, { recursive: true, force: true }); }
+  });
 });

@@ -1,0 +1,34 @@
+# ============================================================
+# Example bot: BYO Workspace (connect an existing local project/workspace)
+#
+# Use this when you already have a working Claude Code / Codex / Gemini / pi
+# directory with your own AGENTS.md / CLAUDE.md, skills, and MCP configs.
+# Larkway runs the agent directly in `workspace:` without writing or
+# scaffolding any files inside it; per-topic session artifacts stay under
+# `~/.larkway/agents/<id>/sessions/`.
+#
+# Copy to  ~/.larkway/bots/<your-id>.yaml  and fill in real values.
+# ============================================================
+
+id: byo-bot
+name: Workspace Bot
+description: Runs directly inside an existing local workspace using its native AGENTS.md, CLAUDE.md, and skills.
+
+app_id: cli_zzzzzzzzzzzzzz
+app_secret_env: BYO_BOT_APP_SECRET   # env var name; secret stays in ~/.larkway/.env
+bot_open_id: ou_zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz
+
+# Empty [] = open mode (any group the bot joins). List chat_ids to restrict.
+chats: []
+peers: []
+
+runtime: agent_workspace
+# Absolute path to an existing local directory (must already exist on disk).
+workspace: /path/to/your/existing-workspace
+
+# Choose any installed backend: "codex" | "claude" | "antigravity" | "pi"
+backend: codex
+
+cot: brief
+cotSurface: bubble
+p2pStickySession: true

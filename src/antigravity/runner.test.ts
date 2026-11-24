@@ -64,9 +64,54 @@ describe("Antigravity cold turns", () => {
     const tool = { step_index: 2, step_type: "tool", tool_name: "write_to_file" };
     expect(read({ event: "step_update", step_update: { ...tool, state: "ACTIVE" } })[0].type).toBe("tool_use");
     expect(read({ event: "step_update", step_update: { ...tool, state: "DONE" } }).map(e => e.type)).toEqual(["tool_result"]);
-    expect(read({ event: "result", result: { status: "SUCCESS", conversation_id: "topic-a", response: "final" } })
-      .map(e => e.type)).toEqual(["answer_snapshot", "result"]);
+    const resEvents = read({
+      event: "result",
+      result: {
+        status: "SUCCESS",
+        conversation_id: "topic-a",
+        response: "final",
+        usage: { input_tokens: 120, output_tokens: 45, cached_tokens: 80, reasoning_tokens: 15 },
+      },
+    });
+    expect(resEvents.map(e => e.type)).toEqual(["answer_snapshot", "result"]);
+    expect(resEvents[1]).toMatchObject({
+      type: "result",
+      stopReason: "SUCCESS",
+      usage: {
+        inputTokens: 120,
+        cacheCreationTokens: 0,
+        cacheReadTokens: 80,
+        outputTokens: 45,
+        reasoningTokens: 15,
+      },
+    });
     expect(decoder.assistantError).toBeUndefined();
+
+    // Inclusive prompt_tokens schema subtracts both cache read & creation buckets.
+    const decoder2 = new AntigravityTurnDecoder();
+    const res2 = [...decoder2.decodeLine(JSON.stringify({
+      event: "result",
+      result: {
+        status: "SUCCESS",
+        conversation_id: "topic-b",
+        response: "ok",
+        usage: {
+          prompt_tokens: 100,
+          cached_tokens: 20,
+          cache_creation_input_tokens: 10,
+          completion_tokens: 30,
+        },
+      },
+    }))];
+    expect(res2.find((e) => e.type === "result")).toMatchObject({
+      type: "result",
+      usage: {
+        inputTokens: 70,
+        cacheCreationTokens: 10,
+        cacheReadTokens: 20,
+        outputTokens: 30,
+      },
+    });
   });
 
   it("rejects truncated, failed and mismatched conversations", () => {
