@@ -852,7 +852,7 @@ export function classifyDiskSpace(freeBytes: number, dirPath: string): CheckResu
 async function checkDiskSpace(ctx: CliContext): Promise<CheckResult> {
   const dir = ctx.paths.larkwayDir;
   try {
-    const stats = await statfs(dir);
+    const stats = await statfs(dir).catch(() => statfs(path.dirname(dir)));
     const freeBytes = Number(stats.bavail) * Number(stats.bsize);
     if (!Number.isFinite(freeBytes) || freeBytes < 0) {
       return { id: "host-disk-space", label: "宿主机可用磁盘空间", status: "ok", message: "无法获取剩余空间(已跳过)" };

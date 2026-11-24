@@ -1592,9 +1592,12 @@ const getStatus: ApiHandler = async (req) => {
   }
 
   // Read-only host disk free space (statfs, zero subprocesses, best-effort).
+  // Prefer ctx.larkwayDir (honours LARKWAY_HOME and isolated test dirs), falling
+  // back to its parent directory when the home dir has not been created yet.
   let hostDisk: { freeBytes: number; freeGiB: number; status: "ok" | "warn" | "error" } | null = null;
+  const diskTarget = ctx.larkwayDir || larkwayHome;
   try {
-    const fsStats = await statfs(larkwayHome);
+    const fsStats = await statfs(diskTarget).catch(() => statfs(path.dirname(diskTarget)));
     const freeBytes = Number(fsStats.bavail) * Number(fsStats.bsize);
     if (Number.isFinite(freeBytes) && freeBytes >= 0) {
       const freeGiB = Math.round((freeBytes / (1024 * 1024 * 1024)) * 10) / 10;
