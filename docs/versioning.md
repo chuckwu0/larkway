@@ -98,7 +98,8 @@
 | v0.3.91 | v0.3.91 | patch / 已发布 | Codex 切换账号后，旧话题会等待写锁释放，再把首次续聊的原文提交到原会话。 |
 | v0.3.92 | v0.3.92 | patch / 已发布 | Add Antigravity CLI (agy) as a local backend with model and effort selection and per-topic conversation resume. |
 | v0.3.93 | v0.3.93 | patch / 已发布 | Retry Antigravity CLI startup auth timeouts before session init with abort-safe backoff. |
-| v0.3.94 | v0.3.94 | 当前 patch / 已发布 | default continuation model-first, Codex stat-cached admission, slim delta/steering prompts, CardKit 30KB overflow recovery, Web UI pi/Layer 4/disk checks, CLI logs -n & doctor fixes, bridge decomposition |
+| v0.3.94 | v0.3.94 | patch / 已发布 | default continuation model-first, Codex stat-cached admission, slim delta/steering prompts, CardKit 30KB overflow recovery, Web UI pi/Layer 4/disk checks, CLI logs -n & doctor fixes, bridge decomposition |
+| v0.3.95 | v0.3.95 | 当前 patch / 已发布 | fix hostDisk and doctor statfs check to use ctx.larkwayDir with parent fallback |
 
 ## 使用原则
 
@@ -204,4 +205,5 @@ v0.3.91       = Codex 切换账号后，旧话题会等待写锁释放，再把�
 v0.3.92       = Add Antigravity CLI (agy) as a local backend with model and effort selection and per-topic conversation resume.
 v0.3.93       = Retry Antigravity CLI startup auth timeouts before session init with abort-safe backoff.
 v0.3.94       = default continuation model-first, Codex stat-cached admission, slim delta/steering prompts, CardKit 30KB overflow recovery, Web UI pi/Layer 4/disk checks, CLI logs -n & doctor fixes, bridge decomposition
+v0.3.95       = fix hostDisk and doctor statfs check to use ctx.larkwayDir with parent fallback
 ```
