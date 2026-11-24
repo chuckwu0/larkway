@@ -97,7 +97,8 @@
 | v0.3.90 | v0.3.90 | patch / 已发布 | 持续读取常驻 Codex 进程的错误输出，修复日志管道写满后当前任务卡住、新任务配置校验超时的问题。 |
 | v0.3.91 | v0.3.91 | patch / 已发布 | Codex 切换账号后，旧话题会等待写锁释放，再把首次续聊的原文提交到原会话。 |
 | v0.3.92 | v0.3.92 | patch / 已发布 | Add Antigravity CLI (agy) as a local backend with model and effort selection and per-topic conversation resume. |
-| v0.3.93 | v0.3.93 | 当前 patch / 已发布 | Retry Antigravity CLI startup auth timeouts before session init with abort-safe backoff. |
+| v0.3.93 | v0.3.93 | patch / 已发布 | Retry Antigravity CLI startup auth timeouts before session init with abort-safe backoff. |
+| v0.3.94 | v0.3.94 | 当前 patch / 已发布 | default continuation model-first, Codex stat-cached admission, slim delta/steering prompts, CardKit 30KB overflow recovery, Web UI pi/Layer 4/disk checks, CLI logs -n & doctor fixes, bridge decomposition |
 
 ## 使用原则
 
@@ -202,4 +203,5 @@ v0.3.90       = 持续读取常驻 Codex 进程的错误输出，修复日志管
 v0.3.91       = Codex 切换账号后，旧话题会等待写锁释放，再把首次续聊的原文提交到原会话。
 v0.3.92       = Add Antigravity CLI (agy) as a local backend with model and effort selection and per-topic conversation resume.
 v0.3.93       = Retry Antigravity CLI startup auth timeouts before session init with abort-safe backoff.
+v0.3.94       = default continuation model-first, Codex stat-cached admission, slim delta/steering prompts, CardKit 30KB overflow recovery, Web UI pi/Layer 4/disk checks, CLI logs -n & doctor fixes, bridge decomposition
 ```

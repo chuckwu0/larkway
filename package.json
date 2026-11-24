@@ -1,6 +1,6 @@
 {
   "name": "larkway",
-  "version": "0.3.93",
+  "version": "0.3.94",
   "description": "Thin bridge: Feishu (Lark) threads to local Claude Code, Codex, Gemini (Antigravity), and pi CLIs",
   "license": "MIT",
   "author": "Chuck Wu (chuckwu0)",
